@@ -1,0 +1,116 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <string_view>
+#include <nlohmann/json.hpp>
+#include "common/types.h"
+
+namespace VideoCore::ReadbackPolicy {
+
+/// Readback behavior that can be changed while the game runs (debug server /set), so variants can be
+/// compared in the same scene without restarting. Initialised from the settings (InitFromSettings),
+/// so with nothing changed the behavior is the one of the settings. All values are plain atomics read
+/// on the hot paths.
+struct State {
+    /// Fence kinds whose fences download the bound linear images.
+    std::atomic<u32> image_download_kinds_mask{~0u};
+    /// cp_full_fence_kinds.
+    std::atomic<u32> full_fence_kinds{31};
+    /// readback_linear_images_async.
+    std::atomic<bool> images_async{false};
+    /// readback_dma_async: DMA copies into guest memory are also downloaded into a private staging buffer
+    /// and written to guest memory by the priority thread (counters: dma_async_copies, dma_async_bytes).
+    std::atomic<bool> dma_async{false};
+    std::atomic<u64> dma_async_copies{0};
+    std::atomic<u64> dma_async_bytes{0};
+    /// Live switch skip_shadows: depth-only draws into a square depth target are dropped (1), or into
+    /// one with this pitch (value >= 256), before any Vulkan work. skipped_draws counts them.
+    std::atomic<u32> skip_shadows{0};
+    std::atomic<u64> skipped_draws{0};
+    /// Histogram of the depth targets of depth-only draws (key = pitch << 16 | height), whatever the switch says.
+    struct DepthOnlyBucket {
+        std::atomic<u32> key{0};
+        std::atomic<u64> count{0};
+    };
+    std::array<DepthOnlyBucket, 24> depth_hist{};
+    void NoteDepthOnly(u32 pitch, u32 height) {
+        const u32 key = (pitch << 16) | (height & 0xffff);
+        for (auto& bucket : depth_hist) {
+            u32 current = bucket.key.load(std::memory_order_relaxed);
+            if (current == 0) {
+                bucket.key.compare_exchange_strong(current, key);
+            }
+            if (bucket.key.load(std::memory_order_relaxed) == key) {
+                bucket.count.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+    }
+    /// -1 = readbacks_mode setting, otherwise 0 Disabled, 1 Relaxed, 2 Precise.
+    std::atomic<s32> readbacks_mode_override{-1};
+    /// cp_flush_commands: hand recorded commands to the encoder every N commands (0 = off).
+    std::atomic<u32> flush_commands{0};
+    /// cp_skip_fill_drain: 1 = the command processor does not wait for queued fills of render target CMASK / HTILE surfaces before planning a draw.
+    std::atomic<u32> skip_fill_drain{0};
+    /// cp_stream_submit / cp_stream_hooks: streaming of the draws (see core/stream_submit.h).
+    std::atomic<u32> stream_submit{0};
+    std::atomic<u32> stream_hooks{64};
+    /// cp_delay_ns / raster_delay_ns (diagnostics): a spin per draw on the command processor / the raster thread.
+    std::atomic<u32> cp_delay_ns{0};
+    /// cp_group_sig: native records are applied by register group identity (see Liverpool::ApplyRecordGroups).
+    std::atomic<u32> group_sig{0};
+    /// cp_stage_key: the pipeline lookup of native draws goes by the record's key (see PipelineCache::GetGraphicsPipeline).
+    std::atomic<u32> stage_key{0};
+    /// cp_exec_inputs: native draws are planned from the record without the register image (see Liverpool::ExecuteNativeDraw).
+    std::atomic<u32> exec_inputs{0};
+    /// cp_stream_probe: the streaming study's probe runs on every draw hook (development part).
+    std::atomic<u32> stream_probe{0};
+    /// native_legacy_registers: executed records are also applied to the shared register image (LEGACY(register-image)).
+    std::atomic<u32> legacy_registers{0};
+    std::atomic<u32> raster_delay_ns{0};
+    /// cp_raster_core: logical processor of the raster thread, -1 = not pinned. Applied live.
+    std::atomic<s32> raster_core{-1};
+    /// native_draw_mode / native_draw_classes (see emulator_settings.h). Applied live.
+    std::atomic<u32> native_draw_mode{0};
+    std::atomic<u32> native_draw_classes{3};
+    std::atomic<u32> native_synth_verify{0};
+    std::atomic<u32> native_audit_every{64}; ///< see emulator_settings.h
+    std::atomic<u32> native_sdk_strip{0};    ///< see emulator_settings.h
+    std::atomic<u32> native_draw_exec{0};
+    /// Ablation switches (documents/tlg/native-isolation.md): -1 = the setting, otherwise the value. Applied live.
+    std::atomic<s32> fence_shortcut_override{-1}; ///< readback_fence_wait_shortcut 0..3
+    std::atomic<s32> stream_reuse_override{-1};   ///< readback_stream_reuse_enabled 0/1
+    std::atomic<s32> rt_reuse_override{-1};       ///< rt_lookup_reuse_enabled 0/1
+    /// Diagnostics: draw call sites (Ghidra addresses of the return address) that are not executed natively; /set?exclude_caller=<address> adds one, 0 clears the list
+    std::array<std::atomic<u32>, 32> exclude_callers{};
+    std::atomic<s32> packet_path{0};              ///< 0: the packet walk is off: a command buffer runs from its entries only, the packets that are not entries are not executed (logged as errors)
+    std::atomic<s32> cs_zero_base{1};             ///< record dispatches run on the record alone on a zeroed compute program (0 = LEGACY(register-image): the record applied to the queue's state)
+    std::atomic<s32> cs_audit{0};                 ///< audit: a record dispatch's compute program against the record alone on a zeroed program (counters in /native)
+    std::atomic<s32> map_native{0};               ///< the texture map helper's upload dispatch as a record: 0 off, 1 verify (tag + game packets), 2 execute
+    std::atomic<s32> register_packets{1};         ///< SET_SH_REG, DISPATCH_DIRECT and WRITE_DATA of the graphics queue are entries of a direct buffer (0: they make it mixed)
+    std::atomic<s32> stage_reuse_override{-1};    ///< stage_lookup_reuse 0..2
+};
+
+State& Get();
+
+/// The readbacks mode in use (setting or live override).
+int ReadbacksMode();
+
+/// True on the emulator's own threads (names starting with "shadPS4:").
+bool IsEmulatorThread();
+
+/// Copies the relevant settings into the state. Call once when the rasterizer starts.
+void InitFromSettings();
+
+/// Debug server: /set?name=value (the name is one of the fields above, values are integers or
+/// 0/1). Returns false for an unknown name.
+bool Set(std::string_view name, s64 value);
+
+/// Current values as JSON.
+nlohmann::json Dump();
+
+} // namespace VideoCore::ReadbackPolicy

@@ -243,6 +243,8 @@ struct PM4CmdNop {
         PrepareFlipLabel = 0x68750778u,     ///< Flip marker with label address
         PrepareFlipInterrupt = 0x68750780u, ///< Flip marker with interrupt
         PrepareFlipInterruptLabel = 0x68750781u, ///< Flip marker with interrupt and label
+        NativeDrawTag = 0x4E445447u, ///< Tag of the next draw written by the native draw hook (TLG)
+        NativeFence = 0x4E444653u,   ///< A graphics end-of-pipe write turned into a 6 dword no-op in place: the words after the magic are the packet's (TLG)
     };
 };
 
@@ -851,7 +853,7 @@ struct PM4DumpConstRam {
 
     template <typename T>
     T Address() const {
-        return reinterpret_cast<T>((u64(addr_hi) << 32u) | addr_lo);
+        return std::bit_cast<T>((u64(addr_hi) << 32u) | addr_lo);
     }
 
     [[nodiscard]] u32 Offset() const {
@@ -952,22 +954,22 @@ struct PM4CmdReleaseMem {
         return data_lo | u64(data_hi) << 32;
     }
 
-    void SignalFence(auto&& signal_irq, auto&& gds_to_mem) const {
+    void SignalFence(auto&& write_mem, auto&& signal_irq, auto&& gds_to_mem) const {
         switch (data_sel.Value()) {
         case DataSelect::Data32Low: {
-            *Address<u32*>() = DataDWord();
+            write_mem(Address<u32*>(), DataDWord(), sizeof(u32));
             break;
         }
         case DataSelect::Data64: {
-            *Address<u64*>() = DataQWord();
+            write_mem(Address<u64*>(), DataQWord(), sizeof(u64));
             break;
         }
         case DataSelect::GpuClock64: {
-            *Address<u64*>() = GetGpuClock64();
+            write_mem(Address<u64*>(), GetGpuClock64(), sizeof(u64));
             break;
         }
         case DataSelect::PerfCounter: {
-            *Address<u64*>() = GetGpuPerfCounter();
+            write_mem(Address<u64*>(), GetGpuPerfCounter(), sizeof(u64));
             break;
         }
         case DataSelect::GdsMemStore: {
@@ -1066,6 +1068,33 @@ struct PM4CmdDrawIndirect {
         BitField<0, 16, u32> start_inst_loc; ///< Offset where the CP will write the
                                              ///< StartInstanceLocation it fetched from memory
     };
+    u32 draw_initiator; ///< Draw Initiator Register
+};
+
+struct PM4CmdDrawIndirectCountMulti {
+    PM4Type3Header header; ///< header
+    u32 data_offset;       ///< Byte aligned offset where the required data structure starts
+    union {
+        u32 dw2;
+        BitField<0, 16, u32> base_vtx_loc; ///< Offset where the CP will write the
+                                           ///< BaseVertexLocation it fetched from memory
+    };
+    union {
+        u32 dw3;
+        BitField<0, 16, u32> start_inst_loc; ///< Offset where the CP will write the
+                                             ///< StartInstanceLocation it fetched from memory
+    };
+    union {
+        u32 dw4;
+        BitField<0, 16, u32> draw_index_loc; ///< register offset to write the Draw Index count
+        BitField<30, 1, u32>
+            count_indirect_enable; ///< Indicates the data structure count is in memory
+        BitField<31, 1, u32>
+            draw_index_enable; ///< Enables writing of Draw Index count to DRAW_INDEX_LOC
+    };
+    u32 count;          ///< Count of data structures to loop through before going to next packet
+    u64 count_addr;     ///< DWord aligned Address[31:2]; Valid if countIndirectEnable is set
+    u32 stride;         ///< Stride in memory from one data structure to the next
     u32 draw_initiator; ///< Draw Initiator Register
 };
 
