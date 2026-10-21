@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "core/debug_server.h"
+#include "core/guest_hooks.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
@@ -707,6 +709,11 @@ void Presenter::PresentLoadingFrame() {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    if (!is_reusing_frame) {
+        // tlg-native: the frame counter of the debug server (fps, frame time) and the frame tick of the guest hooks, as in our presenter
+        Core::DebugServer::NotePresent();
+        Core::GuestHooks::OnFrame();
+    }
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
