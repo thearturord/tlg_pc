@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Prepare and run The Last Guardian (CUSA03627 v1.03) through the native loader.
 
@@ -56,7 +56,7 @@ def default_language(game_dir=''):
     title = shader_cache.title_id(game_dir) if game_dir else None
     return DEFAULT_LANGUAGE_BY_TITLE.get(title, 'es_LA')
 
-# TLG defaults (see README "Opções" and the reasons in each comment).
+# TLG defaults (see README "OpÃ§Ãµes" and the reasons in each comment).
 DEFAULT_ENV = {
     'TLG_PIPELINE_BINARIES': '0',  # VK_KHR_pipeline_binary crashes on the NVIDIA 595 driver
     'TLG_READBACKS': '2',          # the game reads GPU compute results on the CPU (AsyncMap)
@@ -75,7 +75,7 @@ DEFAULT_SETTINGS = {
     'system_lib_dir': str(PORT_DIR / 'system_lib') if FROZEN else str(REPO_DIR / 'dump' / 'system_lib'),
     'game_language': 'pt_BR',
     'ui_language': 'auto',         # auto | pt_BR | en_US
-    'show_fps': False,
+    'show_fps': True,    # the performance overlay on by default (F10 toggles)
     'display_mode': 'Windowed',    # Windowed | Borderless | Fullscreen (tlg.ini)
     'vsync': True,
     'vram_budget_mb': 5600,
@@ -520,7 +520,7 @@ def main(argv=None):
         freed, failures = clear_shader_cache(settings)
         print(f'Cache de shaders: {shader_cache.human_size(freed)} liberados', flush=True)
         for path, error in failures:
-            print(f'Não apagado (em uso? feche o jogo): {path}: {error}', file=sys.stderr)
+            print(f'NÃ£o apagado (em uso? feche o jogo): {path}: {error}', file=sys.stderr)
         return 1 if failures else 0
     if os.environ.get('TLG_NGS2') == 'hle':
         settings['native_audio'] = False
