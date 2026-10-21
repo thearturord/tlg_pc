@@ -2,6 +2,7 @@
 // variables (defaults match shadPS4 except the pipeline cache, which is on).
 #pragma once
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include "common/types.h"
@@ -39,7 +40,20 @@ public:
     // An explicit TLG_VBLANK_HZ is used as given, without a limit (measurements).
     u32 GetVblankFrequency() {
         static const u32 value = [] {
-            const long hz = Number("TLG_VBLANK_HZ", 60);
+            long hz = Number("TLG_VBLANK_HZ", -1);
+            if (hz < 0) {
+                // tlg-native: the applied frame rate mode of the patch script (out/frame_rate_mode.txt next to user/): 120 flips on a 120 Hz vblank
+                hz = 60;
+                if (const char* user = std::getenv("TLG_GPU_USER_DIR")) {
+                    std::string mode;
+                    if (FILE* f = std::fopen((std::string(user) + "/../out/frame_rate_mode.txt").c_str(), "r")) {
+                        char buffer[16]{};
+                        if (std::fgets(buffer, sizeof buffer, f)) mode = buffer;
+                        std::fclose(f);
+                    }
+                    if (mode.compare(0, 3, "120") == 0) hz = 120;
+                }
+            }
             return hz > 0 ? u32(hz) : 480u;
         }();
         return value;

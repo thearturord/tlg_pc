@@ -211,6 +211,8 @@ def prepare(game_dir, out_dir, mode, mods_dir=None, mods_config=None):
             lines.append(f'Mod {what} ({data.hex()})')
     writes = fps_writes + mod_writes
     write_patch_file(Path(out_dir) / 'patches.bin', writes)
+    # The GPU library reads the applied mode from here when TLG_VBLANK_HZ is not set (120 needs a vblank of 120 Hz; the packaged launcher only knows 30, 60 and unlocked).
+    (Path(out_dir) / 'frame_rate_mode.txt').write_text(mode + chr(10))
     lines.append(f'Frame rate: {mode} FPS mode, {len(writes)} patch writes')
     return mode, lines
 
