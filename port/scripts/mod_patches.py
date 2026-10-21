@@ -33,7 +33,7 @@ def eboot_segments(elf):
     segments = []
     for i in range(phnum):
         kind, _, _, vaddr, _, _, memsz, _ = struct.unpack_from('<IIQQQQQQ', elf, phoff + i * phentsize)
-        if kind == 1:
+        if kind in (1, 0x61000010):  # PT_LOAD and PT_SCE_RELRO (the engine's read only data after relocation: the 4K resolution table lives there)
             segments.append((vaddr, vaddr + memsz))
     return segments
 

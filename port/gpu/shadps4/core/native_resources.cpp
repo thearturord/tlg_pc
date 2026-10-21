@@ -19,6 +19,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#ifdef TLG_PORT
+#include "tlg_toggles.h" // sigjmp_buf, tlg_setjmp, runtime_fault_recover
+#endif
 #include "common/logging/log.h"
 #include "core/native_draw.h"
 #include "core/native_resources.h"
@@ -141,7 +144,29 @@ u32 SizeClass(u64 size) {
 
 /// Reads the allocated blocks of one of the engine's Gomalloc heaps: 512 hash buckets from heap + 0xf0, each a list of
 /// 32 byte nodes (address, size, next, previous). ~0 when the heap changed while it was read.
-#ifdef _WIN32
+#if defined(TLG_PORT)
+// tlg-native: faults resume at runtime_fault_recover in the port (see RunGuarded in native_draw.cpp).
+__declspec(noinline) u32 ScanRaw(u64 heap, u8 id, Block* out, u32 capacity) {
+    volatile u32 n = 0;
+    sigjmp_buf recovery;
+    if (tlg_setjmp(recovery) != 0) {
+        return ~0u;
+    }
+    runtime_fault_recover = &recovery;
+    for (u32 bucket = 0; bucket < 512; ++bucket) {
+        u64 node = *reinterpret_cast<const u64*>(heap + 0xf0 + bucket * 8);
+        for (u32 guard = 0; node != 0 && guard < 100000; ++guard) {
+            if (n < capacity) {
+                out[n] = {*reinterpret_cast<const u64*>(node), *reinterpret_cast<const u64*>(node + 8), id};
+                n = n + 1;
+            }
+            node = *reinterpret_cast<const u64*>(node + 0x10);
+        }
+    }
+    runtime_fault_recover = nullptr;
+    return n;
+}
+#elif defined(_WIN32)
 __declspec(noinline) u32 ScanRaw(u64 heap, u8 id, Block* out, u32 capacity) {
     u32 n = 0;
     __try {
@@ -165,7 +190,18 @@ u32 ScanRaw(u64, u8, Block*, u32) {
 }
 #endif
 
-#ifdef _WIN32
+#if defined(TLG_PORT)
+__declspec(noinline) bool SafeRead64(u64 address, u64* out) {
+    sigjmp_buf recovery;
+    if (tlg_setjmp(recovery) != 0) {
+        return false;
+    }
+    runtime_fault_recover = &recovery;
+    *out = *reinterpret_cast<const u64*>(address);
+    runtime_fault_recover = nullptr;
+    return true;
+}
+#elif defined(_WIN32)
 __declspec(noinline) bool SafeRead64(u64 address, u64* out) {
     __try {
         *out = *reinterpret_cast<const u64*>(address);

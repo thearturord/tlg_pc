@@ -1860,7 +1860,73 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 }
 
+Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline* pipeline) const {
+    const auto& key = pipeline->GetGraphicsKey();
+    const auto& regs = *draw_inputs;
+    BeginSignature sig;
+    const u32 num_color = std::bit_width(key.mrt_mask);
+    for (u32 cb = 0; cb < num_color && cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        sig.ids[cb] = cb_descs[cb].image_id;
+        if (cb_descs[cb].image_id) {
+            sig.views[cb] = cb_descs[cb].desc.view_info;
+        }
+        sig.color_samples[cb] = key.color_samples[cb];
+    }
+    sig.ids[AmdGpu::NUM_COLOR_BUFFERS] = db_desc.image_id;
+    if (db_desc.image_id) {
+        sig.views[AmdGpu::NUM_COLOR_BUFFERS] = db_desc.desc.view_info;
+    }
+    sig.mrt_mask = key.mrt_mask;
+    sig.num_samples = key.num_samples;
+    sig.generation = texture_cache.ImageGeneration();
+    std::memcpy(&sig.depth_control, &regs.depth_control, sizeof(u32));
+    sig.depth_valid = regs.depth_buffer.DepthValid();
+    sig.stencil_valid = regs.depth_buffer.StencilValid();
+    return sig;
+}
+
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+    static const bool memo_enabled = [] {
+        // Off by default until it is checked in play (documents/tlg/pc-port-draw-pipeline-architecture.md): TLG_RENDER_STATE_MEMO=1 turns it on.
+        const char* env = std::getenv("TLG_RENDER_STATE_MEMO");
+        return env && env[0] == '1';
+    }();
+    if (!memo_enabled) {
+        return BeginRenderingFull(pipeline);
+    }
+    const auto& regs = *draw_inputs;
+    BeginSignature signature = MakeBeginSignature(pipeline);
+    bool usable = begin_memo.valid && scheduler.IsRenderingWith(begin_memo.state) &&
+                  !regs.depth_render_control.depth_clear_enable &&
+                  !regs.depth_render_control.stencil_clear_enable && signature == begin_memo.signature;
+    for (const auto id : signature.ids) {
+        if (usable && id) {
+            const auto& image = texture_cache.GetImage(id);
+            usable = !image.binding.is_bound && !image.binding.needs_rebind;
+        }
+    }
+    if (usable) {
+        ++begin_memo_hits;
+        attachment_feedback_loop = false;
+        return begin_memo.state;
+    }
+    ++begin_memo_misses;
+    begin_memo.valid = false;
+    RenderState state = BeginRenderingFull(pipeline);
+    if (!attachment_feedback_loop) {
+        // A state with a clear is not remembered: the next draw's differs (the clear is done).
+        bool clears = state.depth_stencil_attachment.depth_clear || state.depth_stencil_attachment.stencil_clear;
+        for (u32 i = 0; i < state.num_color_attachments; ++i) {
+            clears |= state.color_attachments[i].is_clear != 0;
+        }
+        if (!clears) {
+            begin_memo = {true, MakeBeginSignature(pipeline), state};
+        }
+    }
+    return state;
+}
+
+RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     attachment_feedback_loop = false;
     const auto& regs = *draw_inputs;
     const auto& key = pipeline->GetGraphicsKey();

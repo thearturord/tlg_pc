@@ -112,6 +112,11 @@ public:
 
     [[nodiscard]] u64 CurrentTick() const noexcept;
 
+    /// Render state memo hits and misses since the last call (raster thread).
+    std::pair<u64, u64> TakeBeginMemoStats() noexcept {
+        return {std::exchange(begin_memo_hits, 0), std::exchange(begin_memo_misses, 0)};
+    }
+
     PipelineCache::PlanStats TakePlanStats() noexcept {
         return pipeline_cache.TakePlanStats();
     }
@@ -206,6 +211,33 @@ public:
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline, const FixedState& fixed);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
+    /// The render state of a draw that starts or changes a render pass (the work BeginRendering does when the memo below cannot answer).
+    RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
+
+    /// Render state memo (the port's `RenderStateMemo`, tlg_pc docs/parallel_gpu.md): about 90 % of the draws continue the render pass the draw before
+    /// them opened. Such a draw gets that draw's render state back instead of redoing the target lookups, the layout transitions and the attachment
+    /// descriptions. It only applies while the scheduler still has exactly that pass open (a barrier, copy or dispatch ends the pass), the signature of
+    /// the inputs is the same (target ids and views, the pipeline's attachment key, the image registry generation, depth control), nothing clears,
+    /// and no target is also sampled by the draw.
+    struct BeginSignature {
+        std::array<VideoCore::ImageId, AmdGpu::NUM_COLOR_BUFFERS + 1> ids{};
+        std::array<VideoCore::ImageViewInfo, AmdGpu::NUM_COLOR_BUFFERS + 1> views{};
+        u32 mrt_mask = 0;
+        u32 num_samples = 0;
+        std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples{};
+        u64 generation = 0;
+        u32 depth_control = 0;
+        bool depth_valid = false;
+        bool stencil_valid = false;
+        bool operator==(const BeginSignature&) const = default;
+    };
+    BeginSignature MakeBeginSignature(const GraphicsPipeline* pipeline) const;
+    struct BeginMemo {
+        bool valid = false;
+        BeginSignature signature;
+        RenderState state;
+    } begin_memo;
+    u64 begin_memo_hits = 0, begin_memo_misses = 0;
     void Resolve(const DrawInputs& inputs, const AmdGpu::CbDbExtent& cb0, const AmdGpu::CbDbExtent& cb1);
     void DepthStencilCopy(const DrawInputs& inputs, const AmdGpu::CbDbExtent& db_extent, bool is_depth, bool is_stencil);
     void EliminateFastClear(const DrawInputs& inputs, const AmdGpu::CbDbExtent& cb0);

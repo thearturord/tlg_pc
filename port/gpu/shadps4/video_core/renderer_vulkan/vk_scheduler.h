@@ -403,6 +403,11 @@ public:
         return render_state;
     }
 
+    /// Whether a render pass with exactly this state is open (recording side; the raster thread).
+    [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {
+        return is_rendering && render_state == state;
+    }
+
     /// Returns the current pipeline dynamic state tracking.
     DynamicState& GetDynamicState() {
         return dynamic_state;

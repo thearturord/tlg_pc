@@ -22,6 +22,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#ifdef TLG_PORT
+#include "tlg_toggles.h" // sigjmp_buf, tlg_setjmp, runtime_fault_recover
+#endif
 #include "core/guest_heap.h"
 #include "core/stream_probe.h"
 #include "core/stream_submit.h"
@@ -71,7 +74,24 @@ inline u64 Obj(u64 pointer) {
 /// Runs a record builder with a guard: the engine's objects are read without knowing which entries are valid, and a stale
 /// entry that looks like a pointer must not take the game down. A fault ends the build (no record, the packet path).
 using GuardedThunk = u64 (*)(void*);
-#ifdef _WIN32
+#if defined(TLG_PORT)
+// tlg-native: the port's exception handler does not give a fault inside its own module to a structured handler: it resumes the thread at the
+// recovery point of runtime_fault_recover (the same mechanism the port's draw preparation used for speculative guest memory reads).
+__declspec(noinline) u64 RunGuarded(GuardedThunk thunk, void* argument, bool* faulted) {
+    guard_active = true;
+    sigjmp_buf recovery;
+    volatile u64 result = 0;
+    if (tlg_setjmp(recovery) == 0) {
+        runtime_fault_recover = &recovery;
+        result = thunk(argument);
+        runtime_fault_recover = nullptr;
+    } else {
+        *faulted = true; // the handler cleared runtime_fault_recover
+    }
+    guard_active = false;
+    return result;
+}
+#elif defined(_WIN32)
 __declspec(noinline) u64 RunGuarded(GuardedThunk thunk, void* argument, bool* faulted) {
     guard_active = true;
     u64 result = 0;

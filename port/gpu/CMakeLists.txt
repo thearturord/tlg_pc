@@ -216,6 +216,7 @@ set_source_files_properties(shim/tlg_overlay.cpp PROPERTIES
 target_include_directories(tlggpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 target_compile_definitions(tlggpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(tlggpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers -fms-extensions)
+target_compile_definitions(tlggpu PRIVATE TLG_PORT=1) # tlg-native: code shared with the shadPS4 tree switches on this (fault recovery of the native guards)
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against tlg-probe.
 if (NOT WIN32)
     target_link_options(tlggpu PRIVATE -Wl,--allow-shlib-undefined)

@@ -1784,6 +1784,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             now - sp.stat_last_log_ns > 5'000'000'000ULL) {
             const u64 block_start = now;
             const auto plan_stats = rasterizer->TakePlanStats();
+            const auto memo_stats = rasterizer->TakeBeginMemoStats();
             if (sp.stat_last_log_ns != 0) {
                 Core::DebugServer::Publish(
                     "cp_split",
@@ -1794,6 +1795,8 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                      {"draws_no_register_change", sp.stat_draws_no_reg_change},
                      {"plan_draws_all_stages_same", plan_stats.draws_all_stages_same},
                      {"plan_draws", plan_stats.draws},
+                     {"render_state_memo_hits", memo_stats.first},
+                     {"render_state_memo_misses", memo_stats.second},
                      {"note", "counts per ~5 s interval"}});
                 LOG_INFO(Render,
                          "CP split: {} operations, {} draws/dispatches, {} waits for guest memory "
