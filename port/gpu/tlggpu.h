@@ -20,6 +20,9 @@ void tlggpu_register_kernel(void);
 int tlggpu_init(const TlgGpuConfig *config);
 /* Function for an imported NID ("NID#lib#mod"), or 0 when the GPU library does not provide it. */
 uintptr_t tlggpu_resolve(const char *scoped_nid);
+/* Installs the guest hooks of the native render path (hooks.json of the game in user/custom_configs, expect bytes checked) into the loaded eboot:
+ * image_base is the address of image offset 0. Call after the eboot is relocated and patched, before the game runs. */
+void tlggpu_install_hooks(uintptr_t image_base, uint64_t image_size);
 /* Called first by the loader's SIGSEGV handler: 1 when a GPU page-tracking fault was handled. */
 int tlggpu_handle_fault(void *ucontext, void *address);
 /* TLG_WRITE_LOG=1: prints the logged GPU-side writes to guest memory near the fault. */

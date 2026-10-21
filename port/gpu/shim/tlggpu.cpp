@@ -1,4 +1,8 @@
 #include "common/memory_patcher.h"
+#include "common/path_util.h"
+#include "core/debug_server.h"
+#include "core/guest_hooks.h"
+#include "core/emulator_settings.h"
 #include "tlg_write_log.h"
 // tlg: glue between the C loader and the vendored shadPS4 video core.
 #include "tlg_overlay.h"
@@ -234,6 +238,15 @@ extern "C" int tlggpu_init(const TlgGpuConfig* config) {
     if (config->user_dir) setenv("TLG_GPU_USER_DIR", config->user_dir, 0);
 #endif
     Core::Emulator::FillElfInfo(*config);
+    // tlg-native: the settings of the native render path come from the game's config and overlay files in user/custom_configs (our core's keys).
+    {
+        const auto dir = Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs);
+        EmulatorSettings.LoadOverlay((dir / (MemoryPatcher::g_game_serial + ".json")).string());
+        EmulatorSettings.LoadOverlay((dir / (MemoryPatcher::g_game_serial + ".readback.json")).string());
+        if (const u32 port = EmulatorSettings.GetDebugServerPort()) {
+            Core::DebugServer::Start(static_cast<u16>(port));
+        }
+    }
     const std::string title = config->title ? config->title : "God of War III";
     const s32 width = config->width, height = config->height;
     g_window_thread = std::thread([title, width, height] {
@@ -297,6 +310,9 @@ extern "C" int tlggpu_handle_fault(void* ucontext, void* address) {
     return handled;
 }
 
+extern "C" void tlggpu_install_hooks(uintptr_t image_base, uint64_t image_size) {
+    Core::GuestHooks::InstallForEboot(image_base, image_size);
+}
 extern "C" void tlggpu_set_wait_hooks(TlgGpuWaitBegin begin, TlgGpuWaitEnd end) {
     TlgFreeze::end_hook.store(end);
     TlgFreeze::begin_hook.store(begin);

@@ -55,6 +55,9 @@
     u32 m_cp_thread_priority = static_cast<u32>(Number("TLG_CP_THREAD_PRIORITY", static_cast<long>(0)));
     u32 GetCpThreadPriority() const { return m_cp_thread_priority; }
     void SetCpThreadPriority(u32 v, bool = false) { m_cp_thread_priority = v; }
+    u32 m_debug_server_port = static_cast<u32>(Number("TLG_DEBUG_SERVER_PORT", static_cast<long>(0)));
+    u32 GetDebugServerPort() const { return m_debug_server_port; }
+    void SetDebugServerPort(u32 v, bool = false) { m_debug_server_port = v; }
     u32 m_garlic_pool_pro = static_cast<u32>(Number("TLG_GARLIC_POOL_PRO", static_cast<long>(0)));
     u32 GetGarlicPoolPro() const { return m_garlic_pool_pro; }
     void SetGarlicPoolPro(u32 v, bool = false) { m_garlic_pool_pro = v; }
@@ -142,3 +145,5 @@
     u32 m_stage_lookup_reuse = static_cast<u32>(Number("TLG_STAGE_LOOKUP_REUSE", static_cast<long>(0)));
     u32 GetStageLookupReuse() const { return m_stage_lookup_reuse; }
     void SetStageLookupReuse(u32 v, bool = false) { m_stage_lookup_reuse = v; }
+    /// Reads the GPU group of a game config / overlay JSON file (the keys of our core/emulator_settings.h); keys that are not there keep their value.
+    void LoadOverlay(const std::string& path);
