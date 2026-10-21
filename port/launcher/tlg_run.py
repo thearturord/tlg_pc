@@ -85,9 +85,9 @@ DEFAULT_SETTINGS = {
     'mouse_sensitivity': 1.0,
     'mouse_invert_y': False,
     'key_map': {},                 # PS4 button -> 'Key|Mouse Left' (empty: the default)
-    'frame_rate': '30',            # 30 | 60 | unlocked (scripts/tlg_patches.py; TLG_FPS wins)
+    'frame_rate': '30',            # 30 | 60 | 120 | unlocked (scripts/tlg_patches.py; TLG_FPS wins)
 }
-FRAME_RATES = ['30', '60', 'unlocked']
+FRAME_RATES = ['30', '60', '120', 'unlocked']
 # The frame rate mode prepare() really applied (another eboot build stays at 30).
 applied_frame_rate = '30'
 
@@ -450,7 +450,9 @@ def build_env(settings, extra=None):
         env.setdefault('TLG_WINDOW_ICON', str(icon))
     # The present limiter never lets more frames through than the patched engine rate; unlocked
     # flips as soon as a frame is ready (480 Hz vblank) up to the display refresh or the menu limit.
-    env['TLG_ENGINE_FPS'] = {'30': '30', '60': '60'}.get(applied_frame_rate, '240')
+    env['TLG_ENGINE_FPS'] = {'30': '30', '60': '60', '120': '120'}.get(applied_frame_rate, '240')
+    if applied_frame_rate == '120':
+        env.setdefault('TLG_VBLANK_HZ', '120')  # a flip on every vblank: 120 Hz presents 120 frames (needs a display that takes 120 Hz, else its rate limits)
     if applied_frame_rate == 'unlocked':
         env.setdefault('TLG_VBLANK_HZ', '0')
     restart = f'"{sys.executable}" --play' if FROZEN else f'"{sys.executable}" "{Path(__file__).resolve()}"'

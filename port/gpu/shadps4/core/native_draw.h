@@ -231,6 +231,8 @@ bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed = false);
 /// below 2^40 and the guest memory backing, so the descriptor of such a constant buffer holds an address in a window of unused guest
 /// addresses; CopyFromArenaWindow answers reads of it.
 bool CopyFromArenaWindow(u64 address, u8* dest, u64 size);
+/// The range lies in that window (it is not a mapping of the runtime: no clamping to a mapping).
+bool IsArenaWindow(u64 address, u64 size);
 
 /// The record is a copy into a staging resource: the image it writes is returned to guest memory (explicit readback of an image).
 bool RecordReadsBack(u64 seq);

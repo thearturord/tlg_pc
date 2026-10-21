@@ -39,6 +39,7 @@ TEXT = {
     'frame_rate': ('Frame rate (experimental)', 'Taxa de quadros (experimental)'),
     'fps_30': ('30 FPS (as on PS4)', '30 FPS (como no PS4)'),
     'fps_60': ('60 FPS', '60 FPS'),
+    'fps_120': ('120 FPS (needs a 120 Hz display)', '120 FPS (precisa de monitor de 120 Hz)'),
     'fps_unlocked': ('Unlocked (up to the display)', 'Livre (até a taxa do monitor)'),
     'fps_hint': ('60/unlocked patch eboot 1.03 in memory; see docs/60fps.md',
                  '60/livre alteram o eboot 1.03 na memória; ver docs/60fps.md'),

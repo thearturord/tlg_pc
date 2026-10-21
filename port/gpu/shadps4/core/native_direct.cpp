@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <fmt/format.h>
+#include "core/guest_heap.h"
 #include "common/logging/log.h"
 #include "core/guest_hooks.h"
 #include "core/native_direct.h"
@@ -111,7 +112,7 @@ IndirectTarget IndirectOf(const u32* packet) {
 }
 
 bool Plausible(const IndirectTarget& target) {
-    return target.address >= 0x200000000ull && target.address < 0x1000000000ull && (target.address & 3) == 0 && target.dwords != 0 &&
+    return IsGuestAddress(target.address) && (target.address & 3) == 0 && target.dwords != 0 &&
            target.dwords <= (1u << 20);
 }
 

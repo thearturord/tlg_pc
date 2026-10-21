@@ -22,6 +22,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include "core/guest_heap.h"
 #include "core/stream_probe.h"
 #include "core/stream_submit.h"
 #include "common/logging/log.h"
@@ -60,7 +61,7 @@ inline T Rd(u64 base, u64 offset) {
 thread_local bool guard_active;
 thread_local bool bad_object_seen;
 inline u64 Obj(u64 pointer) {
-    if (pointer != 0 && !(pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0)) {
+    if (pointer != 0 && !(IsHeapPointer(pointer) && (pointer & 7) == 0)) {
         bad_object_seen = true;
         return 0;
     }
@@ -2130,7 +2131,7 @@ thread_local std::array<CounterInit, 8> asc_counter_inits;
 thread_local u32 asc_counter_init_count;
 
 u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
-    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     asc_fail = 0;
     asc_counter_init_count = 0;
     const u64 cs_obj = Rd<u64>(jcc, 0x1d10);
@@ -3257,6 +3258,11 @@ bool RecordReadsBack(u64 seq) {
     return slot.seq.load(std::memory_order_acquire) == seq && slot.readback;
 }
 
+bool IsArenaWindow(u64 address, u64 size) {
+    const u64 offset = address - ArenaWindowBase;
+    return table_arena && offset < TableArenaBytes && size <= TableArenaBytes - offset;
+}
+
 bool CopyFromArenaWindow(u64 address, u8* dest, u64 size) {
     const u64 offset = address - ArenaWindowBase;
     if (!table_arena || offset >= TableArenaBytes || size > TableArenaBytes - offset) {
@@ -3635,7 +3641,7 @@ void RunResourceTracking(u64 ctx) {
     const bool native = VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0;
     const auto track = GameTrackFunction();
     // engine objects live in the game's heap; anything else is a stale table entry (the game would fault on it too)
-    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     const auto run_stage = [&](u64 mask_lo, u64 mask_hi, u64 table, u32 stage) {
         for (u32 slot = 0; slot < 128; ++slot) {
             const u64 mask = slot < 64 ? mask_lo : mask_hi;
@@ -3671,7 +3677,7 @@ void RunComputeTracking(u64 ctx) {
     const VAddr base = image_base.load(std::memory_order_relaxed);
     const bool native = VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0;
     const auto track = GameTrackFunction();
-    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     const u64 cs = Rd<u64>(ctx, 0x4670);
     const auto track_view = [&](u64 view) {
         if (view != 0 && valid(view)) {
@@ -3696,7 +3702,7 @@ void RunComputeTracking(u64 ctx) {
 /// objects besides command packets: the last-use stamps of the shader, its samplers and views, and the append / consume
 /// counter range. The descriptor tables of the flush are rebuilt by the next flush that runs (nothing reads them here).
 void ComputeSideEffects(u64 ctx) {
-    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     const u64 cs = Rd<u64>(ctx, 0x4670);
     const u32 stamp = Rd<u32>(ctx, 0x47ac);
     Wr<u32>(cs, 0x2c, stamp);
@@ -3748,7 +3754,7 @@ u64 TargetPointers(u64 ctx) {
 /// block through its virtual function (+0x18), the depth view through FUN_024755f0.
 void RefreshTargets(u64 ctx) {
     const VAddr base = image_base.load(std::memory_order_relaxed);
-    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     if (Rd<u8>(ctx, 0x44c8) != 0) {
         const u32 count = Rd<u32>(ctx, Ctx::RenderTargetCount);
         for (u32 slot = 0; slot < count && slot < 7; ++slot) {
@@ -4263,7 +4269,7 @@ u64 TagCompute(u64 ctx, u64 x, u64 y, u64 z, u64 ret, bool exec_capable) {
 /// dispatch and compared with the game's packets.
 u64 PS4_SYSV_ABI TagDispatchIndirect(u64 ctx, u64 buffer, u64 offset, u64 a3, u64 a4, u64 a5, u64 ret) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || ctx == 0 || !valid(buffer) ||
         policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
         ((policy.native_draw_classes.load(std::memory_order_relaxed) >> Other) & 1) == 0 ||
@@ -4374,7 +4380,7 @@ u64 PS4_SYSV_ABI TagAscCsCopy(u64 jcc, u64 destination, u64 source, u64 bytes_ar
         ((policy.native_sdk_strip.load(std::memory_order_relaxed) >> 6) & 1) == 0) {
         return 0;
     }
-    const auto in_guest_memory = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull; };
+    const auto in_guest_memory = [](u64 pointer) { return IsHeapPointer(pointer); };
     if ((policy.native_sdk_strip.load(std::memory_order_relaxed) & 131072) != 0 && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 &&
         in_guest_memory(destination) && in_guest_memory(source) && (bytes & 3) == 0) {
         // the device's buffer copy is a copy of memory: the command processor copies it (two images of the same layout as images)
@@ -4417,7 +4423,7 @@ bool StripPackets(u64 begin, u64 end);
 /// record (kind 9).
 u64 PS4_SYSV_ABI TagAscCounterReadback(u64 jcc, u64 buffer, u64 view, u64 a3, u64 a4, u64 a5, u64 ret) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     if (jcc == 0 || !valid(buffer) || !valid(view) || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
         (policy.native_sdk_strip.load(std::memory_order_relaxed) & 512) == 0) {
         return 0;
@@ -4523,7 +4529,7 @@ u64 PublishAscMemoryCopy(u64 jcc, u64 destination, u64 source, u64 to, u64 from,
 
 u64 PS4_SYSV_ABI TagAscCopyResource(u64 jcc, u64 destination, u64 source, u64 a3, u64 a4, u64 a5, u64 ret) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     if (jcc == 0 || !valid(destination) || !valid(source) || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
         (policy.native_sdk_strip.load(std::memory_order_relaxed) & 1024) == 0) {
         return 0;
@@ -4731,7 +4737,7 @@ u64 PS4_SYSV_ABI TagAscBegin(u64 jcc, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u6
 /// compared with it); then the whole function is replaced by the tag.
 u64 PS4_SYSV_ABI TagCopyResource(u64 ctx, u64 destination, u64 destination_sub, u64 source, u64 source_sub, u64 a5, u64 ret) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
         ((policy.native_sdk_strip.load(std::memory_order_relaxed) >> 4) & 1) == 0 || ctx == 0 || !valid(destination) ||
         !valid(source) || destination == source) {
@@ -4837,7 +4843,7 @@ using GuestMap7 = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64);
 u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4, u64 size, u64 ret, u64 caller_rsp) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     const s32 mode = policy.map_native.load(std::memory_order_relaxed);
-    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     if (mode == 0 || ctx == 0 || !valid(resource) || subresource != 0 || (type != 2 && type != 3 && type != 4) ||
         policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
         policy.native_draw_exec.load(std::memory_order_relaxed) == 0 || Rd<u32>(resource, 0x124) != 3) {
@@ -4924,7 +4930,7 @@ u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4
 /// label fences in between. With execution: two copy records, the fields the function sets at its end, nothing else.
 u64 PS4_SYSV_ABI TagExCsDepthCopy(u64 ctx, u64 destination, u64 source, u64 a3, u64 a4, u64 a5, u64 ret) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
         policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
         ((policy.native_sdk_strip.load(std::memory_order_relaxed) >> 3) & 1) == 0 || ctx == 0 || !valid(destination) ||
@@ -5409,7 +5415,7 @@ u64 RunAndMeasure(EmitStat& stat, const char* hook_name, u64 dcb, u64 a0, u64 a1
 /// draws, dispatches and copies). With execution it is the native tracking; resources with a depth transition or a second
 /// resource keep the game's function (whose depth quads are stripped, see MeasureTargetEliminate).
 u64 PS4_SYSV_ABI TagTrackResource(u64 ctx, u64 resource, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    if (ctx == 0 || resource < 0x200000000ull || resource >= 0x400000000ull || (resource & 7) != 0 ||
+    if (ctx == 0 || !IsHeapPointer(resource) || (resource & 7) != 0 ||
         VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) == 0 ||
         (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 2) == 0) {
         return 0;
@@ -5586,7 +5592,7 @@ u64 PS4_SYSV_ABI MeasureClearQuad(u64 dcb, u64 target, u64 a2, u64 a3, u64 a4, u
     const u64 start = TakeClearPrelude(dcb, begin, &prelude_values);
     const u64 result = RunAndMeasure(emit_stats[2], "ClearQuad", dcb, dcb, target, a2, a3, a4, a5);
     const u64 end = Rd<u64>(dcb, 0x10);
-    if (result != 0 && Rd<u64>(dcb, 8) == end_marker && end > begin && target >= 0x200000000ull && target < 0x400000000ull &&
+    if (result != 0 && Rd<u64>(dcb, 8) == end_marker && end > begin && IsHeapPointer(target) &&
         (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 32) != 0 &&
         VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0 &&
         (ConvertClearQuad(target, start, begin, end, ret, prelude_values) ||
@@ -5614,7 +5620,7 @@ u64 PS4_SYSV_ABI MeasureCopyResource(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u6
     static std::mutex mutex;
     static std::map<std::tuple<u32, u32, u64>, u32> shapes; ///< dimension, format, caller -> calls
     static std::atomic<u64> last_report{0};
-    if (a1 >= 0x200000000ull && a1 < 0x400000000ull) {
+    if (IsHeapPointer(a1)) {
         std::lock_guard lock{mutex};
         const u32 dimension = Rd<u32>(a1, 0x124);
         ++shapes[{dimension, dimension == 2 ? Rd<u32>(a1, 0x18c) : (dimension == 3 || dimension == 4) ? Rd<u32>(a1, 0x190) : 0,
@@ -5921,7 +5927,7 @@ void PrepareBuffer(u64 begin, u64 end, u32 depth) {
             // an indirect buffer: the game's command buffer behind a ring window or a call (async queues, small state buffers)
             const u64 target = Rd<u32>(at, 4) | static_cast<u64>(Rd<u32>(at, 8) & 0xffff) << 32;
             const u64 dwords = Rd<u32>(at, 12) & 0xfffff;
-            if (target >= 0x200000000ull && target < 0x1000000000ull && (target & 3) == 0 && dwords != 0 && dwords <= (1u << 20)) {
+            if (IsGuestAddress(target) && (target & 3) == 0 && dwords != 0 && dwords <= (1u << 20)) {
                 PrepareBuffer(target, target + dwords * sizeof(u32), depth + 1);
             }
         } else if (opcode == 0x47 || opcode == 0x49 || opcode == 0x3c || opcode == 0x37) {

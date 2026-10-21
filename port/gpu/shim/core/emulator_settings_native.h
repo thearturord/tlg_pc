@@ -139,6 +139,9 @@
     bool m_readback_stream_reuse_enabled = Flag("TLG_READBACK_STREAM_REUSE_ENABLED", false);
     bool IsReadbackStreamReuseEnabled() const { return m_readback_stream_reuse_enabled; }
     void SetReadbackStreamReuseEnabled(bool v, bool = false) { m_readback_stream_reuse_enabled = v; }
+    u32 m_readbacks_mode = static_cast<u32>(Number("TLG_READBACKS_MODE", static_cast<long>(1)));
+    u32 GetReadbacksMode() const { return m_readbacks_mode; }
+    void SetReadbacksMode(u32 v, bool = false) { m_readbacks_mode = v; }
     bool m_rt_lookup_reuse_enabled = Flag("TLG_RT_LOOKUP_REUSE_ENABLED", false);
     bool IsRtLookupReuseEnabled() const { return m_rt_lookup_reuse_enabled; }
     void SetRtLookupReuseEnabled(bool v, bool = false) { m_rt_lookup_reuse_enabled = v; }

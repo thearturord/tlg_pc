@@ -60,6 +60,7 @@ void EmulatorSettingsImpl::LoadOverlay(const std::string& path) {
         if (auto it = j.find("readback_fence_wait_shortcut"); it != j.end() && !it->is_null()) m_readback_fence_wait_shortcut = it->get<u32>();
         if (auto it = j.find("readback_linear_images_async"); it != j.end() && !it->is_null()) m_readback_linear_images_async = it->get<bool>();
         if (auto it = j.find("readback_stream_reuse_enabled"); it != j.end() && !it->is_null()) m_readback_stream_reuse_enabled = it->get<bool>();
+        if (auto it = j.find("readbacks_mode"); it != j.end() && !it->is_null()) m_readbacks_mode = it->get<u32>();
         if (auto it = j.find("rt_lookup_reuse_enabled"); it != j.end() && !it->is_null()) m_rt_lookup_reuse_enabled = it->get<bool>();
         if (auto it = j.find("stage_lookup_reuse"); it != j.end() && !it->is_null()) m_stage_lookup_reuse = it->get<u32>();
     } catch (...) {

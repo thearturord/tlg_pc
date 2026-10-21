@@ -31,9 +31,7 @@ public:
     u32 GetInternalScreenWidth() { static const auto value = u32(Number("TLG_INTERNAL_WIDTH", 1920)); return value; }
     u32 GetInternalScreenHeight() { static const auto value = u32(Number("TLG_INTERNAL_HEIGHT", 1080)); return value; }
     std::string GetPresentMode() { const char* v = std::getenv("TLG_PRESENT_MODE"); return v ? v : "Mailbox"; }
-    // tlg: Relaxed by default: without readbacks FaceGen reads stale GPU-written vertices
-    // (vertex explosions); in the test scene it costs no measurable frame rate.
-    u32 GetReadbacksMode() { static const auto value = u32(Number("TLG_READBACKS", GpuReadbacksMode::Relaxed)); return value; }
+    // tlg: GetReadbacksMode (Relaxed by default: without readbacks FaceGen reads stale GPU-written vertices) is generated, see emulator_settings_native.h
     // tlg: TLG_VBLANK_HZ=0 (uncapped presets): vblank runs at 480 Hz so a finished frame is
     // shown within ~2 ms instead of waiting for the next display-rate vblank (below the display
     // rate frames alternated 10/20 ms at 100 Hz: judder), and GetFrameLimit() caps the rate at

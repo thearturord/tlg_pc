@@ -75,17 +75,26 @@ PATCHES = {
     ],
 }
 
+# 120: the same snap one octave up again, (0.0079167, 0.00875) -> 1/120 (3/360, exact in the 1/360 s rounding). Same three constants as dt_snap_60,
+# so 120 uses this entry instead of it.
+PATCHES['dt_snap_120'] = [
+    (0x24f17f8, f32(0.035), f32(0.00875), 'dt snap upper bound 0.035 -> 0.00875'),
+    (0x24f17fc, f32(1 / 30), f32(1 / 120), 'dt snap target 1/30 -> 1/120'),
+    (0x24f1800, f32(0.0316666663), f32(0.00791666672), 'dt snap lower bound 0.031667 -> 0.0079167'),
+]
+
 MODES = {
     '30': [],
     # max_fps_double/max_fps_off are left out: 60 and unlocked were reached without them
     # (game+0x180 is no frame limiter in the tested scenes; its reader is not found yet).
     # TLG_FPS_PATCHES=flip_rate_60,max_fps_off tries them.
     '60': ['flip_rate_60', 'dt_snap_60'],
+    '120': ['flip_rate_60', 'dt_snap_120'],
     'unlocked': ['flip_rate_60'],
 }
 # The engine rate each mode presents at most (TLG_ENGINE_FPS: the overlay's frame limiter and
 # tlg_graphics.h PresentLimit). Unlocked is paced by the present thread (TLG_VBLANK_HZ=0).
-ENGINE_FPS = {'30': 30, '60': 60, 'unlocked': 240}
+ENGINE_FPS = {'30': 30, '60': 60, '120': 120, 'unlocked': 240}
 
 
 def normalize_mode(value):

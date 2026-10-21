@@ -2,6 +2,8 @@
 #include "common/path_util.h"
 #include "core/debug_server.h"
 #include "core/guest_hooks.h"
+#include "core/guest_heap.h"
+#include "core/native_draw.h"
 #include "core/emulator_settings.h"
 #include "tlg_write_log.h"
 // tlg: glue between the C loader and the vendored shadPS4 video core.
@@ -113,6 +115,9 @@ void MemoryManager::InvalidateMemory(VAddr address, u64 size) {
     if (rasterizer) rasterizer->InvalidateMemory(address, size);
 }
 u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
+    if (Core::NativeDraw::IsArenaWindow(virtual_addr, size)) {
+        return size; // tlg-native: the table arena window is not a mapping of the runtime
+    }
     return runtime_memory_clamp(virtual_addr, size);
 }
 bool MemoryManager::IsValidMapping(VAddr virtual_addr, u64 size) {
@@ -137,6 +142,10 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
     }
 }
 void MemoryManager::CopySparseMemory(VAddr source, u8* dest, u64 size) {
+    // tlg-native: the private table arena of the native path appears at a fake guest address window (core/native_draw.cpp).
+    if (Core::NativeDraw::CopyFromArenaWindow(source, dest, size)) {
+        return;
+    }
     // tlg: large uploads (streaming) are split across the copy threads.
     constexpr u64 Chunk = 512 * 1024;
     if (size < 4 * Chunk || !TlgCopy::Enabled()) {
@@ -238,6 +247,8 @@ extern "C" int tlggpu_init(const TlgGpuConfig* config) {
     if (config->user_dir) setenv("TLG_GPU_USER_DIR", config->user_dir, 0);
 #endif
     Core::Emulator::FillElfInfo(*config);
+    // tlg-native: the runtime maps the game's memory from 64 GiB (the PS4 range of runtime_memory), not at 8 GiB as shadPS4 does.
+    Core::g_guest_heap = {0x1000000000ull, 0x10000000000ull, 0x1000000000ull, 0x10000000000ull};
     // tlg-native: the settings of the native render path come from the game's config and overlay files in user/custom_configs (our core's keys).
     {
         const auto dir = Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs);

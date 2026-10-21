@@ -11,6 +11,7 @@
 #include <fmt/format.h>
 #include <xxhash.h>
 
+#include "core/guest_heap.h"
 #include "common/logging/log.h"
 #include "core/memory.h"
 #include "core/stream_probe.h"
@@ -188,7 +189,7 @@ void AtRecord(u64 caller, const TableView* tables, u32 count) {
             const u32 stride = (v[1] >> 16) & 0x3fff;
             const u32 records = v[2];
             const u64 size = stride != 0 ? static_cast<u64>(stride) * records : records;
-            if (base < 0x200000000ull || base >= 0x4000000000ull || (base & 3) != 0 || size == 0 || records == 0) {
+            if (!IsGuestAddress(base) || (base & 3) != 0 || size == 0 || records == 0) {
                 continue;
             }
             if (size > 65536) {
