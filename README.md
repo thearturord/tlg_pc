@@ -26,6 +26,18 @@ Por **HayatoG** · YouTube [@hayatog-dev](https://www.youtube.com/@hayatog-dev) 
 
 <sub>Capturas na resolução nativa (1920×1080), direto da GPU, no Linux com uma RTX 2060.</sub>
 
+## Sobre este fork (thearturord)
+
+Este é um fork do port de HayatoG, branch `tlg-native-merge`, **experimental e só Windows** (testado no Windows 11 com uma RTX 4090). Ele troca a camada de GPU do port pelo nosso renderizador nativo, vindo de um fork do shadPS4 0.20, e adiciona recursos de desempenho. O que muda:
+
+- **Renderizador nativo:** o núcleo de vídeo do port foi mesclado com o do nosso fork. Os draws do jogo viram registros (hooks nos pontos de desenho do jogo), são planejados pelo processador de comandos e executados por uma thread de raster e uma thread de encoder, sem passar pela emulação dos registros da GPU do PS4 em cada draw. Ligado por padrão; auditorias internas comparam o resultado com o caminho antigo.
+- **Modo 120 FPS:** launcher → Taxa de quadros → 120, ou `TLG_FPS=120`. Ajusta o passo de tempo do jogo e o vblank para 120 Hz.
+- **Patch 4K:** o carregador de mods aceita o segmento RELRO, o que permite o patch de resolução 4K em `user/mods`.
+- **Contador de FPS ligado por padrão** (F10 liga e desliga) e **F11 alterna janela e tela cheia** (no modo da área de trabalho: o monitor mantém a resolução e o Alt+Tab funciona).
+- **Economias no pipeline de draw** (chaves por variável de ambiente): anel de constantes (`TLG_CONST_RING=0..4`, padrão do script de teste 4), memo de estado de render (`TLG_RENDER_STATE_MEMO=1`, opcional) e memo de conjuntos de texturas (`TLG_TEXTURE_SET_MEMO=1`). Os contadores aparecem em `/stats`.
+- **Captura de linha do tempo do quadro:** com o servidor de debug ligado, `http://127.0.0.1:7777/timeline_capture?seconds=10&tag=x` grava as esperas das threads do jogo, os trechos das threads de GPU, os tempos de GPU por passe e o uso de CPU por thread em `user/log/timeline_x.bin/.json`.
+- **Ainda não portado:** os upscalers temporais (FSR 3/4, TAA), a resolução de cena, os efeitos de pós-processamento e o movimento de objetos do port original estão **fora desta build** até serem religados um a um. Problemas conhecidos: falta de cabelo em um personagem e cintilação da sombra sobre a água em algumas execuções.
+
 ## Novidades
 
 - **60 FPS e FPS livre (experimental):** launcher → Vídeo → "Taxa de quadros (experimental)", ou `TLG_FPS=30|60|unlocked`. O padrão continua 30 FPS, como no PS4. Detalhes em [`docs/60fps.md`](docs/60fps.md) ([#5](https://github.com/HayatoG/tlg_pc/issues/5)).
@@ -151,6 +163,18 @@ Este projeto não tem vínculo com a Sony Interactive Entertainment, a SIE Japan
 By **HayatoG** · YouTube [@hayatog-dev](https://www.youtube.com/@hayatog-dev) · Discord [discord.gg/UMkdMYZh9g](https://discord.gg/UMkdMYZh9g)
 
 The screenshots and the performance chart are at the top of this page.
+
+## About this fork (thearturord)
+
+A fork of HayatoG's port, branch `tlg-native-merge`, **experimental and Windows only** (tested on Windows 11 with an RTX 4090). It replaces the port's GPU layer with our native renderer, which comes from a shadPS4 0.20 fork, and adds performance features. What changes:
+
+- **Native renderer:** the port's video core was merged with the one from our fork. The game's draws become records (hooks at the game's draw call sites), are planned by the command processor and run by a raster thread and an encoder thread, without emulating the PS4 GPU registers for every draw. On by default; internal audits compare the result with the old path.
+- **120 FPS mode:** launcher → Frame rate → 120, or `TLG_FPS=120`. Sets the game's time step and the vblank to 120 Hz.
+- **4K patch:** the mod loader accepts the RELRO segment, which allows the 4K resolution patch in `user/mods`.
+- **FPS counter on by default** (F10 toggles it) and **F11 switches between windowed and fullscreen** (desktop mode: the monitor keeps its resolution and Alt+Tab works).
+- **Draw pipeline savers** (environment switches): a constant ring (`TLG_CONST_RING=0..4`, 4 in the test start script), a render state memo (`TLG_RENDER_STATE_MEMO=1`, opt-in) and a texture set memo (`TLG_TEXTURE_SET_MEMO=1`). Counters show in `/stats`.
+- **Frame timeline capture:** with the debug server on, `http://127.0.0.1:7777/timeline_capture?seconds=10&tag=x` records the game threads' waits, the GPU stage thread spans, GPU time per pass and CPU use per thread into `user/log/timeline_x.bin/.json`.
+- **Not ported yet:** the original port's temporal upscalers (FSR 3/4, TAA), scene resolution, post effects and object motion are **left out of this build** until they are re-added one by one. Known issues: a character's missing hair and a flickering shadow over water in some runs.
 
 ## What's new
 
