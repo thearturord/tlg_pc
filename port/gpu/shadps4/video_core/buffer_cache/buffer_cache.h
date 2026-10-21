@@ -122,6 +122,10 @@ public:
     [[nodiscard]] bool IsRegionCpuModified(VAddr addr, size_t size);
 
     /// Return true when a region is modified from the GPU
+    /// The most a read-only buffer may be to be copied through the stream buffer (and the constant ring of the rasterizer).
+    [[nodiscard]] static constexpr u64 StreamThreshold() noexcept {
+        return STREAM_THRESHOLD;
+    }
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
     /// Synchronizes all buffers needed for DMA.

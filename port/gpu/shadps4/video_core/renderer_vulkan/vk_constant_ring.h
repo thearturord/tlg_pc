@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// tlg: small read-only guest buffers (constants) copied by the GPU command thread (stage A of
-// the draw pipeline, vk_draw_pipe.h) into this ring, so the draw recording thread only binds
-// them. Positions are monotonic byte counts; a region is reused once the submission that
-// recorded its last draw has completed on the GPU. Stage B stamps each packet it records with
-// the submission tick (Stamp), stage A retires stamps whose tick the GPU has passed.
+// tlg-native: small read-only guest buffers (constants) copied by the command processor thread (the front) into this ring while it plans a draw, so the raster
+// thread only binds them (documents/tlg/pc-port-draw-pipeline-architecture.md, T1; the idea is the port's constant ring of its draw pipeline).
+//
+// Positions are monotonic byte counts. A region is reused once the submission in which the raster thread recorded the last draw that reads it has completed on
+// the GPU: the raster thread stamps the end position of each draw with the submission tick (Stamp), the front retires the stamps whose tick the GPU has passed.
+// The front never waits for the ring: Allocate answers "no" when the ring is still in use, and the binding then stays on the raster thread.
 
 #pragma once
 
 #include <array>
 #include <atomic>
+#include <optional>
 
 #include "common/assert.h"
 #include "common/types.h"
@@ -22,8 +24,7 @@ public:
     static constexpr u64 Capacity = 32ull << 20;
 
     ConstantRing(const Instance& instance, Scheduler& scheduler_)
-        : scheduler{scheduler_},
-          buffer{instance, 0, Capacity, VideoCore::MemoryType::Stream, "tlg constant ring"} {
+        : scheduler{scheduler_}, buffer{instance, 0, Capacity, VideoCore::MemoryType::Stream, "constant ring"} {
         ASSERT(!buffer.mapped_data.empty());
     }
 
@@ -31,12 +32,11 @@ public:
         return buffer.Handle();
     }
 
-    /// Stage A: `size` bytes at `alignment`; returns the ring offset, or nullopt when the ring is
-    /// still in use by the GPU (the caller leaves the binding to stage B).
+    /// Front: `size` bytes at `alignment`; the ring offset, or nullopt when the region is still in use by the GPU.
     std::optional<u64> Allocate(u64 size, u64 alignment) {
         u64 at = (position + alignment - 1) & ~(alignment - 1);
         if (at % Capacity + size > Capacity) {
-            at += Capacity - at % Capacity; // wrap to the ring start
+            at += Capacity - at % Capacity; // wrap: a region never straddles the end
         }
         const auto in_use = [&] { return at + size > Capacity && at + size - Capacity > retired; };
         if (in_use()) {
@@ -53,18 +53,17 @@ public:
         return buffer.mapped_data.data() + offset;
     }
 
-    /// Stage A, after writing: makes the bytes visible to the GPU.
+    /// Front, after writing: makes the bytes visible to the GPU.
     void Flush(u64 offset, u64 size) {
         buffer.Flush(offset, size);
     }
 
-    /// Stage A: the position the next packet's allocations end at.
+    /// Front: the position the allocations of the plan being built end at.
     [[nodiscard]] u64 Position() const noexcept {
         return position;
     }
 
-    /// Stage B, after recording a packet whose allocations end at `end`. Stamps of one
-    /// submission tick are merged: only the last end per tick is published.
+    /// Raster thread, after recording a draw whose allocations end at `end`. The stamps of one submission tick are merged: only the last end per tick is published.
     void Stamp(u64 end) {
         if (end == pending_end) {
             return;
@@ -106,12 +105,12 @@ private:
     };
     Scheduler& scheduler;
     VideoCore::Buffer buffer;
-    u64 position = 0;     ///< stage A
-    u64 retired = 0;      ///< stage A: the GPU is done with everything before this
-    u64 pending_end = 0, pending_tick = 0, last_published = 0; ///< stage B
+    u64 position = 0; ///< front
+    u64 retired = 0;  ///< front: the GPU is done with everything before this
+    u64 pending_end = 0, pending_tick = 0, last_published = 0; ///< raster thread
     std::array<StampEntry, 1024> stamps{};
-    alignas(64) std::atomic<u64> stamps_head{0}; ///< stage B writes
-    alignas(64) std::atomic<u64> stamps_tail{0}; ///< stage A reads
+    alignas(64) std::atomic<u64> stamps_head{0}; ///< the raster thread writes
+    alignas(64) std::atomic<u64> stamps_tail{0}; ///< the front reads
 };
 
 } // namespace Vulkan

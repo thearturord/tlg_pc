@@ -20,6 +20,7 @@
 #include <string>
 #include "core/native_draw.h"
 #include "video_core/readback_stats.h"
+#include "video_core/renderer_vulkan/vk_constant_ring.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -93,6 +94,28 @@ public:
 
     /// Raster thread: hands a finished plan back for reuse. Allocating a plan for every draw on
     /// one thread and freeing it on another made them fight over the heap lock.
+    // ---- Constant ring (documents/tlg/pc-port-draw-pipeline-architecture.md, T1). Env TLG_CONST_RING, one level per piece of the work:
+    // 1 the front notes the buffers the queued draws and dispatches write (pending GPU writes), counters only; 2 the ring exists; 3 the front copies the
+    // small read-only buffers of a plan into the ring (the raster thread does not use them yet); 4 the raster thread binds them.
+    [[nodiscard]] u32 ConstRingLevel() const noexcept {
+        return const_ring_level;
+    }
+    /// Front (command processor thread) only: a plan about to be pushed as the operation at queue position `position`; `done` is the position the raster
+    /// thread has completed. Notes what the plan writes and, from level 3, copies its small read-only buffers into the ring.
+    void FrontQueueOp(DrawPlan* draw, DispatchPlan* dispatch, u64 position, u64 done);
+    /// Raster thread: the plan the next draw or dispatch runs from (for the ring bindings); Stamp after it was recorded.
+    void BeginRingUse(const DrawPlan* draw, const DispatchPlan* dispatch) noexcept {
+        ring_draw = draw;
+        ring_dispatch = dispatch;
+    }
+    void EndRingUse() noexcept;
+    struct RingStats {
+        u64 queued{}, written_buffers{}, offered{}, taken{}, bytes{};
+        u64 no_sharp{}, written{}, formatted{}, too_large{}, immutable{}, gpu_modified{}, pending_write{}, ring_full{};
+        u64 bound{};
+        u64 verified{}, differing{};
+    };
+    RingStats TakeRingStats() noexcept;
     void RecyclePlan(std::unique_ptr<DrawPlan>&& plan);
     void RecyclePlan(std::unique_ptr<DispatchPlan>&& plan);
 
@@ -213,6 +236,34 @@ private:
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     /// The render state of a draw that starts or changes a render pass (the work BeginRendering does when the memo below cannot answer).
     RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
+
+    u32 const_ring_level = 0;
+    std::unique_ptr<ConstantRing> constant_ring;
+    // Front thread only:
+    struct PendingWrite {
+        VAddr begin, end;
+        u64 position;
+    };
+    std::vector<PendingWrite> pending_gpu_writes;
+    VAddr pending_min = ~VAddr{0}, pending_max = 0;
+    u32 pending_checks = 0;
+    void NotePendingGpuWrite(VAddr address, u64 size, u64 position);
+    bool PendingGpuWriteOverlaps(VAddr address, u64 size, u64 done);
+    /// The buffers of one stage: notes the written ones (`position`), and from level 3 copies the small read-only ones into the ring.
+    void FrontStageNotes(StagePlan& stage, u64 position);
+    void FrontStageRing(StagePlan& stage, u64 done);
+    // Raster thread:
+    const DrawPlan* ring_draw = nullptr;
+    const DispatchPlan* ring_dispatch = nullptr;
+    const RingBinding* FindRingBinding(const Shader::Info& stage, u32 index) const noexcept;
+    /// TLG_CONST_RING_VERIFY=N: every Nth ring binding of the raster thread is compared with the guest memory it was copied from (a difference is the guest
+    /// writing it after the copy, or a stale copy; the counts tell how often).
+    u32 ring_verify_interval = 0;
+    u64 ring_verify_counter = 0;
+    std::atomic<u64> ring_verified{0}, ring_differing{0};
+    std::atomic<u64> ring_queued{0}, ring_written_buffers{0}, ring_offered{0}, ring_taken{0}, ring_bytes{0};
+    std::atomic<u64> ring_no_sharp{0}, ring_written{0}, ring_formatted{0}, ring_too_large{0}, ring_immutable{0}, ring_gpu_modified{0}, ring_pending_write{0},
+        ring_full{0}, ring_bound{0};
 
     /// Render state memo (the port's `RenderStateMemo`, tlg_pc docs/parallel_gpu.md): about 90 % of the draws continue the render pass the draw before
     /// them opened. Such a draw gets that draw's render state back instead of redoing the target lookups, the layout transitions and the attachment

@@ -92,7 +92,16 @@ struct PreparedImage {
     boost::container::small_vector<VideoCore::ImageViewInfo, 1> views;
 };
 
+/// A read-only buffer of a stage that the command processor thread copied into the constant ring (documents/tlg/pc-port-draw-pipeline-architecture.md, T1).
+struct RingBinding {
+    u32 index{};      ///< index in the stage's buffer list
+    u32 size{};
+    u64 offset{};     ///< offset in the ring buffer
+    VAddr address{};  ///< the guest address it was copied from (0 for the flattened user data)
+};
+
 struct StagePlan {
+    boost::container::small_vector<RingBinding, 8> ring; ///< T1: filled by the command processor thread, read by the raster thread
     Shader::Info* info{};
     boost::container::small_vector<PreparedImage, 8> images;
     bool images_prepared{};
@@ -112,6 +121,7 @@ struct DrawPlan {
     std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent{}; ///< the extent hints of the targets when the draw was recorded
     AmdGpu::CbDbExtent db_extent{};
     std::array<StagePlan, MaxShaderStages> stages{};
+    u64 ring_end{}; ///< T1: the constant ring position after this plan's copies
 };
 
 struct DispatchPlan {
@@ -119,6 +129,7 @@ struct DispatchPlan {
     AmdGpu::ComputeProgram cs{};       ///< The compute program of this dispatch: the rasterizer reads it from here.
     AmdGpu::BorderColorBuffer ta_bc_base{}; ///< The custom border colour table the dispatch's samplers use.
     StagePlan stage{};
+    u64 ring_end{}; ///< T1: the constant ring position after this plan's copies
 };
 
 class PipelineCache {

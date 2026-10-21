@@ -968,6 +968,11 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
             op.draw_plan->db_extent = last_db_extent;
         }
     }
+    if (rasterizer->ConstRingLevel() != 0) {
+        // The queue position this operation will have, and the position the raster thread has finished (documents/tlg/pc-port-draw-pipeline-architecture.md, T1).
+        rasterizer->FrontQueueOp(op.draw_plan.get(), op.dispatch_plan.get(), sp.pushed.load(std::memory_order_acquire) + 1,
+                                 sp.done.load(std::memory_order_acquire));
+    }
     RasterPush(std::move(op), false);
 }
 
@@ -1622,6 +1627,7 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
         }
     };
     const ComputeProgram& cs_program = dispatch_plan ? dispatch_plan->cs : GetCsRegs();
+    rasterizer->BeginRingUse(draw_plan, dispatch_plan);
     switch (c.kind) {
     case RasterCall::Kind::Draw:
         rasterizer->SetNativeTag(c.tag);
@@ -1681,6 +1687,7 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
         }
         break;
     }
+    rasterizer->EndRingUse();
     rasterizer->MaybeFlushRecorded();
 }
 
@@ -1785,6 +1792,17 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             const u64 block_start = now;
             const auto plan_stats = rasterizer->TakePlanStats();
             const auto memo_stats = rasterizer->TakeBeginMemoStats();
+            if (rasterizer->ConstRingLevel() != 0) {
+                const auto ring = rasterizer->TakeRingStats();
+                Core::DebugServer::Publish(
+                    "const_ring",
+                    {{"level", rasterizer->ConstRingLevel()}, {"queued_ops", ring.queued}, {"written_buffers_noted", ring.written_buffers}, {"offered", ring.offered},
+                     {"taken", ring.taken}, {"bytes", ring.bytes}, {"bound_by_raster", ring.bound}, {"verified", ring.verified}, {"differing", ring.differing},
+                     {"refused", {{"no_sharp", ring.no_sharp}, {"written", ring.written}, {"formatted", ring.formatted}, {"too_large", ring.too_large},
+                                  {"immutable", ring.immutable}, {"gpu_modified", ring.gpu_modified}, {"pending_write", ring.pending_write},
+                                  {"ring_full", ring.ring_full}}},
+                     {"note", "counts per ~5 s interval"}});
+            }
             if (sp.stat_last_log_ns != 0) {
                 Core::DebugServer::Publish(
                     "cp_split",
