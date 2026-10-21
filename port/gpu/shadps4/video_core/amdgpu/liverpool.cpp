@@ -1792,6 +1792,11 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             const u64 block_start = now;
             const auto plan_stats = rasterizer->TakePlanStats();
             const auto memo_stats = rasterizer->TakeBeginMemoStats();
+            if (rasterizer->TextureSetMemoOn()) {
+                const auto sets = rasterizer->TakeTextureSetStats();
+                Core::DebugServer::Publish("texture_set_memo", {{"hits", sets.hits}, {"recorded", sets.recorded}, {"miss_no_entry", sets.no_entry}, {"miss_generation", sets.generation},
+                                                              {"miss_image_check", sets.image_check}, {"not_eligible", sets.not_eligible}, {"note", "counts per ~5 s interval"}});
+            }
             if (rasterizer->ConstRingLevel() != 0) {
                 const auto ring = rasterizer->TakeRingStats();
                 Core::DebugServer::Publish(

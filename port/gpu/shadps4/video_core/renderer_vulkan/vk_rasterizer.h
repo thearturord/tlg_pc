@@ -135,6 +135,15 @@ public:
 
     [[nodiscard]] u64 CurrentTick() const noexcept;
 
+    struct TextureSetStats {
+        u64 hits{}, no_entry{}, generation{}, image_check{}, not_eligible{}, recorded{};
+    };
+    TextureSetStats TakeTextureSetStats() noexcept {
+        return std::exchange(texture_set_stats, TextureSetStats{});
+    }
+    [[nodiscard]] bool TextureSetMemoOn() const noexcept {
+        return texture_set_on;
+    }
     /// Render state memo hits and misses since the last call (raster thread).
     std::pair<u64, u64> TakeBeginMemoStats() noexcept {
         return {std::exchange(begin_memo_hits, 0), std::exchange(begin_memo_misses, 0)};
@@ -342,6 +351,35 @@ private:
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+    void BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+
+    /// Texture set memo (documents/tlg/pc-port-draw-pipeline-architecture.md, T3; the port's `TextureSetMemo`): the images a stage's T#s resolve to, remembered by
+    /// the raw T# and the use flags of each resource. A hit redoes only the per draw effects (touch, update, bound flags, layout transition, descriptor info).
+    /// Raster thread only. Env TLG_TEXTURE_SET_MEMO=1 turns it on.
+    struct TextureSetEntry {
+        AmdGpu::Image raw{};
+        u64 flags{};
+        VideoCore::ImageId found{}; ///< what FindImage returned
+        VideoCore::ImageId id{};    ///< after the depth redirect (null entry: an empty descriptor)
+        vk::ImageView view{};
+        const void* backing{};
+        VideoCore::SubresourceRange range{};
+        bool null_entry{};
+    };
+    struct TextureSet {
+        static constexpr u32 MaxImages = 16;
+        u64 key{};
+        u64 generation{~0ull};
+        u32 count{};
+        std::array<TextureSetEntry, MaxImages> entries{};
+    };
+    static constexpr u32 TextureSetSlots = 4096;
+    std::unique_ptr<TextureSet[]> texture_sets;
+    bool texture_set_on = false;
+    TextureSetStats texture_set_stats;
+    /// True when the stage's images were bound from the set (the descriptor writes are done).
+    bool BindTexturesFromSet(const Shader::Info& stage, TextureSet& set, const AmdGpu::Image* raws, const u64* flags, u32 count,
+                             Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline, const FixedState* fixed = nullptr);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);

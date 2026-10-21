@@ -80,6 +80,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         ring_verify_interval = static_cast<u32>(std::max(std::atoi(env), 0));
     }
     LOG_INFO(Render, "constant ring: level {}, verify every {}", const_ring_level, ring_verify_interval);
+    if (const char* env = std::getenv("TLG_TEXTURE_SET_MEMO"); env && env[0] == '1') {
+        texture_set_on = true;
+        texture_sets = std::make_unique<TextureSet[]>(TextureSetSlots);
+    }
+    LOG_INFO(Render, "texture set memo: {}", texture_set_on ? "on" : "off");
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
@@ -1692,10 +1697,130 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     }
 }
 
+namespace {
+u64 ImageUseFlags(const Shader::ImageResource& image_desc) {
+    return u64(image_desc.is_depth) | u64(image_desc.is_atomic) << 8 | u64(image_desc.is_array) << 16 | u64(image_desc.is_written) << 24 |
+           u64(image_desc.is_r128) << 32 | u64(image_desc.constant_mip_index) << 40 | u64(static_cast<u8>(image_desc.mip_fallback_mode)) << 48 |
+           u64(static_cast<u8>(image_desc.post_op)) << 56;
+}
+} // namespace
+
+bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set, const AmdGpu::Image* raws, const u64* flags, u32 count,
+                                     Shader::Backend::Bindings& binding) {
+    if (set.count != count) {
+        ++texture_set_stats.no_entry;
+        return false;
+    }
+    for (u32 i = 0; i < count; ++i) {
+        if (set.entries[i].flags != flags[i] || std::memcmp(&set.entries[i].raw, &raws[i], sizeof(AmdGpu::Image)) != 0) {
+            ++texture_set_stats.no_entry;
+            return false;
+        }
+    }
+    if (set.generation != texture_cache.ImageGeneration()) {
+        ++texture_set_stats.generation;
+        return false;
+    }
+    // Everything the slow path does to an image before it looks at the view: touch and refresh. Idempotent, so a miss after it costs nothing.
+    for (u32 i = 0; i < count; ++i) {
+        const auto& entry = set.entries[i];
+        if (entry.null_entry) {
+            continue;
+        }
+        texture_cache.TouchFoundImage(entry.found);
+        texture_cache.UpdateImage(entry.id);
+    }
+    for (u32 i = 0; i < count; ++i) {
+        const auto& entry = set.entries[i];
+        if (entry.null_entry) {
+            continue;
+        }
+        auto& image = texture_cache.GetImage(entry.id);
+        const bool redirected = entry.id != entry.found;
+        const auto associated = texture_cache.GetAssociatedDepth(texture_cache.GetImage(entry.found));
+        if (image.backing != entry.backing || image.binding.needs_rebind || image.binding.force_general || image.binding.is_target ||
+            (image.backing->num_samples > 1) != (image.info.num_samples > 1) || (redirected ? associated != entry.id : bool(associated))) {
+            ++texture_set_stats.image_check;
+            return false;
+        }
+    }
+    ++texture_set_stats.hits;
+    const u32 first_image_idx = image_infos.size();
+    for (u32 i = 0; i < count; ++i) {
+        const auto& entry = set.entries[i];
+        if (entry.null_entry) {
+            image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+            continue;
+        }
+        auto& image = texture_cache.GetImage(entry.id);
+        image.binding.is_bound = 1u;
+        bound_images.emplace_back(entry.id);
+        const auto new_layout = image.info.props.is_depth ? vk::ImageLayout::eDepthStencilReadOnlyOptimal : vk::ImageLayout::eShaderReadOnlyOptimal;
+        needs_barrier |= runtime.Transit(&image, new_layout, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead, entry.range);
+        image.usage.texture |= 1u;
+        image_infos.emplace_back(VK_NULL_HANDLE, entry.view, image.backing->state.layout);
+    }
+    for (u32 i = 0; i < count; ++i) {
+        auto& set_write = set_writes[set_write_index++];
+        set_write.dstSet = VK_NULL_HANDLE;
+        set_write.dstBinding = binding.unified++;
+        set_write.dstArrayElement = 0;
+        set_write.descriptorCount = 1;
+        set_write.descriptorType = vk::DescriptorType::eSampledImage;
+        set_write.pImageInfo = &image_infos[first_image_idx + i];
+    }
+    return true;
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
+
+    // Texture set memo: the set of resolved images for these T#s, when the stage qualifies (no written image, no mip fallback binding, at most 16 images).
+    TextureSet* set_slot = nullptr;
+    std::array<AmdGpu::Image, TextureSet::MaxImages> set_raws;
+    std::array<u64, TextureSet::MaxImages> set_flags{};
+    std::array<VideoCore::ImageId, TextureSet::MaxImages> set_found{};
+    bool set_record = false;
+    u64 set_generation = 0;
+    const u32 stage_images = static_cast<u32>(stage.images.size());
+    if (texture_set_on && stage_images != 0 && stage_images <= TextureSet::MaxImages) {
+        bool eligible = true;
+        for (const auto& image_desc : stage.images) {
+            eligible &= !image_desc.is_written && image_desc.mip_fallback_mode == Shader::MipStorageFallbackMode::None;
+        }
+        if (eligible) {
+            u64 key = 0x9E3779B97F4A7C15ull;
+            const auto flat = stage.FlatUserData();
+            for (u32 i = 0; i < stage_images; ++i) {
+                AmdGpu::Image raw{};
+                if (!stage.images[i].Fetch(flat.data(), &raw)) {
+                    raw = {};
+                }
+                set_raws[i] = raw;
+                set_flags[i] = ImageUseFlags(stage.images[i]);
+                std::array<u64, 5> words{};
+                std::memcpy(words.data(), &raw, sizeof(AmdGpu::Image));
+                words[4] = set_flags[i];
+                for (const u64 word : words) {
+                    key = (key ^ word) * 0xC2B2AE3D27D4EB4Full;
+                    key ^= key >> 29;
+                }
+            }
+            set_slot = &texture_sets[key % TextureSetSlots];
+            if (BindTexturesFromSet(stage, *set_slot, set_raws.data(), set_flags.data(), stage_images, binding)) {
+                BindSamplers(stage, binding);
+                return;
+            }
+            set_record = true;
+            set_slot->count = 0; // the entries are rewritten below: no hit on a half written set
+            set_slot->generation = ~0ull;
+            set_generation = texture_cache.ImageGeneration();
+        } else {
+            ++texture_set_stats.not_eligible;
+        }
+    }
 
     u32 num_images{};
     for (const auto& image_desc : stage.images) {
@@ -1717,6 +1842,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         static_cast<u32>(num_fmt));
             image_bindings[num_images++].image_id = {};
             image_descriptor_array_sizes.push_back(1);
+            set_record = false;
             continue;
         }
 
@@ -1771,6 +1897,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     cached.desc = desc;
                 }
             }
+            if (set_record) {
+                set_found[num_images - 1] = image_id;
+            }
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
@@ -1800,6 +1929,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 old_image.binding.needs_rebind) {
                 old_image.binding = {};
                 image_id = texture_cache.FindImage(desc);
+                set_record = false;
             }
 
             bound_images.emplace_back(image_id);
@@ -1842,6 +1972,19 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
                                      image.backing->state.layout);
+            if (set_record && i < TextureSet::MaxImages) {
+                if (binding.force_general || binding.is_target || is_storage) {
+                    set_record = false;
+                } else {
+                    auto& entry = set_slot->entries[i];
+                    entry.id = image_id;
+                    entry.found = set_found[i];
+                    entry.view = *image_view.image_view;
+                    entry.backing = image.backing;
+                    entry.range = desc.view_info.range;
+                    entry.null_entry = false;
+                }
+            }
         }
     }
 
@@ -1864,6 +2007,25 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         binding.unified += array_size;
     }
 
+    if (set_record && num_images == stage_images && set_generation == texture_cache.ImageGeneration()) {
+        // Complete the entries: null images and the raw T# and flags of every image (the others were written in the second pass).
+        for (u32 i = 0; i < num_images; ++i) {
+            auto& entry = set_slot->entries[i];
+            if (!image_bindings[i].image_id) {
+                entry = {};
+                entry.null_entry = true;
+            }
+            entry.raw = set_raws[i];
+            entry.flags = set_flags[i];
+        }
+        set_slot->count = num_images;
+        set_slot->generation = set_generation;
+        ++texture_set_stats.recorded;
+    }
+    BindSamplers(stage, binding);
+}
+
+void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
