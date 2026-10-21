@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <thread>
+#include "core/frame_timeline.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
@@ -88,6 +89,10 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     const auto recorder = CommandBuffer();
     recorder.beginRendering(rendering_info);
     recorder.record([this](vk::CommandBuffer) { replay_rendering = true; });
+    if (CaptureStamps()) {
+        pass_draws = 0;
+        RecordStamp(GpuStampPassBegin, 0);
+    }
 }
 
 void Scheduler::EndRendering() {
@@ -99,6 +104,35 @@ void Scheduler::EndRendering() {
         cmdbuf.endRendering();
         replay_rendering = false;
     });
+    if (CaptureStamps()) {
+        const u8 kind = render_state.num_color_attachments == 0 ? GpuStampPassEndDepthOnly
+                        : render_state.num_color_attachments >= 4 ? GpuStampPassEndGBuffer
+                                                                  : GpuStampPassEndColor;
+        RecordStamp(kind, (pass_draws & 0xffffff) | (u64(render_state.width) << 24) | (u64(render_state.height) << 44));
+    }
+}
+
+GpuTimeline* Scheduler::Timeline() {
+    std::call_once(gpu_timeline_once, [this] { gpu_timeline = std::make_unique<GpuTimeline>(instance); });
+    return gpu_timeline.get();
+}
+
+bool Scheduler::CaptureStamps() const noexcept {
+    return use_encoder && !direct_active && Core::FrameTimeline::capture_active.load(std::memory_order_relaxed);
+}
+
+void Scheduler::RecordStamp(u8 kind, u64 detail) {
+    auto* timeline = Timeline();
+    const u32 index = timeline->Allocate();
+    list_stamps.push_back({index, kind, detail});
+    const vk::QueryPool pool = timeline->Pool();
+    CommandBuffer().record([pool, index](vk::CommandBuffer cmdbuf) { cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, index); });
+}
+
+void Scheduler::StampDispatch(bool begin) {
+    if (CaptureStamps()) {
+        RecordStamp(begin ? GpuStampDispatchBegin : GpuStampDispatchEnd, 0);
+    }
 }
 
 vk::CommandBuffer Scheduler::UploadCommandBuffer() {
@@ -283,8 +317,13 @@ void Scheduler::HandOffToEncoder(SubmitInfo& info, u64 signal_value) {
         // Back-pressure: the ordering thread may run at most a few ticks ahead of the encoder.
         static const size_t max_queued =
             std::max<size_t>(1, EmulatorSettings.GetCpEncoderQueueDepth());
-        encoder_cv.wait(lk, [this] { return encoder_jobs.size() < max_queued; });
+        {
+            Core::FrameTimeline::StageScope handoff{Core::FrameTimeline::StageRasterHandoffWait, 0, 20'000};
+            encoder_cv.wait(lk, [this] { return encoder_jobs.size() < max_queued; });
+        }
         job.list = std::move(current_list_owner);
+        job.stamps = std::move(list_stamps);
+        list_stamps.clear();
         if (free_lists.empty()) {
             current_list_owner = std::make_unique<CommandList>();
         } else {
@@ -317,7 +356,10 @@ void Scheduler::EncoderThread(std::stop_token stoken) {
         EncoderJob job;
         {
             std::unique_lock lk{encoder_mutex};
-            encoder_cv.wait(lk, stoken, [this] { return !encoder_jobs.empty(); });
+            {
+                Core::FrameTimeline::StageScope idle{Core::FrameTimeline::StageEncoderIdle, 0, 20'000};
+                encoder_cv.wait(lk, stoken, [this] { return !encoder_jobs.empty(); });
+            }
             if (encoder_jobs.empty()) {
                 return; // Stop requested and nothing left to submit.
             }
@@ -331,14 +373,37 @@ void Scheduler::EncoderThread(std::stop_token stoken) {
             std::scoped_lock lk{command_pool_mutex};
             cmdbuf = command_pool.Commit();
         }
+        // Frame timeline capture: a stamp at the start and at the end of the command buffer, and the stamps of the list, read when the submission is done.
+        const bool stamped = !job.stamps.empty() || Core::FrameTimeline::capture_active.load(std::memory_order_relaxed);
+        u32 stamp_begin = 0, stamp_end = 0;
+        if (stamped) {
+            stamp_begin = Timeline()->Allocate();
+            stamp_end = Timeline()->Allocate();
+        }
         Check(cmdbuf.begin(begin_info));
-        job.list->Replay(cmdbuf);
+        if (stamped) {
+            cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, Timeline()->Pool(), stamp_begin);
+        }
+        {
+            Core::FrameTimeline::StageScope replay{Core::FrameTimeline::StageEncoderReplay, job.list->Size(), 0};
+            job.list->Replay(cmdbuf);
+        }
+        if (stamped) {
+            cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, Timeline()->Pool(), stamp_end);
+        }
         Check(cmdbuf.end());
         {
             // ImGui texture uploads submit to the queue too: done here, the ordering thread
             // never waits for the submit lock while this thread is in the driver.
+            Core::FrameTimeline::StageScope submit{Core::FrameTimeline::StageEncoderSubmit, job.signal_value, 0};
             std::scoped_lock lk{submit_mutex};
             SubmitCommandBuffers(std::span{&cmdbuf, 1}, job.info);
+        }
+        if (stamped) {
+            Timeline()->Submitted({job.signal_value, std::move(job.stamps), stamp_begin, stamp_end});
+        }
+        if (gpu_timeline) {
+            gpu_timeline->Collect(work_semaphore);
         }
         {
             std::unique_lock lk{encoder_mutex};

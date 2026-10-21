@@ -800,7 +800,10 @@ void Liverpool::RasterPush(RasterOp&& op, bool wait) {
         if (sp.queue.size() >= RasterSplit::MaxQueued) {
             sp.front_state.store(3, std::memory_order_relaxed);
         }
-        sp.done_cv.wait(lk, [&] { return sp.queue.size() < RasterSplit::MaxQueued; });
+        {
+            Core::FrameTimeline::StageScope queue_full{Core::FrameTimeline::StageFrontQueueFull};
+            sp.done_cv.wait(lk, [&] { return sp.queue.size() < RasterSplit::MaxQueued; });
+        }
         sp.front_state.store(0, std::memory_order_relaxed);
         sp.queue.push_back(std::move(op));
         target = sp.pushed.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -833,6 +836,7 @@ void Liverpool::DrainRasterWrites() {
     sp.front_state.store(2, std::memory_order_relaxed);
     const u64 wait_start = VideoCore::ReadbackStats::NowNs();
     {
+        Core::FrameTimeline::StageScope drain{Core::FrameTimeline::StageFrontDrain};
         std::unique_lock lk{sp.mutex};
         sp.done_cv.wait(lk,
                         [&] { return sp.pending_writes.load(std::memory_order_acquire) == 0; });
@@ -844,6 +848,7 @@ void Liverpool::DrainRasterWrites() {
 }
 
 void Liverpool::RasterDispatch(const RasterCall& call_in) {
+    Core::FrameTimeline::StageScope front_op{Core::FrameTimeline::StageFrontOp, call_in.kind >= RasterCall::Kind::DispatchDirect ? 2u : 1u, 0};
     if (!native_exec_scope && !overlay.list.empty() &&
         (call_in.kind == RasterCall::Kind::Draw || call_in.kind == RasterCall::Kind::DrawIndirect)) {
         OverlayRestore(); // LEGACY(packet-path): a draw of the packet path gets back the registers its packets built on
@@ -1721,6 +1726,10 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                                 [&] { return !sp.queue.empty() || num_commands != 0; });
             {
                 const u64 idle = VideoCore::ReadbackStats::NowNs() - idle_start;
+                if (idle >= 20'000 && Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
+                    Core::FrameTimeline::Record(Core::FrameTimeline::StageSpan, idle | (u64(Core::FrameTimeline::StageRasterIdle) << 56), Core::FrameTimeline::Now(),
+                                                sp.front_state.load(std::memory_order_relaxed));
+                }
                 sp.stat_raster_idle_ns.fetch_add(idle, std::memory_order_relaxed);
                 sp.raster_idle_ns_by_front_state[front_state_at_idle & 3].fetch_add(
                     idle, std::memory_order_relaxed);
@@ -1738,7 +1747,29 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             }
             sp.done_cv.notify_all(); // The queue has room again.
         }
+        // Capture: consecutive operations of one kind are one span (a run of draws, of dispatches, of closures), written when the kind changes.
+        u32 run_kind = 0;
+        u64 run_start = 0, run_count = 0;
+        const bool capturing = Core::FrameTimeline::capture_active.load(std::memory_order_relaxed);
+        const auto end_run = [&] {
+            if (run_kind != 0 && run_count != 0) {
+                const u64 now = Core::FrameTimeline::Now();
+                Core::FrameTimeline::Record(Core::FrameTimeline::StageSpan, (now - run_start) | (u64(Core::FrameTimeline::StageRasterOp) << 56), now,
+                                            run_kind | (run_count << 8));
+            }
+            run_kind = 0;
+            run_count = 0;
+        };
         for (auto& op : batch) {
+            if (capturing) {
+                const u32 kind = op.has_call ? (op.call.kind == RasterCall::Kind::Draw || op.call.kind == RasterCall::Kind::DrawIndirect ? 1u : 2u) : 3u;
+                if (kind != run_kind) {
+                    end_run();
+                    run_kind = kind;
+                    run_start = Core::FrameTimeline::Now();
+                }
+                ++run_count;
+            }
             // Callbacks sent by other threads (fault readbacks, fences) run between operations,
             // like they ran between packets before.
             if (num_commands != 0) {
@@ -1782,6 +1813,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             rasterizer->RecyclePlan(std::move(op.draw_plan));
             rasterizer->RecyclePlan(std::move(op.dispatch_plan));
         }
+        end_run();
         if (num_commands != 0) {
             ProcessCommands();
         }

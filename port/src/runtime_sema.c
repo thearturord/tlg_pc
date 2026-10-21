@@ -110,7 +110,9 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block,u
 }
 static ABI int32_t sem_wait(uint32_t id,int32_t need,uint32_t *timeout) { return wait_count(id,need,timeout,1,RUNTIME_GUEST_FRAME()); }
 static ABI int32_t sem_poll(uint32_t id,int32_t need) { return wait_count(id,need,NULL,0,0); }
+extern void tlggpu_timeline_signal(int kind,const void *object);
 static ABI int32_t sem_signal(uint32_t id,int32_t count) {
+    tlggpu_timeline_signal(7,(const void *)(uintptr_t)id);
     pthread_mutex_lock(&lock);
     Sema *s=find(id);
     int32_t result=0;

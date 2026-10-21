@@ -2,6 +2,7 @@
 #include "common/path_util.h"
 #include "core/debug_server.h"
 #include "core/guest_hooks.h"
+#include "core/frame_timeline.h"
 #include "core/guest_heap.h"
 #include "core/native_draw.h"
 #include "core/emulator_settings.h"
@@ -319,6 +320,41 @@ extern "C" int tlggpu_handle_fault(void* ucontext, void* address) {
     TlgFreeze::faults_in_progress.fetch_sub(1, std::memory_order_relaxed);
     TlgFreeze::faults_handled.fetch_add(handled, std::memory_order_relaxed);
     return handled;
+}
+
+// tlg-native: guest waits and signals of the runtime for the frame timeline capture (core/frame_timeline.*).
+namespace {
+thread_local u64 timeline_wait_start = 0;
+u32 TimelineWaitKind(const char* kind) {
+    if (!kind) return 6;
+    if (!std::strncmp(kind, "condition", 9)) return 1;
+    if (!std::strncmp(kind, "semaphore", 9)) return 2;
+    if (!std::strncmp(kind, "sleep", 5)) return 3;
+    if (!std::strncmp(kind, "event", 5)) return 4;
+    if (!std::strncmp(kind, "mutex", 5)) return 5;
+    return 6;
+}
+} // namespace
+extern "C" void tlggpu_timeline_wait_begin(void) {
+    timeline_wait_start = Core::FrameTimeline::capture_active.load(std::memory_order_relaxed) ? Core::FrameTimeline::Now() : 0;
+}
+extern "C" void tlggpu_timeline_wait_end(const char* kind, const void* object, const char* name) {
+    const u64 start = std::exchange(timeline_wait_start, 0);
+    if (start == 0 || !Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const u64 end = Core::FrameTimeline::Now();
+    if (end - start < 50'000) {
+        return;
+    }
+    const u64 id = reinterpret_cast<u64>(object);
+    Core::FrameTimeline::Record(Core::FrameTimeline::GameWait, (end - start) | (u64(TimelineWaitKind(kind)) << 56), end, id);
+    Core::FrameTimeline::CaptureNote(id, name && name[0] ? name : (kind ? kind : ""));
+}
+extern "C" void tlggpu_timeline_signal(int kind, const void* object) {
+    if (Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
+        Core::FrameTimeline::Signal(static_cast<u64>(kind), object);
+    }
 }
 
 extern "C" void tlggpu_install_hooks(uintptr_t image_base, uint64_t image_size) {

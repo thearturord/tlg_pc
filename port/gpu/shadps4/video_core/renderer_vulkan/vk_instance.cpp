@@ -354,8 +354,8 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- shaderSubgroupClock: {}",
                  shader_clock_features.shaderSubgroupClock);
     }
-    const bool calibrated_timestamps =
-        TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
+    const bool calibrated_timestamps = add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+    calibrated_timestamps_supported = calibrated_timestamps;
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {
@@ -597,7 +597,7 @@ bool Instance::CreateDevice() {
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
 
-    if (calibrated_timestamps) {
+    if (calibrated_timestamps && TRACY_GPU_ENABLED) {
         const auto [time_domains_result, time_domains] =
             physical_device.getCalibrateableTimeDomainsEXT();
         if (time_domains_result == vk::Result::eSuccess) {

@@ -218,14 +218,17 @@ static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t
     if (deadline_after(&end, usec)) return orbis_error(EINVAL);
     return cond_wait_until(cond, mutex, &end, frame);
 }
+extern void tlggpu_timeline_signal(int kind,const void *object);
 static ABI int32_t cond_signal(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
+    tlggpu_timeline_signal(5,*cond);
     ++wakeups; return orbis_error(pthread_cond_signal(&(*cond)->native));
 }
 static ABI int32_t cond_broadcast(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
+    tlggpu_timeline_signal(6,*cond);
     ++wakeups; return orbis_error(pthread_cond_broadcast(&(*cond)->native));
 }
 /* PS4 struct timespec is {int64 sec, int64 nsec}, identical to Linux x86-64. */

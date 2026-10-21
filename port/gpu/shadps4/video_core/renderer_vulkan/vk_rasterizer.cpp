@@ -916,6 +916,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
                     instance_offset);
     }
     DebugState.IncDrawCall();
+    scheduler.NoteDraw();
     ++recorded_work;
 
     ResetBindings(false);
@@ -1055,8 +1056,10 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
+    scheduler.StampDispatch(true);
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    scheduler.StampDispatch(false);
     DebugState.IncDispatch();
     ++recorded_work;
 

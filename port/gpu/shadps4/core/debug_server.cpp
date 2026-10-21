@@ -433,6 +433,17 @@ nlohmann::json Timeline(const Params& params) {
     return j;
 }
 
+nlohmann::json TimelineCapture(const Params& params) {
+    nlohmann::json j;
+    if (params.contains("seconds")) {
+        const u32 seconds = static_cast<u32>(std::clamp<u64>(ParseNumber(params, "seconds", 10), 1, 60));
+        const auto tag = params.contains("tag") ? params.at("tag") : std::string("capture");
+        j["started"] = FrameTimeline::StartCapture(seconds, tag);
+    }
+    j["status"] = nlohmann::json::parse(FrameTimeline::CaptureStatus());
+    return j;
+}
+
 nlohmann::json StreamProbeReport(const Params&) {
     return StreamProbe::Report();
 }
@@ -533,6 +544,7 @@ void RegisterBuiltins() {
     Register("/stream_probe", "(study) the shape of the submitted command buffers and what the game changes after the draw hook saw it", StreamProbeReport);
     Register("/timeline", "?n=8000: the latest frame events (study): hooks, submits, flips, command processor waits, presents", Timeline);
     Register("/frames", "?n=600: the last n frame intervals (time stamp and length in ms)", Frames);
+    Register("/timeline_capture", "?seconds=10&tag=name: records every frame timeline event for that long into log/timeline_<tag>.bin (+ .json); without arguments: the state", TimelineCapture);
     Register("/periodic", "last runs of periodic jobs (when they ended, how long they took)",
              Periodic);
     Register("/stats", "figures published by the subsystems (latest interval)", Stats);

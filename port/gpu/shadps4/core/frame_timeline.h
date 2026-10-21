@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <string>
 #include <thread>
 
 #include "common/types.h"
@@ -33,6 +34,26 @@ enum Type : u32 {
     EopParsed = 17,    ///< the command processor parsed an end of pipe event of the graphics queue (arg = label address)
     EopSignaled = 18,  ///< the end of pipe signal ran: arg = ns from the parse to the start on the raster thread, arg2 = ns from there to the signal
     GameSignal = 11,  ///< a guest thread signalled: arg = kind (5 condition variable signal, 6 broadcast, 7 semaphore post), arg2 = the object
+    // Capture only (documents/tlg/frame-timeline-capture-design.md): the types below are recorded while a capture runs.
+    StageSpan = 20,   ///< a span on a stage thread, written when it ends: arg = duration ns | stage << 56, arg2 = detail (see CaptureStage)
+    GpuCommandBuffer = 21, ///< a command buffer ran on the GPU: ts = end (CPU clock), arg = duration ns, arg2 = submission tick
+    GpuPass = 22,     ///< a render pass or dispatch ran on the GPU: ts = end (CPU clock), arg = duration ns | kind << 56, arg2 = draws | width << 24 | height << 44
+    ThreadCpu = 23,   ///< sampler (1 kHz): arg = CPU cycles the thread named in `thread` ran since the previous sample, taken at ts; cycles / cycles_per_ns (in the .json) = ns
+    GpuClockSync = 24, ///< calibration: arg = GPU timestamp ticks, ts = the CPU clock at the same moment, arg2 = timestamp period (ns * 1000)
+};
+
+/// The stages of StageSpan (arg >> 56).
+enum CaptureStage : u32 {
+    StageFrontOp = 1,      ///< front: one operation planned and pushed (arg2: 1 draw, 2 dispatch)
+    StageFrontQueueFull = 2, ///< front: waited for room in the raster queue
+    StageFrontDrain = 3,   ///< front: waited for queued memory writes (DrainRasterWrites)
+    StageRasterOp = 4,     ///< raster: one draw / dispatch / closure (arg2: 1 draw, 2 dispatch, 3 closure)
+    StageRasterIdle = 5,   ///< raster: waited for work
+    StageRasterPass = 6,   ///< raster: the draws of one render pass (arg2 = draw count)
+    StageEncoderReplay = 7, ///< encoder: replayed a command list into a command buffer
+    StageEncoderSubmit = 8, ///< encoder: queue submit
+    StageEncoderIdle = 9,  ///< encoder: waited for work
+    StageRasterHandoffWait = 10, ///< raster: waited for the encoder's queue to have room
 };
 
 struct Event {
@@ -53,6 +74,31 @@ inline std::array<Event, RingSize> ring{};
 inline std::atomic<u64> head{};
 inline std::atomic<u64> last_hook_ns{};
 inline std::atomic<bool> armed{};
+
+/// The capture buffer: while a capture runs every event is also appended here (a plain record, 32 bytes). Filled by any thread, read after the capture stops.
+struct CapEvent {
+    u64 ns;
+    u64 arg;
+    u64 arg2;
+    u32 type;
+    u32 thread;
+};
+inline std::atomic<bool> capture_active{};
+inline CapEvent* capture_events = nullptr;
+inline u64 capture_capacity = 0;
+inline std::atomic<u64> capture_count{};
+inline void CaptureAppend(Type type, u64 arg, u64 ns, u64 arg2, u32 thread) {
+    const u64 at = capture_count.fetch_add(1, std::memory_order_relaxed);
+    if (at < capture_capacity) {
+        capture_events[at] = {ns, arg, arg2, static_cast<u32>(type), thread};
+    }
+}
+/// Start a capture of `seconds` seconds into the file timeline_<tag>.bin (and .json) in the log directory. False if one is running.
+bool StartCapture(u32 seconds, const std::string& tag);
+/// A short JSON text: whether a capture runs, events so far, the last file written.
+std::string CaptureStatus();
+/// Names for the capture file: an object (a guest wait object, a stage) gets a text.
+void CaptureNote(u64 id, const char* text);
 
 inline u64 Now() {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -78,13 +124,17 @@ inline u32 ThreadId() {
 }
 
 inline void Record(Type type, u64 arg, u64 ns, u64 arg2 = 0) {
+    const u32 thread = ThreadId();
     auto& e = ring[head.fetch_add(1, std::memory_order_relaxed) & (RingSize - 1)];
     e.type.store(0, std::memory_order_relaxed);
     e.ns.store(ns, std::memory_order_relaxed);
     e.arg.store(arg, std::memory_order_relaxed);
     e.arg2.store(arg2, std::memory_order_relaxed);
-    e.thread.store(ThreadId(), std::memory_order_relaxed);
+    e.thread.store(thread, std::memory_order_relaxed);
     e.type.store(type, std::memory_order_release);
+    if (capture_active.load(std::memory_order_relaxed)) [[unlikely]] {
+        CaptureAppend(type, arg, ns, arg2, thread);
+    }
 }
 
 inline void Mark(Type type, u64 arg = 0) {
@@ -127,6 +177,25 @@ struct WaitSpan {
     }
     u64 kind;
     u64 object;
+    u64 start;
+};
+
+/// A span on a stage thread (capture only): written when it ends, only if it lasted `min_ns` or more. `detail` can be set until then.
+struct StageScope {
+    StageScope(CaptureStage stage_, u64 detail_ = 0, u64 min_ns_ = 5'000)
+        : active{capture_active.load(std::memory_order_relaxed)}, stage{stage_}, detail{detail_}, min_ns{min_ns_}, start{active ? Now() : 0} {}
+    ~StageScope() {
+        if (active) {
+            const u64 end = Now();
+            if (end - start >= min_ns) {
+                Record(StageSpan, (end - start) | (u64(stage) << 56), end, detail);
+            }
+        }
+    }
+    bool active;
+    CaptureStage stage;
+    u64 detail;
+    u64 min_ns;
     u64 start;
 };
 

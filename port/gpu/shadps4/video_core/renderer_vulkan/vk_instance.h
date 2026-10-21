@@ -168,6 +168,11 @@ public:
         return dynamic_state_3 && dynamic_state_3_features.extendedDynamicState3ColorWriteMask;
     }
 
+    /// Returns true when VK_EXT_calibrated_timestamps is enabled (the frame timeline capture maps GPU time to the CPU clock with it).
+    bool IsCalibratedTimestampsSupported() const {
+        return calibrated_timestamps_supported;
+    }
+
     /// Returns true when VK_EXT_vertex_input_dynamic_state is supported.
     bool IsVertexInputDynamicState() const {
         return vertex_input_dynamic_state;
@@ -527,6 +532,7 @@ private:
     bool dynamic_state_3{};
     bool depth_range_unrestricted{};
     bool vertex_input_dynamic_state{};
+    bool calibrated_timestamps_supported{};
     bool list_restart{};
     bool provoking_vertex{};
     bool shader_stencil_export{};

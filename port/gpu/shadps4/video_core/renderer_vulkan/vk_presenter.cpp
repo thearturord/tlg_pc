@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/debug_server.h"
+#include "core/frame_timeline.h"
 #include "core/guest_hooks.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
@@ -709,6 +710,7 @@ void Presenter::PresentLoadingFrame() {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    Core::FrameTimeline::Mark(Core::FrameTimeline::PresentStart, is_reusing_frame ? 1 : 0);
     if (!is_reusing_frame) {
         // tlg-native: the frame counter of the debug server (fps, frame time) and the frame tick of the guest hooks, as in our presenter
         Core::DebugServer::NotePresent();
@@ -880,6 +882,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
     }
 
+    Core::FrameTimeline::Mark(Core::FrameTimeline::PresentEnd, is_reusing_frame ? 1 : 0);
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();

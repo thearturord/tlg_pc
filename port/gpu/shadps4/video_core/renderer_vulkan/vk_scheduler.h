@@ -15,6 +15,7 @@
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
+#include "video_core/renderer_vulkan/vk_gpu_timeline.h"
 #include "video_core/renderer_vulkan/vk_command_recorder.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
@@ -398,6 +399,12 @@ public:
         this->on_submit = std::move(on_submit);
     }
 
+    /// Frame timeline capture: one draw was recorded into the open render pass; a compute dispatch is about to start (begin) or has been recorded (end).
+    void NoteDraw() noexcept {
+        ++pass_draws;
+    }
+    void StampDispatch(bool begin);
+
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
         return render_state;
@@ -534,6 +541,7 @@ private:
     // idle).
     struct EncoderJob {
         std::unique_ptr<CommandList> list;
+        std::vector<GpuStamp> stamps; ///< frame timeline capture: the GPU timestamps recorded into the list
         SubmitInfo info;
         u64 signal_value{};
     };
@@ -582,6 +590,14 @@ private:
     std::atomic<u64> max_priority_tick{};
     std::jthread priority_pending_ops_thread;
     std::jthread encoder_thread;
+    // Frame timeline capture (vk_gpu_timeline.h)
+    std::unique_ptr<GpuTimeline> gpu_timeline;
+    std::once_flag gpu_timeline_once;
+    std::vector<GpuStamp> list_stamps; ///< the raster thread's: stamps of the command list being recorded
+    u64 pass_draws = 0;
+    GpuTimeline* Timeline();
+    bool CaptureStamps() const noexcept;
+    void RecordStamp(u8 kind, u64 detail);
     RenderState render_state;
     bool is_rendering = false;
     /// True while the commands replayed so far leave a render pass open. Unlike is_rendering,
