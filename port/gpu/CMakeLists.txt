@@ -175,13 +175,19 @@ add_compile_definitions(TLG_SHADER_CACHE_KEY="${TLG_SHADER_KEY}")
 message(STATUS "Shader cache key: ${TLG_SHADER_KEY}")
 
 list(FILTER VIDEO_CORE EXCLUDE REGEX "renderdoc\\.cpp$")
+# tlg-native M1: the port features that sit on the draw pipeline and the old rasterizer are left out until they are re-added one by one
+# (documents/tlg/pc-port-plan.md section 10): temporal upscalers, scene resolution, post effects, object motion, frame capture, GPU profiler, draw prep, aliasing.
+list(FILTER VIDEO_CORE EXCLUDE REGEX "(vk_temporal_upscaler|vk_scene_resolution|vk_fsr4|fsr411|vk_object_motion|vk_camera_motion|vk_gpu_profiler|vk_draw_prep|aliasing)\\.cpp$")
 set(COMMON
     shadps4/common/decoder.cpp shadps4/common/error.cpp
     shadps4/common/io_file.cpp shadps4/common/native_clock.cpp shadps4/common/number_utils.cpp
     shadps4/common/path_util.cpp shadps4/common/rdtsc.cpp shadps4/common/spin_lock.cpp shadps4/common/recursive_lock.cpp
-    shadps4/common/string_util.cpp shadps4/common/thread.cpp shadps4/common/signal_context.cpp
+    shadps4/common/string_util.cpp shadps4/common/thread.cpp shadps4/common/signal_context.cpp shadps4/common/slot_vector.cpp
     shim/common/logging/log.cpp)
+find_package(absl REQUIRED) # tlg-native: our texture cache uses absl::flat_hash_map
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
+# tlg-native: our native render path (records, hooks, debug server, readbacks).
+file(GLOB NATIVE_CORE CONFIGURE_DEPENDS shadps4/core/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
 # Windows: a DLL cannot leave the runtime_* symbols for tlg-probe.exe to resolve, so the
@@ -191,7 +197,7 @@ if (WIN32)
 else()
     set(TLGGPU_KIND SHARED)
 endif()
-add_library(tlggpu ${TLGGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
+add_library(tlggpu ${TLGGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES} ${NATIVE_CORE}
     shadps4/core/libraries/gnmdriver/gnmdriver.cpp
     shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
     shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
@@ -209,20 +215,21 @@ set_source_files_properties(shim/tlg_overlay.cpp PROPERTIES
     OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf)
 target_include_directories(tlggpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 target_compile_definitions(tlggpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
-target_compile_options(tlggpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
+target_compile_options(tlggpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers -fms-extensions)
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against tlg-probe.
 if (NOT WIN32)
     target_link_options(tlggpu PRIVATE -Wl,--allow-shlib-undefined)
 endif()
 target_link_libraries(tlggpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
 target_link_libraries(tlggpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
-    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit absl::flat_hash_map absl::hash)
 # xbyak is header-only: the distribution's copy when there is one (Fedora xbyak-devel), else the
 # submodule (MSYS2 and Ubuntu do not package it).
 find_path(XBYAK_SYSTEM_INCLUDE xbyak/xbyak.h)
 if (NOT XBYAK_SYSTEM_INCLUDE)
     target_include_directories(tlggpu PRIVATE third_party/xbyak)
 endif()
+target_include_directories(tlggpu PRIVATE third_party/cpp-httplib) # tlg-native: the debug server
 if (WIN32)
     # Guest code is entered with the System V ABI; NOMINMAX/WIN32_LEAN_AND_MEAN keep
     # <windows.h> out of the way of std::min/max and the Vulkan/SDL headers.

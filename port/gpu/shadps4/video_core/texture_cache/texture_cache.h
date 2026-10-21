@@ -109,17 +109,6 @@ public:
                  PageManager& tracker);
     ~TextureCache();
 
-    /// tlg: changes whenever an image is registered or unregistered.
-    [[nodiscard]] u64 RegistryGeneration() const noexcept {
-        return registry_generation.load(std::memory_order_acquire);
-    }
-
-    /// tlg: FindImage's access tick for an image found by a memoized lookup. The LRU touch
-    /// FindImage also does happens in UpdateImage (FindTexture), which every binding reaches.
-    void MarkFound(ImageId image_id) {
-        slot_images[image_id].tick_accessed_last = scheduler.CurrentTick();
-    }
-
     TileManager& GetTileManager() noexcept {
         return tile_manager;
     }
@@ -135,9 +124,6 @@ public:
 
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
-    bool ResolveReadbacks(VAddr address, u64 size, bool assume_locks = true,
-                          ReadbackSource source = ReadbackSource::Unknown);
-    void CancelReadbacks(VAddr address, u64 size);
 
     /// While on, the storage images the dispatch writes are returned to guest memory (a record that copies into a staging resource).
     void SetExplicitDownload(bool on) noexcept {
@@ -167,18 +153,8 @@ public:
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
-    /// tlg: a FindView result remembered by the caller for the same image and view info.
-    struct ViewMemo {
-        ImageId image_id{};
-        const void* backing = nullptr;
-        ImageViewId view_id{};
-    };
-
     /// Retrieves an image view with the properties of the specified image id.
-    /// `refresh` false: an image found out of date is used as is (the texture binding helper
-    /// checked it beforehand; only a guest write racing with the draw can make it so).
-    [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc,
-                                         ViewMemo* memo = nullptr, bool refresh = true);
+    [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
 
     /// Retrieves the render target with specified properties
     [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
@@ -195,13 +171,7 @@ public:
         TouchImage(image);
         TrackImage(image_id);
         RefreshImage(image);
-        SynchronizeAlias(image_id);
     }
-
-    /// tlg: a GPU write to the image (render target, storage): images sharing its memory
-    /// copy from it before their next read. From cuesta4/shadPS4 (eltutz), which fixed God of
-    /// War III's exposure: it is measured into a small image and read through an alias.
-    void PublishAliasWrite(ImageId image_id);
 
     /// Resolves overlap between existing cache image and pending merged image
     [[nodiscard]] std::tuple<ImageId, int, int> ResolveOverlap(const ImageInfo& info,
@@ -220,17 +190,11 @@ public:
     void RefreshImage(Image& image);
 
     /// Retrieves the sampler that matches the provided S# descriptor.
-    /// extra_lod_bias: tlg, added to the S#'s bias (reduced scene rendering).
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
                                          AmdGpu::BorderColorBuffer border_color_base,
-                                         bool is_depth, float extra_lod_bias = 0.0f);
+                                         bool is_depth);
 
     /// Retrieves the image with the specified id.
-    Image* TryGetImage(ImageId id, u64 uid) {
-        if (!slot_images.is_allocated(id)) return nullptr;
-        auto& image = slot_images[id];
-        return !uid || image.image_uid == uid ? &image : nullptr;
-    }
     [[nodiscard]] Image& GetImage(ImageId id) {
         auto& image = slot_images[id];
         TouchImage(image);
@@ -475,8 +439,6 @@ private:
     absl::flat_hash_map<u64, SamplerId> samplers;
     absl::flat_hash_set<ImageId> download_images;
     u64 total_used_memory = 0;
-    u64 gc_evictions = 0, gc_downloads = 0; ///< tlg: pressure report
-    std::chrono::steady_clock::time_point gc_report_time{};
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;

@@ -50,9 +50,6 @@ struct UniqueImage {
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
           image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)} {}
     UniqueImage& operator=(UniqueImage&& other) {
-        if (this == &other) return *this;
-        Destroy();
-        device = other.device;
         image = std::exchange(other.image, VK_NULL_HANDLE);
         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
@@ -133,39 +130,10 @@ public:
     vk::ImageAspectFlags aspect_mask = vk::ImageAspectFlagBits::eColor;
     vk::SampleCountFlags supported_samples = vk::SampleCountFlagBits::e1;
     ImageFlagBits flags = ImageFlagBits::Dirty;
-    struct {
-        u32 is_bound : 1;
-        u32 is_target : 1;
-        u32 needs_rebind : 1;
-        u32 force_general : 1;
-    } binding{};
-    struct {
-        u32 texture : 1;
-        u32 storage : 1;
-        u32 render_target : 1;
-        u32 depth_target : 1;
-        u32 vo_surface : 1;
-    } usage{};
-    bool scene_proxy = false; ///< tlg: SceneTargets holds a reduced-size proxy of it
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
-    VAddr guest_begin = 0; ///< info.guest_address
-    VAddr guest_end = 0;   ///< info.guest_address + info.guest_size
-    BackingImage* backing{};
-    /// tlg: gc tick of the last LRU touch; skips the LRU list (a cache miss) when current.
-    mutable u64 lru_touched_tick = ~0ULL;
-    u64 tick_accessed_last{};
     ImageId depth_id{};
     u64 depth_uid{};
-    u64 image_uid{};
-    /// tlg: order of the last GPU write, to sync images sharing memory (texture_cache.h).
-    u64 alias_generation{};
-
-    ImageInfo info;
-    Vulkan::Runtime* runtime;
-    Common::SlotVector<ImageView>* slot_image_views;
-    vk::ImageAspectFlags aspect_mask = vk::ImageAspectFlagBits::eColor;
-    vk::SampleCountFlags supported_samples = vk::SampleCountFlagBits::e1;
 
     vk::ImageUsageFlags usage_flags;
     vk::FormatFeatureFlags2 format_features;
@@ -186,7 +154,23 @@ public:
     BackingImage* backing{};
     u64 image_uid{};
     u64 lru_id{};
+    u64 tick_accessed_last{};
     u64 hash{};
+
+    struct {
+        u32 texture : 1;
+        u32 storage : 1;
+        u32 render_target : 1;
+        u32 depth_target : 1;
+        u32 vo_surface : 1;
+    } usage{};
+
+    struct {
+        u32 is_bound : 1;
+        u32 is_target : 1;
+        u32 needs_rebind : 1;
+        u32 force_general : 1;
+    } binding{};
 
 private:
     static Common::IncrementalIdProvider<u64> global_image_uid;

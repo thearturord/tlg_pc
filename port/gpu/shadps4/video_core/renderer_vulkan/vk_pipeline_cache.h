@@ -46,8 +46,6 @@ namespace Vulkan {
 class Instance;
 class Scheduler;
 class ShaderCache;
-struct AsyncShaderCompilation;
-struct AsyncGraphicsCompilation;
 
 struct Program {
     struct Module {
@@ -67,17 +65,12 @@ struct Program {
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
         modules.emplace_back(module, std::move(spec));
-        LogPermutationGrowth();
     }
-    /// tlg: at 16, 32, 64... permutations, logs which key fields differ between the last two
-    /// (a field that changes every draw makes the list, and every lookup, grow without end).
-    void LogPermutationGrowth() const;
 
     void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
                       size_t perm_idx) {
         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
         modules[perm_idx] = {module, std::move(spec)};
-        LogPermutationGrowth();
     }
 };
 
@@ -128,81 +121,20 @@ struct DispatchPlan {
     StagePlan stage{};
 };
 
-} // namespace Vulkan
-
-namespace AmdGpu {
-union Regs;
-}
-
-namespace Vulkan {
-
-/// tlg: state of one graphics/compute pipeline selection. The GPU thread owns one
-/// (PipelineCache::sel); draw-preparation workers use their own with their register copies.
-struct PipelineSelection {
-    const AmdGpu::Regs* regs{};
-    std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
-    std::array<const Shader::Info*, MaxShaderStages> infos{};
-    std::array<vk::ShaderModule, MaxShaderStages> modules{};
-    std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
-    GraphicsPipelineKey graphics_key{};
-    bool motion = false;
-    bool compilation_pending = false;
-    DrawIndirectParams draw_indirect_params{};
-    struct PrepWorker* worker{}; ///< set: read-only selection for a draw-preparation worker
-};
-
-/// tlg: a draw-preparation worker's own program state (see vk_draw_prep.h).
-struct PrepWorker {
-    struct Stage {
-        const Program* program;
-        u64 hash;
-        Shader::HwStage hw_stage;
-        VAddr pgm_base;
-        const std::vector<u32>* flat;
-    };
-    // Node-based: stages keep pointers to these Infos while later stages are inserted.
-    std::unordered_map<const Program*, Shader::Info> infos;
-    boost::container::static_vector<Stage, MaxShaderStages> stages;
-    bool failed = false;
-};
-
-struct PreparedDraw;
-
 class PipelineCache {
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
                            AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
     ~PipelineCache();
 
-    /// Loads the pipelines of earlier sessions. tlg: called by the presenter once the window
-    /// can show a loading screen; `progress(done, total)` follows the pipelines read.
-    void WarmUp(const std::function<void(u32 done, u32 total)>& progress = {});
-    /// tlg: the same load on low-priority threads while the game runs; the GPU thread takes
-    /// the results a few at a time (PumpWarmUp). False when it cannot (zip archive store).
-    bool StartBackgroundWarmUp();
-    void StartOnDemand();
+    void WarmUp();
     void Sync();
-    void ReportCompilerStats();
 
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
-    const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {},
-                                                const PreparedDraw* prepared = nullptr);
-
-    /// tlg: worker side of draw preparation: selects the pipeline key for `sel.regs` without
-    /// creating anything. False when a program or permutation does not exist yet.
-    bool PrepareGraphicsPipeline(PipelineSelection& sel);
-
-    /// tlg: GPU-thread side: the pipeline for a prepared draw after checking that registers
-    /// and flattened user data match; null to take the regular path.
-    const GraphicsPipeline* TryPreparedPipeline(const PreparedDraw& prepared);
-
-    /// tlg: the prepared draw the last GetGraphicsPipeline used, or null (regular path).
-    [[nodiscard]] const PreparedDraw* UsedPrepared() const noexcept {
-        return used_prepared;
-    }
+    const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
 
     const ComputePipeline* GetComputePipeline();
 
@@ -258,8 +190,7 @@ private:
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
                                    Shader::Backend::Bindings& binding);
-    const Shader::RuntimeInfo& BuildRuntimeInfo(PipelineSelection& sel, Shader::HwStage stage,
-                                                Shader::SwStage l_stage);
+    const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;
@@ -287,11 +218,6 @@ private:
     /// cp_split_mode: the raster thread's copy of each program's Info.
     tsl::robin_map<const Shader::Info*, std::unique_ptr<Shader::Info>> raster_infos;
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
-    std::vector<Program*> pending_programs;
-    /// tlg: exclusive for program/permutation insertions, shared for worker lookups.
-    std::shared_mutex programs_mutex;
-    u64 prepared_hits = 0, prepared_misses = 0;
-    const PreparedDraw* used_prepared = nullptr;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     /// cp_stage_key: what a draw with a known record key resolves to (see GetGraphicsPipeline).

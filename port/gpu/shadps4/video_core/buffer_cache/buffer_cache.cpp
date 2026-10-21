@@ -88,32 +88,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       stream_reuse_enabled{EmulatorSettings.IsReadbackStreamReuseEnabled()},
       async_guest_faults{EmulatorSettings.IsReadbackAsyncGuestFaultsEnabled()},
       memory_semaphore{instance} {
-    // tlg: TLG_MAX_BUFFER_MB lowers the driver's buffer size limit as the arenas see it
-    // (diagnostics: reproduces AMD on Windows 2048, RADV 4095 on any GPU).
-    u64 max_buffer = instance.GetMaxBufferSize();
-    if (const char* forced = std::getenv("TLG_MAX_BUFFER_MB")) {
-        if (const u64 mb = std::strtoull(forced, nullptr, 10)) {
-            max_buffer = std::min<u64>(max_buffer, mb << 20);
-        }
-    }
-    // tlg: with a limit under two full pages (AMD on Windows 2 GiB, RADV ~4 GiB, Intel), pages
-    // are the smallest size and an arena joins as many as the limit allows: one inFAMOUS request
-    // of ~2.4 GiB (the cutscene before the graffiti) crossed three 1 GiB pages and stopped the
-    // game ("cannot span more than two VA arena pages", iss_pc #18).
-    if ((u64{2} << arena_page_bits) > max_buffer) {
-        arena_page_bits = MIN_ARENA_PAGE_BITS;
-    }
-    arena_page_size = u64{1} << arena_page_bits;
-    max_arena_pages = std::clamp<u64>(max_buffer >> arena_page_bits, 2, 16);
-    num_arena_pages = u64{1} << (ADDRESS_SPACE_BITS - arena_page_bits);
-    std::printf("GPU: buffer arenas of %llu MiB, up to %llu pages (driver buffer limit %llu MiB)\n",
-                static_cast<unsigned long long>(arena_page_size >> 20),
-                static_cast<unsigned long long>(max_arena_pages),
-                static_cast<unsigned long long>(max_buffer >> 20));
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
-        .size = arena_page_size,
+        .size = ARENA_PAGE_SIZE,
         .usage = ARENA_USAGE,
         .sharingMode = vk::SharingMode::eExclusive,
     };
@@ -126,17 +104,17 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     ASSERT_MSG(std::popcount(block_size) == 1, "Sparse block size {} is not a power of 2",
                block_size);
     block_shift = std::bit_width(block_size) - 1;
-    blocks_per_arena_page = arena_page_size / block_size;
-    blocks_per_arena_page_shift = arena_page_bits - block_shift;
+    blocks_per_arena_page = ARENA_PAGE_SIZE / block_size;
+    blocks_per_arena_page_shift = ARENA_PAGE_BITS - block_shift;
     arena_memory_type_index =
         FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
                        reqs.memoryTypeBits)
             .value();
 
     const u64 bda_pagetable_size =
-        (blocks_per_arena_page * num_arena_pages) * sizeof(vk::DeviceAddress);
+        (blocks_per_arena_page * NUM_ARENA_PAGES) * sizeof(vk::DeviceAddress);
     fault_manager = std::make_unique<FaultManager>(instance, scheduler, *this, block_shift,
-                                                   blocks_per_arena_page * num_arena_pages);
+                                                   blocks_per_arena_page * NUM_ARENA_PAGES);
     bda_pagetable_buffer = std::make_unique<Buffer>(
         instance, 0, bda_pagetable_size, MemoryType::DeviceLocal, "BDA Page Table Buffer");
     runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
@@ -540,88 +518,6 @@ void BufferCache::RecordDmaDownload(const Buffer* arena, VAddr dst, u32 size, bo
         scheduler.CurrentTick());
 }
 
-namespace {
-// tlg: TLG_BUFFER_STATS=1 — how buffer bindings reach the GPU, by guest region (256 MiB),
-// printed every 5 s: small read-only copies into the stream buffer, arena bindings, and the
-// bytes those re-upload after CPU writes. Input for engine-level short paths.
-struct BufferStats {
-    struct Region {
-        u64 stream_count{}, stream_bytes{}, arena_count{}, arena_bytes{}, upload_bytes{};
-    };
-    std::map<u64, Region> regions;
-    /// Hot window: frame of the last binding per 64 KiB block, and the distribution of the
-    /// frames between uses (1, 2, 3, 4, 5-8, 9-16, 17+): the ring's reuse distance.
-    std::unordered_map<u64, u64> last_use;
-    std::array<u64, 7> reuse{};
-    std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
-    u64 calls = 0;
-};
-/// 256 MiB regions; 1 MiB inside the hot 0x104xxxxxxx window (the engine's frame data).
-BufferStats& Stats();
-void NoteHotUse(VAddr address, u32 size) {
-    if ((address >> 28) != 0x104) {
-        return;
-    }
-    auto& st = Stats();
-    const u64 frame = TlgStats::gpu_frames.load(std::memory_order_relaxed);
-    for (u64 block = address >> 16; block <= (address + size - 1) >> 16; ++block) {
-        auto [it, inserted] = st.last_use.try_emplace(block, frame);
-        if (!inserted && it->second != frame) {
-            const u64 d = frame - it->second;
-            ++st.reuse[d <= 4 ? d - 1 : d <= 8 ? 4 : d <= 16 ? 5 : 6];
-            it->second = frame;
-        }
-    }
-}
-u64 RegionKey(VAddr address) {
-    return (address >> 28) == 0x104 ? (address >> 20) | (1ull << 40) : address >> 28;
-}
-bool BufferStatsEnabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("TLG_BUFFER_STATS");
-        return value && value[0] == '1';
-    }();
-    return enabled;
-}
-BufferStats& Stats() {
-    static BufferStats stats;
-    return stats;
-}
-void PrintBufferStats() {
-    auto& st = Stats();
-    if ((++st.calls & 4095) != 0) {
-        return;
-    }
-    const auto now = std::chrono::steady_clock::now();
-    const double seconds = std::chrono::duration<double>(now - st.window).count();
-    if (seconds < 5.0) {
-        return;
-    }
-    std::printf("Buffer stats (%.1f s, per second): region, stream copies/bytes, arena bindings, "
-                "re-uploaded bytes\n", seconds);
-    std::printf("  hot window reuse distance in frames (1,2,3,4,5-8,9-16,17+): %llu %llu %llu %llu "
-                "%llu %llu %llu\n",
-                (unsigned long long)st.reuse[0], (unsigned long long)st.reuse[1],
-                (unsigned long long)st.reuse[2], (unsigned long long)st.reuse[3],
-                (unsigned long long)st.reuse[4], (unsigned long long)st.reuse[5],
-                (unsigned long long)st.reuse[6]);
-    st.reuse = {};
-    for (const auto& [region, r] : st.regions) {
-        const u64 base = (region >> 40) ? (region & ((1ull << 40) - 1)) << 20 : region << 28;
-        if ((region >> 40) && r.stream_bytes + r.upload_bytes < 1e6 * seconds) {
-            continue; // quiet MiB of the hot window
-        }
-        std::printf("  %#012llx: %8.0f copies %8.2f MB, %8.0f arena %8.2f MB bound, %8.2f MB uploads\n",
-                    static_cast<unsigned long long>(base), r.stream_count / seconds,
-                    r.stream_bytes / seconds / 1e6, r.arena_count / seconds,
-                    r.arena_bytes / seconds / 1e6,
-                    r.upload_bytes / seconds / 1e6);
-    }
-    st.regions.clear();
-    st.window = now;
-}
-} // namespace
-
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
     // An immutable engine buffer (see NativeResources::ImmutableBuffer): after one synchronization of the whole buffer it is
@@ -745,7 +641,6 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForDownload(VAddr device_
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
-    texture_cache.ResolveReadbacks(device_addr, size, true, ReadbackSource::BufferForImage);
     if (IsRegionGpuModified(device_addr, size)) {
         last_image_source_gpu = true;
         return ObtainBuffer(device_addr, size, false);
@@ -753,27 +648,6 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     last_image_source_gpu = false;
     const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
                                               instance.StorageMinAlignment());
-    if (!TlgToggle::Disabled(TlgToggle::DeferredUploads)) {
-        // tlg: texture data is copied on the copy threads (streaming: 100+ MB per frame);
-        // the upload reads the staging only after submission, which waits for the copies.
-        constexpr u64 Chunk = 1_MB;
-        for (u64 offset = 0; offset < staging.size; offset += Chunk) {
-            const TlgCopy::Item item{
-                .run = &RunGuestCopy,
-                .context = this,
-                .source = device_addr + offset,
-                .destination = reinterpret_cast<u64>(staging.mapped + offset),
-                .size = std::min(Chunk, staging.size - offset),
-                .extra = reinterpret_cast<u64>(staging.buffer),
-            };
-            if (staging.size < Chunk) {
-                SmallGuestCopy(item);
-            } else {
-                TlgCopy::Async([item] { item.run(item); });
-            }
-        }
-        return {staging.buffer, staging.offset};
-    }
     memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
     staging.Flush();
     return {staging.buffer, staging.offset};
@@ -790,7 +664,7 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 void BufferCache::SynchronizeDmaBuffers() {
     fault_process_pending = true;
     for (const auto& range : resident_ranges) {
-        const u64 page = range.start >> (arena_page_bits - block_shift);
+        const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
         const VAddr device_addr = range.start << block_shift;
         const u64 size = (range.end - range.start) << block_shift;
         SynchronizeMemory(address_space[page], device_addr, size, false, false);
@@ -800,17 +674,20 @@ void BufferCache::SynchronizeDmaBuffers() {
 const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     const u64 first_page = first_block >> blocks_per_arena_page_shift;
     const u64 last_page = last_block >> blocks_per_arena_page_shift;
-    // Arenas cover contiguous runs of pages: when both ends are in the same one, so is the rest.
-    if (const Buffer* arena = address_space[first_page]; arena && arena == address_space[last_page]) {
-        return arena;
-    }
-    // tlg: the pages the new arena covers: the request plus every arena it touches (an arena may
-    // join several pages, up to the driver's buffer limit).
-    u64 lo = first_page, hi = last_page;
-    for (u64 page = first_page; page <= last_page; ++page) {
-        if (const Buffer* arena = address_space[page]) {
-            lo = std::min<u64>(lo, arena->cpu_addr >> arena_page_bits);
-            hi = std::max<u64>(hi, ((arena->cpu_addr + arena->size_bytes) >> arena_page_bits) - 1);
+    ASSERT_MSG(last_page - first_page <= 1,
+               "Buffer request cannot span more than two VA arena pages");
+
+    const auto* first_arena = address_space[first_page];
+    const auto* last_arena = address_space[last_page];
+    if (first_arena == last_arena) {
+        if (!first_arena) {
+            const u64 base_block = Common::AlignDownPow2<u64>(first_block, blocks_per_arena_page);
+            const u64 num_pages = last_page - first_page + 1;
+            const auto* new_arena =
+                &arenas.emplace_back(instance, base_block << block_shift,
+                                     num_pages << ARENA_PAGE_BITS, MemoryType::Sparse);
+            address_space[first_page] = new_arena;
+            address_space[last_page] = new_arena;
         }
         return address_space[first_page];
     }
@@ -837,31 +714,13 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
         });
     });
 
-    bool any_arena = false;
-    for (u64 page = lo; page <= hi; ++page) {
-        any_arena |= address_space[page] != nullptr;
+    u64 base_page = first_addr >> ARENA_PAGE_BITS;
+    for (u32 page = 0; page < (first_size >> ARENA_PAGE_BITS); ++page) {
+        address_space[base_page + page] = new_arena;
     }
-    const u64 base_addr = lo << arena_page_bits;
-    const u64 total_size = num_pages << arena_page_bits;
-    auto* new_arena = &arenas.emplace_back(instance, base_addr, total_size, MemoryType::Sparse);
-    if (any_arena) {
-        LOG_WARNING(Render, "Migrating arena ({} pages of {} MiB)", num_pages, arena_page_size >> 20);
-        const u64 base_block = base_addr >> block_shift;
-        const u64 end_block = (base_addr + total_size) >> block_shift;
-        auto* bind = BindsForArena(new_arena);
-        resident_ranges.ForEachInRange(base_block, end_block, [&](const Backing& backing) {
-            const u64 start = std::max(base_block, backing.start);
-            const u64 end = std::min(end_block, backing.end);
-            bind->binds.push_back(vk::SparseMemoryBind{
-                .resourceOffset = (start - base_block) << block_shift,
-                .size = (end - start) << block_shift,
-                .memory = backing.memory,
-                .memoryOffset = backing.offset + ((start - backing.start) << block_shift),
-            });
-        });
-    }
-    for (u64 page = lo; page <= hi; ++page) {
-        address_space[page] = new_arena;
+    base_page = last_page;
+    for (u32 page = 0; page < (last_size >> ARENA_PAGE_BITS); ++page) {
+        address_space[base_page + page] = new_arena;
     }
     range_epoch.fetch_add(1, std::memory_order_acq_rel); // answers that name the old arenas are stale
     return new_arena;
@@ -907,7 +766,6 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         remember();
         return;
     }
-    TlgStats::Timer timer{TlgStats::t_resident};
 
     const vk::MemoryAllocateFlagsInfo alloc_flags = {
         .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
@@ -1035,21 +893,10 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
                         magic_enum::enum_name(meta->type));
         }
     }
-    // tlg: most texel buffers alias no image; remember misses until images change.
-    const u64 generation = texture_cache.RegistryGeneration();
-    auto& miss = image_miss_cache[((device_addr >> 6) ^ size * 0x9E3779B1u) % image_miss_cache.size()];
-    if (miss.address == device_addr && miss.size == size && miss.generation == generation &&
-        !TlgToggle::Disabled(TlgToggle::TextureBindingMemo)) {
-        return false;
-    }
     const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);
     if (!image_id) {
-        miss = {device_addr, size, generation};
         return false;
     }
-    // tlg: the lookups above only read what the texture binding helper leaves alone; the
-    // copy below changes image state, so the helper finishes first.
-    runtime.BeforeImageAccess();
     Image& image = texture_cache.GetImage(image_id);
     ASSERT_MSG(device_addr == image.info.guest_address,
                "Texel buffer aliases image subresources {:x} : {:x}", device_addr,

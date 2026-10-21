@@ -12,21 +12,13 @@
 #include "video_core/thread_usage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "tlg_threads.h"
 
 namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
 
-Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
+Scheduler::Scheduler(const Instance& instance)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
-    // tlg: TLG_VK_RECORD_THREAD=0 records on the calling thread.
-    const char* env = std::getenv("TLG_VK_RECORD_THREAD");
-    if (threaded_recording && !(env && env[0] == '0')) {
-        record_chunk = AcquireChunk();
-        recorder_thread = std::jthread(std::bind_front(&Scheduler::RecorderThread, this));
-        recording_threaded = true;
-    }
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
@@ -36,12 +28,6 @@ Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
 }
 
 Scheduler::~Scheduler() {
-    if (recorder_thread.joinable()) {
-        SyncRecording();
-        recorder_thread.request_stop();
-        recorder_cv.notify_all();
-        recorder_thread.join();
-    }
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
@@ -105,11 +91,6 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
 }
 
 void Scheduler::EndRendering() {
-    // tlg: is_rendering belongs to the draw recording thread (stage B) while draw packets are in
-    // flight: drain first (owner hook), or a stale "not rendering" lets the next command (a
-    // stage A CopyBuffer) be recorded inside the render pass stage B opens meanwhile, which
-    // crashed the NVIDIA driver in the recorder thread (New Game intro at 30 and 60 FPS; GR2).
-    CheckOwner(__builtin_return_address(0));
     if (!is_rendering) {
         return;
     }
@@ -143,11 +124,9 @@ void Scheduler::Flush() {
     Flush(info);
 }
 
-void Scheduler::Finish(std::source_location caller) {
+void Scheduler::Finish() {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
-    const bool diagnose = WaitDiagnostics::Enabled();
-    const auto start = diagnose ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     SubmitInfo info{};
     SubmitExecution(info);
     Wait(presubmit_tick);
@@ -156,30 +135,13 @@ void Scheduler::Finish(std::source_location caller) {
     WaitPriorityOperations();
 }
 
-void Scheduler::WaitSubmitted(std::source_location caller) {
-    const u64 tick = CurrentTick();
-    if (tick > 1) {
-        Wait(tick - 1, caller);
-    }
-}
-
-void Scheduler::Wait(u64 tick, std::source_location caller, u64 submit_ns) {
-    const bool diagnose = WaitDiagnostics::Enabled();
-    auto start = diagnose ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+void Scheduler::Wait(u64 tick) {
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
         Flush(info);
     }
-    TlgStats::WaitTimer timer{TlgStats::tick_wait_ns};
-    const auto submitted = diagnose ? std::chrono::steady_clock::now() : start;
     work_semaphore.Wait(tick);
-    if (diagnose) {
-        const auto completed = std::chrono::steady_clock::now();
-        WaitDiagnostics::Get().Add(caller.file_name(), caller.line(),
-            submit_ns + std::chrono::duration_cast<std::chrono::nanoseconds>(submitted - start).count(),
-            std::chrono::duration_cast<std::chrono::nanoseconds>(completed - submitted).count());
-    }
 }
 
 void Scheduler::WaitPriorityOperations() {
@@ -204,26 +166,11 @@ void Scheduler::WaitPriorityOperations() {
 }
 
 void Scheduler::PopPendingOperations() {
-    if (num_pending_ops.load(std::memory_order_acquire) == 0) {
-        return; // every draw comes here
-    }
     std::unique_lock lk(pending_ops_mutex);
-    // tlg: this runs on every draw and dispatch. Querying the timeline semaphore is an
-    // ioctl, so it is skipped when nothing waits and done once per 32 calls (~0.3 ms; reading
-    // the clock per draw instead was itself a hot spot).
-    if (pending_ops.empty()) {
-        return;
-    }
-    if (!work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
-        if ((++pending_polls & 31) != 0 && !TlgToggle::Disabled(TlgToggle::PendingPollLimit)) {
-            return;
-        }
-        work_semaphore.Refresh();
-    }
+    work_semaphore.Refresh();
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
-        num_pending_ops.fetch_sub(1, std::memory_order_release);
     }
 }
 

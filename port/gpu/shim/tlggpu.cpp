@@ -1,3 +1,4 @@
+#include "common/memory_patcher.h"
 #include "tlg_write_log.h"
 // tlg: glue between the C loader and the vendored shadPS4 video core.
 #include "tlg_overlay.h"
@@ -83,6 +84,7 @@ public:
         auto& info = Common::ElfInfo::Instance();
         info.initialized = true;
         info.game_serial = config.serial ? config.serial : "UNKNOWN";
+        MemoryPatcher::g_game_serial = info.game_serial;
         info.title = config.title ? config.title : "";
         info.sdk_ver = config.sdk_version;
         info.psf_attributes.raw = config.psf_attributes;
@@ -108,6 +110,11 @@ void MemoryManager::InvalidateMemory(VAddr address, u64 size) {
 }
 u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
     return runtime_memory_clamp(virtual_addr, size);
+}
+bool MemoryManager::IsValidMapping(VAddr virtual_addr, u64 size) {
+    uintptr_t start = 0, end = 0;
+    int mapped = 0;
+    return runtime_memory_region(virtual_addr, &start, &end, &mapped) && mapped && virtual_addr >= start && virtual_addr + size <= end;
 }
 static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
     while (size) {

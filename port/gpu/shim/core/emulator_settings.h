@@ -21,6 +21,12 @@ public:
         const char* v = std::getenv(name);
         return v ? std::strtol(v, nullptr, 10) : fallback;
     }
+    static std::string EnvString(const char* name, const char* fallback) {
+        const char* v = std::getenv(name);
+        return v ? v : fallback;
+    }
+    // tlg-native: the settings of our native render path (generated from our core/emulator_settings.h by documents/tlg/tools/gen_shim_settings.py).
+#include "core/emulator_settings_native.h"
     s32 GetGpuId() { static const auto value = s32(Number("TLG_GPU_ID", -1)); return value; }
     u32 GetInternalScreenWidth() { static const auto value = u32(Number("TLG_INTERNAL_WIDTH", 1920)); return value; }
     u32 GetInternalScreenHeight() { static const auto value = u32(Number("TLG_INTERNAL_HEIGHT", 1080)); return value; }

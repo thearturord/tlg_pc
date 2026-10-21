@@ -57,10 +57,6 @@ public:
         return buffer_cache;
     }
 
-    [[nodiscard]] TemporalUpscaler& GetUpscaler() noexcept {
-        return *upscaler;
-    }
-
     [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
         return texture_cache;
     }
@@ -203,7 +199,7 @@ public:
     }
 
     std::thread::id GetGpuCommandProcessorThread();
-#if defined(__linux__) || defined(_WIN32)
+#ifdef __linux__
     u32 GetGpuCommandProcessorThreadId();
 #endif
 
@@ -301,17 +297,6 @@ private:
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;
     PipelineCache pipeline_cache;
-    std::unique_ptr<DrawPreparation> draw_prep;
-    std::unique_ptr<CameraMotion> camera_motion; // tlg: motion vectors (docs/upscaler.md)
-    std::unique_ptr<SceneTargets> scene_targets;
-    bool scene_started = false;
-    std::unique_ptr<ObjectMotion> object_motion;
-    bool motion_draw = false;
-    u64 motion_geometry{};    ///< vertex-stream identity of the current direct draw
-    bool gbuffer_draw = false;
-    std::unique_ptr<TemporalUpscaler> upscaler; // tlg: FSR (docs/upscaler.md)
-    std::array<float, 2> draw_jitter{};         ///< viewport offset of the current draw, pixels
-    std::array<float, 2> target_scale{1.0f, 1.0f}; ///< pass drawn into the upscaler's output-size images
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
     const bool readback_batching;
@@ -392,58 +377,6 @@ private:
 
     bool attachment_feedback_loop{};
     bool needs_barrier{};
-    // tlg: two-stage draw pipeline (stage B state; the thread is the last member so it
-    // stops first).
-    static inline thread_local const AmdGpu::Regs* stage_regs = nullptr;
-    static inline thread_local const AmdGpu::ComputeProgram* stage_cs = nullptr;
-    AmdGpu::Regs pipe_regs{};
-    bool pipe_synced = false;
-    std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> pipe_cb_extent{};
-    AmdGpu::CbDbExtent pipe_db_extent{};
-    /// Stage A: small read-only guest buffers copied into the constant ring for a packet.
-    struct RingBinding {
-        u32 index;  ///< buffer resource of the stage
-        u32 size;
-        u64 offset; ///< in the ring
-        VAddr address;
-    };
-    struct PendingWrite {
-        VAddr begin;
-        VAddr end;
-        u64 position;
-    };
-    std::vector<PendingWrite> pending_writes;
-    VAddr pending_min = ~VAddr{0}, pending_max = 0; ///< bounds of pending_writes
-    u32 pending_checks = 0;
-    u64 proxy_samples = 0; ///< texture bindings that read a scene proxy (statistics)
-    float sampler_lod_bias = 0.0f; ///< tlg: extra bias of this draw's samplers
-    bool scene_debug_frame = false; ///< TLG_SCENE_DEBUG: this frame's passes are printed
-    bool PendingWriteOverlaps(VAddr address, u64 size);
-    /// Stage B: the ring bindings of the stages of the packet being recorded.
-    struct RingStage {
-        const Shader::Info* info;
-        const RingBinding* bindings;
-        u32 count;
-    };
-    std::array<RingStage, Shader::MaxStageTypes> ring_stages{};
-    u32 num_ring_stages = 0;
-    const RingBinding* FindRingBinding(const Shader::Info& stage, u32 index) const {
-        for (u32 i = 0; i < num_ring_stages; ++i) {
-            if (ring_stages[i].info == &stage) {
-                for (u32 j = 0; j < ring_stages[i].count; ++j) {
-                    if (ring_stages[i].bindings[j].index == index) {
-                        return &ring_stages[i].bindings[j];
-                    }
-                }
-                return nullptr;
-            }
-        }
-        return nullptr;
-    }
-    std::unique_ptr<ConstantRing> constant_ring;
-    /// Submissions (prepared draws) kept alive until stage B reaches the position.
-    std::deque<std::pair<u64, std::shared_ptr<const void>>> pipe_keepalive;
-    std::unique_ptr<DrawPipe> draw_pipe;
 };
 
 } // namespace Vulkan

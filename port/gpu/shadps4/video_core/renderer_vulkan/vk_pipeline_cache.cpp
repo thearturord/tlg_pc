@@ -1,19 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <atomic>
-#include <chrono>
-#include <cstdlib>
-#include <cstdio>
-#include <cstring>
-#include <mutex>
 #include <ranges>
-#include <string>
-#include <unordered_set>
-#include "tlg_threads.h"
 
 #include "common/hash.h"
-#include "common/thread.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "core/debug_state.h"
@@ -24,15 +14,11 @@
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
-#include "tlg_settings.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/readback_policy.h"
 #include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
-#include "video_core/renderer_vulkan/vk_depth_stencil_state.h"
-#include "video_core/renderer_vulkan/motion_history.h"
-#include "video_core/renderer_vulkan/vk_draw_prep.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -127,7 +113,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
     case HwStage::Local: {
         BuildCommon(regs.ls_program);
         Shader::TessellationDataConstantBuffer tess_constants{};
-        const auto* hull_info = sel.infos[u32(SwStage::TessellationControl)];
+        const auto* hull_info = infos[u32(SwStage::TessellationControl)];
         hull_info->ReadTessConstantBuffer(tess_constants);
         info.hw.ls.ls_stride = tess_constants.ls_stride;
         break;
@@ -198,7 +184,6 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                 ? regs.aa_config.NumSamples()
                 : 1;
         info.hw.fs.z_export_format = regs.z_export_format;
-        info.hw.fs.motion_vectors = sel.motion;
         u8 stencil_ref_export_enable = regs.depth_shader_control.stencil_op_val_export_enable |
                                        regs.depth_shader_control.stencil_test_val_export_enable;
         info.hw.fs.mrtz_mask = regs.depth_shader_control.z_export_enable |
@@ -216,7 +201,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             };
         }
         for (u32 i = 0; i < Shader::MaxColorBuffers; i++) {
-            info.hw.fs.color_buffers[i] = sel.graphics_key.color_buffers[i];
+            info.hw.fs.color_buffers[i] = graphics_key.color_buffers[i];
         }
         // Lowered user clip planes ride the same emulation path as guest-exported distances, so
         // the fragment side arms whenever the hardware vertex stage lowers them, keeping its input
@@ -335,14 +320,6 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_shader_subgroup_clock = instance_.IsShaderSubgroupClockSupported(),
         .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
                                       instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
-        // tlg: older NVIDIA (Pascal) has no barycentrics; TLG_INTERP_INT_FIX=0/1 overrides.
-        .needs_integer_interpolation_fix = [&] {
-            if (const char* env = std::getenv("TLG_INTERP_INT_FIX")) {
-                return env[0] == '1';
-            }
-            return !instance.IsFragmentShaderBarycentricSupported() &&
-                   instance.GetDriverID() == vk::DriverId::eNvidiaProprietary;
-        }(),
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
                               instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
@@ -350,38 +327,15 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
+    WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
-    // tlg: the compiler threads always exist; the in-game menu switches async compilation live
-    // (TlgSettings::async_shaders, TLG_ASYNC_SHADERS at start).
-    {
-        const auto count = std::clamp(TlgThreads::Available() / 2, 1u, 6u);
-        const auto capture_count = std::min(2u, std::max(1u, TlgThreads::Available() / 4));
-        for (unsigned i = 0; i < count; ++i) {
-            auto [result, worker_cache] = instance.GetDevice().createPipelineCacheUnique({});
-            ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create compiler pipeline cache");
-            worker_pipeline_caches.push_back(std::move(worker_cache));
-        }
-        capture_compiler = std::make_unique<AsyncCompiler>(capture_count, 8, [](unsigned index) {
-            Common::SetCurrentThreadName(("tlg:ShaderCapture" + std::to_string(index)).c_str());
-            Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
-        });
-        compiler = std::make_unique<AsyncCompiler>(count, 64, [](unsigned index) {
-            Common::SetCurrentThreadName(("tlg:ShaderCompile" + std::to_string(index)).c_str());
-            Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
-        });
-        LOG_INFO(Render_Vulkan, "tlg: async graphics compilation ready ({} capture, {} compile workers)",
-                 capture_count, count);
-    }
 }
 
-PipelineCache::~PipelineCache() {
-    StopWarmUp();
-    FinishCompilations();
-}
+PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::PipelineLookup};
@@ -443,21 +397,20 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             VideoCore::ReadbackStats::CpTime::PipelineCompile};
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
-        CompileTimer timer;
 
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
-            sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false);
+            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
+            runtime_infos, fetch_shader, modules, sdata, false);
 
-        RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
+        RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
 
         if (EmulatorSettings.IsShaderCollect()) {
             for (auto stage = 0; stage < MaxShaderStages; ++stage) {
-                if (sel.infos[stage]) {
-                    auto& m = sel.modules[stage];
-                    module_related_pipelines[m].emplace_back(sel.graphics_key);
+                if (infos[stage]) {
+                    auto& m = modules[stage];
+                    module_related_pipelines[m].emplace_back(graphics_key);
                 }
             }
         }
@@ -505,17 +458,16 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             VideoCore::ReadbackStats::CpTime::PipelineCompile};
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
-        CompileTimer timer;
 
         ComputePipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                                                       *pipeline_cache, compute_key, *sel.infos[0],
-                                                       sel.modules[0], sdata, false);
+                                                       *pipeline_cache, compute_key, *infos[0],
+                                                       modules[0], sdata, false);
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 
         if (EmulatorSettings.IsShaderCollect()) {
-            auto& m = sel.modules[0];
+            auto& m = modules[0];
             module_related_pipelines[m].emplace_back(compute_key);
         }
     }
@@ -710,14 +662,11 @@ bool PipelineCache::RefreshGraphicsKey() {
     const auto& fixed = *lookup_fixed;
     auto& key = graphics_key;
 
-    // tlg: a depth/stencil buffer that cannot affect the draw is not attached: on the PC a
-    // smaller one would crop a full-screen pass (eltutz, vk_depth_stencil_state.h).
-    const bool db_enabled = GetEffectiveDepthStencilState(regs).needs_attachment;
+    const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
 
-    key.z_format = db_enabled && regs.depth_buffer.DepthValid()
-                       ? regs.depth_buffer.z_info.format
-                       : AmdGpu::DepthBuffer::ZFormat::Invalid;
-    key.stencil_format = db_enabled && regs.depth_buffer.StencilValid()
+    key.z_format = regs.depth_buffer.DepthValid() ? regs.depth_buffer.z_info.format
+                                                  : AmdGpu::DepthBuffer::ZFormat::Invalid;
+    key.stencil_format = regs.depth_buffer.StencilValid()
                              ? regs.depth_buffer.stencil_info.format
                              : AmdGpu::DepthBuffer::StencilFormat::Invalid;
     key.depth_clamp_enable = fixed.depth_clamp;
@@ -735,22 +684,6 @@ bool PipelineCache::RefreshGraphicsKey() {
     key.alpha_not_exported = fixed.alpha_not_exported;
 
     const bool skip_cb_binding = !fixed.color_enabled;
-
-    // Only potentially animated G-buffer draws may use the extra motion attachment. The
-    // ordinary stage variant is needed first to inspect the vertex shader's resources.
-    bool motion_possible = false;
-    {
-        u32 bound = 0;
-        for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS && !skip_cb_binding; ++cb) {
-            bound += (regs.color_buffers[cb] && regs.color_target_mask.GetMask(cb)) ? 1 : 0;
-        }
-        motion_possible = Shader::MotionVectors::positions_address != 0 && bound >= 5 &&
-                          !regs.color_buffers[Shader::MotionVectors::Output] &&
-                          regs.depth_buffer.DepthValid() &&
-                          regs.depth_buffer.NumSamples() == 1 && !regs.IsClipDisabled() &&
-                          regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs;
-    }
-    sel.motion = false;
 
     // First pass to fill render target information needed by shader recompiler
     for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS && !skip_cb_binding; ++cb) {
@@ -784,56 +717,6 @@ bool PipelineCache::RefreshGraphicsKey() {
     if (!stages_ok) {
         return false;
     }
-    if (motion_possible) {
-        const auto* vs = sel.infos[static_cast<u32>(Shader::SwStage::Vertex)];
-        if (vs) {
-            // Shaders with a bone palette (motion_history.h). Small skeletons (weapons,
-            // props) also include static world pieces: the rasterizer gives those
-            // history only while their constants change.
-            for (const auto& resource : vs->buffers) {
-                if (resource.IsSpecial()) continue;
-                const auto buffer = resource.GetSharp(*vs);
-                if (buffer.Valid() && buffer.GetStride() == 16 &&
-                    Motion::ClassifyBuffer(buffer.GetSize()) != Motion::BufferRole::Other) {
-                    sel.motion = true;
-                    break;
-                }
-            }
-        }
-        // TLG_MOTION_SELECT_LOG=1: each G-buffer vertex shader once, with its buffer sizes
-        // and the selection, to find animated models that the size rule leaves out.
-        static const bool select_log = [] {
-            const char* value = std::getenv("TLG_MOTION_SELECT_LOG");
-            return value && value[0] == '1';
-        }();
-        if (select_log && vs) {
-            std::string sizes;
-            for (const auto& resource : vs->buffers) {
-                if (resource.IsSpecial()) continue;
-                const auto buffer = resource.GetSharp(*vs);
-                sizes += fmt::format(" {}/{}", buffer.GetSize(), buffer.GetStride());
-            }
-            static std::mutex log_mutex;
-            static std::unordered_set<u64> logged;
-            std::scoped_lock lock{log_mutex};
-            if (logged.insert(vs->pgm_hash ^ std::hash<std::string>{}(sizes)).second) {
-                std::printf("Motion select: vs %016llx %s, buffers (size/stride):%s\n",
-                            static_cast<unsigned long long>(vs->pgm_hash),
-                            sel.motion ? "ON " : "off", sizes.c_str());
-            }
-        }
-        // Keep the old broad path available for visual A/B tests.
-        static const bool all_motion = [] {
-            const char* value = std::getenv("TLG_OBJECT_MOTION_ALL");
-            return value && value[0] == '1';
-        }();
-        if (all_motion) {
-            sel.motion = true;
-        }
-        if (sel.motion && !RefreshGraphicsStages(sel)) {
-            return false;
-        }
-    }
 
     // Second pass to mask out render targets not written by shader and fill remaining info
     u8 color_samples = 0;
@@ -865,20 +748,6 @@ bool PipelineCache::RefreshGraphicsKey() {
         key.num_samples = std::max(key.num_samples, color_samples);
     }
 
-    if (sel.motion) {
-        constexpr u32 mv = Shader::MotionVectors::Output;
-        key.motion_vectors = 1;
-        key.mrt_mask |= 1u << mv;
-        key.num_color_attachments = mv + 1;
-        auto& color_buffer = key.color_buffers[mv];
-        color_buffer.data_format = AmdGpu::DataFormat::Format32_32_32_32;
-        color_buffer.num_format = AmdGpu::NumberFormat::Float;
-        color_buffer.swizzle = AmdGpu::IdentityMapping;
-        key.write_masks[mv] = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-                              vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
-        key.color_samples[mv] = 1;
-    }
-
     // Force all color samples to match depth samples to avoid unsupported MSAA configuration
     if (color_samples != 0) {
         const bool depth_mismatch = db_enabled && color_samples != key.depth_samples;
@@ -903,14 +772,14 @@ bool PipelineCache::RefreshGraphicsStages() {
         const auto stage_out_idx = static_cast<u32>(stage_out);
         if (!regs.stage_enable.IsStageEnabled(stage_in_idx)) {
             key.stage_hashes[stage_out_idx] = 0;
-            sel.infos[stage_out_idx] = nullptr;
+            infos[stage_out_idx] = nullptr;
             return false;
         }
 
         const auto* pgm = regs.ProgramForStage(stage_in_idx);
         if (!pgm || !pgm->Address<u32*>()) {
             key.stage_hashes[stage_out_idx] = 0;
-            sel.infos[stage_out_idx] = nullptr;
+            infos[stage_out_idx] = nullptr;
             return false;
         }
 
@@ -922,15 +791,12 @@ bool PipelineCache::RefreshGraphicsStages() {
         return true;
     };
 
-    sel.infos.fill(nullptr);
-    sel.modules.fill(nullptr);
+    infos.fill(nullptr);
+    modules.fill(nullptr);
 
     bind_stage(HwStage::Fragment, SwStage::Fragment);
-    if (sel.compilation_pending) {
-        return false;
-    }
 
-    const auto* fs_info = sel.infos[static_cast<u32>(SwStage::Fragment)];
+    const auto* fs_info = infos[static_cast<u32>(SwStage::Fragment)];
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
     key.num_color_attachments = std::bit_width(key.mrt_mask);
 
@@ -992,21 +858,18 @@ bool PipelineCache::RefreshGraphicsStages() {
         break;
     case AmdGpu::ShaderStageEnable::VgtStages::Vs:
         bind_stage(HwStage::Vertex, SwStage::Vertex);
-        if (sel.compilation_pending) {
-            return false;
-        }
         break;
     default:
         LOG_WARNING(Render_Vulkan, "unimplemented shader stage {}", (u32)regs.stage_enable.raw);
         return false;
     }
 
-    const auto* vs_info = sel.infos[static_cast<u32>(SwStage::Vertex)];
-    if (vs_info && sel.fetch_shader && !instance.IsVertexInputDynamicState()) {
+    const auto* vs_info = infos[static_cast<u32>(SwStage::Vertex)];
+    if (vs_info && fetch_shader && !instance.IsVertexInputDynamicState()) {
         // Without vertex input dynamic state, the pipeline needs to specialize on format.
         // Stride will still be handled outside the pipeline using dynamic state.
         u32 vertex_binding = 0;
-        for (const auto& attrib : sel.fetch_shader->attributes) {
+        for (const auto& attrib : fetch_shader->attributes) {
             const auto& buffer = attrib.GetSharp(*vs_info);
             ASSERT_MSG(vertex_binding < MaxVertexBufferCount,
                        "Vertex attribute binding count exceeded limit: {} >= {}", vertex_binding,
@@ -1034,7 +897,6 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
-    CompileTimer timer;
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
@@ -1062,65 +924,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
-static std::string DescribeSpecDiff(const Shader::StageSpecialization& a, const Shader::StageSpecialization& b) {
-    std::string diff;
-    if (!a.Valid() || !b.Valid()) diff = fmt::format("valid {}/{}", a.Valid(), b.Valid());
-    if (a.bitset != b.bitset) diff += diff.empty() ? "bitset" : ", bitset";
-    auto note = [&](const char* what) { diff += diff.empty() ? what : std::string(", ") + what; };
-    if (a.vs_attribs != b.vs_attribs) note("vs_attribs");
-    if (a.fetch_shader_data != b.fetch_shader_data) note("fetch_shader");
-    if (a.fmasks != b.fmasks) note("fmasks");
-    if (a.start != b.start) note("start_bindings");
-    if (a.buffers != b.buffers) note("buffers");
-    if (a.images != b.images) note("images");
-    if (a.samplers != b.samplers) note("samplers");
-    const auto& ra = a.runtime_info;
-    const auto& rb = b.runtime_info;
-    if (!(ra.props == rb.props)) note("props");
-    if (!ra.HasSameSwInfo(rb.sw)) note("sw_info");
-    if (!ra.HasSameHwInfo(rb.hw)) {
-        if (ra.hw_stage == Shader::HwStage::Fragment) {
-            const auto& fa = ra.hw.fs;
-            const auto& fb = rb.hw.fs;
-            for (size_t i = 0; i < fa.color_buffers.size(); ++i) {
-                if (!(fa.color_buffers[i] == fb.color_buffers[i])) {
-                    diff += fmt::format("{}fs.color_buffers[{}] fmt {}/{} -> {}/{} export {} -> {}",
-                                        diff.empty() ? "" : ", ", i,
-                                        u32(fa.color_buffers[i].data_format), u32(fa.color_buffers[i].num_format),
-                                        u32(fb.color_buffers[i].data_format), u32(fb.color_buffers[i].num_format),
-                                        u32(fa.color_buffers[i].export_format), u32(fb.color_buffers[i].export_format));
-                }
-            }
-            if (!(fa.en_flags == fb.en_flags) || !(fa.addr_flags == fb.addr_flags)) note("fs.input_flags");
-            if (fa.num_inputs != fb.num_inputs) note("fs.num_inputs");
-            if (!std::ranges::equal(fa.inputs.begin(), fa.inputs.begin() + fa.num_inputs, fb.inputs.begin(),
-                                    fb.inputs.begin() + fb.num_inputs)) note("fs.inputs");
-            if (fa.z_export_format != fb.z_export_format) note("fs.z_export");
-            if (fa.num_samples != fb.num_samples) note("fs.num_samples");
-            if (fa.mrtz_mask != fb.mrtz_mask) note("fs.mrtz_mask");
-            if (fa.dual_source_blending != fb.dual_source_blending) note("fs.dual_source");
-            if (fa.clip_distance_emulation != fb.clip_distance_emulation) note("fs.clip_distance");
-            if (fa.front_face_all_bits != fb.front_face_all_bits) note("fs.front_face");
-            if (fa.motion_vectors != fb.motion_vectors) note("fs.motion_vectors");
-        } else {
-            note("hw_info");
-        }
-    }
-    return diff.empty() ? "nothing?" : diff;
-}
-
-void Program::LogPermutationGrowth() const {
-    const size_t n = modules.size();
-    if (n < 16 || (n & (n - 1))) {
-        return;
-    }
-    LOG_WARNING(Render_Vulkan, "tlg: shader {:#x} (hw stage {}) has {} permutations; last two differ in: {}",
-                info.pgm_hash, static_cast<int>(info.hw_stage), n,
-                DescribeSpecDiff(modules[n - 2].spec, modules[n - 1].spec));
-}
-
-PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage hw_stage,
-                                                SwStage sw_stage,
+PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
     const Shader::RuntimeInfo& runtime_info = [&]() -> const Shader::RuntimeInfo& {
@@ -1148,18 +952,6 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     }
 
     auto& program = it_pgm.value();
-    if (program->compilation_failed || (program->modules.empty() && program->pending)) {
-        return {};
-    }
-    if (program->modules.empty() && compile_async) {
-        QueueShader(*program, hw_stage, sw_stage, params, runtime_info, binding, 0, true);
-        return {};
-    }
-    if (!program->info_template) {
-        // Programs loaded by the pipeline cache warm-up get their template on first use.
-        std::unique_lock lk{programs_mutex};
-        program->info_template = std::make_unique<Shader::Info>(program->info);
-    }
     auto& info = program->info;
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
@@ -1238,15 +1030,6 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         }
     }
     if (it == program->modules.end()) {
-        if (program->pending || std::ranges::find(program->failed_permutations, spec) !=
-                                    program->failed_permutations.end()) {
-            return {};
-        }
-        if (compile_async) {
-            QueueShader(*program, hw_stage, sw_stage, params, runtime_info, binding, perm_idx, false,
-                        std::move(spec));
-            return {};
-        }
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         auto compile_info = runtime_info;
         module = CompileModule(new_info, compile_info, params.code, perm_idx, binding);
@@ -1269,8 +1052,6 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
                                                              std::span<const u32> spv_code) {
-    PublishShaders(true);
-    PublishGraphics(true);
     std::optional<vk::ShaderModule> new_module{};
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {

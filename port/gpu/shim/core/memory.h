@@ -17,6 +17,8 @@ public:
         return virtual_addr + size < 0x100'0000'0000ULL;
     }
     u64 ClampRangeSize(VAddr virtual_addr, u64 size);
+    /// tlg-native: the whole range [virtual_addr, virtual_addr + size) is mapped guest memory.
+    bool IsValidMapping(VAddr virtual_addr, u64 size = 0);
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
     bool TryWriteBacking(void* address, const void* data, u64 size);
     /// CPU wrote guest memory outside page tracking (e.g. decoded video frames).

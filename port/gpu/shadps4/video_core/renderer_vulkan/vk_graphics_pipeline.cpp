@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 
@@ -11,28 +9,14 @@
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
-#include "video_core/renderer_vulkan/vk_blend_rewrite.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
-#include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
-#include "common/elf_info.h"
-#include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
 
 using Shader::Backend::SPIRV::AuxShaderType;
-
-// tlg: where pipeline construction time goes (reported when the background warm-up ends).
-std::atomic<u64> g_tlg_pipeline_total_ns, g_tlg_pipeline_driver_ns;
-std::atomic<u32> g_tlg_pipelines_built;
-namespace {
-using Clock = std::chrono::steady_clock;
-u64 NsSince(Clock::time_point start) {
-    return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
-}
-} // namespace
 
 static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eFragment,
@@ -310,10 +294,6 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> attachments;
-    // tlg: GNM scales MIN/MAX operands, Vulkan does not (vk_blend_rewrite.h). A self-scaled
-    // MIN/MAX is drawn twice: native, then this pipeline squares the destination.
-    std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> square_attachments;
-    bool needs_square_pass = false;
     for (u32 i = 0; i < key.num_color_attachments; i++) {
         const auto& control = key.blend[i];
 
@@ -339,16 +319,16 @@ GraphicsPipeline::GraphicsPipeline(
                           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
                     : key.write_masks[i],
         };
-        square_attachments[i] = vk::PipelineColorBlendAttachmentState{
-            .blendEnable = true,
-            .srcColorBlendFactor = vk::BlendFactor::eZero,
-            .dstColorBlendFactor = square_color ? vk::BlendFactor::eDstColor : vk::BlendFactor::eOne,
-            .colorBlendOp = vk::BlendOp::eAdd,
-            .srcAlphaBlendFactor = vk::BlendFactor::eZero,
-            .dstAlphaBlendFactor = square_alpha ? vk::BlendFactor::eDstAlpha : vk::BlendFactor::eOne,
-            .alphaBlendOp = vk::BlendOp::eAdd,
-            .colorWriteMask = attachments[i].colorWriteMask,
-        };
+
+        // The shader squares its color output for this attachment (see PsColorBuffer), so the
+        // factors must not scale the operands again.
+        if (key.color_buffers[i].blend_self_scale) {
+            LOG_WARNING(
+                Render_Vulkan,
+                "Emulating scaled min/max blend with squared shader output on attachment {}", i);
+            attachments[i].srcColorBlendFactor = vk::BlendFactor::eOne;
+            attachments[i].dstColorBlendFactor = vk::BlendFactor::eOne;
+        }
 
         // On GCN GPU there is an additional mask which allows to control color components exported
         // from a pixel shader. A situation possible, when the game may mask out the alpha channel,
@@ -426,32 +406,12 @@ GraphicsPipeline::GraphicsPipeline(
         .layout = *pipeline_layout,
     };
 
-    // tlg: in the game's keyed cache folder, so a new recompiler or "clear cache" drops them too.
-    const auto binary_directory = Storage::GameCacheDir() / "pipeline-binaries";
     auto [pipeline_result, pipe] =
-        CreateCachedGraphicsPipeline(device, pipeline_cache, pipeline_info, key,
-                                     instance.GetPipelineBinaryGlobalKey(), binary_directory);
+        device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
-
-    if (needs_square_pass) {
-        auto square_blending = color_blending;
-        square_blending.logicOpEnable = false;
-        square_blending.pAttachments = square_attachments.data();
-        auto square_info = pipeline_info;
-        square_info.pColorBlendState = &square_blending;
-        auto [square_result, square] =
-            CreateCachedGraphicsPipeline(device, pipeline_cache, square_info, key,
-                                         instance.GetPipelineBinaryGlobalKey(), binary_directory);
-        ASSERT_MSG(square_result == vk::Result::eSuccess,
-                   "Failed to create the squaring pipeline: {}", vk::to_string(square_result));
-        square_pipeline = std::move(square);
-        SetObjectName(device, *square_pipeline, "Graphics Pipeline {} squaring pass", debug_str);
-    }
-    g_tlg_pipeline_total_ns += NsSince(started);
-    ++g_tlg_pipelines_built;
 }
 
 GraphicsPipeline::~GraphicsPipeline() = default;

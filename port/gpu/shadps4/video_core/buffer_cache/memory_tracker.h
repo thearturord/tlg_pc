@@ -44,15 +44,6 @@ public:
         });
     }
 
-    /// tlg: see RegionManager::ExtendWriteFault.
-    void ExtendWriteFault(VAddr window_addr, u64 size) {
-        IteratePages<false>(window_addr, size,
-                            [](RegionManager* manager, u64 offset, size_t size) {
-                                std::scoped_lock lk{manager->lock};
-                                manager->ExtendWriteFault(manager->GetCpuAddr() + offset, size);
-                            });
-    }
-
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr cpu_addr, u64 size, bool is_write) noexcept {
         IteratePages(cpu_addr, size, [is_write](RegionManager* manager, u64 offset, u64 size) {

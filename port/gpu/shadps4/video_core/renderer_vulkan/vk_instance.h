@@ -13,7 +13,6 @@
 
 namespace Frontend {
 class WindowSDL;
-struct WindowSystemInfo;
 }
 
 VK_DEFINE_HANDLE(VmaAllocator)
@@ -25,8 +24,6 @@ public:
     explicit Instance(bool validation = false, bool crash_diagnostic = false);
     explicit Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                       bool enable_validation = false, bool enable_crash_diagnostic = false);
-    /// Headless logical device for renderer regression tests (no window or game).
-    explicit Instance(s32 physical_device_index, bool enable_validation);
     ~Instance();
 
     /// Returns a formatted string for the driver version
@@ -42,22 +39,6 @@ public:
     }
 
     /// Returns the current physical device
-    /// tlg: device features the temporal upscaler reports as enabled.
-    bool IsStorageImageWriteWithoutFormatEnabled() const {
-        return features.shaderStorageImageWriteWithoutFormat;
-    }
-    bool IsShaderFloat16Enabled() const {
-        return vk12_features.shaderFloat16;
-    }
-    bool IsSubgroupSizeControlEnabled() const {
-        return vk13_features.subgroupSizeControl;
-    }
-
-    /// Largest VkBuffer the driver allows (2 GiB on AMD's Windows driver).
-    u64 GetMaxBufferSize() const {
-        return vk13_props.maxBufferSize;
-    }
-
     vk::PhysicalDevice GetPhysicalDevice() const {
         return physical_device;
     }
@@ -65,10 +46,6 @@ public:
     /// Returns the Vulkan device
     vk::Device GetDevice() const {
         return *device;
-    }
-
-    const vk::PipelineBinaryKeyKHR& GetPipelineBinaryGlobalKey() const {
-        return pipeline_binary_global_key;
     }
 
     /// Returns the VMA allocator handle
@@ -292,20 +269,6 @@ public:
     }
 
     /// Returns true when the shaderSubgroupClock feature of
-    /// tlg: the FSR 4 v07 INT8/DOT4 shaders can run (Float16, Int8, Int16, packed int8 dot
-    /// products, linear compute derivatives, extended storage image formats).
-    bool IsFsr4Int8Supported() const {
-        return vk12_features.shaderFloat16 && vk12_features.shaderInt8 && features.shaderInt16 &&
-               vk13_features.shaderIntegerDotProduct && compute_shader_derivatives &&
-               compute_shader_derivatives_features.computeDerivativeGroupLinear &&
-               features.shaderStorageImageExtendedFormats;
-    }
-
-    /// tlg: FSR 4.1.1 (INT8 model passes and VK_VALVE_shader_mixed_float_dot_product).
-    bool IsFsr411Supported() const {
-        return IsFsr4Int8Supported() && mixed_float_dot_product;
-    }
-
     /// VK_KHR_shader_clock is supported.
     bool IsShaderSubgroupClockSupported() const {
         return shader_clock && shader_clock_features.shaderSubgroupClock;
@@ -498,11 +461,10 @@ public:
     /// Returns the amount of memory used.
     [[nodiscard]] u64 GetDeviceMemoryUsage() const;
 
-    /// tlg: the driver's current budget of the heaps GetDeviceMemoryUsage counts
-    /// (VK_EXT_memory_budget: what this process can use now, other processes included).
+    /// Returns the total memory budget available to the device.
+    /// tlg: the budget now (VK_EXT_memory_budget: what this process can use at the moment, other processes included).
     [[nodiscard]] u64 GetDeviceMemoryBudgetNow() const;
 
-    /// Returns the total memory budget available to the device.
     [[nodiscard]] u64 GetTotalMemoryBudget() const {
         return total_memory_budget;
     }
@@ -511,7 +473,6 @@ public:
     [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;
 
 private:
-    Instance(const Frontend::WindowSystemInfo&, s32, bool, bool);
     /// Creates the logical device opportunistically enabling extensions
     bool CreateDevice();
 
@@ -547,7 +508,6 @@ private:
     vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT image_2d_view_of_3d_features;
     vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT list_restart_features;
     vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock_features;
-    vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR compute_shader_derivatives_features;
     vk::DriverIdKHR driver_id;
     vk::UniqueDebugUtilsMessengerEXT debug_callback{};
     std::string vendor_name;
@@ -585,8 +545,6 @@ private:
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool shader_clock{};
-    bool compute_shader_derivatives{};
-    bool mixed_float_dot_product{}; // tlg: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};

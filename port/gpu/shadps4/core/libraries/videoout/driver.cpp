@@ -1,7 +1,19 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "core/frame_timeline.h"
+#include <algorithm>
+#include <cmath>
+#include <vector>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
 #include "common/assert.h"
 #include "tlg_toggles.h"
 #include "tlg_freeze.h"
@@ -470,7 +482,7 @@ void VideoOutDriver::Flip(const Request& req) {
             const double snapshot_ms = Vulkan::g_tlg_snapshot_ns.exchange(0) / 1e6;
             const double guest_wait_ms = Vulkan::g_tlg_guest_wait_ns.exchange(0) / 1e6;
             const u32 pending_draws = Vulkan::g_tlg_pending_draws.exchange(0);
-            const u64 direct = Vulkan::Scheduler::direct_recordings.exchange(0);
+            const u64 direct = 0; // tlg-native: the threaded recording of the old scheduler is gone
             const u64 faults = TlgStats::tracker_faults.exchange(0);
             // GPU command thread CPU time per draw: comparable between builds even when the scene
             // (and so the frame rate) differs a little.
@@ -505,7 +517,6 @@ void VideoOutDriver::Flip(const Request& req) {
                         TlgStats::tick_wait_ns.exchange(0) / (window * 1e7),
                         frames ? double(TlgStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(TlgStats::scene_draws.exchange(0)) / frames : 0.0);
-            presenter->GetRasterizer().GetPipelineCache().ReportCompilerStats();
             Vulkan::WaitDiagnostics::Report();
             // Frame pacing: spread of the guest flip intervals (judder that the mean hides).
             if (intervals.size() > 2) {
@@ -589,7 +600,6 @@ void VideoOutDriver::DrawLastFrame() {
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
-    Core::FrameTimeline::Mark(Core::FrameTimeline::FlipCp, is_eop ? 1 : 0);
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
@@ -626,15 +636,17 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
 
-    std::scoped_lock lock{mutex};
-    requests.push({
-        .frame = frame,
-        .port = port,
-        .flip_arg = flip_arg,
-        .index = index,
-        .eop = is_eop,
-    });
-    Core::FrameTimeline::Mark(Core::FrameTimeline::FlipPrepared, is_eop ? 1 : 0);
+    {
+        std::scoped_lock lock{mutex};
+        requests.push({
+            .frame = frame,
+            .port = port,
+            .flip_arg = flip_arg,
+            .index = index,
+            .eop = is_eop,
+        });
+    }
+    request_cv.notify_one();
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
@@ -716,9 +728,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     }
                 }
             } else {
-                Core::FrameTimeline::Mark(Core::FrameTimeline::PresentStart, main_port.vblank_status.count);
                 Flip(request);
-                Core::FrameTimeline::Mark(Core::FrameTimeline::PresentEnd);
                 FRAME_END;
             }
         }

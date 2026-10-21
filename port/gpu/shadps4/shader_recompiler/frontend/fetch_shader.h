@@ -34,7 +34,15 @@ struct VertexAttribute {
         return static_cast<InstanceIdType>(instance_data);
     }
 
-    AmdGpu::Buffer GetSharp(const Shader::Info& info) const noexcept;
+    constexpr AmdGpu::Buffer GetSharp(const Shader::Info& info) const noexcept {
+        auto buffer = info.ReadUdReg<AmdGpu::Buffer>(sgpr_base, dword_offset);
+        buffer.base_address += inst_offset;
+        if (data_format) {
+            buffer.data_format = data_format;
+            buffer.num_format = num_format;
+        }
+        return buffer;
+    }
 
     bool operator==(const VertexAttribute& other) const = default;
 };
@@ -56,22 +64,6 @@ struct FetchShaderData {
 
     void Serialize(Serialization::Archive& ar) const;
     bool Deserialize(Serialization::Archive& buffer);
-};
-
-// tlg: compiler workers read captured fetch data instead of mutable guest pointers.
-struct FetchShaderSnapshot {
-    const Info* info{};
-    std::optional<FetchShaderData> fetch;
-    std::vector<AmdGpu::Buffer> buffers;
-    void Capture(const Info& source);
-};
-
-class ScopedFetchShaderSnapshot {
-public:
-    explicit ScopedFetchShaderSnapshot(const FetchShaderSnapshot& snapshot);
-    ~ScopedFetchShaderSnapshot();
-private:
-    const FetchShaderSnapshot* previous;
 };
 
 const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);

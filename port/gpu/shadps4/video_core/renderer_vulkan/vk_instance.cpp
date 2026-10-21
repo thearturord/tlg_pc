@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdio>
-#include <cstdlib>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -13,7 +11,6 @@
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
-#include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -98,14 +95,8 @@ Instance::Instance(bool enable_validation, bool enable_crash_diagnostic)
 
 Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                    bool enable_validation /*= false*/, bool enable_crash_diagnostic /*= false*/)
-    : Instance(window.GetWindowInfo(), physical_device_index, enable_validation, enable_crash_diagnostic) {}
-
-Instance::Instance(s32 index, bool validation)
-    : Instance(Frontend::WindowSystemInfo{}, index, validation, false) {}
-
-Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_device_index,
-                   bool enable_validation, bool enable_crash_diagnostic)
-    : instance{CreateInstance(window_info.type, enable_validation, enable_crash_diagnostic)},
+    : instance{CreateInstance(window.GetWindowInfo().type, enable_validation,
+                              enable_crash_diagnostic)},
       physical_devices{EnumeratePhysicalDevices(instance)} {
     if (enable_validation) {
         debug_callback = CreateDebugCallback(*instance);
@@ -113,18 +104,6 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
     const std::size_t num_physical_devices = static_cast<u16>(physical_devices.size());
     ASSERT_MSG(num_physical_devices > 0, "No physical devices found");
     LOG_INFO(Render_Vulkan, "Found {} physical devices", num_physical_devices);
-    // tlg: the device list in the game log tells a missing driver apart from a wrong choice.
-    for (std::size_t i = 0; i < num_physical_devices; ++i) {
-        const auto props = physical_devices[i].getProperties();
-        std::printf("GPU %zu: %s (%s)\n", i, props.deviceName.data(),
-                    vk::to_string(props.deviceType).c_str());
-    }
-    // tlg: a saved choice can outlive its GPU (removed card, new driver order).
-    if (physical_device_index >= static_cast<s32>(num_physical_devices)) {
-        std::printf("GPU: selected GPU %d is not in the device list; choosing automatically\n",
-                    physical_device_index);
-        physical_device_index = -1;
-    }
 
     if (physical_device_index < 0) {
         std::vector<
@@ -175,9 +154,12 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
         });
         physical_device = physical_devices[std::get<0>(properties2[0])];
     } else {
+        ASSERT_MSG(physical_device_index < num_physical_devices,
+                   "Invalid physical device index {} provided when only {} devices exist",
+                   physical_device_index, num_physical_devices);
+
         physical_device = physical_devices[physical_device_index];
     }
-    std::printf("GPU: using %s\n", physical_device.getProperties().deviceName.data());
 
     available_extensions = GetSupportedExtensions(physical_device);
     format_properties = GetFormatProperties(physical_device);
@@ -219,45 +201,6 @@ std::string Instance::GetDriverVersionName() {
     return GetReadableVersion(version);
 }
 
-namespace {
-bool PipelineBinaryCacheRequested() {
-    const char* setting = std::getenv("TLG_PIPELINE_BINARIES");
-    return !setting || *setting != '0';
-}
-}
-
-bool InitializePipelineBinaryCache(vk::Device device, bool supported,
-                                   vk::PipelineBinaryKeyKHR& global_key) {
-    global_key = vk::PipelineBinaryKeyKHR{};
-    if (!PipelineBinaryCacheRequested()) {
-        LOG_INFO(Render_Vulkan, "Pipeline binary cache disabled by settings; using normal compilation");
-        return false;
-    }
-    if (!supported) {
-        LOG_INFO(Render_Vulkan, "Pipeline binary cache unsupported; using normal compilation");
-        return false;
-    }
-    const auto& dispatch = VULKAN_HPP_DEFAULT_DISPATCHER;
-    if (!dispatch.vkGetPipelineKeyKHR || !dispatch.vkCreatePipelineBinariesKHR ||
-        !dispatch.vkGetPipelineBinaryDataKHR || !dispatch.vkDestroyPipelineBinaryKHR ||
-        !dispatch.vkReleaseCapturedPipelineDataKHR) {
-        LOG_WARNING(Render_Vulkan, "Pipeline binary cache functions unavailable; using normal compilation");
-        return false;
-    }
-    const auto result = device.getPipelineKeyKHR(nullptr, &global_key);
-    if (result != vk::Result::eSuccess || !global_key.keySize ||
-        global_key.keySize > VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR) {
-        const auto key_size = global_key.keySize;
-        global_key = vk::PipelineBinaryKeyKHR{};
-        LOG_WARNING(Render_Vulkan,
-                    "Pipeline binary cache key unavailable (result {}, size {}); using normal compilation",
-                    vk::to_string(result), key_size);
-        return false;
-    }
-    LOG_INFO(Render_Vulkan, "Pipeline binary disk cache enabled");
-    return true;
-}
-
 bool Instance::CreateDevice() {
     const vk::StructureChain feature_chain = physical_device.getFeatures2<
         vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,
@@ -267,11 +210,7 @@ bool Instance::CreateDevice() {
         vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
-        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
-        vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR,
-        vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE,
-        vk::PhysicalDevicePipelineBinaryFeaturesKHR,
-        vk::PhysicalDeviceMaintenance5FeaturesKHR>();
+        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -289,7 +228,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 64> enabled_extensions;
+    boost::container::static_vector<const char*, 32> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -409,17 +348,6 @@ bool Instance::CreateDevice() {
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
-    // tlg: FSR 4 v07 INT8 (vk_temporal_upscaler): quad derivatives in compute shaders.
-    compute_shader_derivatives = add_extension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
-    // tlg: FSR 4.1.1 passes (dot2 of halves accumulated in float, as vkd3d-proton translates them).
-    mixed_float_dot_product =
-        feature_chain.get<vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>()
-            .shaderMixedFloatDotProductFloat16AccFloat32 &&
-        add_extension(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME);
-    if (compute_shader_derivatives) {
-        compute_shader_derivatives_features =
-            feature_chain.get<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
-    }
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
@@ -459,18 +387,6 @@ bool Instance::CreateDevice() {
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
-    // tlg: DLSS (optional bridge DLL) needs its own device extensions on NVIDIA GPUs.
-    std::vector<const char*> dlss_extensions;
-    if (Dlss* dlss = Dlss::Get()) {
-        dlss->AppendDeviceExtensions(*instance, physical_device, dlss_extensions);
-        for (const char* name : dlss_extensions) {
-            if (std::none_of(enabled_extensions.begin(), enabled_extensions.end(),
-                             [&](const char* e) { return std::string_view{e} == name; }) &&
-                enabled_extensions.size() < enabled_extensions.capacity()) {
-                enabled_extensions.push_back(name);
-            }
-        }
-    }
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = 1u,
@@ -501,9 +417,6 @@ bool Instance::CreateDevice() {
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
                 .shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
-                // tlg: required by the FSR 3 accumulate shaders (vk_temporal_upscaler).
-                .shaderStorageImageWriteWithoutFormat =
-                    features.shaderStorageImageWriteWithoutFormat,
                 .shaderClipDistance = features.shaderClipDistance,
                 .shaderFloat64 = features.shaderFloat64,
                 .shaderInt64 = features.shaderInt64,
@@ -538,7 +451,6 @@ bool Instance::CreateDevice() {
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
             .synchronization2 = vk13_features.synchronization2,
             .dynamicRendering = vk13_features.dynamicRendering,
-            .shaderIntegerDotProduct = vk13_features.shaderIntegerDotProduct,
             .maintenance4 = vk13_features.maintenance4,
         },
         // Extensions
@@ -618,15 +530,6 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderClockFeaturesKHR{
             .shaderSubgroupClock = shader_clock_features.shaderSubgroupClock,
         },
-        vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR{
-            .computeDerivativeGroupQuads =
-                compute_shader_derivatives_features.computeDerivativeGroupQuads,
-            .computeDerivativeGroupLinear =
-                compute_shader_derivatives_features.computeDerivativeGroupLinear,
-        },
-        vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE{
-            .shaderMixedFloatDotProductFloat16AccFloat32 = true,
-        },
     };
 
     if (!custom_border_color) {
@@ -681,12 +584,6 @@ bool Instance::CreateDevice() {
     if (!shader_clock) {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
     }
-    if (!compute_shader_derivatives) {
-        device_chain.unlink<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
-    }
-    if (!mixed_float_dot_product) {
-        device_chain.unlink<vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>();
-    }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
@@ -696,11 +593,6 @@ bool Instance::CreateDevice() {
     device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
-    pipeline_binaries =
-        InitializePipelineBinaryCache(*device, pipeline_binaries, pipeline_binary_global_key);
-    if (Dlss* dlss = Dlss::Get()) {
-        dlss->Initialize(*instance, physical_device, *device);
-    }
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);

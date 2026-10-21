@@ -54,18 +54,13 @@ class ReadbackBatch;
 
 class BufferCache {
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
-    // tlg: arena pages are 4 GiB unless the driver's buffer size limit is lower (AMD's
-    // Windows driver: 2 GiB); an arena spans up to two pages, so they shrink to half the limit.
-    static constexpr u64 MAX_ARENA_PAGE_BITS = 32;
-    static constexpr u64 MIN_ARENA_PAGE_BITS = 29;
-    static constexpr u64 MAX_ARENA_PAGES = u64{1} << (ADDRESS_SPACE_BITS - MIN_ARENA_PAGE_BITS);
+    static constexpr u64 ARENA_PAGE_BITS = 32;
+    static constexpr u64 ARENA_PAGE_SIZE = u64{1} << ARENA_PAGE_BITS;
+    static constexpr u64 NUM_ARENA_PAGES = u64{1} << (ADDRESS_SPACE_BITS - ARENA_PAGE_BITS);
     static constexpr u64 MIN_BLOCK_SIZE = 16_KB;
-
-public:
-    /// Read-only bindings up to this size are copied into a stream buffer (tlg: public for
-    /// the draw pipeline's constant ring).
     static constexpr u64 STREAM_THRESHOLD = 16_KB;
 
+public:
     explicit BufferCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                          Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool,
                          TextureCache& texture_cache, PageManager& tracker);
@@ -105,14 +100,8 @@ public:
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
 
-    /// tlg: a guest write fault at `device_addr` was handled; unprotect its neighbourhood.
-    void ExtendWriteFault(VAddr device_addr);
-
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
-    /// tlg: a CPU read fault on pages with no GPU-modified data: lift the read protection on the
-    /// faulting thread instead of a round trip through the GPU command thread.
-    void ReleaseReadProtection(VAddr device_addr, u64 size);
 
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
@@ -243,13 +232,6 @@ private:
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
-    // tlg: texel buffer ranges known not to alias an image, per image registry generation.
-    struct ImageMiss {
-        VAddr address = 0;
-        u32 size = 0;
-        u64 generation = ~0ULL;
-    };
-    std::array<ImageMiss, 256> image_miss_cache{};
     Vulkan::Runtime& runtime;
     Vulkan::StagingBufferPool& staging_pool;
     AmdGpu::Liverpool* liverpool;
@@ -323,12 +305,7 @@ private:
     std::unique_ptr<Buffer> bda_pagetable_buffer;
     bool fault_process_pending{};
 
-    std::array<const Buffer*, MAX_ARENA_PAGES> address_space{};
-    u64 arena_page_bits{MAX_ARENA_PAGE_BITS};
-    /// tlg: pages one arena may join (the driver's buffer size limit / the page size, >= 2).
-    u64 max_arena_pages{2};
-    u64 arena_page_size{u64{1} << MAX_ARENA_PAGE_BITS};
-    u64 num_arena_pages{u64{1} << (ADDRESS_SPACE_BITS - MAX_ARENA_PAGE_BITS)};
+    std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
     std::deque<Buffer> arenas;
     std::vector<ArenaBinds> pending_binds;
     Vulkan::Semaphore memory_semaphore;

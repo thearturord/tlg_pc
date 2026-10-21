@@ -69,10 +69,15 @@ void CaptureStackUnsafe(CONTEXT context, Sample& sample) {
 /// ends the walk of this sample.
 void CaptureStack(const CONTEXT& context, Sample& sample) {
     unwinding = true;
+#if defined(_MSC_VER)
     __try {
         CaptureStackUnsafe(context, sample);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
+#else
+    // tlg: clang-gnu has no SEH; the port's vectored exception handler is not armed here, so a bad unwind is not survived.
+    CaptureStackUnsafe(context, sample);
+#endif
     unwinding = false;
 }
 

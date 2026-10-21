@@ -125,9 +125,7 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
              Common::SlotVector<ImageView>& slot_image_views_, const ImageInfo& info_)
-    : guest_begin{info_.guest_address}, guest_end{info_.guest_address + info_.guest_size},
-      info{info_}, runtime{&runtime_}, slot_image_views{&slot_image_views_} {
-    TlgStats::Timer timer{TlgStats::t_image_create};
+    : runtime{&runtime_}, slot_image_views{&slot_image_views_}, info{info_} {
     if (info.pixel_format == vk::Format::eUndefined) {
         return;
     }
@@ -156,29 +154,15 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
 
     constexpr auto tiling = vk::ImageTiling::eOptimal;
     const auto supported_format = instance.GetSupportedFormat(info.pixel_format, format_features);
-    vk::PhysicalDeviceImageFormatInfo2 format_info{
+    const vk::PhysicalDeviceImageFormatInfo2 format_info{
         .format = supported_format,
-        .type = (info.props.is_host_2d ? vk::ImageType::e2D : ConvertImageType(info.type)),
+        .type = ConvertImageType(info.type),
         .tiling = tiling,
         .usage = usage_flags,
         .flags = flags,
     };
-    auto image_format_properties =
+    const auto image_format_properties =
         instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
-    // tlg: storage usage is speculative (see ImageUsageFlags). Drivers that refuse it for a
-    // format (AMD's Windows driver for BC6H) get the image without it: creating the unsupported
-    // combination anyway loses the device a few frames later.
-    if (image_format_properties.result == vk::Result::eErrorFormatNotSupported &&
-        (usage_flags & vk::ImageUsageFlagBits::eStorage)) {
-        format_info.usage = usage_flags & ~vk::ImageUsageFlagBits::eStorage;
-        image_format_properties = instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
-        if (image_format_properties.result == vk::Result::eSuccess) {
-            usage_flags = format_info.usage;
-            format_features = FormatFeatureFlags(usage_flags);
-        } else {
-            format_info.usage = usage_flags;
-        }
-    }
     if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
         LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
                   vk::to_string(supported_format), vk::to_string(format_info.type),
@@ -190,7 +174,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
 
     const vk::ImageCreateInfo image_ci = {
         .flags = flags,
-        .imageType = (info.props.is_host_2d ? vk::ImageType::e2D : ConvertImageType(info.type)),
+        .imageType = ConvertImageType(info.type),
         .format = supported_format,
         .extent{
             .width = info.size.width,
@@ -224,13 +208,9 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
         runtime->SetBackingSamples(this, info.num_samples);
     }
     const auto& view_infos = backing->image_view_infos;
-    if (backing->last_view < view_infos.size() && view_infos[backing->last_view] == view_info) {
-        return (*slot_image_views)[backing->image_view_ids[backing->last_view]];
-    }
     const auto it = std::ranges::find(view_infos, view_info);
     if (it != view_infos.end()) {
-        backing->last_view = static_cast<u32>(std::distance(view_infos.begin(), it));
-        const auto view_id = backing->image_view_ids[backing->last_view];
+        const auto view_id = backing->image_view_ids[std::distance(view_infos.begin(), it)];
         return (*slot_image_views)[view_id];
     }
     const auto view_id = slot_image_views->Insert(runtime->GetInstance(), view_info, *this);
@@ -250,16 +230,6 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
         (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
     const bool partially_transited = !subresource_states.empty();
 
-    constexpr auto memo_write_flags = vk::AccessFlagBits2::eTransferWrite |
-                                      vk::AccessFlagBits2::eShaderWrite |
-                                      vk::AccessFlagBits2::eMemoryWrite;
-    auto& memo = backing->partial_memo;
-    if (needs_partial_transition && partially_transited && memo.valid &&
-        memo.range == *subres_range && memo.layout == dst_layout && memo.access == dst_mask &&
-        memo.stage == dst_stage) {
-        return;
-    }
-    memo.valid = false;
     if (needs_partial_transition || partially_transited) {
         if (!partially_transited) {
             subresource_states.resize(info.resources.levels * info.resources.layers);
@@ -317,8 +287,6 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
 
         if (!needs_partial_transition) {
             subresource_states.clear();
-        } else if (!(dst_mask & memo_write_flags)) {
-            memo = {true, *subres_range, dst_layout, dst_mask, dst_stage};
         }
     } else { // Full resource transition
         constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |

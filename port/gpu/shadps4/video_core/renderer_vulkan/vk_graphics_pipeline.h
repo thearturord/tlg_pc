@@ -3,8 +3,6 @@
 
 #pragma once
 
-#include <algorithm>
-
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -48,7 +46,6 @@ struct GraphicsPipelineKey {
     u8 depth_samples;
     std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples;
     u32 mrt_mask;
-    u32 motion_vectors = 0;
     struct {
         AmdGpu::DepthBuffer::ZFormat z_format : 2;
         AmdGpu::DepthBuffer::StencilFormat stencil_format : 1;
@@ -104,11 +101,6 @@ public:
 
     const GraphicsPipelineKey& GetGraphicsKey() const {
         return key;
-    }
-
-    /// tlg: second draw squaring a self-scaled MIN/MAX blend, or null (vk_blend_rewrite.h).
-    vk::Pipeline SquarePassHandle() const noexcept {
-        return *square_pipeline;
     }
 
     /// Gets the attributes and bindings for vertex inputs.
