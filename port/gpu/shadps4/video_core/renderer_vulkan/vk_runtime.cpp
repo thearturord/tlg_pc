@@ -6,6 +6,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/readback_policy.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
@@ -21,10 +22,10 @@ static vk::ImageType ConvertImageType(AmdGpu::ImageType type) noexcept {
     switch (type) {
     case AmdGpu::ImageType::Color1D:
     case AmdGpu::ImageType::Color1DArray:
-        return vk::ImageType::e1D;
     case AmdGpu::ImageType::Color2D:
     case AmdGpu::ImageType::Color2DMsaa:
     case AmdGpu::ImageType::Color2DArray:
+    case AmdGpu::ImageType::Cube:
         return vk::ImageType::e2D;
     case AmdGpu::ImageType::Color3D:
         return vk::ImageType::e3D;
@@ -335,7 +336,7 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     SetBackingSamples(dst, dst->info.num_samples, false);
     SetBackingSamples(src, src->info.num_samples);
 
-    boost::container::small_vector<vk::ImageCopy, 8> regions;
+    SmallVector<vk::ImageCopy, 8> regions;
 
     const vk::ImageAspectFlags src_aspect = src->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
     const vk::ImageAspectFlags dst_aspect = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
@@ -419,7 +420,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                                   const VideoCore::Buffer* buffer, u64 offset) {
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
-    ASSERT(src->info.resources.layers == dst->info.resources.layers && num_mips == 1);
+    ASSERT(num_mips == 1);
 
     SetBackingSamples(dst, dst->info.num_samples, false);
     SetBackingSamples(src, src->info.num_samples);
@@ -481,7 +482,7 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     const auto dst_dim = dst->info.props.is_block ? 2 : 0;
     const auto mip_block_w = std::max(dst->info.size.width >> (mip + dst_dim), 1u);
     const auto mip_block_h = std::max(dst->info.size.height >> (mip + dst_dim), 1u);
-    const auto mip_block_p = std::max(dst->info.mips_layout[mip].pitch >> dst_dim, 1u);
+    const auto mip_block_p = std::max<u32>(dst->info.mips_layout[mip].pitch >> dst_dim, 1u);
 
     const auto src_dim = src->info.props.is_block ? 2 : 0;
     ASSERT(mip_block_w == (src->info.size.width >> src_dim));
@@ -533,8 +534,9 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
 
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
     if (src->info.num_samples == 1 && dst->info.num_samples == 1) {
-        if (instance.IsMaintenance8Supported() ||
-            src->info.props.is_depth == dst->info.props.is_depth) {
+        if ((instance.IsMaintenance8Supported() ||
+             src->info.props.is_depth == dst->info.props.is_depth) &&
+            src->aspect_mask == dst->aspect_mask) {
             CopyImage(src, dst);
         } else {
             // Perform depth from/to color copy using the intermediate copy buffer.
@@ -706,6 +708,42 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
+void Runtime::ClearDepthStencilImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range, bool clear_depth,
+                                     float depth, bool clear_stencil, u32 stencil) {
+    vk::ImageAspectFlags aspect{};
+    if (clear_depth && (dst->aspect_mask & vk::ImageAspectFlagBits::eDepth)) {
+        aspect |= vk::ImageAspectFlagBits::eDepth;
+    }
+    if (clear_stencil && (dst->aspect_mask & vk::ImageAspectFlagBits::eStencil)) {
+        aspect |= vk::ImageAspectFlagBits::eStencil;
+    }
+    if (!aspect) {
+        return;
+    }
+    scheduler.EndRendering();
+
+    const bool needs_flush =
+        Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eClear,
+                vk::AccessFlagBits2::eTransferWrite, range);
+    if (needs_flush) {
+        FlushBarriers();
+    }
+
+    const vk::ImageSubresourceRange vk_range = {
+        .aspectMask = aspect,
+        .baseMipLevel = range.base.level,
+        .levelCount = range.extent.levels,
+        .baseArrayLayer = range.base.layer,
+        .layerCount = range.extent.layers,
+    };
+    const vk::ClearDepthStencilValue value{.depth = depth, .stencil = stencil};
+    scheduler.CommandBuffer().clearDepthStencilImage(dst->GetImage(), vk::ImageLayout::eTransferDstOptimal, value,
+                                                     vk_range);
+
+    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+}
+
 void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing) {
     BeforeImageAccess();
     auto& backing = image->backing;
@@ -786,24 +824,21 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
-    const AddressRange range = {
-        .resource = reinterpret_cast<u64>(handle),
-        .range_start = offset,
-        .range_end = offset + size - 1,
-    };
-    bool has_access = barrier_tracker.FindRange(range, Access::Write);
+    MakeCurrent(handle);
+    bool has_access = resource->write_ranges.Overlaps(offset, offset + size);
     if (check_read_access && !has_access) {
-        has_access |= barrier_tracker.FindRange(range, Access::Read);
+        has_access |= resource->read_ranges.Overlaps(offset, offset + size);
     }
     return has_access;
 }
 
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
-    AddressRange range = {
-        .resource = reinterpret_cast<u64>(handle),
-        .range_start = offset,
-        .range_end = offset + size - 1,
+    MakeCurrent(handle);
+
+    const Interval range = {
+        .start = offset,
+        .end = offset + size,
     };
 
     constexpr static vk::AccessFlags2 READ_MASK =
@@ -818,36 +853,39 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
-    // tlg: reads are tracked at 4 KiB granularity. Constant data comes from ring allocations
-    // at a new offset every draw; rounded, they land in ranges already present and the
-    // insert returns early instead of growing the tree until the next barrier flush.
-    // Wider read ranges only add barriers, never drop one.
-    if (!(src_access & WRITE_MASK) && !TlgToggle::Disabled(TlgToggle::CoarseReadTracking)) {
-        range.range_start &= ~u64{0xFFF};
-        range.range_end |= 0xFFF;
-    }
-    const auto insert = [&](Access access) {
-        if (TlgToggle::Disabled(TlgToggle::AccessMemo)) {
-            barrier_tracker.InsertRange(range, access);
+    // The lists are only consulted to decide whether a later access needs a barrier. A list that grows
+    // without a barrier in between (thousands of tiny constant buffer ranges) made every insert shift the
+    // vector; with the native draw path on, a list that holds many ranges is replaced by the one range that
+    // covers them all, which can only add a barrier, never drop one.
+    const bool bounded = VideoCore::ReadbackPolicy::Get().native_draw_mode.load(
+                             std::memory_order_relaxed) >= 2;
+    const auto add_range = [bounded](auto& list, const Interval& new_range) {
+        if (!bounded) {
+            list.Add(new_range);
             return;
         }
-        u64 hash = range.resource ^ range.range_start * 0x9E3779B97F4A7C15ull ^
-                   range.range_end << 13 ^ u64(access) << 61;
-        hash = (hash ^ hash >> 31) * 0xFF51AFD7ED558CCDull;
-        auto& memo = access_memo[(hash ^ hash >> 29) % access_memo.size()];
-        if (memo.epoch == access_epoch && memo.resource == range.resource &&
-            memo.start == range.range_start && memo.end == range.range_end &&
-            memo.access == u32(access)) {
+        if (list.Contains(new_range.start, new_range.end)) {
             return;
         }
-        barrier_tracker.InsertRange(range, access);
-        memo = {range.resource, range.range_start, range.range_end, access_epoch, u32(access)};
+        constexpr size_t MaxIntervals = 64;
+        if (list.Size() >= MaxIntervals) {
+            u64 lo = new_range.start;
+            u64 hi = new_range.end;
+            for (const auto& interval : list) {
+                lo = std::min(lo, interval.start);
+                hi = std::max(hi, interval.end);
+            }
+            list.Clear();
+            list.Add({.start = lo, .end = hi});
+            return;
+        }
+        list.Add(new_range);
     };
     if (src_access & WRITE_MASK) {
-        insert(Access::Write);
+        add_range(resource->write_ranges, range);
     }
     if (src_access & READ_MASK) {
-        insert(Access::Read);
+        add_range(resource->read_ranges, range);
     }
 
     memory_barrier.srcStageMask |= src_stage;
@@ -888,8 +926,24 @@ void Runtime::FlushBarriers() {
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
 
     image_barriers.clear();
-    barrier_tracker.Clear();
-    ++access_epoch;
+    for (auto& resource : resources) {
+        resource.read_ranges.Clear();
+        resource.write_ranges.Clear();
+    }
+    resources.clear();
+    resource = nullptr;
+}
+
+void Runtime::MakeCurrent(const VideoCore::Buffer* handle) {
+    if (resource && resource->handle == handle) {
+        return;
+    }
+    auto it = std::ranges::find(resources, handle, &BufferBarriers::handle);
+    if (it != resources.end()) {
+        resource = std::addressof(*it);
+        return;
+    }
+    resource = &resources.emplace_back(handle);
 }
 
 } // namespace Vulkan

@@ -3,29 +3,22 @@
 
 #pragma once
 
-#include <algorithm>
-#include <array>
 #include <atomic>
-#include "video_core/texture_cache/readback_queue.h"
-#include "video_core/texture_cache/readback_sources.h"
-#include <chrono>
-#include "tlg_toggles.h"
-#include <optional>
-#include <cstdlib>
-#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
-
-#include <condition_variable>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_set>
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 #include <boost/container/small_vector.hpp>
 #include <queue>
 #include <tsl/robin_map.h>
 
 #include "common/lru_cache.h"
+#include "common/multi_level_page_table.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
-#include "video_core/multi_level_page_table.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
@@ -44,22 +37,41 @@ namespace VideoCore {
 
 class BufferCache;
 class PageManager;
+class ReadbackBatch;
 
 class TextureCache {
-    // Default values for garbage collection
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
     static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 3_GB;
     static constexpr s64 TARGET_GC_THRESHOLD = 8_GB;
 
-    using ImageIds = boost::container::small_vector<ImageId, 16>;
+    struct BucketEntry {
+        u32 key;
+        u32 size;
+        ImageId id;
+
+        bool Overlaps(VAddr addr, size_t size) const noexcept {
+            const VAddr base = Address();
+            return base < (addr + size) && addr < (base + this->size);
+        }
+
+        VAddr Address() const noexcept {
+            return VAddr(key) << 8;
+        }
+    };
+
+    struct alignas(64) Bucket {
+        SmallVector<BucketEntry, 4, u32> entries;
+    };
+    static_assert(sizeof(Bucket) == 64);
 
     struct Traits {
-        using Entry = ImageIds;
-        static constexpr size_t AddressSpaceBits = 40;
-        static constexpr size_t FirstLevelBits = 10;
-        static constexpr size_t PageBits = 20;
+        using Entry = Bucket;
+        static constexpr size_t ADDRESS_SPACE_BITS = 40;
+        static constexpr size_t L1_BITS = 10;
+        static constexpr size_t PAGE_BITS = 18;
+        static constexpr bool NULL_CHECK = true;
     };
-    using PageTable = MultiLevelPageTable<Traits>;
+    using PageTable = Common::MultiLevelPageTable<Traits>;
 
 public:
     enum class BindingType : u32 {
@@ -89,6 +101,7 @@ public:
         ImageDesc(const Libraries::VideoOut::BufferAttributeGroup& group, VAddr cpu_address)
             : info{group, cpu_address}, type{BindingType::VideoOut} {}
     };
+    static_assert(std::is_trivially_destructible_v<ImageDesc>);
 
 public:
     TextureCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
@@ -115,7 +128,7 @@ public:
     void InvalidateMemory(VAddr addr, size_t size);
 
     /// Marks an image as dirty if it exists at the provided address.
-    void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
+    void InvalidateMemoryFromGPU(VAddr address, size_t max_size, const char* by = "");
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
@@ -125,6 +138,28 @@ public:
     bool ResolveReadbacks(VAddr address, u64 size, bool assume_locks = true,
                           ReadbackSource source = ReadbackSource::Unknown);
     void CancelReadbacks(VAddr address, u64 size);
+
+    /// While on, the storage images the dispatch writes are returned to guest memory (a record that copies into a staging resource).
+    void SetExplicitDownload(bool on) noexcept {
+        explicit_download = on;
+    }
+
+    /// Records downloads of all pending images into a batch instead of waiting per image.
+    void RecordImageDownloads(ReadbackBatch& batch, u32 fence_kind = ~0u);
+
+    /// True once if RecordImageDownloads recorded copies for the priority thread since the last
+    /// call (their command buffer has to be submitted).
+    [[nodiscard]] bool TakeAsyncRecorded() {
+        return async_recorded.exchange(0, std::memory_order_acq_rel) != 0;
+    }
+
+    /// Changes whenever the set of registered images changes.
+    [[nodiscard]] u64 ImageGeneration() const noexcept {
+        return image_generation.load(std::memory_order_acquire);
+    }
+
+    /// Does what FindImage does for an image found again: marks it as recently used.
+    void TouchFoundImage(ImageId image_id);
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
@@ -151,43 +186,14 @@ public:
     /// Retrieves the depth target with specified properties
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
-    /// tlg: whether UpdateImage has nothing to do for this image (its fast path).
-    [[nodiscard]] bool IsUpToDate(ImageId image_id) const {
-        const Image& image = slot_images[image_id];
-        const u32 flags = std::atomic_ref<u32>(const_cast<u32&>(reinterpret_cast<const u32&>(image.flags)))
-                              .load(std::memory_order_acquire);
-        constexpr u32 Dirty = static_cast<u32>(ImageFlagBits::Dirty);
-        constexpr u32 Registered = static_cast<u32>(ImageFlagBits::Registered);
-        constexpr u32 Aliased = static_cast<u32>(ImageFlagBits::Aliased);
-        return (flags & (Dirty | Registered | Aliased)) == Registered &&
-               image.track_addr == image.guest_begin && image.track_addr_end == image.guest_end &&
-               image.lru_touched_tick == gc_tick;
-    }
+    /// Links the stencil plane of a depth surface to its depth image.
+    void AssociateStencil(ImageId depth_id, const ImageInfo& depth_info);
 
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
-        // tlg: a clean image already tracked and touched in this GC period needs nothing.
-        // Every texture binding comes here; the mutex (shared with the fault handlers of the
-        // guest threads) was ~3% of the GPU thread. Flags are read atomically: an invalidation
-        // racing with this check races the same way with the locked path.
-        if (!TlgToggle::Disabled(TlgToggle::UpdateImageFastPath)) {
-            const Image& image = slot_images[image_id];
-            const u32 flags = std::atomic_ref<u32>(const_cast<u32&>(reinterpret_cast<const u32&>(image.flags)))
-                                  .load(std::memory_order_acquire);
-            constexpr u32 Dirty = static_cast<u32>(ImageFlagBits::Dirty);
-            constexpr u32 Registered = static_cast<u32>(ImageFlagBits::Registered);
-            // Images sharing memory with another take the locked path: SynchronizeAlias.
-            constexpr u32 Aliased = static_cast<u32>(ImageFlagBits::Aliased);
-            if ((flags & (Dirty | Registered | Aliased)) == Registered &&
-                image.track_addr == image.guest_begin && image.track_addr_end == image.guest_end &&
-                image.lru_touched_tick == gc_tick) {
-                return;
-            }
-        }
-        std::scoped_lock lock{mutex};
         Image& image = slot_images[image_id];
-        TrackImage(image_id);
         TouchImage(image);
+        TrackImage(image_id);
         RefreshImage(image);
         SynchronizeAlias(image_id);
     }
@@ -241,7 +247,7 @@ public:
         if (!image.depth_id) {
             return {};
         }
-        if (slot_images.is_allocated(image.depth_id)) {
+        if (slot_images.IsAllocated(image.depth_id)) {
             auto& depth_image = slot_images[image.depth_id];
             if (depth_image.image_uid == image.depth_uid &&
                 depth_image.flags & ImageFlagBits::Registered) {
@@ -259,6 +265,31 @@ public:
         HTile,
     };
 
+    struct MetaDataInfo {
+        MetaType type;
+        ImageId owner_id{};
+        u64 owner_uid{};
+        u32 num_samples = 1;
+        s32 clear_mask = -1;
+    };
+
+    /// Returns metadata information if the specified address belongs to a live image.
+    std::optional<MetaDataInfo> GetMetaInfo(VAddr address) const {
+        const auto it = surface_metas.find(address);
+        if (it == surface_metas.end()) {
+            return std::nullopt;
+        }
+        const auto& meta = it->second;
+        if (!meta.owner_id || !slot_images.IsAllocated(meta.owner_id)) {
+            return std::nullopt;
+        }
+        const auto& owner = slot_images[meta.owner_id];
+        if (owner.image_uid != meta.owner_uid || False(owner.flags & ImageFlagBits::Registered)) {
+            return std::nullopt;
+        }
+        return meta;
+    }
+
     /// Returns meta type if the specified address is a metadata surface.
     std::optional<MetaType> IsMeta(VAddr address) const {
         auto it = surface_metas.find(address);
@@ -272,7 +303,7 @@ public:
     bool IsMetaCleared(VAddr address, u32 slice) const {
         const auto& it = surface_metas.find(address);
         if (it != surface_metas.end()) {
-            return it.value().clear_mask & (1u << slice);
+            return it->second.clear_mask & (1u << slice);
         }
         return false;
     }
@@ -281,7 +312,7 @@ public:
     bool ClearMeta(VAddr address) {
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
-            it.value().clear_mask = u32(-1);
+            it->second.clear_mask = u32(-1);
             return true;
         }
         return false;
@@ -292,9 +323,9 @@ public:
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
             if (is_clear) {
-                it.value().clear_mask |= 1u << slice;
+                it->second.clear_mask |= 1u << slice;
             } else {
-                it.value().clear_mask &= ~(1u << slice);
+                it->second.clear_mask &= ~(1u << slice);
             }
             return true;
         }
@@ -303,13 +334,14 @@ public:
 
     /// Runs the garbage collector.
     void RunGarbageCollector();
+    void NoteSlotUsage();
 
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
         static constexpr bool BOOL_BREAK = std::is_same_v<FuncReturn, bool>;
-        ImageIds images;
-        ForEachPage(cpu_addr, size, [this, &images, cpu_addr, size, func](u64 page) {
+        const u64 first_page = cpu_addr >> Traits::PAGE_BITS;
+        ForEachPage(cpu_addr, size, [this, first_page, cpu_addr, size, func](u64 page) {
             const auto it = page_table.find(page);
             if (it == nullptr) {
                 if constexpr (BOOL_BREAK) {
@@ -318,30 +350,40 @@ public:
                     return;
                 }
             }
-            for (const ImageId image_id : *it) {
-                Image& image = slot_images[image_id];
-                if (image.flags & ImageFlagBits::Picked) {
+            for (const auto& entry : it->entries) {
+                const u64 base_page = entry.Address() >> Traits::PAGE_BITS;
+                if (page != std::max(first_page, base_page)) {
                     continue;
                 }
-                if (!image.Overlaps(cpu_addr, size)) {
+                if (!entry.Overlaps(cpu_addr, size)) {
                     continue;
                 }
-                image.flags |= ImageFlagBits::Picked;
-                images.push_back(image_id);
+                Image& image = slot_images[entry.id];
                 if constexpr (BOOL_BREAK) {
-                    if (func(image_id, image)) {
+                    if (func(entry.id, image)) {
                         return true;
                     }
                 } else {
-                    func(image_id, image);
+                    func(entry.id, image);
                 }
             }
             if constexpr (BOOL_BREAK) {
                 return false;
             }
         });
-        for (const ImageId image_id : images) {
-            slot_images[image_id].flags &= ~ImageFlagBits::Picked;
+    }
+
+    template <typename Func>
+    void ForEachImageWithAddress(VAddr cpu_addr, Func&& func) {
+        const auto it = page_table.find(cpu_addr >> Traits::PAGE_BITS);
+        if (it == nullptr) {
+            return;
+        }
+        const u32 key = u32(cpu_addr >> 8);
+        for (const auto& entry : it->entries) {
+            if (entry.key == key) {
+                func(entry.id, slot_images[entry.id]);
+            }
         }
     }
 
@@ -350,8 +392,8 @@ private:
     template <typename Func>
     static void ForEachPage(PAddr addr, size_t size, Func&& func) {
         static constexpr bool RETURNS_BOOL = std::is_same_v<std::invoke_result<Func, u64>, bool>;
-        const u64 page_end = (addr + size - 1) >> Traits::PageBits;
-        for (u64 page = addr >> Traits::PageBits; page <= page_end; ++page) {
+        const u64 page_end = (addr + size - 1) >> Traits::PAGE_BITS;
+        for (u64 page = addr >> Traits::PAGE_BITS; page <= page_end; ++page) {
             if constexpr (RETURNS_BOOL) {
                 if (func(page)) {
                     break;
@@ -365,20 +407,16 @@ private:
     /// Copies image memory back to CPU.
     void DownloadImageMemory(ImageId image_id, bool sync = false);
 
-    /// tlg: a recorded image-to-staging copy, written to guest memory after a GPU wait.
-    struct PendingDownload {
-        VAddr guest_address;
-        u32 size;
-        Vulkan::StagingBufferRef staging;
-    };
-    /// Records the copy of a GPU-modified image into a deferred staging allocation.
-    std::optional<PendingDownload> RecordImageDownload(ImageId image_id);
+    /// Size in bytes of the data downloaded for an image.
+    static u32 ImageDownloadSize(const Image& image);
 
-    /// Thread function for copying downloaded images out to CPU memory.
-    void DownloadedImagesThread(const std::stop_token& token);
+    /// Records a copy of the image into staging memory. With deferred the memory is held until
+    /// the caller frees it (StagingBufferPool::FreeDeferred).
+    Vulkan::StagingBufferRef RecordImageCopy(Image& image, u32 download_size, bool deferred);
 
-    /// Create an image from the given parameters
-    [[nodiscard]] ImageId InsertImage(const ImageInfo& info, VAddr cpu_addr);
+    /// readback_linear_images_async: records the copy of the image into a held staging buffer; the
+    /// priority thread puts the pixels into guest memory once the GPU executed the copy.
+    void RecordImageCopyAsync(Image& image, u32 download_size);
 
     /// Register image in the page table
     void RegisterImage(ImageId image);
@@ -388,8 +426,6 @@ private:
 
     /// Track CPU reads and writes for image
     void TrackImage(ImageId image_id);
-    void TrackImageHead(ImageId image_id);
-    void TrackImageTail(ImageId image_id);
 
     /// Stop tracking CPU reads and writes for image
     void UntrackImage(ImageId image_id);
@@ -398,22 +434,29 @@ private:
 
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 
+    void RegisterMeta(VAddr address, MetaDataInfo info);
+    void UnregisterMeta(VAddr address, u64 owner_uid);
+
     /// Removes the image and any views/surface metas that reference it.
     void DeleteImage(ImageId image_id);
 
     /// Touch the image in the LRU cache.
-    void TouchImage(const Image& image);
+    void TouchImage(Image& image) {
+        image_lru_cache.Touch(image, gc_tick);
+    }
 
+    /// Removes image from the cache and schedules it for deletion.
     void FreeImage(ImageId image_id) {
-        const auto& image = slot_images[image_id];
-        ResolveReadbacks(image.info.guest_address, image.info.guest_size, true,
-                         ReadbackSource::ImageFree);
-        UntrackImage(image_id);
+        {
+            std::scoped_lock lk{slot_images[image_id].mutex};
+            UntrackImage(image_id);
+        }
         UnregisterImage(image_id);
         DeleteImage(image_id);
     }
 
     void GarbageCollectImages();
+    void GarbageCollectImageSlots();
     void GarbageCollectSamplers();
 
 private:
@@ -423,12 +466,14 @@ private:
     AmdGpu::Liverpool* liverpool;
     BufferCache& buffer_cache;
     PageManager& tracker;
-    BlitHelper blit_helper;
-    TileManager tile_manager;
+    PageTable page_table;
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
-    tsl::robin_map<u64, Sampler> samplers;
-    std::unordered_set<ImageId> download_images;
+    Common::SlotVector<Sampler> slot_samplers;
+    BlitHelper blit_helper;
+    TileManager tile_manager;
+    absl::flat_hash_map<u64, SamplerId> samplers;
+    absl::flat_hash_set<ImageId> download_images;
     u64 total_used_memory = 0;
     u64 gc_evictions = 0, gc_downloads = 0; ///< tlg: pressure report
     std::chrono::steady_clock::time_point gc_report_time{};
@@ -440,91 +485,16 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
-    Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
-    Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
+    Common::LRUCache<Image> image_lru_cache;
+    Common::LRUCache<Sampler> sampler_lru_cache;
     const bool readback_linear_images;
-    const bool deferred_readbacks = [] {
-        const char* value = std::getenv("TLG_DEFERRED_READBACK");
-        return value && value[0] == '1';
-    }();
-    /// tlg: TLG_STALE_READBACK=1 (needs deferred readbacks). A pending copy only blocks CPU
-    /// writes: CPU reads see the version the GPU published last (one frame late) instead of
-    /// waiting for the GPU. Writes still wait, so no byte is lost.
-    const bool stale_readbacks = deferred_readbacks && [] {
-        const char* value = std::getenv("TLG_STALE_READBACK");
-        return value && value[0] == '1';
-    }();
-    template <bool track>
-    void WatchReadback(VAddr address, u64 size);
-    struct ReadbackImageStat {
-        VAddr address;
-        u32 width, height, bits, copies, cpu_accesses;
-        vk::Format format;
-        u64 Bytes() const { return u64{width} * height * bits / 8; }
-    };
-    std::array<ReadbackImageStat, 16> readback_images{};
-    u64 readbacks_released = 0;
-    ReadbackQueue<Vulkan::StagingBufferRef> pending_readbacks;
-    std::mutex readback_mutex;
-    std::atomic<bool> has_pending_readbacks{false};
-    u64 readbacks_queued = 0, readbacks_completed = 0, readbacks_waited = 0;
-    u64 readbacks_canceled = 0, readbacks_peak_bytes = 0;
-    std::chrono::steady_clock::time_point readback_report = std::chrono::steady_clock::now();
-    ReadbackSourceStats readback_sources;
-    void RetireReadbacks();
-    PageTable page_table;
-    std::mutex mutex;
-    /// tlg: images with the same guest address (guarded by `mutex`). `backing` holds the
-    /// complete contents; `writer` is a newer write not yet copied into it.
-    struct AliasState {
-        u64 backing_uid{};
-        u64 writer_uid{};
-        ImageId backing{};
-        ImageId writer{};
-        u32 members{};
-        void ResetAuthority() {
-            const u32 count = members;
-            *this = {};
-            members = count;
-        }
-    };
-    tsl::robin_map<VAddr, AliasState> alias_states;
-    std::atomic<u64> alias_generation{};
-    [[nodiscard]] bool IsLiveImage(ImageId image_id, u64 image_uid) const {
-        return image_id && slot_images.is_allocated(image_id) &&
-               slot_images[image_id].image_uid == image_uid;
-    }
-    template <typename Func>
-    void ForEachAlias(const Image& image, Func&& func);
-    void SynchronizeAlias(ImageId image_id);
-    [[nodiscard]] bool CommitAliasWriter(AliasState& state);
-    void CopyAlias(ImageId src_id, ImageId dst_id, const Extent3D& extent);
-    void InvalidateAlias(Image& image);
-    // tlg: FindImage results for unchanged image registrations (guarded by `mutex`).
-    struct FindImageCacheEntry {
-        VAddr address = 0;
-        u64 size = 0;
-        Extent3D extent{};
-        vk::Format format{};
-        AmdGpu::ImageType type{};
-        bool exact_fmt = false;
-        BindingType binding{};
-        u32 levels = 0;
-        u32 layers = 0;
-        u64 generation = ~0ULL;
-        ImageId image_id{};
-        int view_mip = -1;
-        int view_slice = -1;
-    };
-    std::array<FindImageCacheEntry, 1024> find_image_cache{};
-    std::atomic<u64> registry_generation{0};
-    std::mutex samplers_mutex;
     std::mutex download_images_mutex;
-    struct MetaDataInfo {
-        MetaType type;
-        s32 clear_mask = -1;
-    };
-    tsl::robin_map<VAddr, MetaDataInfo> surface_metas;
+    bool explicit_download{};
+    std::atomic<u32> async_recorded{};
+    /// Bumped whenever an image is registered or unregistered: a lookup result stays valid while
+    /// it is unchanged (rt_lookup_reuse_enabled).
+    std::atomic<u64> image_generation{};
+    absl::flat_hash_map<VAddr, MetaDataInfo> surface_metas;
 };
 
 } // namespace VideoCore

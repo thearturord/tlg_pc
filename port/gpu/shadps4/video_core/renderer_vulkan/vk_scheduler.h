@@ -4,19 +4,12 @@
 #pragma once
 
 #include <atomic>
-#include <chrono>
-#include <cstring>
 #include <condition_variable>
 #include <deque>
-#include <functional>
-#include <memory>
-#include <span>
-#include <source_location>
-#include <utility>
-#include <vector>
 #include <mutex>
 #include <thread>
 #include <queue>
+#include <span>
 
 #include "tlg_toggles.h"
 #include "common/assert.h"
@@ -24,9 +17,10 @@
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
-#include "video_core/renderer_vulkan/vk_draw_pipe.h"
+#include "video_core/renderer_vulkan/vk_command_recorder.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "vulkan/vulkan.hpp"
 
 namespace tracy {
 class VkCtxScope;
@@ -176,9 +170,8 @@ struct DynamicState {
     float line_width{};
     bool feedback_loop_enabled{};
 
-    /// Commits the dynamic state to the provided command buffer (a null one only clears the
-    /// flags that committing clears).
-    void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
+    /// Commits the dynamic state to the provided command buffer.
+    void Commit(const Instance& instance, const CommandRecorder& cmdbuf);
 
     /// tlg: passes each dirty state change to `emit` as a small command closure holding only
     /// its own values (recording a copy of the whole state per draw was a hot spot), and clears
@@ -576,6 +569,7 @@ struct DynamicState {
     }
 };
 
+using SessionFunc = Common::UniqueFunction<void>;
 using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 
 /// tlg: a block of deferred Vulkan commands. Commands are closures placed in
@@ -702,6 +696,17 @@ public:
     /// Ends current rendering scope.
     void EndRendering();
 
+    /// Starts a new session.
+    void BeginSession();
+
+    /// Returns the current command buffer used for uploads.
+    vk::CommandBuffer UploadCommandBuffer();
+
+    /// Sets a function to be called on every session finalization.
+    void SetSessionCallback(SessionFunc&& on_session) {
+        this->on_session = std::move(on_session);
+    }
+
     /// Sets a function to be called on every scheduler submission.
     void SetSubmitCallback(SubmitFunc&& on_submit) {
         this->on_submit = std::move(on_submit);
@@ -726,19 +731,40 @@ public:
         return dynamic_state;
     }
 
-    /// Returns the current command buffer for recording on the calling thread. With threaded
-    /// recording this first waits until all commands passed to Record() are recorded, then
-    /// records directly (Record() included, so callers may mix both) until the next
-    /// KickRecording() or submission.
-    [[gnu::noinline]] vk::CommandBuffer CommandBuffer() {
-        CheckOwner(__builtin_return_address(0));
-        if (recording_threaded && !direct_mode) {
-            SyncRecording();
-            direct_mode = true;
-            direct_recordings.fetch_add(1, std::memory_order_relaxed);
-            TraceDirectRecording(__builtin_return_address(0));
+    /// Returns the recorder for the current command buffer. With command recording enabled
+    /// (cp_encoder_mode), commands are recorded and replayed into the command buffer at submit.
+    CommandRecorder CommandBuffer() const {
+        return CommandRecorder{sessions.back().primary, record_commands ? current_list : nullptr};
+    }
+
+    /// True if commands are recorded into lists.
+    [[nodiscard]] bool IsRecordingCommands() const noexcept {
+        return record_commands;
+    }
+
+    /// Returns the current command buffer for direct use (host passes, ImGui, screenshots):
+    /// commands recorded so far are replayed into it first, so the order is kept. With the
+    /// encoder thread, waits until it submitted everything handed over and records the rest of
+    /// this tick on the calling thread.
+    vk::CommandBuffer SyncedCommandBuffer();
+
+    /// cp_encoder_mode: 0 = commands go straight into the command buffer, 1 = recorded and
+    /// replayed at submit on this thread, 2 = replayed and submitted on an encoder thread.
+    void SetEncoderMode(u32 mode);
+
+    /// Commands recorded since the last hand-off to the encoder thread (0 when not recording for
+    /// it, for example while a direct tick is open).
+    [[nodiscard]] u64 PendingEncoderCommands() const noexcept {
+        return use_encoder && !direct_active && current_list ? current_list->Size() : 0;
+    }
+
+    /// Encoder thread: submits the open tick and waits until everything handed over is
+    /// submitted (cp_encoder_debug diagnostics). Does nothing without the encoder.
+    void SyncEncoder() {
+        if (use_encoder && !direct_active) {
+            Flush();
+            WaitEncoderIdle();
         }
-        return current_cmdbuf;
     }
 
     /// TLG_RECORDER_TRACE=1: prints the most frequent CommandBuffer() callers every 2000 calls.
@@ -891,17 +917,50 @@ public:
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Runs as soon as possible in another thread.
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
+        DeferPriorityOperation(std::move(func), CurrentTick());
+    }
+
+    /// Defers an operation until the gpu has reached the given tick.
+    /// Operations run in the order they were deferred, in another thread.
+    void DeferPriorityOperation(Common::UniqueFunction<void>&& func, u64 tick) {
+        num_priority_ops.fetch_add(1, std::memory_order_acq_rel);
+        u64 max_tick = max_priority_tick.load(std::memory_order_relaxed);
+        while (tick > max_tick && !max_priority_tick.compare_exchange_weak(
+                                      max_tick, tick, std::memory_order_acq_rel)) {
+        }
         {
             std::unique_lock lk(priority_pending_ops_mutex);
-            priority_pending_ops.emplace(std::move(func), CurrentTick());
+            priority_pending_ops.emplace(std::move(func), tick);
         }
         priority_pending_ops_cv.notify_one();
     }
 
+    /// Returns true when a deferred priority operation waits for the command buffer that is
+    /// still being recorded, so it has to be submitted for the operation to ever run.
+    [[nodiscard]] bool PriorityOperationsNeedSubmit() const noexcept {
+        return max_priority_tick.load(std::memory_order_acquire) >= CurrentTick();
+    }
+
+    /// Returns true when deferred priority operations have not finished running.
+    [[nodiscard]] bool HasPriorityOperations() const noexcept {
+        return num_priority_ops.load(std::memory_order_acquire) != 0;
+    }
+
+    /// Waits until all deferred priority operations have run. The ticks they wait on must
+    /// already be submitted.
+    void WaitPriorityOperations();
+
+    /// True on the thread running deferred priority operations. Work done there must never wait
+    /// for another priority operation (it would wait for itself).
+    [[nodiscard]] static bool OnPriorityThread() noexcept;
+
     static std::mutex submit_mutex;
+    /// True on a thread that holds submit_mutex inside SubmitExecution (the submit callback must
+    /// not lock it again).
+    static inline thread_local bool submit_lock_held = false;
 
 private:
-    void AllocateWorkerCommandBuffers();
+    void EndSession();
 
     std::unique_ptr<RecordChunk> AcquireChunk();
 
@@ -911,13 +970,47 @@ private:
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
+    // Encoder thread (cp_encoder_mode 2). The ordering thread closes a tick by handing its
+    // command list over; the encoder replays lists into command buffers and submits them in
+    // tick order. While direct_active, the ordering thread records the open tick into the
+    // session's command buffer itself (after SyncedCommandBuffer) and submits it (the encoder is
+    // idle).
+    struct EncoderJob {
+        std::unique_ptr<CommandList> list;
+        SubmitInfo info;
+        u64 signal_value{};
+    };
+    void EncoderThread(std::stop_token stoken);
+    void HandOffToEncoder(SubmitInfo& info, u64 signal_value);
+    void SubmitCommandBuffers(std::span<const vk::CommandBuffer> cmd_buffers, SubmitInfo& info);
+    void WaitEncoderIdle();
+
 private:
     const Instance& instance;
     Semaphore work_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
+    SessionFunc on_session{};
     SubmitFunc on_submit{};
-    vk::CommandBuffer current_cmdbuf;
+    struct Session {
+        vk::CommandBuffer upload{};
+        vk::CommandBuffer primary{};
+    };
+    std::vector<Session> sessions;
+    // Command recording (cp_encoder_mode). current_list collects the commands of the open tick.
+    std::unique_ptr<CommandList> current_list_owner{std::make_unique<CommandList>()};
+    CommandList* current_list{current_list_owner.get()};
+    bool record_commands{};
+    bool use_encoder{};
+    bool encoder_sync{}; ///< cp_encoder_mode 3: wait for each list to be submitted.
+    bool direct_active{};
+    std::mutex encoder_mutex;
+    std::condition_variable_any encoder_cv;
+    std::deque<EncoderJob> encoder_jobs;
+    std::vector<std::unique_ptr<CommandList>> free_lists;
+    u64 jobs_handed{};
+    u64 jobs_done{};
+    std::mutex command_pool_mutex;
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;
@@ -930,38 +1023,16 @@ private:
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
+    std::atomic<u32> num_priority_ops{};
+    std::atomic<u64> max_priority_tick{};
     std::jthread priority_pending_ops_thread;
+    std::jthread encoder_thread;
     RenderState render_state;
     bool is_rendering = false;
-    // tlg: threaded recording
-    std::unique_ptr<RecordChunk> record_chunk;
-    void (*owner_hook)(void*, void*) = nullptr;
-    void* owner_context = nullptr;
-
-    [[gnu::always_inline]] void CheckOwner(void* caller) {
-        if (owner_hook && !DrawPipe::OnStageB()) [[unlikely]] {
-            owner_hook(owner_context, caller);
-        }
-    }
-    std::vector<std::unique_ptr<RecordChunk>> full_chunks;
-    std::mutex recorder_mutex;
-    std::condition_variable_any recorder_cv;
-    std::condition_variable_any recorder_idle_cv;
-    std::deque<std::unique_ptr<RecordChunk>> recorder_queue;
-    std::vector<std::unique_ptr<RecordChunk>> free_chunks;
-    bool recorder_busy = false;
-    std::atomic<size_t> queued_chunks{0}; ///< recorder_queue.size() for lock-free polling
-    bool recorder_sleeping = false; ///< waiting on recorder_cv (guarded by recorder_mutex)
-    bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
-    u64 host_copies_issued = 0;
-    std::atomic<u64> host_copies_done{0};
-    std::atomic<u64> deferred_signals_issued{0}; ///< by the thread recording (A or B)
-    std::shared_ptr<std::atomic<u64>> deferred_signals_done =
-        std::make_shared<std::atomic<u64>>(0);
-    // tlg: whether recorder_thread runs, read on every Record(). std::jthread::joinable()
-    // compares thread ids, which on Windows (libc++ over winpthreads) costs two system calls.
-    bool recording_threaded{false};
-    std::jthread recorder_thread;
+    /// True while the commands replayed so far leave a render pass open. Unlike is_rendering,
+    /// which follows the recording thread, this one follows the replay, so a worker can record
+    /// "end the pass if there is one".
+    bool replay_rendering = false;
     tracy::VkCtxScope* profiler_scope{};
 };
 

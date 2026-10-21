@@ -3,16 +3,24 @@
 
 #pragma once
 
-#include <cstdlib>
+#include "core/native_direct.h"
+#include "core/native_draw.h"
 
+#include "video_core/native_draw_tag.h"
+#include "video_core/readback_policy.h"
+
+#include <source_location>
 #include <condition_variable>
 #include <deque>
 #include <coroutine>
+#include <deque>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <semaphore>
 #include <span>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #include "tlg_freeze.h"
 #include <queue>
@@ -22,11 +30,16 @@
 #include "common/types.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/draw_state.h"
 #include "video_core/amdgpu/regs.h"
+#include "video_core/readback_stats.h"
 
 namespace Vulkan {
 class Rasterizer;
-}
+struct DrawPlan;
+struct DispatchPlan;
+struct FixedState;
+} // namespace Vulkan
 
 namespace Libraries::VideoOut {
 struct VideoOutPort;
@@ -35,6 +48,10 @@ struct VideoOutPort;
 namespace AmdGpu {
 
 union PM4Header;
+struct PM4CmdWaitRegMem;
+struct PM4CmdEventWriteEop;
+struct PM4DmaData;
+struct PM4CmdReleaseMem;
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -66,6 +83,7 @@ struct Liverpool {
     };
 
     Regs regs{};
+    u32 index_buffer_num_indices{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
     /// tlg: register blocks written since the last draw handed to the draw recording thread
@@ -97,8 +115,48 @@ public:
     explicit Liverpool();
     ~Liverpool();
 
-    void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb);
+    /// `partial`: a part of a command buffer that the game is still recording (streaming of the draws); it does not count as work submitted by the game.
+    void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bool partial = false);
+    /// The register groups of the draw state: the group of a register is fixed by its index. The registers of a native record are stored by group.
+    enum RegisterGroup : u32 {
+        GroupOther,
+        GroupArguments,
+        GroupVsProgram,
+        GroupVsUserData,
+        GroupPsProgram,
+        GroupPsUserData,
+        GroupInterpolants,
+        GroupTargets,
+    };
+    static u32 RegisterGroupOf(u32 index);
+    /// The GPU is idle as far as the game's own submits are concerned (work streamed ahead of the game's submit does not count).
+    bool IsGpuIdleForGame() const {
+        return IsGpuIdle() || stream_open.load(std::memory_order_acquire) != 0;
+    }
+    /// Streaming of the draws: a frame has parts of its command buffer handed over and the real submit is still to come; the GpuIdle signal waits for it.
+    std::atomic<u32> stream_open{0};
+    std::atomic<u32> partial_pending{0}; ///< streamed spans queued and not done
+    std::mutex partial_mutex;
+    std::unordered_set<void*> partial_handles;
     void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb);
+
+    /// What the rasterizer reads while it executes draws and dispatches. Without the command
+    /// processor split (cp_split_mode) these are the command processor's own registers; with it
+    /// they are the raster thread's mirror, kept in sync through the operation queue.
+    [[nodiscard]] DrawRegs& RasterRegs() noexcept {
+        return direct_state;
+    }
+    [[nodiscard]] std::array<CbDbExtent, NUM_COLOR_BUFFERS>& RasterCbExtents() noexcept {
+        return last_cb_extent;
+    }
+    [[nodiscard]] CbDbExtent& RasterDbExtent() noexcept {
+        return last_db_extent;
+    }
+    /// True while the raster thread runs the rasterizer (cp_split_mode): the pipeline lookup is
+    /// then done by the command processor thread.
+    [[nodiscard]] bool SplitActive() const noexcept {
+        return split_active;
+    }
 
     void SubmitDone() noexcept {
         std::scoped_lock lk{submit_mutex};
@@ -110,29 +168,28 @@ public:
 
     void WaitGpuIdle() noexcept {
         std::unique_lock lk{submit_mutex};
-        submit_cv.wait(lk, [this] { return num_submits == 0; });
+        submit_cv.wait(lk, [this] { return num_submits == 0 && RasterIdle(); });
     }
 
     /// tlg: also the draw recording thread and the fences it deferred are done (see
     /// work_retired). sceGnmSubmitDone does not block the guest when this is true.
     bool IsGpuIdle() const {
-        static const bool use_retired = [] {
-            const char* env = std::getenv("TLG_WORK_RETIRED");
-            return !(env && env[0] == '0');
-        }();
-        return num_submits == 0 && (work_retired || !use_retired);
+        return num_submits == 0 && RasterIdle();
     }
 
     void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
         vo_port = port;
     }
 
-    void BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
-        rasterizer = rasterizer_;
-    }
+    void BindRasterizer(Vulkan::Rasterizer* rasterizer_);
 
     template <bool wait_done = false>
     void SendCommand(auto&& func) {
+        if (split_active && std::this_thread::get_id() == front_id) {
+            // The command processor thread read guest memory that faulted (GPU data): the
+            // callback must see all earlier work executed, as it did before the split.
+            DrainRaster();
+        }
         if constexpr (wait_done) {
             std::binary_semaphore sem{0};
             {
@@ -144,7 +201,7 @@ public:
                 ++num_commands;
                 submit_cv.notify_one();
             }
-            TlgFreeze::WaitScope wait{"GPU thread (command)"}; // tlg: freeze report
+            WakeRaster();
             sem.acquire();
         } else {
             std::scoped_lock lk{submit_mutex};
@@ -152,6 +209,7 @@ public:
             ++num_commands;
             submit_cv.notify_one();
         }
+        WakeRaster();
     }
 
     void ReserveCopyBufferSpace() {
@@ -175,7 +233,7 @@ public:
         std::array<u32, Pm4BufferSize> tmp_packet;
         u32 tmp_dwords;
     };
-    Common::SlotVector<AscQueueInfo> asc_queues{};
+    Common::SlotVector<AscQueueInfo> asc_queues{64};
 
     std::thread::id GetGpuCommandProcessorThread() {
         return gpu_id;
@@ -222,13 +280,208 @@ private:
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, u64 seq = NoSeq);
+    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, std::shared_ptr<Core::NativeDirect::Buffer> direct = {});
+    Task ProcessDirect(std::shared_ptr<Core::NativeDirect::Buffer> direct, std::span<const u32> ccb = {});
+    Task DirectWait(const PM4CmdWaitRegMem& wait);
+    void StartNativeTag(const u32* tag);
+    void ExecuteDma(const PM4DmaData& dma);
+    void ExecuteSetShReg(const PM4Header* header);
+    void ExecuteSetContextReg(const PM4Header* header);
+    void ExecuteEventWrite(const PM4Header* header);
+    void ExecuteDispatchDirect(const PM4Header* header, u64 base_addr);
+    void ExecuteWriteData(const PM4Header* header);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
-    Task ProcessCompute(std::span<const u32> acb, u32 vqid);
+    Task ProcessCompute(std::span<const u32> acb, u32 vqid, std::shared_ptr<Core::NativeDirect::Buffer> direct = {});
+    Task ProcessDirectAsc(std::shared_ptr<Core::NativeDirect::Buffer> direct, u32 vqid);
+    Task DirectWaitAsc(const PM4CmdWaitRegMem& wait, u32 vqid);
+    void StartAscTag(const u32* tag, const void* address, u32 vqid);
+    void SignalComputeRelease(const PM4CmdReleaseMem& release, u32 vqid, u32 pipe_id);
 
     void ProcessCommands();
     void Process(std::stop_token stoken);
+
+    // ---- Command processor split (documents/tlg/cp-split-design.md) ----
+    struct RasterSplit;
+    struct RasterCall;
+    struct RasterOp;
+    /// Tag written by the game in front of the next draw (front thread only).
+    VideoCore::NativeTag native_tag_pending{};
+    u64 native_exec_calls{};
+    u32 native_tag_skips{};
+    void StartRasterSplit();
+    void StopRasterSplit();
+    void RasterMain(std::stop_token stoken);
+    void ExecRasterCall(const RasterCall& call, const Vulkan::DrawPlan* draw_plan,
+                        const Vulkan::DispatchPlan* dispatch_plan);
+    /// Queues `func` (a closure) for the raster thread, or runs it now without the split.
+    /// `writes_memory`: the closure writes guest memory that later pipeline lookups may read
+    /// (descriptor tables, shader code), so the command processor thread must not plan a draw
+    /// before it has run.
+    void RasterRun(Common::UniqueFunction<void>&& func, bool wait = false,
+                   bool writes_memory = false,
+                   std::source_location site = std::source_location::current());
+    /// Queues a draw or dispatch. Without the split it runs right away.
+    void RasterDispatch(const RasterCall& call);
+    /// Draws the pending native draw tag from its record instead of from command packets.
+    void ExecuteNativeDraw(const void* header = nullptr, u32 asc_vqid = ~0u, u32 index_count = ~0u);
+    void SignalGraphicsEop(const PM4CmdEventWriteEop& event_eop);
+    bool native_follow_pending{}; ///< an executed draw waits for its draw packet (index count)
+    void RasterPush(RasterOp&& op, bool wait);
+    /// Blocks until every queued closure that writes guest memory has run.
+    void DrainRasterWrites();
+    /// A command processor write to guest memory, done in order with the draws.
+    void CpWriteData(void* address, const u32* data, u32 data_size, u32 queue);
+    /// Blocks until the raster thread has executed everything queued so far.
+    void DrainRaster();
+    [[nodiscard]] bool RasterIdle() const noexcept;
+    /// Register writes made by the command processor: copied to the raster mirror.
+    void MirrorRegs(u32 dword_offset, u32 count);
+    void MirrorRegsRaw(u32 dword_offset, u32 count);
+    void ApplyStateTemplate(const Core::NativeDraw::StateTemplate& state);
+    void MirrorObject(const void* object, size_t size);
+    void MirrorSetDefaults();
+
+    /// Registers of executed native draws stay in the register file (and the raster mirror) between draws; only the
+    /// registers that differ from the previous draw are written. `truth` keeps what the command packets wrote for
+    /// every register that currently holds a record's value, so the packet path (and a fast clear eliminate) gets
+    /// its own state back before it runs (front thread only).
+    struct NativeOverlay {
+        std::vector<u64> bits; ///< register indices that hold a record's value
+        std::vector<u32> list;
+    };
+    NativeOverlay overlay;
+    /// The registers of a record come in groups (targets, the two stage programs, their user data, the interpolants, the draw arguments, the rest). A group
+    /// whose values are the ones the last record applied, and that nothing has written since, is not applied again (front thread only).
+    static constexpr u32 NumRegisterGroups = 8;
+    std::array<u64, NumRegisterGroups> group_applied_sig{};
+    std::array<bool, NumRegisterGroups> group_sig_valid{};
+    std::array<bool, NumRegisterGroups> group_sig_full{}; ///< the group was applied with the fixed-function registers too
+    u32 group_sig_tick{};
+    /// The native path's private register block: the mirror of the register file (packets and state templates write both) plus what the executed records wrote,
+    /// never restored. Executed draws, clears and operations are planned from it; the shared `front_state` and its overlay serve the game's own packets only.
+    DrawRegs exec_state{};
+    bool exec_state_ready{};
+    std::array<u64, NumRegisterGroups> exec_group_applied_sig{};
+    std::array<bool, NumRegisterGroups> exec_group_sig_valid{};
+    std::array<bool, NumRegisterGroups> exec_group_sig_full{};
+    u32 exec_group_tick{};
+    /// What the executed records wrote into the private block since the registers were last restored (a fast clear eliminate, a depth clear and a draw of the
+    /// game's own packets restore them to the register file's values, as the shared image's overlay does).
+    std::vector<u64> exec_overlay_bits;
+    std::vector<u32> exec_overlay_list;
+    void ExecRestore();
+    void ExecForget(u32 dword_offset, u32 count);
+    void SeedExecState();
+    void ExecApplyRecord(const Core::NativeDraw::ExecDraw& draw, bool skip_fixed, u32 index_count);
+    void ExecSetWord(u32 index, u32* word, u32 value);
+    void InvalidateExecGroup(u32 index);
+    Vulkan::DrawPlan* native_state_plan{}; ///< the draw planned from the private block, to compare with the plan made from the shared image (legacy switch on)
+    std::array<u64, NumRegisterGroups> group_applied_hash{};
+    std::array<bool, NumRegisterGroups> group_applied_valid{};
+    void ApplyRecordRegisters(const Core::NativeDraw::ExecRegister* regs, u32 count, bool skip_fixed);
+    void ApplyRecordGroups(const Core::NativeDraw::ExecDraw& draw, bool skip_fixed);
+    void OverlaySetWord(u32 index, u32* word, u32 value);
+    void InvalidateRegisterGroup(u32 index);
+    void InvalidateRegisterGroups();
+    bool native_exec_scope{}; ///< the draw being dispatched is an executed record
+    u32 native_fixed_stale{};
+    bool native_fixed_verify{};
+    u64 native_fixed_draws{};
+    u64 native_inputs_key{};                        ///< identity of the render target inputs of the draw being dispatched (0: unknown)
+    std::array<u32, 16> exec_vertex_user_data{};     ///< the typed user data of the last executed records, per stage
+    std::array<u32, 16> exec_pixel_user_data{};
+    u32 exec_plan_tick{};
+    Vulkan::DrawPlan* native_exec_plan{};            ///< a draw planned from its record: RasterDispatch pushes it instead of planning
+    Vulkan::DrawPlan* native_audit_plan{};           ///< the same draw planned from its record, to compare with the plan made from the registers
+    u16 native_audit_vertex_mask{}, native_audit_pixel_mask{};
+    u32 native_audit_kind{};
+    u64 native_exec_key{}; ///< pipeline key of the draw being dispatched, from the record (0: look the pipeline up from the registers)
+    const Vulkan::FixedState* native_fixed{}; ///< fixed-function state of the draw being dispatched, from the engine's objects (null: from the registers)
+    void OverlaySet(u32 index, u32 value);
+    void OverlayRestore();
+    void OverlayForget(u32 dword_offset, u32 count);
+    void OverlayForgetAll();
+    /// Wakes the raster thread (it runs SendCommand callbacks) when the split is active.
+    void WakeRaster();
+
+    /// Label timeline: per fence label, the latest value a fence packet the command processor
+    /// already recorded will write, while fence writes are held back (async readback fences
+    /// write them once the GPU finished and the readbacks landed). A command stream wait only
+    /// needs its producer to be recorded ahead of it in the single Vulkan queue, not executed,
+    /// so it may pass on that value. When everything recorded has landed, guest memory is
+    /// authoritative again, and so it is as soon as someone else writes the label meanwhile.
+    struct LabelState {
+        VAddr address;
+        u32 num_bytes;
+        u32 queue; ///< Queue of the latest fence: 0 = graphics, n = compute ring n - 1.
+        u64 latest_value;
+        u64 latest_seq; ///< Order in which the fence packets were processed.
+        u64 gpu_tick;   ///< Scheduler tick holding the GPU work before the latest fence.
+        u32 pending;    ///< Recorded fences whose write hasn't landed yet.
+        bool overridden;
+        /// Guest memory before the first held back fence, then every value recorded since.
+        std::vector<u64> known_values;
+    };
+    static constexpr size_t MaxKnownLabelValues = 64;
+    struct FenceMatch {
+        bool satisfied{};
+        VAddr label_address{}; ///< The matched label and the fence recorded last for it.
+        u64 seq{};
+        u64 gpu_tick{};
+        u32 queue{};
+        u32 value{};
+        u32 initial{};
+    };
+    u64 RecordFence(VAddr address, u64 value, u32 num_bytes, u32 queue);
+    /// Raster thread: the scheduler tick holding the work before fence `seq` of a label.
+    void SetFenceTick(VAddr address, u64 seq);
+    [[nodiscard]] u64 GetFenceTick(VAddr address, u64 seq);
+    void RetireFence(VAddr address, u64 seq);
+    FenceMatch MatchRecordedFence(const PM4CmdWaitRegMem& wait_reg_mem);
+
+    /// readback_fence_wait_shortcut: 0 = off, 1 = graphics queue waits, 2 = graphics and compute
+    /// queue waits, 3 = like 2 plus a GPU barrier that orders the work after the wait on the
+    /// GPU (the wait passes on a recorded fence instead of a finished one).
+    [[nodiscard]] bool FenceShortcutEnabled(bool is_compute) const noexcept {
+        const s32 override_mode = VideoCore::ReadbackPolicy::Get().fence_shortcut_override.load(std::memory_order_relaxed);
+        const u32 mode = override_mode >= 0 ? static_cast<u32>(override_mode) : fence_wait_shortcut;
+        return mode != 0 && (!is_compute || mode >= 2);
+    }
+
+    /// Called when a wait passed on a recorded fence: orders the following GPU work after it.
+    void OnWaitPassedOnFence(const PM4CmdWaitRegMem& wait_reg_mem, const FenceMatch& match,
+                             u32 queue);
+
+    /// Logs a command stream wait that has been blocked for more than 2 seconds.
+    void ReportLongWait(const PM4CmdWaitRegMem& wait_reg_mem, const char* queue, u64 wait_start,
+                        bool& reported);
+    /// Logs a MemSemaphore/Rewind wait that has been blocked for more than 2 seconds.
+    void ReportLongSpin(const char* what, const void* address, u64 wait_start, bool& reported);
+
+    /// A command processor memory write (WriteData) normally lands when the packet is processed.
+    /// If a fence write to the same label is still held back, the GPU would run it after that
+    /// fence, so it is queued behind it instead. Returns false when it can be written now.
+    bool DeferWriteBehindFences(void* address, const u32* data, u32 num_bytes, u32 queue);
+
+    /// Runs `signal` once the readbacks before this fence are in guest memory, recording the
+    /// fence value (if known) in the label timeline meanwhile.
+    /// Fence latency per FenceKind (index = bit position): the time from parsing the fence packet
+    /// to the raster thread starting it ("queue"), from there to the moment its signal is about to
+    /// run, after the GPU and the readbacks ("gpu"), and the sum. Published by the debug server.
+    struct FenceLatencyStat {
+        std::atomic<u64> count{};
+        std::atomic<u64> queue_ns{};
+        std::atomic<u64> gpu_ns{};
+        std::atomic<u64> total_ns{};
+        std::atomic<u64> max_total_ns{};
+    };
+    std::array<FenceLatencyStat, VideoCore::NumFenceKinds> fence_latency;
+    void NoteFenceLatency(VideoCore::FenceKind kind, u64 queue_ns, u64 gpu_ns);
+
+    void SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal, bool must_sync,
+                                   VAddr address, u64 value, u32 num_bytes, u32 queue,
+                                   VideoCore::FenceKind kind);
 
     struct GpuQueue {
         std::mutex m_access{};
@@ -279,10 +532,25 @@ private:
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};
     std::thread::id gpu_id;
-#if defined(__linux__) || defined(_WIN32)
-    u32 gpu_tid{};
+    std::thread::id front_id;
+#ifdef __linux__
+    u32 gpu_tid;
 #endif
     s32 curr_qid{-1};
+
+    /// The draw state of the command processor (kept equal to `regs`, planning reads it), what the rasterizer reads
+    /// without the split (rebuilt from `regs` before each operation) and the raster thread's own with it.
+    DrawRegs front_state{};
+    DrawRegs direct_state{};
+    bool split_active{};
+    std::unique_ptr<RasterSplit> split;
+    const u32 fence_wait_shortcut;
+    std::mutex recorded_fence_mutex;
+    std::vector<LabelState> label_states;
+    u64 next_fence_seq{};
+    std::unordered_set<VAddr> logged_compute_passes;
+    std::unordered_set<VAddr> logged_overrides;
+    std::unordered_set<VAddr> logged_deferred_writes;
 };
 
 } // namespace AmdGpu

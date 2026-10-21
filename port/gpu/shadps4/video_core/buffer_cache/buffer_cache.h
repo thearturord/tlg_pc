@@ -3,13 +3,28 @@
 
 #pragma once
 
-#include "tlg_copy.h"
+#include "video_core/readback_policy.h"
 
+#include <condition_variable>
+#include <mutex>
+#include <vector>
+
+#include <atomic>
 #include <deque>
+#include <map>
+#include <mutex>
+#include <shared_mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 #include <boost/container/small_vector.hpp>
+#include <tsl/robin_map.h>
 
+#include "common/hash_u64.h"
 #include "common/interval_set.h"
 #include "common/types.h"
+#include "common/unique_function.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
@@ -35,6 +50,7 @@ namespace VideoCore {
 class TextureCache;
 class MemoryTracker;
 class PageManager;
+class ReadbackBatch;
 
 class BufferCache {
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
@@ -60,6 +76,10 @@ public:
         return &gds_buffer;
     }
 
+    [[nodiscard]] const Buffer* GetNullIndexBuffer() const noexcept {
+        return null_index_buffer.get();
+    }
+
     /// Retrieves the device local DBA page table buffer.
     [[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept {
         return bda_pagetable_buffer.get();
@@ -71,7 +91,7 @@ public:
     }
 
     /// Retrieves the stream buffer.
-    StreamBuffer& GetStreamBuffer() noexcept {
+    [[nodiscard]] StreamBuffer& GetStreamBuffer() noexcept {
         return stream_buffer;
     }
 
@@ -79,6 +99,8 @@ public:
     u32 GetSparsePageShift() const noexcept {
         return block_shift;
     }
+
+    void TickFrame();
 
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
@@ -97,6 +119,13 @@ public:
                                                              bool is_written,
                                                              bool is_texel_buffer = false);
 
+    /// The arena range of a copy destination that is downloaded in stream order (an explicit readback): the CPU's pending writes are
+    /// uploaded, the range is not marked GPU modified.
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForDownload(VAddr device_addr, u32 size);
+
+    /// The largest copy RecordDmaDownload downloads.
+    static constexpr u32 MaxDmaDownload = 4_MB;
+
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
 
@@ -106,14 +135,41 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
-    /// Processes the fault buffer.
-    void ProcessFaultBuffer();
-
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
 
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
+
+    /// True once if downloads for the priority thread were recorded since the last call (the
+    /// command buffer must reach the GPU soon).
+    [[nodiscard]] bool TakeAsyncRecorded() {
+        return async_recorded.exchange(0, std::memory_order_acq_rel) != 0;
+    }
+
+    /// A guest memory write by the command processor (WriteData, occlusion results, DMA...).
+    /// Drops reusable stream copies it overlaps.
+    void NoteCpGuestWrite(VAddr device_addr, u64 size) {
+        if (StreamReuseOn()) {
+            InvalidateStreamReuse(device_addr, size);
+        }
+    }
+
+    /// readback_dma_async: copies [dst, dst + size) of the arena into a private staging buffer; the
+    /// priority thread puts the bytes into guest memory once the GPU executed the copy.
+    void RecordDmaDownload(const Buffer* arena, VAddr dst, u32 size, bool tracked = false);
+
+    /// Waits until the explicit downloads (RecordDmaDownload with `tracked`) over the range have landed; 0 nothing in flight, 1 waited, 2 timed out.
+    u32 WaitForExplicitDownloads(VAddr device_addr, u64 size, u32 timeout_ms);
+
+    /// Unprotects ranges whose asynchronous readback has landed. Must run on the GPU thread.
+    void ApplyPendingUnmarks();
+
+    /// Returns true if an asynchronous download of part of the range has not landed yet.
+    bool IsDownloadInFlight(VAddr device_addr, u64 size);
+
+    /// Waits until asynchronous downloads of the range have landed in guest memory.
+    void WaitForDownloads(VAddr device_addr, u64 size);
 
 private:
     struct ArenaBinds {
@@ -133,19 +189,57 @@ private:
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
-    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+    struct DownloadResult {
+        u64 bytes{};
+    };
+
+    using DownloadCopies = boost::container::small_vector<vk::BufferCopy, 1>;
+
+    DownloadResult DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+
+    /// Gathers GPU modified ranges to download and clears them from the modified range set.
+    u64 CollectDownloadCopies(const Buffer* arena, VAddr device_addr, u64 size,
+                              DownloadCopies& copies);
+
+    /// Records the copy into download memory. The returned function writes the data back to
+    /// guest memory and must only run once the GPU has executed the copy. With deferred_unmark
+    /// the download memory is held until then and the protection of the range is lifted on the
+    /// GPU thread (see ApplyPendingUnmarks).
+    Common::UniqueFunction<void> RecordDownloadCopies(const Buffer* arena, VAddr device_addr,
+                                                      u64 size, DownloadCopies&& copies,
+                                                      u64 total_size_bytes, bool deferred_unmark);
+
+    /// Window around a readback request: GPU-modified ranges come as many small scattered
+    /// islands, so a download is widened to the 512 KB block around the request.
+    std::pair<VAddr, VAddr> ReadbackWindow(const Buffer* arena, VAddr device_addr, u64 size) const;
+
+    /// Readback for a guest thread: the command processor records and submits the downloads and
+    /// goes on while the faulting thread waits for them to land.
+    void ReadMemoryForGuest(VAddr device_addr, u64 size, bool is_write);
+
+    /// End of a fault readback, on the GPU thread: drops GPU marks with nothing left behind them,
+    /// downloads what the GPU wrote to the page in the meantime (waiting), and marks the CPU write.
+    void FinishFaultReadback(VAddr device_addr, u64 size, bool is_write, VAddr window_start,
+                             u64 window_size, u64& bytes);
+
+    /// Unprotects the pages in the range that the GPU didn't write again since their data was
+    /// downloaded. Must run on the GPU thread.
+    void UnmarkSettledPages(VAddr device_addr, u64 size);
+
+    /// Drops the reusable stream copies if a guest memory write overlaps them.
+    void InvalidateStreamReuse(VAddr device_addr, u64 size);
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
 
-    /// tlg: batched small copies on the copy threads (TlgCopy::QueueCopy).
-    static void RunGuestCopy(const TlgCopy::Item& item);
-    void SmallGuestCopy(const TlgCopy::Item& item);
-
-    const Buffer* UploadCopies(const Buffer* arena, std::span<vk::BufferCopy> copies,
-                               size_t total_size_bytes);
-
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
+
+    /// Bytes the last SynchronizeMemory of this thread copied from guest memory (resource census).
+    static inline thread_local u64 last_upload_bytes{};
+public:
+    /// True when the last ObtainBufferForImage of this thread read GPU written memory (the data came from the arena, not from guest memory).
+    static inline thread_local bool last_image_source_gpu{};
+private:
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
@@ -165,10 +259,69 @@ private:
 
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
+    std::unique_ptr<Buffer> null_index_buffer;
     RangeSet gpu_modified_ranges;
+
+    struct ExplicitDownload {
+        VAddr addr;
+        u64 size;
+        u64 id;
+    };
+    std::mutex explicit_mutex;
+    std::condition_variable explicit_landed;
+    std::vector<ExplicitDownload> explicit_inflight;
+    u64 explicit_next_id{1};
+
+    /// Answers of ObtainBuffer for large read-only and for written ranges: the same request in the same command
+    /// buffer with the tracker and the range bookkeeping unchanged has nothing to upload and nothing to mark.
+    struct ObtainMemo {
+        VAddr addr{};
+        u32 size{};
+        u32 flags{};
+        const Buffer* arena{};
+        u64 offset{};
+        u64 epoch{~0ull};
+        u64 tick{~0ull};
+    };
+    static constexpr u32 ObtainMemoSlots = 8192;
+    std::unique_ptr<ObtainMemo[]> obtain_memo;
+    std::atomic<u64> range_epoch{0}; ///< bumped when the GPU modified ranges shrink or the arenas move
+    /// Guards gpu_modified_ranges.
+    mutable std::shared_mutex gpu_ranges_mutex;
+
+    /// readback_stream_reuse_enabled: stream copies of the current command buffer by range. A copy
+    /// is only reused while the command buffer, and the stream buffer pass, are the same.
+    const bool stream_reuse_enabled;
+    bool StreamReuseOn() const {
+        const s32 override_mode = VideoCore::ReadbackPolicy::Get().stream_reuse_override.load(std::memory_order_relaxed);
+        return override_mode >= 0 ? override_mode != 0 : stream_reuse_enabled;
+    }
+    /// readback_async_guest_faults: guest threads wait for their readbacks themselves.
+    const bool async_guest_faults;
+    tsl::robin_map<u64, u64, Common::U64Hash> stream_reuse;
+    u64 stream_reuse_tick{};
+    u64 stream_reuse_wraps{};
+    VAddr stream_reuse_min{~0ULL};
+    VAddr stream_reuse_max{};
+
+    /// Asynchronous downloads recorded but not landed in guest memory yet.
+    struct InflightDownload {
+        VAddr addr;
+        u64 size;
+        u64 id;
+    };
+    std::mutex pending_unmarks_mutex;
+    std::vector<std::pair<VAddr, u64>> pending_unmarks;
+    std::vector<InflightDownload> inflight_downloads; // guarded by pending_unmarks_mutex
+    u64 next_inflight_id{};
+
+    std::mutex dma_mutex;
+    std::vector<std::unique_ptr<Buffer>> dma_pool;
+    std::atomic<u32> async_recorded{};
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
+    bool fault_process_pending{};
 
     std::array<const Buffer*, MAX_ARENA_PAGES> address_space{};
     u64 arena_page_bits{MAX_ARENA_PAGE_BITS};
@@ -191,6 +344,18 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    /// Blocks verified resident (block + 1; 0 = empty). Residency is never revoked, so entries stay valid.
+    std::array<u64, 4096> resident_block_cache{};
+    /// Ranges of more blocks (vertex and index buffers) verified resident, round robin.
+    std::array<std::pair<u64, u64>, 8> resident_range_cache{};
+    u32 resident_range_next{};
+    /// Upload ring ranges already uploaded in the current command buffer (see UntrackedRing).
+    struct RingUpload {
+        u64 lo{};
+        u64 hi{};
+        u64 tick{};
+    };
+    std::array<RingUpload, 256> ring_uploads{};
 
     u32 arena_memory_type_index{};
     u32 block_size{};

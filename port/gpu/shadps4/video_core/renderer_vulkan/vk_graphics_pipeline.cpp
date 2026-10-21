@@ -48,11 +48,13 @@ GraphicsPipeline::GraphicsPipeline(
     const Shader::Profile& profile, const GraphicsPipelineKey& key_,
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
-    std::optional<const Shader::Gcn::FetchShaderData> fetch_shader_,
-    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
-    : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
-      fetch_shader{std::move(fetch_shader_)} {
-    const auto started = Clock::now();
+    const Shader::Gcn::FetchShaderData* fetch_shader_, std::span<const vk::ShaderModule> modules,
+    SerializationSupport& sdata, bool preloading)
+    : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_} {
+    if (fetch_shader_) {
+        fetch_shader = *fetch_shader_;
+    }
+
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
     BuildDescSetLayout(preloading);
@@ -115,13 +117,12 @@ GraphicsPipeline::GraphicsPipeline(
             .depthClampEnable = key.depth_clamp_enable &&
                                 (!key.depth_clip_enable || instance.IsDepthClipEnableSupported()),
             .rasterizerDiscardEnable = false,
-            .polygonMode = LiverpoolToVK::PolygonMode(key.polygon_mode),
+            .polygonMode = key.polygon_mode,
             .lineWidth = 1.0f,
         },
         vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT{
-            .provokingVertexMode = key.provoking_vtx_last == AmdGpu::ProvokingVtxLast::First
-                                       ? vk::ProvokingVertexModeEXT::eFirstVertex
-                                       : vk::ProvokingVertexModeEXT::eLastVertex,
+            .provokingVertexMode = key.provoking_first ? vk::ProvokingVertexModeEXT::eFirstVertex
+                                                       : vk::ProvokingVertexModeEXT::eLastVertex,
         },
         vk::PipelineRasterizationDepthClipStateCreateInfoEXT{
             .depthClipEnable = key.depth_clip_enable,
@@ -146,7 +147,7 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {
-        .negativeOneToOne = key.clip_space == AmdGpu::ClipSpace::MinusWToW,
+        .negativeOneToOne = key.negative_one_to_one,
     };
 
     const vk::PipelineViewportStateCreateInfo viewport_info = {
@@ -314,50 +315,24 @@ GraphicsPipeline::GraphicsPipeline(
     std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> square_attachments;
     bool needs_square_pass = false;
     for (u32 i = 0; i < key.num_color_attachments; i++) {
-        const auto& control = key.blend_controls[i];
-        const auto target_format = key.color_buffers[i].num_format;
-        BlendEquation color_equation{control.color_src_factor, control.color_func,
-                                     control.color_dst_factor};
-        BlendEquation alpha_equation{
-            control.separate_alpha_blend ? control.alpha_src_factor : control.color_src_factor,
-            control.separate_alpha_blend ? control.alpha_func : control.color_func,
-            control.separate_alpha_blend ? control.alpha_dst_factor : control.color_dst_factor};
-        const auto color_rewrite =
-            RewriteScaledMinMaxBlend(color_equation, target_format, BlendChannel::Color);
-        const auto alpha_rewrite =
-            RewriteScaledMinMaxBlend(alpha_equation, target_format, BlendChannel::Alpha);
-        const bool writes_color = bool(key.write_masks[i] & (vk::ColorComponentFlagBits::eR |
-                                                             vk::ColorComponentFlagBits::eG |
-                                                             vk::ColorComponentFlagBits::eB));
-        const bool writes_alpha = bool(key.write_masks[i] & vk::ColorComponentFlagBits::eA);
-        if (control.enable &&
-            ((writes_color && color_rewrite == BlendRewriteResult::Unsupported) ||
-             (writes_alpha && alpha_rewrite == BlendRewriteResult::Unsupported))) {
-            LOG_WARNING(Render_Vulkan,
-                        "Scaled MIN/MAX blend on attachment {} has no Vulkan equivalent "
-                        "(format {}, color {}/{}/{}, alpha {}/{}/{})",
-                        i, u32(target_format), u32(color_equation.src_factor),
-                        u32(color_equation.function), u32(color_equation.dst_factor),
-                        u32(alpha_equation.src_factor), u32(alpha_equation.function),
-                        u32(alpha_equation.dst_factor));
-        }
-        const bool square_color =
-            control.enable && writes_color && color_rewrite == BlendRewriteResult::Squared;
-        const bool square_alpha =
-            control.enable && writes_alpha && alpha_rewrite == BlendRewriteResult::Squared;
-        needs_square_pass |= square_color || square_alpha;
+        const auto& control = key.blend[i];
 
-        const auto src_color = LiverpoolToVK::BlendFactor(color_equation.src_factor);
-        const auto dst_color = LiverpoolToVK::BlendFactor(color_equation.dst_factor);
+        const auto src_color = control.src_color;
+        const auto dst_color = control.dst_color;
+        const auto color_blend = control.color_op;
+
+        const auto src_alpha = control.src_alpha;
+        const auto dst_alpha = control.dst_alpha;
+        const auto alpha_blend = control.alpha_op;
 
         attachments[i] = vk::PipelineColorBlendAttachmentState{
             .blendEnable = control.enable,
             .srcColorBlendFactor = src_color,
             .dstColorBlendFactor = dst_color,
-            .colorBlendOp = LiverpoolToVK::BlendOp(color_equation.function),
-            .srcAlphaBlendFactor = LiverpoolToVK::BlendFactor(alpha_equation.src_factor),
-            .dstAlphaBlendFactor = LiverpoolToVK::BlendFactor(alpha_equation.dst_factor),
-            .alphaBlendOp = LiverpoolToVK::BlendOp(alpha_equation.function),
+            .colorBlendOp = color_blend,
+            .srcAlphaBlendFactor = src_alpha,
+            .dstAlphaBlendFactor = dst_alpha,
+            .alphaBlendOp = alpha_blend,
             .colorWriteMask =
                 instance.IsDynamicColorWriteMaskSupported()
                     ? vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
@@ -381,8 +356,7 @@ GraphicsPipeline::GraphicsPipeline(
         // to 1 and perform the blending, while shader normally outputs 0 in the last component.
         // Unfortunatelly, Vulkan doesn't provide any control on blend inputs, so below we detecting
         // such cases and override alpha value in order to emulate HW behaviour.
-        const auto has_alpha_masked_out =
-            (key.cb_shader_mask.GetMask(i) & AmdGpu::ColorBufferMask::ComponentA) == 0;
+        const auto has_alpha_masked_out = ((key.alpha_not_exported >> i) & 1) != 0;
         const auto has_src_alpha_in_src_blend = src_color == vk::BlendFactor::eSrcAlpha ||
                                                 src_color == vk::BlendFactor::eOneMinusSrcAlpha;
         const auto has_src_alpha_in_dst_blend = dst_color == vk::BlendFactor::eSrcAlpha ||
@@ -397,12 +371,35 @@ GraphicsPipeline::GraphicsPipeline(
                                                      ? vk::BlendFactor::eOne
                                                      : vk::BlendFactor::eZero; // 1-A
         }
+
+        auto& attachment = attachments[i];
+        LiverpoolToVK::NormalizeMinMaxBlend(attachment.colorBlendOp, attachment.srcColorBlendFactor,
+                                            attachment.dstColorBlendFactor,
+                                            key.color_buffers[i].num_format);
+        LiverpoolToVK::NormalizeMinMaxBlend(attachment.alphaBlendOp, attachment.srcAlphaBlendFactor,
+                                            attachment.dstAlphaBlendFactor,
+                                            key.color_buffers[i].num_format);
+
+        const auto color_scaled_min_max =
+            (attachment.colorBlendOp == vk::BlendOp::eMin ||
+             attachment.colorBlendOp == vk::BlendOp::eMax) &&
+            (attachment.srcColorBlendFactor != vk::BlendFactor::eOne ||
+             attachment.dstColorBlendFactor != vk::BlendFactor::eOne);
+        const auto alpha_scaled_min_max =
+            (attachment.alphaBlendOp == vk::BlendOp::eMin ||
+             attachment.alphaBlendOp == vk::BlendOp::eMax) &&
+            (attachment.srcAlphaBlendFactor != vk::BlendFactor::eOne ||
+             attachment.dstAlphaBlendFactor != vk::BlendFactor::eOne);
+        if (control.enable && (color_scaled_min_max || alpha_scaled_min_max)) {
+            LOG_WARNING(
+                Render_Vulkan,
+                "Unimplemented use of min/max blend op with blend factor not equal to one.");
+        }
     }
 
     const vk::PipelineColorBlendStateCreateInfo color_blending = {
-        .logicOpEnable =
-            instance.IsLogicOpSupported() && key.logic_op != AmdGpu::ColorControl::LogicOp::Copy,
-        .logicOp = LiverpoolToVK::LogicOp(key.logic_op),
+        .logicOpEnable = instance.IsLogicOpSupported() && key.logic_op_enable,
+        .logicOp = key.logic_op,
         .attachmentCount = key.num_color_attachments,
         .pAttachments = attachments.data(),
         .blendConstants = std::array{1.0f, 1.0f, 1.0f, 1.0f},
@@ -465,21 +462,22 @@ void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const {
     using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-    if (!fetch_shader || fetch_shader->attributes.empty()) {
+    if (fetch_shader.Empty() || fetch_shader.attributes.empty()) {
         return;
     }
     const auto& vs_info = GetStage(Shader::SwStage::Vertex);
-    for (const auto& attrib : fetch_shader->attributes) {
+    for (u32 semantic = 0; semantic < fetch_shader.attributes.size(); ++semantic) {
+        const auto& attrib = fetch_shader.attributes[semantic];
         const auto step_rate = attrib.GetStepRate();
         const auto buffer = attrib.GetSharp(vs_info);
         attributes.push_back(Attribute{
-            .location = attrib.semantic,
-            .binding = attrib.semantic,
+            .location = semantic,
+            .binding = semantic,
             .format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt()),
             .offset = 0,
         });
         bindings.push_back(Binding{
-            .binding = attrib.semantic,
+            .binding = semantic,
             .stride = buffer.GetStride(),
             .inputRate = step_rate == InstanceIdType::None ? vk::VertexInputRate::eVertex
                                                            : vk::VertexInputRate::eInstance,
@@ -491,7 +489,7 @@ void GraphicsPipeline::GetVertexInputs(
             bindings.back().divisor = divisor;
         } else if (step_rate != InstanceIdType::None) {
             divisors.push_back(vk::VertexInputBindingDivisorDescriptionEXT{
-                .binding = attrib.semantic,
+                .binding = semantic,
                 .divisor = divisor,
             });
         }

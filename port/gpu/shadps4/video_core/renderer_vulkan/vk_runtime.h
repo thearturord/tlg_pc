@@ -3,9 +3,9 @@
 
 #pragma once
 
+#include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
-#include "video_core/renderer_vulkan/vk_barrier_tracker.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/types.h"
@@ -88,6 +88,8 @@ public:
                       const VideoCore::SubresourceRange& dst_range);
     void ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
                     const vk::ClearValue& clear_value);
+    void ClearDepthStencilImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range, bool clear_depth,
+                                float depth, bool clear_stencil, u32 stencil);
 
     void SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing = true);
 
@@ -112,13 +114,21 @@ public:
     }
 
 private:
-    void (*image_access_hook)(void*) = nullptr;
-    void* image_access_context = nullptr;
+    void MakeCurrent(const VideoCore::Buffer* handle);
+
+private:
     const Instance& instance;
     Scheduler& scheduler;
     std::unique_ptr<VideoCore::BlitHelper> blit_helper;
     StagingBufferPool staging_pool;
-    BarrierTracker barrier_tracker;
+    struct BufferBarriers {
+        const VideoCore::Buffer* handle;
+        using AccessList = IntervalList<Interval>;
+        AccessList read_ranges;
+        AccessList write_ranges;
+    };
+    BufferBarriers* resource{};
+    std::vector<BufferBarriers> resources;
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
     // tlg: ranges inserted into barrier_tracker since its last Clear(); re-inserting a

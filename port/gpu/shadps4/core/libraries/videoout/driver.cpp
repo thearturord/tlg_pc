@@ -1,19 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
-#include <cmath>
-#include <vector>
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
-#include <time.h>
-#ifdef _WIN32
-#include <windows.h>
-#endif
-#ifndef _WIN32
-#include <sys/resource.h>
-#endif
+#include "core/frame_timeline.h"
 #include "common/assert.h"
 #include "tlg_toggles.h"
 #include "tlg_freeze.h"
@@ -601,6 +589,7 @@ void VideoOutDriver::DrawLastFrame() {
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
+    Core::FrameTimeline::Mark(Core::FrameTimeline::FlipCp, is_eop ? 1 : 0);
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
@@ -637,17 +626,15 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
 
-    {
-        std::scoped_lock lock{mutex};
-        requests.push({
-            .frame = frame,
-            .port = port,
-            .flip_arg = flip_arg,
-            .index = index,
-            .eop = is_eop,
-        });
-    }
-    request_cv.notify_one();
+    std::scoped_lock lock{mutex};
+    requests.push({
+        .frame = frame,
+        .port = port,
+        .flip_arg = flip_arg,
+        .index = index,
+        .eop = is_eop,
+    });
+    Core::FrameTimeline::Mark(Core::FrameTimeline::FlipPrepared, is_eop ? 1 : 0);
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
@@ -729,7 +716,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     }
                 }
             } else {
+                Core::FrameTimeline::Mark(Core::FrameTimeline::PresentStart, main_port.vblank_status.count);
                 Flip(request);
+                Core::FrameTimeline::Mark(Core::FrameTimeline::PresentEnd);
                 FRAME_END;
             }
         }

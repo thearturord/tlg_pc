@@ -1,12 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/arch.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
+#include "core/debug_server.h"
+#include "core/guest_hooks.h"
+#include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -127,7 +131,361 @@ static vk::Rect2D FitImage(s32 frame_width, s32 frame_height, s32 swapchain_widt
                          dst_rect.offset.x, dst_rect.offset.y);
 }
 
-// tlg: screenshot capture and ImGui overlays removed; the port presents directly.
+enum class ScreenshotKind : u8 {
+    GameOnly,
+    WithOverlays,
+};
+
+struct ScreenshotReadback {
+    ScreenshotKind kind{};
+    std::vector<std::filesystem::path> paths{};
+    VideoCore::Buffer buffer;
+    u32 width{};
+    u32 height{};
+    vk::Format format{};
+    bool hdr_encoded{};
+
+    ScreenshotReadback(const Instance& instance, ScreenshotKind kind_,
+                       std::vector<std::filesystem::path> paths_, const u32 width_,
+                       const u32 height_, const vk::Format format_, const bool hdr_encoded_)
+        : kind{kind_}, paths{std::move(paths_)},
+          buffer{instance, 0, static_cast<u64>(width_) * static_cast<u64>(height_) * 4,
+                 VideoCore::MemoryType::HostCached},
+          width{width_}, height{height_}, format{format_}, hdr_encoded{hdr_encoded_} {}
+};
+
+static std::string SanitizeFilenameComponent(std::string value) {
+    for (char& c : value) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (!std::isalnum(uc) && c != '_' && c != '-') {
+            c = '_';
+        }
+    }
+    if (value.empty()) {
+        return "UNKNOWN";
+    }
+    return value;
+}
+
+static std::vector<std::filesystem::path> BuildScreenshotPaths(const ScreenshotKind kind,
+                                                               const u32 count) {
+    static std::atomic<u64> screenshot_sequence{0};
+    std::vector<std::filesystem::path> paths{};
+    if (count == 0) {
+        return paths;
+    }
+
+    const auto& screenshots_dir = Common::FS::GetUserPath(Common::FS::PathType::ScreenshotsDir);
+    std::filesystem::create_directories(screenshots_dir);
+
+    const auto game_id =
+        SanitizeFilenameComponent(std::string(Common::ElfInfo::Instance().GameSerial()));
+    const auto now = std::chrono::system_clock::now();
+    const auto now_time = std::chrono::system_clock::to_time_t(now);
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() %
+        1000;
+
+    std::tm local_tm{};
+#ifdef _WIN32
+    localtime_s(&local_tm, &now_time);
+#else
+    localtime_r(&now_time, &local_tm);
+#endif
+
+    std::ostringstream stamp;
+    stamp << std::put_time(&local_tm, "%Y%m%d_%H%M%S") << '_' << std::setw(3) << std::setfill('0')
+          << ms;
+
+    const char* suffix = kind == ScreenshotKind::GameOnly ? "game" : "hud";
+    const auto first_sequence = screenshot_sequence.fetch_add(count, std::memory_order_relaxed);
+
+    paths.reserve(count);
+    const auto stamp_str = stamp.str();
+    for (u32 i = 0; i < count; ++i) {
+        paths.emplace_back(screenshots_dir / fmt::format("{}_{}_{}_{:06}.png", game_id, stamp_str,
+                                                         suffix, first_sequence + i));
+    }
+
+    return paths;
+}
+
+static float PqToNits(const float encoded) {
+    // ST.2084 inverse EOTF
+    constexpr float m1 = 2610.0f / 16384.0f;
+    constexpr float m2 = 2523.0f / 32.0f;
+    constexpr float c1 = 3424.0f / 4096.0f;
+    constexpr float c2 = 2413.0f / 128.0f;
+    constexpr float c3 = 2392.0f / 128.0f;
+
+    const float v = std::clamp(encoded, 0.0f, 1.0f);
+    const float vp = std::pow(v, 1.0f / m2);
+    const float num = std::max(vp - c1, 0.0f);
+    const float den = std::max(c2 - c3 * vp, 1e-6f);
+    return 10000.0f * std::pow(num / den, 1.0f / m1);
+}
+
+static float ToneMapToSdrLinear(const float nits) {
+    // Map absolute HDR luminance into SDR [0,1], preserving 100-nit white.
+    constexpr float sdr_white_nits = 100.0f;
+    const float x = std::max(nits, 0.0f) / sdr_white_nits;
+    const float mapped = (2.0f * x) / (1.0f + x);
+    return std::clamp(mapped, 0.0f, 1.0f);
+}
+
+static float LinearToSrgb(const float linear) {
+    const float x = std::clamp(linear, 0.0f, 1.0f);
+    if (x <= 0.0031308f) {
+        return 12.92f * x;
+    }
+    return 1.055f * std::pow(x, 1.0f / 2.4f) - 0.055f;
+}
+
+static const std::array<float, 1024>& GetPqDecodeNitsLut() {
+    static const std::array<float, 1024> lut = [] {
+        std::array<float, 1024> values{};
+        for (size_t i = 0; i < values.size(); ++i) {
+            values[i] = PqToNits(static_cast<float>(i) / 1023.0f);
+        }
+        return values;
+    }();
+    return lut;
+}
+
+static const std::array<u8, 1024>& GetUnorm10ToU8Lut() {
+    static const std::array<u8, 1024> lut = [] {
+        std::array<u8, 1024> values{};
+        for (size_t i = 0; i < values.size(); ++i) {
+            values[i] = static_cast<u8>((i * 255u + 511u) / 1023u);
+        }
+        return values;
+    }();
+    return lut;
+}
+
+static void CopyImageToReadback(const vk::CommandBuffer& cmdbuf, const vk::Image image,
+                                const vk::ImageLayout layout, ScreenshotReadback& readback) {
+    const vk::BufferImageCopy copy_region = {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource =
+            {
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {readback.width, readback.height, 1},
+    };
+    cmdbuf.copyImageToBuffer(image, layout, readback.buffer.Handle(), copy_region);
+}
+
+static bool ConvertReadbackToRgba8(const ScreenshotReadback& readback, std::vector<u8>& out_rgba) {
+    const u64 pixel_count = static_cast<u64>(readback.width) * static_cast<u64>(readback.height);
+    const u64 byte_size = pixel_count * 4;
+    if (readback.buffer.mapped_data.size() < byte_size) {
+        LOG_ERROR(Render_Vulkan, "Screenshot readback buffer size mismatch (have {}, need {})",
+                  readback.buffer.mapped_data.size(), byte_size);
+        return false;
+    }
+
+    const auto src =
+        std::span<const u8>{readback.buffer.mapped_data.data(), static_cast<size_t>(byte_size)};
+    out_rgba.resize(static_cast<size_t>(byte_size));
+
+    switch (readback.format) {
+    case vk::Format::eR8G8B8A8Unorm:
+    case vk::Format::eR8G8B8A8Srgb:
+        std::memcpy(out_rgba.data(), src.data(), out_rgba.size());
+        for (u64 i = 0; i < pixel_count; ++i) {
+            out_rgba[static_cast<size_t>(i) * 4 + 3] = 255;
+        }
+        return true;
+    case vk::Format::eB8G8R8A8Unorm:
+    case vk::Format::eB8G8R8A8Srgb:
+        for (u64 i = 0; i < pixel_count; ++i) {
+            const size_t o = static_cast<size_t>(i) * 4;
+            out_rgba[o + 0] = src[o + 2];
+            out_rgba[o + 1] = src[o + 1];
+            out_rgba[o + 2] = src[o + 0];
+            out_rgba[o + 3] = 255;
+        }
+        return true;
+    case vk::Format::eA2R10G10B10UnormPack32: {
+        const auto& pq_decode_lut = GetPqDecodeNitsLut();
+        const auto& unorm10_to_u8 = GetUnorm10ToU8Lut();
+
+        for (u64 i = 0; i < pixel_count; ++i) {
+            const size_t o = static_cast<size_t>(i) * 4;
+            const u32 packed = static_cast<u32>(src[o + 0]) | (static_cast<u32>(src[o + 1]) << 8) |
+                               (static_cast<u32>(src[o + 2]) << 16) |
+                               (static_cast<u32>(src[o + 3]) << 24);
+            const u32 b = (packed >> 0) & 0x3FF;
+            const u32 g = (packed >> 10) & 0x3FF;
+            const u32 r = (packed >> 20) & 0x3FF;
+
+            if (readback.hdr_encoded) {
+                // Rec.2020 + PQ. Convert to SDR Rec.709 for PNG output.
+                const float r2020 = pq_decode_lut[r];
+                const float g2020 = pq_decode_lut[g];
+                const float b2020 = pq_decode_lut[b];
+
+                const float r709_nits = 1.6605f * r2020 - 0.5876f * g2020 - 0.0728f * b2020;
+                const float g709_nits = -0.1246f * r2020 + 1.1329f * g2020 - 0.0083f * b2020;
+                const float b709_nits = -0.0182f * r2020 - 0.1006f * g2020 + 1.1187f * b2020;
+
+                const float r_srgb = LinearToSrgb(ToneMapToSdrLinear(r709_nits));
+                const float g_srgb = LinearToSrgb(ToneMapToSdrLinear(g709_nits));
+                const float b_srgb = LinearToSrgb(ToneMapToSdrLinear(b709_nits));
+
+                out_rgba[o + 0] = static_cast<u8>(std::clamp(r_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
+                out_rgba[o + 1] = static_cast<u8>(std::clamp(g_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
+                out_rgba[o + 2] = static_cast<u8>(std::clamp(b_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
+            } else {
+                out_rgba[o + 0] = unorm10_to_u8[r];
+                out_rgba[o + 1] = unorm10_to_u8[g];
+                out_rgba[o + 2] = unorm10_to_u8[b];
+            }
+            out_rgba[o + 3] = 255;
+        }
+        return true;
+    }
+    case vk::Format::eA2B10G10R10UnormPack32: {
+        const auto& pq_decode_lut = GetPqDecodeNitsLut();
+        const auto& unorm10_to_u8 = GetUnorm10ToU8Lut();
+
+        for (u64 i = 0; i < pixel_count; ++i) {
+            const size_t o = static_cast<size_t>(i) * 4;
+            const u32 packed = static_cast<u32>(src[o + 0]) | (static_cast<u32>(src[o + 1]) << 8) |
+                               (static_cast<u32>(src[o + 2]) << 16) |
+                               (static_cast<u32>(src[o + 3]) << 24);
+            const u32 r = (packed >> 0) & 0x3FF;
+            const u32 g = (packed >> 10) & 0x3FF;
+            const u32 b = (packed >> 20) & 0x3FF;
+
+            if (readback.hdr_encoded) {
+                // HDR swapchain path is Rec.2020 + PQ. Convert to SDR Rec.709 for PNG output.
+                const float r2020 = pq_decode_lut[r];
+                const float g2020 = pq_decode_lut[g];
+                const float b2020 = pq_decode_lut[b];
+
+                const float r709_nits = 1.6605f * r2020 - 0.5876f * g2020 - 0.0728f * b2020;
+                const float g709_nits = -0.1246f * r2020 + 1.1329f * g2020 - 0.0083f * b2020;
+                const float b709_nits = -0.0182f * r2020 - 0.1006f * g2020 + 1.1187f * b2020;
+
+                const float r_srgb = LinearToSrgb(ToneMapToSdrLinear(r709_nits));
+                const float g_srgb = LinearToSrgb(ToneMapToSdrLinear(g709_nits));
+                const float b_srgb = LinearToSrgb(ToneMapToSdrLinear(b709_nits));
+
+                out_rgba[o + 0] = static_cast<u8>(std::clamp(r_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
+                out_rgba[o + 1] = static_cast<u8>(std::clamp(g_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
+                out_rgba[o + 2] = static_cast<u8>(std::clamp(b_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
+            } else {
+                out_rgba[o + 0] = unorm10_to_u8[r];
+                out_rgba[o + 1] = unorm10_to_u8[g];
+                out_rgba[o + 2] = unorm10_to_u8[b];
+            }
+            out_rgba[o + 3] = 255;
+        }
+        return true;
+    }
+    default:
+        LOG_WARNING(Render_Vulkan, "Unsupported screenshot format: {}",
+                    vk::to_string(readback.format));
+        return false;
+    }
+}
+
+static bool WritePng(const std::filesystem::path& path, const std::span<const u8> rgba,
+                     const u32 width, const u32 height) {
+    Common::FS::IOFile file(path, Common::FS::FileAccessMode::Create);
+    if (!file.IsOpen()) {
+        return false;
+    }
+
+    auto callback = [](void* context, void* data, int size) {
+        const auto* f = static_cast<Common::FS::IOFile*>(context);
+        f->WriteRaw<u8>(data, size);
+    };
+    return stbi_write_png_to_func(callback, &file, width, height, 4, rgba.data(), 0);
+}
+
+/// One frame of a debug capture sequence: the cropped guest output as a PNG (the crop is in fractions of the image).
+static void SaveSequenceFrame(const ScreenshotReadback& readback, const VideoCore::FrameSequenceStep& step) {
+    if (readback.paths.empty()) {
+        return;
+    }
+    std::vector<u8> rgba;
+    if (!ConvertReadbackToRgba8(readback, rgba)) {
+        return;
+    }
+    const u32 x0 = static_cast<u32>(std::clamp(step.x0, 0.0f, 1.0f) * readback.width);
+    const u32 x1 = std::max(x0 + 1, static_cast<u32>(std::clamp(step.x1, 0.0f, 1.0f) * readback.width));
+    const u32 y0 = static_cast<u32>(std::clamp(step.y0, 0.0f, 1.0f) * readback.height);
+    const u32 y1 = std::max(y0 + 1, static_cast<u32>(std::clamp(step.y1, 0.0f, 1.0f) * readback.height));
+    const u32 w = std::min(x1, readback.width) - x0;
+    const u32 h = std::min(y1, readback.height) - y0;
+    std::vector<u8> crop(static_cast<size_t>(w) * h * 4);
+    for (u32 row = 0; row < h; ++row) {
+        std::memcpy(crop.data() + static_cast<size_t>(row) * w * 4, rgba.data() + (static_cast<size_t>(y0 + row) * readback.width + x0) * 4,
+                    static_cast<size_t>(w) * 4);
+    }
+    WritePng(readback.paths.front(), crop, w, h);
+}
+
+static void SavePendingScreenshot(const ScreenshotReadback& readback) {
+    if (readback.paths.empty()) {
+        return;
+    }
+
+    std::vector<u8> rgba;
+    if (!ConvertReadbackToRgba8(readback, rgba)) {
+        return;
+    }
+
+    const auto& primary_path = readback.paths.front();
+    if (!WritePng(primary_path, rgba, readback.width, readback.height)) {
+        LOG_ERROR(Render_Vulkan, "Failed saving screenshot to {}", primary_path.string());
+        return;
+    }
+
+    LOG_INFO(Render_Vulkan, "Saved screenshot: {}", primary_path.string());
+
+    std::ifstream file(primary_path, std::ios::binary);
+    std::vector<u8> imgdata;
+    if (file) {
+        imgdata =
+            std::vector<u8>(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    }
+    shadNotifications::QueueNotification("Saved screenshot:\n" + primary_path.string(), 3.0f,
+                                         shadNotifications::position::BottomRight, imgdata);
+
+    for (size_t i = 1; i < readback.paths.size(); ++i) {
+        const auto& path = readback.paths[i];
+        std::error_code ec{};
+        std::filesystem::copy_file(primary_path, path, std::filesystem::copy_options::none, ec);
+        if (ec) {
+            // Fallback for platforms/filesystems where copy_file can fail for transient
+            // reasons.
+            if (!WritePng(path, rgba, readback.width, readback.height)) {
+                LOG_ERROR(Render_Vulkan, "Failed saving screenshot to {}", path.string());
+                continue;
+            }
+        }
+
+        LOG_INFO(Render_Vulkan, "Saved screenshot: {}", path.string());
+        std::ifstream file(path, std::ios::binary);
+        std::vector<u8> imgdata;
+        if (file) {
+            imgdata = std::vector<u8>(std::istreambuf_iterator<char>(file),
+                                      std::istreambuf_iterator<char>());
+        }
+        shadNotifications::QueueNotification("Saved screenshot:\n" + path.string(), 3.0f,
+                                             shadNotifications::position::BottomRight, imgdata);
+    }
+}
 
 Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
     : window{window_}, liverpool{liverpool_},
@@ -197,9 +555,9 @@ Presenter::~Presenter() {
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();
-    Check(draw_scheduler.CommandBuffer().reset());
-    Check(present_scheduler.CommandBuffer().reset());
-    Check(flip_scheduler.CommandBuffer().reset());
+    Check(draw_scheduler.SyncedCommandBuffer().reset());
+    Check(present_scheduler.SyncedCommandBuffer().reset());
+    Check(flip_scheduler.SyncedCommandBuffer().reset());
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
@@ -299,7 +657,7 @@ Frame* Presenter::PrepareLastFrame() {
 
     auto& scheduler = flip_scheduler;
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.SyncedCommandBuffer();
 
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -424,7 +782,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     };
 
     draw_scheduler.EndRendering();
-    const auto cmdbuf = draw_scheduler.CommandBuffer();
+    const auto cmdbuf = draw_scheduler.SyncedCommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = 1,
         .pImageMemoryBarriers = &pre_barrier,
@@ -433,7 +791,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     VideoCore::ImageViewInfo view_info{};
     view_info.format = GetFrameViewFormat(attribute.attrib.pixel_format);
     // Exclude alpha from output frame to avoid blending with UI.
-    view_info.mapping.a = vk::ComponentSwizzle::eOne;
+    view_info.mapping.a = AmdGpu::CompSwizzle::One;
 
     vk::ImageView image_view{};
     vk::Extent2D image_size{};
@@ -479,9 +837,43 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     }
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
 
-    // tlg: FSR 1, RCAS and its strength come from the in-game menu, every frame.
-    TlgSettings::ReloadIfRequested();
-    const auto& graphics = TlgSettings::Get();
+    VideoCore::FrameSequenceStep sequence_step;
+    std::optional<ScreenshotReadback> pending_sequence;
+    if (!pending_screenshot && VideoCore::TakeFrameSequenceStep(sequence_step)) {
+        const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "frame_sequence";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        const bool hdr_encoded =
+            attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq;
+        auto& readback = pending_sequence.emplace(
+            instance, ScreenshotKind::GameOnly,
+            std::vector<std::filesystem::path>{dir / fmt::format("f{:04}_p{}.png", sequence_step.index, Core::DebugServer::PresentCount())},
+            image_size.width, image_size.height, view_info.format, hdr_encoded);
+        const vk::BufferImageCopy copy_region = {
+            .bufferOffset = 0,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {readback.width, readback.height, 1},
+        };
+        runtime.DownloadImage(&image, &readback.buffer, std::span{&copy_region, 1});
+    }
+
+    // Continue with host-side passes that draw the displayed (scaled) frame.
+
+    runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
+                    vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
+    runtime.FlushBarriers();
+
+    image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
+                                 fsr_settings, frame->is_hdr);
+
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
     // the post process pass still sRGB encoded and has to be decoded there instead.
     pp_settings.srgb_input =
@@ -578,6 +970,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                 frame->width, frame->height, "output", frame_dump_index);
         ++frame_dump_index;
     }
+    if (pending_sequence) {
+        draw_scheduler.DeferPriorityOperation(
+            [deferred = std::move(pending_sequence), sequence_step]() { SaveSequenceFrame(deferred.value(), sequence_step); });
+    }
 
     // Flush frame creation commands.
     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
@@ -614,7 +1010,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
     scheduler.EndRendering();
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.SyncedCommandBuffer();
 
     constexpr vk::ImageSubresourceRange simple_subresource = {
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -680,63 +1076,29 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     return frame;
 }
 
-void Presenter::PresentLoadingFrame() {
-    if (window.GetWidth() == 0 || window.GetHeight() == 0) {
-        return;
+// Port measurement aid (not upstream): log the present rate once per second so the fps can be read
+// from the log without an overlay.
+static void LogPresentRate() {
+    static auto last = std::chrono::steady_clock::now();
+    static u32 frames = 0;
+    ++frames;
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(now - last).count();
+    if (elapsed >= 1.0) {
+        LOG_INFO(Render_Vulkan, "FPS {:.1f}", static_cast<double>(frames) / elapsed);
+        frames = 0;
+        last = now;
     }
-    swapchain.UpdateVsync();
-    if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
-        swapchain.Recreate(window.GetWidth(), window.GetHeight());
-    }
-    if (!swapchain.AcquireNextImage()) {
-        return;
-    }
-    const vk::Image image = swapchain.Image();
-    const vk::Extent2D extent = swapchain.GetExtent();
-    const auto cmdbuf = present_scheduler.CommandBuffer();
-    const vk::ImageSubresourceRange range{
-        .aspectMask = vk::ImageAspectFlagBits::eColor,
-        .levelCount = 1,
-        .layerCount = VK_REMAINING_ARRAY_LAYERS,
-    };
-    const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::AccessFlags src,
-                             vk::AccessFlags dst) {
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-                               vk::PipelineStageFlagBits::eAllCommands, {}, {}, {},
-                               vk::ImageMemoryBarrier{
-                                   .srcAccessMask = src,
-                                   .dstAccessMask = dst,
-                                   .oldLayout = from,
-                                   .newLayout = to,
-                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                   .image = image,
-                                   .subresourceRange = range,
-                               });
-    };
-    barrier(vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal, {},
-            vk::AccessFlagBits::eTransferWrite);
-    cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal,
-                           vk::ClearColorValue{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}},
-                           range);
-    barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eColorAttachmentOptimal,
-            vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eColorAttachmentWrite);
-    TlgOverlay::Render(cmdbuf, swapchain.ImageView(), extent);
-    barrier(vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::ePresentSrcKHR,
-            vk::AccessFlagBits::eColorAttachmentWrite, {});
-    SubmitInfo info{};
-    info.AddWait(swapchain.GetImageAcquiredSemaphore());
-    info.AddSignal(swapchain.GetPresentReadySemaphore());
-    present_scheduler.Flush(info);
-    {
-        std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        swapchain.Present();
-    }
-    // A few frames a second during start-up: waiting keeps semaphores and the swapchain simple.
-    present_scheduler.Finish();
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    if (!is_reusing_frame) {
+        LogPresentRate();
+        Core::DebugServer::NotePresent();
+#ifdef ARCH_X86_64
+        Core::GuestHooks::OnFrame();
+#endif
+    }
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -780,7 +1142,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // tlg: the game frame is blitted (letterboxed) straight into the swapchain image.
     const vk::Image swapchain_image = swapchain.Image();
     auto& scheduler = present_scheduler;
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.SyncedCommandBuffer();
+    const u32 capture_with_overlays_count = VideoCore::ConsumeWithOverlaysScreenshotRequests();
+    std::optional<ScreenshotReadback> pending_screenshot;
 
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
@@ -811,7 +1175,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             },
             vk::ImageMemoryBarrier{
                 .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-                .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
                 .oldLayout = vk::ImageLayout::eGeneral,
                 .newLayout = vk::ImageLayout::eTransferSrcOptimal,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -820,54 +1184,78 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 .subresourceRange = color_range,
             },
         };
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-                               vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
-                               {}, {}, pre_barriers);
-        const vk::ClearColorValue black{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}};
-        cmdbuf.clearColorImage(swapchain_image, vk::ImageLayout::eTransferDstOptimal, black, color_range);
-        const vk::MemoryBarrier clear_done{
-            .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-            .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
-        };
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
-                               vk::DependencyFlagBits::eByRegion, clear_done, {}, {});
-        cmdbuf.blitImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
-                         vk::ImageLayout::eTransferDstOptimal,
-                         MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height),
-                         vk::Filter::eLinear);
-        // tlg: the settings menu / FPS counter over the frame, at display resolution.
-        const bool overlay = TlgOverlay::Visible();
-        const std::array post_barriers{
-            vk::ImageMemoryBarrier{
-                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-                .dstAccessMask = overlay ? vk::AccessFlagBits::eColorAttachmentRead |
-                                               vk::AccessFlagBits::eColorAttachmentWrite
-                                         : vk::AccessFlagBits::eNone,
-                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
-                .newLayout = overlay ? vk::ImageLayout::eColorAttachmentOptimal
-                                     : vk::ImageLayout::ePresentSrcKHR,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = swapchain_image,
-                .subresourceRange = color_range,
-            },
-            vk::ImageMemoryBarrier{
-                .srcAccessMask = vk::AccessFlagBits::eTransferRead,
-                .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-                .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
-                .newLayout = vk::ImageLayout::eGeneral,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = frame->image,
-                .subresourceRange = color_range,
-            },
-        };
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                               vk::PipelineStageFlagBits::eAllCommands,
-                               vk::DependencyFlagBits::eByRegion, {}, {}, post_barriers);
-        if (overlay) {
-            TlgOverlay::Render(cmdbuf, swapchain.ImageView(), extent);
-            const vk::ImageMemoryBarrier to_present{
+
+        bool swapchain_copied_for_screenshot = false;
+
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                               vk::PipelineStageFlagBits::eColorAttachmentOutput |
+                                   vk::PipelineStageFlagBits::eFragmentShader,
+                               {}, {}, {}, pre_barriers);
+
+        { // Draw the game
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{0.0f});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+            ImGui::SetNextWindowDockID(dockId, ImGuiCond_Once);
+            if (ImGui::Begin("Display##game_display", nullptr, ImGuiWindowFlags_NoNav)) {
+                auto game_texture = frame->imgui_texture;
+                auto game_width = frame->width;
+                auto game_height = frame->height;
+
+                if (Libraries::SystemService::IsSplashVisible()) { // draw splash
+                    if (!splash_img.has_value()) {
+                        splash_img.emplace();
+                        const auto& splash_data = Common::ElfInfo::Instance().GetSplashData();
+                        if (!splash_data.empty()) {
+                            splash_img = ImGui::RefCountedTexture::DecodePngTexture(splash_data);
+                        }
+                    }
+                    if (auto& splash_image = this->splash_img.value()) {
+                        auto [im_id, width, height] = splash_image.GetTexture();
+                        game_texture = im_id;
+                        game_width = width;
+                        game_height = height;
+                    }
+                }
+
+                ImVec2 contentArea = ImGui::GetContentRegionAvail();
+                SetExpectedGameSize((s32)contentArea.x, (s32)contentArea.y);
+
+                const auto imgRect =
+                    FitImage(game_width, game_height, (s32)contentArea.x, (s32)contentArea.y);
+                ImVec2 offset{
+                    static_cast<float>(imgRect.offset.x),
+                    static_cast<float>(imgRect.offset.y),
+                };
+                ImVec2 size{
+                    static_cast<float>(imgRect.extent.width),
+                    static_cast<float>(imgRect.extent.height),
+                };
+
+                ImGui::SetCursorPos(ImGui::GetCursorStartPos() + offset);
+                ImGui::Image(game_texture, size);
+
+                if (EmulatorSettings.IsNullGPU()) {
+                    Core::Devtools::Layer::DrawNullGpuNotice();
+                }
+            }
+            ImGui::End();
+            ImGui::PopStyleVar(3);
+            ImGui::PopStyleColor();
+        }
+        ImGui::Core::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
+
+        if (capture_with_overlays_count > 0) {
+            auto& readback = pending_screenshot.emplace(
+                instance, ScreenshotKind::WithOverlays,
+                BuildScreenshotPaths(ScreenshotKind::WithOverlays, capture_with_overlays_count),
+                extent.width, extent.height,
+                swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32
+                                   : swapchain.GetSurfaceFormat().format,
+                swapchain.GetHDR());
+
+            const vk::ImageMemoryBarrier to_transfer{
                 .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
                 .dstAccessMask = vk::AccessFlagBits::eNone,
                 .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,

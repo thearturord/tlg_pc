@@ -32,9 +32,9 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 7u; // tlg: interpolated integer fix (Pascal)
-static constexpr u32 ShaderMetaVersion = 7u; // tlg: ImageResource::needs_native
-static constexpr u32 PipelineKeyVersion = 5u; // tlg: Info layout (ImageResource::needs_native)
+static constexpr u32 ShaderBinaryVersion = 9u;
+static constexpr u32 ShaderMetaVersion = 6u;
+static constexpr u32 PipelineKeyVersion = 4u;
 } // namespace Serialization
 
 namespace Vulkan {
@@ -619,7 +619,6 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
 }
 
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
-                    std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                     Shader::StageSpecialization& spec, size_t& perm_idx) {
     Serialization::Reader meta{ar};
 
@@ -641,14 +640,6 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     spec.Deserialize(ar);
     info.Deserialize(ar);
-
-    // Motion vertex shaders embed session-local buffer device addresses. They must be
-    // recompiled for the current allocation, never loaded from a previous process.
-    if (info.hw_stage == Shader::HwStage::Vertex && spec.runtime_info.hw.vs.motion_vectors) {
-        return false;
-    }
-
-    fetch_shader_data = spec.fetch_shader_data;
     return true;
 }
 
@@ -800,9 +791,9 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
             sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, true);
     }
 
-    sel.infos.fill(nullptr);
-    sel.modules.fill(nullptr);
-    sel.fetch_shader.reset();
+    infos.fill(nullptr);
+    modules.fill(nullptr);
+    fetch_shader = nullptr;
 
     return true;
 }
@@ -812,7 +803,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
     size_t perm_idx{};
-    if (!LoadShaderMeta(ar, program->info, sel.fetch_shader, spec, perm_idx)) {
+    if (!LoadShaderMeta(ar, program->info, spec, perm_idx)) {
         return false;
     }
 
@@ -854,8 +845,11 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     }
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
 
-    sel.infos[stage] = &it_pgm.value()->info;
-    sel.modules[stage] = module;
+    infos[stage] = &it_pgm.value()->info;
+    modules[stage] = module;
+    if (auto& fetch = it_pgm.value()->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
+        fetch_shader = &fetch;
+    }
 
     return true;
 }
@@ -1427,9 +1421,9 @@ void StageSpecialization::Serialize(Serialization::Archive& ar) const {
 
     spec.Write(bitset.to_string());
 
-    if (fetch_shader_data) {
-        spec.Write(sizeof(*fetch_shader_data));
-        fetch_shader_data->Serialize(ar);
+    if (!fetch_shader_data.Empty()) {
+        spec.Write(sizeof(fetch_shader_data));
+        fetch_shader_data.Serialize(ar);
     } else {
         spec.Write(size_t{0});
     }

@@ -3,17 +3,17 @@
 
 #pragma once
 
+#include <mutex>
+#include <optional>
+
 #include "common/enum.h"
 #include "common/incremental_id.h"
+#include "common/lru_cache.h"
+#include "common/small_vector.h"
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
-
-#include <deque>
-#include <optional>
-#include <boost/container/small_vector.hpp>
-#include <boost/container/static_vector.hpp>
 
 namespace Vulkan {
 class Instance;
@@ -33,8 +33,6 @@ enum ImageFlagBits : u32 {
     Dirty = MaybeCpuDirty | CpuDirty | GpuDirty,
     GpuModified = 1 << 3, ///< Contents have been modified from the GPU
     Registered = 1 << 6,  ///< True when the image is registered
-    Picked = 1 << 7,      ///< Temporary flag to mark the image as picked
-    Aliased = 1 << 8,     ///< tlg: another image has the same guest address (alias_states)
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -83,7 +81,7 @@ public:
     vk::DeviceSize size_bytes{};
 };
 
-struct Image {
+struct Image : public Common::LRUNode<> {
     explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,
                    Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info);
     ~Image();
@@ -91,30 +89,23 @@ struct Image {
     Image(const Image&) = delete;
     Image& operator=(const Image&) = delete;
 
-    Image(Image&&) = default;
-    Image& operator=(Image&&) = default;
+    Image(Image&&) = delete;
+    Image& operator=(Image&&) = delete;
 
-    bool Overlaps(VAddr overlap_cpu_addr, size_t overlap_size) const noexcept {
-        const VAddr overlap_end = overlap_cpu_addr + overlap_size;
-        const auto image_addr = info.guest_address;
-        const auto image_end = info.guest_address + info.guest_size;
-        return image_addr < overlap_end && overlap_cpu_addr < image_end;
+    bool Overlaps(VAddr addr, size_t size) const noexcept {
+        return info.guest_address < (addr + size) && addr < (info.guest_address + info.guest_size);
     }
 
     vk::Image GetImage() const {
         return backing->image.image;
     }
 
-    vk::DeviceSize GetHostImageSize() const {
-        return backing->image.size_bytes;
-    }
-
-    bool IsTracked() {
-        return track_addr != 0 && track_addr_end != 0;
+    bool IsUntracked() {
+        return track_addr == 0 || track_addr_end == 0;
     }
 
     bool SafeToDownload() const {
-        return True(flags & ImageFlagBits::GpuModified) && False(flags & (ImageFlagBits::Dirty));
+        return True(flags & ImageFlagBits::GpuModified) && False(flags & ImageFlagBits::Dirty);
     }
 
     void AssociateDepth(ImageId depth_image_id, u64 depth_image_uid) {
@@ -129,15 +120,18 @@ struct Image {
 
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
 
-    using Barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 32>;
+    using Barriers = SmallVector<vk::ImageMemoryBarrier2, 32>;
     void GetBarriers(Barriers& out_barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                      vk::PipelineStageFlags2 dst_stage,
                      std::optional<SubresourceRange> subres_range = {});
 
 public:
-    struct BackingImage;
-    // tlg: fields every binding of the image reads, together ahead of the large ImageInfo
-    // (they were spread over several cache lines: one miss each per texture per draw).
+    Vulkan::Runtime* runtime;
+    Common::SlotVector<ImageView>* slot_image_views;
+    std::mutex mutex;
+    ImageInfo info;
+    vk::ImageAspectFlags aspect_mask = vk::ImageAspectFlagBits::eColor;
+    vk::SampleCountFlags supported_samples = vk::SampleCountFlagBits::e1;
     ImageFlagBits flags = ImageFlagBits::Dirty;
     struct {
         u32 is_bound : 1;
@@ -184,24 +178,13 @@ public:
         UniqueImage image;
         State state;
         std::vector<State> subresource_states;
-        /// tlg: the last partial transition (range and target state). The same request again,
-        /// with nothing transitioned in between, needs no barriers: skips the walk over every
-        /// level and layer in range (inFAMOUS binds partially transitioned arrays thousands of
-        /// times per frame).
-        struct PartialMemo {
-            bool valid = false;
-            SubresourceRange range{};
-            vk::ImageLayout layout{};
-            vk::AccessFlags2 access{};
-            vk::PipelineStageFlags2 stage{};
-        } partial_memo;
-        boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
-        boost::container::small_vector<ImageViewId, 4> image_view_ids;
-        u32 last_view = 0; ///< tlg: index of the view FindView returned last
+        SmallVector<ImageViewInfo, 2> image_view_infos;
+        SmallVector<ImageViewId, 2> image_view_ids;
         u32 num_samples;
     };
-    std::deque<BackingImage> backing_images;
-    boost::container::static_vector<u64, 16> mip_hashes{};
+    SmallVector<BackingImage, 2> backing_images;
+    BackingImage* backing{};
+    u64 image_uid{};
     u64 lru_id{};
     u64 hash{};
 

@@ -12,6 +12,7 @@
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/regs_primitive.h"
+#include "video_core/renderer_vulkan/vk_fixed_state.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 
 namespace VideoCore {
@@ -37,10 +38,12 @@ struct GraphicsPipelineKey {
     u32 patch_control_points;
     u32 num_color_attachments;
     std::array<Shader::PsColorBuffer, AmdGpu::NUM_COLOR_BUFFERS> color_buffers;
-    std::array<AmdGpu::BlendControl, AmdGpu::NUM_COLOR_BUFFERS> blend_controls;
+    std::array<BlendTarget, AmdGpu::NUM_COLOR_BUFFERS> blend;
     std::array<vk::ColorComponentFlags, AmdGpu::NUM_COLOR_BUFFERS> write_masks;
-    AmdGpu::ColorBufferMask cb_shader_mask;
-    AmdGpu::ColorControl::LogicOp logic_op;
+    vk::LogicOp logic_op;
+    vk::PolygonMode polygon_mode;
+    u8 alpha_not_exported;
+    u8 logic_op_enable;
     u8 num_samples;
     u8 depth_samples;
     std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples;
@@ -53,9 +56,8 @@ struct GraphicsPipelineKey {
     };
     struct {
         AmdGpu::PrimitiveType prim_type : 5;
-        AmdGpu::PolygonMode polygon_mode : 2;
-        AmdGpu::ClipSpace clip_space : 1;
-        AmdGpu::ProvokingVtxLast provoking_vtx_last : 1;
+        u32 negative_one_to_one : 1;
+        u32 provoking_first : 1;
         u32 depth_clip_enable : 1;
     };
 
@@ -91,17 +93,12 @@ public:
                      vk::PipelineCache pipeline_cache,
                      std::span<const Shader::Info*, MaxShaderStages> stages,
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
-                     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader,
+                     const Shader::Gcn::FetchShaderData* fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
                      bool preloading);
     ~GraphicsPipeline();
 
-    // tlg: switch from compiler-owned snapshots to live stage data on publication.
-    void PublishStages(std::span<const Shader::Info*, MaxShaderStages> infos) {
-        std::ranges::copy(infos, stages.begin());
-    }
-
-    const std::optional<const Shader::Gcn::FetchShaderData>& GetFetchShader() const noexcept {
+    const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {
         return fetch_shader;
     }
 
@@ -126,8 +123,7 @@ private:
 
 private:
     GraphicsPipelineKey key;
-    std::optional<const Shader::Gcn::FetchShaderData> fetch_shader{};
-    vk::UniquePipeline square_pipeline;
+    Shader::Gcn::FetchShaderData fetch_shader{};
 };
 
 struct ClipDistanceShaderKey {
