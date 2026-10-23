@@ -7,6 +7,8 @@
 
 #include <unordered_map>
 
+#include <xxhash.h>
+
 #include "common/types.h"
 #include "core/frame_timeline.h"
 
@@ -36,6 +38,10 @@ inline void Note(Kind kind, u64 address, u64 size, bool written) {
     at = now;
     if (last_emit.size() > 400'000) {
         last_emit.clear();
+    }
+    if (raster_class == 1 && kind == BufferUse && !written && address > 0x100000000ull && size <= (8u << 20)) {
+        // does the content change from frame to frame (are the inputs of queue 1 written by the CPU every frame)?
+        FrameTimeline::Record(FrameTimeline::ResourceHash, address, now, XXH64(reinterpret_cast<const void*>(address), size, 0));
     }
     FrameTimeline::Record(FrameTimeline::ResourceUse, (address & 0xffffffffffffull) | (u64(raster_class) << 48) | (u64(kind) << 56) | (u64(written) << 63), now, size);
 }
