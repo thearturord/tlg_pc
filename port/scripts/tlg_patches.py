@@ -83,6 +83,19 @@ PATCHES['dt_snap_120'] = [
     (0x24f1800, f32(0.0316666663), f32(0.00791666672), 'dt snap lower bound 0.031667 -> 0.0079167'),
 ]
 
+# ScriptMgrGc task (Run = 0x1d12950): every frame the engine runs the Lua garbage collector in steps for a time budget of 50 ns per KB of Lua heap
+# (the float 5.0e-8 at 0x24f17e0, read only there): budget = lua_gc(COUNT) * 5.0e-8 s. With the heap at about 41 MB that is 2.05 ms, and the collector uses all of it
+# every frame (measured: the task takes 2.08 ms). The task is on the critical path of the frame (Ai2InterestsTick waits for it), and the budget is per FRAME, not per
+# second: at 60 and 120 fps the game collects 2 and 4 times as much per second as on the console at 30 fps. These entries divide the budget by the frame rate
+# factor, so the collector gets the same time per second as at 30 fps (1.02 ms at 60, 0.51 ms at 120). Disable: TLG_GC_BUDGET=0.
+# 5.0e-8 = 0x3356bf95; one octave down = exponent 1 lower (/2 -> 0x32d6bf95, /4 -> 0x3256bf95).
+PATCHES['gc_budget_60'] = [
+    (0x24f17e0, bytes.fromhex('95bf5633'), bytes.fromhex('95bfd632'), 'Lua GC time budget per frame 50 ns/KB -> 25 ns/KB'),
+]
+PATCHES['gc_budget_120'] = [
+    (0x24f17e0, bytes.fromhex('95bf5633'), bytes.fromhex('95bf5632'), 'Lua GC time budget per frame 50 ns/KB -> 12.5 ns/KB'),
+]
+
 # Resource task (0x1d0b590), end: when the loader is idle the game waits for the render thread to be idle (WaitRender, vtable +0x20 of the engine object) and only
 # then looks at the deferred callback at [manager+0x128] (argument [manager+0x130]). That wait blocks the game thread for the render thread's whole prelude and
 # recording every frame, although the engine is double-buffered (SceneDraw flips RenderDev and spins on its state). Replacement: look at the callback first and wait
@@ -116,8 +129,8 @@ MODES = {
     # max_fps_double/max_fps_off are left out: 60 and unlocked were reached without them
     # (game+0x180 is no frame limiter in the tested scenes; its reader is not found yet).
     # TLG_FPS_PATCHES=flip_rate_60,max_fps_off tries them.
-    '60': ['flip_rate_60', 'dt_snap_60'],
-    '120': ['flip_rate_60', 'dt_snap_120'],
+    '60': ['flip_rate_60', 'dt_snap_60', 'gc_budget_60'],
+    '120': ['flip_rate_60', 'dt_snap_120', 'gc_budget_120'],
     'unlocked': ['flip_rate_60'],
 }
 # The engine rate each mode presents at most (TLG_ENGINE_FPS: the overlay's frame limiter and
@@ -201,6 +214,8 @@ def prepare(game_dir, out_dir, mode, mods_dir=None, mods_config=None):
     eboot = None
     # TLG_FPS_PATCHES="a,b" (measurements): these patches instead of the mode's own.
     names = [n for n in os.environ.get('TLG_FPS_PATCHES', '').split(',') if n in PATCHES] or MODES[mode]
+    if os.environ.get('TLG_GC_BUDGET') == '0':
+        names = [n for n in names if not n.startswith('gc_budget')]
     # The render wait patches (skip_render_wait, skip_worker_render_wait) were failed experiments and are no longer selectable here; see their entries above.
     if names:
         try:

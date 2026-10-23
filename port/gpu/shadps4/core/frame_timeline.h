@@ -42,6 +42,9 @@ enum Type : u32 {
     GuestSpan = 25,   ///< a timed guest function (spans file): ts = end, arg = duration ns | span id << 48, arg2 = start ns
     GuestSpanInfo = 26, ///< written just before a GuestSpan of a job: arg = the job's function (Ghidra address), arg2 = its setup function
     GpuClockSync = 24, ///< calibration: arg = GPU timestamp ticks, ts = the CPU clock at the same moment, arg2 = timestamp period (ns * 1000)
+    // Task manager study (documents/tlg/light-scene-cap-plan.md section 8): hooks on the engine's task manager poll (FUN_01e4b060) and node dispatch (FUN_01e4a6f0).
+    SchedPoll = 27,   ///< the manager polled its waiting list: arg = nodes waiting | nodes with all dependencies finished << 16 | (ready list not empty) << 32, arg2 = first finished node
+    SchedNode = 28,   ///< a node: arg = node pointer, arg2 = 1 finished waiting node seen by a poll, 2 dispatch: 2 | state << 8 | pending << 16 | flags << 32
 };
 
 /// The stages of StageSpan (arg >> 56).

@@ -4245,6 +4245,60 @@ u64 PS4_SYSV_ABI JobSpanEnter(u64 pool, u64 job, u64 a2, u64 a3, u64 a4, u64 a5,
     return 0;
 }
 
+// Task manager study (documents/tlg/light-scene-cap-plan.md section 8). The engine's task manager (one thread) keeps nodes on a waiting list (manager + 0x58, next node at
+// node + 0x90) and a ready list (manager + 0x68); its poll function FUN_01e4b060(manager) moves one node whose dependencies are all finished to the ready list, or sleeps; its
+// dispatch FUN_01e4a6f0(node) starts a node. A node's dependencies are at node + 0x40 (array) and node + 0x48 (count); a dependency is finished when
+// (state at +0x80 == 3) ? pending at +0x78 == 1 : pending == 0 (the test the poll function itself uses). Both hooks only read and record while a capture runs.
+u64 PS4_SYSV_ABI SchedPoll(u64 manager, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
+    if (!FrameTimeline::capture_active.load(std::memory_order_relaxed) || manager == 0) {
+        return 0;
+    }
+    const auto rd32 = [](u64 address) { return *reinterpret_cast<const volatile u32*>(address); };
+    const auto rd64 = [](u64 address) { return *reinterpret_cast<const volatile u64*>(address); };
+    u32 waiting = 0;
+    u32 finished = 0;
+    u64 first = 0;
+    u64 node = rd64(manager + 0x58);
+    for (u32 guard = 0; node != 0 && guard < 1024; ++guard, node = rd64(node + 0x90)) {
+        ++waiting;
+        const u64 deps = rd64(node + 0x40);
+        const u32 count = rd32(node + 0x48);
+        bool ok = true;
+        for (u32 i = 0; ok && deps != 0 && i < count && i < 512; ++i) {
+            const u64 dep = rd64(deps + 8ull * i);
+            if (dep == 0) {
+                continue;
+            }
+            const u32 state = rd32(dep + 0x80);
+            const u32 pending = rd32(dep + 0x78);
+            ok = state == 3 ? pending == 1 : pending == 0;
+        }
+        if (ok) {
+            ++finished;
+            if (first == 0) {
+                first = node;
+            }
+            if (finished <= 6) {
+                FrameTimeline::Record(FrameTimeline::SchedNode, node, FrameTimeline::Now(), 1);
+            }
+        }
+    }
+    const u64 ready = rd64(manager + 0x68);
+    FrameTimeline::Record(FrameTimeline::SchedPoll, u64{waiting} | (u64{finished} << 16) | (u64{ready != 0} << 32), FrameTimeline::Now(), first);
+    return 0;
+}
+
+u64 PS4_SYSV_ABI SchedDispatch(u64 node, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
+    if (!FrameTimeline::capture_active.load(std::memory_order_relaxed) || node == 0) {
+        return 0;
+    }
+    const u32 state = *reinterpret_cast<const volatile u32*>(node + 0x80);
+    const u32 pending = *reinterpret_cast<const volatile u32*>(node + 0x78);
+    const u32 flags = *reinterpret_cast<const volatile u32*>(node + 0x84);
+    FrameTimeline::Record(FrameTimeline::SchedNode, node, FrameTimeline::Now(), 2 | (u64{state} << 8) | (u64{pending} << 16) | (u64{flags} << 32));
+    return 0;
+}
+
 u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     if (ring_checked.load(std::memory_order_relaxed)) {
         return 0;
@@ -5952,6 +6006,12 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "span_job") {
         return reinterpret_cast<u64>(&JobSpanEnter);
+    }
+    if (name == "sched_poll") {
+        return reinterpret_cast<u64>(&SchedPoll);
+    }
+    if (name == "sched_dispatch") {
+        return reinterpret_cast<u64>(&SchedDispatch);
     }
     if (name == "wait_render_probe") {
         return reinterpret_cast<u64>(&WaitRenderProbe);
