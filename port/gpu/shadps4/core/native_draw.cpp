@@ -4170,6 +4170,26 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
 // allocator + 0x18, size in the low half of the first qword. With native_draw_mode 3 and readbacks off the ring is taken out of page tracking.
 std::atomic<bool> ring_checked{false};
 
+// Study (documents/tlg/frame-pipeline-read-2026-10-23.md): who calls the engine's WaitRender (Ghidra 0x1c4efb0), which blocks the game thread until the render
+// thread is idle. Counts the calls by return address (Ghidra address) and logs the table every 5 s; never skips the function.
+u64 PS4_SYSV_ABI WaitRenderProbe(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    static std::mutex mutex;
+    static std::map<u32, u32> callers;
+    static u64 last_ms = 0;
+    const u32 site = static_cast<u32>(ret - ImageBase() + 0x1000000);
+    std::lock_guard lock{mutex};
+    ++callers[site];
+    const u64 now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (now - last_ms >= 5000) {
+        last_ms = now;
+        for (const auto& [caller, count] : callers) {
+            LOG_WARNING(Core, "WaitRender per 5 s: caller {:#x}: {} calls", caller, count);
+        }
+        callers.clear();
+    }
+    return 0;
+}
+
 u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     if (ring_checked.load(std::memory_order_relaxed)) {
         return 0;
@@ -5874,6 +5894,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "ring_discover") {
         return reinterpret_cast<u64>(&RingDiscover);
+    }
+    if (name == "wait_render_probe") {
+        return reinterpret_cast<u64>(&WaitRenderProbe);
     }
     if (name == "tag_indexed") {
         return reinterpret_cast<u64>(&TagIndexed);

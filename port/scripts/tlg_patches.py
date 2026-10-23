@@ -97,6 +97,16 @@ PATCHES['skip_render_wait'] = [
      'Resource task: wait for the render thread only when a deferred callback is pending'),
 ]
 
+# Engine_WorkerThreadMain (0x1e4c420), the job worker loop: the worker with role 1 (workerThread0, the one that runs the main-thread jobs) calls
+# WaitRender (the render device's "wait until the render thread is idle", through [engine+0x48] vtable +0x48) at the top of EVERY iteration, before it looks
+# for its next job, about 300,000 times a second. So no job of that worker runs while the render thread records the frame (about 5.7 ms of every frame),
+# although the engine double-buffers the scene (SceneDraw flips RenderDev). Replacement: no wait (call [rax+0x48] -> 3 byte nop).
+# Off by default; TLG_SKIP_WORKER_RENDER_WAIT=1 turns it on (documents/tlg/frame-pipeline-read-2026-10-23.md, section 6).
+PATCHES['skip_worker_render_wait'] = [
+    (0x1e4c65d, bytes.fromhex('ff5048'), bytes.fromhex('0f1f00'),
+     'job worker 0: do not wait for the render thread before every job pick'),
+]
+
 MODES = {
     '30': [],
     # max_fps_double/max_fps_off are left out: 60 and unlocked were reached without them
@@ -190,6 +200,8 @@ def prepare(game_dir, out_dir, mode, mods_dir=None, mods_config=None):
     # Optional game patches, independent of the frame rate mode (each behind its own switch, off by default).
     if os.environ.get('TLG_SKIP_RENDER_WAIT', '').strip() == '1' and 'skip_render_wait' not in names:
         names = names + ['skip_render_wait']
+    if os.environ.get('TLG_SKIP_WORKER_RENDER_WAIT', '').strip() == '1' and 'skip_worker_render_wait' not in names:
+        names = names + ['skip_worker_render_wait']
     if names:
         try:
             eboot = (Path(game_dir) / 'eboot.bin').read_bytes()
