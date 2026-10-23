@@ -83,6 +83,20 @@ PATCHES['dt_snap_120'] = [
     (0x24f1800, f32(0.0316666663), f32(0.00791666672), 'dt snap lower bound 0.031667 -> 0.0079167'),
 ]
 
+# Resource task (0x1d0b590), end: when the loader is idle the game waits for the render thread to be idle (WaitRender, vtable +0x20 of the engine object) and only
+# then looks at the deferred callback at [manager+0x128] (argument [manager+0x130]). That wait blocks the game thread for the render thread's whole prelude and
+# recording every frame, although the engine is double-buffered (SceneDraw flips RenderDev and spins on its state). Replacement: look at the callback first and wait
+# only when there is one. Same length, same exit (0x1d0bb8c); r14 is free (restored by the epilogue); WaitRender takes no argument, so "mov esi,1" is dropped.
+# Off by default; TLG_SKIP_RENDER_WAIT=1 turns it on (documents/tlg/frame-pipeline-read-2026-10-23.md, section 5).
+PATCHES['skip_render_wait'] = [
+    (0x1d0bb56,
+     bytes.fromhex('85c07532488b3ddf5fc904be01000000488b07ff5020498b8728010000'
+                   '4885c07414498bbf30010000ffd049c78728010000' '00000000'),
+     bytes.fromhex('85c07532498b8728010000' '4885c07426' '4989c6' '488b3dd05fc904' '488b07ff5020'
+                   '498bbf30010000' '41ffd6' '49c78728010000' '00000000' '90'),
+     'Resource task: wait for the render thread only when a deferred callback is pending'),
+]
+
 MODES = {
     '30': [],
     # max_fps_double/max_fps_off are left out: 60 and unlocked were reached without them
@@ -173,6 +187,9 @@ def prepare(game_dir, out_dir, mode, mods_dir=None, mods_config=None):
     eboot = None
     # TLG_FPS_PATCHES="a,b" (measurements): these patches instead of the mode's own.
     names = [n for n in os.environ.get('TLG_FPS_PATCHES', '').split(',') if n in PATCHES] or MODES[mode]
+    # Optional game patches, independent of the frame rate mode (each behind its own switch, off by default).
+    if os.environ.get('TLG_SKIP_RENDER_WAIT', '').strip() == '1' and 'skip_render_wait' not in names:
+        names = names + ['skip_render_wait']
     if names:
         try:
             eboot = (Path(game_dir) / 'eboot.bin').read_bytes()
