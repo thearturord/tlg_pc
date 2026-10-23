@@ -80,6 +80,10 @@ u32 ResourceUsage(u64 object);
 u32 UsageClassOf(VAddr address);
 /// "buffer/dynamic" and the like.
 std::string UsageClassNameOf(u32 usage_class);
+/// The heap block (census snapshot) that contains `address`: its start and size. False when the census is off or the address is in no block.
+bool BlockContaining(VAddr address, u64* start, u64* size);
+/// The engine's frame allocator window (census), false when unknown.
+bool FrameRing(u64* base, u64* size);
 /// The heap block around `address`: class, begin and size ("unknown" when the census is off or the address is in no block).
 std::string DescribeAddress(VAddr address);
 

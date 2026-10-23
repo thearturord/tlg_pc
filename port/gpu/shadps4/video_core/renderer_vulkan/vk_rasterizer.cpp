@@ -845,6 +845,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     // shares with the previous one. Nothing is reused unless the previous executed operation was a tagged draw
     // in the same command buffer.
     const VideoCore::NativeTag tag = std::exchange(native_tag, {});
+    Core::NativeRegistry::SetDrawClass(tag.valid ? (tag.meta & 0xff) : 15);
+    Core::NativeRegistry::SetCurrentDraw(tag.valid ? tag.seq : 0);
     const bool use_tag =
         tag.valid &&
         VideoCore::ReadbackPolicy::Get().native_draw_mode.load(std::memory_order_relaxed) >= 2;
@@ -1025,6 +1027,8 @@ void Rasterizer::SetExplicitImageReadback(bool on) {
 
 void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     RENDERER_TRACE;
+    Core::NativeRegistry::SetDrawClass(3);
+    Core::NativeRegistry::SetCurrentDraw(0);
 
     scheduler.PopPendingOperations();
 

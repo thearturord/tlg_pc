@@ -12,6 +12,9 @@
 #include <vector>
 
 #include <fmt/format.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <nlohmann/json.hpp>
 
 #include "core/native_registry.h"
@@ -64,16 +67,33 @@ struct Dump {
 std::vector<Dump> dumps;
 std::map<std::pair<u8, u32>, bool> dumped;
 
+thread_local u32 draw_class = 15;
+thread_local u64 current_draw_seq = 0;
+constexpr u32 DrawRing = 8192;
+std::unique_ptr<DrawResources[]> draw_ring;
+std::mutex draw_ring_mutex;
+std::array<std::atomic<u64>, 16> explained_buffers{}, unexplained_registered_buffers{}, unexplained_unknown_buffers{}, no_draw_record_buffers{};
+std::array<std::atomic<u64>, 16> explained_images{}, unexplained_images{}, no_draw_record_images{};
+struct ClassCounters {
+    std::atomic<u64> buffers{}, buffers_inside{}, images{}, images_found{};
+};
+std::array<ClassCounters, 16> by_class;
 struct AuditCounters {
     std::atomic<u64> buffers{}, buffers_inside{}, buffers_partial{}, buffers_missing{}, buffers_missing_written{};
-    std::atomic<u64> images{}, images_found{}, images_missing{};
+    std::atomic<u64> images{}, images_found{}, images_missing{}, images_in_buffer{}, images_in_texture_block{};
 };
 AuditCounters audit;
 std::mutex sample_mutex;
 struct Sample {
     u64 address, size;
     bool written;
+    u32 draw_class{};
+    u64 reg_address{}, reg_bytes{};
+    u32 reg_usage{~0u};
+    u32 draw_buffers{};
 };
+std::vector<Sample> unexplained_samples;
+std::array<u32, 16> unexplained_per_class{};
 std::vector<Sample> buffer_miss_samples, buffer_partial_samples, image_miss_samples;
 struct MissCount {
     u64 count{};
@@ -298,21 +318,94 @@ void Observe(u64 object, Kind hint) {
     }
 }
 
+void DrawResources::AddBuffer(u64 begin, u64 end) {
+    for (u32 i = 0; i < buffer_count; ++i) {
+        if (buffers[i].begin == begin && buffers[i].end == end) {
+            return;
+        }
+    }
+    if (buffer_count < MaxBuffers) {
+        buffers[buffer_count++] = {begin, end};
+    } else {
+        ++dropped;
+    }
+}
+
+void DrawResources::AddImage(u64 start) {
+    for (u32 i = 0; i < image_count; ++i) {
+        if (images[i] == start) {
+            return;
+        }
+    }
+    if (image_count < MaxImages) {
+        images[image_count++] = start;
+    } else {
+        ++dropped;
+    }
+}
+
+void CollectResource(DrawResources& draw, u64 object) {
+    if (!Plausible(object)) {
+        return;
+    }
+    const Kind own = ResourceKind(Read<u32>(object, 0x124));
+    const u64 address = Read<u64>(object, 0x30);
+    if (own == Kind::Buffer) {
+        draw.AddBuffer(address, address + Read<u32>(object, 0x180));
+    } else if (own != Kind::Unknown) {
+        draw.AddImage(address);
+    }
+}
+
+void StoreDraw(const DrawResources& draw) {
+    if (draw.seq == 0) {
+        return;
+    }
+    if (!draw_ring) {
+        std::scoped_lock lock{draw_ring_mutex};
+        if (!draw_ring) {
+            draw_ring = std::make_unique<DrawResources[]>(DrawRing);
+        }
+    }
+    draw_ring[draw.seq % DrawRing] = draw;
+}
+
+std::mutex slot_mutex;
+std::map<std::pair<u32, u32>, u64> context_slots;
+void NoteContextSlot(u32 offset, u32 resource_kind) {
+    std::scoped_lock lock{slot_mutex};
+    ++context_slots[{offset, resource_kind}];
+}
+
+void SetCurrentDraw(u64 seq) {
+    current_draw_seq = seq;
+}
+
+void SetDrawClass(u32 draw_class_) {
+    draw_class = draw_class_ & 15;
+}
+
 void AuditBuffer(u64 address, u64 size, bool written) {
     if (!enabled.load(std::memory_order_relaxed)) {
         return;
     }
+    by_class[draw_class].buffers.fetch_add(1, std::memory_order_relaxed);
     if ((audit_calls.fetch_add(1, std::memory_order_relaxed) & 0xfff) == 0) {
         DrainTextures();
     }
     audit.buffers.fetch_add(1, std::memory_order_relaxed);
     bool inside = false, partial = false;
+    u64 reg_address = 0, reg_bytes = 0;
+    u32 reg_usage = ~0u;
     {
         std::shared_lock lock{registry_mutex};
         auto it = buffer_intervals.upper_bound(address);
         if (it != buffer_intervals.begin()) {
             --it;
             if (const auto e = by_id.find(it->second); e != by_id.end() && address >= e->second.address && address < e->second.address + e->second.size) {
+                reg_address = e->second.address;
+                reg_bytes = e->second.size;
+                reg_usage = e->second.usage;
                 if (address + size <= e->second.address + e->second.size) {
                     inside = true;
                 } else {
@@ -321,8 +414,32 @@ void AuditBuffer(u64 address, u64 size, bool written) {
             }
         }
     }
+    {
+        // Is it one of the buffers this draw's own objects describe?
+        const DrawResources* draw = (current_draw_seq != 0 && draw_ring) ? &draw_ring[current_draw_seq % DrawRing] : nullptr;
+        if (draw == nullptr || draw->seq != current_draw_seq) {
+            no_draw_record_buffers[draw_class].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            bool explained = false;
+            for (u32 i = 0; i < draw->buffer_count && !explained; ++i) {
+                explained = address >= draw->buffers[i].begin && address + size <= draw->buffers[i].end;
+            }
+            if (explained) {
+                explained_buffers[draw_class].fetch_add(1, std::memory_order_relaxed);
+            } else {
+                (inside ? unexplained_registered_buffers : unexplained_unknown_buffers)[draw_class].fetch_add(1, std::memory_order_relaxed);
+                if (draw->dropped == 0) {
+                    std::scoped_lock lock{sample_mutex};
+                    if (unexplained_per_class[draw_class]++ < 6) {
+                        unexplained_samples.push_back({address, size, written, draw_class, reg_address, reg_bytes, reg_usage, draw->buffer_count});
+                    }
+                }
+            }
+        }
+    }
     if (inside) {
         audit.buffers_inside.fetch_add(1, std::memory_order_relaxed);
+        by_class[draw_class].buffers_inside.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     (partial ? audit.buffers_partial : audit.buffers_missing).fetch_add(1, std::memory_order_relaxed);
@@ -359,14 +476,48 @@ void AuditImage(u64 address) {
         return;
     }
     audit.images.fetch_add(1, std::memory_order_relaxed);
-    bool found = false;
+    by_class[draw_class].images.fetch_add(1, std::memory_order_relaxed);
+    {
+        const DrawResources* draw = (current_draw_seq != 0 && draw_ring) ? &draw_ring[current_draw_seq % DrawRing] : nullptr;
+        if (draw == nullptr || draw->seq != current_draw_seq) {
+            no_draw_record_images[draw_class].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            bool explained = false;
+            for (u32 i = 0; i < draw->image_count && !explained; ++i) {
+                explained = draw->images[i] == address;
+            }
+            (explained ? explained_images : unexplained_images)[draw_class].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    bool found = false, in_buffer = false;
     {
         std::shared_lock lock{registry_mutex};
         found = texture_by_start.contains(address);
+        if (!found) {
+            auto it = buffer_intervals.upper_bound(address);
+            if (it != buffer_intervals.begin()) {
+                --it;
+                if (const auto e = by_id.find(it->second); e != by_id.end() && address >= e->second.address && address < e->second.address + e->second.size) {
+                    in_buffer = true;
+                }
+            }
+        }
+    }
+    if (in_buffer) {
+        audit.images_in_buffer.fetch_add(1, std::memory_order_relaxed);
+        return;
     }
     if (found) {
         audit.images_found.fetch_add(1, std::memory_order_relaxed);
+        by_class[draw_class].images_found.fetch_add(1, std::memory_order_relaxed);
         return;
+    }
+    if (u64 start = 0, size = 0; NativeResources::BlockContaining(address, &start, &size)) {
+        std::shared_lock lock{registry_mutex};
+        if (texture_by_start.contains(start)) {
+            audit.images_in_texture_block.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
     }
     audit.images_missing.fetch_add(1, std::memory_order_relaxed);
     std::scoped_lock lock{sample_mutex};
@@ -408,6 +559,67 @@ nlohmann::json Report() {
             kinds[KindNames[k]] = {{"live", live[k]}, {"seen", seen_by_kind[k]}};
         }
         j["buffers_by_usage"] = {{"default", usage_buffers[0]}, {"immutable", usage_buffers[1]}, {"dynamic", usage_buffers[2]}, {"staging", usage_buffers[3]}};
+        {
+            auto& list = j["texture3d_entries"] = nlohmann::json::array();
+            for (const auto& [id, e] : by_id) {
+                if (e.actual == Kind::Texture3D && list.size() < 40) {
+                    list.push_back({{"id", id}, {"alive", e.alive}, {"address", fmt::format("{:#x}", e.address)}, {"w", e.width}, {"h", e.height}, {"d", e.layers}, {"mips", e.mips}, {"format", e.format}, {"usage", e.usage}});
+                }
+            }
+        }
+        {
+            // How a buffer's own descriptor (V# at +0x60) relates to its D3D11 state (memory at +0x30, ByteWidth): the rule the native description needs.
+            u64 ring_base = 0, ring_size = 0;
+            const bool ring = NativeResources::FrameRing(&ring_base, &ring_size);
+            struct Rel {
+                u64 equal{}, inside{}, in_frame_ring{}, other{}, zero{};
+            };
+            std::array<Rel, 4> rel{};
+            std::array<std::string, 6> examples;
+            for (const auto& [id, e] : by_id) {
+                if (!e.alive || e.actual != Kind::Buffer || e.usage > 3 || e.address == 0) {
+                    continue;
+                }
+                u32 v[4]{};
+#ifdef _WIN32
+                SIZE_T got = 0;
+                if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(e.object + 0x60), v, sizeof(v), &got) || got != sizeof(v)) {
+                    continue;
+                }
+#endif
+                const u64 base = u64{v[0]} | (u64{v[1] & 0xffff} << 32);
+                const u64 stride = (v[1] >> 16) & 0x3fff;
+                const u64 bytes = stride != 0 ? stride * v[2] : v[2];
+                Rel& r = rel[e.usage];
+                if (base == 0 && bytes == 0) {
+                    ++r.zero;
+                } else if (base == e.address && bytes == e.size) {
+                    ++r.equal;
+                } else if (base >= e.address && base + bytes <= e.address + e.size) {
+                    ++r.inside;
+                } else if (ring && base >= ring_base && base < ring_base + ring_size) {
+                    ++r.in_frame_ring;
+                } else {
+                    ++r.other;
+                    if (examples[e.usage].empty()) {
+                        examples[e.usage] = fmt::format("id {} mem {:#x}+{} vsharp {:#x}+{} dwords {:08x} {:08x} {:08x} {:08x}", id, e.address, e.size, base, bytes, v[0], v[1], v[2], v[3]);
+                    }
+                }
+            }
+            auto& out = j["buffer_vsharp_vs_d3d11_state"] = nlohmann::json::object();
+            constexpr const char* usage_names[4] = {"default", "immutable", "dynamic", "staging"};
+            for (u32 u = 0; u < 4; ++u) {
+                out[usage_names[u]] = {{"equal_to_memory_and_bytewidth", rel[u].equal}, {"inside_the_buffer", rel[u].inside}, {"in_frame_ring", rel[u].in_frame_ring},
+                                       {"zero", rel[u].zero}, {"other", rel[u].other}, {"example_other", examples[u]}};
+            }
+        }
+        {
+            std::scoped_lock lock{slot_mutex};
+            auto& slots = j["context_slots_holding_resources"] = nlohmann::json::object();
+            for (const auto& [key, count] : context_slots) {
+                slots[fmt::format("{}{:#x}:{}", (key.first & 0x80000000u) != 0 ? "NOT_COLLECTED " : "", key.first & 0x7fffffffu, KindNames[key.second < 5 ? (key.second == 1 ? 1 : key.second) : 0])] = count;
+            }
+        }
         j["dead_objects"] = dead_objects;
         j["address_reuse"] = reused_addresses;
         auto& tags = j["tags_by_slot_kind"] = nlohmann::json::object();
@@ -430,6 +642,39 @@ nlohmann::json Report() {
         return out;
     };
     {
+        auto& v2 = j["draw_description_audit"] = nlohmann::json::object();
+        constexpr const char* names[16] = {"z_prepass_shadow", "g_buffer", "forward", "compute_other", "", "", "", "", "", "", "", "", "", "", "", "untagged"};
+        for (u32 c = 0; c < 16; ++c) {
+            const u64 total = explained_buffers[c] + unexplained_registered_buffers[c] + unexplained_unknown_buffers[c] + no_draw_record_buffers[c] + explained_images[c] +
+                              unexplained_images[c] + no_draw_record_images[c];
+            if (total != 0) {
+                v2[names[c][0] ? names[c] : std::to_string(c)] = {{"buffers_explained_by_the_draws_objects", explained_buffers[c].load()},
+                                                                  {"buffers_other_registered_object", unexplained_registered_buffers[c].load()},
+                                                                  {"buffers_not_registered", unexplained_unknown_buffers[c].load()},
+                                                                  {"buffers_no_draw_record", no_draw_record_buffers[c].load()},
+                                                                  {"images_explained", explained_images[c].load()},
+                                                                  {"images_not_explained", unexplained_images[c].load()},
+                                                                  {"images_no_draw_record", no_draw_record_images[c].load()}};
+            }
+        }
+        auto& ex = v2["samples_unexplained_buffers"] = nlohmann::json::array();
+        std::scoped_lock lock{sample_mutex};
+        for (const auto& s : unexplained_samples) {
+            ex.push_back({{"address", fmt::format("{:#x}", s.address)}, {"size", s.size}, {"written", s.written}, {"class", s.draw_class}, {"block", NativeResources::DescribeAddress(s.address)},
+                       {"registered_buffer", fmt::format("{:#x}+{}", s.reg_address, s.reg_bytes)}, {"registered_usage", s.reg_usage}, {"buffers_in_draw_description", s.draw_buffers}});
+        }
+    }
+    {
+        auto& by = j["audit_by_pass_class"] = nlohmann::json::object();
+        constexpr const char* names[16] = {"z_prepass_shadow", "g_buffer", "forward", "compute_other", "", "", "", "", "", "", "", "", "", "", "", "untagged"};
+        for (u32 c = 0; c < 16; ++c) {
+            if (by_class[c].buffers.load() + by_class[c].images.load() != 0) {
+                by[names[c][0] ? names[c] : std::to_string(c)] = {{"buffer_requests", by_class[c].buffers.load()}, {"buffers_inside_registered", by_class[c].buffers_inside.load()},
+                                                                  {"image_requests", by_class[c].images.load()}, {"images_at_registered_start", by_class[c].images_found.load()}};
+            }
+        }
+    }
+    {
         std::scoped_lock lock{sample_mutex};
         j["audit_buffers"] = {{"requests", audit.buffers.load()},
                               {"inside_a_registered_buffer", audit.buffers_inside.load()},
@@ -447,6 +692,33 @@ nlohmann::json Report() {
                                 {"block", NativeResources::DescribeAddress(top[i].first)}});
             }
             j["audit_buffers"]["distinct_not_registered"] = buffer_misses.size();
+            // Probe: does a registered buffer's descriptor (V# at object + 0x60: base, stride, records) cover the address right now?
+            auto& probe = j["audit_buffers"]["vsharp_probe"] = nlohmann::json::array();
+            std::shared_lock registry_lock{registry_mutex};
+            for (size_t i = 0; i < top.size() && i < 8; ++i) {
+                const u64 address = top[i].first;
+                nlohmann::json hit = {{"address", fmt::format("{:#x}", address)}, {"covering", nlohmann::json::array()}};
+                for (const auto& [id, e] : by_id) {
+                    if (!e.alive || e.actual != Kind::Buffer) {
+                        continue;
+                    }
+                    u32 v[4]{};
+#ifdef _WIN32
+                    SIZE_T got = 0;
+                    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(e.object + 0x60), v, sizeof(v), &got) || got != sizeof(v)) {
+                        continue;
+                    }
+#endif
+                    const u64 base = u64{v[0]} | (u64{v[1] & 0xffff} << 32);
+                    const u64 stride = (v[1] >> 16) & 0x3fff;
+                    const u64 bytes = stride != 0 ? stride * v[2] : v[2];
+                    if (base > 0x1000000000ull && base < 0x2000000000ull && bytes != 0 && bytes <= (64ull << 20) && address >= base && address < base + bytes && hit["covering"].size() < 3) {
+                        hit["covering"].push_back({{"id", id}, {"object", fmt::format("{:#x}", e.object)}, {"memory", fmt::format("{:#x}", e.address)}, {"byte_width", e.size}, {"usage", e.usage},
+                                                  {"vsharp_base", fmt::format("{:#x}", base)}, {"vsharp_bytes", bytes}});
+                    }
+                }
+                probe.push_back(std::move(hit));
+            }
         }
         auto& by_class = j["audit_buffers"]["not_registered_by_heap_class"] = nlohmann::json::object();
         for (u32 c = 0; c < 17; ++c) {
@@ -456,6 +728,8 @@ nlohmann::json Report() {
         }
         j["audit_images"] = {{"requests", audit.images.load()},
                              {"start_address_registered", audit.images_found.load()},
+                             {"inside_a_registered_buffer", audit.images_in_buffer.load()},
+                             {"inside_a_registered_texture_allocation", audit.images_in_texture_block.load()},
                              {"not_registered", audit.images_missing.load()},
                              {"samples_not_registered", samples(image_miss_samples, 8)}};
         {

@@ -743,6 +743,27 @@ std::string UsageClassNameOf(u32 usage_class) {
     return UsageClassName(usage_class);
 }
 
+bool FrameRing(u64* base, u64* size) {
+    *base = ring_base.load(std::memory_order_relaxed);
+    *size = ring_size.load(std::memory_order_relaxed);
+    return *base != 0 && *size != 0;
+}
+
+bool BlockContaining(VAddr address, u64* start, u64* size) {
+    const Snapshot* snapshot = current.load(std::memory_order_acquire);
+    if (snapshot == nullptr) {
+        return false;
+    }
+    size_t index = 0;
+    const Block* block = Find(snapshot, address, &index);
+    if (block == nullptr) {
+        return false;
+    }
+    *start = block->address;
+    *size = block->size;
+    return true;
+}
+
 std::string DescribeAddress(VAddr address) {
     const Snapshot* snapshot = current.load(std::memory_order_acquire);
     size_t index = 0;

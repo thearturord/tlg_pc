@@ -204,9 +204,43 @@ void HashSlots(Hasher& h, u64 ctx, u64 table, u64 mask_lo, u64 mask_hi) {
 }
 
 /// Native registry (shadow mode): the engine objects the context holds for this draw. Guarded by the caller.
-void ObserveContext(u64 ctx) {
+void ObserveContext(u64 ctx, NativeRegistry::DrawResources* draw) {
     using NativeRegistry::Kind;
-    using NativeRegistry::Observe;
+    const auto buffer = [&](u64 object) {
+        NativeRegistry::Observe(object, Kind::Buffer);
+        if (draw != nullptr && object != 0) {
+            NativeRegistry::CollectResource(*draw, object);
+        }
+    };
+    const auto view = [&](u64 object, Kind kind) {
+        // The per-primitive binding (FUN_01c92f30) stores the resource objects themselves in the shader resource tables, the engine's own passes store views:
+        // the class tag at +0x18 tells (19 / 20 / 21: texture 2D / 3D / buffer, 22 to 25: views).
+        if (object == 0) {
+            return;
+        }
+        const u32 tag = Rd<u32>(object, 0x18);
+        if (tag == 18 || tag == 19 || tag == 20 || tag == 21) {
+            const Kind own = tag == 21 ? Kind::Buffer : tag == 19 ? Kind::Texture2D : tag == 20 ? Kind::Texture3D : Kind::Texture1D;
+            NativeRegistry::Observe(object, own);
+            if (draw != nullptr) {
+                NativeRegistry::CollectResource(*draw, object);
+            }
+            return;
+        }
+        NativeRegistry::Observe(object, kind);
+        if (draw != nullptr) {
+            NativeRegistry::CollectResource(*draw, Obj(Rd<u64>(object, 0x30)));
+        }
+    };
+    const auto Observe = [&](u64 object, Kind kind) {
+        if (kind == Kind::Buffer) {
+            buffer(object);
+        } else if (kind == Kind::ShaderResourceView || kind == Kind::RenderTargetView || kind == Kind::DepthStencilView || kind == Kind::UnorderedAccessView) {
+            view(object, kind);
+        } else {
+            NativeRegistry::Observe(object, kind);
+        }
+    };
     const u64 vs = Rd<u64>(ctx, Ctx::VertexShader);
     const u64 ps = Rd<u64>(ctx, Ctx::PixelShader);
     Observe(Obj(vs), Kind::VertexShader);
@@ -4157,8 +4191,38 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
             LOG_INFO(Core, "native forward dump: {}", text);
         }
     }
+    static thread_local NativeRegistry::DrawResources draw_resources;
+    NativeRegistry::DrawResources* v2 = nullptr;
     if (NativeRegistry::enabled.load(std::memory_order_relaxed)) {
-        Guarded([&] { ObserveContext(ctx); return u64{0}; });
+        draw_resources = {};
+        v2 = &draw_resources;
+        Guarded([&] { ObserveContext(ctx, v2); return u64{0}; });
+        static std::atomic<u32> scan_counter{0};
+        if (const u32 n = scan_counter.fetch_add(1, std::memory_order_relaxed); n < 40000 || n % 64 == 0) {
+            // which slots of the device context hold a Js resource, and which of those the description above did not collect (marked with bit 31 of the offset)
+            Guarded([&] {
+                for (u32 offset = 0; offset < 0x4800; offset += 8) {
+                    const u64 pointer = Obj(Rd<u64>(ctx, offset));
+                    if (pointer > 0x10000) {
+                        if (const u32 kind = Rd<u32>(pointer, 0x124); kind >= 1 && kind <= 4 && Rd<u64>(pointer, 0x30) > 0x100000000ull) {
+                            bool collected = false;
+                            const u64 address = Rd<u64>(pointer, 0x30);
+                            if (kind == 1) {
+                                for (u32 i = 0; i < v2->buffer_count && !collected; ++i) {
+                                    collected = v2->buffers[i].begin == address;
+                                }
+                            } else {
+                                for (u32 i = 0; i < v2->image_count && !collected; ++i) {
+                                    collected = v2->images[i] == address;
+                                }
+                            }
+                            NativeRegistry::NoteContextSlot(offset | (collected ? 0u : 0x80000000u), kind);
+                        }
+                    }
+                }
+                return u64{0};
+            });
+        }
     }
     const Signature sig = Compute(ctx, a1, a2, a3, kind);
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
@@ -4190,6 +4254,10 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
     std::memcpy(&words[9], &seq, sizeof(u64));
     words[11] = 0;
     words[12] = 0;
+    if (v2 != nullptr && seq != 0) {
+        v2->seq = seq;
+        NativeRegistry::StoreDraw(*v2);
+    }
     const bool exec = seq != 0 && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligible(ctx, seq, ret);
     if (exec) {
         words[2] |= ExecFlag;
