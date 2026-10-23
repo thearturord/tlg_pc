@@ -48,6 +48,7 @@ enum Type : u32 {
     CpResume = 30,    ///< the command processor resumed a queue's task: arg = queue index | done << 8, arg2 = how long it ran before it yielded or finished, ts = end
     FenceSignaled = 31, ///< a guest fence landed (the label write ran): arg = ns from the parse to the start on the raster thread | queue << 48 | fence kind << 56, arg2 = ns from there to the signal, ts = after the write
     LabelWrite = 32,  ///< a guest label write by a command stream ran (CpWriteData, or the write held behind a fence): arg = first dword | queue << 32 | (1 << 48 if the held-fence path), arg2 = address, ts = at the write
+    ResourceUse = 33, ///< capture only, resource audit: a buffer / image bound by the raster thread: arg = address | class << 48 (queue index, 0 graphics) | kind << 56 | written << 63, arg2 = size (core/resource_audit.h)
     SchedNode = 28,   ///< a node: arg = node pointer, arg2 = 1 finished waiting node seen by a poll, 2 dispatch: 2 | state << 8 | pending << 16 | flags << 32
 };
 

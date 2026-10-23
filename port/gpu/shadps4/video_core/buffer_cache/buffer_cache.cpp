@@ -16,6 +16,7 @@
 #include "core/native_audit.h"
 #include "core/native_readbacks.h"
 #include "core/native_resources.h"
+#include "core/resource_audit.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -520,6 +521,7 @@ void BufferCache::RecordDmaDownload(const Buffer* arena, VAddr dst, u32 size, bo
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    Core::ResourceAudit::Note(Core::ResourceAudit::BufferUse, device_addr, size, is_written);
     // An immutable engine buffer (see NativeResources::ImmutableBuffer): after one synchronization of the whole buffer it is
     // read straight from the arena.
     if (!is_written && !is_texel_buffer && Core::NativeResources::ImmutableResidencyEnabled()) {

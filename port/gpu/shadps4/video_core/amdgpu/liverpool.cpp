@@ -5,6 +5,7 @@
 
 #include "core/stream_probe.h"
 #include "core/frame_timeline.h"
+#include "core/resource_audit.h"
 #include "common/arch.h"
 #ifdef ARCH_X86_64
 #include <immintrin.h>
@@ -168,6 +169,7 @@ struct Liverpool::RasterCall {
 struct Liverpool::RasterOp {
     bool has_call{};
     bool writes_memory{};
+    u8 audit_class{0xff}; ///< Core::ResourceAudit: the queue whose command stream pushed this operation
     u32 write_line{}; ///< Source line of the RasterRun call that queued a writes_memory closure.
     RasterCall call{};
     Common::UniqueFunction<void> closure{};
@@ -785,6 +787,7 @@ void Liverpool::DrainRaster() {
 
 void Liverpool::RasterPush(RasterOp&& op, bool wait) {
     auto& sp = *split;
+    op.audit_class = Core::ResourceAudit::front_class;
     if (op.writes_memory) {
         sp.pending_writes.fetch_add(1, std::memory_order_acq_rel);
         sp.last_write_line = op.write_line;
@@ -1764,6 +1767,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             run_count = 0;
         };
         for (auto& op : batch) {
+            Core::ResourceAudit::raster_class = op.audit_class;
             if (capturing) {
                 const u32 kind = op.has_call ? (op.call.kind == RasterCall::Kind::Draw || op.call.kind == RasterCall::Kind::DrawIndirect ? 1u : 2u) : 3u;
                 if (kind != run_kind) {
@@ -1817,6 +1821,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             rasterizer->RecyclePlan(std::move(op.dispatch_plan));
         }
         end_run();
+        Core::ResourceAudit::raster_class = Core::ResourceAudit::NoClass;
         if (num_commands != 0) {
             ProcessCommands();
         }
@@ -2430,7 +2435,9 @@ void Liverpool::Process(std::stop_token stoken) {
                 task = queue.submits.front();
             }
             const u64 resume_start = Core::FrameTimeline::capture_active.load(std::memory_order_relaxed) ? Core::FrameTimeline::Now() : 0;
+            Core::ResourceAudit::front_class = static_cast<u8>(curr_qid);
             task.resume();
+            Core::ResourceAudit::front_class = Core::ResourceAudit::NoClass;
             if (resume_start != 0) {
                 const u64 resume_end = Core::FrameTimeline::Now();
                 Core::FrameTimeline::Record(Core::FrameTimeline::CpResume, static_cast<u64>(curr_qid) | (task.done() ? 0x100u : 0u), resume_end, resume_end - resume_start);
