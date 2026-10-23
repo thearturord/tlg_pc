@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <SDL3/SDL.h>
+#include "core/frame_timeline.h"
 #include "tlg_settings.h"
 #include "tlg_orbs.h"
 #include "tlg_actors.h"
@@ -1244,6 +1245,17 @@ void LoadingScreen() {
     ImGui::End();
 }
 
+// The frame profiler is recording (F9 or the debug server): a red mark at the top centre, shown even with the overlay off.
+void ProfilerIndicator() {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f, viewport->WorkPos.y + 8.0f * base_scale), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.6f);
+    ImGui::Begin("##profiler", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::TextColored(ImVec4(1.0f, 0.25f, 0.25f, 1.0f), "PROFILER RECORDING (F9 stops)");
+    ImGui::End();
+}
+
 void FpsCounter() {
     const auto& s = TlgSettings::Get();
     const std::string text = OverlayText();
@@ -1812,6 +1824,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     }
     if (TlgSettings::Get().show_fps && !menu_open) {
         FpsCounter();
+    }
+    if (Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
+        ProfilerIndicator();
     }
     if (!loading && !menu_open) {
         HealthDisplay();

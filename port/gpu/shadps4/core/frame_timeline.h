@@ -39,6 +39,7 @@ enum Type : u32 {
     GpuCommandBuffer = 21, ///< a command buffer ran on the GPU: ts = end (CPU clock), arg = duration ns, arg2 = submission tick
     GpuPass = 22,     ///< a render pass or dispatch ran on the GPU: ts = end (CPU clock), arg = duration ns | kind << 56, arg2 = draws | width << 24 | height << 44
     ThreadCpu = 23,   ///< sampler (1 kHz): arg = CPU cycles the thread named in `thread` ran since the previous sample, taken at ts; cycles / cycles_per_ns (in the .json) = ns
+    GuestSpan = 25,   ///< a timed guest function (spans file): ts = end, arg = duration ns | span id << 48, arg2 = start ns
     GpuClockSync = 24, ///< calibration: arg = GPU timestamp ticks, ts = the CPU clock at the same moment, arg2 = timestamp period (ns * 1000)
 };
 
@@ -97,6 +98,10 @@ inline void CaptureAppend(Type type, u64 arg, u64 ns, u64 arg2, u32 thread) {
 bool StartCapture(u32 seconds, const std::string& tag);
 /// A short JSON text: whether a capture runs, events so far, the last file written.
 std::string CaptureStatus();
+/// Stop a running capture now (it is written as if its time had run out). False when none runs.
+bool StopCapture();
+/// Name of a guest span id, written into the capture file (see guest_hooks.cpp, the spans file).
+void RegisterSpan(u32 id, const std::string& name);
 /// Names for the capture file: an object (a guest wait object, a stage) gets a text.
 void CaptureNote(u64 id, const char* text);
 

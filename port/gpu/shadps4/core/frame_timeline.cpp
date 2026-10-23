@@ -28,6 +28,7 @@ namespace {
 constexpr u64 CaptureCapacity = 4ull << 20; // events, 128 MiB
 std::mutex capture_mutex;
 std::map<u64, std::string> capture_names;
+std::map<u32, std::string> span_names;
 std::string last_file;
 u64 capture_start_ns = 0;
 u64 capture_end_ns = 0;
@@ -108,9 +109,16 @@ void WriteCapture(const std::string& tag) {
     j["types"] = {{"1", "FirstHook"}, {"2", "Submit"}, {"3", "SubmitFlip"}, {"4", "FlipCp"}, {"5", "FlipPrepared"}, {"6", "PresentStart"}, {"7", "PresentEnd"},
                   {"8", "CpWait"}, {"9", "FlipWait"}, {"10", "GameWait"}, {"11", "GameSignal"}, {"12", "CpIdleQueued"}, {"13", "RasterIdleSignal"},
                   {"14", "StreamPublish"}, {"15", "SubmitDone"}, {"16", "DingDongWait"}, {"17", "EopParsed"}, {"18", "EopSignaled"}, {"20", "StageSpan"},
-                  {"21", "GpuCommandBuffer"}, {"22", "GpuPass"}, {"23", "ThreadCpu"}, {"24", "GpuClockSync"}};
+                  {"21", "GpuCommandBuffer"}, {"22", "GpuPass"}, {"23", "ThreadCpu"}, {"24", "GpuClockSync"}, {"25", "GuestSpan"}};
     j["stages"] = {{"1", "FrontOp"}, {"2", "FrontQueueFull"}, {"3", "FrontDrain"}, {"4", "RasterOp"}, {"5", "RasterIdle"}, {"6", "RasterPass"},
                    {"7", "EncoderReplay"}, {"8", "EncoderSubmit"}, {"9", "EncoderIdle"}};
+    {
+        auto& spans = j["spans"] = nlohmann::json::object();
+        std::scoped_lock lock{capture_mutex};
+        for (const auto& [id, text] : span_names) {
+            spans[std::to_string(id)] = text;
+        }
+    }
     auto& threads = j["threads"] = nlohmann::json::object();
     for (const auto& [id, name] : VideoCore::ThreadNames()) {
         threads[std::to_string(id)] = name;
@@ -168,6 +176,19 @@ bool StartCapture(u32 seconds, const std::string& tag) {
         running.store(false);
     });
     return true;
+}
+
+bool StopCapture() {
+    if (!running.load()) {
+        return false;
+    }
+    capture_thread.request_stop();
+    return true;
+}
+
+void RegisterSpan(u32 id, const std::string& name) {
+    std::scoped_lock lock{capture_mutex};
+    span_names[id] = name;
 }
 
 std::string CaptureStatus() {

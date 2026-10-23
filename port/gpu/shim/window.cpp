@@ -3,11 +3,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "core/frame_timeline.h"
 #include "sdl_window.h"
 #include "tlg_overlay.h"
 #include "tlg_graphics.h"
@@ -350,6 +353,13 @@ bool WindowSDL::PollEvents() {
             const char* env = std::getenv("TLG_FRAME_CAPTURE_KEY");
             return env && *env == '1';
         }();
+        // tlg: F9 starts the frame profiler (a 10 s capture into user/log/timeline_f9_<time>.bin/.json, documents/tlg/frame-profiler.md) or stops a running one.
+        if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F9 && !event.key.repeat) {
+            if (!Core::FrameTimeline::StopCapture()) {
+                Core::FrameTimeline::StartCapture(10, "f9_" + std::to_string(static_cast<long long>(std::time(nullptr))));
+            }
+            continue;
+        }
         if (!capture_key && event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F11 && !event.key.repeat) {
             TlgSettings::Get().display_mode = TlgSettings::Get().display_mode == TlgGraphics::Windowed ? TlgGraphics::Fullscreen : TlgGraphics::Windowed;
             continue;

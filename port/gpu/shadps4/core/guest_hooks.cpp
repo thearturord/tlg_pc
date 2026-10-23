@@ -21,6 +21,7 @@
 #include "common/path_util.h"
 #include "core/cpu_patches.h"
 #include "core/debug_server.h"
+#include "core/frame_timeline.h"
 #include "core/guest_hooks.h"
 #include "core/native_draw.h"
 #include "core/memory.h"
@@ -339,10 +340,120 @@ bool InstallHook(Hook& hook, u8* image_base, u64 image_size) {
     return true;
 }
 
+// ---- Frame profiler spans (documents/tlg/frame-profiler.md) ----
+// A spans file (<serial>.spans.json in the custom configs folder) lists guest functions that are reached through a vtable slot: the slot is pointed at a small stub
+// that records the function's start and end into the frame timeline capture while a capture runs. With no capture running the stub costs two calls that return at
+// once. Entries: {"name": "...", "slot": ghidra address of the vtable slot, "target": ghidra address of the function the slot holds}; the slot must hold the target
+// or the entry is refused.
+u64 PS4_SYSV_ABI SpanEnter(u64 id) {
+    return FrameTimeline::capture_active.load(std::memory_order_relaxed) ? FrameTimeline::Now() : 0;
+}
+
+void PS4_SYSV_ABI SpanExit(u64 id, u64 start) {
+    if (start != 0) {
+        const u64 end = FrameTimeline::Now();
+        FrameTimeline::Record(FrameTimeline::GuestSpan, (end - start) | (id << 48), end, start);
+    }
+}
+
+std::vector<std::string> span_names_installed;
+
+void InstallSpans(VAddr base, u64 image_size) {
+    const auto path = Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (MemoryPatcher::g_game_serial + ".spans.json");
+    if (!std::filesystem::exists(path)) {
+        return;
+    }
+    nlohmann::json config;
+    try {
+        std::ifstream in(path);
+        in >> config;
+    } catch (const std::exception& e) {
+        LOG_ERROR(Core, "frame profiler spans: cannot read {}: {}", path.string(), e.what());
+        return;
+    }
+    u32 installed = 0;
+    try {
+        const u64 ghidra_base = config.contains("ghidra_image_base") ? ParseHex(config.at("ghidra_image_base")) : 0x1000000;
+        for (const auto& item : config.at("spans")) {
+            const auto name = item.at("name").get<std::string>();
+            const u64 slot_offset = ParseHex(item.at("slot")) - ghidra_base;
+            const u64 target_offset = ParseHex(item.at("target")) - ghidra_base;
+            if (slot_offset + 8 > image_size || target_offset >= image_size) {
+                LOG_ERROR(Core, "frame profiler span '{}': outside the image", name);
+                continue;
+            }
+            auto* slot = reinterpret_cast<u64*>(base + slot_offset);
+            const u64 original = base + target_offset;
+            if (*slot != original) {
+                LOG_ERROR(Core, "frame profiler span '{}': the slot holds {:#x}, expected {:#x}: skipped", name, *slot, original);
+                continue;
+            }
+            const u32 id = static_cast<u32>(span_names_installed.size());
+            const u8* stub = nullptr;
+            const bool emitted = EmitInTrampolineArea(reinterpret_cast<const void*>(original), [&](Xbyak::CodeGenerator& c) {
+                stub = c.getCurr<const u8*>();
+                // Entry: rsp is 8 mod 16. Eight pushes keep it 8 mod 16, the sub makes it 16 aligned for the calls.
+                c.push(rbx);
+                c.push(r12);
+                c.push(rdi);
+                c.push(rsi);
+                c.push(rdx);
+                c.push(rcx);
+                c.push(r8);
+                c.push(r9);
+                c.sub(rsp, 8);
+                c.mov(r12d, id);
+                c.mov(edi, r12d);
+                c.mov(rax, reinterpret_cast<u64>(&SpanEnter));
+                c.call(rax);
+                c.mov(rbx, rax);
+                c.add(rsp, 8);
+                c.pop(r9);
+                c.pop(r8);
+                c.pop(rcx);
+                c.pop(rdx);
+                c.pop(rsi);
+                c.pop(rdi);
+                c.sub(rsp, 8);
+                c.mov(rax, original);
+                c.call(rax); // the function itself, with the caller's own argument registers
+                c.mov(edi, r12d);
+                c.mov(rsi, rbx);
+                c.mov(rax, reinterpret_cast<u64>(&SpanExit));
+                c.call(rax);
+                c.add(rsp, 8);
+                c.pop(r12);
+                c.pop(rbx);
+                c.ret();
+                return true;
+            });
+            if (!emitted) {
+                LOG_ERROR(Core, "frame profiler span '{}': no room in the trampoline area", name);
+                continue;
+            }
+#ifdef _WIN32
+            DWORD old = 0;
+            VirtualProtect(slot, 8, PAGE_READWRITE, &old);
+            *slot = reinterpret_cast<u64>(stub);
+            VirtualProtect(slot, 8, old, &old);
+#else
+            *slot = reinterpret_cast<u64>(stub);
+#endif
+            span_names_installed.push_back(name);
+            FrameTimeline::RegisterSpan(id, name);
+            ++installed;
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR(Core, "frame profiler spans: bad file {}: {}", path.string(), e.what());
+    }
+    LOG_WARNING(Core, "frame profiler: {} spans installed from {}", installed, path.filename().string());
+}
+
 } // namespace
 
 void InstallForEboot(VAddr base, u64 image_size) {
     NativeDraw::SetImageBase(base);
+    InstallSpans(base, image_size);
     const auto path = ConfigPath();
     if (!std::filesystem::exists(path)) {
         return;
