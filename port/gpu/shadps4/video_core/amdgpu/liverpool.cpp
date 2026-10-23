@@ -1768,8 +1768,13 @@ void Liverpool::RasterMain(std::stop_token stoken) {
         };
         for (auto& op : batch) {
             Core::ResourceAudit::raster_class = op.audit_class;
+            if (rasterizer) {
+                rasterizer->SelectStream(op.audit_class == 1);
+            }
             if (capturing) {
-                const u32 kind = op.has_call ? (op.call.kind == RasterCall::Kind::Draw || op.call.kind == RasterCall::Kind::DrawIndirect ? 1u : 2u) : 3u;
+                // run key: kind (bits 0-3) | the queue that pushed the operation (bits 4-7, 15 = none), so a run never mixes queues
+                const u32 kind = (op.has_call ? (op.call.kind == RasterCall::Kind::Draw || op.call.kind == RasterCall::Kind::DrawIndirect ? 1u : 2u) : 3u) |
+                                 (u32(op.audit_class & 0xf) << 4);
                 if (kind != run_kind) {
                     end_run();
                     run_kind = kind;
@@ -1822,6 +1827,9 @@ void Liverpool::RasterMain(std::stop_token stoken) {
         }
         end_run();
         Core::ResourceAudit::raster_class = Core::ResourceAudit::NoClass;
+        if (rasterizer) {
+            rasterizer->SelectStream(false);
+        }
         if (num_commands != 0) {
             ProcessCommands();
         }

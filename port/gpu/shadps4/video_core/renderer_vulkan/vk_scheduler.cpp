@@ -16,25 +16,31 @@
 
 namespace Vulkan {
 
-std::mutex Scheduler::submit_mutex;
+std::mutex SchedulerLocks::submit_mutex;
 
 Scheduler::Scheduler(const Instance& instance)
-    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
+    : gfx{instance, instance.GetGraphicsQueue(), 0},
+      side{instance.HasAsyncQueue() ? std::make_unique<SchedulerCore>(instance, instance.GetAsyncQueue(), 1) : nullptr} {}
+
+Scheduler::~Scheduler() = default;
+
+SchedulerCore::SchedulerCore(const Instance& instance, vk::Queue queue, u32 stream)
+    : instance{instance}, submit_queue{queue}, stream_id{stream}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
     BeginSession();
     priority_pending_ops_thread =
-        std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
+        std::jthread(std::bind_front(&SchedulerCore::PriorityPendingOpsThread, this));
 }
 
-Scheduler::~Scheduler() {
+SchedulerCore::~SchedulerCore() {
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
 }
 
-void Scheduler::BeginRendering(const RenderState& new_state) {
+void SchedulerCore::BeginRendering(const RenderState& new_state) {
     if (is_rendering && render_state == new_state) {
         return;
     }
@@ -95,7 +101,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     }
 }
 
-void Scheduler::EndRendering() {
+void SchedulerCore::EndRendering() {
     if (!is_rendering) {
         return;
     }
@@ -112,16 +118,16 @@ void Scheduler::EndRendering() {
     }
 }
 
-GpuTimeline* Scheduler::Timeline() {
+GpuTimeline* SchedulerCore::Timeline() {
     std::call_once(gpu_timeline_once, [this] { gpu_timeline = std::make_unique<GpuTimeline>(instance); });
     return gpu_timeline.get();
 }
 
-bool Scheduler::CaptureStamps() const noexcept {
-    return use_encoder && !direct_active && Core::FrameTimeline::capture_active.load(std::memory_order_relaxed);
+bool SchedulerCore::CaptureStamps() const noexcept {
+    return stream_id == 0 && use_encoder && !direct_active && Core::FrameTimeline::capture_active.load(std::memory_order_relaxed);
 }
 
-void Scheduler::RecordStamp(u8 kind, u64 detail) {
+void SchedulerCore::RecordStamp(u8 kind, u64 detail) {
     auto* timeline = Timeline();
     const u32 index = timeline->Allocate();
     list_stamps.push_back({index, kind, detail});
@@ -129,13 +135,13 @@ void Scheduler::RecordStamp(u8 kind, u64 detail) {
     CommandBuffer().record([pool, index](vk::CommandBuffer cmdbuf) { cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, index); });
 }
 
-void Scheduler::StampDispatch(bool begin) {
+void SchedulerCore::StampDispatch(bool begin) {
     if (CaptureStamps()) {
         RecordStamp(begin ? GpuStampDispatchBegin : GpuStampDispatchEnd, 0);
     }
 }
 
-vk::CommandBuffer Scheduler::UploadCommandBuffer() {
+vk::CommandBuffer SchedulerCore::UploadCommandBuffer() {
     auto& upload_cmdbuf = sessions.back().upload;
     if (upload_cmdbuf) {
         return upload_cmdbuf;
@@ -148,17 +154,17 @@ vk::CommandBuffer Scheduler::UploadCommandBuffer() {
     return upload_cmdbuf;
 }
 
-void Scheduler::Flush(SubmitInfo& info) {
+void SchedulerCore::Flush(SubmitInfo& info) {
     // When flushing, we only send data to the driver; no waiting is necessary.
     SubmitExecution(info);
 }
 
-void Scheduler::Flush() {
+void SchedulerCore::Flush() {
     SubmitInfo info{};
     Flush(info);
 }
 
-void Scheduler::Finish() {
+void SchedulerCore::Finish() {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
@@ -169,7 +175,7 @@ void Scheduler::Finish() {
     WaitPriorityOperations();
 }
 
-void Scheduler::Wait(u64 tick) {
+void SchedulerCore::Wait(u64 tick) {
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
@@ -178,7 +184,7 @@ void Scheduler::Wait(u64 tick) {
     work_semaphore.Wait(tick);
 }
 
-void Scheduler::WaitPriorityOperations() {
+void SchedulerCore::WaitPriorityOperations() {
     if (num_priority_ops.load(std::memory_order_acquire) == 0) {
         return;
     }
@@ -199,7 +205,7 @@ void Scheduler::WaitPriorityOperations() {
     }
 }
 
-void Scheduler::PopPendingOperations() {
+void SchedulerCore::PopPendingOperations() {
     std::unique_lock lk(pending_ops_mutex);
     work_semaphore.Refresh();
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
@@ -208,7 +214,7 @@ void Scheduler::PopPendingOperations() {
     }
 }
 
-void Scheduler::BeginSession() {
+void SchedulerCore::BeginSession() {
     EndSession();
 
     auto& session = sessions.emplace_back();
@@ -240,7 +246,7 @@ void Scheduler::BeginSession() {
 #endif
 }
 
-void Scheduler::EndSession() {
+void SchedulerCore::EndSession() {
     if (sessions.empty()) {
         return;
     }
@@ -260,7 +266,7 @@ void Scheduler::EndSession() {
     }
 }
 
-void Scheduler::SetEncoderMode(u32 mode) {
+void SchedulerCore::SetEncoderMode(u32 mode) {
     if (mode == 0) {
         SyncedCommandBuffer();
     }
@@ -271,13 +277,13 @@ void Scheduler::SetEncoderMode(u32 mode) {
         // first direct tick, submitted by the ordering thread. Later ticks go to the encoder.
         direct_active = true;
         encoder_sync = mode == 3;
-        encoder_thread = std::jthread(std::bind_front(&Scheduler::EncoderThread, this));
+        encoder_thread = std::jthread(std::bind_front(&SchedulerCore::EncoderThread, this));
         LOG_INFO(Render_Vulkan, "Command processor: Vulkan encoding on an encoder thread{}",
                  encoder_sync ? " (synchronous hand-off, diagnostic)" : "");
     }
 }
 
-vk::CommandBuffer Scheduler::SyncedCommandBuffer() {
+vk::CommandBuffer SchedulerCore::SyncedCommandBuffer() {
     if (use_encoder && !direct_active) {
         // Everything handed over must be submitted before commands recorded here, which are
         // submitted by this thread at the end of the tick.
@@ -301,12 +307,12 @@ vk::CommandBuffer Scheduler::SyncedCommandBuffer() {
     return cmdbuf;
 }
 
-void Scheduler::WaitEncoderIdle() {
+void SchedulerCore::WaitEncoderIdle() {
     std::unique_lock lk{encoder_mutex};
     encoder_cv.wait(lk, [this] { return jobs_done == jobs_handed; });
 }
 
-void Scheduler::HandOffToEncoder(SubmitInfo& info, u64 signal_value) {
+void SchedulerCore::HandOffToEncoder(SubmitInfo& info, u64 signal_value) {
     info.AddSignal(work_semaphore.Handle(), signal_value);
     EncoderJob job{
         .info = info,
@@ -341,8 +347,8 @@ void Scheduler::HandOffToEncoder(SubmitInfo& info, u64 signal_value) {
     }
 }
 
-void Scheduler::EncoderThread(std::stop_token stoken) {
-    Common::SetCurrentThreadName("shadPS4:GpuEncoder");
+void SchedulerCore::EncoderThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName(stream_id == 0 ? "shadPS4:GpuEncoder" : "shadPS4:GpuEncoderAsc");
     if (const s32 core = EmulatorSettings.GetCpEncoderCore(); core >= 0) {
         VideoCore::PinThreadAndIsolateCore(static_cast<u32>(core));
     }
@@ -414,7 +420,7 @@ void Scheduler::EncoderThread(std::stop_token stoken) {
     }
 }
 
-void Scheduler::SubmitExecution(SubmitInfo& info) {
+void SchedulerCore::SubmitExecution(SubmitInfo& info) {
     // Recorded commands go into the command buffer before anything written directly at the end.
     EndRendering();
 
@@ -486,7 +492,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     PopPendingOperations();
 }
 
-void Scheduler::SubmitCommandBuffers(std::span<const vk::CommandBuffer> cmd_buffers,
+void SchedulerCore::SubmitCommandBuffers(std::span<const vk::CommandBuffer> cmd_buffers,
                                      SubmitInfo& info) {
     std::array<vk::PipelineStageFlags, std::tuple_size_v<decltype(info.wait_semas)>>
         wait_stage_masks;
@@ -510,8 +516,10 @@ void Scheduler::SubmitCommandBuffers(std::span<const vk::CommandBuffer> cmd_buff
         .pSignalSemaphores = info.signal_semas.data(),
     };
 
-    ImGui::Core::TextureManager::Submit();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    if (stream_id == 0) {
+        ImGui::Core::TextureManager::Submit();
+    }
+    auto submit_result = submit_queue.submit(submit_info, info.fence);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 }
 
@@ -519,12 +527,12 @@ namespace {
 thread_local bool is_priority_thread = false;
 } // Anonymous namespace
 
-bool Scheduler::OnPriorityThread() noexcept {
+bool SchedulerCore::OnPriorityThread() noexcept {
     return is_priority_thread;
 }
 
-void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
-    Common::SetCurrentThreadName("shadPS4:GpuSchedPriorityPendingOpsRunner");
+void SchedulerCore::PriorityPendingOpsThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName(stream_id == 0 ? "shadPS4:GpuSchedPriorityPendingOpsRunner" : "shadPS4:GpuSchedPriorityAsc");
     is_priority_thread = true;
 
     while (!stoken.stop_requested()) {

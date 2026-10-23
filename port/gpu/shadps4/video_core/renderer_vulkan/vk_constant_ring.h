@@ -88,11 +88,9 @@ private:
     }
 
     void Retire() {
-        auto* semaphore = scheduler.GetWorkSemaphore();
-        semaphore->Refresh();
         u64 at = stamps_tail.load(std::memory_order_relaxed);
         const u64 head = stamps_head.load(std::memory_order_acquire);
-        while (at < head && semaphore->IsFree(stamps[at % stamps.size()].tick)) {
+        while (at < head && scheduler.IsFree(stamps[at % stamps.size()].tick)) {
             retired = stamps[at % stamps.size()].end;
             ++at;
         }

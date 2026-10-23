@@ -71,6 +71,14 @@ public:
         return graphics_queue;
     }
 
+    [[nodiscard]] bool HasAsyncQueue() const {
+        return has_async_queue;
+    }
+
+    vk::Queue GetAsyncQueue() const {
+        return async_queue;
+    }
+
     vk::Queue GetPresentQueue() const {
         return present_queue;
     }
@@ -519,6 +527,8 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue async_queue;     ///< second queue of the graphics family (TLG_ASC_QUEUE=1), null otherwise
+    bool has_async_queue{};
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;

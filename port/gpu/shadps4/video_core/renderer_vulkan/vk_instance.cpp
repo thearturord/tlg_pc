@@ -377,10 +377,16 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
+    // TLG_ASC_QUEUE=1 (documents/tlg/async-compute-queue-plan.md): a second queue of the graphics family for the asynchronous compute queue 1.
+    const char* asc_queue_env = std::getenv("TLG_ASC_QUEUE");
+    const bool want_async_queue = asc_queue_env != nullptr && asc_queue_env[0] == '1';
+    LOG_INFO(Render_Vulkan, "Graphics queue family {} exposes {} queues (TLG_ASC_QUEUE {})", queue_family_index,
+             family_properties[queue_family_index].queueCount, want_async_queue ? "on" : "off");
+    has_async_queue = want_async_queue && family_properties[queue_family_index].queueCount >= 2;
+    static constexpr std::array queue_priorities = {1.0f, 1.0f};
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
+        .queueCount = has_async_queue ? 2u : 1u,
         .pQueuePriorities = queue_priorities.data(),
     };
 
@@ -596,6 +602,10 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    if (has_async_queue) {
+        async_queue = device->getQueue(queue_family_index, 1);
+        LOG_INFO(Render_Vulkan, "Second queue of family {} created for the asynchronous compute queue", queue_family_index);
+    }
 
     if (calibrated_timestamps && TRACY_GPU_ENABLED) {
         const auto [time_domains_result, time_domains] =

@@ -1103,6 +1103,33 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Dis
     ResetBindings(true);
 }
 
+void Rasterizer::SelectStream(bool side) {
+    constexpr u32 WarmupWindows = 240;
+    const bool new_window = side && !side_requested;
+    side_requested = side;
+    if (new_window) {
+        ++side_windows;
+    }
+    if (side == (side_scope != nullptr)) {
+        return;
+    }
+    if (side && (!scheduler.HasSideStream() || side_windows <= WarmupWindows)) {
+        return;
+    }
+    // Barriers recorded so far belong to the stream being left.
+    runtime.FlushBarriers();
+    if (side) {
+        const u64 now = Core::FrameTimeline::Now();
+        if (now - side_last_end_ns > 3'000'000) {
+            buffer_cache.SetSideUploadEpoch(++side_epoch); // the work of the next frame: the CPU may have rewritten the inputs
+        }
+        side_scope = std::make_unique<Scheduler::SideScope>(scheduler, true);
+    } else {
+        side_scope.reset();
+        side_last_end_ns = Core::FrameTimeline::Now();
+    }
+}
+
 u64 Rasterizer::Flush() {
     const u64 current_tick = scheduler.CurrentTick();
     SubmitInfo info{};

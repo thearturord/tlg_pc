@@ -212,6 +212,11 @@ public:
 
     u64 Flush();
     void Finish();
+
+    /// Raster thread: records the following operations into the asynchronous stream (second Vulkan queue, TLG_ASC_QUEUE=1) or the graphics stream.
+    /// Leaving the asynchronous stream submits what it recorded. No effect without the second queue; the first windows stay on the graphics stream
+    /// (the inputs shared with the graphics are uploaded there first).
+    void SelectStream(bool side);
     void OnSubmit();
 
     void ProcessDownloadImages();
@@ -405,6 +410,11 @@ private:
 
     const Instance& instance;
     Scheduler& scheduler;
+    std::unique_ptr<Scheduler::SideScope> side_scope;
+    u32 side_windows{};
+    bool side_requested{};
+    u64 side_epoch{1};
+    u64 side_last_end_ns{};
     Runtime& runtime;
     VideoCore::PageManager page_manager;
     VideoCore::BufferCache buffer_cache;

@@ -466,13 +466,14 @@ void BufferCache::UnmarkSettledPages(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::InvalidateStreamReuse(VAddr device_addr, u64 size) {
-    if (stream_reuse.empty() || device_addr >= stream_reuse_max ||
-        device_addr + size <= stream_reuse_min) {
-        return;
+    for (auto& set : stream_reuse_sets) {
+        if (set.map.empty() || device_addr >= set.max || device_addr + size <= set.min) {
+            continue;
+        }
+        set.map.clear();
+        set.min = ~0ULL;
+        set.max = 0;
     }
-    stream_reuse.clear();
-    stream_reuse_min = ~0ULL;
-    stream_reuse_max = 0;
 }
 
 void BufferCache::RecordDmaDownload(const Buffer* arena, VAddr dst, u32 size, bool tracked) {
@@ -545,18 +546,19 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
         // Stream copies are at most STREAM_THRESHOLD bytes, so the size fits in the low 16 bits.
         const u64 reuse_key = (device_addr << 16) | size;
+        auto& reuse = stream_reuse_sets[Vulkan::Scheduler::SideSelected() ? 1 : 0];
         if (StreamReuseOn()) {
             const u64 tick = scheduler.CurrentTick();
             const u64 wraps = stream_buffer.WrapCount();
-            if (tick != stream_reuse_tick || wraps != stream_reuse_wraps) {
+            if (tick != reuse.tick || wraps != reuse.wraps) {
                 // A new command buffer: the game may have changed the data since. A wrap of the
                 // stream buffer may overwrite earlier copies.
-                stream_reuse_tick = tick;
-                stream_reuse_wraps = wraps;
-                stream_reuse.clear();
-                stream_reuse_min = ~0ULL;
-                stream_reuse_max = 0;
-            } else if (const auto it = stream_reuse.find(reuse_key); it != stream_reuse.end()) {
+                reuse.tick = tick;
+                reuse.wraps = wraps;
+                reuse.map.clear();
+                reuse.min = ~0ULL;
+                reuse.max = 0;
+            } else if (const auto it = reuse.map.find(reuse_key); it != reuse.map.end()) {
                 Core::NativeResources::NoteBufferRequest(device_addr, size, false,
                                                          Core::NativeResources::BufferPath::StreamReuse, 0);
                 return {&stream_buffer, it->second};
@@ -567,10 +569,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         stream_buffer.Commit();
         Core::NativeResources::NoteBufferRequest(device_addr, size, false,
                                                  Core::NativeResources::BufferPath::StreamCopy, size);
-        if (StreamReuseOn() && stream_buffer.WrapCount() == stream_reuse_wraps) {
-            stream_reuse.emplace(reuse_key, offset);
-            stream_reuse_min = std::min<VAddr>(stream_reuse_min, device_addr);
-            stream_reuse_max = std::max<VAddr>(stream_reuse_max, device_addr + size);
+        if (StreamReuseOn() && stream_buffer.WrapCount() == reuse.wraps) {
+            reuse.map.emplace(reuse_key, offset);
+            reuse.min = std::min<VAddr>(reuse.min, device_addr);
+            reuse.max = std::max<VAddr>(reuse.max, device_addr + size);
         }
         return {&stream_buffer, offset};
     }
@@ -836,7 +838,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             }
             // Read again in the same command buffer: the data cannot have changed since the first upload.
             auto& done = ring_uploads[(lo >> 6) & 255];
-            const u64 tick = scheduler.CurrentTick();
+            const u64 tick = Vulkan::Scheduler::SideSelected() ? (side_upload_epoch | Vulkan::Scheduler::SideTag) : scheduler.CurrentTick();
             if (done.tick != tick || done.lo > lo || done.hi < hi) {
                 add_copy(lo, hi - lo);
                 done = {lo, hi, tick};
@@ -937,6 +939,10 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
 
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     if (pending_binds.empty()) {
+        // With a second command stream the stream that did not carry the binds has to wait for them too.
+        if (last_bind_tick != 0 && instance.HasAsyncQueue()) {
+            info.AddWait(memory_semaphore.Handle(), last_bind_tick);
+        }
         return;
     }
 
@@ -952,6 +958,7 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     }
 
     const u64 signal_tick = memory_semaphore.NextTick();
+    last_bind_tick = signal_tick;
     const auto signal_sema = memory_semaphore.Handle();
 
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {

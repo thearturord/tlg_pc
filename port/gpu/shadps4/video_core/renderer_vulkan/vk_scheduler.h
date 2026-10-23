@@ -355,10 +355,20 @@ struct DynamicState {
 using SessionFunc = Common::UniqueFunction<void>;
 using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 
-class Scheduler {
+/// The queue submission lock, shared by all streams (and used by code that submits to the graphics queue itself).
+struct SchedulerLocks {
+    static std::mutex submit_mutex;
+    /// True on a thread that holds submit_mutex inside SubmitExecution (the submit callback must
+    /// not lock it again).
+    static inline thread_local bool submit_lock_held = false;
+};
+
+/// One command stream: ticks (timeline semaphore), command lists, encoder thread, priority operation thread, one VkQueue.
+/// Scheduler (below) owns the graphics stream and, with TLG_ASC_QUEUE=1, a second one for the asynchronous compute queue 1.
+class SchedulerCore : public SchedulerLocks {
 public:
-    explicit Scheduler(const Instance& instance);
-    ~Scheduler();
+    explicit SchedulerCore(const Instance& instance, vk::Queue queue, u32 stream);
+    ~SchedulerCore();
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
@@ -522,11 +532,6 @@ public:
     /// for another priority operation (it would wait for itself).
     [[nodiscard]] static bool OnPriorityThread() noexcept;
 
-    static std::mutex submit_mutex;
-    /// True on a thread that holds submit_mutex inside SubmitExecution (the submit callback must
-    /// not lock it again).
-    static inline thread_local bool submit_lock_held = false;
-
 private:
     void EndSession();
 
@@ -552,6 +557,8 @@ private:
 
 private:
     const Instance& instance;
+    vk::Queue submit_queue;
+    u32 stream_id;
     Semaphore work_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
@@ -605,6 +612,179 @@ private:
     /// "end the pass if there is one".
     bool replay_rendering = false;
     tracy::VkCtxScope* profiler_scope{};
+};
+
+/// The scheduler the rest of the renderer talks to. It forwards to the graphics stream; while a thread has the asynchronous stream selected
+/// (SideScope, raster thread only) it forwards to the second stream instead. Ticks returned while the second stream is selected carry SideTag
+/// in bit 62, so IsFree / Wait / DeferPriorityOperation find the right semaphore later, from any thread and with any stream selected.
+class Scheduler : public SchedulerLocks {
+public:
+    static constexpr u64 SideTag = 1ull << 62;
+
+    explicit Scheduler(const Instance& instance);
+    ~Scheduler();
+
+    /// Selects the asynchronous stream for this thread while alive; submits what it recorded when it ends. No effect without the second queue.
+    class SideScope {
+    public:
+        SideScope(Scheduler& scheduler_, bool on) : scheduler{scheduler_}, active{on && scheduler_.side != nullptr} {
+            if (active) {
+                Scheduler::use_side = true;
+            }
+        }
+        ~SideScope() {
+            if (active) {
+                if (scheduler.side->PendingEncoderCommands() != 0) {
+                    scheduler.side->Flush();
+                }
+                Scheduler::use_side = false;
+            }
+        }
+        SideScope(const SideScope&) = delete;
+        SideScope& operator=(const SideScope&) = delete;
+        [[nodiscard]] bool Active() const noexcept {
+            return active;
+        }
+
+    private:
+        Scheduler& scheduler;
+        bool active;
+    };
+    [[nodiscard]] bool HasSideStream() const noexcept {
+        return side != nullptr;
+    }
+    /// True on a thread that has the asynchronous stream selected.
+    [[nodiscard]] static bool SideSelected() noexcept {
+        return use_side;
+    }
+
+    void Flush(SubmitInfo& info) {
+        Active().Flush(info);
+    }
+    void Flush() {
+        Active().Flush();
+    }
+    /// Waits for everything submitted on both streams.
+    void Finish() {
+        gfx.Finish();
+        if (side) {
+            side->Finish();
+        }
+    }
+    void Wait(u64 tick) {
+        Core(tick).Wait(tick & ~SideTag);
+    }
+    void PopPendingOperations() {
+        Active().PopPendingOperations();
+    }
+    void BeginRendering(const RenderState& new_state) {
+        Active().BeginRendering(new_state);
+    }
+    void EndRendering() {
+        Active().EndRendering();
+    }
+    void BeginSession() {
+        Active().BeginSession();
+    }
+    vk::CommandBuffer UploadCommandBuffer() {
+        return Active().UploadCommandBuffer();
+    }
+    void SetSessionCallback(SessionFunc&& on_session) {
+        gfx.SetSessionCallback(std::move(on_session));
+    }
+    template <typename F>
+    void SetSubmitCallback(F on_submit) {
+        // Both streams run the same callback (the barriers of the stream being submitted, pending sparse binds).
+        gfx.SetSubmitCallback(SubmitFunc{F{on_submit}});
+        if (side) {
+            side->SetSubmitCallback(SubmitFunc{std::move(on_submit)});
+        }
+    }
+    void NoteDraw() noexcept {
+        Active().NoteDraw();
+    }
+    void StampDispatch(bool begin) {
+        Active().StampDispatch(begin);
+    }
+    const RenderState& GetRenderState() const {
+        return ActiveConst().GetRenderState();
+    }
+    [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {
+        return ActiveConst().IsRenderingWith(state);
+    }
+    DynamicState& GetDynamicState() {
+        return Active().GetDynamicState();
+    }
+    CommandRecorder CommandBuffer() const {
+        return ActiveConst().CommandBuffer();
+    }
+    [[nodiscard]] bool IsRecordingCommands() const noexcept {
+        return gfx.IsRecordingCommands();
+    }
+    vk::CommandBuffer SyncedCommandBuffer() {
+        return Active().SyncedCommandBuffer();
+    }
+    void SetEncoderMode(u32 mode) {
+        gfx.SetEncoderMode(mode);
+        if (side) {
+            side->SetEncoderMode(mode);
+        }
+    }
+    [[nodiscard]] u64 PendingEncoderCommands() const noexcept {
+        return ActiveConst().PendingEncoderCommands();
+    }
+    void SyncEncoder() {
+        Active().SyncEncoder();
+    }
+    [[nodiscard]] u64 CurrentTick() const noexcept {
+        return use_side && side ? (side->CurrentTick() | SideTag) : gfx.CurrentTick();
+    }
+    [[nodiscard]] bool IsFree(u64 tick) noexcept {
+        return Core(tick).IsFree(tick & ~SideTag);
+    }
+    /// The graphics stream's semaphore (presentation waits on it).
+    [[nodiscard]] Semaphore* GetWorkSemaphore() noexcept {
+        return gfx.GetWorkSemaphore();
+    }
+    void DeferOperation(Common::UniqueFunction<void>&& func) {
+        Active().DeferOperation(std::move(func));
+    }
+    void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
+        Active().DeferPriorityOperation(std::move(func));
+    }
+    void DeferPriorityOperation(Common::UniqueFunction<void>&& func, u64 tick) {
+        Core(tick).DeferPriorityOperation(std::move(func), tick & ~SideTag);
+    }
+    [[nodiscard]] bool PriorityOperationsNeedSubmit() const noexcept {
+        return ActiveConst().PriorityOperationsNeedSubmit();
+    }
+    [[nodiscard]] bool HasPriorityOperations() const noexcept {
+        return gfx.HasPriorityOperations() || (side && side->HasPriorityOperations());
+    }
+    void WaitPriorityOperations() {
+        gfx.WaitPriorityOperations();
+        if (side) {
+            side->WaitPriorityOperations();
+        }
+    }
+    [[nodiscard]] static bool OnPriorityThread() noexcept {
+        return SchedulerCore::OnPriorityThread();
+    }
+
+private:
+    SchedulerCore& Active() noexcept {
+        return use_side && side ? *side : gfx;
+    }
+    const SchedulerCore& ActiveConst() const noexcept {
+        return use_side && side ? *side : gfx;
+    }
+    SchedulerCore& Core(u64 tick) noexcept {
+        return (tick & SideTag) && side ? *side : gfx;
+    }
+
+    static inline thread_local bool use_side = false;
+    SchedulerCore gfx;
+    std::unique_ptr<SchedulerCore> side;
 };
 
 } // namespace Vulkan

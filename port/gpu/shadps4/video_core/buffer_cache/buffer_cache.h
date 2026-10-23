@@ -131,6 +131,10 @@ public:
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
 
+    void SetSideUploadEpoch(u64 epoch) {
+        side_upload_epoch = epoch;
+    }
+
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
@@ -284,11 +288,18 @@ private:
     }
     /// readback_async_guest_faults: guest threads wait for their readbacks themselves.
     const bool async_guest_faults;
-    tsl::robin_map<u64, u64, Common::U64Hash> stream_reuse;
-    u64 stream_reuse_tick{};
-    u64 stream_reuse_wraps{};
-    VAddr stream_reuse_min{~0ULL};
-    VAddr stream_reuse_max{};
+    /// One set per command stream (0 graphics, 1 asynchronous): a window of the other stream must not drop the copies of this one.
+    struct StreamReuseSet {
+        tsl::robin_map<u64, u64, Common::U64Hash> map;
+        u64 tick{};
+        u64 wraps{};
+        VAddr min{~0ULL};
+        VAddr max{};
+    };
+    std::array<StreamReuseSet, 2> stream_reuse_sets;
+    /// Asynchronous stream: the untracked ring is uploaded once per epoch (one frame's window of work of queue 1, which the graphics stream
+    /// covers with one tick), not once per tick of that stream.
+    u64 side_upload_epoch{1};
 
     /// Asynchronous downloads recorded but not landed in guest memory yet.
     struct InflightDownload {
@@ -313,6 +324,7 @@ private:
     std::deque<Buffer> arenas;
     std::vector<ArenaBinds> pending_binds;
     Vulkan::Semaphore memory_semaphore;
+    u64 last_bind_tick{}; ///< memory_semaphore value of the latest sparse bind submission
 
     struct Backing : public Interval {
         vk::DeviceMemory memory;
