@@ -667,6 +667,10 @@ void InstallForEboot(VAddr base, u64 image_size) {
     fault_file << "frame,page,npages,rip,st0,st1,st2\n";
 }
 
+u64 FaultRip() {
+    return current_fault_rip;
+}
+
 void SetFaultRip(u64 rip, const u64* stack_words) {
     current_fault_rip = rip;
     for (int i = 0; i < 3; ++i) {

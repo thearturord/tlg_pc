@@ -21,6 +21,7 @@
 #include "core/frame_timeline.h"
 #include "core/native_resources.h"
 #include "core/memory.h"
+#include "core/guest_hooks.h"
 #include "core/native_draw.h"
 #include "core/native_entry_dump.h"
 #include "core/native_audit.h"
@@ -337,6 +338,13 @@ nlohmann::json Log(const Params& params) {
     return {{"file", name}, {"lines", result}};
 }
 
+namespace {
+// Write faults by the instruction that took them (Ghidra address): small open addressed table, emptied by /faults.
+constexpr u32 FaultRipSlots = 512;
+std::array<std::atomic<u64>, FaultRipSlots> fault_rip_keys{};
+std::array<std::atomic<u64>, FaultRipSlots> fault_rip_counts{};
+} // namespace
+
 nlohmann::json Faults(const Params& params) {
     const u64 top = std::min<u64>(ParseNumber(params, "top", 15), 100);
     std::vector<std::pair<u32, u32>> counts; // {count, region}
@@ -357,7 +365,27 @@ nlohmann::json Faults(const Params& params) {
     const double seconds = previous == 0 ? 0.0 : static_cast<double>(now - previous) / 1e9;
     std::ranges::sort(counts, std::greater<>{});
     nlohmann::json j;
-    j["note"] = "CPU write faults on tracked pages since the previous call, by 4 MB region";
+    {
+        const u64 base = NativeDraw::ImageBase();
+        std::vector<std::pair<u64, u64>> rips;
+        for (u32 i = 0; i < FaultRipSlots; ++i) {
+            const u64 key = fault_rip_keys[i].load(std::memory_order_relaxed);
+            if (key == 0) {
+                continue;
+            }
+            const u64 count = fault_rip_counts[i].exchange(0, std::memory_order_relaxed);
+            fault_rip_keys[i].store(0, std::memory_order_relaxed);
+            if (count != 0) {
+                rips.emplace_back(count, key);
+            }
+        }
+        std::ranges::sort(rips, std::greater<>{});
+        auto& list = j["top_instructions"] = nlohmann::json::array();
+        for (size_t i = 0; i < rips.size() && i < top; ++i) {
+            list.push_back({{"ghidra", fmt::format("{:#x}", rips[i].second >= base ? rips[i].second - base + 0x1000000 : rips[i].second)}, {"faults", rips[i].first}});
+        }
+    }
+    j["note"] = "CPU write faults on tracked pages since the previous call, by 4 MB region and by faulting instruction (Ghidra address)";
     j["total"] = total;
     j["seconds_since_previous_call"] = seconds;
     j["handler_ms_total"] = static_cast<double>(total_ns) / 1e6;
@@ -604,6 +632,20 @@ void NotePresent() {
 
 void NoteWriteFault(VAddr address) {
     fault_regions[(address >> 22) & (FaultRegions - 1)].fetch_add(1, std::memory_order_relaxed);
+    if (const u64 rip = GuestHooks::FaultRip(); rip != 0) {
+        u32 slot = static_cast<u32>((rip * 0x9E3779B97F4A7C15ull) >> 55) % FaultRipSlots;
+        for (u32 probe = 0; probe < 8; ++probe, slot = (slot + 1) % FaultRipSlots) {
+            u64 key = fault_rip_keys[slot].load(std::memory_order_relaxed);
+            if (key == rip || (key == 0 && fault_rip_keys[slot].compare_exchange_strong(key, rip, std::memory_order_relaxed))) {
+                fault_rip_counts[slot].fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            if (key == rip) {
+                fault_rip_counts[slot].fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+    }
 }
 
 void NoteWriteFaultTime(VAddr address, u64 nanoseconds) {
