@@ -12,6 +12,7 @@
 #include "core/native_audit.h"
 #include "core/native_readbacks.h"
 #include "core/native_resources.h"
+#include "core/native_registry.h"
 #include "core/resource_audit.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -1693,6 +1694,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                Core::NativeRegistry::AuditBuffer(vsharp.base_address, size, desc.is_written);
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
@@ -1865,6 +1867,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             continue;
         }
 
+        Core::NativeRegistry::AuditImage(tsharp.Address());
         if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
             !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
             LOG_WARNING(Render_Vulkan,

@@ -36,6 +36,7 @@
 #include "core/frame_timeline.h"
 #include "core/native_draw.h"
 #include "core/native_readbacks.h"
+#include "core/native_registry.h"
 #include "core/native_resources.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pixel_format.h"
@@ -200,6 +201,106 @@ void HashSlots(Hasher& h, u64 ctx, u64 table, u64 mask_lo, u64 mask_hi) {
             h.Add(Rd<u64>(ctx, table + slot * 8));
         }
     }
+}
+
+/// Native registry (shadow mode): the engine objects the context holds for this draw. Guarded by the caller.
+void ObserveContext(u64 ctx) {
+    using NativeRegistry::Kind;
+    using NativeRegistry::Observe;
+    const u64 vs = Rd<u64>(ctx, Ctx::VertexShader);
+    const u64 ps = Rd<u64>(ctx, Ctx::PixelShader);
+    Observe(Obj(vs), Kind::VertexShader);
+    Observe(Obj(ps), Kind::PixelShader);
+    Observe(Obj(Rd<u64>(ctx, Ctx::InputLayout)), Kind::InputLayout);
+    Observe(Obj(Rd<u64>(ctx, Ctx::CurrentIndexBuffer)), Kind::Buffer);
+    for (u32 slot = 0; slot < 16; ++slot) {
+        Observe(Obj(Rd<u64>(ctx, Ctx::VertexBufferSlots + slot * 8)), Kind::Buffer);
+    }
+    const std::array<u64, 2> shaders{vs, ps};
+    for (u64 stage = 0; stage < 2; ++stage) {
+        const u64 shader = Obj(shaders[stage]);
+        if (!shader) {
+            continue;
+        }
+        const u32 cb_mask = Rd<u32>(shader, Shader::CbMask) & 0xffff;
+        for (u32 slot = 0; slot < 16; ++slot) {
+            if ((cb_mask >> slot) & 1) {
+                Observe(Obj(Rd<u64>(ctx, Ctx::ConstantBufferTable(stage) + slot * 8)), Kind::Buffer);
+            }
+        }
+        const u64 lo = Rd<u64>(shader, Shader::SrvMaskLo);
+        const u64 hi = Rd<u64>(shader, Shader::SrvMaskHi);
+        for (u32 slot = 0; slot < 128; ++slot) {
+            if ((slot < 64 ? (lo >> slot) & 1 : (hi >> (slot - 64)) & 1) != 0) {
+                Observe(Obj(Rd<u64>(ctx, Ctx::ShaderResourceTable(stage) + slot * 8)), Kind::ShaderResourceView);
+            }
+        }
+        const u32 smp_mask = Rd<u32>(shader, Shader::SamplerMask) & 0xffff;
+        for (u32 slot = 0; slot < 16; ++slot) {
+            if ((smp_mask >> slot) & 1) {
+                Observe(Obj(Rd<u64>(ctx, Ctx::SamplerTable(stage) + slot * 8)), Kind::SamplerState);
+            }
+        }
+    }
+    const u32 targets = std::min<u32>(Rd<u32>(ctx, Ctx::RenderTargetCount), 7);
+    for (u32 i = 0; i < targets; ++i) {
+        Observe(Obj(Rd<u64>(ctx, Ctx::RenderTargets + i * 8)), Kind::RenderTargetView);
+    }
+    Observe(Obj(Rd<u64>(ctx, Ctx::DepthStencilView)), Kind::DepthStencilView);
+    Observe(Obj(Rd<u64>(ctx, Ctx::BlendState)), Kind::BlendState);
+    Observe(Obj(Rd<u64>(ctx, Ctx::RasterizerState)), Kind::RasterizerState);
+    Observe(Obj(Rd<u64>(ctx, Ctx::DepthStencilState)), Kind::DepthStencilState);
+}
+
+/// Native registry (shadow mode): the compute stage of the device context (shader at +0x4670, API stage 5 tables, views at +0x1980 / +0x2098).
+void ObserveComputeContext(u64 ctx) {
+    using NativeRegistry::Kind;
+    using NativeRegistry::Observe;
+    const u64 cs = Obj(Rd<u64>(ctx, 0x4670));
+    if (!cs) {
+        return;
+    }
+    Observe(cs, Kind::ComputeShader);
+    const u32 cb_mask = Rd<u32>(cs, 0xb0) & 0xffff;
+    for (u32 slot = 0; slot < 16; ++slot) {
+        if ((cb_mask >> slot) & 1) {
+            Observe(Obj(Rd<u64>(ctx, 5 * 0x80 + 0x280 + slot * 8)), Kind::Buffer);
+        }
+    }
+    for (u32 slot = 0; slot < 128; ++slot) {
+        if (((Rd<u64>(cs, slot < 64 ? 0xc0 : 0xc8) >> (slot & 63)) & 1) != 0) {
+            Observe(Obj(Rd<u64>(ctx, 0x1980 + slot * 8)), Kind::ShaderResourceView);
+        }
+    }
+    for (u32 bits = Rd<u32>(cs, 0xd0), slot = 0; bits != 0 && slot < 8; bits >>= 1, ++slot) {
+        if ((bits & 1) != 0) {
+            Observe(Obj(Rd<u64>(ctx, 0x2098 + slot * 8)), Kind::UnorderedAccessView);
+        }
+    }
+}
+
+/// Native registry (shadow mode): the asynchronous compute context (JsComputeContext): shader at +0x1d10, sampler / constant buffer / shader resource /
+/// unordered access tables at +0x2178 / +0x21f8 / +0x1d18 / +0x2118, with the masks in the shader object.
+void ObserveAscContext(u64 jcc) {
+    using NativeRegistry::Kind;
+    using NativeRegistry::Observe;
+    const u64 cs = Obj(Rd<u64>(jcc, 0x1d10));
+    if (!cs) {
+        return;
+    }
+    Observe(cs, Kind::ComputeShader);
+    const auto walk = [&](u64 mask_offset, u64 table, u32 slots, Kind kind) {
+        u32 mask = Rd<u32>(cs, mask_offset);
+        for (u32 index = 0; mask != 0 && index < slots; mask >>= 1, ++index) {
+            if ((mask & 1) != 0) {
+                Observe(Obj(Rd<u64>(jcc, table + index * 8)), kind);
+            }
+        }
+    };
+    walk(0xe4, 0x2178, 16, Kind::SamplerState);
+    walk(0xe0, 0x21f8, 16, Kind::Buffer);
+    walk(0xf0, 0x1d18, 32, Kind::ShaderResourceView);
+    walk(0x100, 0x2118, 8, Kind::UnorderedAccessView);
 }
 
 Signature Compute(u64 ctx, u64 a1, u64 a2, u64 a3, u32 kind) {
@@ -4056,6 +4157,9 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
             LOG_INFO(Core, "native forward dump: {}", text);
         }
     }
+    if (NativeRegistry::enabled.load(std::memory_order_relaxed)) {
+        Guarded([&] { ObserveContext(ctx); return u64{0}; });
+    }
     const Signature sig = Compute(ctx, a1, a2, a3, kind);
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
     const u64 k1 = sig.pipeline_key;
@@ -4378,6 +4482,9 @@ u64 TagCompute(u64 ctx, u64 x, u64 y, u64 z, u64 ret, bool exec_capable) {
     }
     // The resource tracking runs natively first; the descriptor flush and the program packets of PrepareDispatch are the
     // game's own and only run (in the wrapper) when the dispatch is not executed from its record
+    if (NativeRegistry::enabled.load(std::memory_order_relaxed)) {
+        Guarded([&] { ObserveComputeContext(ctx); return u64{0}; });
+    }
     if (Rd<u64>(ctx, 0x4670) != 0) {
         RunComputeTracking(ctx);
     }
@@ -5208,6 +5315,9 @@ u64 TagAsc(u64 jcc, u64 x, u64 y, u64 z, u64 ret, bool allow_exec = true) {
         ((policy.native_draw_classes.load(std::memory_order_relaxed) >> Other) & 1) == 0) {
         return 0;
     }
+    if (NativeRegistry::enabled.load(std::memory_order_relaxed)) {
+        Guarded([&] { ObserveAscContext(jcc); return u64{0}; });
+    }
     const u64 seq = Guarded([&] { return MakeAscRecord(jcc, x, y, z, ret); });
     if (seq == 0) {
         {
@@ -5867,7 +5977,9 @@ u64 PS4_SYSV_ABI ResourceBufferCreated(u64 device, u64 description, u64 initial,
     }
     reinterpret_cast<GuestFunction6>(original)(device, description, initial, out, a4, a5);
     if (out != 0) {
-        NativeResources::NoteBufferObject(Guarded([&] { return Rd<u64>(out, 0); }));
+        const u64 created = Guarded([&] { return Rd<u64>(out, 0); });
+        NativeResources::NoteBufferObject(created);
+        NativeRegistry::NoteBufferCreated(created);
     }
     return 1;
 }
@@ -5875,11 +5987,13 @@ u64 PS4_SYSV_ABI ResourceBufferCreated(u64 device, u64 description, u64 initial,
 /// JsTexture initialization (this, description, initial data): the object is read later.
 u64 PS4_SYSV_ABI ResourceTextureInit(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     NativeResources::NoteTextureObject(object);
+    NativeRegistry::NoteTextureInitializing(object);
     return 0;
 }
 
 u64 PS4_SYSV_ABI ResourceBufferDestroyed(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     NativeResources::NoteBufferDestroyed(object);
+    NativeRegistry::NoteBufferDestroyed(object);
     return 0;
 }
 

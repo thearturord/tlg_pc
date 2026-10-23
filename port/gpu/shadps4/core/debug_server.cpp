@@ -19,6 +19,7 @@
 #include "core/debug_server.h"
 #include "core/stream_probe.h"
 #include "core/frame_timeline.h"
+#include "core/native_registry.h"
 #include "core/native_resources.h"
 #include "core/memory.h"
 #include "core/guest_hooks.h"
@@ -558,6 +559,13 @@ void RegisterBuiltins() {
                      Core::NativeResources::Start();
                  }
                  return Core::NativeResources::Report();
+             });
+    Register("/registry", "?start=1 turns the native resource registry (shadow mode) on; objects bound by draws, their kinds, tags and raw bytes, and the audit against the legacy buffer / image resolution",
+             [](const Params& params) {
+                 if (ParseNumber(params, "start", 0) != 0) {
+                     Core::NativeRegistry::Start();
+                 }
+                 return Core::NativeRegistry::Report();
              });
     Register("/threads", "CPU use of the busiest threads since the previous call", Threads);
     Register("/memory", "?addr=0x..&size=N (max 65536): guest memory as hex", Memory);
