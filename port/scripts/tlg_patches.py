@@ -87,7 +87,9 @@ PATCHES['dt_snap_120'] = [
 # then looks at the deferred callback at [manager+0x128] (argument [manager+0x130]). That wait blocks the game thread for the render thread's whole prelude and
 # recording every frame, although the engine is double-buffered (SceneDraw flips RenderDev and spins on its state). Replacement: look at the callback first and wait
 # only when there is one. Same length, same exit (0x1d0bb8c); r14 is free (restored by the epilogue); WaitRender takes no argument, so "mov esi,1" is dropped.
-# Off by default; TLG_SKIP_RENDER_WAIT=1 turns it on (documents/tlg/frame-pipeline-read-2026-10-23.md, section 5).
+# FAILED EXPERIMENT (2026-10-23), DISABLED: in the light scene the deferred callback is never pending (0 in 5.4 million live samples), so the wait this patch removes
+# was already skipped as intended and the frame rate did not change. Kept as documentation of the finding; nothing selects it any more
+# (documents/tlg/frame-pipeline-read-2026-10-23.md, sections 5 to 7).
 PATCHES['skip_render_wait'] = [
     (0x1d0bb56,
      bytes.fromhex('85c07532488b3ddf5fc904be01000000488b07ff5020498b8728010000'
@@ -101,7 +103,9 @@ PATCHES['skip_render_wait'] = [
 # WaitRender (the render device's "wait until the render thread is idle", through [engine+0x48] vtable +0x48) at the top of EVERY iteration, before it looks
 # for its next job, about 300,000 times a second. So no job of that worker runs while the render thread records the frame (about 5.7 ms of every frame),
 # although the engine double-buffers the scene (SceneDraw flips RenderDev). Replacement: no wait (call [rax+0x48] -> 3 byte nop).
-# Off by default; TLG_SKIP_WORKER_RENDER_WAIT=1 turns it on (documents/tlg/frame-pipeline-read-2026-10-23.md, section 6).
+# FAILED EXPERIMENT (2026-10-23), DISABLED: with the wait gone the main worker no longer blocks and the render thread idles longer, but the frame did not get shorter
+# (about 14 ms against 12.6 to 13 ms, the owner saw 88 fps against 90): the limit is the length of the game's own task chain (scripts, physics, animation jobs), not
+# this wait. Kept as documentation; nothing selects it any more (documents/tlg/frame-pipeline-read-2026-10-23.md, sections 6 and 7).
 PATCHES['skip_worker_render_wait'] = [
     (0x1e4c65d, bytes.fromhex('ff5048'), bytes.fromhex('0f1f00'),
      'job worker 0: do not wait for the render thread before every job pick'),
@@ -197,11 +201,7 @@ def prepare(game_dir, out_dir, mode, mods_dir=None, mods_config=None):
     eboot = None
     # TLG_FPS_PATCHES="a,b" (measurements): these patches instead of the mode's own.
     names = [n for n in os.environ.get('TLG_FPS_PATCHES', '').split(',') if n in PATCHES] or MODES[mode]
-    # Optional game patches, independent of the frame rate mode (each behind its own switch, off by default).
-    if os.environ.get('TLG_SKIP_RENDER_WAIT', '').strip() == '1' and 'skip_render_wait' not in names:
-        names = names + ['skip_render_wait']
-    if os.environ.get('TLG_SKIP_WORKER_RENDER_WAIT', '').strip() == '1' and 'skip_worker_render_wait' not in names:
-        names = names + ['skip_worker_render_wait']
+    # The render wait patches (skip_render_wait, skip_worker_render_wait) were failed experiments and are no longer selectable here; see their entries above.
     if names:
         try:
             eboot = (Path(game_dir) / 'eboot.bin').read_bytes()
