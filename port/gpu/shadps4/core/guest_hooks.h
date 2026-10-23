@@ -55,6 +55,10 @@ void InstallForEboot(VAddr base, u64 image_size);
 /// Called once per presented frame: writes the call counts and recorded arguments.
 void OnFrame();
 
+/// A stub that a call hook can put in place of the return address of the hooked function: the function then returns into `exit_handler`
+/// (called with the return value registers saved; it returns the original return address). Created on first use.
+u64 ExitStub(u64 exit_handler);
+
 /// Entry of a call hook that runs the guest function itself (its handler calls it to run the original and look at the
 /// result); 0 when the hook does not exist.
 u64 OriginalEntry(const char* name);

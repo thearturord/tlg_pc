@@ -4190,6 +4190,61 @@ u64 PS4_SYSV_ABI WaitRenderProbe(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
     return 0;
 }
 
+// Frame profiler, job level (documents/tlg/frame-profiler.md): the engine runs every job through one function, FUN_01e4baf0(pool, job) (Ghidra 0x1e4baf0). While a
+// capture runs, a call hook on it replaces the return address with the exit stub and times the call; the job's own function (the first entry of the table at job+0x30)
+// and its setup function (job+8) are recorded as the job's identity. Jobs shorter than TLG_JOB_MIN_US (default 8) are not written.
+constexpr u32 JobSpanId = 1000;
+struct JobShadow {
+    u64 ret;
+    u64 start;
+    u64 exec;
+    u64 setup;
+};
+thread_local JobShadow job_shadow[512];
+thread_local u32 job_depth = 0;
+
+u64 PS4_SYSV_ABI JobSpanExit() {
+    const u64 end = FrameTimeline::Now();
+    const JobShadow e = job_shadow[--job_depth];
+    static const u64 min_ns = [] {
+        const char* env = std::getenv("TLG_JOB_MIN_US");
+        return (env && *env ? std::strtoull(env, nullptr, 10) : 8ull) * 1000;
+    }();
+    if (end - e.start >= min_ns) {
+        const u64 base = ImageBase();
+        const auto ghidra = [base](u64 address) { return address >= base ? address - base + 0x1000000 : address; };
+        FrameTimeline::Record(FrameTimeline::GuestSpanInfo, ghidra(e.exec), end, ghidra(e.setup));
+        FrameTimeline::Record(FrameTimeline::GuestSpan, (end - e.start) | (u64{JobSpanId} << 48), end, e.start);
+    }
+    return e.ret;
+}
+
+u64 PS4_SYSV_ABI JobSpanEnter(u64 pool, u64 job, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
+    if (!FrameTimeline::capture_active.load(std::memory_order_relaxed) || job_depth >= 512) {
+        return 0;
+    }
+    static const u64 exit_stub = [] {
+        FrameTimeline::RegisterSpan(JobSpanId, "Job:Run");
+        return GuestHooks::ExitStub(reinterpret_cast<u64>(&JobSpanExit));
+    }();
+    if (exit_stub == 0) {
+        return 0;
+    }
+    JobShadow& e = job_shadow[job_depth++];
+    e.ret = ret;
+    e.exec = 0;
+    e.setup = 0;
+    if (job != 0) {
+        e.setup = *reinterpret_cast<const u64*>(job + 8);
+        if (const u64 table = *reinterpret_cast<const u64*>(job + 0x30); table != 0) {
+            e.exec = *reinterpret_cast<const u64*>(table);
+        }
+    }
+    e.start = FrameTimeline::Now();
+    *reinterpret_cast<u64*>(caller_rsp - 8) = exit_stub; // the function returns into the exit stub
+    return 0;
+}
+
 u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     if (ring_checked.load(std::memory_order_relaxed)) {
         return 0;
@@ -5894,6 +5949,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "ring_discover") {
         return reinterpret_cast<u64>(&RingDiscover);
+    }
+    if (name == "span_job") {
+        return reinterpret_cast<u64>(&JobSpanEnter);
     }
     if (name == "wait_render_probe") {
         return reinterpret_cast<u64>(&WaitRenderProbe);

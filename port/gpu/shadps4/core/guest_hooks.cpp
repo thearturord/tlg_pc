@@ -9,6 +9,8 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <fmt/ranges.h>
@@ -357,6 +359,41 @@ void PS4_SYSV_ABI SpanExit(u64 id, u64 start) {
 }
 
 std::vector<std::string> span_names_installed;
+VAddr stub_area_base = 0;
+
+u64 ExitStubImpl(u64 handler) {
+    static std::mutex mutex;
+    static std::unordered_map<u64, u64> stubs;
+    std::lock_guard lock{mutex};
+    if (const auto it = stubs.find(handler); it != stubs.end()) {
+        return it->second;
+    }
+    u64 address = 0;
+    const bool emitted = EmitInTrampolineArea(reinterpret_cast<const void*>(stub_area_base), [&](Xbyak::CodeGenerator& c) {
+        address = c.getCurr<u64>();
+        // Reached by the `ret` of the hooked function: rsp is 16 byte aligned here. Layout: [xmm0, xmm1 (32)] [flags] [rdx] [rax] [slot for the original return address].
+        c.sub(rsp, 8);
+        c.push(rax);
+        c.push(rdx);
+        c.pushfq();
+        c.sub(rsp, 32);
+        c.movdqu(ptr[rsp], xmm0);
+        c.movdqu(ptr[rsp + 16], xmm1);
+        c.mov(rax, handler);
+        c.call(rax);
+        c.mov(ptr[rsp + 56], rax);
+        c.movdqu(xmm0, ptr[rsp]);
+        c.movdqu(xmm1, ptr[rsp + 16]);
+        c.add(rsp, 32);
+        c.popfq();
+        c.pop(rdx);
+        c.pop(rax);
+        c.ret();
+        return true;
+    });
+    stubs[handler] = emitted ? address : 0;
+    return stubs[handler];
+}
 
 void InstallSpans(VAddr base, u64 image_size) {
     const auto path = Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (MemoryPatcher::g_game_serial + ".spans.json");
@@ -451,8 +488,13 @@ void InstallSpans(VAddr base, u64 image_size) {
 
 } // namespace
 
+u64 ExitStub(u64 exit_handler) {
+    return ExitStubImpl(exit_handler);
+}
+
 void InstallForEboot(VAddr base, u64 image_size) {
     NativeDraw::SetImageBase(base);
+    stub_area_base = base;
     InstallSpans(base, image_size);
     const auto path = ConfigPath();
     if (!std::filesystem::exists(path)) {

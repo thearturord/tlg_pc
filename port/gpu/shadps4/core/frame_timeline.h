@@ -40,6 +40,7 @@ enum Type : u32 {
     GpuPass = 22,     ///< a render pass or dispatch ran on the GPU: ts = end (CPU clock), arg = duration ns | kind << 56, arg2 = draws | width << 24 | height << 44
     ThreadCpu = 23,   ///< sampler (1 kHz): arg = CPU cycles the thread named in `thread` ran since the previous sample, taken at ts; cycles / cycles_per_ns (in the .json) = ns
     GuestSpan = 25,   ///< a timed guest function (spans file): ts = end, arg = duration ns | span id << 48, arg2 = start ns
+    GuestSpanInfo = 26, ///< written just before a GuestSpan of a job: arg = the job's function (Ghidra address), arg2 = its setup function
     GpuClockSync = 24, ///< calibration: arg = GPU timestamp ticks, ts = the CPU clock at the same moment, arg2 = timestamp period (ns * 1000)
 };
 

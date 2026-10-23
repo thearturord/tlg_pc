@@ -25,7 +25,7 @@
 
 namespace Core::FrameTimeline {
 namespace {
-constexpr u64 CaptureCapacity = 4ull << 20; // events, 128 MiB
+constexpr u64 CaptureCapacity = 12ull << 20; // events, 384 MiB
 std::mutex capture_mutex;
 std::map<u64, std::string> capture_names;
 std::map<u32, std::string> span_names;
@@ -109,7 +109,7 @@ void WriteCapture(const std::string& tag) {
     j["types"] = {{"1", "FirstHook"}, {"2", "Submit"}, {"3", "SubmitFlip"}, {"4", "FlipCp"}, {"5", "FlipPrepared"}, {"6", "PresentStart"}, {"7", "PresentEnd"},
                   {"8", "CpWait"}, {"9", "FlipWait"}, {"10", "GameWait"}, {"11", "GameSignal"}, {"12", "CpIdleQueued"}, {"13", "RasterIdleSignal"},
                   {"14", "StreamPublish"}, {"15", "SubmitDone"}, {"16", "DingDongWait"}, {"17", "EopParsed"}, {"18", "EopSignaled"}, {"20", "StageSpan"},
-                  {"21", "GpuCommandBuffer"}, {"22", "GpuPass"}, {"23", "ThreadCpu"}, {"24", "GpuClockSync"}, {"25", "GuestSpan"}};
+                  {"21", "GpuCommandBuffer"}, {"22", "GpuPass"}, {"23", "ThreadCpu"}, {"24", "GpuClockSync"}, {"25", "GuestSpan"}, {"26", "GuestSpanInfo"}};
     j["stages"] = {{"1", "FrontOp"}, {"2", "FrontQueueFull"}, {"3", "FrontDrain"}, {"4", "RasterOp"}, {"5", "RasterIdle"}, {"6", "RasterPass"},
                    {"7", "EncoderReplay"}, {"8", "EncoderSubmit"}, {"9", "EncoderIdle"}};
     {
