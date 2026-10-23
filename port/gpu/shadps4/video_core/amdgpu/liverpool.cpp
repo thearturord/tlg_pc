@@ -2234,16 +2234,21 @@ void Liverpool::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal,
     }
     const u64 parsed_ns = VideoCore::ReadbackStats::NowNs();
     // Wraps the signal to time the fence: parsed -> started on the raster thread -> signal runs.
-    const auto timed = [this, kind, parsed_ns](Common::UniqueFunction<void>&& inner) {
+    const auto timed = [this, kind, parsed_ns, queue](Common::UniqueFunction<void>&& inner) {
         const u64 started_ns = VideoCore::ReadbackStats::NowNs();
         return Common::UniqueFunction<void>{
-            [this, kind, parsed_ns, started_ns, inner = std::move(inner)]() mutable {
+            [this, kind, parsed_ns, started_ns, queue, inner = std::move(inner)]() mutable {
                 const u64 now = VideoCore::ReadbackStats::NowNs();
                 NoteFenceLatency(kind, started_ns - parsed_ns, now - started_ns);
                 if (kind == VideoCore::FenceGfxEop) {
                     Core::FrameTimeline::Record(Core::FrameTimeline::EopSignaled, started_ns - parsed_ns, Core::FrameTimeline::Now(), now - started_ns);
                 }
                 inner();
+                if (Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
+                    // arg = ns from the parse to the start on the raster thread | queue << 48 | kind << 56, arg2 = ns from there to the signal; ts = after the write
+                    Core::FrameTimeline::Record(Core::FrameTimeline::FenceSignaled, (started_ns - parsed_ns) | (u64(queue & 0xff) << 48) | (u64(kind) << 56),
+                                                Core::FrameTimeline::Now(), now - started_ns);
+                }
             }};
     };
     if (address == 0 || num_bytes == 0) {
@@ -2307,6 +2312,22 @@ bool Liverpool::DeferWriteBehindFences(void* address, const u32* data, u32 num_b
     const bool is_label = num_bytes == sizeof(u32) || num_bytes == sizeof(u64);
     SignalFenceAfterReadbacks(std::move(signal), false, is_label ? begin : 0, value,
                               is_label ? num_bytes : 0, queue, VideoCore::FenceHeldWrite);
+    return true;
+}
+
+bool Liverpool::ShouldYieldToOtherQueue(u64& last_ns) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("TLG_CP_ASC_YIELD");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled || num_submits.load(std::memory_order_relaxed) <= mapped_queues[GfxQueueId].submits.size()) {
+        return false;
+    }
+    const u64 now = Core::FrameTimeline::Now();
+    if (now - last_ns < 50'000) {
+        return false;
+    }
+    last_ns = now;
     return true;
 }
 
@@ -2386,7 +2407,12 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 task = queue.submits.front();
             }
+            const u64 resume_start = Core::FrameTimeline::capture_active.load(std::memory_order_relaxed) ? Core::FrameTimeline::Now() : 0;
             task.resume();
+            if (resume_start != 0) {
+                const u64 resume_end = Core::FrameTimeline::Now();
+                Core::FrameTimeline::Record(Core::FrameTimeline::CpResume, static_cast<u64>(curr_qid) | (task.done() ? 0x100u : 0u), resume_end, resume_end - resume_start);
+            }
 
             if (task.done()) {
                 bool was_partial = false;
@@ -2859,8 +2885,12 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
     }
     Core::EntryDump::Span entry_dump{0, reinterpret_cast<const u32*>(direct->begin), direct->dwords};
     using Core::NativeDirect::EntryKind;
+    u64 last_yield_ns = Core::FrameTimeline::Now();
     for (const auto& entry : direct->entries) {
         ProcessCommands();
+        if (ShouldYieldToOtherQueue(last_yield_ns)) {
+            YIELD_GFX();
+        }
         entry_dump.Packet(entry.words.data(), entry.address, entry.dwords != 0);
         switch (entry.kind) {
         case EntryKind::Tag:
@@ -2964,8 +2994,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    u64 last_yield_ns = Core::FrameTimeline::Now();
     while (!dcb.empty()) {
         ProcessCommands();
+        if (ShouldYieldToOtherQueue(last_yield_ns)) {
+            YIELD_GFX();
+        }
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;

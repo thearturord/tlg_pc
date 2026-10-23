@@ -317,10 +317,15 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
         return;
     }
 
+    const u64 kick_start = Core::FrameTimeline::Now();
     std::scoped_lock lk{m_submit_lock};
     {
         Core::FrameTimeline::Span wait_span{Core::FrameTimeline::DingDongWait};
         WaitGpuIdle();
+    }
+    if (Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
+        const u64 now = Core::FrameTimeline::Now();
+        Core::FrameTimeline::Record(Core::FrameTimeline::AscKick, gnm_vqid, now, now - kick_start);
     }
 
     if (DebugState.ShouldPauseInSubmit()) {

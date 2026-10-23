@@ -489,6 +489,11 @@ private:
         static std::array<u8, 48_KB> constants_heap;
     } cblock{};
 
+    /// The graphics queue's task runs until it blocks on a wait; a compute queue kicked meanwhile (sceGnmDingDong) would wait for the whole run
+    /// (up to 4 ms in the light scene, documents/tlg/light-scene-cap-plan.md). True when another queue has work and `last_ns` is at least 50 us old
+    /// (then set to now): the graphics task yields so the round robin runs it. Switch: env TLG_CP_ASC_YIELD=0 turns it off.
+    [[nodiscard]] bool ShouldYieldToOtherQueue(u64& last_ns);
+
     Vulkan::Rasterizer* rasterizer{};
     Libraries::VideoOut::VideoOutPort* vo_port{};
     const bool guest_markers_enabled;
