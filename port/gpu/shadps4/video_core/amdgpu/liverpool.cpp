@@ -1589,8 +1589,11 @@ void Liverpool::CpWriteData(void* address, const u32* data, u32 data_size, u32 q
     // Whether a fence write to the label is held back is decided here, in stream order.
     if (!DeferWriteBehindFences(address, data, data_size, queue)) {
         RasterRun(
-            [address, words = std::vector<u32>(data, data + data_size / sizeof(u32)), data_size] {
+            [address, words = std::vector<u32>(data, data + data_size / sizeof(u32)), data_size, queue] {
                 std::memcpy(address, words.data(), data_size);
+                if (Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
+                    Core::FrameTimeline::Record(Core::FrameTimeline::LabelWrite, words[0] | (u64(queue) << 32), Core::FrameTimeline::Now(), reinterpret_cast<u64>(address));
+                }
             },
             false, true);
     }
@@ -2263,6 +2266,22 @@ void Liverpool::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal,
     // see the fence without waiting for the raster thread. The raster thread records the work
     // before the fence and notes its tick (SetFenceTick).
     const u64 seq = RecordFence(address, value, num_bytes, queue);
+    // CEILING TEST ONLY (TLG_CEILING_ASC_FENCE=1): the label of compute queue 1 is written as soon as the raster thread reaches it, without waiting for the
+    // GPU. The results the game reads back are wrong (measuring how short the frame gets, documents/tlg/light-scene-cap-plan.md section 11).
+    static const bool ceiling = [] {
+        const char* value = std::getenv("TLG_CEILING_ASC_FENCE");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (ceiling && queue == 1 && (kind == VideoCore::FenceComputeRelease || kind == VideoCore::FenceHeldWrite)) {
+        RasterRun(
+            [this, address, seq, signal = std::move(signal), timed]() mutable {
+                SetFenceTick(address, seq);
+                timed(std::move(signal))();
+                RetireFence(address, seq);
+            },
+            must_sync);
+        return;
+    }
     RasterRun(
         [this, address, seq, signal = std::move(signal), kind, must_sync, timed]() mutable {
             SetFenceTick(address, seq);
@@ -2297,8 +2316,11 @@ bool Liverpool::DeferWriteBehindFences(void* address, const u32* data, u32 num_b
     std::vector<u32> words(data, data + num_bytes / sizeof(u32));
     u64 value{};
     std::memcpy(&value, words.data(), std::min<u32>(num_bytes, sizeof(u64)));
-    auto signal = [this, address, words = std::move(words)] {
+    auto signal = [this, address, queue, words = std::move(words)] {
         const u32 size = static_cast<u32>(words.size() * sizeof(u32));
+        if (Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
+            Core::FrameTimeline::Record(Core::FrameTimeline::LabelWrite, words[0] | (u64(queue) << 32) | (u64(1) << 48), Core::FrameTimeline::Now(), reinterpret_cast<u64>(address));
+        }
         RunFenceSignal(
             *this, gpu_id,
             [&] { return TryWriteOffThread(rasterizer, address, words.data(), size); },
