@@ -139,6 +139,9 @@ void SetDrawClass(u32 draw_class);
 /// NativeDraw v2 audit (raster thread): the legacy backend reads the descriptor of a shader resource from the flat user data at `offset` (`words`, `dwords` of them;
 /// offset 0xffff: it is not a single load of consecutive dwords). Compares it with the binding of the current draw's record at that offset: same words.
 void AuditBinding(u32 sw_stage, bool image, u32 offset, const u32* words, u32 dwords);
+/// The native binder (N3): 0 buffer descriptor taken from the record, 1 image descriptor taken from the record, 2 buffer fell back to the flat user data, 3 image fell back,
+/// 4 buffer descriptor differed from the legacy one (verify mode), 5 image differed.
+void NoteBinder(u32 what);
 /// Returns true when the draw has a description and it does not explain this buffer.
 /// `shader_constant`: the descriptor is built from immediates and the stage's program base (constants stored with the shader code), so it belongs to the shader
 /// variant, not to the draw's engine objects.

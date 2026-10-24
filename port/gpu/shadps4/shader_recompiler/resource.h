@@ -98,11 +98,22 @@ struct BufferResource {
         return buffer_type != BufferType::Guest;
     }
 
+    /// The sharp from four descriptor words the draw's record holds (a single load), with the same post operation as `GetSharp`.
+    constexpr AmdGpu::Buffer FromWords(const u32* words, const auto& info) const noexcept {
+        AmdGpu::Buffer buffer;
+        std::memcpy(&buffer, words, sizeof(buffer));
+        return PostOp(buffer, info);
+    }
+
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
         AmdGpu::Buffer buffer;
         if (!sharp_fetch.Fetch(info.FlatUserData().data(), &buffer)) {
             return AmdGpu::Buffer::Null();
         }
+        return PostOp(buffer, info);
+    }
+
+    constexpr AmdGpu::Buffer PostOp(AmdGpu::Buffer buffer, const auto& info) const noexcept {
         if (post_op == SharpFetchPostOp::BitwiseOrDw1WithImm) {
             reinterpret_cast<u32*>(&buffer)[1] |= post_op_dw1_mask;
         } else if (post_op == SharpFetchPostOp::ClearStrideAndBitshiftDw2WithImm) {
@@ -139,11 +150,25 @@ struct ImageResource {
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};
 
+    /// The sharp from the eight descriptor words the draw's record holds (a single load), with the same fix ups as `GetSharp`.
+    constexpr AmdGpu::Image FromWords(const u32* words) const noexcept {
+        AmdGpu::Image image{};
+        std::memcpy(&image, words, (is_r128 ? 4 : 8) * sizeof(u32));
+        if (is_r128) {
+            image.pitch = image.width;
+        }
+        return Finish(image);
+    }
+
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
         AmdGpu::Image image{};
         if (!Fetch(info.FlatUserData().data(), &image)) {
             return AmdGpu::Image::Null(is_depth);
         }
+        return Finish(image);
+    }
+
+    constexpr AmdGpu::Image Finish(AmdGpu::Image image) const noexcept {
         if (post_op == SharpFetchPostOp::ConvertCubeTo2DArray) {
             image.type = u64(AmdGpu::ImageType::Color2DArray);
             image.depth = (image.depth + 1) * 6 - 1;

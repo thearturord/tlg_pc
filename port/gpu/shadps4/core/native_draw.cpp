@@ -1060,6 +1060,11 @@ struct NativeRecord {
     };
     u32 check_count{};
     std::array<TableCheck, 8> checks{};
+    /// NativeDraw v2: the descriptors put into the user data of the vertex and pixel stage (valid when `bindings_for` is this record's number)
+    std::array<RecordBinding, MaxRecordBindings> bindings{};
+    u32 binding_count{};
+    bool bindings_overflow{};
+    u64 bindings_for{};
     u64 fill_destination{}; ///< a dispatch of the device's fill shader: the pattern fill it performs
     u32 fill_bytes{};
     u32 fill_dwords{};
@@ -1217,8 +1222,35 @@ void SetLastDescriptorObject(u64 object, bool sampler = false) {
     last_descriptor_object = {object, resource, resource != 0 ? Rd<u64>(resource, 0x10) : 0};
 }
 
+/// The record whose user data are being built (NativeDraw v2 bindings go into it).
+thread_local struct NativeRecord* binding_record = nullptr;
+void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* words, u32 dwords) {
+    if (binding_record == nullptr || stage > 1) {
+        return;
+    }
+    auto& record = *binding_record;
+    if (record.binding_count >= MaxRecordBindings) {
+        record.bindings_overflow = true;
+        return;
+    }
+    RecordBinding& binding = record.bindings[record.binding_count++];
+    binding = {};
+    binding.stage = static_cast<u8>(stage);
+    binding.kind = static_cast<u8>(kind);
+    binding.offset = static_cast<u16>(offset);
+    binding.slot = static_cast<u16>(slot);
+    binding.dwords = static_cast<u16>(std::min<u32>(dwords, 8));
+    binding.id = last_descriptor_object.id;
+    for (u32 i = 0; i < binding.dwords; ++i) {
+        binding.words[i] = words[i];
+    }
+}
+
 /// Adds the descriptor just built to the draw's binding list (`offset` 0xffff: an entry of a table behind a pointer).
 void NoteBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* words, u32 dwords) {
+    if (last_descriptor_object.object != 0 && offset != 0xffff) {
+        AddRecordBinding(stage, kind, slot, offset, words, dwords);
+    }
     if (v2_collect == nullptr || last_descriptor_object.object == 0) {
         return;
     }
@@ -2353,8 +2385,13 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
         const u64 vertex_shader = Rd<u64>(ctx, Ctx::VertexShader);
         const u64 pixel_shader = Rd<u64>(ctx, Ctx::PixelShader);
         synth_desc_key = {};
+        slot.binding_count = 0;
+        slot.bindings_overflow = false;
+        slot.bindings_for = seq;
+        binding_record = &slot;
         SynthesizeUserData(ctx, 0, vertex_shader + 0x30, slot.vs_gnm, 0x28, ShBase + 0x4c, slot.regs.data(), n, slot);
         SynthesizeUserData(ctx, 1, pixel_shader + 0x30, slot.ps_gnm, 0x3c, ShBase + 0x0c, slot.regs.data(), n, slot);
+        binding_record = nullptr;
         slot.desc_key = synth_desc_key;
         // draw arguments: VGT_NUM_INDICES / VGT_NUM_INSTANCES, then for indexed draws the index buffer view
         // (IT_INDEX_BASE), the base vertex and the draw packet's maximum size
@@ -3691,6 +3728,15 @@ bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed) {
     auto& slot = Slot(seq);
     if (slot.seq.load(std::memory_order_acquire) != seq) {
         return false;
+    }
+    out.binding_count = 0;
+    out.bindings_complete = false;
+    if (slot.kind <= 2 && slot.bindings_for == seq && !slot.bindings_overflow && slot.binding_count != 0) {
+        out.binding_count = slot.binding_count;
+        out.bindings_complete = true;
+        for (u32 i = 0; i < slot.binding_count; ++i) {
+            out.bindings[i] = slot.bindings[i];
+        }
     }
     u32 n = 0;
     const auto user_data_slot = [&](u32 index, u32 value) {

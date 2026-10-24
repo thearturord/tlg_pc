@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "core/native_binding.h"
 #include "video_core/amdgpu/draw_state.h"
 #include <functional>
 #include <memory>
@@ -123,6 +124,10 @@ struct DrawPlan {
     std::array<StagePlan, MaxShaderStages> stages{};
     u64 ring_end{}; ///< T1: the constant ring position after this plan's copies
     u64 native_seq{}; ///< the record the plan was made from (0: planned from the registers); diagnostics
+    /// NativeDraw v2: the descriptors of the record in the user data of its stages; the native binder reads them by (stage, flat offset)
+    std::array<Core::NativeDraw::RecordBinding, Core::NativeDraw::MaxRecordBindings> bindings{};
+    u32 binding_count{};
+    bool bindings_complete{};
 };
 
 struct DispatchPlan {

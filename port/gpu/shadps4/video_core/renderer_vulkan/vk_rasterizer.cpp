@@ -350,6 +350,8 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
     }
     plan->executed = executed;
     plan->native_seq = 0;
+    plan->bindings_complete = false;
+    plan->binding_count = 0;
     plan->op_class = is_operation ? static_cast<u8>(operation.kind) : u8{0xff};
     plan->depth_copy = operation.depth_copy;
     plan->stencil_copy = operation.stencil_copy;
@@ -497,6 +499,11 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u32
     }
     plan->executed = true;
     plan->native_seq = draw.seq;
+    plan->binding_count = draw.binding_count;
+    plan->bindings_complete = draw.bindings_complete;
+    for (u32 i = 0; i < draw.binding_count; ++i) {
+        plan->bindings[i] = draw.bindings[i];
+    }
     plan->op_class = 0xff;
     plan->depth_copy = plan->stencil_copy = false;
     plan->fixed = native;
@@ -881,7 +888,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     const bool same_dynamic_state = same_pipeline && last.k2 == tag.k2;
 
     PrepareRenderState(pipeline, fixed);
-    if (!BindResources(pipeline, &fixed)) {
+    binder_plan = NativeBinderFor(plan, tag.valid ? (tag.meta & 0xff) : 15u);
+    const bool bound = BindResources(pipeline, &fixed);
+    binder_plan = nullptr;
+    if (!bound) {
         return;
     }
     const auto state = BeginRendering(pipeline);
@@ -1254,6 +1264,39 @@ void Rasterizer::OnFence(Common::UniqueFunction<void>&& signal, VideoCore::Fence
     if (needs_submit) {
         scheduler.Flush();
     }
+}
+
+/// N3 native binder switch (`TLG_NATIVE_BINDER`): 0 off, 1 the depth passes (class 0), 2 every class with a complete binding list, 3 like 2 and every descriptor is compared with
+/// the legacy one (the legacy one wins on a difference).
+const DrawPlan* Rasterizer::NativeBinderFor(const DrawPlan* plan, u32 draw_class) {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_NATIVE_BINDER");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 0u;
+    }();
+    binder_verify = mode == 3;
+    if (mode == 0 || plan == nullptr || !plan->bindings_complete || plan->binding_count == 0) {
+        return nullptr;
+    }
+    if (mode == 1 && draw_class != 0) {
+        return nullptr;
+    }
+    return plan;
+}
+
+/// The descriptor words of the binder's plan for the resource at flat user data `offset` of `stage` (null: the record has no binding there).
+const u32* Rasterizer::BinderWords(const Shader::Info& stage, u32 offset, u32 dwords, bool image) const {
+    const u32 s = stage.sw_stage == Shader::SwStage::Vertex ? 0 : stage.sw_stage == Shader::SwStage::Fragment ? 1 : 2;
+    if (s > 1) {
+        return nullptr;
+    }
+    const u8 kind = image ? 2 : 1;
+    for (u32 i = 0; i < binder_plan->binding_count; ++i) {
+        const auto& b = binder_plan->bindings[i];
+        if (b.stage == s && b.kind == kind && offset >= b.offset && offset + dwords <= b.offset + b.dwords) {
+            return b.words + (offset - b.offset);
+        }
+    }
+    return nullptr;
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed) {
@@ -1700,7 +1743,30 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     Core::NativeRegistry::AuditBinding(static_cast<u32>(stage.sw_stage), false, 0xffff, nullptr, 0);
                 }
             }
-            const auto vsharp = desc.GetSharp(stage);
+            AmdGpu::Buffer chosen_sharp;
+            bool from_record = false;
+            if (binder_plan != nullptr && desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
+                if (const u32* words = BinderWords(stage, desc.sharp_fetch.offsets[0], 4, false)) {
+                    chosen_sharp = desc.FromWords(words, stage);
+                    from_record = true;
+                    if (binder_verify) {
+                        const auto legacy = desc.GetSharp(stage);
+                        if (std::memcmp(&legacy, &chosen_sharp, sizeof(legacy)) != 0) {
+                            Core::NativeRegistry::NoteBinder(4);
+                            chosen_sharp = legacy;
+                        }
+                    }
+                }
+            }
+            if (from_record) {
+                Core::NativeRegistry::NoteBinder(0);
+            } else {
+                chosen_sharp = desc.GetSharp(stage);
+                if (binder_plan != nullptr) {
+                    Core::NativeRegistry::NoteBinder(2);
+                }
+            }
+            const AmdGpu::Buffer vsharp = chosen_sharp;
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else if (vsharp.GetSize() >= (1ull << 30) && !memory->IsValidMapping(vsharp.base_address)) {
@@ -1952,7 +2018,30 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 Core::NativeRegistry::AuditBinding(static_cast<u32>(stage.sw_stage), true, 0xffff, nullptr, 0);
             }
         }
-        const auto tsharp = image_desc.GetSharp(stage);
+        AmdGpu::Image chosen_tsharp;
+        bool image_from_record = false;
+        if (binder_plan != nullptr && image_desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad) {
+            if (const u32* words = BinderWords(stage, image_desc.sharp_fetch.offsets[0], image_desc.is_r128 ? 4 : 8, true)) {
+                chosen_tsharp = image_desc.FromWords(words);
+                image_from_record = true;
+                if (binder_verify) {
+                    const auto legacy = image_desc.GetSharp(stage);
+                    if (std::memcmp(&legacy, &chosen_tsharp, sizeof(legacy)) != 0) {
+                        Core::NativeRegistry::NoteBinder(5);
+                        chosen_tsharp = legacy;
+                    }
+                }
+            }
+        }
+        if (image_from_record) {
+            Core::NativeRegistry::NoteBinder(1);
+        } else {
+            chosen_tsharp = image_desc.GetSharp(stage);
+            if (binder_plan != nullptr) {
+                Core::NativeRegistry::NoteBinder(3);
+            }
+        }
+        const auto tsharp = chosen_tsharp;
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {

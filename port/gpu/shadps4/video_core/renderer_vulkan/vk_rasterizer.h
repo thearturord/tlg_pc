@@ -475,6 +475,10 @@ private:
     };
     PendingFill pending_fill{};
     const DrawInputs* draw_inputs{}; ///< of the draw being recorded (Draw / DrawIndirect)
+    const DrawPlan* binder_plan{};   ///< N3: the plan whose record binds the resources of the draw being recorded (null: from the flat user data)
+    bool binder_verify{};
+    const DrawPlan* NativeBinderFor(const DrawPlan* plan, u32 draw_class);
+    const u32* BinderWords(const Shader::Info& stage, u32 offset, u32 dwords, bool image) const;
     u64 dispatch_caller{}; ///< diagnostics: the game call that made the dispatch being bound
     u8 clip_plane_mask{}; ///< user clip planes of the draw being bound
     std::vector<std::unique_ptr<DispatchPlan>> dispatch_plan_pool;

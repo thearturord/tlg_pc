@@ -9,6 +9,7 @@
 #include <string>
 #include "common/types.h"
 #include "video_core/amdgpu/draw_state.h"
+#include "core/native_binding.h"
 
 // Host functions called from the guest at chosen game functions (hook mode "call", see guest_hooks.h).
 //
@@ -123,6 +124,10 @@ struct ExecRegister {
 struct ExecDraw {
     static constexpr u32 MaxRegisters = 320;
     u64 seq{}; ///< the record this draw was taken from (diagnostics: the native registry audit)
+    /// NativeDraw v2: the descriptors of the record in the user data of the two stages (graphics records); `bindings_complete` when none was dropped
+    std::array<RecordBinding, MaxRecordBindings> bindings;
+    u32 binding_count{};
+    bool bindings_complete{};
     std::array<ExecRegister, MaxRegisters> regs;
     u32 count{};
     /// The first `grouped` registers are stored by group (group g is regs[group_begin[g]] to regs[group_begin[g + 1]]), the rest always applies.
