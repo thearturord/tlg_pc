@@ -34,6 +34,7 @@ struct Window {
     u32 usage{};
     u32 type{};
     bool in_ring{}; ///< the engine handed out a window of the frame ring, not the buffer's own memory
+    u32 writer{};   ///< 0: a Map, else the announcing engine function
 };
 
 std::mutex mutex;
@@ -50,6 +51,7 @@ struct MapCounters {
 struct FaultCounters {
     std::atomic<u64> total{};
     std::atomic<u64> covered_now{}, covered_earlier{}, covered_other_thread{}, uncovered{};
+    std::array<std::atomic<u64>, 8> covered_by_writer{}; ///< covered_now by the announcing writer (0: a Map)
     std::array<std::atomic<u64>, 16> uncovered_by_class{};
     std::array<std::atomic<u64>, 16> covered_by_class{};
 } faults;
@@ -95,12 +97,21 @@ void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u6
     windows[window_count++ % WindowCount] = {address, address + size, resource_id, NowNs(), ThreadKey(), usage, map_type, in_ring};
 }
 
+void NoteWriterRange(u32 writer, u64 address, u64 size) {
+    if (address == 0 || size == 0) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    windows[window_count++ % WindowCount] = {address, address + size, 0, NowNs(), ThreadKey(), 0, 0, false, writer};
+}
+
 void NoteFault(u64 address, u64 size) {
     faults.total.fetch_add(1, std::memory_order_relaxed);
     const u32 usage_class = NativeResources::UsageClassOf(address) & 15;
     const u64 now = NowNs();
     const u64 thread = ThreadKey();
     enum class Kind { None, Now, Earlier, Other } kind = Kind::None;
+    u32 writer = 0;
     {
         std::scoped_lock lock{mutex};
         const u64 count = std::min<u64>(window_count, WindowCount);
@@ -113,6 +124,7 @@ void NoteFault(u64 address, u64 size) {
                 kind = kind == Kind::None ? Kind::Other : kind;
             } else if (now - w.time_ns <= NowWindowNs) {
                 kind = Kind::Now;
+                writer = w.writer;
             } else if (kind != Kind::Now) {
                 kind = Kind::Earlier;
             }
@@ -128,6 +140,7 @@ void NoteFault(u64 address, u64 size) {
     switch (kind) {
     case Kind::Now:
         faults.covered_now.fetch_add(1, std::memory_order_relaxed);
+        faults.covered_by_writer[writer & 7].fetch_add(1, std::memory_order_relaxed);
         break;
     case Kind::Earlier:
         faults.covered_earlier.fetch_add(1, std::memory_order_relaxed);
@@ -165,6 +178,7 @@ nlohmann::json Report() {
     const u64 total = faults.total.load();
     f["total"] = total;
     f["inside_a_map_window_of_the_same_thread_within_200ms"] = faults.covered_now.load();
+    f["inside_a_window_by_announcer"] = {{"map", faults.covered_by_writer[0].load()}, {"skinning_FUN_01c93730", faults.covered_by_writer[1].load()}, {"light_constants_FUN_01eeb610", faults.covered_by_writer[2].load()}};
     f["inside_an_older_map_window_of_the_same_thread"] = faults.covered_earlier.load();
     f["inside_a_map_window_of_another_thread"] = faults.covered_other_thread.load();
     f["in_no_map_window"] = faults.uncovered.load();

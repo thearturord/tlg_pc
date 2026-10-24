@@ -5461,6 +5461,59 @@ u64 MakeMapUploadRecord(u64 ctx, u64 resource, u64 scratch, u64 caller) {
 
 using GuestMap7 = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64);
 
+/// N5b: the skinning prelude `FUN_01c93730(ring, scene, flag)` copies the bone matrices of every skin job (a linked list at scene + 0x29e00; per job a source pointer at +0x48
+/// and a matrix count at +0x50, 64 bytes each) with memcpy into the memory of one of four buffers of a ring (the buffer object at ring + 4 * index, index = the counter at
+/// ring + 0x40 after its increment; the memory pointer at buffer + 0x30), without any Map. The writes are announced here, before the function runs: the range is the
+/// buffer memory from the start for the sum of the counts (jobs the function skips make the range larger than what it writes, never smaller).
+u64 PS4_SYSV_ABI SkinWrites(u64 ring, u64 scene, u64 flag, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
+    (void)flag, (void)a3, (void)a4, (void)a5, (void)ret, (void)caller_rsp;
+    if (!Core::NativeUpdates::enabled.load(std::memory_order_relaxed) || !IsHeapPointer(ring) || !IsHeapPointer(scene)) {
+        return 0;
+    }
+    Guarded([&]() -> u64 {
+        const u64 first = Rd<u64>(scene, 0x29e00);
+        if (first == 0) {
+            return 0;
+        }
+        const u32 index = (Rd<u32>(ring, 0x40) + 1) & 3;
+        const u64 buffer = Rd<u64>(ring, index * 8);
+        if (!IsHeapPointer(buffer)) {
+            return 0;
+        }
+        const u64 memory = Rd<u64>(buffer, 0x30);
+        u64 matrices = 0;
+        u32 jobs = 0;
+        for (u64 node = first; node != 0 && jobs < 100000; node = Rd<u64>(node, 0), ++jobs) {
+            matrices += Rd<u32>(node, 0x50);
+        }
+        Core::NativeUpdates::NoteWriterRange(1, memory, matrices * 64);
+        return 0;
+    });
+    return 0;
+}
+
+/// N5b: `FUN_01eeb610(object, source)` fills a 160 byte light constant structure from the source (colour, position, ...) straight into the memory of a buffer of a ring of
+/// three (the buffer object at object + 0xc0 + index * 0xb0 and, when the source has a second part, at object + 0x2d0 + index * 0xb0; index = the counter at object + 0x440
+/// after its increment modulo 3; memory pointer at buffer + 0x30), no Map. Announced before the function runs.
+u64 PS4_SYSV_ABI LightWrites(u64 object, u64 source, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
+    (void)a2, (void)a3, (void)a4, (void)a5, (void)ret, (void)caller_rsp;
+    if (!Core::NativeUpdates::enabled.load(std::memory_order_relaxed) || !IsHeapPointer(object)) {
+        return 0;
+    }
+    Guarded([&]() -> u64 {
+        const u32 index = (Rd<u32>(object, 0x440) + 1) % 3;
+        for (const u64 base : {u64{0xc0}, u64{0x2d0}}) {
+            const u64 buffer = Rd<u64>(object, base + index * 0xb0ull);
+            if (IsHeapPointer(buffer)) {
+                Core::NativeUpdates::NoteWriterRange(2, Rd<u64>(buffer, 0x30), 0xa0);
+            }
+        }
+        return 0;
+    });
+    (void)source;
+    return 0;
+}
+
 u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4, u64 size, u64 ret, u64 caller_rsp) {
     if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && ctx != 0 && IsHeapPointer(resource) && (resource & 7) == 0 && Rd<u32>(resource, 0x124) == 1) {
         // N5a: a Map of a buffer is announced to the update audit; the game's function runs here and its result is returned
@@ -6500,6 +6553,12 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "tag_asc_cs_copy") {
         return reinterpret_cast<u64>(&TagAscCsCopy);
+    }
+    if (name == "light_writes") {
+        return reinterpret_cast<u64>(&LightWrites);
+    }
+    if (name == "skin_writes") {
+        return reinterpret_cast<u64>(&SkinWrites);
     }
     if (name == "tag_map") {
         return reinterpret_cast<u64>(&TagMap);
