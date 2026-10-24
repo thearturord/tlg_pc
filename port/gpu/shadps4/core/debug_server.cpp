@@ -19,6 +19,7 @@
 #include "core/debug_server.h"
 #include "core/stream_probe.h"
 #include "core/frame_timeline.h"
+#include "core/native_pass.h"
 #include "core/native_registry.h"
 #include "core/native_resources.h"
 #include "core/memory.h"
@@ -593,6 +594,13 @@ void RegisterBuiltins() {
                      Core::NativeRegistry::Start();
                  }
                  return Core::NativeRegistry::Report();
+             });
+    Register("/passes", "?start=1 turns the pass audit on (N4a): rendering instances of the scheduler, their draws, what ends them and whether they are plain runs of draws",
+             [](const Params& params) {
+                 if (ParseNumber(params, "start", 0) != 0) {
+                     Core::NativePass::Start();
+                 }
+                 return Core::NativePass::Report();
              });
     Register("/threads", "CPU use of the busiest threads since the previous call", Threads);
     Register("/memory", "?addr=0x..&size=N (max 65536): guest memory as hex", Memory);

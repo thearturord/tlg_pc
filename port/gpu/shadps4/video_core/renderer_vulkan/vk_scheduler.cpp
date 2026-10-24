@@ -4,6 +4,7 @@
 #include <chrono>
 #include <thread>
 #include "core/frame_timeline.h"
+#include "core/native_pass.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
@@ -44,9 +45,15 @@ void SchedulerCore::BeginRendering(const RenderState& new_state) {
     if (is_rendering && render_state == new_state) {
         return;
     }
+    if (is_rendering && stream_id == 0) {
+        Core::NativePass::SetEndCause(Core::NativePass::EndCause::NewState);
+    }
     EndRendering();
     is_rendering = true;
     render_state = new_state;
+    if (stream_id == 0) {
+        Core::NativePass::PassBegin(render_state.num_color_attachments, render_state.width, render_state.height);
+    }
 
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
@@ -106,6 +113,9 @@ void SchedulerCore::EndRendering() {
         return;
     }
     is_rendering = false;
+    if (stream_id == 0) {
+        Core::NativePass::PassEnd(__builtin_return_address(0));
+    }
     CommandBuffer().record([this](vk::CommandBuffer cmdbuf) {
         cmdbuf.endRendering();
         replay_rendering = false;
@@ -260,6 +270,7 @@ void SchedulerCore::EndSession() {
         Check(session.upload.end());
     }
 
+    Core::NativePass::SetEndCause(Core::NativePass::EndCause::Submit);
     EndRendering();
     if (session.primary) {
         Check(session.primary.end());
@@ -422,6 +433,7 @@ void SchedulerCore::EncoderThread(std::stop_token stoken) {
 
 void SchedulerCore::SubmitExecution(SubmitInfo& info) {
     // Recorded commands go into the command buffer before anything written directly at the end.
+    Core::NativePass::SetEndCause(Core::NativePass::EndCause::Submit);
     EndRendering();
 
     if (use_encoder && !direct_active) {

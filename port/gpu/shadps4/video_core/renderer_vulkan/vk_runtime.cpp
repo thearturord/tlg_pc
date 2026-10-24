@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "core/native_pass.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -110,6 +111,7 @@ void Runtime::TickFrame() {
 
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                          std::span<const vk::BufferCopy> copies) {
+    Core::NativePass::SetEndSite(__builtin_return_address(0));
     scheduler.EndRendering();
 
     bool needs_flush{};
@@ -801,6 +803,7 @@ void Runtime::FlushBarriers() {
         return;
     }
 
+    Core::NativePass::SetEndCause(Core::NativePass::EndCause::Barrier);
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.pipelineBarrier2(dep_info);

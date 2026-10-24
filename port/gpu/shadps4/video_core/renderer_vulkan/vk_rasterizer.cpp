@@ -12,6 +12,7 @@
 #include "core/native_audit.h"
 #include "core/native_readbacks.h"
 #include "core/native_resources.h"
+#include "core/native_pass.h"
 #include "core/native_registry.h"
 #include "core/resource_audit.h"
 #include "core/debug_state.h"
@@ -937,6 +938,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         BindIndexBuffer(index_offset);
     }
 
+    const bool pass_barrier = needs_barrier;
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
@@ -969,6 +971,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     }
     DebugState.IncDrawCall();
     scheduler.NoteDraw();
+    Core::NativePass::NoteDraw(tag.valid ? (tag.meta & 0xff) : 15u, false, pass_barrier, pipeline);
     ++recorded_work;
 
     ResetBindings(false);
@@ -1038,6 +1041,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                                    vk::AccessFlagBits2::eIndirectCommandRead);
     }
 
+    const bool pass_barrier = needs_barrier;
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
@@ -1045,6 +1049,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed, fixed);
     scheduler.BeginRendering(state);
+    Core::NativePass::NoteDraw(4, true, pass_barrier, pipeline);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
@@ -1712,6 +1717,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         const auto src_access =
             vk::AccessFlagBits2::eShaderRead |
             (desc.is_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eNone);
+        if (desc.is_written) {
+            Core::NativePass::NoteWrite(false);
+        }
         const RingBinding* ring =
             const_ring_level >= 4 && (ring_draw || ring_dispatch) ? FindRingBinding(stage, buffer_index) : nullptr;
         if (ring) {
@@ -2077,6 +2085,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     u32 num_images{};
     for (const auto& image_desc : stage.images) {
+        if (image_desc.is_written) {
+            Core::NativePass::NoteWrite(true);
+        }
         if (Core::NativeRegistry::enabled.load(std::memory_order_relaxed)) {
             // NativeDraw v2 audit: the T# the legacy path reads is the binding of the record at that offset
             const auto flat = StageFlatSkipped(stage) ? std::span<const u32>{} : stage.FlatUserData();
