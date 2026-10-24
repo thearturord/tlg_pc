@@ -10,6 +10,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "core/native_draw.h"
+#include "core/native_registry.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
@@ -482,16 +483,62 @@ Shader::Info* PipelineCache::RasterInfoFor(const Shader::Info* shared) {
     return it.value().get();
 }
 
-void PipelineCache::CapturePlan(StagePlan& out, Shader::Info* clone, const Shader::Info& shared) {
+void PipelineCache::CapturePlan(StagePlan& out, Shader::Info* clone, const Shader::Info& shared, bool skip_flat) {
     out.info = clone;
     out.images.clear();
     out.images_prepared = false;
     out.user_data_count = static_cast<u32>(shared.user_data.size());
     ASSERT(out.user_data_count <= out.user_data.size());
     std::copy_n(shared.user_data.begin(), out.user_data_count, out.user_data.begin());
-    out.flat.assign(shared.flattened_ud_buf.begin(), shared.flattened_ud_buf.end());
+    out.flat_skipped = skip_flat;
+    if (skip_flat) {
+        out.flat.clear();
+    } else {
+        out.flat.assign(shared.flattened_ud_buf.begin(), shared.flattened_ud_buf.end());
+    }
     out.pgm_base = shared.pgm_base;
 }
+
+namespace {
+/// N3b: true when every descriptor the stage's shader reads from the flat user data is a single load that the draw's record has a binding for (or is built from
+/// immediates), so the flat user data is not needed: no flat buffer for the shader, no FMask, no sampler post operation that reads another descriptor.
+bool StageCoveredByRecord(const Shader::Info& info, u32 record_stage, const Core::NativeDraw::ExecDraw& draw) {
+    if (!draw.bindings_complete || info.has_flatbuf || !info.fmasks.empty()) {
+        return false;
+    }
+    const auto covered = [&](u32 kind, u32 offset, u32 dwords) {
+        for (u32 i = 0; i < draw.binding_count; ++i) {
+            const auto& b = draw.bindings[i];
+            if (b.stage == record_stage && b.kind == kind && offset >= b.offset && offset + dwords <= u32{b.offset} + b.dwords) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (const auto& desc : info.buffers) {
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        if (desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::MultiLoad && desc.sharp_fetch.load_mask == 0) {
+            continue; // built from immediates (and the program base)
+        }
+        if (desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad || !covered(1, desc.sharp_fetch.offsets[0], 4)) {
+            return false;
+        }
+    }
+    for (const auto& desc : info.images) {
+        if (desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad || !covered(2, desc.sharp_fetch.offsets[0], desc.is_r128 ? 4 : 8)) {
+            return false;
+        }
+    }
+    for (const auto& desc : info.samplers) {
+        if (!desc.FromWordsPossible() || !covered(3, desc.sharp_fetch.offsets[0], 4)) {
+            return false;
+        }
+    }
+    return true;
+}
+} // namespace
 
 /// The record's key and the parts of the fixed-function state that go into the pipeline key.
 static u64 ExecKeyOf(u64 key, const FixedState& fixed) {
@@ -521,7 +568,7 @@ static u64 ExecKeyOf(u64 key, const FixedState& fixed) {
 }
 
 bool PipelineCache::PlanGraphicsTyped(u64 exec_key, const FixedState& fixed, std::span<const u32, 16> vertex_user_data,
-                                      std::span<const u32, 16> pixel_user_data, DrawPlan& plan) {
+                                      std::span<const u32, 16> pixel_user_data, DrawPlan& plan, const Core::NativeDraw::ExecDraw* skip_flat_for) {
     const auto found = exec_pipelines.find(ExecKeyOf(exec_key, fixed));
     if (found == exec_pipelines.end() || found->second.epoch != exec_epoch) {
         return false;
@@ -535,6 +582,8 @@ bool PipelineCache::PlanGraphicsTyped(u64 exec_key, const FixedState& fixed, std
     infos = entry.infos;
     modules = entry.modules;
     fetch_shader = entry.fetch_shader;
+    std::array<bool, MaxShaderStages> skip_flat{};
+    plan.any_flat_skipped = false;
     for (u32 s = 0; s < MaxShaderStages; ++s) {
         if (!infos[s]) {
             continue;
@@ -542,12 +591,20 @@ bool PipelineCache::PlanGraphicsTyped(u64 exec_key, const FixedState& fixed, std
         auto* info = const_cast<Shader::Info*>(infos[s]);
         info->pgm_base = entry.pgm_base[s];
         info->user_data = entry.stage_hw[s] == static_cast<u32>(HwStage::Vertex) ? vertex_user_data : pixel_user_data;
-        info->RefreshFlatBuf();
+        if (skip_flat_for != nullptr) {
+            const u32 record_stage = entry.stage_hw[s] == static_cast<u32>(HwStage::Vertex) ? 0 : 1;
+            skip_flat[s] = StageCoveredByRecord(*info, record_stage, *skip_flat_for);
+            plan.any_flat_skipped |= skip_flat[s];
+            Core::NativeRegistry::NoteBinder(skip_flat[s] ? 9 : 10);
+        }
+        if (!skip_flat[s]) {
+            info->RefreshFlatBuf();
+        }
     }
     plan.pipeline = entry.pipeline;
     for (u32 i = 0; i < MaxShaderStages; ++i) {
         if (infos[i]) {
-            CapturePlan(plan.stages[i], RasterInfoFor(infos[i]), *infos[i]);
+            CapturePlan(plan.stages[i], RasterInfoFor(infos[i]), *infos[i], skip_flat[i]);
         }
     }
     auto* mutable_pipeline = const_cast<GraphicsPipeline*>(entry.pipeline);
@@ -644,7 +701,7 @@ void PipelineCache::ApplyPlan(const DrawPlan& plan) {
             continue;
         }
         stage.info->user_data = std::span<const u32>{stage.user_data.data(), stage.user_data_count};
-        stage.info->flattened_ud_buf.assign(stage.flat.begin(), stage.flat.end());
+        stage.info->flattened_ud_buf.assign(stage.flat.begin(), stage.flat.end()); // empty for a skipped stage: nothing may read it
         stage.info->pgm_base = stage.pgm_base;
     }
 }

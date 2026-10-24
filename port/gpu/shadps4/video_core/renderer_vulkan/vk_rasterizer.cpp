@@ -466,9 +466,19 @@ void ApplyExecRegisters(DrawInputs& in, const Core::NativeDraw::ExecDraw& draw, 
 }
 } // namespace
 
+/// N3 native binder switch (`TLG_NATIVE_BINDER`): 0 off, 1 the depth passes (class 0), 2 every class with a complete binding list, 3 like 2 and every descriptor is compared with
+/// the legacy one (the legacy one wins on a difference). Modes 1 and 2 also leave the flat user data out of the plan of a stage the record covers completely (N3b).
+static u32 NativeBinderMode() {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_NATIVE_BINDER");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 0u;
+    }();
+    return mode;
+}
+
 std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u32 native_stale, u64 exec_key, u64 inputs_key,
                                                    std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data,
-                                                   const Core::NativeDraw::ExecDraw& draw, u32 index_count) {
+                                                   const Core::NativeDraw::ExecDraw& draw, u32 index_count, u32 draw_class) {
     const auto strip = VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed);
     if ((strip & 1073741824) != 0) {
         native_stale |= StaleClear;
@@ -512,7 +522,10 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u32
     if (index_count != ~0u) {
         plan->inputs.num_indices = index_count; // an inline draw: the count comes with the draw packet
     }
-    if (!pipeline_cache.PlanGraphicsTyped(exec_key, plan->fixed, vertex_user_data, pixel_user_data, *plan)) {
+    // the constant ring (levels 1 and up) and the verify mode read the flat user data of the plan
+    const u32 binder_mode = NativeBinderMode();
+    const bool skip_flat = (binder_mode == 1 || binder_mode == 2) && const_ring_level == 0 && draw.bindings_complete && (binder_mode == 2 || draw_class == 0);
+    if (!pipeline_cache.PlanGraphicsTyped(exec_key, plan->fixed, vertex_user_data, pixel_user_data, *plan, skip_flat ? &draw : nullptr)) {
         RecyclePlan(std::move(plan));
         return nullptr;
     }
@@ -586,7 +599,7 @@ std::string Rasterizer::DiffExecPlans(const DrawPlan& typed, const DrawPlan& ref
     for (u32 s = 0; s < MaxShaderStages; ++s) {
         const auto& a = typed.stages[s];
         const auto& b = reference.stages[s];
-        if (a.info != b.info || a.pgm_base != b.pgm_base || a.flat.size() != b.flat.size() || a.user_data_count != b.user_data_count) {
+        if (a.info != b.info || a.pgm_base != b.pgm_base || (!a.flat_skipped && a.flat.size() != b.flat.size()) || a.user_data_count != b.user_data_count) {
             out += fmt::format("stage{} ", s);
             continue;
         }
@@ -595,7 +608,7 @@ std::string Rasterizer::DiffExecPlans(const DrawPlan& typed, const DrawPlan& ref
         for (u32 i = 0; i < a.user_data_count; ++i) {
             differs |= ((mask >> i) & 1) != 0 && a.user_data[i] != b.user_data[i];
         }
-        for (size_t i = 0; i < a.flat.size(); ++i) {
+        for (size_t i = 0; i < a.flat.size(); ++i) { // a skipped stage has none: its descriptors are the record's
             differs |= (i >= 16 || ((mask >> i) & 1) != 0) && a.flat[i] != b.flat[i];
         }
         if (differs) {
@@ -627,6 +640,7 @@ void ResetStage(StagePlan& stage) {
     stage.ring.clear();
     stage.user_data_count = 0;
     stage.flat.clear();
+    stage.flat_skipped = false;
     stage.pgm_base = 0;
 }
 } // namespace
@@ -975,7 +989,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     current_db_extent = plan ? &plan->db_extent : &liverpool->RasterDbExtent();
 
     PrepareRenderState(pipeline, fixed);
-    if (!BindResources(pipeline, &fixed)) {
+    binder_plan = NativeBinderFor(plan, 4);
+    const bool bound = BindResources(pipeline, &fixed);
+    binder_plan = nullptr;
+    if (!bound) {
         return;
     }
     const auto state = BeginRendering(pipeline);
@@ -1269,11 +1286,11 @@ void Rasterizer::OnFence(Common::UniqueFunction<void>&& signal, VideoCore::Fence
 /// N3 native binder switch (`TLG_NATIVE_BINDER`): 0 off, 1 the depth passes (class 0), 2 every class with a complete binding list, 3 like 2 and every descriptor is compared with
 /// the legacy one (the legacy one wins on a difference).
 const DrawPlan* Rasterizer::NativeBinderFor(const DrawPlan* plan, u32 draw_class) {
-    static const u32 mode = [] {
-        const char* e = std::getenv("TLG_NATIVE_BINDER");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 0u;
-    }();
+    const u32 mode = NativeBinderMode();
     binder_verify = mode == 3;
+    if (plan != nullptr && plan->any_flat_skipped) {
+        return plan; // a stage of the plan has no flat user data: the record serves every descriptor, whatever the class
+    }
     if (mode == 0 || plan == nullptr || !plan->bindings_complete || plan->binding_count == 0) {
         return nullptr;
     }
@@ -1283,16 +1300,20 @@ const DrawPlan* Rasterizer::NativeBinderFor(const DrawPlan* plan, u32 draw_class
     return plan;
 }
 
+bool Rasterizer::StageFlatSkipped(const Shader::Info& stage) const {
+    const u32 index = static_cast<u32>(stage.sw_stage);
+    return binder_plan != nullptr && binder_plan->any_flat_skipped && index < MaxShaderStages && binder_plan->stages[index].flat_skipped;
+}
+
 /// The descriptor words of the binder's plan for the resource at flat user data `offset` of `stage` (null: the record has no binding there).
-const u32* Rasterizer::BinderWords(const Shader::Info& stage, u32 offset, u32 dwords, bool image) const {
+const u32* Rasterizer::BinderWords(const Shader::Info& stage, u32 offset, u32 dwords, u32 kind) const {
     const u32 s = stage.sw_stage == Shader::SwStage::Vertex ? 0 : stage.sw_stage == Shader::SwStage::Fragment ? 1 : 2;
     if (s > 1) {
         return nullptr;
     }
-    const u8 kind = image ? 2 : 1;
     for (u32 i = 0; i < binder_plan->binding_count; ++i) {
         const auto& b = binder_plan->bindings[i];
-        if (b.stage == s && b.kind == kind && offset >= b.offset && offset + dwords <= b.offset + b.dwords) {
+        if (b.stage == s && b.kind == kind && offset >= b.offset && offset + dwords <= u32{b.offset} + b.dwords) {
             return b.words + (offset - b.offset);
         }
     }
@@ -1734,7 +1755,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
             }
         } else {
-            if (Core::NativeRegistry::enabled.load(std::memory_order_relaxed)) {
+            if (Core::NativeRegistry::enabled.load(std::memory_order_relaxed) && !StageFlatSkipped(stage)) {
                 // NativeDraw v2 audit: the descriptor the legacy path reads is the binding of the record at that offset
                 const auto flat = stage.FlatUserData();
                 if (desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad && desc.sharp_fetch.offsets[0] + 4 <= flat.size()) {
@@ -1746,7 +1767,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             AmdGpu::Buffer chosen_sharp;
             bool from_record = false;
             if (binder_plan != nullptr && desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
-                if (const u32* words = BinderWords(stage, desc.sharp_fetch.offsets[0], 4, false)) {
+                if (const u32* words = BinderWords(stage, desc.sharp_fetch.offsets[0], 4, 1)) {
                     chosen_sharp = desc.FromWords(words, stage);
                     from_record = true;
                     if (binder_verify) {
@@ -1760,6 +1781,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
             if (from_record) {
                 Core::NativeRegistry::NoteBinder(0);
+            } else if (StageFlatSkipped(stage) && desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::MultiLoad) {
+                Core::NativeRegistry::NoteBinder(6); // must not happen: the plan skipped the flat user data for a stage the record covers
+                chosen_sharp = AmdGpu::Buffer::Null();
             } else {
                 chosen_sharp = desc.GetSharp(stage);
                 if (binder_plan != nullptr) {
@@ -1980,7 +2004,16 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             const auto flat = stage.FlatUserData();
             for (u32 i = 0; i < stage_images; ++i) {
                 AmdGpu::Image raw{};
-                if (!stage.images[i].Fetch(flat.data(), &raw)) {
+                const auto& res = stage.images[i];
+                const u32* record_words = binder_plan != nullptr && res.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad
+                                              ? BinderWords(stage, res.sharp_fetch.offsets[0], res.is_r128 ? 4 : 8, 2)
+                                              : nullptr;
+                if (record_words != nullptr) {
+                    res.RawFromWords(record_words, &raw);
+                } else if (StageFlatSkipped(stage)) {
+                    Core::NativeRegistry::NoteBinder(6); // must not happen
+                    raw = {};
+                } else if (!res.Fetch(flat.data(), &raw)) {
                     raw = {};
                 }
                 set_raws[i] = raw;
@@ -2011,7 +2044,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     for (const auto& image_desc : stage.images) {
         if (Core::NativeRegistry::enabled.load(std::memory_order_relaxed)) {
             // NativeDraw v2 audit: the T# the legacy path reads is the binding of the record at that offset
-            const auto flat = stage.FlatUserData();
+            const auto flat = StageFlatSkipped(stage) ? std::span<const u32>{} : stage.FlatUserData();
             if (image_desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad && image_desc.sharp_fetch.offsets[0] + 8 <= flat.size()) {
                 Core::NativeRegistry::AuditBinding(static_cast<u32>(stage.sw_stage), true, image_desc.sharp_fetch.offsets[0], flat.data() + image_desc.sharp_fetch.offsets[0], 8);
             } else {
@@ -2021,7 +2054,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         AmdGpu::Image chosen_tsharp;
         bool image_from_record = false;
         if (binder_plan != nullptr && image_desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad) {
-            if (const u32* words = BinderWords(stage, image_desc.sharp_fetch.offsets[0], image_desc.is_r128 ? 4 : 8, true)) {
+            if (const u32* words = BinderWords(stage, image_desc.sharp_fetch.offsets[0], image_desc.is_r128 ? 4 : 8, 2)) {
                 chosen_tsharp = image_desc.FromWords(words);
                 image_from_record = true;
                 if (binder_verify) {
@@ -2035,6 +2068,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
         if (image_from_record) {
             Core::NativeRegistry::NoteBinder(1);
+        } else if (StageFlatSkipped(stage)) {
+            Core::NativeRegistry::NoteBinder(6); // must not happen
+            chosen_tsharp = AmdGpu::Image::Null(image_desc.is_depth);
         } else {
             chosen_tsharp = image_desc.GetSharp(stage);
             if (binder_plan != nullptr) {
@@ -2245,7 +2281,24 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
 void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     for (const auto& sampler : stage.samplers) {
-        auto ssharp = sampler.GetSharp(stage);
+        AmdGpu::Sampler ssharp;
+        const u32* record_words = binder_plan != nullptr && sampler.FromWordsPossible() ? BinderWords(stage, sampler.sharp_fetch.offsets[0], 4, 3) : nullptr;
+        if (record_words != nullptr) {
+            ssharp = sampler.FromWords(record_words);
+            Core::NativeRegistry::NoteBinder(7);
+            if (binder_verify) {
+                const auto legacy = sampler.GetSharp(stage);
+                if (std::memcmp(&legacy, &ssharp, sizeof(legacy)) != 0) {
+                    Core::NativeRegistry::NoteBinder(8);
+                    ssharp = legacy;
+                }
+            }
+        } else if (StageFlatSkipped(stage)) {
+            Core::NativeRegistry::NoteBinder(6); // must not happen
+            ssharp = AmdGpu::Sampler{};
+        } else {
+            ssharp = sampler.GetSharp(stage);
+        }
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
                                 current_bc_base->Address() == 0)) {
             LOG_WARNING(Render_Vulkan,

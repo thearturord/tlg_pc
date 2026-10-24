@@ -85,7 +85,7 @@ public:
     /// fixed-function state needs the registers (the caller plans the old way).
     [[nodiscard]] std::unique_ptr<DrawPlan> PlanExecDraw(const FixedState& native, u32 native_stale, u64 exec_key, u64 inputs_key,
                                                          std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data,
-                                                         const Core::NativeDraw::ExecDraw& draw, u32 index_count = ~0u);
+                                                         const Core::NativeDraw::ExecDraw& draw, u32 index_count = ~0u, u32 draw_class = 15);
     /// The plan of a fast clear eliminate record: the operation and the render target it works on, decoded from the record's register pairs.
     [[nodiscard]] std::unique_ptr<DrawPlan> PlanExecOperation(const Core::NativeDraw::ExecDraw& draw);
     /// The differences between a plan made from the record and the same draw planned from the registers ("" when they agree; the user data under the masks).
@@ -478,7 +478,10 @@ private:
     const DrawPlan* binder_plan{};   ///< N3: the plan whose record binds the resources of the draw being recorded (null: from the flat user data)
     bool binder_verify{};
     const DrawPlan* NativeBinderFor(const DrawPlan* plan, u32 draw_class);
-    const u32* BinderWords(const Shader::Info& stage, u32 offset, u32 dwords, bool image) const;
+    /// kind: 1 buffer, 2 image, 3 sampler descriptor
+    const u32* BinderWords(const Shader::Info& stage, u32 offset, u32 dwords, u32 kind) const;
+    /// N3b: the binder's plan has no flat user data for this stage
+    bool StageFlatSkipped(const Shader::Info& stage) const;
     u64 dispatch_caller{}; ///< diagnostics: the game call that made the dispatch being bound
     u8 clip_plane_mask{}; ///< user clip planes of the draw being bound
     std::vector<std::unique_ptr<DispatchPlan>> dispatch_plan_pool;

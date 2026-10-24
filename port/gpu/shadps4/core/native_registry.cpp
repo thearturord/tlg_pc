@@ -357,10 +357,10 @@ std::atomic<u32> binding_logged{0};
 } // namespace
 
 namespace {
-std::array<std::atomic<u64>, 8> binder_counters{};
+std::array<std::atomic<u64>, 16> binder_counters{};
 }
 void NoteBinder(u32 what) {
-    binder_counters[what & 7].fetch_add(1, std::memory_order_relaxed);
+    binder_counters[what & 15].fetch_add(1, std::memory_order_relaxed);
 }
 
 void AuditBinding(u32 sw_stage, bool image, u32 offset, const u32* words, u32 dwords) {
@@ -1008,7 +1008,10 @@ nlohmann::json Report() {
     };
     j["native_binder"] = {{"buffers_from_the_record", binder_counters[0].load()}, {"images_from_the_record", binder_counters[1].load()},
                           {"buffers_from_the_flat_user_data", binder_counters[2].load()}, {"images_from_the_flat_user_data", binder_counters[3].load()},
-                          {"buffer_descriptors_differing_from_the_legacy_ones", binder_counters[4].load()}, {"image_descriptors_differing_from_the_legacy_ones", binder_counters[5].load()}};
+                          {"buffer_descriptors_differing_from_the_legacy_ones", binder_counters[4].load()}, {"image_descriptors_differing_from_the_legacy_ones", binder_counters[5].load()},
+                          {"skipped_stage_needed_the_flat_user_data", binder_counters[6].load()}, {"samplers_from_the_record", binder_counters[7].load()},
+                          {"sampler_descriptors_differing_from_the_legacy_ones", binder_counters[8].load()},
+                          {"stages_planned_without_the_flat_user_data", binder_counters[9].load()}, {"stages_planned_with_the_flat_user_data_not_covered", binder_counters[10].load()}};
     {
         auto& v2b = j["binding_audit"] = nlohmann::json::object();
         constexpr const char* names[16] = {"z_prepass_shadow", "g_buffer", "forward", "compute_other", "indirect_draws", "", "", "", "", "", "", "", "", "", "", "untagged"};

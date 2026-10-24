@@ -1454,7 +1454,8 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
                 if (native_fixed_verify) {
                     left(3);
                 } else if (auto plan = rasterizer->PlanExecDraw(*draw.fixed, draw.fixed_stale, draw.stage_key, native_inputs_key, exec_vertex_user_data,
-                                                                exec_pixel_user_data, draw, index_count)) {
+                                                                exec_pixel_user_data, draw, index_count,
+                                                                native_tag_pending.valid ? (native_tag_pending.meta & 0xff) : 15u)) {
                     take(std::move(plan));
                 } else {
                     left(4);

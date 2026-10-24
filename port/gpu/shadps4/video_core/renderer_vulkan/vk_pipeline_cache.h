@@ -4,6 +4,7 @@
 #pragma once
 
 #include "core/native_binding.h"
+#include "core/native_draw.h"
 #include "video_core/amdgpu/draw_state.h"
 #include <functional>
 #include <memory>
@@ -109,6 +110,7 @@ struct StagePlan {
     std::array<u32, Shader::NUM_USER_DATA_REGS> user_data{};
     u32 user_data_count{};
     boost::container::small_vector<u32, 64> flat;
+    bool flat_skipped{}; ///< N3b: every descriptor of the stage comes from the record's binding list; the flat user data was not built (flat is empty)
     VAddr pgm_base{};
 };
 
@@ -128,6 +130,7 @@ struct DrawPlan {
     std::array<Core::NativeDraw::RecordBinding, Core::NativeDraw::MaxRecordBindings> bindings{};
     u32 binding_count{};
     bool bindings_complete{};
+    bool any_flat_skipped{}; ///< N3b: a stage of the plan has no flat user data, the binder must serve the draw
 };
 
 struct DispatchPlan {
@@ -162,7 +165,9 @@ public:
                       DrawIndirectParams params, DrawPlan& plan, u64 exec_key = 0);
     /// cp_exec_inputs: the same for a draw whose pipeline was resolved before under `exec_key` (the record's key): the stages take the typed user data, nothing is read from
     /// registers. False when there is no entry (the caller plans the old way).
-    bool PlanGraphicsTyped(u64 exec_key, const FixedState& fixed, std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data, DrawPlan& plan);
+    /// skip_flat_for (N3b): the draw's record; a stage whose every descriptor it covers gets no flat user data.
+    bool PlanGraphicsTyped(u64 exec_key, const FixedState& fixed, std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data, DrawPlan& plan,
+                           const Core::NativeDraw::ExecDraw* skip_flat_for = nullptr);
     void PlanCompute(const AmdGpu::ComputeProgram& cs, DispatchPlan& plan);
     /// Raster thread: writes the captured state into the stage Infos the pipeline uses.
     static void ApplyPlan(const DrawPlan& plan);
@@ -195,7 +200,7 @@ public:
 
 private:
     Shader::Info* RasterInfoFor(const Shader::Info* shared);
-    static void CapturePlan(StagePlan& out, Shader::Info* clone, const Shader::Info& shared);
+    static void CapturePlan(StagePlan& out, Shader::Info* clone, const Shader::Info& shared, bool skip_flat = false);
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();

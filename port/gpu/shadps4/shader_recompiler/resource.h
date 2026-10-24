@@ -185,6 +185,14 @@ struct ImageResource {
         return image;
     }
 
+    /// The raw T# (before the fix ups of `GetSharp`) from the descriptor words of the draw's record.
+    constexpr void RawFromWords(const u32* words, AmdGpu::Image* out) const noexcept {
+        std::memcpy(out, words, (is_r128 ? 4 : 8) * sizeof(u32));
+        if (is_r128) {
+            out->pitch = out->width;
+        }
+    }
+
     constexpr bool Fetch(const u32* flatbuf, AmdGpu::Image* out) const {
         if (!is_r128) {
             // Fetch full 8 byte T#
@@ -213,11 +221,25 @@ struct SamplerResource {
     SharpLocation post_op_tsharp_dw3_off{};
     bool is_depth{};
 
+    /// True when the sampler can be built from its own four descriptor words (the record's): the post operation needs nothing else from the flat user data.
+    constexpr bool FromWordsPossible() const noexcept {
+        return sharp_fetch.summary == SharpFetch<AmdGpu::Sampler>::Summary::SingleLoad && post_op != SharpFetchPostOp::DisableAnisoIfSingleLod;
+    }
+
+    constexpr AmdGpu::Sampler FromWords(const u32* words) const noexcept {
+        AmdGpu::Sampler sampler{};
+        std::memcpy(&sampler, words, sizeof(sampler));
+        return PostOp(sampler, 0);
+    }
+
     constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
         AmdGpu::Sampler sampler{};
         sharp_fetch.Fetch(info.FlatUserData().data(), &sampler);
+        return PostOp(sampler, post_op == SharpFetchPostOp::DisableAnisoIfSingleLod ? info.FlatUserData()[post_op_tsharp_dw3_off] : 0);
+    }
+
+    constexpr AmdGpu::Sampler PostOp(AmdGpu::Sampler sampler, u32 tsharp_dw3) const noexcept {
         if (post_op == SharpFetchPostOp::DisableAnisoIfSingleLod) {
-            const u32 tsharp_dw3 = info.FlatUserData()[post_op_tsharp_dw3_off];
             if (((tsharp_dw3 >> 12) & 0xff) == 0) {
                 sampler.max_aniso.Assign(AmdGpu::AnisoRatio::One);
             }
