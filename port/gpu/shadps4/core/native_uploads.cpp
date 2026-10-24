@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string>
+#include "core/native_resources.h"
 #include <deque>
 #include <map>
 #include <utility>
@@ -254,6 +256,68 @@ SnapshotResult SnapshotRead(u64 begin, u64 size, u64 seq, void* data) {
     return SnapshotResult::Found;
 }
 
+// ---- on-demand upload audit ----------------------------------------------------------------------------------------------------------
+namespace {
+thread_local u32 current_caller = 0;
+thread_local u32 current_detail = 0;
+std::array<std::atomic<u64>, 64> detail_counts{}; ///< in-pass uploads of draw buffers by detail bits
+struct OnDemandBucket {
+    std::atomic<u64> requests{}, uploaded{};
+};
+constexpr const char* CallerNames[5] = {"other", "draw_buffer", "dispatch_buffer", "vertex_buffer", "index_buffer"};
+constexpr const char* SizeNames[7] = {"up_to_256", "up_to_4K", "up_to_16K", "up_to_64K", "up_to_1M", "up_to_16M", "more"};
+std::array<std::array<OnDemandBucket, 7>, 5> demand_by_caller_size_in_pass;   // [caller][request size]: uploads while a render pass was open
+std::array<OnDemandBucket, 5> demand_by_caller_outside_pass;
+std::array<OnDemandBucket, 5> demand_immutable_by_caller;
+std::mutex class_mutex;
+std::map<std::string, std::pair<u64, u64>> demand_in_pass_by_class; // memory class -> {requests, uploaded}
+} // namespace
+
+bool OnDemandAudit() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_UPLOAD_AUDIT");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+
+void SetCaller(u32 caller) {
+    current_caller = caller;
+}
+
+u32 Caller() {
+    return current_caller;
+}
+
+void SetDetail(u32 detail) {
+    current_detail = detail;
+}
+
+void NoteOnDemand(bool pass_open, u64 request_size, u64 uploaded_bytes, u64 address, bool immutable_whole) {
+    const u32 caller = current_caller < 5 ? current_caller : 0;
+    if (immutable_whole) {
+        demand_immutable_by_caller[caller].requests.fetch_add(1, std::memory_order_relaxed);
+        demand_immutable_by_caller[caller].uploaded.fetch_add(uploaded_bytes, std::memory_order_relaxed);
+        return;
+    }
+    if (!pass_open) {
+        demand_by_caller_outside_pass[caller].requests.fetch_add(1, std::memory_order_relaxed);
+        demand_by_caller_outside_pass[caller].uploaded.fetch_add(uploaded_bytes, std::memory_order_relaxed);
+        return;
+    }
+    const u32 bucket = request_size <= 256 ? 0 : request_size <= 4096 ? 1 : request_size <= 16384 ? 2 : request_size <= 65536 ? 3 : request_size <= (1u << 20) ? 4 : request_size <= (16u << 20) ? 5 : 6;
+    if (caller == 1) {
+        detail_counts[current_detail & 63].fetch_add(1, std::memory_order_relaxed);
+    }
+    demand_by_caller_size_in_pass[caller][bucket].requests.fetch_add(1, std::memory_order_relaxed);
+    demand_by_caller_size_in_pass[caller][bucket].uploaded.fetch_add(uploaded_bytes, std::memory_order_relaxed);
+    const std::string cls = NativeResources::UsageClassNameOf(NativeResources::UsageClassOf(address));
+    std::scoped_lock lock{class_mutex};
+    auto& entry = demand_in_pass_by_class[cls];
+    entry.first += 1;
+    entry.second += uploaded_bytes;
+}
+
 nlohmann::json Report() {
     nlohmann::json j = nlohmann::json::object();
     j["enabled"] = Enabled();
@@ -281,6 +345,56 @@ nlohmann::json Report() {
                       {"snapshot_ring_bindings_compared_with_guest_memory", ring_snapshot_counters[2].load()},
                       {"snapshot_differs_from_guest_memory_at_bind_time", ring_snapshot_counters[3].load()},
                       {"snapshot_differed_from_guest_memory_when_planned_guest_bytes_used_instead", ring_snapshot_counters[4].load()}};
+    {
+        auto& a = j["on_demand_upload_audit"] = nlohmann::json::object();
+        a["enabled"] = OnDemandAudit();
+        auto& in_pass = a["uploads_while_a_render_pass_was_open_which_ended_it"] = nlohmann::json::object();
+        u64 total_requests = 0, total_bytes = 0;
+        for (u32 c = 0; c < 5; ++c) {
+            auto& o = in_pass[CallerNames[c]] = nlohmann::json::object();
+            u64 requests = 0, bytes = 0;
+            for (u32 b = 0; b < 7; ++b) {
+                const u64 r = demand_by_caller_size_in_pass[c][b].requests.load(), u = demand_by_caller_size_in_pass[c][b].uploaded.load();
+                if (r != 0) {
+                    o["by_request_size"][SizeNames[b]] = {{"uploads", r}, {"bytes", u}};
+                }
+                requests += r;
+                bytes += u;
+            }
+            o["uploads"] = requests;
+            o["bytes"] = bytes;
+            total_requests += requests;
+            total_bytes += bytes;
+        }
+        {
+            auto& d = in_pass["draw_buffer_uploads_by_what_the_buffer_is"] = nlohmann::json::object();
+            for (u32 i = 0; i < 64; ++i) {
+                if (const u64 n = detail_counts[i].load()) {
+                    std::string name;
+                    name += (i & 1) ? "written " : "read_only ";
+                    name += (i & 2) ? "formatted " : "";
+                    name += (i & 4) ? "over_16K " : "up_to_16K ";
+                    name += (i & 16) ? "draw_has_ring_plan " : "no_ring_plan ";
+                    name += (i & 32) ? "page_is_gpu_modified " : "page_not_gpu_modified ";
+                    name += (i & 8) ? "ring_binding_existed" : "";
+                    d[name] = n;
+                }
+            }
+        }
+        in_pass["total_uploads"] = total_requests;
+        in_pass["total_bytes"] = total_bytes;
+        auto& outside = a["uploads_with_no_render_pass_open"] = nlohmann::json::object();
+        auto& immutable = a["whole_immutable_buffer_synchronizations"] = nlohmann::json::object();
+        for (u32 c = 0; c < 5; ++c) {
+            outside[CallerNames[c]] = {{"uploads", demand_by_caller_outside_pass[c].requests.load()}, {"bytes", demand_by_caller_outside_pass[c].uploaded.load()}};
+            immutable[CallerNames[c]] = {{"uploads", demand_immutable_by_caller[c].requests.load()}, {"bytes", demand_immutable_by_caller[c].uploaded.load()}};
+        }
+        std::scoped_lock lock{class_mutex};
+        auto& classes = a["uploads_while_a_render_pass_was_open_by_memory_class"] = nlohmann::json::object();
+        for (const auto& [name, v] : demand_in_pass_by_class) {
+            classes[name] = {{"uploads", v.first}, {"bytes", v.second}};
+        }
+    }
     j["journal_peak_entries"] = journal_peak.load();
     j["frame_ring_uploads_at_draw_time_bytes"] = ring_upload_bytes.load();
     j["frame_ring_uploads_by_the_pre_synchronization_bytes"] = ring_upload_presync_bytes.load();

@@ -64,6 +64,18 @@ SnapshotResult SnapshotRead(u64 begin, u64 size, u64 seq, void* data);
 /// The constant ring and the snapshots: 0 a ring binding carries a snapshot, 1 refused (partly covered), 2 verified against guest memory at bind time, 3 differs from it.
 void NoteSnapshotRing(u32 what);
 
+// ---- the on-demand upload audit (TLG_UPLOAD_AUDIT=1, changes nothing) ----------------------------------------------------------------
+// Which buffer requests at draw or dispatch time copy bytes from guest memory, how big the requests are, who asks, and whether a render pass was open (the upload then
+// ended it).
+bool OnDemandAudit();
+/// Who is asking the buffer cache (set by the rasterizer around its buffer requests): 0 other, 1 buffer of a draw, 2 buffer of a dispatch, 3 vertex buffer, 4 index buffer.
+void SetCaller(u32 caller);
+u32 Caller();
+/// What the buffer being requested is (set by the rasterizer's BindBuffers): bit 0 written by the shader, bit 1 formatted (texel buffer), bit 2 larger than the ring takes,
+/// bit 3 a ring binding existed for it (the request should not have come), bit 4 the draw has a ring plan.
+void SetDetail(u32 detail);
+void NoteOnDemand(bool pass_open, u64 request_size, u64 uploaded_bytes, u64 address, bool immutable_whole);
+
 nlohmann::json Report();
 
 } // namespace Core::NativeUploads

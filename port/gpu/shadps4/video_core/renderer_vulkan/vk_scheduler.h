@@ -424,6 +424,10 @@ public:
     [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {
         return is_rendering && render_state == state;
     }
+    /// Whether any render pass is open (recording side).
+    [[nodiscard]] bool IsRendering() const {
+        return is_rendering;
+    }
 
     /// Returns the current pipeline dynamic state tracking.
     DynamicState& GetDynamicState() {
@@ -711,6 +715,9 @@ public:
     }
     [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {
         return ActiveConst().IsRenderingWith(state);
+    }
+    [[nodiscard]] bool IsRendering() const {
+        return ActiveConst().IsRendering();
     }
     DynamicState& GetDynamicState() {
         return Active().GetDynamicState();

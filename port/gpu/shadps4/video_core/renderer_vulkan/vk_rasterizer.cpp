@@ -1401,6 +1401,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
 }
 
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
+    Core::NativeUploads::SetCaller(3);
     const auto& regs = *draw_inputs;
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
@@ -1506,6 +1507,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 }
 
 void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
+    Core::NativeUploads::SetCaller(4);
     const auto& regs = *draw_inputs;
 
     // Figure out index type and size.
@@ -1555,6 +1557,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {
+    Core::NativeUploads::SetCaller(0);
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
@@ -1726,6 +1729,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
+    Core::NativeUploads::SetCaller(stage.sw_stage == Shader::SwStage::Compute ? 2 : 1);
     const u64 alignment = instance.StorageMinAlignment();
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
@@ -1869,6 +1873,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         Core::NativeResources::NoteHandle(1);
                     }
                 }
+                Core::NativeUploads::SetDetail((desc.is_written ? 1u : 0u) | (desc.is_formatted ? 2u : 0u) | (size > VideoCore::BufferCache::StreamThreshold() ? 4u : 0u) |
+                                               ((ring_draw || ring_dispatch) ? 16u : 0u) |
+                                               (Core::NativeUploads::OnDemandAudit() && buffer_cache.IsRegionGpuModified(vsharp.base_address, size) ? 32u : 0u));
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2);
                 if (Core::NativeRegistry::AuditBuffer(vsharp.base_address, size, desc.is_written, desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase)) {

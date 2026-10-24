@@ -574,7 +574,12 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             const u32 whole = static_cast<u32>(immutable->end - immutable->begin);
             const auto* arena = GetArena(immutable->begin >> block_shift, (immutable->end - 1) >> block_shift);
             EnsureResident(arena, immutable->begin >> block_shift, (immutable->end - 1) >> block_shift);
+            last_upload_bytes = 0;
+            const bool immutable_pass_open = Core::NativeUploads::OnDemandAudit() && scheduler.IsRendering();
             SynchronizeMemory(arena, immutable->begin, whole, false, false);
+            if (last_upload_bytes != 0 && Core::NativeUploads::OnDemandAudit()) {
+                Core::NativeUploads::NoteOnDemand(immutable_pass_open, whole, last_upload_bytes, immutable->begin, true);
+            }
             Core::NativeResources::ImmutableSynced(*immutable, generation);
             Core::NativeResources::NoteImmutableSync();
             return {arena, arena->Offset(device_addr)};
@@ -638,7 +643,11 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
     last_upload_bytes = 0;
+    const bool pass_open_before = Core::NativeUploads::OnDemandAudit() && scheduler.IsRendering(); // the upload itself ends the pass
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    if (last_upload_bytes != 0 && Core::NativeUploads::OnDemandAudit()) {
+        Core::NativeUploads::NoteOnDemand(pass_open_before, size, last_upload_bytes, device_addr, false);
+    }
     Core::NativeResources::NoteBufferRequest(device_addr, size, is_written,
                                              Core::NativeResources::BufferPath::Arena, last_upload_bytes);
     if (is_written) {
