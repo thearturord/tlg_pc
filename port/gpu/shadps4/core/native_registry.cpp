@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <tuple>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
@@ -69,11 +70,15 @@ std::map<std::pair<u8, u32>, bool> dumped;
 
 thread_local u32 draw_class = 15;
 thread_local u64 current_draw_seq = 0;
+thread_local bool current_from_plan = false;
+thread_local u64 draw_call_index = 0;
 constexpr u32 DrawRing = 8192;
 std::unique_ptr<DrawResources[]> draw_ring;
 std::mutex draw_ring_mutex;
 std::array<std::atomic<u64>, 16> explained_buffers{}, unexplained_registered_buffers{}, unexplained_unknown_buffers{}, no_draw_record_buffers{};
 std::array<std::atomic<u64>, 16> explained_images{}, unexplained_images{}, no_draw_record_images{};
+// buffers by (class, special draw?): requests explained / not by the draw's description
+std::array<std::array<std::atomic<u64>, 2>, 16> special_explained{}, special_unexplained{};
 struct ClassCounters {
     std::atomic<u64> buffers{}, buffers_inside{}, images{}, images_found{};
 };
@@ -93,6 +98,9 @@ struct Sample {
     u32 draw_buffers{};
 };
 std::vector<Sample> unexplained_samples;
+/// Where the unexplained requests come from: (pass class, how, where, distance bucket, registered buffer bytes) -> requests (distance bucket 255: not searched).
+std::mutex attribution_mutex;
+std::map<std::tuple<u32, u32, u32, u32, u64>, u64> attribution;
 std::array<u32, 16> unexplained_per_class{};
 std::vector<Sample> buffer_miss_samples, buffer_partial_samples, image_miss_samples;
 struct MissCount {
@@ -331,6 +339,33 @@ void DrawResources::AddBuffer(u64 begin, u64 end) {
     }
 }
 
+void DrawResources::AddOther(u64 begin, u64 end, u32 where) {
+    for (u32 i = 0; i < other_count; ++i) {
+        if (others[i].begin == begin && others[i].end == end) {
+            return;
+        }
+    }
+    if (other_count < MaxOthers) {
+        others[other_count++] = {begin, end, where};
+    }
+}
+
+void CollectOtherBuffer(DrawResources& draw, u64 object, u32 where) {
+    if (!Plausible(object) || ResourceKind(Read<u32>(object, 0x124)) != Kind::Buffer) {
+        return;
+    }
+    const u64 address = Read<u64>(object, 0x30);
+    const u64 bytes = Read<u32>(object, 0x180);
+    draw.AddOther(address, address + bytes, where);
+    const u32 d0 = Read<u32>(object, 0x60), d1 = Read<u32>(object, 0x64), d2 = Read<u32>(object, 0x68);
+    const u64 stride = (d1 >> 16) & 0x3fff;
+    const u64 base = u64{d0} | (u64{d1 & 0xfff} << 32);
+    const u64 v_bytes = stride != 0 ? stride * d2 : d2;
+    if (v_bytes != 0 && (base != address || v_bytes != bytes) && base > 0x1000000000ull && base < 0x2000000000ull && v_bytes <= (1ull << 31)) {
+        draw.AddOther(base, base + v_bytes, where + 0x1000);
+    }
+}
+
 void DrawResources::AddImage(u64 start) {
     for (u32 i = 0; i < image_count; ++i) {
         if (images[i] == start) {
@@ -370,6 +405,58 @@ void StoreDraw(const DrawResources& draw) {
     draw_ring[draw.seq % DrawRing] = draw;
 }
 
+struct CueKey {
+    u32 kind, stage, slot;
+    u64 caller;
+    bool operator<(const CueKey& o) const {
+        return std::tie(kind, caller, stage, slot) < std::tie(o.kind, o.caller, o.stage, o.slot);
+    }
+};
+struct CueStat {
+    u64 count{};
+    u64 address{};
+    u64 bytes{};
+    u64 registered{}; ///< how many of the calls named memory inside a registered buffer / at a registered texture
+};
+std::mutex cue_mutex;
+std::map<CueKey, CueStat> cue_calls;
+
+void NoteCueCall(u32 kind, u64 caller, u32 stage, u32 slot, u64 address, u64 bytes) {
+    if (!enabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    bool registered = false;
+    {
+        std::shared_lock lock{registry_mutex};
+        if (kind == 2) {
+            registered = texture_by_start.contains(address);
+        } else {
+            auto it = buffer_intervals.upper_bound(address);
+            if (it != buffer_intervals.begin()) {
+                --it;
+                if (const auto e = by_id.find(it->second); e != by_id.end() && address >= e->second.address && address + bytes <= e->second.address + e->second.size) {
+                    registered = true;
+                }
+            }
+        }
+    }
+    std::scoped_lock lock{cue_mutex};
+    auto& stat = cue_calls[{kind, stage, slot, caller}];
+    ++stat.count;
+    stat.address = address;
+    stat.bytes = bytes;
+    stat.registered += registered ? 1 : 0;
+}
+
+std::mutex debug_mutex;
+std::vector<std::string> debug_texts;
+void NoteDebug(const std::string& text) {
+    std::scoped_lock lock{debug_mutex};
+    if (debug_texts.size() < 160) {
+        debug_texts.push_back(text);
+    }
+}
+
 std::mutex slot_mutex;
 std::map<std::pair<u32, u32>, u64> context_slots;
 void NoteContextSlot(u32 offset, u32 resource_kind) {
@@ -377,7 +464,96 @@ void NoteContextSlot(u32 offset, u32 resource_kind) {
     ++context_slots[{offset, resource_kind}];
 }
 
-void SetCurrentDraw(u64 seq) {
+std::string DescribeCurrentDraw() {
+    if (current_draw_seq == 0 || !draw_ring) {
+        return "no draw";
+    }
+    const DrawResources& d = draw_ring[current_draw_seq % DrawRing];
+    if (d.seq != current_draw_seq) {
+        return fmt::format("record {} overwritten (ring holds {})", current_draw_seq, d.seq);
+    }
+    std::string text = fmt::format("draw record {} buffers {} images {} dropped {} descriptors_emitted {} vs_entries {} ps_entries {} vs_pgm_lo {:#x}:", d.seq, d.buffer_count, d.image_count, d.dropped, d.note_calls, d.vs_object_entries, d.ps_object_entries, d.vs_object_pgm);
+    for (u32 i = 0; i < d.buffer_count && i < 12; ++i) {
+        text += fmt::format(" [{:#x}..{:#x}]", d.buffers[i].begin, d.buffers[i].end);
+    }
+    return text;
+}
+
+namespace {
+std::mutex sh_mutex;
+std::array<DrawResources::Range, 1024> sh_ranges;
+u32 sh_next = 0;
+std::atomic<u64> sh_packets{}, sh_user_data_packets{}, sh_vsharps{};
+std::array<std::atomic<u64>, 16> explained_by_sh{};
+} // namespace
+
+void NoteShPacket(u32 reg_offset, const u32* words, u32 count) {
+    if (!enabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    sh_packets.fetch_add(1, std::memory_order_relaxed);
+    // user data windows relative to the SH register base: pixel 0x0c..0x1b, vertex 0x4c..0x5b
+    for (u32 i = 0; i < count; ++i) {
+        const u32 reg = reg_offset + i;
+        const bool window = (reg >= 0x0c && reg < 0x1c) || (reg >= 0x4c && reg < 0x5c);
+        if (!window || (reg & 3) != 0 || i + 4 > count) {
+            continue;
+        }
+        sh_user_data_packets.fetch_add(1, std::memory_order_relaxed);
+        const u32 d0 = words[i], d1 = words[i + 1], d2 = words[i + 2];
+        const u64 stride = (d1 >> 16) & 0x3fff;
+        const u64 begin = u64{d0} | (u64{d1 & 0xfff} << 32);
+        const u64 bytes = stride != 0 ? stride * d2 : d2;
+        if (begin > 0x1000000000ull && begin < 0x2000000000ull && bytes != 0 && bytes <= (1ull << 28)) {
+            sh_vsharps.fetch_add(1, std::memory_order_relaxed);
+            std::scoped_lock lock{sh_mutex};
+            sh_ranges[sh_next++ & 1023] = {begin, begin + bytes};
+        }
+    }
+}
+
+u64 CurrentDrawSeq() {
+    return current_draw_seq;
+}
+
+bool CurrentDrawFromPlan() {
+    return current_from_plan;
+}
+
+u64 CurrentDrawCallIndex() {
+    return draw_call_index;
+}
+
+bool DrawDescribes(u64 seq, u64 address, u64 size) {
+    if (seq == 0 || !draw_ring) {
+        return false;
+    }
+    const DrawResources& draw = draw_ring[seq % DrawRing];
+    if (draw.seq != seq) {
+        return false;
+    }
+    for (u32 i = 0; i < draw.buffer_count; ++i) {
+        if (address >= draw.buffers[i].begin && address + size <= draw.buffers[i].end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+namespace {
+std::mutex site_mutex;
+std::map<std::tuple<u32, u32, u32, u32, u32, u32, u32>, u64> sites;
+} // namespace
+
+void NoteUnexplainedSite(u32 sw_stage, u32 summary, u32 offset, u32 set_by_record, u32 table_described, u32 plan_matches_record) {
+    const u32 bucket = offset < 16 ? offset : offset < 64 ? 16 + (offset - 16) / 4 * 4 : 64;
+    std::scoped_lock lock{site_mutex};
+    ++sites[{draw_class | (current_from_plan ? 0x100u : 0u), sw_stage, summary, bucket, set_by_record, table_described, plan_matches_record}];
+}
+
+void SetCurrentDraw(u64 seq, bool from_plan) {
+    current_from_plan = from_plan;
+    ++draw_call_index;
     current_draw_seq = seq;
 }
 
@@ -385,9 +561,10 @@ void SetDrawClass(u32 draw_class_) {
     draw_class = draw_class_ & 15;
 }
 
-void AuditBuffer(u64 address, u64 size, bool written) {
+bool AuditBuffer(u64 address, u64 size, bool written) {
+    bool unexplained_flag = false;
     if (!enabled.load(std::memory_order_relaxed)) {
-        return;
+        return false;
     }
     by_class[draw_class].buffers.fetch_add(1, std::memory_order_relaxed);
     if ((audit_calls.fetch_add(1, std::memory_order_relaxed) & 0xfff) == 0) {
@@ -424,9 +601,55 @@ void AuditBuffer(u64 address, u64 size, bool written) {
             for (u32 i = 0; i < draw->buffer_count && !explained; ++i) {
                 explained = address >= draw->buffers[i].begin && address + size <= draw->buffers[i].end;
             }
+            (explained ? special_explained : special_unexplained)[draw_class][draw->special != 0 ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
             if (explained) {
                 explained_buffers[draw_class].fetch_add(1, std::memory_order_relaxed);
             } else {
+                bool by_packets = false;
+                {
+                    std::scoped_lock lock{sh_mutex};
+                    for (const auto& r : sh_ranges) {
+                        if (r.end != 0 && address >= r.begin && address + size <= r.end) {
+                            by_packets = true;
+                            break;
+                        }
+                    }
+                }
+                if (by_packets) {
+                    explained_by_sh[draw_class].fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    unexplained_flag = true;
+                    // Where does it come from? In another context slot of this draw, or in the description of one of the last draws (stale user data).
+                    u32 how = 0, where = 0, distance = 255;
+                    for (u32 i = 0; i < draw->other_count; ++i) {
+                        if (address >= draw->others[i].begin && address + size <= draw->others[i].end) {
+                            how = 1;
+                            where = draw->others[i].where;
+                            break;
+                        }
+                    }
+                    thread_local u32 searched = 0;
+                    if ((searched++ & 7) == 0 && draw_ring) {
+                        distance = 0;
+                        for (u32 d = 1; d <= 64 && distance == 0; ++d) {
+                            const DrawResources& prev = draw_ring[(current_draw_seq - d) % DrawRing];
+                            if (prev.seq != current_draw_seq - d) {
+                                continue;
+                            }
+                            for (u32 i = 0; i < prev.buffer_count; ++i) {
+                                if (address >= prev.buffers[i].begin && address + size <= prev.buffers[i].end) {
+                                    distance = d == 1 ? 1 : d <= 4 ? 2 : d <= 16 ? 3 : 4;
+                                    break;
+                                }
+                            }
+                        }
+                        if (distance != 0) {
+                            how |= 2;
+                        }
+                    }
+                    std::scoped_lock lock{attribution_mutex};
+                    ++attribution[{draw_class | (current_from_plan ? 0x100u : 0u), how, where, distance, reg_bytes}];
+                }
                 (inside ? unexplained_registered_buffers : unexplained_unknown_buffers)[draw_class].fetch_add(1, std::memory_order_relaxed);
                 if (draw->dropped == 0) {
                     std::scoped_lock lock{sample_mutex};
@@ -440,7 +663,7 @@ void AuditBuffer(u64 address, u64 size, bool written) {
     if (inside) {
         audit.buffers_inside.fetch_add(1, std::memory_order_relaxed);
         by_class[draw_class].buffers_inside.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return unexplained_flag;
     }
     (partial ? audit.buffers_partial : audit.buffers_missing).fetch_add(1, std::memory_order_relaxed);
     if (!partial) {
@@ -464,11 +687,12 @@ void AuditBuffer(u64 address, u64 size, bool written) {
     if (samples.size() < 48) {
         for (const auto& s : samples) {
             if (s.address == address && s.size == size) {
-                return;
+                return unexplained_flag;
             }
         }
         samples.push_back({address, size, written});
     }
+    return unexplained_flag;
 }
 
 void AuditImage(u64 address) {
@@ -587,7 +811,7 @@ nlohmann::json Report() {
                     continue;
                 }
 #endif
-                const u64 base = u64{v[0]} | (u64{v[1] & 0xffff} << 32);
+                const u64 base = u64{v[0]} | (u64{v[1] & 0xfff} << 32);
                 const u64 stride = (v[1] >> 16) & 0x3fff;
                 const u64 bytes = stride != 0 ? stride * v[2] : v[2];
                 Rel& r = rel[e.usage];
@@ -617,9 +841,26 @@ nlohmann::json Report() {
             std::scoped_lock lock{slot_mutex};
             auto& slots = j["context_slots_holding_resources"] = nlohmann::json::object();
             for (const auto& [key, count] : context_slots) {
-                slots[fmt::format("{}{:#x}:{}", (key.first & 0x80000000u) != 0 ? "NOT_COLLECTED " : "", key.first & 0x7fffffffu, KindNames[key.second < 5 ? (key.second == 1 ? 1 : key.second) : 0])] = count;
+                slots[fmt::format("{}{:#x}:{}{}", (key.first & 0x80000000u) != 0 ? "NOT_COLLECTED " : "", key.first & 0x7fffffffu, KindNames[(key.second & 0xff) < 5 ? (key.second & 0xff) : 0], (key.second >> 8) != 0 ? fmt::format(" bytes {}", key.second >> 8) : std::string{})] = count;
             }
         }
+        {
+            std::scoped_lock lock{debug_mutex};
+            j["debug"] = debug_texts;
+        }
+        {
+            std::scoped_lock lock{cue_mutex};
+            std::vector<std::pair<CueKey, CueStat>> list(cue_calls.begin(), cue_calls.end());
+            std::ranges::sort(list, [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+            auto& out = j["cue_calls"] = nlohmann::json::array();
+            constexpr const char* kinds[4] = {"constant_buffer", "buffer", "texture", "user_table"};
+            for (size_t i = 0; i < list.size() && i < 60; ++i) {
+                const auto& [k, st] = list[i];
+                out.push_back({{"kind", kinds[k.kind & 3]}, {"caller", fmt::format("{:#x}", k.caller)}, {"stage", k.stage}, {"slot", k.slot}, {"calls", st.count},
+                               {"in_registered_object", st.registered}, {"last_address", fmt::format("{:#x}", st.address)}, {"last_bytes", st.bytes}});
+            }
+        }
+        j["sh_register_packets"] = {{"packets", sh_packets.load()}, {"user_data_window_groups", sh_user_data_packets.load()}, {"buffer_descriptors_decoded", sh_vsharps.load()}};
         j["dead_objects"] = dead_objects;
         j["address_reuse"] = reused_addresses;
         auto& tags = j["tags_by_slot_kind"] = nlohmann::json::object();
@@ -643,18 +884,59 @@ nlohmann::json Report() {
     };
     {
         auto& v2 = j["draw_description_audit"] = nlohmann::json::object();
-        constexpr const char* names[16] = {"z_prepass_shadow", "g_buffer", "forward", "compute_other", "", "", "", "", "", "", "", "", "", "", "", "untagged"};
+        constexpr const char* names[16] = {"z_prepass_shadow", "g_buffer", "forward", "compute_other", "indirect_draws", "", "", "", "", "", "", "", "", "", "", "untagged"};
         for (u32 c = 0; c < 16; ++c) {
             const u64 total = explained_buffers[c] + unexplained_registered_buffers[c] + unexplained_unknown_buffers[c] + no_draw_record_buffers[c] + explained_images[c] +
                               unexplained_images[c] + no_draw_record_images[c];
             if (total != 0) {
-                v2[names[c][0] ? names[c] : std::to_string(c)] = {{"buffers_explained_by_the_draws_objects", explained_buffers[c].load()},
+                v2[names[c][0] ? names[c] : std::to_string(c)] = {{"buffers_explained_normal_draws", special_explained[c][0].load()},
+                                                                  {"buffers_unexplained_normal_draws", special_unexplained[c][0].load()},
+                                                                  {"buffers_explained_special_draws", special_explained[c][1].load()},
+                                                                  {"buffers_unexplained_special_draws", special_unexplained[c][1].load()},
+                                                                  {"buffers_unexplained_but_written_by_sh_register_packets", explained_by_sh[c].load()},
+                                                                  {"buffers_explained_by_the_draws_objects", explained_buffers[c].load()},
                                                                   {"buffers_other_registered_object", unexplained_registered_buffers[c].load()},
                                                                   {"buffers_not_registered", unexplained_unknown_buffers[c].load()},
                                                                   {"buffers_no_draw_record", no_draw_record_buffers[c].load()},
                                                                   {"images_explained", explained_images[c].load()},
                                                                   {"images_not_explained", unexplained_images[c].load()},
                                                                   {"images_no_draw_record", no_draw_record_images[c].load()}};
+            }
+        }
+        {
+            std::scoped_lock lock{attribution_mutex};
+            std::vector<std::pair<std::tuple<u32, u32, u32, u32, u64>, u64>> list(attribution.begin(), attribution.end());
+            std::ranges::sort(list, [](const auto& a, const auto& b) { return a.second > b.second; });
+            auto& out = v2["unexplained_attribution"] = nlohmann::json::array();
+            constexpr const char* how_names[4] = {"nowhere_found", "other_context_slot", "earlier_draw", "other_slot_and_earlier_draw"};
+            constexpr const char* distance_names[5] = {"not_in_last_64_draws", "previous_draw", "2_to_4_draws_back", "5_to_16_draws_back", "17_to_64_draws_back"};
+            for (size_t i = 0; i < list.size() && i < 60; ++i) {
+                const auto& [key, count] = list[i];
+                const auto& [cls, how, where, distance, bytes] = key;
+                std::string slot;
+                if (how & 1) {
+                    const u32 w = where & 0xfff;
+                    slot = std::string((where & 0x1000) != 0 ? "V# of " : "") +
+                           (w >= 0x100 ? fmt::format("srv stage {} slot {}", (w - 0x100) / 128, (w - 0x100) % 128) : fmt::format("cb stage {} slot {}", w / 16, w % 16));
+                }
+                out.push_back({{"class", cls & 0xff}, {"plan_built_from_record", (cls & 0x100) != 0}, {"how", how_names[how & 3]}, {"slot", slot}, {"distance", distance == 255 ? "not_searched" : distance_names[distance < 5 ? distance : 0]},
+                               {"registered_buffer_bytes", bytes}, {"requests", count}});
+            }
+        }
+        {
+            std::scoped_lock lock{site_mutex};
+            std::vector<std::pair<std::tuple<u32, u32, u32, u32, u32, u32, u32>, u64>> list(sites.begin(), sites.end());
+            std::ranges::sort(list, [](const auto& a, const auto& b) { return a.second > b.second; });
+            auto& out = v2["unexplained_sites"] = nlohmann::json::array();
+            constexpr const char* stage_names[6] = {"pixel", "tess_control", "tess_eval", "vertex", "geometry", "compute"};
+            for (size_t i = 0; i < list.size() && i < 80; ++i) {
+                const auto& [key, count] = list[i];
+                const auto& [cls, stage, summary, bucket, set_by_record, table_described, matches] = key;
+                out.push_back({{"class", cls & 0xff}, {"plan_built_from_record", (cls & 0x100) != 0}, {"stage", stage_names[stage < 6 ? stage : 0]},
+                               {"descriptor_read", summary == 0 ? "directly from the user data / flat table" : "fetched by the shader from a table in memory"}, {"flat_offset", bucket},
+                               {"registers_set_by_the_record", set_by_record == 0 ? "no" : set_by_record == 1 ? "yes" : "n/a"},
+                               {"fetch_table_in_description", table_described == 0 ? "no" : table_described == 1 ? "yes" : "n/a"},
+                               {"plan_user_data_equals_record", matches == 0 ? "DIFFERS" : matches == 1 ? "equal" : "n/a"}, {"requests", count}});
             }
         }
         auto& ex = v2["samples_unexplained_buffers"] = nlohmann::json::array();
@@ -666,7 +948,7 @@ nlohmann::json Report() {
     }
     {
         auto& by = j["audit_by_pass_class"] = nlohmann::json::object();
-        constexpr const char* names[16] = {"z_prepass_shadow", "g_buffer", "forward", "compute_other", "", "", "", "", "", "", "", "", "", "", "", "untagged"};
+        constexpr const char* names[16] = {"z_prepass_shadow", "g_buffer", "forward", "compute_other", "indirect_draws", "", "", "", "", "", "", "", "", "", "", "untagged"};
         for (u32 c = 0; c < 16; ++c) {
             if (by_class[c].buffers.load() + by_class[c].images.load() != 0) {
                 by[names[c][0] ? names[c] : std::to_string(c)] = {{"buffer_requests", by_class[c].buffers.load()}, {"buffers_inside_registered", by_class[c].buffers_inside.load()},
@@ -709,7 +991,7 @@ nlohmann::json Report() {
                         continue;
                     }
 #endif
-                    const u64 base = u64{v[0]} | (u64{v[1] & 0xffff} << 32);
+                    const u64 base = u64{v[0]} | (u64{v[1] & 0xfff} << 32);
                     const u64 stride = (v[1] >> 16) & 0x3fff;
                     const u64 bytes = stride != 0 ? stride * v[2] : v[2];
                     if (base > 0x1000000000ull && base < 0x2000000000ull && bytes != 0 && bytes <= (64ull << 20) && address >= base && address < base + bytes && hit["covering"].size() < 3) {

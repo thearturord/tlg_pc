@@ -206,10 +206,35 @@ void HashSlots(Hasher& h, u64 ctx, u64 table, u64 mask_lo, u64 mask_hi) {
 /// Native registry (shadow mode): the engine objects the context holds for this draw. Guarded by the caller.
 void ObserveContext(u64 ctx, NativeRegistry::DrawResources* draw) {
     using NativeRegistry::Kind;
+    // The descriptor the shader sees, from the object (the same bytes the record builder copies): a buffer's V# at +0x60, a buffer view's V# at +0x78 (shader
+    // resource) / +0x74 (unordered access), a texture view's T# at +0x58 / +0x54. The engine can point a buffer object's V# at memory that is not its own.
+    const auto add_vsharp = [&](u64 address) {
+        if (draw == nullptr) {
+            return;
+        }
+        const u32 d0 = Rd<u32>(address, 0), d1 = Rd<u32>(address, 4), d2 = Rd<u32>(address, 8);
+        const u64 stride = (d1 >> 16) & 0x3fff;
+        const u64 begin = u64{d0} | (u64{d1 & 0xfff} << 32);
+        const u64 bytes = stride != 0 ? stride * d2 : d2;
+        if (begin > 0x1000000000ull && begin < 0x2000000000ull && bytes != 0 && bytes <= (1ull << 31)) {
+            draw->AddBuffer(begin, begin + bytes);
+        }
+    };
+    const auto add_tsharp = [&](u64 address) {
+        if (draw == nullptr) {
+            return;
+        }
+        const u32 d0 = Rd<u32>(address, 0), d1 = Rd<u32>(address, 4);
+        const u64 start = (u64{d0} | (u64{d1 & 0xff} << 32)) << 8;
+        if (start > 0x1000000000ull && start < 0x2000000000ull) {
+            draw->AddImage(start);
+        }
+    };
     const auto buffer = [&](u64 object) {
         NativeRegistry::Observe(object, Kind::Buffer);
         if (draw != nullptr && object != 0) {
             NativeRegistry::CollectResource(*draw, object);
+            add_vsharp(object + 0x60);
         }
     };
     const auto view = [&](u64 object, Kind kind) {
@@ -224,12 +249,22 @@ void ObserveContext(u64 ctx, NativeRegistry::DrawResources* draw) {
             NativeRegistry::Observe(object, own);
             if (draw != nullptr) {
                 NativeRegistry::CollectResource(*draw, object);
+                if (tag == 21) {
+                    add_vsharp(object + 0x60);
+                }
             }
             return;
         }
         NativeRegistry::Observe(object, kind);
         if (draw != nullptr) {
             NativeRegistry::CollectResource(*draw, Obj(Rd<u64>(object, 0x30)));
+            const u32 view_kind = Rd<u32>(object, 0x44);
+            const bool is_buffer = view_kind == 1 || view_kind == 0xb;
+            if (kind == Kind::UnorderedAccessView) {
+                is_buffer ? add_vsharp(object + 0x74) : add_tsharp(object + 0x54);
+            } else if (kind == Kind::ShaderResourceView) {
+                is_buffer ? add_vsharp(object + 0x78) : add_tsharp(object + 0x58);
+            }
         }
     };
     const auto Observe = [&](u64 object, Kind kind) {
@@ -243,6 +278,46 @@ void ObserveContext(u64 ctx, NativeRegistry::DrawResources* draw) {
     };
     const u64 vs = Rd<u64>(ctx, Ctx::VertexShader);
     const u64 ps = Rd<u64>(ctx, Ctx::PixelShader);
+    if (draw != nullptr && vs != 0 && ps != 0) {
+        const u64 vs_gnm = Rd<u64>(vs, 0x120), ps_gnm = Rd<u64>(ps, 0x120);
+        draw->vs_object_entries = vs_gnm != 0 ? Rd<u8>(vs_gnm, 3) : 0xffff;
+        draw->ps_object_entries = ps_gnm != 0 ? Rd<u8>(ps_gnm, 3) : 0xffff;
+        draw->vs_object_pgm = static_cast<u32>(Rd<u64>(vs, 0x30 + 0x38));
+    }
+    if (draw != nullptr) {
+        draw->special = (vs != 0 && Rd<u64>(vs, 0x420) != 0 ? 1u : 0u) | (Rd<u64>(ctx, 0x4680) != 0 ? 2u : 0u) | (Rd<u64>(ctx, 0x4688) != 0 ? 4u : 0u) | (Rd<u32>(ctx, 0x130c8) == 0x200 ? 8u : 0u);
+    }
+    {
+        // user shader resource tables (PrepareDraw: vertex shader flag +0xd6, size +0xd8, table ctx + 0x13068, capacity ctx + 0x13088 * 2; pixel shader flag +0x106,
+        // size +0x108, table ctx + 0x13040, capacity ctx + 0x13060 * 2): a probe of the first draws with such a shader
+        static std::atomic<u32> probes{0};
+        if (vs != 0 && ps != 0 && probes.load(std::memory_order_relaxed) < 6 && (Rd<u8>(vs, 0xd6) != 0 || Rd<u8>(ps, 0x106) != 0) && probes.fetch_add(1) < 6) {
+            std::string text = fmt::format("vs {:#x} srt_flag {} srt_dwords {} cap {} | ps {:#x} srt_flag {} srt_dwords {} cap {} | ctx table 0x13040:", vs, Rd<u8>(vs, 0xd6),
+                                           Rd<u32>(vs, 0xd8), Rd<u32>(ctx, 0x13088) * 2, ps, Rd<u8>(ps, 0x106), Rd<u32>(ps, 0x108), Rd<u32>(ctx, 0x13060) * 2);
+            for (u32 i = 0; i < 48; ++i) {
+                text += fmt::format(" {:x}", Rd<u32>(ctx, 0x13040 + i * 4));
+            }
+            NativeRegistry::NoteDebug(text);
+        }
+    }
+    {
+        // the shaders' input usage tables (GNM shader header at shader + 0x120: count at +3, entries of 4 bytes from +0x3c: usage type, API slot, start register, flags):
+        // the engine's own description of how the user data registers map to resources. Once per shader.
+        static std::mutex mutex;
+        static std::unordered_set<u64> seen;
+        std::scoped_lock lock{mutex};
+        for (const u64 shader : {vs, ps}) {
+            if (shader != 0 && seen.size() < 400 && seen.insert(shader).second && shader == vs && Rd<u8>(Rd<u64>(shader, 0x120), 3) >= 5) {
+                const u64 gnm = Rd<u64>(shader, 0x120);
+                std::string text = fmt::format("{} {:#x} id {} variant420 {:#x} gnm {:#x} usage table:", shader == vs ? "vs" : "ps", shader, Rd<u64>(shader, 0x10), Rd<u64>(shader, 0x420), gnm);
+                for (u32 k = 0; gnm != 0 && k < Rd<u8>(gnm, 3) && k < 40; ++k) {
+                    const u64 e = gnm + (shader == vs ? 0x28 : 0x3c) + k * 4;
+                    text += fmt::format(" <{} s{} r{} f{}>", Rd<u8>(e, 0), Rd<u8>(e, 1), Rd<u8>(e, 2), Rd<u8>(e, 3));
+                }
+                NativeRegistry::NoteDebug(text);
+            }
+        }
+    }
     Observe(Obj(vs), Kind::VertexShader);
     Observe(Obj(ps), Kind::PixelShader);
     Observe(Obj(Rd<u64>(ctx, Ctx::InputLayout)), Kind::InputLayout);
@@ -255,6 +330,45 @@ void ObserveContext(u64 ctx, NativeRegistry::DrawResources* draw) {
         const u64 shader = Obj(shaders[stage]);
         if (!shader) {
             continue;
+        }
+        // The shader's input usage table is the engine's list of what it takes from the context (immediate resource / sampler / constant buffer slots, and
+        // pointers to whole tables): walk it, not only the used-slot masks.
+        if (const u64 gnm = Obj(Rd<u64>(shader, 0x120)); gnm != 0) {
+            const u32 count = Rd<u8>(gnm, 3);
+            const u32 inputs_offset = stage == 0 ? 0x28 : 0x3c;
+            for (u32 i = 0; i < count && i < 40; ++i) {
+                const u64 e = gnm + inputs_offset + i * 4;
+                const u32 type = Rd<u8>(e, 0);
+                const u32 slot = Rd<u8>(e, 1);
+                switch (type) {
+                case 0:
+                    Observe(Obj(Rd<u64>(ctx, Ctx::ShaderResourceTable(stage) + slot * 8)), Kind::ShaderResourceView);
+                    break;
+                case 1:
+                    Observe(Obj(Rd<u64>(ctx, Ctx::SamplerTable(stage) + slot * 8)), Kind::SamplerState);
+                    break;
+                case 2:
+                    Observe(Obj(Rd<u64>(ctx, Ctx::ConstantBufferTable(stage) + slot * 8)), Kind::Buffer);
+                    break;
+                case 19: // pointer to the resource table: every non-empty slot
+                    for (u32 s = 0; s < 128; ++s) {
+                        Observe(Obj(Rd<u64>(ctx, Ctx::ShaderResourceTable(stage) + s * 8)), Kind::ShaderResourceView);
+                    }
+                    break;
+                case 21:
+                    for (u32 s = 0; s < 16; ++s) {
+                        Observe(Obj(Rd<u64>(ctx, Ctx::SamplerTable(stage) + s * 8)), Kind::SamplerState);
+                    }
+                    break;
+                case 22:
+                    for (u32 s = 0; s < 16; ++s) {
+                        Observe(Obj(Rd<u64>(ctx, Ctx::ConstantBufferTable(stage) + s * 8)), Kind::Buffer);
+                    }
+                    break;
+                default:
+                    break;
+                }
+            }
         }
         const u32 cb_mask = Rd<u32>(shader, Shader::CbMask) & 0xffff;
         for (u32 slot = 0; slot < 16; ++slot) {
@@ -284,6 +398,23 @@ void ObserveContext(u64 ctx, NativeRegistry::DrawResources* draw) {
     Observe(Obj(Rd<u64>(ctx, Ctx::BlendState)), Kind::BlendState);
     Observe(Obj(Rd<u64>(ctx, Ctx::RasterizerState)), Kind::RasterizerState);
     Observe(Obj(Rd<u64>(ctx, Ctx::DepthStencilState)), Kind::DepthStencilState);
+    if (draw != nullptr) {
+        // diagnostics: every buffer the context holds in a constant buffer slot of any API stage, and the buffer-class objects in the shader resource tables
+        for (u32 stage = 0; stage < 6; ++stage) {
+            for (u32 slot = 0; slot < 16; ++slot) {
+                if (const u64 object = Obj(Rd<u64>(ctx, Ctx::ConstantBufferTable(stage) + slot * 8)); object != 0) {
+                    NativeRegistry::CollectOtherBuffer(*draw, object, stage * 16 + slot);
+                }
+            }
+        }
+        for (u32 stage = 0; stage < 2; ++stage) {
+            for (u32 slot = 0; slot < 128; ++slot) {
+                if (const u64 object = Obj(Rd<u64>(ctx, Ctx::ShaderResourceTable(stage) + slot * 8)); object != 0 && Rd<u32>(object, 0x18) == 21) {
+                    NativeRegistry::CollectOtherBuffer(*draw, object, 0x100 + stage * 128 + slot);
+                }
+            }
+        }
+    }
 }
 
 /// Native registry (shadow mode): the compute stage of the device context (shader at +0x4670, API stage 5 tables, views at +0x1980 / +0x2098).
@@ -1056,7 +1187,28 @@ thread_local std::array<u64, 2> synth_desc_key;
 
 /// The descriptor fields a stage specialization compares (kind 1 buffer V#, 2 image T#, 3 sampler S#, 0 no object in the slot), without addresses and sizes:
 /// a running key of the stage's descriptors in the order the record builder reads them.
+thread_local NativeRegistry::DrawResources* v2_collect = nullptr; ///< the draw whose record is being built (native registry description)
+
 void NoteDescriptor(u32 stage, u32 kind, const u32* d) {
+    if (v2_collect != nullptr) {
+        ++v2_collect->note_calls;
+    }
+    if (v2_collect != nullptr && d != nullptr) {
+        // every descriptor the record builder emits is what a shader of the draw will see: the buffer range of a V#, the image start of a T#
+        if (kind == 1) {
+            const u64 stride = (d[1] >> 16) & 0x3fff;
+            const u64 begin = u64{d[0]} | (u64{d[1] & 0xfff} << 32);
+            const u64 bytes = stride != 0 ? stride * d[2] : d[2];
+            if (begin > 0x1000000000ull && begin < 0x2000000000ull && bytes != 0 && bytes <= (1ull << 31)) {
+                v2_collect->AddBuffer(begin, begin + bytes);
+            }
+        } else if (kind == 2) {
+            const u64 start = (u64{d[0]} | (u64{d[1] & 0xff} << 32)) << 8;
+            if (start > 0x1000000000ull && start < 0x2000000000ull) {
+                v2_collect->AddImage(start);
+            }
+        }
+    }
     if (stage > 1) {
         return;
     }
@@ -3403,6 +3555,40 @@ u32 RecordDrawCount(u64 seq) {
     return slot.seq.load(std::memory_order_acquire) == seq ? count : 0xffffffffu;
 }
 
+u32 RecordUserData(u64 seq, u32* vs, u32* ps) {
+    auto& slot = Slot(seq);
+    if (slot.seq.load(std::memory_order_acquire) != seq) {
+        return 0xffffffffu;
+    }
+    u32 vs_mask = 0, ps_mask = 0;
+    for (u32 i = 0; i < slot.count; ++i) {
+        const u32 index = slot.regs[i].index;
+        if (index - VsUserDataRegister < 16) {
+            vs[index - VsUserDataRegister] = slot.regs[i].value;
+            vs_mask |= 1u << (index - VsUserDataRegister);
+        } else if (index - PsUserDataRegister < 16) {
+            ps[index - PsUserDataRegister] = slot.regs[i].value;
+            ps_mask |= 1u << (index - PsUserDataRegister);
+        }
+    }
+    return vs_mask | (ps_mask << 16);
+}
+
+u32 RecordRegisterWith(u64 seq, u32 value, u32* count) {
+    auto& slot = Slot(seq);
+    if (slot.seq.load(std::memory_order_acquire) != seq) {
+        *count = 0;
+        return 0xfffffffeu;
+    }
+    *count = slot.count;
+    for (u32 i = 0; i < slot.count; ++i) {
+        if (slot.regs[i].value == value) {
+            return slot.regs[i].index;
+        }
+    }
+    return 0xffffffffu;
+}
+
 u64 RecordCaller(u64 seq) {
     auto& slot = Slot(seq);
     return slot.seq.load(std::memory_order_acquire) == seq ? slot.caller : 0;
@@ -3442,6 +3628,7 @@ const std::array<u8, 65536>& GroupTable() {
 } // namespace
 
 bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed) {
+    out.seq = seq;
     NoteConsumed(seq);
     auto& slot = Slot(seq);
     if (slot.seq.load(std::memory_order_acquire) != seq) {
@@ -4198,10 +4385,11 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
         v2 = &draw_resources;
         Guarded([&] { ObserveContext(ctx, v2); return u64{0}; });
         static std::atomic<u32> scan_counter{0};
-        if (const u32 n = scan_counter.fetch_add(1, std::memory_order_relaxed); n < 40000 || n % 64 == 0) {
-            // which slots of the device context hold a Js resource, and which of those the description above did not collect (marked with bit 31 of the offset)
+        if (const u32 n = scan_counter.fetch_add(1, std::memory_order_relaxed); n % 16 == 0) {
+            // which slots of the device context hold a Js resource, and which of those the description above did not collect (marked with bit 31 of the offset);
+            // only the ones the description missed are counted (the byte width of buffers is part of the key)
             Guarded([&] {
-                for (u32 offset = 0; offset < 0x4800; offset += 8) {
+                for (u32 offset = 0; offset < 0x13200; offset += 8) {
                     const u64 pointer = Obj(Rd<u64>(ctx, offset));
                     if (pointer > 0x10000) {
                         if (const u32 kind = Rd<u32>(pointer, 0x124); kind >= 1 && kind <= 4 && Rd<u64>(pointer, 0x30) > 0x100000000ull) {
@@ -4216,7 +4404,9 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
                                     collected = v2->images[i] == address;
                                 }
                             }
-                            NativeRegistry::NoteContextSlot(offset | (collected ? 0u : 0x80000000u), kind);
+                            if (!collected) {
+                                NativeRegistry::NoteContextSlot(offset | 0x80000000u, kind | (kind == 1 ? Rd<u32>(pointer, 0x180) << 8 : 0u));
+                            }
                         }
                     }
                 }
@@ -4240,7 +4430,9 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
     std::memcpy(&words[3], &k1, sizeof(u64));
     std::memcpy(&words[5], &k2, sizeof(u64));
     std::memcpy(&words[7], &k3, sizeof(u64));
+    v2_collect = v2;
     const u64 seq = policy.native_synth_verify.load(std::memory_order_relaxed) != 0 ? Guarded([&] { return MakeRecord(ctx, kind, a1, a2, a3, ret); }) : 0;
+    v2_collect = nullptr;
     if (seq != 0) {
         const auto& record = Slot(seq);
         std::array<StreamProbe::TableView, 8> views{};
@@ -6074,7 +6266,48 @@ u64 PS4_SYSV_ABI SkipWaitComputeDone(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u6
     return 1;
 }
 
+/// Constant update engine entry points of the engine's GNM layer (FUN_0249fe90 setConstantBuffer, FUN_0249fa60 setBuffer, FUN_0249f630 setTexture,
+/// FUN_024a0a10 user resource table): which call site gives a shader which resource (native registry, call census).
+template <u32 Kind>
+u64 PS4_SYSV_ABI CueCall(u64 cue, u64 stage, u64 slot, u64 descriptor, u64 a4, u64 a5, u64 ret) {
+    if (!NativeRegistry::enabled.load(std::memory_order_relaxed)) {
+        return 0;
+    }
+    Guarded([&] {
+        const u64 caller = ret - ImageBase() + 0x1000000;
+        if (Kind == 3) {
+            // (cue, stage, table pointer, dwords)
+            NativeRegistry::NoteCueCall(Kind, caller, static_cast<u32>(stage), 0, slot, descriptor);
+            return u64{0};
+        }
+        if (descriptor == 0) {
+            return u64{0};
+        }
+        const u32 d0 = Rd<u32>(descriptor, 0), d1 = Rd<u32>(descriptor, 4), d2 = Rd<u32>(descriptor, 8);
+        if (Kind == 2) {
+            NativeRegistry::NoteCueCall(Kind, caller, static_cast<u32>(stage), static_cast<u32>(slot), (u64{d0} | (u64{d1 & 0xff} << 32)) << 8, 0);
+        } else {
+            const u64 stride = (d1 >> 16) & 0x3fff;
+            NativeRegistry::NoteCueCall(Kind, caller, static_cast<u32>(stage), static_cast<u32>(slot), u64{d0} | (u64{d1 & 0xfff} << 32), stride != 0 ? stride * d2 : d2);
+        }
+        return u64{0};
+    });
+    return 0;
+}
+
 u64 FindHandler(const std::string& name) {
+    if (name == "cue_set_constant_buffer") {
+        return reinterpret_cast<u64>(&CueCall<0>);
+    }
+    if (name == "cue_set_buffer") {
+        return reinterpret_cast<u64>(&CueCall<1>);
+    }
+    if (name == "cue_set_texture") {
+        return reinterpret_cast<u64>(&CueCall<2>);
+    }
+    if (name == "cue_set_user_table") {
+        return reinterpret_cast<u64>(&CueCall<3>);
+    }
     if (name == "skip_wait_compute_done") {
         return reinterpret_cast<u64>(&SkipWaitComputeDone);
     }

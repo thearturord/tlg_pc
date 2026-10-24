@@ -56,6 +56,10 @@ struct DrawResources {
     u32 buffer_count{};
     u32 image_count{};
     u32 dropped{}; ///< entries that did not fit
+    u32 special{};    ///< 1 vertex shader has a variant object (+0x420), 2 / 4 context +0x4680 / +0x4688 set, 8 dispatch draw mode
+    u32 vs_object_entries{}, ps_object_entries{}; ///< input usage entries of the shaders the context holds
+    u32 vs_object_pgm{};
+    u32 note_calls{}; ///< descriptors the record builder emitted for this draw (vertex buffer, resource, constant buffer, sampler descriptors)
     struct Range {
         u64 begin, end;
     } buffers[MaxBuffers];
@@ -63,19 +67,54 @@ struct DrawResources {
 
     void AddBuffer(u64 begin, u64 end);
     void AddImage(u64 start);
+
+    /// Diagnostics for the attribution of unexplained requests: buffers the context holds in slots the shaders' usage tables do not name
+    /// (`where`: stage * 16 + slot of the constant buffer tables, 0x100 + stage * 128 + slot of the shader resource tables; +0x1000 for the
+    /// object's own V# when it points elsewhere).
+    static constexpr u32 MaxOthers = 48;
+    u32 other_count{};
+    struct Other {
+        u64 begin, end;
+        u32 where;
+    } others[MaxOthers];
+    void AddOther(u64 begin, u64 end, u32 where);
 };
+/// Adds the memory (and the V# range, when different) of a buffer object found in a context slot the description does not collect.
+void CollectOtherBuffer(DrawResources& draw, u64 object, u32 where);
 /// Reads the object (a Js resource) and adds its memory to the draw. Guarded by the caller.
 void CollectResource(DrawResources& draw, u64 object);
 void StoreDraw(const DrawResources& draw);
+/// The constant update engine of the engine's GNM layer was given a resource: kind 0 constant buffer, 1 buffer, 2 texture, 3 user resource table; `caller` is the
+/// Ghidra address of the call site. Counted per (kind, caller, stage, slot) for the report.
+void NoteCueCall(u32 kind, u64 caller, u32 stage, u32 slot, u64 address, u64 bytes);
+/// Diagnostics: a short text for the report (bounded).
+void NoteDebug(const std::string& text);
+/// Raster thread: the ranges the current draw's description holds (diagnostics).
+std::string DescribeCurrentDraw();
 /// Diagnostics: a device context pointer-sized slot at `offset` held a pointer to a Js resource (buffer / texture) that the known context tables do not
 /// explain; counted per offset and kind for the report.
 void NoteContextSlot(u32 offset, u32 resource_kind);
 /// Raster thread: the record sequence of the draw being bound (0 none).
-void SetCurrentDraw(u64 seq);
+void SetCurrentDraw(u64 seq, bool from_plan = false);
+u64 CurrentDrawSeq();
+/// True when the sequence number of the current draw is the one the plan was built from (an executed record), false when it is only the pending tag.
+bool CurrentDrawFromPlan();
+/// Number of draws set as current on this thread so far (diagnostics).
+u64 CurrentDrawCallIndex();
+/// True when [address, address + size) lies in a buffer the description of draw `seq` names.
+bool DrawDescribes(u64 seq, u64 address, u64 size);
+/// Aggregated for the report: an unexplained buffer request of the current draw, with where the shader got its descriptor: `sw_stage`, `summary` (0 the V# is
+/// read straight from the user data / the flattened table, 1 the shader fetches it from a table in memory), the flat user data offset of the V#, whether the
+/// record wrote those user data registers itself (`set_by_record`: 0 no, 1 yes, 2 not applicable), whether the table the shader fetches from is named by the description.
+void NoteUnexplainedSite(u32 sw_stage, u32 summary, u32 offset, u32 set_by_record, u32 table_described, u32 plan_matches_record);
+/// Command processor (front): a SET_SH_REG packet of the game's own command stream wrote `count` registers from SH register offset `reg_offset`. The user data windows of
+/// the vertex (0x4c..0x5b) and pixel (0x0c..0x1b) stage are decoded for buffer descriptors (the engine's pass code writes per-pass constants there directly).
+void NoteShPacket(u32 reg_offset, const u32* words, u32 count);
 
 /// The pass class of what the raster thread is binding for (0 z prepass / shadow, 1 g-buffer, 2 forward, 3 compute / other, 15 untagged).
 void SetDrawClass(u32 draw_class);
-void AuditBuffer(u64 address, u64 size, bool written);
+/// Returns true when the draw has a description and it does not explain this buffer.
+bool AuditBuffer(u64 address, u64 size, bool written);
 void AuditImage(u64 address);
 
 void Start();

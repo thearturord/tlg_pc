@@ -349,6 +349,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
         plan = std::make_unique<DrawPlan>();
     }
     plan->executed = executed;
+    plan->native_seq = 0;
     plan->op_class = is_operation ? static_cast<u8>(operation.kind) : u8{0xff};
     plan->depth_copy = operation.depth_copy;
     plan->stencil_copy = operation.stencil_copy;
@@ -495,6 +496,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u32
         plan = std::make_unique<DrawPlan>();
     }
     plan->executed = true;
+    plan->native_seq = draw.seq;
     plan->op_class = 0xff;
     plan->depth_copy = plan->stencil_copy = false;
     plan->fixed = native;
@@ -846,7 +848,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     // in the same command buffer.
     const VideoCore::NativeTag tag = std::exchange(native_tag, {});
     Core::NativeRegistry::SetDrawClass(tag.valid ? (tag.meta & 0xff) : 15);
-    Core::NativeRegistry::SetCurrentDraw(tag.valid ? tag.seq : 0);
+    Core::NativeRegistry::SetCurrentDraw(plan != nullptr && plan->native_seq != 0 ? plan->native_seq : (tag.valid ? tag.seq : 0), plan != nullptr && plan->native_seq != 0);
     const bool use_tag =
         tag.valid &&
         VideoCore::ReadbackPolicy::Get().native_draw_mode.load(std::memory_order_relaxed) >= 2;
@@ -936,6 +938,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
+
+    // audit context of this draw (class 4: indirect draws); without it the binds of this draw were compared with the previous normal draw
+    Core::NativeRegistry::SetDrawClass(4);
+    Core::NativeRegistry::SetCurrentDraw(plan != nullptr && plan->native_seq != 0 ? plan->native_seq : 0, plan != nullptr && plan->native_seq != 0);
 
     if (!FilterDraw(plan)) {
         return;
@@ -1074,6 +1080,8 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const DispatchPlan* plan) {
     RENDERER_TRACE;
+    Core::NativeRegistry::SetDrawClass(3);
+    Core::NativeRegistry::SetCurrentDraw(0);
 
     scheduler.PopPendingOperations();
 
@@ -1698,7 +1706,65 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
-                Core::NativeRegistry::AuditBuffer(vsharp.base_address, size, desc.is_written);
+                if (Core::NativeRegistry::AuditBuffer(vsharp.base_address, size, desc.is_written)) {
+                    {
+                        // where did the shader get this descriptor from, and did the record write the registers it sits in?
+                        thread_local u32 site_tick = 0;
+                        if ((site_tick++ & 3) == 0) {
+                            const u32 offset = desc.sharp_fetch.offsets[0];
+                            const u64 seq = Core::NativeRegistry::CurrentDrawSeq();
+                            u32 set_by_record = 2, table_described = 2;
+                            if (static_cast<u32>(desc.sharp_fetch.summary) != 0) {
+                                const auto flat = stage.FlatUserData();
+                                if (offset + 2 <= flat.size()) {
+                                    const u64 table = u64{flat[offset]} | (u64{flat[offset + 1] & 0xfff} << 32);
+                                    table_described = Core::NativeRegistry::DrawDescribes(seq, table, 1) ? 1 : 0;
+                                }
+                            } else if (offset < 16 && Core::NativeRegistry::CurrentDrawFromPlan()) {
+                                std::array<u32, 16> rvs{}, rps{};
+                                const u32 masks = Core::NativeDraw::RecordUserData(seq, rvs.data(), rps.data());
+                                const u32 mask = stage.sw_stage == Shader::SwStage::Fragment ? masks >> 16 : masks & 0xffff;
+                                set_by_record = (mask >> offset & 1) != 0 ? 1 : 0;
+                            }
+                            Core::NativeRegistry::NoteUnexplainedSite(static_cast<u32>(stage.sw_stage), static_cast<u32>(desc.sharp_fetch.summary) != 0 ? 1u : 0u, offset, set_by_record, table_described, 2);
+                        }
+                    }
+                    // the draw's description did not name this buffer: where did the shader's descriptor come from (user data register, flattened table offset)?
+                    static std::atomic<u64> details{0};
+                    static std::atomic<u32> logged_details{0};
+                    if (details.fetch_add(1) % 60000 == 0 && logged_details.fetch_add(1) < 30) {
+                        std::string text = fmt::format("unexplained buffer {:#x}+{} stage {} pgm {:#x} plan_from_record {} index {} sharp_fetch summary {} load_mask {:#x} flat_size {} offsets:", vsharp.base_address,
+                                                       size, static_cast<u32>(stage.sw_stage), stage.pgm_hash, Core::NativeRegistry::CurrentDrawFromPlan(), buffer_index,
+                                                       static_cast<u32>(desc.sharp_fetch.summary), desc.sharp_fetch.load_mask, stage.FlatUserData().size());
+                        for (u32 k = 0; k < 4; ++k) {
+                            const u32 offset = desc.sharp_fetch.offsets[k];
+                            text += fmt::format(" {}:{:08x}", offset, offset < stage.FlatUserData().size() ? stage.FlatUserData()[offset] : 0u);
+                        }
+                        text += " user_data:";
+                        for (const u32 word : stage.UserData()) {
+                            text += fmt::format(" {:x}", word);
+                        }
+                        text += " flat:";
+                        for (const u32 word : stage.FlatUserData()) {
+                            text += fmt::format(" {:x}", word);
+                        }
+                        u32 record_registers = 0;
+                        const u32 at = Core::NativeDraw::RecordRegisterWith(Core::NativeRegistry::CurrentDrawSeq(), static_cast<u32>(vsharp.base_address), &record_registers);
+                        text += fmt::format(" | record has base word at register {:#x} of {}", at, record_registers);
+                        std::array<u32, 16> rvs{}, rps{};
+                        const u32 masks = Core::NativeDraw::RecordUserData(Core::NativeRegistry::CurrentDrawSeq(), rvs.data(), rps.data());
+                        text += fmt::format(" | record user data masks vs {:#x} ps {:#x}: vs", masks & 0xffff, masks >> 16);
+                        for (const u32 word : rvs) {
+                            text += fmt::format(" {:x}", word);
+                        }
+                        text += " ps";
+                        for (const u32 word : rps) {
+                            text += fmt::format(" {:x}", word);
+                        }
+                        text += " | " + Core::NativeRegistry::DescribeCurrentDraw();
+                        Core::NativeRegistry::NoteDebug(text);
+                    }
+                }
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {

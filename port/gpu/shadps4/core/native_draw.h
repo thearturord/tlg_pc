@@ -122,6 +122,7 @@ struct ExecRegister {
 /// draw arguments.
 struct ExecDraw {
     static constexpr u32 MaxRegisters = 320;
+    u64 seq{}; ///< the record this draw was taken from (diagnostics: the native registry audit)
     std::array<ExecRegister, MaxRegisters> regs;
     u32 count{};
     /// The first `grouped` registers are stored by group (group g is regs[group_begin[g]] to regs[group_begin[g + 1]]), the rest always applies.
@@ -223,6 +224,10 @@ u64 ShadowExtraByKind(u32 kind);
 
 /// The Ghidra address of the call that made record `seq` (0 when the record is gone).
 u64 RecordCaller(u64 seq);
+/// Diagnostics: the index of the first register of the record with this value (0xffffffff none) and the number of registers the record carries in `count`.
+u32 RecordRegisterWith(u64 seq, u32 value, u32* count);
+/// Diagnostics: the vertex / pixel user data registers the record writes (values in `vs` / `ps`), returned as masks vs | ps << 16 (0xffffffff: record gone).
+u32 RecordUserData(u64 seq, u32* vs, u32* ps);
 
 /// Command processor: the record of a draw the hook executed natively. False when the record was overwritten.
 bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed = false);

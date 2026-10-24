@@ -5,6 +5,7 @@
 
 #include "core/stream_probe.h"
 #include "core/frame_timeline.h"
+#include "core/native_registry.h"
 #include "core/resource_audit.h"
 #include "common/arch.h"
 #ifdef ARCH_X86_64
@@ -2875,6 +2876,7 @@ void Liverpool::ExecuteSetShReg(const PM4Header* header) {
     } else {
         std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset], header + 2, set_size);
         MirrorRegs(Regs::ShRegWordOffset + set_data->reg_offset, set_size / sizeof(u32));
+        Core::NativeRegistry::NoteShPacket(set_data->reg_offset, reinterpret_cast<const u32*>(header + 2), static_cast<u32>(set_size / sizeof(u32)));
     }
 }
 

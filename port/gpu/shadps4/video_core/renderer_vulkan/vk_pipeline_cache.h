@@ -122,6 +122,7 @@ struct DrawPlan {
     AmdGpu::CbDbExtent db_extent{};
     std::array<StagePlan, MaxShaderStages> stages{};
     u64 ring_end{}; ///< T1: the constant ring position after this plan's copies
+    u64 native_seq{}; ///< the record the plan was made from (0: planned from the registers); diagnostics
 };
 
 struct DispatchPlan {
