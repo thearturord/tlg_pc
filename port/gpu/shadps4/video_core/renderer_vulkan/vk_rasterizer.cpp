@@ -532,9 +532,9 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u32
     if (index_count != ~0u) {
         plan->inputs.num_indices = index_count; // an inline draw: the count comes with the draw packet
     }
-    // the constant ring (levels 1 and up) and the verify mode read the flat user data of the plan
+    // the verify mode reads the flat user data of the plan; the constant ring takes the V#s of a stage without it from the record's bindings (N3d)
     const u32 binder_mode = NativeBinderMode();
-    const bool skip_flat = (binder_mode == 1 || binder_mode == 2) && const_ring_level == 0 && draw.bindings_complete && (binder_mode == 2 || draw_class == 0);
+    const bool skip_flat = (binder_mode == 1 || binder_mode == 2) && draw.bindings_complete && (binder_mode == 2 || draw_class == 0);
     if (!pipeline_cache.PlanGraphicsTyped(exec_key, plan->fixed, vertex_user_data, pixel_user_data, *plan, skip_flat ? &draw : nullptr)) {
         RecyclePlan(std::move(plan));
         return nullptr;
@@ -2574,6 +2574,25 @@ struct PlanStageView {
         return base;
     }
 };
+
+/// N3d: the V# of a buffer of a planned stage. A stage planned without flat user data takes it from the record's bindings of the plan (the binder's source); a
+/// descriptor built from immediates needs no flat data at all.
+template <class Desc>
+AmdGpu::Buffer PlanBufferSharp(const DrawPlan* owner, const StagePlan& stage, const Desc& desc, const PlanStageView& view) {
+    if (owner == nullptr || !stage.flat_skipped || desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
+        return desc.GetSharp(view);
+    }
+    const u32 s = stage.info->sw_stage == Shader::SwStage::Vertex ? 0 : stage.info->sw_stage == Shader::SwStage::Fragment ? 1 : 2;
+    const u32 offset = desc.sharp_fetch.offsets[0];
+    for (u32 i = 0; s <= 1 && i < owner->binding_count; ++i) {
+        const auto& b = owner->bindings[i];
+        if (b.stage == s && b.kind == 1 && offset >= b.offset && offset + 4 <= u32{b.offset} + b.dwords) {
+            return desc.FromWords(b.words + (offset - b.offset), view);
+        }
+    }
+    Core::NativeRegistry::NoteBinder(6); // must not happen: the cover test of the plan promised a binding
+    return AmdGpu::Buffer::Null();
+}
 } // namespace
 
 void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size, u64 position) {
@@ -2605,7 +2624,7 @@ bool Rasterizer::PendingGpuWriteOverlaps(VAddr address, u64 size, u64 done) {
     return false;
 }
 
-void Rasterizer::FrontStageNotes(StagePlan& stage, u64 position) {
+void Rasterizer::FrontStageNotes(StagePlan& stage, u64 position, const DrawPlan* owner) {
     stage.ring.clear();
     if (!stage.info) {
         return;
@@ -2615,7 +2634,7 @@ void Rasterizer::FrontStageNotes(StagePlan& stage, u64 position) {
         if (desc.IsSpecial() || !desc.is_written) {
             continue;
         }
-        const auto vsharp = desc.GetSharp(view);
+        const auto vsharp = PlanBufferSharp(owner, stage, desc, view);
         if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
             continue;
         }
@@ -2624,7 +2643,7 @@ void Rasterizer::FrontStageNotes(StagePlan& stage, u64 position) {
     }
 }
 
-void Rasterizer::FrontStageRing(StagePlan& stage, u64 done) {
+void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owner) {
     if (!stage.info) {
         return;
     }
@@ -2658,7 +2677,7 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done) {
             ring_formatted.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        const auto vsharp = desc.GetSharp(view);
+        const auto vsharp = PlanBufferSharp(owner, stage, desc, view);
         const VAddr address = vsharp.base_address;
         const u64 size = vsharp.GetSize();
         if (address == 0 || size == 0) {
@@ -2703,21 +2722,21 @@ void Rasterizer::FrontQueueOp(DrawPlan* draw, DispatchPlan* dispatch, u64 positi
     // First everything the plan writes (a read-only binding of the same plan may alias a written one), then the copies.
     if (draw) {
         for (auto& stage : draw->stages) {
-            FrontStageNotes(stage, position);
+            FrontStageNotes(stage, position, draw);
         }
     } else {
-        FrontStageNotes(dispatch->stage, position);
+        FrontStageNotes(dispatch->stage, position, nullptr);
     }
     if (const_ring_level < 3 || !constant_ring) {
         return;
     }
     if (draw) {
         for (auto& stage : draw->stages) {
-            FrontStageRing(stage, done);
+            FrontStageRing(stage, done, draw);
         }
         draw->ring_end = constant_ring->Position();
     } else {
-        FrontStageRing(dispatch->stage, done);
+        FrontStageRing(dispatch->stage, done, nullptr);
         dispatch->ring_end = constant_ring->Position();
     }
 }

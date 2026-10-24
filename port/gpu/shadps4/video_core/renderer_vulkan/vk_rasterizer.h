@@ -264,8 +264,9 @@ private:
     void NotePendingGpuWrite(VAddr address, u64 size, u64 position);
     bool PendingGpuWriteOverlaps(VAddr address, u64 size, u64 done);
     /// The buffers of one stage: notes the written ones (`position`), and from level 3 copies the small read-only ones into the ring.
-    void FrontStageNotes(StagePlan& stage, u64 position);
-    void FrontStageRing(StagePlan& stage, u64 done);
+    /// `owner`: the draw plan the stage belongs to (null for a dispatch); its record bindings give the V#s of a stage planned without flat user data (N3d).
+    void FrontStageNotes(StagePlan& stage, u64 position, const DrawPlan* owner);
+    void FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owner);
     // Raster thread:
     const DrawPlan* ring_draw = nullptr;
     const DispatchPlan* ring_dispatch = nullptr;
