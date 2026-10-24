@@ -5517,11 +5517,15 @@ u64 PS4_SYSV_ABI LightWrites(u64 object, u64 source, u64 a2, u64 a3, u64 a4, u64
 /// N5b: `RenderDev::BeginRecording(this)` fills two small dynamic buffers directly (no Map) once per frame: the buffer at this + 0x2830 (28,672 bytes: 256 records of 0x70)
 /// and the buffer at this + 0x26e0 (4,096 bytes: 128 records of 32), from the arrays of the frame data (the loops at 0x1c4b13e and 0x1c49a7b). Both are announced whole
 /// (the buffers are small); the size is the buffer's ByteWidth (description at +0x180).
+void InstallUnmapSlot();
+
 u64 PS4_SYSV_ABI RecordingWrites(u64 device, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
     (void)a1, (void)a2, (void)a3, (void)a4, (void)a5, (void)ret, (void)caller_rsp;
     if (!Core::NativeUpdates::enabled.load(std::memory_order_relaxed) || !IsHeapPointer(device)) {
         return 0;
     }
+    Core::NativeUpdates::NoteRenderThread();
+    InstallUnmapSlot();
     Guarded([&]() -> u64 {
         for (const u64 field : {u64{0x2830}, u64{0x26e0}}) {
             const u64 buffer = Rd<u64>(device, field);
@@ -5535,6 +5539,51 @@ u64 PS4_SYSV_ABI RecordingWrites(u64 device, u64 a1, u64 a2, u64 a3, u64 a4, u64
     return 0;
 }
 
+/// N5c: `JsDeviceContext::Unmap(context, resource, subresource)` is an empty function in the engine (one `ret`, `0x2480f80`) that cannot be displaced by a hook. Its slot
+/// in the device context's table (`0x26fe200`) is replaced by this function (installed once, when the first Map is seen, after the image is relocated): it tells the
+/// update audit that the writes into the memory the thread's Map of this resource handed out are finished.
+u64 PS4_SYSV_ABI UnmapSlot(u64 ctx, u64 resource, u64 subresource) {
+    (void)ctx, (void)subresource;
+    if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && IsHeapPointer(resource) && (resource & 7) == 0) {
+        Guarded([&]() -> u64 {
+            if (Rd<u32>(resource, 0x124) == 1) {
+                Core::NativeUpdates::NoteUnmap(Rd<u64>(resource, 0x10));
+            }
+            return 0;
+        });
+    }
+    return 0;
+}
+
+void InstallUnmapSlot() {
+    static std::atomic<bool> done{false};
+    if (done.exchange(true)) {
+        return;
+    }
+    const VAddr base = ImageBase();
+    if (base == 0) {
+        done.store(false);
+        return;
+    }
+    auto* slot = reinterpret_cast<u64*>(base + 0x26fe200 - 0x1000000);
+    if (*slot != base + 0x2480f80 - 0x1000000) {
+        LOG_ERROR(Core, "native updates: the Unmap slot holds {:#x}, expected {:#x}: not installed", *slot, base + 0x2480f80 - 0x1000000);
+        return;
+    }
+#ifdef _WIN32
+    DWORD old_protect = 0;
+    if (!VirtualProtect(slot, sizeof(u64), PAGE_READWRITE, &old_protect)) { // the table is read only after relocation
+        LOG_ERROR(Core, "native updates: cannot make the Unmap slot writable");
+        return;
+    }
+    *slot = reinterpret_cast<u64>(&UnmapSlot);
+    VirtualProtect(slot, sizeof(u64), old_protect, &old_protect);
+#else
+    *slot = reinterpret_cast<u64>(&UnmapSlot);
+#endif
+    LOG_INFO(Core, "native updates: the Unmap slot of the device context is replaced");
+}
+
 u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4, u64 size, u64 ret, u64 caller_rsp) {
     if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && ctx != 0 && IsHeapPointer(resource) && (resource & 7) == 0 && Rd<u32>(resource, 0x124) == 1) {
         // N5a: a Map of a buffer is announced to the update audit; the game's function runs here and its result is returned
@@ -5543,7 +5592,7 @@ u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4
         if (original_map != 0 && out_map != 0 && (out_map & 7) == 0) {
             const u64 result = reinterpret_cast<GuestMap7>(original_map)(ctx, resource, subresource, type, a4, size, out_map);
             Core::NativeUpdates::NoteMap(Rd<u64>(resource, 0x10), Core::NativeResources::ResourceUsage(resource), static_cast<u32>(type), Rd<u64>(out_map, 0),
-                                         Rd<u32>(out_map, 8), Rd<u64>(resource, 0x30), ret);
+                                         Rd<u32>(out_map, 8), Rd<u64>(resource, 0x30), ret, size);
             return 0x8000000000000000ull | (result & 0x7fffffffffffffffull);
         }
     }
@@ -7097,6 +7146,10 @@ VAddr ImageBase() {
 
 void SetImageBase(VAddr base) {
     image_base.store(base, std::memory_order_relaxed);
+}
+
+u64 NextSeq() {
+    return next_seq.load(std::memory_order_acquire);
 }
 
 } // namespace Core::NativeDraw

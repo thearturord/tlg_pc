@@ -14,14 +14,18 @@
 #endif
 #include <nlohmann/json.hpp>
 #include "core/guest_hooks.h"
+#include "core/native_draw.h"
 #include "core/native_resources.h"
+#include "core/native_uploads.h"
 #include "core/native_updates.h"
 
 namespace Core::NativeUpdates {
 
 std::atomic<bool> enabled{[] {
     const char* e = std::getenv("TLG_UPDATE_AUDIT");
-    return e != nullptr && *e != 0 && *e != '0';
+    const char* u = std::getenv("TLG_NATIVE_UPLOADS");
+    // the announcements are also what the native uploads are made of
+    return (e != nullptr && *e != 0 && *e != '0') || (u != nullptr && *u != 0 && *u != '0');
 }()};
 
 namespace {
@@ -43,6 +47,28 @@ struct Window {
 std::mutex mutex;
 std::array<Window, WindowCount> windows{};
 u64 window_count = 0;
+
+/// Which thread announces: the thread of `RenderDev::BeginRecording` (the render thread, where the frame's commands are recorded) or another one. Per announcer 0..7;
+/// 0 is a Map. Threads other than the render thread are numbered in the order they first announce.
+std::atomic<u64> render_thread{0};
+std::array<std::atomic<u64>, 8> announced_on_render_thread{}, announced_elsewhere{};
+std::mutex thread_mutex;
+std::map<u64, u32> other_threads;                                    ///< thread key -> number
+std::array<std::array<std::atomic<u64>, 8>, 8> other_thread_counts{}; ///< [announcer][thread number], 8 threads at most
+void NoteAnnouncerThread(u32 writer) {
+    const u64 thread = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    const u64 render = render_thread.load(std::memory_order_relaxed);
+    if (render != 0 && thread == render) {
+        announced_on_render_thread[writer & 7].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    announced_elsewhere[writer & 7].fetch_add(1, std::memory_order_relaxed);
+    std::scoped_lock lock{thread_mutex};
+    const auto [it, added] = other_threads.try_emplace(thread, static_cast<u32>(other_threads.size()));
+    if (it->second < 8) {
+        other_thread_counts[writer & 7][it->second].fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
 struct MapCounters {
     std::array<std::atomic<u64>, 8> by_type{};   ///< D3D11 map type 1..5 (0 and 6, 7 other)
@@ -79,6 +105,7 @@ struct SiteKey {
         return std::tie(rip, st0, st1) < std::tie(o.rip, o.st0, o.st1);
     }
 };
+std::map<SiteKey, Site> map_sites; ///< the writers that fill the memory a Map handed out (faults inside a Map window of the same thread)
 std::map<SiteKey, Site> uncovered_sites; ///< by faulting instruction and the first two stack words (the caller of a leaf function such as memcpy)
 
 /// Faults that come without a faulting instruction are explicit invalidations (the runtime reports a protection change or a system call write): where from?
@@ -101,30 +128,81 @@ u64 ThreadKey() {
 
 } // namespace
 
+namespace {
+struct OpenMap {
+    u64 address{}, size{};
+};
+std::mutex open_map_mutex;
+std::map<std::pair<u64, u64>, OpenMap> open_maps; ///< (thread, resource id) -> the window of the Map that has not been unmapped yet
+} // namespace
+
+void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread);
+
+void NoteRenderThread() {
+    render_thread.store(std::hash<std::thread::id>{}(std::this_thread::get_id()), std::memory_order_relaxed);
+    // a Map that was never unmapped (the engine keeps some pointers for the whole frame): its window is announced at the next frame start, for the thread that mapped it
+    std::vector<std::pair<u64, OpenMap>> stale;
+    {
+        std::scoped_lock lock{open_map_mutex};
+        for (const auto& [key, map] : open_maps) {
+            stale.emplace_back(key.first, map);
+        }
+        open_maps.clear();
+    }
+    for (const auto& [thread, map] : stale) {
+        NoteWriterRangeOf(0, map.address, map.size, thread);
+    }
+    NativeUploads::PublishPending(NativeDraw::NextSeq());
+}
+
 void Start() {
     enabled.store(true, std::memory_order_relaxed);
 }
 
-void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u64 memory, u64 caller) {
+
+void NoteUnmap(u64 resource_id) {
+    OpenMap map;
+    {
+        std::scoped_lock lock{open_map_mutex};
+        const auto it = open_maps.find({ThreadKey(), resource_id});
+        if (it == open_maps.end()) {
+            return;
+        }
+        map = it->second;
+        open_maps.erase(it);
+    }
+    NoteWriterRange(0, map.address, map.size);
+}
+
+void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u64 memory, u64 caller, u64 requested_size) {
     (void)caller;
+    NoteAnnouncerThread(0);
     maps.total.fetch_add(1, std::memory_order_relaxed);
     maps.by_type[map_type < 8 ? map_type : 7].fetch_add(1, std::memory_order_relaxed);
     maps.by_usage[usage < 4 ? usage : 3].fetch_add(1, std::memory_order_relaxed);
     const bool in_ring = address != memory;
     (in_ring ? maps.in_ring : maps.own_memory).fetch_add(1, std::memory_order_relaxed);
-    if (address == 0 || size == 0) {
+    if (address == 0 || size == 0 || map_type == 1) {
         return;
     }
-    std::scoped_lock lock{mutex};
-    windows[window_count++ % WindowCount] = {address, address + size, resource_id, NowNs(), ThreadKey(), usage, map_type, in_ring};
+    // the written part: the requested size when the caller gave one, else everything the Map handed out; it is announced when the thread unmaps the resource
+    const u64 written = requested_size != 0 && requested_size < size ? requested_size : size;
+    std::scoped_lock lock{open_map_mutex};
+    open_maps[{ThreadKey(), resource_id}] = {address, written};
+    (void)usage, (void)in_ring;
 }
 
 void NoteWriterRange(u32 writer, u64 address, u64 size) {
+    NoteWriterRangeOf(writer, address, size, ThreadKey());
+}
+
+void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread) {
     if (address == 0 || size == 0) {
         return;
     }
+    NoteAnnouncerThread(writer);
+    NativeUploads::Announce(writer, address, size, thread == render_thread.load(std::memory_order_relaxed), NativeDraw::NextSeq());
     const u64 now = NowNs();
-    const u64 thread = ThreadKey();
     std::scoped_lock lock{mutex};
     windows[window_count++ % WindowCount] = {address, address + size, 0, now, thread, 0, 0, false, writer};
     // faults of this thread inside the range that came first (the writer announces after it wrote) are covered by it
@@ -198,6 +276,13 @@ void NoteFault(u64 address, u64 size) {
             entry.bytes += size;
 #endif
         }
+        if (kind == Kind::Now && writer == 0) {
+            Site& site = map_sites[{GuestHooks::FaultRip(), GuestHooks::FaultStack(0), GuestHooks::FaultStack(1)}];
+            if (site.count++ == 0) {
+                site.sample_address = address;
+                site.usage_class = usage_class;
+            }
+        }
         if (kind == Kind::None) {
             pending[pending_count++ % pending.size()] = {address, size, now, thread, usage_class, GuestHooks::FaultRip(), GuestHooks::FaultStack(0), GuestHooks::FaultStack(1)};
             Site& site = uncovered_sites[{GuestHooks::FaultRip(), GuestHooks::FaultStack(0), GuestHooks::FaultStack(1)}];
@@ -242,6 +327,21 @@ nlohmann::json Report() {
     for (u32 i = 0; i < 4; ++i) {
         if (const u64 n = maps.by_usage[i].load()) {
             m["by_buffer_usage"][usage_names[i]] = n;
+        }
+    }
+    {
+        constexpr const char* names[8] = {"map", "skinning", "light_constants", "command_stream_copy", "begin_recording", "buffer_creation", "texture_initialization", "7"};
+        auto& t = j["announcements_by_thread"] = nlohmann::json::object();
+        t["render_thread_key"] = render_thread.load();
+        for (u32 w = 0; w < 7; ++w) {
+            auto& o = t[names[w]] = nlohmann::json::object();
+            o["on_the_render_thread"] = announced_on_render_thread[w].load();
+            o["on_other_threads"] = announced_elsewhere[w].load();
+            for (u32 n = 0; n < 8; ++n) {
+                if (const u64 c = other_thread_counts[w][n].load()) {
+                    o["other_thread_" + std::to_string(n)] = c;
+                }
+            }
         }
     }
     auto& f = j["cpu_write_faults"] = nlohmann::json::object();
@@ -290,6 +390,15 @@ nlohmann::json Report() {
     }
     std::vector<std::pair<SiteKey, Site>> sites(uncovered_sites.begin(), uncovered_sites.end());
     std::ranges::sort(sites, [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+    {
+        std::vector<std::pair<SiteKey, Site>> mapped(map_sites.begin(), map_sites.end());
+        std::ranges::sort(mapped, [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+        auto& out = f["writers_into_map_windows"] = nlohmann::json::array();
+        for (size_t i = 0; i < mapped.size() && i < 32; ++i) {
+            out.push_back({{"rip", mapped[i].first.rip}, {"stack0", mapped[i].first.st0}, {"stack1", mapped[i].first.st1}, {"faults", mapped[i].second.count},
+                           {"sample_address", mapped[i].second.sample_address}});
+        }
+    }
     auto& list = f["unannounced_writes_by_faulting_instruction"] = nlohmann::json::array();
     for (size_t i = 0; i < sites.size() && i < 24; ++i) {
 #ifdef _WIN32

@@ -19,6 +19,7 @@
 #include <span>
 #include <string>
 #include "core/native_draw.h"
+#include "core/native_uploads.h"
 #include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/vk_constant_ring.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -206,6 +207,8 @@ public:
     }
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
+    /// N5c (raster thread): uploads the ranges the engine announced (outside a render pass: it is called in front of a draw or dispatch).
+    void PreSynchronize(const std::vector<Core::NativeUploads::Range>& ranges);
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);

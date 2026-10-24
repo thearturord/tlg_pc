@@ -96,6 +96,9 @@ LiveCounters& Live();
 /// The engine's JsDevice (0 until known).
 u64 EngineDevice();
 
+/// The number the next record will get (records are numbered in the order the game's hooks create them, across all contexts).
+u64 NextSeq();
+
 void SetImageBase(VAddr base);
 /// Load address of the game's main module (0 until known).
 VAddr ImageBase();

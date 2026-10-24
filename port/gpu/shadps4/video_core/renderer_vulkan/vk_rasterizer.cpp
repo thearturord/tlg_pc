@@ -14,6 +14,7 @@
 #include "core/native_resources.h"
 #include "core/native_pass.h"
 #include "core/native_updates.h"
+#include "core/native_uploads.h"
 #include "core/native_registry.h"
 #include "core/resource_audit.h"
 #include "core/debug_state.h"
@@ -1080,6 +1081,19 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
     ResetBindings(false);
+}
+
+void Rasterizer::PreSynchronize(const std::vector<Core::NativeUploads::Range>& ranges) {
+    scheduler.PopPendingOperations();
+    u64 bytes = 0, uploaded = 0;
+    for (const auto& range : ranges) {
+        if (!IsMapped(range.begin, range.size)) {
+            continue;
+        }
+        bytes += range.size;
+        uploaded += buffer_cache.PreSynchronize(range.begin, range.size);
+    }
+    Core::NativeUploads::NoteApplied(ranges.size(), bytes, uploaded);
 }
 
 void Rasterizer::SetExplicitImageReadback(bool on) {

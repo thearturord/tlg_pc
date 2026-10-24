@@ -24,6 +24,7 @@
 #include "video_core/buffer_cache/readback_batch.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/readback_policy.h"
+#include "core/native_uploads.h"
 #include "video_core/untracked_ring.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -520,6 +521,25 @@ void BufferCache::RecordDmaDownload(const Buffer* arena, VAddr dst, u32 size, bo
         scheduler.CurrentTick());
 }
 
+u64 BufferCache::PreSynchronize(VAddr device_addr, u64 size) {
+    if (size == 0 || !memory->IsValidMapping(device_addr, 1)) {
+        return 0;
+    }
+    size = std::min<u64>(memory->ClampRangeSize(device_addr, size), u64{1} << 26);
+    if (size == 0) {
+        return 0;
+    }
+    const u64 first_block = device_addr >> block_shift;
+    const u64 last_block = (device_addr + size - 1) >> block_shift;
+    const auto* arena = GetArena(first_block, last_block);
+    EnsureResident(arena, first_block, last_block);
+    last_upload_bytes = 0;
+    Core::NativeUploads::SetPreSyncActive(true);
+    SynchronizeMemory(arena, device_addr, static_cast<u32>(size), false, false);
+    Core::NativeUploads::SetPreSyncActive(false);
+    return last_upload_bytes;
+}
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer,
                                                         Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint) {
@@ -859,7 +879,10 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             const u64 tick = Vulkan::Scheduler::SideSelected() ? (side_upload_epoch | Vulkan::Scheduler::SideTag) : scheduler.CurrentTick();
             if (done.tick != tick || done.lo > lo || done.hi < hi) {
                 add_copy(lo, hi - lo);
+                Core::NativeUploads::NoteRingUpload(hi - lo);
                 done = {lo, hi, tick};
+            } else {
+                Core::NativeUploads::NoteRingSkipped(hi - lo);
             }
             if (hi < device_addr + size) {
                 memory_tracker->ForEachUploadRange(hi, device_addr + size - hi, is_written, add_copy);
@@ -871,6 +894,12 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         memory_tracker->ForEachUploadRange(device_addr, size, is_written, add_copy);
     }
     last_upload_bytes += total_size_bytes;
+    Core::NativeUploads::NoteUploaded(total_size_bytes);
+    if (Core::NativeUploads::Enabled()) {
+        for (const auto& copy : copies) {
+            Core::NativeUploads::NoteUploadedRange(copy.dstOffset, copy.size);
+        }
+    }
     if (!copies.empty()) {
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
         for (auto& copy : copies) {

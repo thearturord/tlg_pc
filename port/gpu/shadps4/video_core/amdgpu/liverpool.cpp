@@ -23,6 +23,7 @@
 #include "core/native_audit.h"
 #include "core/native_direct.h"
 #include "core/native_draw.h"
+#include "core/native_uploads.h"
 #include "core/native_readbacks.h"
 #include "core/native_entry_dump.h"
 #include "core/native_resources.h"
@@ -910,6 +911,14 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         (call.tag.meta & VideoCore::NativeTagExecFlag) == 0) {
         // LEGACY(packet-path): a draw that runs on the game's packets: the record is compared with the state those packets made (verification only)
         Core::NativeDraw::VerifyRecord(call.tag.seq, front_state);
+    }
+    if (Core::NativeUploads::Enabled()) {
+        // N5c: the uploads the engine announced before this record are queued in front of it (one operation per record that finds some)
+        const u64 upload_seq = call.tag.valid ? call.tag.seq : (native_exec_plan ? native_exec_plan->native_seq : 0);
+        std::vector<Core::NativeUploads::Range> due;
+        if (upload_seq != 0 && Core::NativeUploads::TakeDue(upload_seq, due)) {
+            RasterRun([this, ranges = std::move(due)]() { rasterizer->PreSynchronize(ranges); });
+        }
     }
     if (!split_active) {
         direct_state = front_state;
