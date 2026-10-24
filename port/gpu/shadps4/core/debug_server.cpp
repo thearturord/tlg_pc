@@ -21,6 +21,7 @@
 #include "core/frame_timeline.h"
 #include "core/native_pass.h"
 #include "core/native_registry.h"
+#include "core/native_updates.h"
 #include "core/native_resources.h"
 #include "core/memory.h"
 #include "core/guest_hooks.h"
@@ -601,6 +602,13 @@ void RegisterBuiltins() {
                      Core::NativePass::Start();
                  }
                  return Core::NativePass::Report();
+             });
+    Register("/updates", "?start=1 turns the update audit on (N5a): buffer Maps the engine announces, and which CPU write faults they cover",
+             [](const Params& params) {
+                 if (ParseNumber(params, "start", 0) != 0) {
+                     Core::NativeUpdates::Start();
+                 }
+                 return Core::NativeUpdates::Report();
              });
     Register("/threads", "CPU use of the busiest threads since the previous call", Threads);
     Register("/memory", "?addr=0x..&size=N (max 65536): guest memory as hex", Memory);

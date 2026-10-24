@@ -13,6 +13,7 @@
 #include "core/native_readbacks.h"
 #include "core/native_resources.h"
 #include "core/native_pass.h"
+#include "core/native_updates.h"
 #include "core/native_registry.h"
 #include "core/resource_audit.h"
 #include "core/debug_state.h"
@@ -3109,6 +3110,9 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     Core::DebugServer::NoteWriteFault(addr);
     Core::NativeResources::NoteCpuWrite(addr, size);
+    if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
+        Core::NativeUpdates::NoteFault(addr, size);
+    }
 #ifdef ARCH_X86_64
     Core::GuestHooks::NoteWriteFault(addr, size);
 #endif

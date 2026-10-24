@@ -54,6 +54,8 @@ void InstallForEboot(VAddr base, u64 image_size);
 
 /// The instruction a write fault was taken at, valid inside the fault handler (0 when unknown).
 u64 FaultRip();
+/// The first three stack words recorded with SetFaultRip (index 0 to 2).
+u64 FaultStack(u32 index);
 
 /// Called once per presented frame: writes the call counts and recorded arguments.
 void OnFrame();

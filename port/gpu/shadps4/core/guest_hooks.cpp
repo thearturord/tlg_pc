@@ -671,6 +671,10 @@ u64 FaultRip() {
     return current_fault_rip;
 }
 
+u64 FaultStack(u32 index) {
+    return index < 3 ? current_fault_stack[index] : 0;
+}
+
 void SetFaultRip(u64 rip, const u64* stack_words) {
     current_fault_rip = rip;
     for (int i = 0; i < 3; ++i) {

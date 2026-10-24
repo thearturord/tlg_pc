@@ -38,6 +38,7 @@
 #include "core/native_readbacks.h"
 #include "core/native_registry.h"
 #include "core/native_resources.h"
+#include "core/native_updates.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/native_draw_tag.h"
@@ -5461,6 +5462,17 @@ u64 MakeMapUploadRecord(u64 ctx, u64 resource, u64 scratch, u64 caller) {
 using GuestMap7 = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64);
 
 u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4, u64 size, u64 ret, u64 caller_rsp) {
+    if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && ctx != 0 && IsHeapPointer(resource) && (resource & 7) == 0 && Rd<u32>(resource, 0x124) == 1) {
+        // N5a: a Map of a buffer is announced to the update audit; the game's function runs here and its result is returned
+        const u64 original_map = Core::GuestHooks::OriginalEntry("Map");
+        const u64 out_map = Rd<u64>(caller_rsp, 0);
+        if (original_map != 0 && out_map != 0 && (out_map & 7) == 0) {
+            const u64 result = reinterpret_cast<GuestMap7>(original_map)(ctx, resource, subresource, type, a4, size, out_map);
+            Core::NativeUpdates::NoteMap(Rd<u64>(resource, 0x10), Core::NativeResources::ResourceUsage(resource), static_cast<u32>(type), Rd<u64>(out_map, 0),
+                                         Rd<u32>(out_map, 8), Rd<u64>(resource, 0x30), ret);
+            return 0x8000000000000000ull | (result & 0x7fffffffffffffffull);
+        }
+    }
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     const s32 mode = policy.map_native.load(std::memory_order_relaxed);
     const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };

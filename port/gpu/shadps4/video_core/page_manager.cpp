@@ -18,6 +18,8 @@
 #include "core/emulator_settings.h"
 #include "core/guest_hooks.h"
 #include "core/memory.h"
+#include "core/native_draw.h"
+#include "core/native_updates.h"
 #include "core/signals.h"
 #include "video_core/page_manager.h"
 #include "video_core/untracked_ring.h"
@@ -490,10 +492,29 @@ struct SignalImpl : public PageManager::Impl {
                 u64 stack_words[3] = {};
 #ifdef _WIN32
                 const u64 rsp = ((EXCEPTION_POINTERS*)context)->ContextRecord->Rsp;
-                if (Core::Memory::Instance()->IsValidMapping(rsp, sizeof(stack_words))) {
+                // the stack of a guest thread is not always inside a mapping the emulator knows: ask the system
+                if (Core::Memory::Instance()->IsValidMapping(rsp, sizeof(stack_words)) || !IsBadReadPtr(reinterpret_cast<const void*>(rsp), sizeof(stack_words))) {
                     std::memcpy(stack_words, reinterpret_cast<const void*>(rsp), sizeof(stack_words));
                 }
 #endif
+                if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
+                    // update audit: the stack words are the first three return-address-looking words of the game image above the stack pointer (a leaf routine such as
+                    // memcpy has no useful frame), so the writer can be named
+                    const u64 image = Core::NativeDraw::ImageBase();
+                    u32 found = 0;
+                    stack_words[0] = stack_words[1] = stack_words[2] = 0;
+                    for (u32 i = 0; i < 512 && found < 3 && image != 0; ++i) {
+                        u64 word = 0;
+                        const u64 at = ((EXCEPTION_POINTERS*)context)->ContextRecord->Rsp + i * 8;
+                        if (IsBadReadPtr(reinterpret_cast<const void*>(at), 8)) {
+                            break;
+                        }
+                        std::memcpy(&word, reinterpret_cast<const void*>(at), 8);
+                        if (word >= image && word < image + 0x8000000) {
+                            stack_words[found++] = word;
+                        }
+                    }
+                }
                 Core::GuestHooks::SetFaultRip(reinterpret_cast<u64>(Common::GetRip(context)),
                                               stack_words);
             }
