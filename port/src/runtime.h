@@ -101,6 +101,8 @@ uintptr_t runtime_audio_resolve(const char *name);
 void runtime_audio_report(void);
 uintptr_t runtime_pad_resolve(const char *name);
 void runtime_pad_report(void);
+/* The game image (for TLG_AUTO_START: the pad reads the game's title menu state). */
+void runtime_pad_set_image(uintptr_t image, uint64_t size);
 uintptr_t runtime_rtc_resolve(const char *name);
 const char *runtime_file_user_dir(void);
 void runtime_savedata_configure(const char *title);

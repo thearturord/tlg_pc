@@ -259,17 +259,43 @@ nlohmann::json Threads(const Params&) {
 }
 
 nlohmann::json Memory(const Params& params) {
-    const u64 address = ParseNumber(params, "addr", 0);
+    // ?ghidra=0x... reads the game image at a Ghidra address (runtime address = image base + ghidra - 0x1000000)
+    u64 address = ParseNumber(params, "addr", 0);
+    if (params.find("ghidra") != params.end()) {
+        const u64 base = NativeDraw::ImageBase();
+        if (base == 0) {
+            return {{"error", "the image base is not known yet"}};
+        }
+        address = base + ParseNumber(params, "ghidra", 0) - 0x1000000;
+    }
     const u64 size = ParseNumber(params, "size", 64);
     if (size == 0 || size > 0x10000) {
         return {{"error", "size must be 1..65536"}};
     }
     auto* memory = Core::Memory::Instance();
-    if (address == 0 || !memory->IsValidMapping(address, size)) {
-        return {{"error", "address range is not mapped"}, {"addr", address}, {"size", size}};
-    }
     std::vector<u8> data(size);
-    memory->CopySparseMemory(address, data.data(), size);
+    if (address != 0 && memory->IsValidMapping(address, size)) {
+        memory->CopySparseMemory(address, data.data(), size);
+    } else {
+        // the game image and the engine's own memory are plain host memory of this process (not in the GPU memory manager): read it when it is committed and readable
+        bool readable = address != 0;
+#ifdef _WIN32
+        for (u64 at = address; readable && at < address + size;) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+                readable = false;
+                break;
+            }
+            at = reinterpret_cast<u64>(info.BaseAddress) + info.RegionSize;
+        }
+#else
+        readable = false;
+#endif
+        if (!readable) {
+            return {{"error", "address range is not mapped"}, {"addr", address}, {"size", size}};
+        }
+        std::memcpy(data.data(), reinterpret_cast<const void*>(address), size);
+    }
     static constexpr char digits[] = "0123456789abcdef";
     std::string hex;
     hex.reserve(size * 2);
@@ -279,6 +305,7 @@ nlohmann::json Memory(const Params& params) {
     }
     nlohmann::json j;
     j["addr"] = fmt::format("{:#x}", address);
+    j["image_base"] = fmt::format("{:#x}", NativeDraw::ImageBase());
     j["size"] = size;
     j["hex"] = hex;
     if (size % 4 == 0 && size <= 256) {

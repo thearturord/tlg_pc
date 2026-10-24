@@ -25,6 +25,9 @@
 #include <time.h>
 #include <SDL3/SDL.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #define ERR_INVALID_ARG ((int32_t)0x80920001)
 #define ERR_INVALID_HANDLE ((int32_t)0x80920003)
@@ -596,6 +599,57 @@ static void read_inject(void) {
     printf("Runtime: pad file: buttons 0x%x sticks %d %d %d %d\n",injected.buttons,
            injected.stick[0],injected.stick[1],injected.stick[2],injected.stick[3]);
 }
+/* TLG_AUTO_START=1: passes the title screen and picks Continue by itself, without a window in front or a keyboard (for automated runs and tests). The game's
+ * menu manager (CUSA03627: *(*(image + 0x5832568) + 0xd0), Ghidra 0x6832568) tells the state: +0xe0 counts while a title or menu screen waits for input
+ * (0 during start-up and in the level), +0x218 becomes 1 once Continue is chosen and stays 1. The pad presses Cross for 150 ms every
+ * TLG_AUTO_START_GAP ms (default 2500) while a screen waits, and stops for good once Continue is chosen (or after TLG_AUTO_START_LIMIT seconds, default 300).
+ * Not the game version this knows: nothing is pressed. */
+static uintptr_t auto_image;
+static uint64_t auto_image_size;
+void runtime_pad_set_image(uintptr_t image, uint64_t size) { auto_image=image; auto_image_size=size; }
+static int auto_readable(uint64_t address, size_t size) {
+    if (address<0x10000 || address>0x7fffffffffffull) return 0;
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION info;
+    for (uint64_t at=address; at<address+size;) {
+        if (!VirtualQuery((const void *)(uintptr_t)at,&info,sizeof(info)) || info.State!=MEM_COMMIT || (info.Protect&(PAGE_NOACCESS|PAGE_GUARD))) return 0;
+        at=(uint64_t)(uintptr_t)info.BaseAddress+info.RegionSize;
+    }
+#endif
+    return 1;
+}
+static int auto_menu(uint32_t *counter, uint32_t *selected) {
+    enum { MENU_GLOBAL=0x5832568, MENU_OFFSET=0xd0, COUNTER=0xe0, SELECTED=0x218 };
+    uint64_t global=auto_image+MENU_GLOBAL, pointer, menu;
+    if (!auto_image || auto_image_size<=MENU_GLOBAL+8 || !auto_readable(global,8)) return 0;
+    memcpy(&pointer,(const void *)(uintptr_t)global,8);
+    if (!auto_readable(pointer+MENU_OFFSET,8)) return 0;
+    memcpy(&menu,(const void *)(uintptr_t)(pointer+MENU_OFFSET),8);
+    if (!auto_readable(menu+COUNTER,4) || !auto_readable(menu+SELECTED,4)) return 0;
+    memcpy(counter,(const void *)(uintptr_t)(menu+COUNTER),4);
+    memcpy(selected,(const void *)(uintptr_t)(menu+SELECTED),4);
+    return 1;
+}
+static uint32_t auto_start_buttons(void) {
+    static int mode=-1, done; static uint64_t first, next_press, pulse_end; static uint64_t gap_us=2500000, limit_us=300000000;
+    if (mode<0) {
+        const char *e=getenv("TLG_AUTO_START"); mode=e && *e && strcmp(e,"0");
+        const char *g=getenv("TLG_AUTO_START_GAP"), *l=getenv("TLG_AUTO_START_LIMIT");
+        if (g && atoi(g)>0) gap_us=(uint64_t)atoi(g)*1000u;
+        if (l && atoi(l)>0) limit_us=(uint64_t)atoi(l)*1000000u;
+        if (mode) puts("Runtime: auto start on: Cross is pressed on the title screen and on Continue");
+    }
+    if (!mode || done) return 0;
+    uint32_t counter=0, selected=0;
+    if (!auto_menu(&counter,&selected)) return 0;
+    uint64_t now=now_us();
+    if (selected==1) { done=1; printf("Runtime: auto start: Continue chosen after %.1f s\n",first ? (double)(now-first)/1e6 : 0.0); return 0; }
+    if (counter==0) return 0;
+    if (!first) { first=now; next_press=now; puts("Runtime: auto start: the title screen waits for input"); }
+    if (now-first>limit_us) { done=1; puts("Runtime: auto start: gave up (time limit)"); return 0; }
+    if (now>=next_press) { pulse_end=now+150000; next_press=now+gap_us; printf("Runtime: auto start: Cross (menu counter %u)\n",counter); }
+    return now<pulse_end ? BTN_CROSS : 0;
+}
 /* TLG_PAD_RECORD=<file>: F9 starts and stops recording the pad state (gamepad or keyboard) with
  * the time since F9; TLG_PAD_REPLAY=<file> plays such a recording back, started by the token
  * "replay" in TLG_PAD_FILE (scripted tests repeat a route the player ran once). Lines: ms buttons
@@ -674,6 +728,7 @@ static void sample(PadData *d) {
     read_inject();
     replay_sample(d);
     d->buttons|=injected.buttons;
+    d->buttons|=auto_start_buttons();
     if (injected.buttons & BTN_L2) d->l2=255;
     if (injected.buttons & BTN_R2) d->r2=255;
     uint8_t *axes[4]={&d->left_x,&d->left_y,&d->right_x,&d->right_y};

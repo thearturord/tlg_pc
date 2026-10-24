@@ -1127,6 +1127,7 @@ int main(int argc, char **argv) {
     if (gpu_enabled) install_actor_watch(app0, segments, ns, size);
     if (gpu_enabled) install_stat_multipliers(app0, segments, ns, size);
     if (gpu_enabled) tlggpu_install_hooks((uintptr_t)image, size); /* the native render path's hooks (hooks.json of the game) */
+    runtime_pad_set_image((uintptr_t)image, size);
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
