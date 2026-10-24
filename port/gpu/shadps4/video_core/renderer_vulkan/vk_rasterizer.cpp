@@ -1748,6 +1748,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
             buffer_infos.emplace_back(constant_ring->Handle(), ring->offset, ring->size);
             ring_bound.fetch_add(1, std::memory_order_relaxed);
+            if (Core::NativeUploads::RingPrecise() && ring->address != 0 && buffer_cache.IsRangeGpuWritten(ring->address, ring->size)) {
+                Core::NativeUploads::NoteRingPrecise(1); // the GPU wrote bytes of this range after the command processor copied it
+            }
             if (ring_verify_interval != 0 && ring->address != 0 && ++ring_verify_counter % ring_verify_interval == 0) {
                 std::vector<u8> now(ring->size);
                 memory->CopySparseMemory(ring->address, now.data(), ring->size);
@@ -1875,7 +1878,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
                 Core::NativeUploads::SetDetail((desc.is_written ? 1u : 0u) | (desc.is_formatted ? 2u : 0u) | (size > VideoCore::BufferCache::StreamThreshold() ? 4u : 0u) |
                                                ((ring_draw || ring_dispatch) ? 16u : 0u) |
-                                               (Core::NativeUploads::OnDemandAudit() && buffer_cache.IsRegionGpuModified(vsharp.base_address, size) ? 32u : 0u));
+                                               (Core::NativeUploads::OnDemandAudit() && buffer_cache.IsRegionGpuModified(vsharp.base_address, size) ? 32u : 0u) |
+                                               (Core::NativeUploads::OnDemandAudit() && buffer_cache.IsRangeGpuWritten(vsharp.base_address, size) ? 64u : 0u) |
+                                               (Core::NativeUploads::OnDemandAudit() && texture_cache.FindImageFromRange(vsharp.base_address, size) ? 128u : 0u));
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2);
                 if (Core::NativeRegistry::AuditBuffer(vsharp.base_address, size, desc.is_written, desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase)) {
@@ -2734,7 +2739,17 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
             ring_immutable.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        if (buffer_cache.IsRegionGpuModified(address, size)) {
+        if (Core::NativeUploads::RingPrecise()) {
+            // N5e: the bytes decide, not the 4 KB page that holds them
+            if (buffer_cache.IsRangeGpuWritten(address, size)) {
+                ring_gpu_modified.fetch_add(1, std::memory_order_relaxed);
+                Core::NativeUploads::NoteRingPrecise(2);
+                continue;
+            }
+            if (buffer_cache.IsRegionGpuModified(address, size)) {
+                Core::NativeUploads::NoteRingPrecise(0);
+            }
+        } else if (buffer_cache.IsRegionGpuModified(address, size)) {
             ring_gpu_modified.fetch_add(1, std::memory_order_relaxed);
             continue;
         }

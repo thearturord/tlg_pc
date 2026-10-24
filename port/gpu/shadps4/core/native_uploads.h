@@ -76,6 +76,12 @@ u32 Caller();
 void SetDetail(u32 detail);
 void NoteOnDemand(bool pass_open, u64 request_size, u64 uploaded_bytes, u64 address, bool immutable_whole);
 
+// ---- byte precise GPU-written ranges for the constant ring (N5e, `TLG_RING_PRECISE=1`) ----------------------------------------------------------------------
+bool RingPrecise();
+/// 0 a range the page flag would have refused went through the ring (its bytes were never written by the GPU), 1 the GPU wrote bytes of a ring-bound range between the
+/// plan and the bind (the ring served guest bytes the GPU had changed since), 2 refused because its bytes are GPU written.
+void NoteRingPrecise(u32 what);
+
 nlohmann::json Report();
 
 } // namespace Core::NativeUploads

@@ -134,6 +134,9 @@ public:
         return STREAM_THRESHOLD;
     }
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
+    /// N5e: byte precise. True when a shader or a GPU copy wrote bytes of [addr, addr + size) that were not downloaded since (the set `gpu_modified_ranges`), as against
+    /// `IsRegionGpuModified`, which answers per 4 KB page and keeps the answer for as long as the page lives.
+    [[nodiscard]] bool IsRangeGpuWritten(VAddr addr, size_t size);
 
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();

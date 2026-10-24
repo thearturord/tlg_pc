@@ -260,7 +260,7 @@ SnapshotResult SnapshotRead(u64 begin, u64 size, u64 seq, void* data) {
 namespace {
 thread_local u32 current_caller = 0;
 thread_local u32 current_detail = 0;
-std::array<std::atomic<u64>, 64> detail_counts{}; ///< in-pass uploads of draw buffers by detail bits
+std::array<std::atomic<u64>, 256> detail_counts{}; ///< in-pass uploads of draw buffers by detail bits
 struct OnDemandBucket {
     std::atomic<u64> requests{}, uploaded{};
 };
@@ -307,7 +307,7 @@ void NoteOnDemand(bool pass_open, u64 request_size, u64 uploaded_bytes, u64 addr
     }
     const u32 bucket = request_size <= 256 ? 0 : request_size <= 4096 ? 1 : request_size <= 16384 ? 2 : request_size <= 65536 ? 3 : request_size <= (1u << 20) ? 4 : request_size <= (16u << 20) ? 5 : 6;
     if (caller == 1) {
-        detail_counts[current_detail & 63].fetch_add(1, std::memory_order_relaxed);
+        detail_counts[current_detail & 255].fetch_add(1, std::memory_order_relaxed);
     }
     demand_by_caller_size_in_pass[caller][bucket].requests.fetch_add(1, std::memory_order_relaxed);
     demand_by_caller_size_in_pass[caller][bucket].uploaded.fetch_add(uploaded_bytes, std::memory_order_relaxed);
@@ -316,6 +316,21 @@ void NoteOnDemand(bool pass_open, u64 request_size, u64 uploaded_bytes, u64 addr
     auto& entry = demand_in_pass_by_class[cls];
     entry.first += 1;
     entry.second += uploaded_bytes;
+}
+
+bool RingPrecise() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_RING_PRECISE");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+
+namespace {
+std::atomic<u64> ring_precise_counters[4]{};
+}
+void NoteRingPrecise(u32 what) {
+    ring_precise_counters[what & 3].fetch_add(1, std::memory_order_relaxed);
 }
 
 nlohmann::json Report() {
@@ -368,7 +383,7 @@ nlohmann::json Report() {
         }
         {
             auto& d = in_pass["draw_buffer_uploads_by_what_the_buffer_is"] = nlohmann::json::object();
-            for (u32 i = 0; i < 64; ++i) {
+            for (u32 i = 0; i < 256; ++i) {
                 if (const u64 n = detail_counts[i].load()) {
                     std::string name;
                     name += (i & 1) ? "written " : "read_only ";
@@ -376,6 +391,8 @@ nlohmann::json Report() {
                     name += (i & 4) ? "over_16K " : "up_to_16K ";
                     name += (i & 16) ? "draw_has_ring_plan " : "no_ring_plan ";
                     name += (i & 32) ? "page_is_gpu_modified " : "page_not_gpu_modified ";
+                    name += (i & 64) ? "BYTES_GPU_WRITTEN " : "bytes_not_gpu_written ";
+                    name += (i & 128) ? "image_overlaps " : "no_image ";
                     name += (i & 8) ? "ring_binding_existed" : "";
                     d[name] = n;
                 }
@@ -395,6 +412,10 @@ nlohmann::json Report() {
             classes[name] = {{"uploads", v.first}, {"bytes", v.second}};
         }
     }
+    j["ring_precise"] = {{"enabled", RingPrecise()},
+                         {"ranges_the_page_flag_refuses_that_went_through_the_ring", ring_precise_counters[0].load()},
+                         {"ring_bound_ranges_the_gpu_wrote_between_plan_and_bind", ring_precise_counters[1].load()},
+                         {"ranges_refused_because_their_bytes_are_gpu_written", ring_precise_counters[2].load()}};
     j["journal_peak_entries"] = journal_peak.load();
     j["frame_ring_uploads_at_draw_time_bytes"] = ring_upload_bytes.load();
     j["frame_ring_uploads_by_the_pre_synchronization_bytes"] = ring_upload_presync_bytes.load();
