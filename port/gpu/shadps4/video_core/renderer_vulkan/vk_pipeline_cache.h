@@ -102,6 +102,7 @@ struct RingBinding {
     u64 offset{};     ///< offset in the ring buffer
     VAddr address{};  ///< the guest address it was copied from (0 for the flattened user data)
     bool snapshot{};  ///< N5d: the bytes are the writer's snapshot, not what guest memory held when the command processor looked
+    bool formatted{}; ///< N5f: a formatted (texel) buffer: the raster thread checks at bind time that no image or metadata surface covers the range
 };
 
 struct StagePlan {

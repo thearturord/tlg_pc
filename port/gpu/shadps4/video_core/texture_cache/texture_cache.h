@@ -337,6 +337,24 @@ public:
         });
     }
 
+    /// True when a cached image covers any byte of [address, address + size) (raster thread). `ForEachImageWithAddress` only finds images that start exactly at an address.
+    [[nodiscard]] bool AnyImageOverlaps(VAddr address, size_t size) {
+        const u64 last_page = (address + size - 1) >> Traits::PAGE_BITS;
+        for (u64 page = address >> Traits::PAGE_BITS; page <= last_page; ++page) {
+            const auto it = page_table.find(page);
+            if (it == nullptr) {
+                continue;
+            }
+            for (const auto& entry : it->entries) {
+                const Image& image = slot_images[entry.id];
+                if (image.info.guest_address < address + size && address < image.info.guest_address + image.info.guest_size) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     template <typename Func>
     void ForEachImageWithAddress(VAddr cpu_addr, Func&& func) {
         const auto it = page_table.find(cpu_addr >> Traits::PAGE_BITS);

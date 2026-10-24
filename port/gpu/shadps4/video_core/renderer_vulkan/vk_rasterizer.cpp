@@ -1741,6 +1741,18 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         }
         const RingBinding* ring =
             const_ring_level >= 4 && (ring_draw || ring_dispatch) ? FindRingBinding(stage, buffer_index) : nullptr;
+        if (ring != nullptr && ring->formatted) {
+            // N5f: a texel buffer may be the memory of an image (a surface a shader reads as a buffer, HTile, CMask): only the raster thread knows
+            if (texture_cache.AnyImageOverlaps(ring->address, ring->size) || texture_cache.IsMeta(ring->address)) {
+                Core::NativeUploads::NoteRingPrecise(5);
+                ring = nullptr;
+            } else if (buffer_cache.IsRangeGpuWritten(ring->address, ring->size)) {
+                Core::NativeUploads::NoteRingPrecise(6);
+                ring = nullptr;
+            } else {
+                Core::NativeUploads::NoteRingPrecise(4);
+            }
+        }
         if (ring) {
             // Copied by the command processor thread into the constant ring (read-only, small, not written by queued work).
             if (!desc.IsSpecial()) {
@@ -2719,7 +2731,7 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
             ring_written.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        if (desc.is_formatted) {
+        if (desc.is_formatted && !Core::NativeUploads::RingFormatted()) {
             ring_formatted.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
@@ -2799,7 +2811,7 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
             memory->CopySparseMemory(address, constant_ring->Data(*offset), size);
         }
         constant_ring->Flush(*offset, size);
-        stage.ring.push_back({index, static_cast<u32>(size), *offset, address, from_snapshot});
+        stage.ring.push_back({index, static_cast<u32>(size), *offset, address, from_snapshot, desc.is_formatted});
         ring_taken.fetch_add(1, std::memory_order_relaxed);
         ring_bytes.fetch_add(size, std::memory_order_relaxed);
     }

@@ -318,6 +318,14 @@ void NoteOnDemand(bool pass_open, u64 request_size, u64 uploaded_bytes, u64 addr
     entry.second += uploaded_bytes;
 }
 
+bool RingFormatted() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_RING_FORMATTED");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+
 bool RingPrecise() {
     static const bool on = [] {
         const char* e = std::getenv("TLG_RING_PRECISE");
@@ -327,10 +335,10 @@ bool RingPrecise() {
 }
 
 namespace {
-std::atomic<u64> ring_precise_counters[4]{};
+std::atomic<u64> ring_precise_counters[8]{};
 }
 void NoteRingPrecise(u32 what) {
-    ring_precise_counters[what & 3].fetch_add(1, std::memory_order_relaxed);
+    ring_precise_counters[what & 7].fetch_add(1, std::memory_order_relaxed);
 }
 
 nlohmann::json Report() {
@@ -415,7 +423,10 @@ nlohmann::json Report() {
     j["ring_precise"] = {{"enabled", RingPrecise()},
                          {"ranges_the_page_flag_refuses_that_went_through_the_ring", ring_precise_counters[0].load()},
                          {"ring_bound_ranges_the_gpu_wrote_between_plan_and_bind", ring_precise_counters[1].load()},
-                         {"ranges_refused_because_their_bytes_are_gpu_written", ring_precise_counters[2].load()}};
+                         {"ranges_refused_because_their_bytes_are_gpu_written", ring_precise_counters[2].load()},
+                         {"formatted_buffers_bound_from_the_ring", ring_precise_counters[4].load()},
+                         {"formatted_ring_copies_ignored_at_bind_an_image_or_metadata_covers_the_range", ring_precise_counters[5].load()},
+                         {"formatted_ring_copies_ignored_at_bind_the_gpu_wrote_the_bytes", ring_precise_counters[6].load()}};
     j["journal_peak_entries"] = journal_peak.load();
     j["frame_ring_uploads_at_draw_time_bytes"] = ring_upload_bytes.load();
     j["frame_ring_uploads_by_the_pre_synchronization_bytes"] = ring_upload_presync_bytes.load();
