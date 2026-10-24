@@ -24,8 +24,9 @@ namespace Core::NativeUpdates {
 std::atomic<bool> enabled{[] {
     const char* e = std::getenv("TLG_UPDATE_AUDIT");
     const char* u = std::getenv("TLG_NATIVE_UPLOADS");
-    // the announcements are also what the native uploads are made of
-    return (e != nullptr && *e != 0 && *e != '0') || (u != nullptr && *u != 0 && *u != '0');
+    const char* s = std::getenv("TLG_SNAPSHOTS");
+    // the announcements are also what the native uploads and the snapshots are made of
+    return (e != nullptr && *e != 0 && *e != '0') || (u != nullptr && *u != 0 && *u != '0') || (s != nullptr && *s != 0 && *s != '0');
 }()};
 
 namespace {
@@ -171,6 +172,7 @@ void NoteUnmap(u64 resource_id) {
         map = it->second;
         open_maps.erase(it);
     }
+    NativeUploads::SnapshotTake(map.address, map.size, NativeDraw::NextSeq());
     NoteWriterRange(0, map.address, map.size);
 }
 

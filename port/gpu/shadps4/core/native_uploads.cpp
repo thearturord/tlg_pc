@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
 #include <cstdlib>
+#include <cstring>
+#include <memory>
 #include <deque>
 #include <map>
 #include <utility>
@@ -146,6 +149,111 @@ void NoteUploaded(u64 bytes) {
     (presync_active ? presync_uploaded_bytes : on_demand_uploaded_bytes).fetch_add(bytes, std::memory_order_relaxed);
 }
 
+// ---- snapshots ---------------------------------------------------------------------------------------------------------------------
+namespace {
+constexpr u64 SnapshotBytes = 64ull << 20;         // ring of host memory
+constexpr u32 SnapshotEntries = 1u << 16;          // entries, circular
+constexpr u64 SnapshotMaxRange = 64 << 10;
+constexpr u32 PageSlots = 1u << 16;                // page (4 KB) -> the newest entries that touch it
+constexpr u32 PerPage = 4;
+
+struct SnapEntry {
+    u64 id{};     // 1 + index of the entry in the order taken; 0 = empty
+    u64 begin{}, size{}, stamp{}, offset{}; // offset: absolute position in the ring (monotonic)
+};
+
+struct SnapStore {
+    std::mutex mutex;
+    std::unique_ptr<u8[]> bytes = std::make_unique<u8[]>(SnapshotBytes);
+    std::unique_ptr<SnapEntry[]> entries = std::make_unique<SnapEntry[]>(SnapshotEntries);
+    std::unique_ptr<std::array<u64, PerPage>[]> pages = std::make_unique<std::array<u64, PerPage>[]>(PageSlots); // entry ids, newest first
+    u64 next_id = 1;
+    u64 head = 0; // absolute bytes written
+};
+SnapStore& Snap() {
+    static SnapStore store;
+    return store;
+}
+std::atomic<u64> ring_snapshot_counters[8]{};
+std::atomic<u64> snap_taken{}, snap_taken_bytes{}, snap_too_big{}, snap_found{}, snap_partial{}, snap_none{}, snap_lapped{};
+} // namespace
+
+bool SnapshotsEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_SNAPSHOTS");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+
+void SnapshotTake(u64 begin, u64 size, u64 stamp) {
+    if (!SnapshotsEnabled() || size == 0) {
+        return;
+    }
+    if (size > SnapshotMaxRange) {
+        snap_too_big.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    auto& s = Snap();
+    std::scoped_lock lock{s.mutex};
+    u64 offset = s.head;
+    if ((offset % SnapshotBytes) + size > SnapshotBytes) {
+        offset += SnapshotBytes - (offset % SnapshotBytes); // never straddle the end of the ring
+    }
+    s.head = offset + ((size + 15) & ~u64{15});
+    std::memcpy(s.bytes.get() + (offset % SnapshotBytes), reinterpret_cast<const void*>(begin), size);
+    const u64 id = s.next_id++;
+    s.entries[id % SnapshotEntries] = {id, begin, size, stamp, offset};
+    for (u64 page = begin >> 12; page <= (begin + size - 1) >> 12; ++page) {
+        auto& slot = s.pages[page % PageSlots];
+        for (u32 i = PerPage - 1; i > 0; --i) {
+            slot[i] = slot[i - 1];
+        }
+        slot[0] = id;
+    }
+    snap_taken.fetch_add(1, std::memory_order_relaxed);
+    snap_taken_bytes.fetch_add(size, std::memory_order_relaxed);
+}
+
+void NoteSnapshotRing(u32 what) {
+    ring_snapshot_counters[what & 7].fetch_add(1, std::memory_order_relaxed);
+}
+
+SnapshotResult SnapshotRead(u64 begin, u64 size, u64 seq, void* data) {
+    auto& s = Snap();
+    std::scoped_lock lock{s.mutex};
+    const SnapEntry* best = nullptr;
+    for (u64 page = begin >> 12; page <= (begin + size - 1) >> 12; ++page) {
+        for (const u64 id : s.pages[page % PageSlots]) {
+            if (id == 0) {
+                continue;
+            }
+            const SnapEntry& e = s.entries[id % SnapshotEntries];
+            if (e.id != id || e.stamp > seq || e.begin >= begin + size || begin >= e.begin + e.size) {
+                continue; // overwritten entry, newer than the record, or not touching the range
+            }
+            if (s.head - e.offset > SnapshotBytes) {
+                snap_lapped.fetch_add(1, std::memory_order_relaxed);
+                continue; // its bytes were overwritten by a later lap of the ring
+            }
+            if (best == nullptr || e.id > best->id) {
+                best = &e;
+            }
+        }
+    }
+    if (best == nullptr) {
+        snap_none.fetch_add(1, std::memory_order_relaxed);
+        return SnapshotResult::None;
+    }
+    if (best->begin > begin || best->begin + best->size < begin + size) {
+        snap_partial.fetch_add(1, std::memory_order_relaxed);
+        return SnapshotResult::Partial;
+    }
+    std::memcpy(data, s.bytes.get() + (best->offset % SnapshotBytes) + (begin - best->begin), size);
+    snap_found.fetch_add(1, std::memory_order_relaxed);
+    return SnapshotResult::Found;
+}
+
 nlohmann::json Report() {
     nlohmann::json j = nlohmann::json::object();
     j["enabled"] = Enabled();
@@ -160,6 +268,19 @@ nlohmann::json Report() {
     j["bytes_applied"] = applied_bytes.load();
     j["uploaded_by_the_pre_synchronization_bytes"] = presync_uploaded_bytes.load();
     j["uploaded_on_demand_bytes_at_draw_time"] = on_demand_uploaded_bytes.load();
+    j["snapshots"] = {{"enabled", SnapshotsEnabled()},
+                      {"taken", snap_taken.load()},
+                      {"taken_bytes", snap_taken_bytes.load()},
+                      {"writes_over_64KB_not_kept", snap_too_big.load()},
+                      {"reads_answered_from_a_snapshot", snap_found.load()},
+                      {"reads_the_newest_write_only_partly_covers", snap_partial.load()},
+                      {"reads_no_snapshot_touches", snap_none.load()},
+                      {"entries_found_overwritten_by_a_later_lap", snap_lapped.load()},
+                      {"ring_bindings_carrying_a_snapshot", ring_snapshot_counters[0].load()},
+                      {"ring_bindings_refused_partly_covered", ring_snapshot_counters[1].load()},
+                      {"snapshot_ring_bindings_compared_with_guest_memory", ring_snapshot_counters[2].load()},
+                      {"snapshot_differs_from_guest_memory_at_bind_time", ring_snapshot_counters[3].load()},
+                      {"snapshot_differed_from_guest_memory_when_planned_guest_bytes_used_instead", ring_snapshot_counters[4].load()}};
     j["journal_peak_entries"] = journal_peak.load();
     j["frame_ring_uploads_at_draw_time_bytes"] = ring_upload_bytes.load();
     j["frame_ring_uploads_by_the_pre_synchronization_bytes"] = ring_upload_presync_bytes.load();

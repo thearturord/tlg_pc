@@ -101,6 +101,7 @@ struct RingBinding {
     u32 size{};
     u64 offset{};     ///< offset in the ring buffer
     VAddr address{};  ///< the guest address it was copied from (0 for the flattened user data)
+    bool snapshot{};  ///< N5d: the bytes are the writer's snapshot, not what guest memory held when the command processor looked
 };
 
 struct StagePlan {

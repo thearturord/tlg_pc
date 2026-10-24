@@ -989,7 +989,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
     if (rasterizer->ConstRingLevel() != 0) {
         // The queue position this operation will have, and the position the raster thread has finished (documents/tlg/pc-port-draw-pipeline-architecture.md, T1).
         rasterizer->FrontQueueOp(op.draw_plan.get(), op.dispatch_plan.get(), sp.pushed.load(std::memory_order_acquire) + 1,
-                                 sp.done.load(std::memory_order_acquire));
+                                 sp.done.load(std::memory_order_acquire), call.tag.valid ? call.tag.seq : (op.draw_plan ? op.draw_plan->native_seq : 0));
     }
     RasterPush(std::move(op), false);
 }

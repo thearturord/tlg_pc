@@ -1747,9 +1747,17 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             if (ring_verify_interval != 0 && ring->address != 0 && ++ring_verify_counter % ring_verify_interval == 0) {
                 std::vector<u8> now(ring->size);
                 memory->CopySparseMemory(ring->address, now.data(), ring->size);
-                ring_verified.fetch_add(1, std::memory_order_relaxed);
-                if (std::memcmp(now.data(), constant_ring->Data(ring->offset), ring->size) != 0) {
-                    ring_differing.fetch_add(1, std::memory_order_relaxed);
+                const bool differs = std::memcmp(now.data(), constant_ring->Data(ring->offset), ring->size) != 0;
+                if (ring->snapshot) {
+                    Core::NativeUploads::NoteSnapshotRing(2);
+                    if (differs) {
+                        Core::NativeUploads::NoteSnapshotRing(3);
+                    }
+                } else {
+                    ring_verified.fetch_add(1, std::memory_order_relaxed);
+                    if (differs) {
+                        ring_differing.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
         } else if (desc.IsSpecial()) {
@@ -2669,7 +2677,7 @@ void Rasterizer::FrontStageNotes(StagePlan& stage, u64 position, const DrawPlan*
     }
 }
 
-void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owner) {
+void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owner, u64 seq) {
     if (!stage.info) {
         return;
     }
@@ -2732,15 +2740,50 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
             ring_full.fetch_add(1, std::memory_order_relaxed);
             continue; // never wait: the binding stays on the raster thread
         }
-        memory->CopySparseMemory(address, constant_ring->Data(*offset), size);
+        bool from_snapshot = false;
+        if (seq != 0 && Core::NativeUploads::SnapshotsEnabled()) {
+            // N5d: the writers' copy of the range as it was when this record was issued; a range the newest write only partly covers is not known at all
+            const auto result = Core::NativeUploads::SnapshotRead(address, size, seq, constant_ring->Data(*offset));
+            if (result == Core::NativeUploads::SnapshotResult::Partial) {
+                Core::NativeUploads::NoteSnapshotRing(1);
+                continue; // the binding stays on the raster thread (the ring bytes already allocated are simply unused)
+            }
+            from_snapshot = result == Core::NativeUploads::SnapshotResult::Found;
+            if (from_snapshot) {
+                // guard (on until the snapshots are proven): where guest memory holds other bytes than the snapshot, the guest bytes are used as before and the case is counted
+                static const bool guard = [] {
+                    const char* e = std::getenv("TLG_SNAPSHOT_GUARD");
+                    return e == nullptr || *e != '0';
+                }();
+                if (guard) {
+                    thread_local std::vector<u8> now;
+                    now.resize(size);
+                    memory->CopySparseMemory(address, now.data(), size);
+                    if (std::memcmp(now.data(), constant_ring->Data(*offset), size) != 0) {
+                        std::memcpy(constant_ring->Data(*offset), now.data(), size);
+                        Core::NativeUploads::NoteSnapshotRing(4);
+                        from_snapshot = false;
+                    }
+                }
+                if (from_snapshot) {
+                    Core::NativeUploads::NoteSnapshotRing(0);
+                }
+            }
+            if (result == Core::NativeUploads::SnapshotResult::Found && !from_snapshot) {
+                memory->CopySparseMemory(address, constant_ring->Data(*offset), size);
+            }
+        }
+        if (!from_snapshot) {
+            memory->CopySparseMemory(address, constant_ring->Data(*offset), size);
+        }
         constant_ring->Flush(*offset, size);
-        stage.ring.push_back({index, static_cast<u32>(size), *offset, address});
+        stage.ring.push_back({index, static_cast<u32>(size), *offset, address, from_snapshot});
         ring_taken.fetch_add(1, std::memory_order_relaxed);
         ring_bytes.fetch_add(size, std::memory_order_relaxed);
     }
 }
 
-void Rasterizer::FrontQueueOp(DrawPlan* draw, DispatchPlan* dispatch, u64 position, u64 done) {
+void Rasterizer::FrontQueueOp(DrawPlan* draw, DispatchPlan* dispatch, u64 position, u64 done, u64 seq) {
     if (const_ring_level == 0 || (!draw && !dispatch)) {
         return;
     }
@@ -2758,11 +2801,11 @@ void Rasterizer::FrontQueueOp(DrawPlan* draw, DispatchPlan* dispatch, u64 positi
     }
     if (draw) {
         for (auto& stage : draw->stages) {
-            FrontStageRing(stage, done, draw);
+            FrontStageRing(stage, done, draw, seq);
         }
         draw->ring_end = constant_ring->Position();
     } else {
-        FrontStageRing(dispatch->stage, done, nullptr);
+        FrontStageRing(dispatch->stage, done, nullptr, seq);
         dispatch->ring_end = constant_ring->Position();
     }
 }

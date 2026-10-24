@@ -44,6 +44,26 @@ void NoteRingSkipped(u64 bytes);
 /// Where SynchronizeMemory copied from (guest address): the on-demand uploads are kept by 256 KB block to name the biggest.
 void NoteUploadedRange(u64 address, u64 bytes);
 
+// ---- snapshots (N5d) ---------------------------------------------------------------------------------------------------------------
+// The writers' announcements carry the data: at the end of a write (Unmap) the written bytes are copied into a ring of host memory, stamped with the number of the next
+// record. A record that reads a range of such memory takes the bytes as they were when it was issued, whatever the command processor's lag and whatever the render
+// thread wrote into the same buffer for the next draw. `TLG_SNAPSHOTS=1` (needs the constant ring, `TLG_CONST_RING=3` or more, which carries the bytes to the GPU).
+
+bool SnapshotsEnabled();
+/// A write of [begin, begin + size) just ended (stamp = the number the next record gets). Ranges over 64 KB are not kept.
+void SnapshotTake(u64 begin, u64 size, u64 stamp);
+
+enum class SnapshotResult : u8 {
+    None,    ///< no snapshot touches the range (it was never announced, or the snapshots are gone): the caller reads guest memory as before
+    Partial, ///< the newest write before the record touches the range but does not cover it: unknown, the caller must not use guest memory
+    Found,   ///< `data` holds the range as the newest write before the record left it
+};
+/// The range [begin, begin + size) as the writes before record `seq` left it. For `Found` the bytes are copied to `data` (size bytes).
+SnapshotResult SnapshotRead(u64 begin, u64 size, u64 seq, void* data);
+
+/// The constant ring and the snapshots: 0 a ring binding carries a snapshot, 1 refused (partly covered), 2 verified against guest memory at bind time, 3 differs from it.
+void NoteSnapshotRing(u32 what);
+
 nlohmann::json Report();
 
 } // namespace Core::NativeUploads
