@@ -510,7 +510,7 @@ struct SignalImpl : public PageManager::Impl {
                             break;
                         }
                         std::memcpy(&word, reinterpret_cast<const void*>(at), 8);
-                        if (word >= image && word < image + 0x8000000) {
+                        if (word >= image && word < image + 0x1700000) { // the code of the game image only (ghidra 0x1000000 to 0x2700000), not its data
                             stack_words[found++] = word;
                         }
                     }

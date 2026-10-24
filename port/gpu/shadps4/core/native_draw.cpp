@@ -6451,6 +6451,32 @@ u64 PS4_SYSV_ABI ResourceTextureInit(u64 object, u64 a1, u64 a2, u64 a3, u64 a4,
     return 0;
 }
 
+/// N5b: the same, but with the update audit on the function runs here and the memory it cleared or filled (initial data, or a memset to zero) is announced after it
+/// returns: the texture memory pointer is at object + 0x30 and its size at object + 0x38 (set by the allocation inside the initialization).
+template <u32 Kind>
+u64 PS4_SYSV_ABI ResourceTextureInitAnnounced(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    NativeResources::NoteTextureObject(object);
+    NativeRegistry::NoteTextureInitializing(object);
+    if (!NativeUpdates::enabled.load(std::memory_order_relaxed)) {
+        return 0;
+    }
+    static constexpr const char* Names[3] = {"ResourceTexture1D", "ResourceTexture2D", "ResourceTexture3D"};
+    const u64 original = Core::GuestHooks::OriginalEntry(Names[Kind]);
+    if (original == 0) {
+        return 0;
+    }
+    const u64 result = reinterpret_cast<GuestFunction6>(original)(object, a1, a2, a3, a4, a5);
+    Guarded([&]() -> u64 {
+        const u64 memory = Rd<u64>(object, 0x30);
+        const u64 size = Rd<u64>(object, 0x38);
+        if (memory != 0 && size != 0 && size <= (1ull << 32)) {
+            NativeUpdates::NoteWriterRange(6, memory, size);
+        }
+        return 0;
+    });
+    return 0x8000000000000000ull | (result & 0x7fffffffffffffffull);
+}
+
 u64 PS4_SYSV_ABI ResourceBufferDestroyed(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     NativeResources::NoteBufferDestroyed(object);
     NativeRegistry::NoteBufferDestroyed(object);
@@ -6524,6 +6550,15 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "resource_buffer_created") {
         return reinterpret_cast<u64>(&ResourceBufferCreated);
+    }
+    if (name == "resource_texture_init_1d") {
+        return reinterpret_cast<u64>(&ResourceTextureInitAnnounced<0>);
+    }
+    if (name == "resource_texture_init_2d") {
+        return reinterpret_cast<u64>(&ResourceTextureInitAnnounced<1>);
+    }
+    if (name == "resource_texture_init_3d") {
+        return reinterpret_cast<u64>(&ResourceTextureInitAnnounced<2>);
     }
     if (name == "resource_texture_init") {
         return reinterpret_cast<u64>(&ResourceTextureInit);

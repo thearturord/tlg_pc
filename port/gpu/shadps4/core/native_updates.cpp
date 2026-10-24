@@ -53,6 +53,7 @@ struct MapCounters {
 
 struct FaultCounters {
     std::atomic<u64> total{};
+    std::atomic<u64> own_host_writes{}; ///< written by our own native code (tags into the game's command buffers), not by the game
     std::atomic<u64> covered_now{}, covered_earlier{}, covered_other_thread{}, uncovered{};
     std::array<std::atomic<u64>, 8> covered_by_writer{}; ///< covered_now by the announcing writer (0: a Map)
     std::array<std::atomic<u64>, 16> uncovered_by_class{};
@@ -147,6 +148,16 @@ void NoteWriterRange(u32 writer, u64 address, u64 size) {
 
 void NoteFault(u64 address, u64 size) {
     faults.total.fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
+    {
+        const u64 exe = reinterpret_cast<u64>(GetModuleHandleA(nullptr));
+        const u64 rip = GuestHooks::FaultRip();
+        if (rip >= exe && rip < exe + 0x10000000) {
+            faults.own_host_writes.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+#endif
     const u32 usage_class = NativeResources::UsageClassOf(address) & 15;
     const u64 now = NowNs();
     const u64 thread = ThreadKey();
@@ -239,10 +250,12 @@ nlohmann::json Report() {
     f["inside_a_map_window_of_the_same_thread_within_200ms"] = faults.covered_now.load();
     f["inside_a_window_by_announcer"] = {{"map", faults.covered_by_writer[0].load()}, {"skinning_FUN_01c93730", faults.covered_by_writer[1].load()}, {"light_constants_FUN_01eeb610", faults.covered_by_writer[2].load()},
                                                        {"command_stream_memory_copy", faults.covered_by_writer[3].load()}, {"begin_recording_direct_stores", faults.covered_by_writer[4].load()},
-                                                       {"buffer_creation_with_initial_data", faults.covered_by_writer[5].load()}};
+                                                       {"buffer_creation_with_initial_data", faults.covered_by_writer[5].load()},
+                                                       {"texture_initialization", faults.covered_by_writer[6].load()}};
     f["inside_an_older_map_window_of_the_same_thread"] = faults.covered_earlier.load();
     f["inside_a_map_window_of_another_thread"] = faults.covered_other_thread.load();
     f["in_no_map_window"] = faults.uncovered.load();
+    f["written_by_our_own_native_code_tags_in_command_buffers"] = faults.own_host_writes.load();
     if (total != 0) {
         f["percent_announced_by_a_map_on_the_same_thread_within_200ms"] = 100.0 * static_cast<double>(faults.covered_now.load()) / static_cast<double>(total);
     }
@@ -279,7 +292,13 @@ nlohmann::json Report() {
     std::ranges::sort(sites, [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
     auto& list = f["unannounced_writes_by_faulting_instruction"] = nlohmann::json::array();
     for (size_t i = 0; i < sites.size() && i < 24; ++i) {
-        list.push_back({{"rip", sites[i].first.rip}, {"stack0", sites[i].first.st0}, {"stack1", sites[i].first.st1}, {"faults", sites[i].second.count}, {"sample_address", sites[i].second.sample_address},
+#ifdef _WIN32
+        const u64 exe = reinterpret_cast<u64>(GetModuleHandleA(nullptr));
+        const u64 rip_rva = sites[i].first.rip >= exe && sites[i].first.rip < exe + 0x10000000 ? sites[i].first.rip - exe : 0;
+#else
+        const u64 rip_rva = 0;
+#endif
+        list.push_back({{"rip", sites[i].first.rip}, {"host_exe_rva", rip_rva}, {"stack0", sites[i].first.st0}, {"stack1", sites[i].first.st1}, {"faults", sites[i].second.count}, {"sample_address", sites[i].second.sample_address},
                         {"memory_class", NativeResources::UsageClassNameOf(sites[i].second.usage_class)}});
     }
     return j;
