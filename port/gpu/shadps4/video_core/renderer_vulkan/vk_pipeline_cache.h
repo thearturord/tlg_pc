@@ -5,6 +5,7 @@
 
 #include "core/native_binding.h"
 #include "core/native_draw.h"
+#include "core/native_resources.h"
 #include "video_core/amdgpu/draw_state.h"
 #include <functional>
 #include <memory>
@@ -131,6 +132,11 @@ struct DrawPlan {
     u32 binding_count{};
     bool bindings_complete{};
     bool any_flat_skipped{}; ///< N3b: a stage of the plan has no flat user data, the binder must serve the draw
+    /// N3c: the immutable engine buffer of each kind 1 binding, resolved by the engine's id when the plan was made (null: none); valid while `handle_epoch` is the
+    /// current `Core::NativeResources::ImmutableEpoch()`
+    std::array<Core::NativeResources::ImmutableBuffer*, Core::NativeDraw::MaxRecordBindings> handles{};
+    u64 handle_epoch{};
+    bool has_handles{};
 };
 
 struct DispatchPlan {

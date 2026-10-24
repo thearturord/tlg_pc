@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "core/native_resources.h"
 #include "video_core/readback_policy.h"
 
 #include <condition_variable>
@@ -104,9 +105,12 @@ public:
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
 
     /// Finds a buffer for the specified region.
+    /// immutable_hint (N3c): the immutable engine buffer the caller resolved by the engine's id (null: found by the address).
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
-                                                             bool is_texel_buffer = false);
+                                                             bool is_texel_buffer = false,
+                                                             Core::NativeResources::ImmutableBuffer* immutable_hint = nullptr,
+                                                             bool verify_hint = false);
 
     /// The arena range of a copy destination that is downloaded in stream order (an explicit readback): the CPU's pending writes are
     /// uploaded, the range is not marked GPU modified.

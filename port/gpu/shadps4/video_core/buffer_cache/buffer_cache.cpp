@@ -521,12 +521,30 @@ void BufferCache::RecordDmaDownload(const Buffer* arena, VAddr dst, u32 size, bo
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
-                                                        bool is_written, bool is_texel_buffer) {
+                                                        bool is_written, bool is_texel_buffer,
+                                                        Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint) {
     Core::ResourceAudit::Note(Core::ResourceAudit::BufferUse, device_addr, size, is_written);
     // An immutable engine buffer (see NativeResources::ImmutableBuffer): after one synchronization of the whole buffer it is
     // read straight from the arena.
     if (!is_written && !is_texel_buffer && Core::NativeResources::ImmutableResidencyEnabled()) {
-        if (auto* immutable = Core::NativeResources::FindImmutable(device_addr, size)) {
+        Core::NativeResources::ImmutableBuffer* immutable = nullptr;
+        if (immutable_hint != nullptr) {
+            // N3c: the handle of the engine id replaces the lookup by address; it must contain the request
+            if (device_addr >= immutable_hint->begin && device_addr + size <= immutable_hint->end && immutable_hint->alive.load(std::memory_order_acquire)) {
+                immutable = immutable_hint;
+                Core::NativeResources::NoteHandle(0);
+                if (verify_hint && Core::NativeResources::FindImmutable(device_addr, size) != immutable) {
+                    Core::NativeResources::NoteHandle(4);
+                    immutable = Core::NativeResources::FindImmutable(device_addr, size);
+                }
+            } else {
+                Core::NativeResources::NoteHandle(3);
+                immutable = Core::NativeResources::FindImmutable(device_addr, size);
+            }
+        } else {
+            immutable = Core::NativeResources::FindImmutable(device_addr, size);
+        }
+        if (immutable != nullptr) {
             if (immutable->synced.load(std::memory_order_acquire) && !Core::NativeResources::ImmutableCheck(*immutable)) {
                 const auto* arena = GetArena(device_addr >> block_shift, (device_addr + size - 1) >> block_shift);
                 Core::NativeResources::NoteImmutableHit();

@@ -45,6 +45,7 @@ struct ImmutableBuffer {
     u64 begin{};
     u64 end{};
     u64 object{};
+    u64 id{}; ///< the engine's unique id of the buffer (JsResource +0x10): the key of the native handles (N3c)
     std::atomic<bool> alive{true};
     std::atomic<bool> synced{false};
     std::atomic<u32> generation{0}; ///< bumped by every CPU write to the range
@@ -56,6 +57,13 @@ struct ImmutableBuffer {
 bool ImmutableResidencyEnabled();
 /// The live immutable buffer that contains [address, address + size), or null.
 ImmutableBuffer* FindImmutable(VAddr address, u32 size);
+/// N3c: the live immutable buffer of the engine id `id` that contains [address, address + size) (size 0: the id alone), or null. Per thread cache by id, valid while
+/// `ImmutableEpoch` does not change (a buffer was registered or destroyed). The pointer is only good for the epoch read together with it.
+ImmutableBuffer* FindImmutableById(u64 id);
+u64 ImmutableEpoch();
+/// N3c counters of the handle path (0 handle used, 1 handle stale because the epoch changed, 2 the id names no immutable buffer, 3 the request is outside the
+/// handle's range, 4 verify mode: the handle differs from the address lookup).
+void NoteHandle(u32 what);
 /// The backend synchronized the whole buffer; `generation` is the one read before it started.
 void ImmutableSynced(ImmutableBuffer& buffer, u32 generation);
 /// Every 4096th request: true when the guest memory no longer matches what was synchronized (the state is dropped).

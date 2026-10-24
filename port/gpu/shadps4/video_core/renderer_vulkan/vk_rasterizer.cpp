@@ -468,6 +468,16 @@ void ApplyExecRegisters(DrawInputs& in, const Core::NativeDraw::ExecDraw& draw, 
 
 /// N3 native binder switch (`TLG_NATIVE_BINDER`): 0 off, 1 the depth passes (class 0), 2 every class with a complete binding list, 3 like 2 and every descriptor is compared with
 /// the legacy one (the legacy one wins on a difference). Modes 1 and 2 also leave the flat user data out of the plan of a stage the record covers completely (N3b).
+/// N3c handle switch (`TLG_NATIVE_HANDLES`): 0 off, 1 the immutable engine buffers of a draw are found by the engine's id (resolved when the plan is made),
+/// 2 like 1 and every handle is compared with the lookup by address (the lookup wins on a difference). Needs the binder (the record's bindings) and the immutable residency.
+static u32 NativeHandleMode() {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_NATIVE_HANDLES");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 0u;
+    }();
+    return mode;
+}
+
 static u32 NativeBinderMode() {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_NATIVE_BINDER");
@@ -528,6 +538,18 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u32
     if (!pipeline_cache.PlanGraphicsTyped(exec_key, plan->fixed, vertex_user_data, pixel_user_data, *plan, skip_flat ? &draw : nullptr)) {
         RecyclePlan(std::move(plan));
         return nullptr;
+    }
+    plan->has_handles = false;
+    if (NativeHandleMode() != 0 && binder_mode != 0 && draw.bindings_complete && Core::NativeResources::ImmutableResidencyEnabled()) {
+        plan->handle_epoch = Core::NativeResources::ImmutableEpoch();
+        for (u32 i = 0; i < plan->binding_count; ++i) {
+            const auto& b = plan->bindings[i];
+            plan->handles[i] = b.kind == 1 && b.id != 0 ? Core::NativeResources::FindImmutableById(b.id) : nullptr;
+            plan->has_handles |= plan->handles[i] != nullptr;
+            if (b.kind == 1 && plan->handles[i] == nullptr && NativeHandleMode() == 2) {
+                Core::NativeResources::NoteHandle(2);
+            }
+        }
     }
     Core::NativeDraw::Live().fixed_native.fetch_add(1, std::memory_order_relaxed);
     return plan;
@@ -1306,7 +1328,7 @@ bool Rasterizer::StageFlatSkipped(const Shader::Info& stage) const {
 }
 
 /// The descriptor words of the binder's plan for the resource at flat user data `offset` of `stage` (null: the record has no binding there).
-const u32* Rasterizer::BinderWords(const Shader::Info& stage, u32 offset, u32 dwords, u32 kind) const {
+const u32* Rasterizer::BinderWords(const Shader::Info& stage, u32 offset, u32 dwords, u32 kind, u32* binding_index) const {
     const u32 s = stage.sw_stage == Shader::SwStage::Vertex ? 0 : stage.sw_stage == Shader::SwStage::Fragment ? 1 : 2;
     if (s > 1) {
         return nullptr;
@@ -1314,6 +1336,9 @@ const u32* Rasterizer::BinderWords(const Shader::Info& stage, u32 offset, u32 dw
     for (u32 i = 0; i < binder_plan->binding_count; ++i) {
         const auto& b = binder_plan->bindings[i];
         if (b.stage == s && b.kind == kind && offset >= b.offset && offset + dwords <= u32{b.offset} + b.dwords) {
+            if (binding_index != nullptr) {
+                *binding_index = i;
+            }
             return b.words + (offset - b.offset);
         }
     }
@@ -1766,8 +1791,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
             AmdGpu::Buffer chosen_sharp;
             bool from_record = false;
+            u32 record_binding = ~0u;
             if (binder_plan != nullptr && desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
-                if (const u32* words = BinderWords(stage, desc.sharp_fetch.offsets[0], 4, 1)) {
+                if (const u32* words = BinderWords(stage, desc.sharp_fetch.offsets[0], 4, 1, &record_binding)) {
                     chosen_sharp = desc.FromWords(words, stage);
                     from_record = true;
                     if (binder_verify) {
@@ -1803,8 +1829,17 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
+                // N3c: the immutable engine buffer named by the record's binding (by the engine's id), when the plan resolved one and nothing was registered since
+                Core::NativeResources::ImmutableBuffer* immutable_hint = nullptr;
+                if (record_binding != ~0u && binder_plan->has_handles && (binder_plan->handles[record_binding] != nullptr)) {
+                    if (binder_plan->handle_epoch == Core::NativeResources::ImmutableEpoch()) {
+                        immutable_hint = binder_plan->handles[record_binding];
+                    } else {
+                        Core::NativeResources::NoteHandle(1);
+                    }
+                }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-                    vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                    vsharp.base_address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2);
                 if (Core::NativeRegistry::AuditBuffer(vsharp.base_address, size, desc.is_written, desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase)) {
                     {
                         // where did the shader get this descriptor from, and did the record write the registers it sits in?

@@ -479,7 +479,7 @@ private:
     bool binder_verify{};
     const DrawPlan* NativeBinderFor(const DrawPlan* plan, u32 draw_class);
     /// kind: 1 buffer, 2 image, 3 sampler descriptor
-    const u32* BinderWords(const Shader::Info& stage, u32 offset, u32 dwords, u32 kind) const;
+    const u32* BinderWords(const Shader::Info& stage, u32 offset, u32 dwords, u32 kind, u32* binding_index = nullptr) const;
     /// N3b: the binder's plan has no flat user data for this stage
     bool StageFlatSkipped(const Shader::Info& stage) const;
     u64 dispatch_caller{}; ///< diagnostics: the game call that made the dispatch being bound

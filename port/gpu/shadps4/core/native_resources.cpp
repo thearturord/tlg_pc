@@ -113,6 +113,7 @@ std::array<Block, MaxBlocks> scan_buffer;
 std::shared_mutex immutable_mutex;
 std::map<u64, std::shared_ptr<ImmutableBuffer>> immutables;                  ///< by begin address
 std::unordered_map<u64, std::shared_ptr<ImmutableBuffer>> immutable_by_object;
+std::unordered_map<u64, std::shared_ptr<ImmutableBuffer>> immutable_by_id;
 std::vector<std::pair<u64, std::shared_ptr<ImmutableBuffer>>> immutable_graveyard; ///< destroyed, kept alive for readers
 std::atomic<u64> immutable_epoch{1};
 // ---- frame ring upload redundancy ---------------------------------------------------------------------------------------
@@ -129,6 +130,7 @@ std::array<std::atomic<u64>, 3> image_clears_refused;
 std::atomic<u64> image_copies_done{};
 std::array<std::atomic<u64>, 3> image_copies_refused;
 std::atomic<u64> immutable_hits{}, immutable_syncs{}, immutable_drops{}, immutable_checks{}, immutable_stale{};
+std::array<std::atomic<u64>, 8> immutable_handle_counters{};
 
 u64 NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -298,6 +300,7 @@ void AddImmutable(const Resource& resource) {
     entry->begin = resource.address;
     entry->end = resource.address + ((u64{resource.width} + 3) & ~u64{3});
     entry->object = resource.object;
+    entry->id = resource.id;
     std::unique_lock lock{immutable_mutex};
     if (const auto it = immutables.find(entry->begin); it != immutables.end()) {
         it->second->alive.store(false, std::memory_order_release);
@@ -306,6 +309,9 @@ void AddImmutable(const Resource& resource) {
     }
     immutables[entry->begin] = entry;
     immutable_by_object[entry->object] = entry;
+    if (entry->id != 0) {
+        immutable_by_id[entry->id] = entry;
+    }
     immutable_epoch.fetch_add(1, std::memory_order_release);
 }
 
@@ -521,6 +527,9 @@ void NoteBufferDestroyed(u64 object) {
             }
             const u64 now = NowNs();
             immutable_graveyard.emplace_back(now, it->second);
+            if (const auto by_id = immutable_by_id.find(it->second->id); by_id != immutable_by_id.end() && by_id->second == it->second) {
+                immutable_by_id.erase(by_id);
+            }
             immutable_by_object.erase(it);
             immutable_epoch.fetch_add(1, std::memory_order_release);
             std::erase_if(immutable_graveyard, [now](const auto& g) { return now - g.first > 5'000'000'000ull; });
@@ -693,6 +702,44 @@ ImmutableBuffer* FindImmutable(VAddr address, u32 size) {
     }
     gap = {gap_unit, previous != nullptr ? previous->end : 0, it != immutables.end() ? it->first : ~0ull};
     return nullptr;
+}
+
+u64 ImmutableEpoch() {
+    return immutable_epoch.load(std::memory_order_acquire);
+}
+
+void NoteHandle(u32 what) {
+    immutable_handle_counters[what & 7].fetch_add(1, std::memory_order_relaxed);
+}
+
+ImmutableBuffer* FindImmutableById(u64 id) {
+    struct Entry {
+        u64 id{};
+        ImmutableBuffer* buffer{};
+    };
+    struct Cache {
+        u64 epoch{};
+        std::array<Entry, 1024> entries{};
+    };
+    static thread_local Cache cache;
+    const u64 epoch = immutable_epoch.load(std::memory_order_acquire);
+    if (cache.epoch != epoch) {
+        cache.entries.fill({});
+        cache.epoch = epoch;
+    }
+    Entry& entry = cache.entries[(id * 0x9E3779B97F4A7C15ull) >> 54];
+    if (entry.id == id) {
+        return entry.buffer; // may be null: the id names no immutable buffer (the negative answer is cached too)
+    }
+    ImmutableBuffer* found = nullptr;
+    {
+        std::shared_lock lock{immutable_mutex};
+        if (const auto it = immutable_by_id.find(id); it != immutable_by_id.end() && it->second->alive.load(std::memory_order_acquire)) {
+            found = it->second.get();
+        }
+    }
+    entry = {id, found};
+    return found;
 }
 
 void ImmutableSynced(ImmutableBuffer& buffer, u32 generation) {
@@ -940,7 +987,12 @@ nlohmann::json Report() {
                                       {"whole_buffer_syncs", immutable_syncs.load()},
                                       {"dropped_by_cpu_writes", immutable_drops.load()},
                                       {"content_checks", immutable_checks.load()},
-                                      {"changed_without_fault", immutable_stale.load()}};
+                                      {"changed_without_fault", immutable_stale.load()},
+                                      {"handles_used", immutable_handle_counters[0].load()},
+                                      {"handles_stale_epoch_changed", immutable_handle_counters[1].load()},
+                                      {"handles_id_names_no_immutable_buffer", immutable_handle_counters[2].load()},
+                                      {"handles_request_outside_the_range", immutable_handle_counters[3].load()},
+                                      {"handles_differing_from_the_address_lookup", immutable_handle_counters[4].load()}};
     }
     return out;
 }
