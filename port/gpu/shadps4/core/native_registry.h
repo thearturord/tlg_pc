@@ -94,6 +94,10 @@ std::string DescribeCurrentDraw();
 /// Diagnostics: a device context pointer-sized slot at `offset` held a pointer to a Js resource (buffer / texture) that the known context tables do not
 /// explain; counted per offset and kind for the report.
 void NoteContextSlot(u32 offset, u32 resource_kind);
+/// The engine's render device object (the `this` of the pass functions, seen by the hook of the per-primitive binding `FUN_01c92f30`): its buffer descriptor
+/// table at +0xe80 (up to 7 V# of 16 bytes: the primitive's resource set, copied there by that function) is what the shaders that fetch their constants from a table read.
+void SetRenderDevice(u64 render_device);
+u64 RenderDevice();
 /// Raster thread: the record sequence of the draw being bound (0 none).
 void SetCurrentDraw(u64 seq, bool from_plan = false);
 u64 CurrentDrawSeq();
@@ -114,7 +118,9 @@ void NoteShPacket(u32 reg_offset, const u32* words, u32 count);
 /// The pass class of what the raster thread is binding for (0 z prepass / shadow, 1 g-buffer, 2 forward, 3 compute / other, 15 untagged).
 void SetDrawClass(u32 draw_class);
 /// Returns true when the draw has a description and it does not explain this buffer.
-bool AuditBuffer(u64 address, u64 size, bool written);
+/// `shader_constant`: the descriptor is built from immediates and the stage's program base (constants stored with the shader code), so it belongs to the shader
+/// variant, not to the draw's engine objects.
+bool AuditBuffer(u64 address, u64 size, bool written, bool shader_constant = false);
 void AuditImage(u64 address);
 
 void Start();

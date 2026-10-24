@@ -75,6 +75,7 @@ thread_local u64 draw_call_index = 0;
 constexpr u32 DrawRing = 8192;
 std::unique_ptr<DrawResources[]> draw_ring;
 std::mutex draw_ring_mutex;
+std::array<std::atomic<u64>, 16> explained_by_shader_constants{};
 std::array<std::atomic<u64>, 16> explained_buffers{}, unexplained_registered_buffers{}, unexplained_unknown_buffers{}, no_draw_record_buffers{};
 std::array<std::atomic<u64>, 16> explained_images{}, unexplained_images{}, no_draw_record_images{};
 // buffers by (class, special draw?): requests explained / not by the draw's description
@@ -520,6 +521,16 @@ bool CurrentDrawFromPlan() {
     return current_from_plan;
 }
 
+namespace {
+std::atomic<u64> render_device{0};
+}
+void SetRenderDevice(u64 device) {
+    render_device.store(device, std::memory_order_relaxed);
+}
+u64 RenderDevice() {
+    return render_device.load(std::memory_order_relaxed);
+}
+
 u64 CurrentDrawCallIndex() {
     return draw_call_index;
 }
@@ -561,7 +572,7 @@ void SetDrawClass(u32 draw_class_) {
     draw_class = draw_class_ & 15;
 }
 
-bool AuditBuffer(u64 address, u64 size, bool written) {
+bool AuditBuffer(u64 address, u64 size, bool written, bool shader_constant) {
     bool unexplained_flag = false;
     if (!enabled.load(std::memory_order_relaxed)) {
         return false;
@@ -601,9 +612,11 @@ bool AuditBuffer(u64 address, u64 size, bool written) {
             for (u32 i = 0; i < draw->buffer_count && !explained; ++i) {
                 explained = address >= draw->buffers[i].begin && address + size <= draw->buffers[i].end;
             }
+            const bool by_shader = !explained && shader_constant;
+            explained |= by_shader;
             (explained ? special_explained : special_unexplained)[draw_class][draw->special != 0 ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
             if (explained) {
-                explained_buffers[draw_class].fetch_add(1, std::memory_order_relaxed);
+                (by_shader ? explained_by_shader_constants : explained_buffers)[draw_class].fetch_add(1, std::memory_order_relaxed);
             } else {
                 bool by_packets = false;
                 {
@@ -895,6 +908,7 @@ nlohmann::json Report() {
                                                                   {"buffers_unexplained_special_draws", special_unexplained[c][1].load()},
                                                                   {"buffers_unexplained_but_written_by_sh_register_packets", explained_by_sh[c].load()},
                                                                   {"buffers_explained_by_the_draws_objects", explained_buffers[c].load()},
+                                                                  {"buffers_explained_by_the_shaders_own_constants", explained_by_shader_constants[c].load()},
                                                                   {"buffers_other_registered_object", unexplained_registered_buffers[c].load()},
                                                                   {"buffers_not_registered", unexplained_unknown_buffers[c].load()},
                                                                   {"buffers_no_draw_record", no_draw_record_buffers[c].load()},
@@ -936,7 +950,8 @@ nlohmann::json Report() {
                                {"descriptor_read", summary == 0 ? "directly from the user data / flat table" : "fetched by the shader from a table in memory"}, {"flat_offset", bucket},
                                {"registers_set_by_the_record", set_by_record == 0 ? "no" : set_by_record == 1 ? "yes" : "n/a"},
                                {"fetch_table_in_description", table_described == 0 ? "no" : table_described == 1 ? "yes" : "n/a"},
-                               {"plan_user_data_equals_record", matches == 0 ? "DIFFERS" : matches == 1 ? "equal" : "n/a"}, {"requests", count}});
+                               {"post_operation_of_the_descriptor", matches >> 8}, {"address_relative_to_program_base", fmt::format("{}2^{}", (matches & 0x80) != 0 ? "-" : "+", matches & 0x3f)},
+                               {"requests", count}});
             }
         }
         auto& ex = v2["samples_unexplained_buffers"] = nlohmann::json::array();

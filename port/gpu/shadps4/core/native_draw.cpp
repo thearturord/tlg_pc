@@ -399,6 +399,15 @@ void ObserveContext(u64 ctx, NativeRegistry::DrawResources* draw) {
     Observe(Obj(Rd<u64>(ctx, Ctx::RasterizerState)), Kind::RasterizerState);
     Observe(Obj(Rd<u64>(ctx, Ctx::DepthStencilState)), Kind::DepthStencilState);
     if (draw != nullptr) {
+        // The primitive's resource set: the per-primitive binding (FUN_01c92f30) copies up to seven buffer descriptors (V#, 16 bytes: raw ranges of the frame data arena)
+        // of the primitive into the render device at +0xe80 and uploads them as the contents of a constant buffer that the shaders read their constants through.
+        if (const u64 render_device = NativeRegistry::RenderDevice(); render_device != 0) {
+            for (u32 k = 0; k < 7; ++k) {
+                add_vsharp(render_device + 0xe80 + k * 16);
+            }
+        }
+    }
+    if (draw != nullptr) {
         // diagnostics: every buffer the context holds in a constant buffer slot of any API stage, and the buffer-class objects in the shader resource tables
         for (u32 stage = 0; stage < 6; ++stage) {
             for (u32 slot = 0; slot < 16; ++slot) {
@@ -6295,7 +6304,18 @@ u64 PS4_SYSV_ABI CueCall(u64 cue, u64 stage, u64 slot, u64 descriptor, u64 a4, u
     return 0;
 }
 
+/// FUN_01c92f30(render device, device context, primitive, helper): the per-primitive resource binding of the Z / G-buffer / forward passes. Only notes the render device.
+u64 PS4_SYSV_ABI PrimitiveBind(u64 render_device, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (NativeRegistry::enabled.load(std::memory_order_relaxed) && render_device != 0) {
+        NativeRegistry::SetRenderDevice(render_device);
+    }
+    return 0;
+}
+
 u64 FindHandler(const std::string& name) {
+    if (name == "primitive_bind") {
+        return reinterpret_cast<u64>(&PrimitiveBind);
+    }
     if (name == "cue_set_constant_buffer") {
         return reinterpret_cast<u64>(&CueCall<0>);
     }

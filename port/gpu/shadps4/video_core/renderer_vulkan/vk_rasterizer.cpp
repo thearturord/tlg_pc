@@ -1706,7 +1706,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
-                if (Core::NativeRegistry::AuditBuffer(vsharp.base_address, size, desc.is_written)) {
+                if (Core::NativeRegistry::AuditBuffer(vsharp.base_address, size, desc.is_written, desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase)) {
                     {
                         // where did the shader get this descriptor from, and did the record write the registers it sits in?
                         thread_local u32 site_tick = 0;
@@ -1726,7 +1726,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                 const u32 mask = stage.sw_stage == Shader::SwStage::Fragment ? masks >> 16 : masks & 0xffff;
                                 set_by_record = (mask >> offset & 1) != 0 ? 1 : 0;
                             }
-                            Core::NativeRegistry::NoteUnexplainedSite(static_cast<u32>(stage.sw_stage), static_cast<u32>(desc.sharp_fetch.summary) != 0 ? 1u : 0u, offset, set_by_record, table_described, 2);
+                            // where is the buffer relative to the program of the stage (shader constants sit next to the code), and which post operation builds the descriptor
+                            const u64 program = stage.ProgramBase();
+                            const u64 distance = vsharp.base_address >= program ? vsharp.base_address - program : program - vsharp.base_address;
+                            const u32 below = vsharp.base_address >= program ? 0u : 1u;
+                            const u32 bucket = distance == 0 ? 0u : static_cast<u32>(std::bit_width(distance));
+                            Core::NativeRegistry::NoteUnexplainedSite(static_cast<u32>(stage.sw_stage), static_cast<u32>(desc.sharp_fetch.summary) != 0 ? 1u : 0u, offset, set_by_record, table_described,
+                                                                      (static_cast<u32>(desc.post_op) << 8) | (below << 7) | std::min(bucket, 63u));
                         }
                     }
                     // the draw's description did not name this buffer: where did the shader's descriptor come from (user data register, flattened table offset)?
