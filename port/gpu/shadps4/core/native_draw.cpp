@@ -1197,6 +1197,45 @@ thread_local std::array<u64, 2> synth_desc_key;
 /// The descriptor fields a stage specialization compares (kind 1 buffer V#, 2 image T#, 3 sampler S#, 0 no object in the slot), without addresses and sizes:
 /// a running key of the stage's descriptors in the order the record builder reads them.
 thread_local NativeRegistry::DrawResources* v2_collect = nullptr; ///< the draw whose record is being built (native registry description)
+/// The object the last descriptor helper (ResourceDescriptor, ConstBufferDescriptor, SamplerDescriptor) read, for the binding list of the description.
+thread_local struct {
+    u64 object, resource, id;
+} last_descriptor_object;
+
+void SetLastDescriptorObject(u64 object, bool sampler = false) {
+    last_descriptor_object = {};
+    if (object == 0) {
+        return;
+    }
+    u64 resource = object;
+    if (!sampler) {
+        const u32 tag = Rd<u32>(object, 0x18);
+        if (tag >= 22 && tag <= 25) {
+            resource = Obj(Rd<u64>(object, 0x30)); // a view: the resource it looks at
+        }
+    }
+    last_descriptor_object = {object, resource, resource != 0 ? Rd<u64>(resource, 0x10) : 0};
+}
+
+/// Adds the descriptor just built to the draw's binding list (`offset` 0xffff: an entry of a table behind a pointer).
+void NoteBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* words, u32 dwords) {
+    if (v2_collect == nullptr || last_descriptor_object.object == 0) {
+        return;
+    }
+    NativeRegistry::DrawResources::Binding binding{};
+    binding.stage = static_cast<u8>(stage);
+    binding.kind = static_cast<u8>(kind);
+    binding.offset = static_cast<u16>(offset);
+    binding.slot = static_cast<u16>(slot);
+    binding.dwords = static_cast<u16>(std::min<u32>(dwords, 8));
+    binding.object = last_descriptor_object.object;
+    binding.resource = last_descriptor_object.resource;
+    binding.id = last_descriptor_object.id;
+    for (u32 i = 0; i < binding.dwords; ++i) {
+        binding.words[i] = words[i];
+    }
+    v2_collect->AddBinding(binding);
+}
 
 void NoteDescriptor(u32 stage, u32 kind, const u32* d) {
     if (v2_collect != nullptr) {
@@ -1287,8 +1326,10 @@ u32 ResourceDescriptor(u64 ctx, u32 stage, u32 slot, u32* out, u32 max_dwords) {
             out[i] = Rd<u32>(src, i * 4);
         }
         NoteDescriptor(stage, buffer ? 1 : 2, out);
+        SetLastDescriptorObject(view);
     } else {
         NoteDescriptor(stage, 0, nullptr);
+        SetLastDescriptorObject(0);
     }
     for (u32 i = size; i < max_dwords; ++i) {
         out[i] = 0;
@@ -1320,6 +1361,7 @@ void ConstBufferDescriptor(u64 ctx, u32 stage, u32 slot, u32* out) {
         out[i] = buffer ? Rd<u32>(buffer, 0x60 + i * 4) : 0;
     }
     NoteDescriptor(stage, buffer ? 1 : 0, out);
+    SetLastDescriptorObject(buffer);
 }
 
 void SamplerDescriptor(u64 ctx, u32 stage, u32 slot, u32* out) {
@@ -1328,6 +1370,7 @@ void SamplerDescriptor(u64 ctx, u32 stage, u32 slot, u32* out) {
         out[i] = sampler ? Rd<u32>(sampler, 0x64 + i * 4) : 0;
     }
     NoteDescriptor(stage, sampler ? 3 : 0, out);
+    SetLastDescriptorObject(sampler, true);
 }
 
 /// Which dwords of the tables behind user data pointers a shader reads: the scalar loads (`s_load_*`) from the SGPR
@@ -1488,17 +1531,20 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 shader_block, u64 gnm, u64 input
         switch (type) {
         case 0: { // immediate resource (V# of 4 dwords or T# of 8)
             const u32 size = (flags & 1) ? 8 : 4;
-            ResourceDescriptor(ctx, stage, slot, words.data(), size);
+            const u32 got = ResourceDescriptor(ctx, stage, slot, words.data(), size);
             put(start, words.data(), size);
+            NoteBinding(stage, got == 8 ? 2 : 1, slot, start, words.data(), size);
             break;
         }
         case 1: // immediate sampler
             SamplerDescriptor(ctx, stage, slot, words.data());
             put(start, words.data(), 4);
+            NoteBinding(stage, 3, slot, start, words.data(), 4);
             break;
         case 2: // immediate constant buffer
             ConstBufferDescriptor(ctx, stage, slot, words.data());
             put(start, words.data(), 4);
+            NoteBinding(stage, 1, slot, start, words.data(), 4);
             break;
         case 18: // pointer to the fetch shader
             words[0] = static_cast<u32>(synth_fetch_address);
@@ -1599,13 +1645,16 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 shader_block, u64 gnm, u64 input
             u32* table = AllocTable(slots * entry);
             for (u32 s = 0; s < slots; ++s) {
                 if (type == 19) {
-                    ResourceDescriptor(ctx, stage, s, table + s * 8, 8);
+                    const u32 got = ResourceDescriptor(ctx, stage, s, table + s * 8, 8);
+                    NoteBinding(stage, got == 8 ? 2 : 1, s, 0xffff, table + s * 8, got);
                 } else if (type == 25) {
                     UavDescriptor(ctx, s, table + s * 8, 8);
                 } else if (type == 22) {
                     ConstBufferDescriptor(ctx, stage, s, table + s * 4);
+                    NoteBinding(stage, 1, s, 0xffff, table + s * 4, 4);
                 } else {
                     SamplerDescriptor(ctx, stage, s, table + s * 4);
+                    NoteBinding(stage, 3, s, 0xffff, table + s * 4, 4);
                 }
             }
             const u64 address = reinterpret_cast<u64>(table);

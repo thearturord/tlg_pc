@@ -68,6 +68,25 @@ struct DrawResources {
     void AddBuffer(u64 begin, u64 end);
     void AddImage(u64 start);
 
+    /// NativeDraw v2: the descriptors the record builder put into the draw's user data, with where they came from. A native binder looks a shader resource up by
+    /// (stage, flat user data offset) and gets the engine object, its resource and the descriptor words.
+    static constexpr u32 MaxBindings = 160;
+    struct Binding {
+        u8 stage;    ///< 0 vertex, 1 pixel (the record builder's order)
+        u8 kind;     ///< 1 buffer descriptor (V#), 2 image descriptor (T#), 3 sampler (S#)
+        u16 offset;  ///< flat user data index of the first dword (the user data register, or 16 + the extended user data index); 0xffff: an entry of a table behind a pointer
+        u16 slot;    ///< the engine's slot (constant buffer, shader resource, sampler) the object was found in
+        u16 dwords;
+        u64 object;   ///< the engine object in the slot (buffer, view, sampler)
+        u64 resource; ///< the resource behind it (buffer or texture); the sampler itself
+        u64 id;       ///< the engine's unique id of `resource` (object + 0x10), the key of the registry
+        u32 words[8];
+    };
+    u32 binding_count{};
+    u32 bindings_dropped{};
+    Binding bindings[MaxBindings];
+    void AddBinding(const Binding& binding);
+
     /// Diagnostics for the attribution of unexplained requests: buffers the context holds in slots the shaders' usage tables do not name
     /// (`where`: stage * 16 + slot of the constant buffer tables, 0x100 + stage * 128 + slot of the shader resource tables; +0x1000 for the
     /// object's own V# when it points elsewhere).
@@ -117,6 +136,9 @@ void NoteShPacket(u32 reg_offset, const u32* words, u32 count);
 
 /// The pass class of what the raster thread is binding for (0 z prepass / shadow, 1 g-buffer, 2 forward, 3 compute / other, 15 untagged).
 void SetDrawClass(u32 draw_class);
+/// NativeDraw v2 audit (raster thread): the legacy backend reads the descriptor of a shader resource from the flat user data at `offset` (`words`, `dwords` of them;
+/// offset 0xffff: it is not a single load of consecutive dwords). Compares it with the binding of the current draw's record at that offset: same words.
+void AuditBinding(u32 sw_stage, bool image, u32 offset, const u32* words, u32 dwords);
 /// Returns true when the draw has a description and it does not explain this buffer.
 /// `shader_constant`: the descriptor is built from immediates and the stage's program base (constants stored with the shader code), so it belongs to the shader
 /// variant, not to the draw's engine objects.

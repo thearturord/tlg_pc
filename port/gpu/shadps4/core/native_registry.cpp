@@ -340,6 +340,92 @@ void DrawResources::AddBuffer(u64 begin, u64 end) {
     }
 }
 
+void DrawResources::AddBinding(const Binding& binding) {
+    if (binding_count < MaxBindings) {
+        bindings[binding_count++] = binding;
+    } else {
+        ++bindings_dropped;
+    }
+}
+
+namespace {
+struct BindingCounters {
+    std::atomic<u64> exact{}, differs{}, not_found{}, in_table{}, not_single_load{}, no_record{}, id_registered{}, id_unregistered{};
+};
+std::array<std::array<BindingCounters, 2>, 16> binding_counters;
+std::atomic<u32> binding_logged{0};
+} // namespace
+
+void AuditBinding(u32 sw_stage, bool image, u32 offset, const u32* words, u32 dwords) {
+    if (!enabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    auto& counters = binding_counters[draw_class & 15][image ? 1 : 0];
+    const DrawResources* draw = (current_draw_seq != 0 && draw_ring) ? &draw_ring[current_draw_seq % DrawRing] : nullptr;
+    if (draw == nullptr || draw->seq != current_draw_seq) {
+        ++counters.no_record;
+        return;
+    }
+    if (offset == 0xffff || words == nullptr) {
+        ++counters.not_single_load;
+        return;
+    }
+    const u32 stage = sw_stage == 3 ? 0 : sw_stage == 0 ? 1 : 2;
+    const u8 kind = image ? 2 : 1;
+    for (u32 i = 0; i < draw->binding_count; ++i) {
+        const auto& b = draw->bindings[i];
+        if (b.stage != stage || b.kind != kind || b.offset == 0xffff || offset < b.offset || offset + dwords > b.offset + b.dwords) {
+            continue;
+        }
+        bool same = true;
+        for (u32 k = 0; k < dwords; ++k) {
+            same &= b.words[offset - b.offset + k] == words[k];
+        }
+        if (same) {
+            ++counters.exact;
+            thread_local u32 sampled = 0;
+            if ((sampled++ & 7) == 0) {
+                std::shared_lock lock{registry_mutex};
+                ++(by_id.contains(b.id) ? counters.id_registered : counters.id_unregistered);
+            }
+        } else {
+            ++counters.differs;
+            if (binding_logged.fetch_add(1) < 10) {
+                std::string text = fmt::format("binding differs: draw {} class {} {} stage {} offset {} slot {} object {:#x} id {} binding words:", draw->seq, draw_class, image ? "image" : "buffer", stage, offset, b.slot, b.object, b.id);
+                for (u32 k = 0; k < dwords; ++k) {
+                    text += fmt::format(" {:x}", b.words[offset - b.offset + k]);
+                }
+                text += " legacy words:";
+                for (u32 k = 0; k < dwords; ++k) {
+                    text += fmt::format(" {:x}", words[k]);
+                }
+                NoteDebug(text);
+            }
+        }
+        return;
+    }
+    // not at that offset: is the same descriptor an entry of a table behind a pointer?
+    for (u32 i = 0; i < draw->binding_count; ++i) {
+        const auto& b = draw->bindings[i];
+        if (b.stage == stage && b.kind == kind && b.offset == 0xffff && dwords <= b.dwords && std::memcmp(b.words, words, dwords * sizeof(u32)) == 0) {
+            ++counters.in_table;
+            return;
+        }
+    }
+    ++counters.not_found;
+    if (binding_logged.fetch_add(1) < 10) {
+        std::string text = fmt::format("binding not found: draw {} class {} {} stage {} offset {} legacy words:", draw->seq, draw_class, image ? "image" : "buffer", stage, offset);
+        for (u32 k = 0; k < dwords; ++k) {
+            text += fmt::format(" {:x}", words[k]);
+        }
+        text += fmt::format(" | bindings ({}):", draw->binding_count);
+        for (u32 i = 0; i < draw->binding_count && i < 16; ++i) {
+            text += fmt::format(" [s{} k{} o{} sl{} w{:x}]", draw->bindings[i].stage, draw->bindings[i].kind, draw->bindings[i].offset, draw->bindings[i].slot, draw->bindings[i].words[0]);
+        }
+        NoteDebug(text);
+    }
+}
+
 void DrawResources::AddOther(u64 begin, u64 end, u32 where) {
     for (u32 i = 0; i < other_count; ++i) {
         if (others[i].begin == begin && others[i].end == end) {
@@ -403,7 +489,25 @@ void StoreDraw(const DrawResources& draw) {
             draw_ring = std::make_unique<DrawResources[]>(DrawRing);
         }
     }
-    draw_ring[draw.seq % DrawRing] = draw;
+    // only the used part of the arrays (the whole struct is several KB per draw)
+    DrawResources& dst = draw_ring[draw.seq % DrawRing];
+    dst.seq = 0; // invalid while it is rewritten
+    dst.buffer_count = draw.buffer_count;
+    dst.image_count = draw.image_count;
+    dst.dropped = draw.dropped;
+    dst.special = draw.special;
+    dst.vs_object_entries = draw.vs_object_entries;
+    dst.ps_object_entries = draw.ps_object_entries;
+    dst.vs_object_pgm = draw.vs_object_pgm;
+    dst.note_calls = draw.note_calls;
+    dst.other_count = draw.other_count;
+    dst.binding_count = draw.binding_count;
+    dst.bindings_dropped = draw.bindings_dropped;
+    std::memcpy(dst.buffers, draw.buffers, draw.buffer_count * sizeof(draw.buffers[0]));
+    std::memcpy(dst.images, draw.images, draw.image_count * sizeof(draw.images[0]));
+    std::memcpy(dst.others, draw.others, draw.other_count * sizeof(draw.others[0]));
+    std::memcpy(dst.bindings, draw.bindings, draw.binding_count * sizeof(draw.bindings[0]));
+    dst.seq = draw.seq;
 }
 
 struct CueKey {
@@ -896,6 +1000,22 @@ nlohmann::json Report() {
         return out;
     };
     {
+        auto& v2b = j["binding_audit"] = nlohmann::json::object();
+        constexpr const char* names[16] = {"z_prepass_shadow", "g_buffer", "forward", "compute_other", "indirect_draws", "", "", "", "", "", "", "", "", "", "", "untagged"};
+        for (u32 c = 0; c < 16; ++c) {
+            for (u32 image = 0; image < 2; ++image) {
+                const auto& k = binding_counters[c][image];
+                if (k.exact + k.differs + k.not_found + k.in_table + k.not_single_load + k.no_record == 0) {
+                    continue;
+                }
+                v2b[std::string(names[c][0] ? names[c] : std::to_string(c)) + (image ? " images" : " buffers")] = {
+                    {"exact_same_words_at_the_same_stage_and_offset", k.exact.load()}, {"words_differ", k.differs.load()}, {"found_as_an_entry_of_a_table", k.in_table.load()},
+                    {"no_binding_at_that_offset", k.not_found.load()}, {"legacy_descriptor_is_built_from_immediates_or_several_loads", k.not_single_load.load()},
+                    {"no_draw_record", k.no_record.load()}, {"exact_and_object_registered_sampled", k.id_registered.load()}, {"exact_and_object_not_registered_sampled", k.id_unregistered.load()}};
+            }
+        }
+    }
+    {
         auto& v2 = j["draw_description_audit"] = nlohmann::json::object();
         constexpr const char* names[16] = {"z_prepass_shadow", "g_buffer", "forward", "compute_other", "indirect_draws", "", "", "", "", "", "", "", "", "", "", "untagged"};
         for (u32 c = 0; c < 16; ++c) {
@@ -947,7 +1067,7 @@ nlohmann::json Report() {
                 const auto& [key, count] = list[i];
                 const auto& [cls, stage, summary, bucket, set_by_record, table_described, matches] = key;
                 out.push_back({{"class", cls & 0xff}, {"plan_built_from_record", (cls & 0x100) != 0}, {"stage", stage_names[stage < 6 ? stage : 0]},
-                               {"descriptor_read", summary == 0 ? "directly from the user data / flat table" : "fetched by the shader from a table in memory"}, {"flat_offset", bucket},
+                               {"descriptor_read", summary == 0 ? "a single load of consecutive dwords from the flat user data" : "several loads and / or immediates"}, {"flat_offset", bucket},
                                {"registers_set_by_the_record", set_by_record == 0 ? "no" : set_by_record == 1 ? "yes" : "n/a"},
                                {"fetch_table_in_description", table_described == 0 ? "no" : table_described == 1 ? "yes" : "n/a"},
                                {"post_operation_of_the_descriptor", matches >> 8}, {"address_relative_to_program_base", fmt::format("{}2^{}", (matches & 0x80) != 0 ? "-" : "+", matches & 0x3f)},

@@ -1691,6 +1691,15 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
             }
         } else {
+            if (Core::NativeRegistry::enabled.load(std::memory_order_relaxed)) {
+                // NativeDraw v2 audit: the descriptor the legacy path reads is the binding of the record at that offset
+                const auto flat = stage.FlatUserData();
+                if (desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad && desc.sharp_fetch.offsets[0] + 4 <= flat.size()) {
+                    Core::NativeRegistry::AuditBinding(static_cast<u32>(stage.sw_stage), false, desc.sharp_fetch.offsets[0], flat.data() + desc.sharp_fetch.offsets[0], 4);
+                } else {
+                    Core::NativeRegistry::AuditBinding(static_cast<u32>(stage.sw_stage), false, 0xffff, nullptr, 0);
+                }
+            }
             const auto vsharp = desc.GetSharp(stage);
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
@@ -1934,6 +1943,15 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     u32 num_images{};
     for (const auto& image_desc : stage.images) {
+        if (Core::NativeRegistry::enabled.load(std::memory_order_relaxed)) {
+            // NativeDraw v2 audit: the T# the legacy path reads is the binding of the record at that offset
+            const auto flat = stage.FlatUserData();
+            if (image_desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad && image_desc.sharp_fetch.offsets[0] + 8 <= flat.size()) {
+                Core::NativeRegistry::AuditBinding(static_cast<u32>(stage.sw_stage), true, image_desc.sharp_fetch.offsets[0], flat.data() + image_desc.sharp_fetch.offsets[0], 8);
+            } else {
+                Core::NativeRegistry::AuditBinding(static_cast<u32>(stage.sw_stage), true, 0xffff, nullptr, 0);
+            }
+        }
         const auto tsharp = image_desc.GetSharp(stage);
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
