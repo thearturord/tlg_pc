@@ -3059,6 +3059,9 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory. The destination is
             // invalidated as one range first: written page by page the copy would take a write fault per page.
+            if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
+                Core::NativeUpdates::NoteWriterRange(3, dst, num_bytes); // a copy of the command stream (the engine's own CsCopyBufferDwords / Map copies), not a game write
+            }
             InvalidateMemory(dst, num_bytes, false);
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             buffer_cache.NoteCpGuestWrite(dst, num_bytes);

@@ -5514,6 +5514,27 @@ u64 PS4_SYSV_ABI LightWrites(u64 object, u64 source, u64 a2, u64 a3, u64 a4, u64
     return 0;
 }
 
+/// N5b: `RenderDev::BeginRecording(this)` fills two small dynamic buffers directly (no Map) once per frame: the buffer at this + 0x2830 (28,672 bytes: 256 records of 0x70)
+/// and the buffer at this + 0x26e0 (4,096 bytes: 128 records of 32), from the arrays of the frame data (the loops at 0x1c4b13e and 0x1c49a7b). Both are announced whole
+/// (the buffers are small); the size is the buffer's ByteWidth (description at +0x180).
+u64 PS4_SYSV_ABI RecordingWrites(u64 device, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
+    (void)a1, (void)a2, (void)a3, (void)a4, (void)a5, (void)ret, (void)caller_rsp;
+    if (!Core::NativeUpdates::enabled.load(std::memory_order_relaxed) || !IsHeapPointer(device)) {
+        return 0;
+    }
+    Guarded([&]() -> u64 {
+        for (const u64 field : {u64{0x2830}, u64{0x26e0}}) {
+            const u64 buffer = Rd<u64>(device, field);
+            const u64 width = IsHeapPointer(buffer) ? Rd<u32>(buffer, 0x180) : 0;
+            if (width != 0 && width <= (1u << 24)) {
+                Core::NativeUpdates::NoteWriterRange(4, Rd<u64>(buffer, 0x30), width);
+            }
+        }
+        return 0;
+    });
+    return 0;
+}
+
 u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4, u64 size, u64 ret, u64 caller_rsp) {
     if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && ctx != 0 && IsHeapPointer(resource) && (resource & 7) == 0 && Rd<u32>(resource, 0x124) == 1) {
         // N5a: a Map of a buffer is announced to the update audit; the game's function runs here and its result is returned
@@ -6409,6 +6430,16 @@ u64 PS4_SYSV_ABI ResourceBufferCreated(u64 device, u64 description, u64 initial,
         const u64 created = Guarded([&] { return Rd<u64>(out, 0); });
         NativeResources::NoteBufferObject(created);
         NativeRegistry::NoteBufferCreated(created);
+        if (NativeUpdates::enabled.load(std::memory_order_relaxed) && initial != 0) {
+            // N5b: a buffer created with initial data: the engine copied the data into the new memory before returning (announced after the write)
+            Guarded([&]() -> u64 {
+                const u64 width = Rd<u32>(created, 0x180);
+                if (width != 0 && width <= (1ull << 30)) {
+                    NativeUpdates::NoteWriterRange(5, Rd<u64>(created, 0x30), width);
+                }
+                return 0;
+            });
+        }
     }
     return 1;
 }
@@ -6553,6 +6584,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "tag_asc_cs_copy") {
         return reinterpret_cast<u64>(&TagAscCsCopy);
+    }
+    if (name == "recording_writes") {
+        return reinterpret_cast<u64>(&RecordingWrites);
     }
     if (name == "light_writes") {
         return reinterpret_cast<u64>(&LightWrites);

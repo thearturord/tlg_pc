@@ -19,7 +19,7 @@ extern std::atomic<bool> enabled;
 void Start();
 /// The engine mapped a buffer: `address` / `size` are what Map returned (the buffer's own memory, or a window of the frame ring), `memory` the buffer's own memory.
 void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u64 memory, u64 caller);
-/// A hooked engine function announces the memory it is about to write (`writer` names the function: 1 skinning matrices, 2 light constants).
+/// A hooked engine function announces the memory it is about to write (`writer` names the function: 1 skinning matrices, 2 light constants, 3 a memory copy of the command stream, 4 the BeginRecording stores, 5 buffer creation with initial data).
 void NoteWriterRange(u32 writer, u64 address, u64 size);
 /// The game wrote tracked memory (called from the fault handler, on the writing thread).
 void NoteFault(u64 address, u64 size);

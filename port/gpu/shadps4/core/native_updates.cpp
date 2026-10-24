@@ -9,6 +9,9 @@
 #include <thread>
 #include <tuple>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <nlohmann/json.hpp>
 #include "core/guest_hooks.h"
 #include "core/native_resources.h"
@@ -61,6 +64,14 @@ struct Site {
     u64 sample_address{};
     u32 usage_class{};
 };
+struct PendingFault {
+    u64 address, size, time_ns, thread;
+    u32 usage_class;
+    u64 rip, st0, st1;
+};
+std::array<PendingFault, 8192> pending{}; ///< faults that no announcement covered yet (a writer announces after it wrote): recent ones, newest last
+u64 pending_count = 0;
+
 struct SiteKey {
     u64 rip, st0, st1;
     bool operator<(const SiteKey& o) const {
@@ -68,6 +79,16 @@ struct SiteKey {
     }
 };
 std::map<SiteKey, Site> uncovered_sites; ///< by faulting instruction and the first two stack words (the caller of a leaf function such as memcpy)
+
+/// Faults that come without a faulting instruction are explicit invalidations (the runtime reports a protection change or a system call write): where from?
+struct NoInstruction {
+    u64 count{}, bytes{};
+    std::array<u64, 12> stack{};
+    u32 frames{};
+    u64 first_address{};
+};
+std::map<u64, NoInstruction> no_instruction; ///< by the first frame of the host stack outside this module
+std::array<std::atomic<u64>, 8> no_instruction_sizes{}; ///< size buckets: 1, <=8, <=64, <=4K, <=64K, <=1M, more
 
 u64 NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -101,8 +122,27 @@ void NoteWriterRange(u32 writer, u64 address, u64 size) {
     if (address == 0 || size == 0) {
         return;
     }
+    const u64 now = NowNs();
+    const u64 thread = ThreadKey();
     std::scoped_lock lock{mutex};
-    windows[window_count++ % WindowCount] = {address, address + size, 0, NowNs(), ThreadKey(), 0, 0, false, writer};
+    windows[window_count++ % WindowCount] = {address, address + size, 0, now, thread, 0, 0, false, writer};
+    // faults of this thread inside the range that came first (the writer announces after it wrote) are covered by it
+    const u64 count = std::min<u64>(pending_count, pending.size());
+    for (u64 i = 0; i < count; ++i) {
+        PendingFault& p = pending[(pending_count - count + i) % pending.size()];
+        if (p.address == 0 || p.thread != thread || now - p.time_ns > NowWindowNs || p.address < address || p.address + p.size > address + size) {
+            continue;
+        }
+        faults.uncovered.fetch_sub(1, std::memory_order_relaxed);
+        faults.covered_now.fetch_add(1, std::memory_order_relaxed);
+        faults.covered_by_writer[writer & 7].fetch_add(1, std::memory_order_relaxed);
+        faults.uncovered_by_class[p.usage_class].fetch_sub(1, std::memory_order_relaxed);
+        faults.covered_by_class[p.usage_class].fetch_add(1, std::memory_order_relaxed);
+        if (const auto site = uncovered_sites.find(SiteKey{p.rip, p.st0, p.st1}); site != uncovered_sites.end() && site->second.count > 0) {
+            --site->second.count;
+        }
+        p.address = 0;
+    }
 }
 
 void NoteFault(u64 address, u64 size) {
@@ -129,7 +169,26 @@ void NoteFault(u64 address, u64 size) {
                 kind = Kind::Earlier;
             }
         }
+        if (kind == Kind::None && GuestHooks::FaultRip() == 0) {
+            u32 bucket = size <= 1 ? 0 : size <= 8 ? 1 : size <= 64 ? 2 : size <= 4096 ? 3 : size <= 65536 ? 4 : size <= (1u << 20) ? 5 : 6;
+            no_instruction_sizes[bucket].fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
+            void* frames[12] = {};
+            const USHORT n = CaptureStackBackTrace(1, 12, frames, nullptr);
+            const u64 key = n > 2 ? reinterpret_cast<u64>(frames[2]) : 0;
+            NoInstruction& entry = no_instruction[key];
+            if (entry.count++ == 0) {
+                entry.frames = n;
+                for (USHORT i = 0; i < n; ++i) {
+                    entry.stack[i] = reinterpret_cast<u64>(frames[i]);
+                }
+                entry.first_address = address;
+            }
+            entry.bytes += size;
+#endif
+        }
         if (kind == Kind::None) {
+            pending[pending_count++ % pending.size()] = {address, size, now, thread, usage_class, GuestHooks::FaultRip(), GuestHooks::FaultStack(0), GuestHooks::FaultStack(1)};
             Site& site = uncovered_sites[{GuestHooks::FaultRip(), GuestHooks::FaultStack(0), GuestHooks::FaultStack(1)}];
             if (site.count++ == 0) {
                 site.sample_address = address;
@@ -178,7 +237,9 @@ nlohmann::json Report() {
     const u64 total = faults.total.load();
     f["total"] = total;
     f["inside_a_map_window_of_the_same_thread_within_200ms"] = faults.covered_now.load();
-    f["inside_a_window_by_announcer"] = {{"map", faults.covered_by_writer[0].load()}, {"skinning_FUN_01c93730", faults.covered_by_writer[1].load()}, {"light_constants_FUN_01eeb610", faults.covered_by_writer[2].load()}};
+    f["inside_a_window_by_announcer"] = {{"map", faults.covered_by_writer[0].load()}, {"skinning_FUN_01c93730", faults.covered_by_writer[1].load()}, {"light_constants_FUN_01eeb610", faults.covered_by_writer[2].load()},
+                                                       {"command_stream_memory_copy", faults.covered_by_writer[3].load()}, {"begin_recording_direct_stores", faults.covered_by_writer[4].load()},
+                                                       {"buffer_creation_with_initial_data", faults.covered_by_writer[5].load()}};
     f["inside_an_older_map_window_of_the_same_thread"] = faults.covered_earlier.load();
     f["inside_a_map_window_of_another_thread"] = faults.covered_other_thread.load();
     f["in_no_map_window"] = faults.uncovered.load();
@@ -194,6 +255,26 @@ nlohmann::json Report() {
         }
     }
     std::scoped_lock lock{mutex};
+    {
+#ifdef _WIN32
+        const u64 base = reinterpret_cast<u64>(GetModuleHandleA(nullptr));
+#else
+        const u64 base = 0;
+#endif
+        auto& n = f["faults_without_an_instruction"] = nlohmann::json::object();
+        constexpr const char* names[7] = {"1_byte", "up_to_8", "up_to_64", "up_to_4K", "up_to_64K", "up_to_1M", "more"};
+        for (u32 i = 0; i < 7; ++i) {
+            n["by_size"][names[i]] = no_instruction_sizes[i].load();
+        }
+        auto& list = n["by_host_caller"] = nlohmann::json::array();
+        for (const auto& [key, e] : no_instruction) {
+            nlohmann::json stack = nlohmann::json::array();
+            for (u32 i = 0; i < e.frames; ++i) {
+                stack.push_back(e.stack[i] - base);
+            }
+            list.push_back({{"faults", e.count}, {"bytes", e.bytes}, {"first_address", e.first_address}, {"exe_rva_stack", stack}});
+        }
+    }
     std::vector<std::pair<SiteKey, Site>> sites(uncovered_sites.begin(), uncovered_sites.end());
     std::ranges::sort(sites, [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
     auto& list = f["unannounced_writes_by_faulting_instruction"] = nlohmann::json::array();
