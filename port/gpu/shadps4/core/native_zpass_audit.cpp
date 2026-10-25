@@ -66,6 +66,7 @@ struct Item {
     u64 material_sig{};  // expected side: a hash of the material fields the variant search reads
     u32 material_flag{}; // expected side: material + 0xd4 & 1 (the per-primitive resource set is bound only for these)
     u64 batch_object{};  // expected side: the batch object
+    u64 prim_record{};     // expected side: the address of the primitive record (the loop stores the chosen variant behind it: *(*(record + 0x28) + 0x48))
     u64 instance_object{}; // expected side: the instance group object of an instanced / indirect batch (FUN_01ee4e50 binds it)
     u64 batch_special{}; // expected side: batch + 0x48 (a special entry that fills the resource table itself)
     u32 mesh_word{};     // expected side: the mesh's vertex format word (mesh + 0x78), part of the variant key
@@ -113,6 +114,27 @@ struct State {
     Item current;
     std::vector<Overlay> overlay;
     std::unordered_map<u64, std::pair<u64, u64>> variant_table; // key -> (vertex shader, pixel shader), learned from the loop
+    // first-use rule (N6.3f): the variant object the loop chose for a key; its shader pair is read from the object when the draw is generated
+    struct VariantEntry {
+        u64 variant{0};
+        u64 last_vs{0}, last_ps{0};
+        u64 pair_changes{0};
+        u64 draws{0};
+    };
+    std::unordered_map<u64, VariantEntry> variants;
+    u64 draws_with_special_entry{0}, draws_with_special_entry_pair_right{0};
+    u64 draws_keeping_the_previous_shaders{0}, draws_keeping_right{0};
+    u64 prev_live_vs{0}, prev_live_ps{0}, wrong_equal_previous{0}, wrong_total{0};
+    // fields of the primitive record and the batch of one family (view 0, batch flags 0x6, mesh word 0x1a40): value sets of right and of wrong draws
+    struct FieldValues {
+        std::map<u32, u64> right, wrong;
+    };
+    std::map<std::string, FieldValues> family_fields;
+    std::map<u64, std::pair<u64, u64>> wrong_over_time; // frame / 64 -> {draws, wrong draws}
+    std::map<std::string, std::pair<u64, u64>> wrong_by_fields; // (view type, batch flags, mesh word, material flag) -> {draws, wrong draws}
+    u64 variant_right{0}, variant_wrong{0}, variant_pair_right{0}, variant_pair_wrong{0}, variant_unreadable{0}, variant_cold{0};
+    std::map<std::string, u64> variant_wrong_kinds;
+    std::vector<std::string> variant_samples;
     u64 shadow_built{0}, shadow_failed{0}, shadow_equal{0}, shadow_differ{0}, key_hit{0}, key_cold{0}, key_wrong{0}, shadow_no_baseline{0};
     std::map<std::string, u64> shadow_difference_kinds;
     // which 8-byte words of the device context differ between the live context at the draw and the patched copy: offset -> {draws, a sample live value, a sample shadow value}
@@ -800,6 +822,7 @@ void PassEnter(u64 render_device, u64 desc) {
             Rd(batch + 0x48, item.batch_special);
             item.batch_object = batch;
             item.instance_object = instance_object;
+            item.prim_record = prim_array + u64{p} * 0x38;
             item.material_flag = material_flag;
             item.mesh_word = mesh_word;
             item.batch_flags = batch_flags;
@@ -879,15 +902,120 @@ void RealRecord(u64 ctx, u64 seq, u32 kind, u64 a1, u64 a2, u64 a3) {
     Rd(ctx + 0x4690, real_ps);
     const Item& e = s.current;
     const u64 key = ((e.material_sig * 0x9E3779B97F4A7C15ull ^ s.view_type) * 31 + (e.batch_flags & 0x10) * 8 + e.kind) * 0x100000001b3ull + e.mesh_word * 131u + s.pass_flags;
+    // the variant object the loop chose for this primitive (it stored it behind the primitive record); the generator reads the shader pair from the object of the key
+    u64 live_variant = 0, record_data = 0;
+    const bool variant_readable = Rd(e.prim_record + 0x28, record_data) && Rd(record_data + 0x48, live_variant) && live_variant != 0;
     u64 vs = real_vs, ps = real_ps;
-    if (const auto it = s.variant_table.find(key); it != s.variant_table.end()) {
-        vs = it->second.first;
-        ps = it->second.second;
-        ++(vs == real_vs && ps == real_ps ? s.key_hit : s.key_wrong);
+    // the loop selects a variant only for a material whose +0x18 is not the engine's default (DAT_069ae968); for the others the context keeps the shader pair of the previous draw
+    u64 material_kind = 0, default_kind = 0;
+    Rd(e.material + 0x18, material_kind);
+    Rd(NativeDraw::ImageBase() + (0x069ae968ull - 0x1000000), default_kind);
+    const bool keeps_previous_shaders = material_kind == default_kind;
+    if (keeps_previous_shaders) {
+        ++s.draws_keeping_the_previous_shaders;
+        u64 held_vs = 0, held_ps = 0;
+        Rd(reinterpret_cast<u64>(s.shadow.data()) + 0x4698, held_vs);
+        Rd(reinterpret_cast<u64>(s.shadow.data()) + 0x4690, held_ps);
+        vs = held_vs;
+        ps = held_ps;
+        s.draws_keeping_right += (vs == real_vs && ps == real_ps) ? 1 : 0;
+    } else if (!variant_readable) {
+        ++s.variant_unreadable;
     } else {
-        s.variant_table.emplace(key, std::make_pair(real_vs, real_ps));
-        ++s.key_cold;
+        auto [it, fresh] = s.variants.try_emplace(key);
+        auto& entry = it->second;
+        if (fresh) {
+            entry.variant = live_variant;
+            ++s.variant_cold;
+        }
+        ++entry.draws;
+        u64 object_vs = 0, object_ps = 0;
+        if (Rd(entry.variant + 8, object_vs) && Rd(entry.variant + 0x18, object_ps)) {
+            if (entry.last_vs != 0 && (entry.last_vs != object_vs || entry.last_ps != object_ps)) {
+                ++entry.pair_changes;
+            }
+            entry.last_vs = object_vs;
+            entry.last_ps = object_ps;
+            const bool variant_right = entry.variant == live_variant;
+            const bool pair_right = object_vs == real_vs && object_ps == real_ps;
+            ++(variant_right ? s.variant_right : s.variant_wrong);
+            ++(pair_right ? s.variant_pair_right : s.variant_pair_wrong);
+            {
+                auto& bucket = s.wrong_over_time[s.frame / 64];
+                ++bucket.first;
+                bucket.second += pair_right ? 0 : 1;
+            }
+            {
+                auto& cell = s.wrong_by_fields[fmt::format("view {} batch flags {:#x} mesh word {:#x} material flag {} kind {}", s.view_type, e.batch_flags, e.mesh_word, e.material_flag, e.kind)];
+                ++cell.first;
+                if (s.view_type == 0 && e.batch_flags == 0x6 && e.mesh_word == 0x1a40) {
+                    std::array<u32, 14> record_words{};
+                    std::array<u32, 40> batch_words{};
+                    RdBytes(e.prim_record, record_words.data(), 14 * 4);
+                    RdBytes(e.batch_object, batch_words.data(), 40 * 4);
+                    for (u32 w = 0; w < 14; ++w) {
+                        (pair_right ? s.family_fields[fmt::format("primitive record +{:#x}", w * 4)].right : s.family_fields[fmt::format("primitive record +{:#x}", w * 4)].wrong)[record_words[w]]++;
+                    }
+                    for (u32 w = 0; w < 40; ++w) {
+                        (pair_right ? s.family_fields[fmt::format("batch +{:#x}", w * 4)].right : s.family_fields[fmt::format("batch +{:#x}", w * 4)].wrong)[batch_words[w]]++;
+                    }
+                }
+                if (!pair_right) {
+                    ++cell.second;
+                    ++s.wrong_total;
+                    s.wrong_equal_previous += (real_vs == s.prev_live_vs && real_ps == s.prev_live_ps) ? 1 : 0;
+                }
+            }
+            if (e.batch_special != 0) {
+                ++s.draws_with_special_entry;
+                s.draws_with_special_entry_pair_right += pair_right ? 1 : 0;
+            }
+            if (!variant_right || !pair_right) {
+                const std::string kind = fmt::format("{}{}; batch special entry {}; material flag {}; draw kind {}", variant_right ? "same variant object" : "a different variant object than the key first had", pair_right ? "" : ", the object's pair is not the context's", e.batch_special != 0 ? "yes" : "no", e.material_flag, e.kind);
+                ++s.variant_wrong_kinds[kind];
+                if (!pair_right && s.variant_samples.size() < 6) {
+                    // which variant of the engine's cache holds the context's pair, and what are the key fields of it and of the stored one?
+                    u64 cache = 0;
+                    u32 cache_count = 0;
+                    Rd(s.render_device + 0x1c60, cache);
+                    Rd(s.render_device + 0x1c68, cache_count);
+                    std::string holder = "none in the cache";
+                    for (u32 i = 0; i < cache_count && i < 20000; ++i) {
+                        u64 v = 0, cvs = 0, cps = 0;
+                        if (Rd(cache + u64{i} * 8, v) && Rd(v + 8, cvs) && Rd(v + 0x18, cps) && cvs == real_vs && cps == real_ps) {
+                            u32 k0 = 0, k1 = 0, k2 = 0, k3 = 0;
+                            Rd(v + 0x10, k0);
+                            Rd(v + 0x14, k1);
+                            Rd(v + 0x18, k2);
+                            Rd(v + 0x1c, k3);
+                            holder = fmt::format("variant {:#x} (cache entry {}) key fields {:#x} {:#x} {:#x} {:#x}", v, i, k0, k1, k2, k3);
+                            break;
+                        }
+                    }
+                    u32 s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+                    Rd(live_variant + 0x10, s0);
+                    Rd(live_variant + 0x14, s1);
+                    Rd(live_variant + 0x18, s2);
+                    Rd(live_variant + 0x1c, s3);
+                    s.variant_samples.push_back(fmt::format("the context's pair {:#x}/{:#x} is held by: {}; the stored variant {:#x} has key fields {:#x} {:#x} {:#x} {:#x}; cache size {}", real_vs, real_ps, holder, live_variant, s0, s1, s2, s3, cache_count));
+                }
+                if (false) {
+                    s.variant_samples.push_back(fmt::format("{}: key {:#x} view type {} first variant {:#x} live variant {:#x}; object pair {:#x}/{:#x} live pair {:#x}/{:#x}", kind, key, s.view_type, entry.variant, live_variant, object_vs, object_ps, real_vs, real_ps));
+                }
+            }
+            vs = object_vs;
+            ps = object_ps;
+        }
+        // the old key table (shader pair learned from the loop) is kept for comparison
+        if (const auto old = s.variant_table.find(key); old != s.variant_table.end()) {
+            ++(old->second.first == real_vs && old->second.second == real_ps ? s.key_hit : s.key_wrong);
+        } else {
+            s.variant_table.emplace(key, std::make_pair(real_vs, real_ps));
+            ++s.key_cold;
+        }
     }
+    s.prev_live_vs = real_vs;
+    s.prev_live_ps = real_ps;
     std::memcpy(s.shadow.data() + 0x4698, &vs, 8);
     std::memcpy(s.shadow.data() + 0x4690, &ps, 8);
     {
@@ -991,6 +1119,69 @@ nlohmann::json Report() {
         shadow["no_baseline_copy_of_the_context"] = s.shadow_no_baseline;
         shadow["shader_pair_from_the_learned_key_table"] = {{"keys_learned", s.variant_table.size()}, {"draws_predicted_right", s.key_hit}, {"draws_predicted_wrong", s.key_wrong}, {"draws_on_a_key_not_seen_before", s.key_cold}};
         shadow["difference_kinds"] = s.shadow_difference_kinds;
+        {
+            u64 multi = 0, changing = 0, changes = 0;
+            for (const auto& [key, v] : s.variants) {
+                changing += v.pair_changes != 0 ? 1 : 0;
+                changes += v.pair_changes;
+                (void)multi;
+            }
+            {
+                nlohmann::json fields = nlohmann::json::array();
+                std::vector<std::pair<std::string, std::pair<u64, u64>>> cells(s.wrong_by_fields.begin(), s.wrong_by_fields.end());
+                std::sort(cells.begin(), cells.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+                for (size_t i = 0; i < cells.size() && i < 8 && cells[i].second.second != 0; ++i) {
+                    fields.push_back({{"fields", cells[i].first}, {"draws", cells[i].second.first}, {"wrong", cells[i].second.second}});
+                }
+                shadow["wrong_pair_by_fields"] = fields;
+            }
+            {
+                nlohmann::json fields = nlohmann::json::array();
+                for (const auto& [name, v] : s.family_fields) {
+                    // a field separates right from wrong draws when no value is in both sets
+                    bool shared = false;
+                    for (const auto& [value, count] : v.wrong) {
+                        shared |= v.right.count(value) != 0;
+                    }
+                    if (!shared && !v.wrong.empty() && !v.right.empty()) {
+                        nlohmann::json w = nlohmann::json::array(), r = nlohmann::json::array();
+                        for (const auto& [value, count] : v.wrong) {
+                            w.push_back(fmt::format("{:#x} x{}", value, count));
+                            if (w.size() >= 5) break;
+                        }
+                        for (const auto& [value, count] : v.right) {
+                            r.push_back(fmt::format("{:#x} x{}", value, count));
+                            if (r.size() >= 5) break;
+                        }
+                        fields.push_back({{"field", name}, {"values_of_wrong_draws", w}, {"values_of_right_draws", r}});
+                    }
+                }
+                shadow["fields_that_separate_the_wrong_draws_of_the_family"] = fields;
+            }
+            {
+                nlohmann::json over_time = nlohmann::json::array();
+                for (const auto& [bucket, counts] : s.wrong_over_time) {
+                    over_time.push_back(fmt::format("frames {}..{}: {} draws, {} wrong", bucket * 64, bucket * 64 + 63, counts.first, counts.second));
+                }
+                shadow["wrong_pairs_over_time"] = over_time;
+            }
+            shadow["first_use_rule"] = {{"keys_with_a_variant_object", s.variants.size()},
+                                        {"draws_where_the_keys_variant_object_is_the_one_the_loop_chose", s.variant_right},
+                                        {"draws_where_it_is_another_object", s.variant_wrong},
+                                        {"draws_where_the_pair_read_from_the_object_is_the_contexts_pair", s.variant_pair_right},
+                                        {"draws_where_it_is_not", s.variant_pair_wrong},
+                                        {"draws_without_a_readable_variant", s.variant_unreadable},
+                                        {"keys_whose_object_changed_its_shader_pair_over_time", changing},
+                                        {"changes_of_the_pair_in_all_objects", changes},
+                                        {"wrong_draws", s.wrong_total},
+                                        {"wrong_draws_whose_pair_is_the_previous_draws_pair", s.wrong_equal_previous},
+                                        {"draws_of_a_material_that_keeps_the_previous_draws_shaders", s.draws_keeping_the_previous_shaders},
+                                        {"of_those_the_shadow_contexts_previous_pair_is_the_contexts_pair", s.draws_keeping_right},
+                                        {"draws_of_batches_with_a_special_entry", s.draws_with_special_entry},
+                                        {"of_those_with_the_pair_from_the_object_right", s.draws_with_special_entry_pair_right},
+                                        {"wrong_by_kind", s.variant_wrong_kinds},
+                                        {"samples", s.variant_samples}};
+        }
         {
             std::vector<std::pair<u32, State::WordDiff>> words(s.context_word_diffs.begin(), s.context_word_diffs.end());
             std::sort(words.begin(), words.end(), [](const auto& a, const auto& b) { return a.second.draws > b.second.draws; });
