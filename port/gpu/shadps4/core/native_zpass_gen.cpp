@@ -107,6 +107,8 @@ struct BatchLevel {
     std::array<std::pair<u32, u64>, 16> table{}; // (index j, value for ctx + 0x6c0 + 8 j), ascending j; the engine's loop fills them downwards, the values do not depend on each other
     u32 first_step{0}, step_count{0};
     // instance group batches (N6.4)
+    u64 special{0};         // batch + 0x48, the special entry (class 0x26dbfc8: the vertex modifier entry)
+    bool special_modifier{false}; // special + 0x40 != 0
     bool visibility{false}; // pass kind 3 with desc + 0x1d clear and batch flag 0x8: the primitive is skipped when the visibility cache says culled
     bool group{false};
     bool only_580{false};   // the loop writes ctx + 0x580 and nothing else for this batch (its group has no instances or no object)
@@ -174,6 +176,7 @@ struct State {
     std::vector<u64> cache_seen;
     u64 table_resets{0}, learned{0}, conflicts{0}, learn_not_in_cache{0}, learn_faults{0}, scan_faults{0};
     std::map<std::string, u64> mismatch_kinds;
+    std::map<std::string, u64> special_classes;
     std::map<std::string, u64> raced_words; // verify: words where the live value differed from the shadow read but equals what the object holds when compared
     std::vector<std::string> samples;
 };
@@ -544,9 +547,19 @@ void ScanImpl(ScanArgs& args) {
             plan.batches.push_back(level);
             continue;
         }
-        if (R<u64>(batch + 0x48) != 0) {
-            plan.Decline("batch with a special entry (a virtual call picks the material index)");
-            continue;
+        u64 special_bits = 0;
+        if (const u64 special = R<u64>(batch + 0x48); special != 0) {
+            // the only class in use (live data): its virtuals are +0x48 (the token the variant key uses: the material's, or the VERTEX_MODIFIER token when special + 0x40 is set; a
+            // reference counted handle, net zero over the loop's sequence), +0x50 (special + 0x40 != 0) and +0x58 (the resource table fill inside FUN_01c92f30, the engine's own)
+            const u64 vtable = R<u64>(special);
+            if (vtable - NativeDraw::ImageBase() + 0x1000000 != 0x26dbfc8) {
+                S().special_classes[fmt::format("vtable {:#x}", vtable - NativeDraw::ImageBase() + 0x1000000)]++;
+                plan.Decline("batch with a special entry of an unknown class");
+                continue;
+            }
+            level.special = special;
+            level.special_modifier = R<u64>(special + 0x40) != 0;
+            special_bits = (1ull << 48) | (u64(level.special_modifier) << 49);
         }
         if (plan.kind == 3 && flag_1d == 0 && (batch_flags & 8) != 0) {
             level.visibility = true;
@@ -556,7 +569,7 @@ void ScanImpl(ScanArgs& args) {
                 continue;
             }
         }
-        u64 group_bits = 0;
+        u64 group_bits = special_bits;
         if (group != 0) {
             if (plan.indirect_mode == 0) {
                 plan.Decline("instance group batch without the indirect mode (DrawIndexedInstanced is not hooked)");
@@ -736,7 +749,19 @@ void Generate(Target& t, const Plan& plan) {
             if (step.flag != 0) {
                 CopyEarlyBlock(t, step.material);
                 if (!level.bvar54 && t.live) {
-                    reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, 0);
+                    reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, level.special);
+                }
+            }
+            if (level.special != 0) {
+                // the loop copies the material block first when its own conditions say so, then binds the resource set through the special entry (always), then the block again below
+                const u64 cached = R<u64>(step.material + 0x48);
+                const bool early = cached == 0 ? (R<u32>(step.material + 0x158) != 0 || (R<u8>(step.material + 0xd5) & 1) != 0)
+                                               : ((R<u32>(cached + 0x24) != 0 && R<u32>(cached + 0x28) != 0) || (R<u8>(step.material + 0xd5) & 1) != 0);
+                if (early) {
+                    BindMaterial(t, step.material);
+                }
+                if (t.live) {
+                    reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, level.special);
                 }
             }
             BindMaterial(t, step.material);
@@ -1280,6 +1305,7 @@ nlohmann::json Report() {
         views[std::to_string(view)] = entry;
     }
     out["verify_difference_kinds"] = s.mismatch_kinds;
+    out["special_entry_classes"] = s.special_classes;
     out["verify_words_that_moved_by_view_kind_offset"] = s.raced_words;
     out["verify_difference_samples"] = s.samples;
     return out;
