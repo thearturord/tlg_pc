@@ -57,6 +57,10 @@ static Shader::PushData MakeUserData(const FixedState* fixed) {
     return push_data;
 }
 
+namespace {
+Rasterizer* supersede_target = nullptr;
+}
+
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
                        AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, page_manager{this},
@@ -88,6 +92,12 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         ring_verify_interval = static_cast<u32>(std::max(std::atoi(env), 0));
     }
     LOG_INFO(Render, "constant ring: level {}, verify every {}", const_ring_level, ring_verify_interval);
+    supersede_target = this;
+    Core::NativeUpdates::SetSupersede([](u64 address, u64 size) {
+        if (supersede_target != nullptr) {
+            supersede_target->SupersedeGpuWritten(address, size);
+        }
+    });
     if (const char* env = std::getenv("TLG_TEXTURE_SET_MEMO"); env && env[0] == '1') {
         texture_set_on = true;
         texture_sets = std::make_unique<TextureSet[]>(TextureSetSlots);
@@ -1939,6 +1949,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                                (Core::NativeUploads::OnDemandAudit() && buffer_cache.IsRegionGpuModified(vsharp.base_address, size) ? 32u : 0u) |
                                                (Core::NativeUploads::OnDemandAudit() && buffer_cache.IsRangeGpuWritten(vsharp.base_address, size) ? 64u : 0u) |
                                                (Core::NativeUploads::OnDemandAudit() && texture_cache.FindImageFromRange(vsharp.base_address, size) ? 128u : 0u));
+                if (Core::NativeUploads::OnDemandAudit()) {
+                    Core::NativeUploads::SetWriter(Core::NativeUpdates::WhoWrote(vsharp.base_address, size));
+                }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2);
                 if (Core::NativeRegistry::AuditBuffer(vsharp.base_address, size, desc.is_written, desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase)) {
@@ -3426,6 +3439,9 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     Core::NativeResources::NoteCpuWrite(addr, size);
     if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
         Core::NativeUpdates::NoteFault(addr, size);
+        if (Core::NativeUploads::OnDemandAudit() && buffer_cache.IsRangeGpuWritten(addr, size)) {
+            Core::NativeUpdates::NoteGpuWrittenDirtied(addr, size);
+        }
     }
 #ifdef ARCH_X86_64
     Core::GuestHooks::NoteWriteFault(addr, size);

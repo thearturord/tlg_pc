@@ -74,6 +74,8 @@ u32 Caller();
 /// What the buffer being requested is (set by the rasterizer's BindBuffers): bit 0 written by the shader, bit 1 formatted (texel buffer), bit 2 larger than the ring takes,
 /// bit 3 a ring binding existed for it (the request should not have come), bit 4 the draw has a ring plan.
 void SetDetail(u32 detail);
+/// The audit of the uploads on GPU-written bytes: the announcer that last wrote the range (NativeUpdates::WhoWrote), set together with the detail.
+void SetWriter(u32 who);
 void NoteOnDemand(bool pass_open, u64 request_size, u64 uploaded_bytes, u64 address, bool immutable_whole);
 
 // ---- byte precise GPU-written ranges for the constant ring (N5e, `TLG_RING_PRECISE=1`) ----------------------------------------------------------------------

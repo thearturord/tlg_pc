@@ -712,6 +712,11 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionGpuModified(addr, size);
 }
 
+void BufferCache::SupersedeGpuWritten(VAddr addr, size_t size) {
+    std::unique_lock lock{gpu_ranges_mutex};
+    gpu_modified_ranges.Subtract(addr, size);
+}
+
 bool BufferCache::IsRangeGpuWritten(VAddr addr, size_t size) {
     std::shared_lock lock{gpu_ranges_mutex};
     return gpu_modified_ranges.Intersects(addr, size);

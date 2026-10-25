@@ -207,6 +207,10 @@ public:
     }
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
+    /// N5h: see BufferCache::SupersedeGpuWritten.
+    void SupersedeGpuWritten(VAddr addr, u64 size) {
+        buffer_cache.SupersedeGpuWritten(addr, size);
+    }
     /// N5c (raster thread): uploads the ranges the engine announced (outside a render pass: it is called in front of a draw or dispatch).
     void PreSynchronize(const std::vector<Core::NativeUploads::Range>& ranges);
     void MapMemory(VAddr addr, u64 size);

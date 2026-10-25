@@ -260,6 +260,10 @@ SnapshotResult SnapshotRead(u64 begin, u64 size, u64 seq, void* data) {
 namespace {
 thread_local u32 current_caller = 0;
 thread_local u32 current_detail = 0;
+thread_local u32 current_who = ~0u;
+std::array<std::atomic<u64>, 8> who_by_writer{};          ///< uploads on GPU-written bytes by the announcer that wrote them last (index 7: none found)
+std::array<std::atomic<u64>, 8> who_on_render_thread{};   ///< of those, announced on the render thread
+std::array<std::atomic<u64>, 6> who_age_ms{};             ///< age of that announcement: <1, <4, <16, <64, <512, more
 std::array<std::atomic<u64>, 256> detail_counts{}; ///< in-pass uploads of draw buffers by detail bits
 struct OnDemandBucket {
     std::atomic<u64> requests{}, uploaded{};
@@ -293,6 +297,10 @@ void SetDetail(u32 detail) {
     current_detail = detail;
 }
 
+void SetWriter(u32 who) {
+    current_who = who;
+}
+
 void NoteOnDemand(bool pass_open, u64 request_size, u64 uploaded_bytes, u64 address, bool immutable_whole) {
     const u32 caller = current_caller < 5 ? current_caller : 0;
     if (immutable_whole) {
@@ -308,6 +316,18 @@ void NoteOnDemand(bool pass_open, u64 request_size, u64 uploaded_bytes, u64 addr
     const u32 bucket = request_size <= 256 ? 0 : request_size <= 4096 ? 1 : request_size <= 16384 ? 2 : request_size <= 65536 ? 3 : request_size <= (1u << 20) ? 4 : request_size <= (16u << 20) ? 5 : 6;
     if (caller == 1) {
         detail_counts[current_detail & 255].fetch_add(1, std::memory_order_relaxed);
+        if ((current_detail & 64) != 0) { // bytes the GPU wrote: who wrote them from the CPU side?
+            const u32 who = current_who;
+            const u32 writer = who == ~0u ? 7 : (who & 0xff) % 7;
+            who_by_writer[writer].fetch_add(1, std::memory_order_relaxed);
+            if (who != ~0u) {
+                if ((who & 0x100) != 0) {
+                    who_on_render_thread[writer].fetch_add(1, std::memory_order_relaxed);
+                }
+                const u32 age = who >> 16;
+                who_age_ms[age < 1 ? 0 : age < 4 ? 1 : age < 16 ? 2 : age < 64 ? 3 : age < 512 ? 4 : 5].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     }
     demand_by_caller_size_in_pass[caller][bucket].requests.fetch_add(1, std::memory_order_relaxed);
     demand_by_caller_size_in_pass[caller][bucket].uploaded.fetch_add(uploaded_bytes, std::memory_order_relaxed);
@@ -426,6 +446,21 @@ nlohmann::json Report() {
                     name += (i & 128) ? "image_overlaps " : "no_image ";
                     name += (i & 8) ? "ring_binding_existed" : "";
                     d[name] = n;
+                }
+            }
+        }
+        {
+            auto& w = in_pass["draw_buffer_uploads_on_gpu_written_bytes_by_the_cpu_writer"] = nlohmann::json::object();
+            constexpr const char* names[8] = {"map_unmap", "skinning", "light_constants", "command_stream_copy", "begin_recording", "buffer_creation", "texture_initialization", "no_announcement_found"};
+            for (u32 i = 0; i < 8; ++i) {
+                if (const u64 n = who_by_writer[i].load()) {
+                    w[names[i]] = {{"uploads", n}, {"on_the_render_thread", who_on_render_thread[i].load()}};
+                }
+            }
+            constexpr const char* ages[6] = {"under_1ms", "under_4ms", "under_16ms", "under_64ms", "under_512ms", "older"};
+            for (u32 i = 0; i < 6; ++i) {
+                if (const u64 n = who_age_ms[i].load()) {
+                    w["announcement_age"][ages[i]] = n;
                 }
             }
         }

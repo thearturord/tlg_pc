@@ -25,8 +25,10 @@ std::atomic<bool> enabled{[] {
     const char* e = std::getenv("TLG_UPDATE_AUDIT");
     const char* u = std::getenv("TLG_NATIVE_UPLOADS");
     const char* s = std::getenv("TLG_SNAPSHOTS");
+    const char* r = std::getenv("TLG_RING_SUPERSEDE");
     // the announcements are also what the native uploads and the snapshots are made of
-    return (e != nullptr && *e != 0 && *e != '0') || (u != nullptr && *u != 0 && *u != '0') || (s != nullptr && *s != 0 && *s != '0');
+    return (e != nullptr && *e != 0 && *e != '0') || (u != nullptr && *u != 0 && *u != '0') || (s != nullptr && *s != 0 && *s != '0') ||
+           (r != nullptr && *r != 0 && *r != '0');
 }()};
 
 namespace {
@@ -156,6 +158,23 @@ void NoteRenderThread() {
     NativeUploads::PublishPending(NativeDraw::NextSeq());
 }
 
+namespace {
+void (*supersede_fn)(u64, u64) = nullptr;
+std::atomic<u64> superseded_ranges{}, superseded_bytes{};
+} // namespace
+
+void SetSupersede(void (*fn)(u64, u64)) {
+    supersede_fn = fn;
+}
+
+bool SupersedeEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_RING_SUPERSEDE");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+
 void Start() {
     enabled.store(true, std::memory_order_relaxed);
 }
@@ -204,6 +223,11 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread) {
     }
     NoteAnnouncerThread(writer);
     NativeUploads::Announce(writer, address, size, thread == render_thread.load(std::memory_order_relaxed), NativeDraw::NextSeq());
+    if (supersede_fn != nullptr && SupersedeEnabled() && (writer == 5 || writer == 6 || (writer == 0 && thread == render_thread.load(std::memory_order_relaxed)))) {
+        supersede_fn(address, size);
+        superseded_ranges.fetch_add(1, std::memory_order_relaxed);
+        superseded_bytes.fetch_add(size, std::memory_order_relaxed);
+    }
     const u64 now = NowNs();
     std::scoped_lock lock{mutex};
     windows[window_count++ % WindowCount] = {address, address + size, 0, now, thread, 0, 0, false, writer};
@@ -312,9 +336,68 @@ void NoteFault(u64 address, u64 size) {
     (kind == Kind::None ? faults.uncovered_by_class : faults.covered_by_class)[usage_class].fetch_add(1, std::memory_order_relaxed);
 }
 
+namespace {
+struct DirtierKey {
+    u64 rip, a, b, c;
+    bool operator<(const DirtierKey& o) const {
+        return std::tie(rip, a, b, c) < std::tie(o.rip, o.a, o.b, o.c);
+    }
+};
+struct Dirtier {
+    u64 count{}, bytes{}, sample{};
+};
+std::mutex dirtier_mutex;
+std::map<DirtierKey, Dirtier> dirtiers;
+} // namespace
+
+void NoteGpuWrittenDirtied(u64 address, u64 size) {
+    DirtierKey key{GuestHooks::FaultRip(), 0, 0, 0};
+    if (key.rip == 0) {
+#ifdef _WIN32
+        void* frames[8] = {};
+        const USHORT n = CaptureStackBackTrace(2, 8, frames, nullptr);
+        const u64 exe = reinterpret_cast<u64>(GetModuleHandleA(nullptr));
+        u64 rva[3] = {};
+        for (USHORT i = 0, found = 0; i < n && found < 3; ++i) {
+            const u64 at = reinterpret_cast<u64>(frames[i]);
+            if (at >= exe && at < exe + 0x10000000) {
+                rva[found++] = at - exe;
+            }
+        }
+        key.a = rva[0];
+        key.b = rva[1];
+        key.c = rva[2];
+#endif
+    } else {
+        key.a = GuestHooks::FaultStack(0);
+    }
+    std::scoped_lock lock{dirtier_mutex};
+    Dirtier& d = dirtiers[key];
+    if (d.count++ == 0) {
+        d.sample = address;
+    }
+    d.bytes += size;
+}
+
+u32 WhoWrote(u64 address, u64 size) {
+    const u64 now = NowNs();
+    const u64 render = render_thread.load(std::memory_order_relaxed);
+    std::scoped_lock lock{mutex};
+    const u64 count = std::min<u64>(window_count, WindowCount);
+    for (u64 i = 0; i < count; ++i) {
+        const Window& w = windows[(window_count - 1 - i) % WindowCount];
+        if (address >= w.begin && address + size <= w.end) {
+            const u64 age_ms = std::min<u64>((now - w.time_ns) / 1'000'000, 60000);
+            return (w.writer & 0xff) | (w.thread == render ? 0x100u : 0u) | static_cast<u32>(age_ms << 16);
+        }
+    }
+    return ~0u;
+}
+
 nlohmann::json Report() {
     nlohmann::json j = nlohmann::json::object();
     j["enabled"] = enabled.load();
+    j["gpu_written_marks_superseded"] = {{"enabled", SupersedeEnabled()}, {"ranges", superseded_ranges.load()}, {"bytes", superseded_bytes.load()}};
     auto& m = j["maps_of_buffers"] = nlohmann::json::object();
     m["total"] = maps.total.load();
     m["into_the_buffers_own_memory"] = maps.own_memory.load();
@@ -388,6 +471,16 @@ nlohmann::json Report() {
                 stack.push_back(e.stack[i] - base);
             }
             list.push_back({{"faults", e.count}, {"bytes", e.bytes}, {"first_address", e.first_address}, {"exe_rva_stack", stack}});
+        }
+    }
+    {
+        std::scoped_lock dlock{dirtier_mutex};
+        std::vector<std::pair<DirtierKey, Dirtier>> list(dirtiers.begin(), dirtiers.end());
+        std::ranges::sort(list, [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+        auto& out = j["who_dirtied_gpu_written_bytes"] = nlohmann::json::array();
+        for (size_t i = 0; i < list.size() && i < 24; ++i) {
+            out.push_back({{"guest_rip", list[i].first.rip}, {"stack_or_host_rva_0", list[i].first.a}, {"host_rva_1", list[i].first.b}, {"host_rva_2", list[i].first.c},
+                           {"invalidations", list[i].second.count}, {"bytes", list[i].second.bytes}, {"sample_address", list[i].second.sample}});
         }
     }
     std::vector<std::pair<SiteKey, Site>> sites(uncovered_sites.begin(), uncovered_sites.end());
