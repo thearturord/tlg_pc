@@ -29,6 +29,7 @@ struct State {
     std::map<std::string, u64> passes;       // arguments
     std::map<std::string, u64> batches;      // batch shapes
     std::map<std::string, u64> prims;        // primitive shapes
+    std::map<std::string, u64> forward_passes, forward_batches, forward_prims;
     u64 faults{0};
 };
 State& S() {
@@ -69,7 +70,67 @@ void Scan(Args& a) {
     }
 }
 
+struct ForwardArgs {
+    u64 rd, list, mode;
+};
+
+void ScanForward(ForwardArgs& a) {
+    State& s = S();
+    const u64 batch_array = R<u64>(a.list);
+    const u32 batch_count = R<u32>(a.list + 8);
+    s.forward_passes[fmt::format("mode {} indirect {} batches>0 {}", a.mode, R<s32>(a.rd + 0x38e0), batch_count != 0)]++;
+    for (u32 b = 0; b < batch_count && b < 100000; ++b) {
+        const u64 batch = R<u64>(batch_array + u64{b} * 8);
+        const u16 bflags = R<u16>(batch + 0x66);
+        const u64 mesh = R<u64>(batch + 0x20), second = R<u64>(batch + 0x28), group = R<u64>(batch + 0x38), special = R<u64>(batch + 0x48);
+        const u16 prim_count = R<u16>(batch + 100);
+        const u64 render_data = mesh != 0 ? R<u64>(mesh + 0x38) : 0;
+        u64 first_entry_valid = 0;
+        if (render_data != 0) {
+            const u64 inner = R<u64>(render_data + 0x20);
+            const u64 context_global = R<u64>(NativeDraw::ImageBase() + (0x069a1b40ull - 0x1000000));
+            const u64 default_object = R<u64>(R<u64>(context_global + 0x38) + 0x20);
+            if (inner != 0 && R<u32>(inner + 0x68) != 0) {
+                const u64 first = R<u64>(R<u64>(inner + 0x60));
+                first_entry_valid = (first != default_object && first != 0 && R<u64>(first + 0x38) != 0) ? 1 : 0;
+            }
+        }
+        s.forward_batches[fmt::format("mode {} group {} (skipped by the loop) mesh {} render data {} second {} special {} flags {:#x} first table entry valid {} prims {}", a.mode, group != 0, mesh != 0, render_data != 0, second != 0, special != 0,
+                                      bflags & 0x1fff, first_entry_valid, prim_count != 0)]++;
+        if (group != 0 || mesh == 0) {
+            continue;
+        }
+        const u64 prim_array = R<u64>(batch + 0x58);
+        for (u32 p = 0; p < prim_count && p < 4096; ++p) {
+            const u64 rec = prim_array + u64{p} * 0x38;
+            const u64 material = R<u64>(rec + 0x18);
+            const u64 data = R<u64>(rec + 0x28);
+            s.forward_prims[fmt::format("material +0x158 {} cached object +0x48 {} flags {:#x} token {} prim +0x24 {} +0x30 {} data +0x40 {}", R<u32>(material + 0x158), R<u64>(material + 0x48) != 0, R<u32>(material + 0xd4) & 0x2e,
+                                        R<u32>(material + 0x1bc) != 0, R<s32>(rec + 0x24) < 0 ? "negative" : "non-negative", R<u32>(rec + 0x30) != 0, data != 0 && R<u64>(data + 0x40) != 0)]++;
+        }
+    }
+}
+
 } // namespace
+
+void EnterForward(u64 render_device, u64 list, u64 mode) {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_GBUFFER_AUDIT");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    if (!on || list == 0) {
+        return;
+    }
+    static std::atomic<u32> counter{0};
+    if (counter.fetch_add(1) % 16 != 0) {
+        return;
+    }
+    ForwardArgs args{render_device, list, mode};
+    std::scoped_lock lock{S().mutex};
+    if (!NativeDraw::GuardedCall([](void* p) { ScanForward(*static_cast<ForwardArgs*>(p)); }, &args)) {
+        ++S().faults;
+    }
+}
 
 void Enter(u64 render_device, u64 mode, u64 list, u64 flags, u64 query_mode, u64 param7) {
     static const bool on = [] {
@@ -93,7 +154,8 @@ void Enter(u64 render_device, u64 mode, u64 list, u64 flags, u64 query_mode, u64
 nlohmann::json Report() {
     State& s = S();
     std::scoped_lock lock{s.mutex};
-    return {{"passes_by_arguments", s.passes}, {"batch_shapes", s.batches}, {"primitive_shapes", s.prims}, {"faults", s.faults}};
+    return {{"passes_by_arguments", s.passes}, {"batch_shapes", s.batches}, {"primitive_shapes", s.prims}, {"forward_passes", s.forward_passes}, {"forward_batch_shapes", s.forward_batches},
+            {"forward_primitive_shapes", s.forward_prims}, {"faults", s.faults}};
 }
 
 } // namespace Core::NativeGBufferAudit

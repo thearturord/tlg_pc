@@ -6772,7 +6772,17 @@ u64 PS4_SYSV_ABI GBufferEnter(u64 render_device, u64 mode, u64 list, u64 a3, u64
     return 0;
 }
 
+/// N6.7: RenderDev_DrawForwardPass(render device, a2, a3, list, mode): the census of what it is asked to draw (read only).
+u64 PS4_SYSV_ABI ForwardEnter(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 a5, u64 ret) {
+    (void)a1, (void)a2, (void)a5, (void)ret;
+    NativeGBufferAudit::EnterForward(render_device, list, mode);
+    return 0;
+}
+
 u64 FindHandler(const std::string& name) {
+    if (name == "forward_enter") {
+        return reinterpret_cast<u64>(&ForwardEnter);
+    }
     if (name == "gbuffer_enter") {
         return reinterpret_cast<u64>(&GBufferEnter);
     }

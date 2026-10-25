@@ -10,6 +10,8 @@ namespace Core::NativeGBufferAudit {
 
 /// `DrawGBufferPrimitives(render_device, mode, list, a3, flags, query_mode, param7)` was entered.
 void Enter(u64 render_device, u64 mode, u64 list, u64 flags, u64 query_mode, u64 param7);
+/// `DrawForwardPass(render_device, a2, a3, list, mode)` was entered (ghidra 0x01c779a0).
+void EnterForward(u64 render_device, u64 list, u64 mode);
 nlohmann::json Report();
 
 } // namespace Core::NativeGBufferAudit
