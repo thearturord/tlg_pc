@@ -130,7 +130,7 @@ std::array<std::atomic<u64>, 3> image_clears_refused;
 std::atomic<u64> image_copies_done{};
 std::array<std::atomic<u64>, 3> image_copies_refused;
 std::atomic<u64> immutable_hits{}, immutable_syncs{}, immutable_drops{}, immutable_checks{}, immutable_stale{};
-std::array<std::atomic<u64>, 8> immutable_handle_counters{};
+std::array<std::atomic<u64>, 16> immutable_handle_counters{};
 
 u64 NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -709,7 +709,7 @@ u64 ImmutableEpoch() {
 }
 
 void NoteHandle(u32 what) {
-    immutable_handle_counters[what & 7].fetch_add(1, std::memory_order_relaxed);
+    immutable_handle_counters[what & 15].fetch_add(1, std::memory_order_relaxed);
 }
 
 ImmutableBuffer* FindImmutableById(u64 id) {
@@ -992,7 +992,11 @@ nlohmann::json Report() {
                                       {"handles_stale_epoch_changed", immutable_handle_counters[1].load()},
                                       {"handles_id_names_no_immutable_buffer", immutable_handle_counters[2].load()},
                                       {"handles_request_outside_the_range", immutable_handle_counters[3].load()},
-                                      {"handles_differing_from_the_address_lookup", immutable_handle_counters[4].load()}};
+                                      {"handles_differing_from_the_address_lookup", immutable_handle_counters[4].load()},
+                                      {"geometry_handles_used", immutable_handle_counters[5].load()},
+                                      {"geometry_handles_stale_epoch_changed", immutable_handle_counters[6].load()},
+                                      {"geometry_handles_differing_from_the_address_lookup", immutable_handle_counters[7].load()},
+                                      {"geometry_handles_aliasing_another_buffer_that_holds_the_range", immutable_handle_counters[8].load()}};
     }
     return out;
 }

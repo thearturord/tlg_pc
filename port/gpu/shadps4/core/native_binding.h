@@ -8,6 +8,7 @@
 
 namespace Core::NativeDraw {
 
+constexpr u32 MaxGeometryIds = 9; // N6.2: the engine ids of the vertex buffers of a draw (up to 8) and of its index buffer
 constexpr u32 MaxRecordBindings = 64; // N6.1: the entries of the descriptor tables are in the list too
 
 struct RecordBinding {

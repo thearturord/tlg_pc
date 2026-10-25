@@ -184,6 +184,10 @@ struct DrawPlan {
     std::array<Core::NativeResources::ImmutableBuffer*, Core::NativeDraw::MaxRecordBindings> handles{};
     u64 handle_epoch{};
     bool has_handles{};
+    /// N6.2: the immutable engine buffers named by the record's vertex and index buffer ids (valid while `handle_epoch` is the immutable epoch)
+    std::array<Core::NativeResources::ImmutableBuffer*, Core::NativeDraw::MaxGeometryIds> geometry_handles{};
+    u32 geometry_handle_count{};
+    bool has_geometry_handles{};
     /// N5g: vertex ranges (`index` = GeometryVertex) and the index range (`GeometryIndex`) the command processor copied into the constant ring
     boost::container::small_vector<RingBinding, 4> geometry_ring;
 };

@@ -132,6 +132,9 @@ struct ExecDraw {
     u32 binding_count{};
     bool bindings_complete{};
     bool bindings_overflow{}; ///< the list did not fit (MaxRecordBindings)
+    /// N6.2: the engine ids of the buffers the draw reads as vertex or index data (the engine's vertex buffer slots of the input layout, the index buffer view)
+    std::array<u64, MaxGeometryIds> geometry_ids{};
+    u32 geometry_id_count{};
     std::array<ExecRegister, MaxRegisters> regs;
     u32 count{};
     /// The first `grouped` registers are stored by group (group g is regs[group_begin[g]] to regs[group_begin[g + 1]]), the rest always applies.

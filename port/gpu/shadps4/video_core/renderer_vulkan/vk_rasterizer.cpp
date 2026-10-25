@@ -368,6 +368,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
     plan->executed = executed;
     plan->native_seq = 0;
     plan->bindings_complete = false;
+    plan->has_geometry_handles = false;
     plan->binding_count = 0;
     plan->op_class = is_operation ? static_cast<u8>(operation.kind) : u8{0xff};
     plan->depth_copy = operation.depth_copy;
@@ -560,8 +561,15 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u32
         return nullptr;
     }
     plan->has_handles = false;
+    plan->has_geometry_handles = false;
+    plan->geometry_handle_count = 0;
     if (NativeHandleMode() != 0 && binder_mode != 0 && draw.bindings_complete && Core::NativeResources::ImmutableResidencyEnabled()) {
         plan->handle_epoch = Core::NativeResources::ImmutableEpoch();
+        plan->geometry_handle_count = draw.geometry_id_count;
+        for (u32 i = 0; i < draw.geometry_id_count; ++i) {
+            plan->geometry_handles[i] = Core::NativeResources::FindImmutableById(draw.geometry_ids[i]);
+            plan->has_geometry_handles |= plan->geometry_handles[i] != nullptr;
+        }
         for (u32 i = 0; i < plan->binding_count; ++i) {
             const auto& b = plan->bindings[i];
             plan->handles[i] = b.kind == 1 && b.id != 0 ? Core::NativeResources::FindImmutableById(b.id) : nullptr;
@@ -984,12 +992,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     if (!bound) {
         return;
     }
+    geometry_plan = plan;
     const auto state = BeginRendering(pipeline);
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer(index_offset);
     }
+    geometry_plan = nullptr;
 
     const bool pass_barrier = needs_barrier;
     if (needs_barrier) {
@@ -1393,6 +1403,41 @@ const DrawPlan* Rasterizer::NativeBinderFor(const DrawPlan* plan, u32 draw_class
     return plan;
 }
 
+Core::NativeResources::ImmutableBuffer* Rasterizer::GeometryHandle(VAddr address, u64 size) const {
+    if (geometry_plan == nullptr || !geometry_plan->has_geometry_handles) {
+        return nullptr;
+    }
+    if (geometry_plan->handle_epoch != Core::NativeResources::ImmutableEpoch()) {
+        Core::NativeResources::NoteHandle(6);
+        return nullptr;
+    }
+    for (u32 i = 0; i < geometry_plan->geometry_handle_count; ++i) {
+        auto* handle = geometry_plan->geometry_handles[i];
+        if (handle != nullptr && address >= handle->begin && address + size <= handle->end && handle->alive.load(std::memory_order_acquire)) {
+            if (NativeHandleMode() == 2) {
+                // compare mode: the lookup by address wins, and a difference is counted apart from the bindings'
+                auto* lookup = Core::NativeResources::FindImmutable(address, size);
+                if (lookup != handle) {
+                    // Two live engine buffers can hold the same range (the log of the first run showed overlapping registrations: an engine buffer and another one that starts inside it).
+                    // The data path is the same arena memory either way, the whole-buffer synchronization of either covers the request: that is an alias, not a difference.
+                    // A difference is a lookup that finds no immutable buffer at all.
+                    Core::NativeResources::NoteHandle(lookup == nullptr ? 7 : 8);
+                    if (lookup == nullptr) {
+                        static std::atomic<u32> logged{0};
+                        if (logged.fetch_add(1) < 12) {
+                            LOG_ERROR(Render_Vulkan, "N6.2 geometry handle differs: request {:#x}+{:#x}; handle {:#x}..{:#x}; the lookup finds none", address, size, handle->begin, handle->end);
+                        }
+                    }
+                    return lookup;
+                }
+            }
+            Core::NativeResources::NoteHandle(5);
+            return handle;
+        }
+    }
+    return nullptr;
+}
+
 bool Rasterizer::StageFlatSkipped(const Shader::Info& stage) const {
     const u32 index = static_cast<u32>(stage.sw_stage);
     return binder_plan != nullptr && binder_plan->any_flat_skipped && index < MaxShaderStages && binder_plan->stages[index].flat_skipped;
@@ -1527,7 +1572,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
             }
         }
         std::tie(range.buffer, range.offset) =
-            buffer_cache.ObtainBuffer(range.base_address, size, false);
+            buffer_cache.ObtainBuffer(range.base_address, size, false, false, GeometryHandle(range.base_address, size), NativeHandleMode() == 2);
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
         bound_buffers.emplace_back(range.buffer, range.offset, size,
                                    vk::AccessFlagBits2::eVertexAttributeRead);
@@ -1618,7 +1663,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
         }
     } else if (index_buffer_size != 0) {
         const auto [buffer, offset] =
-            buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
+            buffer_cache.ObtainBuffer(index_address, index_buffer_size, false, false, GeometryHandle(index_address, index_buffer_size), NativeHandleMode() == 2);
         needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
         bound_buffers.emplace_back(buffer, offset, index_buffer_size,
                                    vk::AccessFlagBits2::eIndexRead);

@@ -489,11 +489,14 @@ private:
     };
     PendingFill pending_fill{};
     const DrawInputs* draw_inputs{}; ///< of the draw being recorded (Draw / DrawIndirect)
+    const DrawPlan* geometry_plan{}; ///< N6.2: the plan of the draw whose vertex and index buffers are being bound (its record names their engine ids)
     const DrawPlan* binder_plan{};   ///< N3: the plan whose record binds the resources of the draw being recorded (null: from the flat user data)
     bool binder_verify{};
     const DrawPlan* NativeBinderFor(const DrawPlan* plan, u32 draw_class);
     /// kind: 1 buffer, 2 image, 3 sampler descriptor
     const u32* BinderWords(const Shader::Info& stage, u32 offset, u32 dwords, u32 kind, u32* binding_index = nullptr) const;
+    /// N6.2: the immutable engine buffer the record's ids name that holds [address, address + size) (null: none, the lookup by address decides)
+    Core::NativeResources::ImmutableBuffer* GeometryHandle(VAddr address, u64 size) const;
     /// N3b: the binder's plan has no flat user data for this stage
     bool StageFlatSkipped(const Shader::Info& stage) const;
     u64 dispatch_caller{}; ///< diagnostics: the game call that made the dispatch being bound

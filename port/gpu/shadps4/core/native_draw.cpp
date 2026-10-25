@@ -1029,6 +1029,8 @@ struct SynthReg {
 struct NativeRecord {
     std::atomic<u64> seq{0};
     u32 count{};
+    std::array<u64, MaxGeometryIds> geometry_ids{}; ///< N6.2: engine ids of the vertex and index buffers of the draw
+    u32 geometry_id_count{};
     u64 vs_gnm{}; ///< Gnm shader binaries of the draw (for the shader input dump)
     u64 ps_gnm{};
     u64 dbg_vs{};
@@ -1225,6 +1227,21 @@ void SetLastDescriptorObject(u64 object, bool sampler = false) {
 
 /// The record whose user data are being built (NativeDraw v2 bindings go into it).
 thread_local struct NativeRecord* binding_record = nullptr;
+
+/// N6.2: the engine id of the buffer behind `object` (a buffer or a view of one) goes into the record's geometry list, once.
+void AddGeometryId(NativeRecord& record, u64 object) {
+    SetLastDescriptorObject(object);
+    const u64 id = last_descriptor_object.id;
+    if (id == 0 || record.geometry_id_count >= MaxGeometryIds) {
+        return;
+    }
+    for (u32 i = 0; i < record.geometry_id_count; ++i) {
+        if (record.geometry_ids[i] == id) {
+            return;
+        }
+    }
+    record.geometry_ids[record.geometry_id_count++] = id;
+}
 void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* words, u32 dwords, u32 table_sgpr = 0xff, u32 entry_dwords = 0) {
     if (binding_record == nullptr || stage > 1) {
         return;
@@ -1619,6 +1636,9 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 shader_block, u64 gnm, u64 input
                 const u32 vertex_slot = Rd<u32>(element, 8);
                 const u64 buffer = Rd<u64>(ctx, Ctx::VertexBufferSlots + vertex_slot * 8);
                 u32* v = table + e * 4;
+                if (binding_record != nullptr && buffer != 0 && vertex_slot < 32) {
+                    AddGeometryId(*binding_record, buffer);
+                }
                 if (buffer == 0 || vertex_slot >= 32) {
                     for (u32 k = 0; k < 4; ++k) {
                         v[k] = Rd<u32>(empty_descriptor, k * 4);
@@ -2392,6 +2412,7 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
         const u64 pixel_shader = Rd<u64>(ctx, Ctx::PixelShader);
         synth_desc_key = {};
         slot.binding_count = 0;
+        slot.geometry_id_count = 0;
         slot.bindings_overflow = false;
         slot.bindings_for = seq;
         binding_record = &slot;
@@ -2429,6 +2450,7 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
             // which is the case when no tessellation or geometry stage is bound
             if (const u64 view = Rd<u64>(ctx, 0x58); view != 0 && a1 != 0 && slot.vs_gnm != 0 && Rd<u64>(ctx, 0x4680) == 0 &&
                                                        Rd<u64>(ctx, 0x4688) == 0) {
+                AddGeometryId(slot, view);
                 slot.regs[n++] = {ContextBase + 0x1fa, Rd<u32>(view, 0x60) & 0xfffffffeu};
                 slot.regs[n++] = {ContextBase + 0x1f9, Rd<u32>(view, 0x64) & 0xff};
                 slot.regs[n++] = {ContextBase + 0x102, Rd<u32>(ctx, 0x64)};
@@ -2451,6 +2473,7 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
         }
         if (kind == 0) {
             if (const u64 view = Rd<u64>(ctx, 0x58); view != 0) {
+                AddGeometryId(slot, view);
                 slot.regs[n++] = {ContextBase + 0x1fa, Rd<u32>(view, 0x60) & 0xfffffffeu};
                 slot.regs[n++] = {ContextBase + 0x1f9, Rd<u32>(view, 0x64) & 0xff};
                 slot.regs[n++] = {ContextBase + 0x102, Rd<u32>(ctx, 0x64)};
@@ -3738,6 +3761,13 @@ bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed) {
     out.binding_count = 0;
     out.bindings_complete = false;
     out.bindings_overflow = slot.bindings_for == seq && slot.bindings_overflow;
+    out.geometry_id_count = 0;
+    if (slot.kind <= 2 && slot.bindings_for == seq) {
+        out.geometry_id_count = slot.geometry_id_count;
+        for (u32 i = 0; i < slot.geometry_id_count; ++i) {
+            out.geometry_ids[i] = slot.geometry_ids[i];
+        }
+    }
     if (slot.kind <= 2 && slot.bindings_for == seq && !slot.bindings_overflow && slot.binding_count != 0) {
         out.binding_count = slot.binding_count;
         out.bindings_complete = true;
