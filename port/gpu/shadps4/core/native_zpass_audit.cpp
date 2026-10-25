@@ -111,6 +111,7 @@ struct State {
     std::vector<u8> baseline, shadow;
     u64 pass_ctx{0};
     bool current_valid{false};
+    bool current_ctx_differs{false};
     Item current;
     std::vector<Overlay> overlay;
     std::unordered_map<u64, std::pair<u64, u64>> variant_table; // key -> (vertex shader, pixel shader), learned from the loop
@@ -130,6 +131,11 @@ struct State {
         std::map<u32, u64> right, wrong;
     };
     std::map<std::string, FieldValues> family_fields;
+    u64 last_caller{0};
+    u64 entry_vs{0}, entry_ps{0}; // the shader objects the context held when the draw call was entered (before the record builder's resource tracking could draw internal quads)
+    u64 pair_changed_inside_tag{0};
+    u64 draws_on_another_context{0}, wrong_on_another_context{0}, wrong_on_the_pass_context{0};
+    std::map<u64, std::array<u64, 2>> callers; // call site -> {draws, wrong draws}
     std::map<u64, std::pair<u64, u64>> wrong_over_time; // frame / 64 -> {draws, wrong draws}
     std::map<std::string, std::pair<u64, u64>> wrong_by_fields; // (view type, batch flags, mesh word, material flag) -> {draws, wrong draws}
     u64 variant_right{0}, variant_wrong{0}, variant_pair_right{0}, variant_pair_wrong{0}, variant_unreadable{0}, variant_cold{0};
@@ -866,6 +872,9 @@ void NoteDraw(u64 caller, u32 kind, u64 count, u64 first, u64 instances, u64 ver
         s.current_valid = false; // a draw of another pass: the shadow generator has nothing for it
         return;
     }
+    s.last_caller = caller;
+    s.entry_vs = vertex_shader;
+    s.entry_ps = pixel_shader;
     if (s.active) {
         CheckBinding(s, kind, count, first, instances, ctx);
         Item item{kind, count, first, instances, 0, 0};
@@ -897,10 +906,16 @@ void RealRecord(u64 ctx, u64 seq, u32 kind, u64 a1, u64 a2, u64 a3) {
         }
     }
     // the shader pair: from the key table the audit learns from the loop; a key the table does not know yet is learned from this draw (and counted)
-    u64 real_vs = 0, real_ps = 0;
-    Rd(ctx + 0x4698, real_vs);
-    Rd(ctx + 0x4690, real_ps);
+    u64 real_vs = s.entry_vs, real_ps = s.entry_ps;
+    {
+        u64 after_vs = 0, after_ps = 0;
+        Rd(ctx + 0x4698, after_vs);
+        Rd(ctx + 0x4690, after_ps);
+        s.pair_changed_inside_tag += (after_vs != real_vs || after_ps != real_ps) ? 1 : 0;
+    }
     const Item& e = s.current;
+    s.current_ctx_differs = ctx != s.pass_ctx;
+    s.draws_on_another_context += s.current_ctx_differs ? 1 : 0;
     const u64 key = ((e.material_sig * 0x9E3779B97F4A7C15ull ^ s.view_type) * 31 + (e.batch_flags & 0x10) * 8 + e.kind) * 0x100000001b3ull + e.mesh_word * 131u + s.pass_flags;
     // the variant object the loop chose for this primitive (it stored it behind the primitive record); the generator reads the shader pair from the object of the key
     u64 live_variant = 0, record_data = 0;
@@ -941,6 +956,11 @@ void RealRecord(u64 ctx, u64 seq, u32 kind, u64 a1, u64 a2, u64 a3) {
             ++(variant_right ? s.variant_right : s.variant_wrong);
             ++(pair_right ? s.variant_pair_right : s.variant_pair_wrong);
             {
+                auto& site = s.callers[s.last_caller];
+                ++site[0];
+                site[1] += pair_right ? 0 : 1;
+            }
+            {
                 auto& bucket = s.wrong_over_time[s.frame / 64];
                 ++bucket.first;
                 bucket.second += pair_right ? 0 : 1;
@@ -961,6 +981,7 @@ void RealRecord(u64 ctx, u64 seq, u32 kind, u64 a1, u64 a2, u64 a3) {
                     }
                 }
                 if (!pair_right) {
+                    (s.current_ctx_differs ? s.wrong_on_another_context : s.wrong_on_the_pass_context)++;
                     ++cell.second;
                     ++s.wrong_total;
                     s.wrong_equal_previous += (real_vs == s.prev_live_vs && real_ps == s.prev_live_ps) ? 1 : 0;
@@ -973,7 +994,62 @@ void RealRecord(u64 ctx, u64 seq, u32 kind, u64 a1, u64 a2, u64 a3) {
             if (!variant_right || !pair_right) {
                 const std::string kind = fmt::format("{}{}; batch special entry {}; material flag {}; draw kind {}", variant_right ? "same variant object" : "a different variant object than the key first had", pair_right ? "" : ", the object's pair is not the context's", e.batch_special != 0 ? "yes" : "no", e.material_flag, e.kind);
                 ++s.variant_wrong_kinds[kind];
-                if (!pair_right && s.variant_samples.size() < 6) {
+                if (!pair_right && s.variant_samples.size() < 10) {
+                    // does another primitive of the same batch hold a variant whose pair is the context's pair? (the loop may have bound that one)
+                    u64 prim_array_base = e.prim_record - u64{e.primitive} * 0x38;
+                    u16 prim_count = 0;
+                    Rd(e.batch_object + 100, prim_count);
+                    std::string holder_text = "no primitive of the batch";
+                    for (u32 q = 0; q < prim_count && q < 4096; ++q) {
+                        u64 data = 0, variant_q = 0, qvs = 0, qps = 0;
+                        if (Rd(prim_array_base + u64{q} * 0x38 + 0x28, data) && Rd(data + 0x48, variant_q) && variant_q != 0 && Rd(variant_q + 8, qvs) && Rd(variant_q + 0x18, qps) && qvs == real_vs && qps == real_ps) {
+                            u32 k[4] = {};
+                            Rd(variant_q + 0x20, k[0]);
+                            Rd(variant_q + 0x24, k[1]);
+                            Rd(variant_q + 0x28, k[2]);
+                            Rd(variant_q + 0x2c, k[3]);
+                            holder_text = fmt::format("primitive {} of the batch (variant {:#x}, key {:#x} {:#x} {:#x} {:#x})", q, variant_q, k[0], k[1], k[2], k[3]);
+                            break;
+                        }
+                    }
+                    u32 k[4] = {};
+                    Rd(live_variant + 0x20, k[0]);
+                    Rd(live_variant + 0x24, k[1]);
+                    Rd(live_variant + 0x28, k[2]);
+                    Rd(live_variant + 0x2c, k[3]);
+                    std::array<u64, 4> head{};
+                    RdBytes(live_variant, head.data(), 32);
+                    // the per batch flag bVar54 of the loop, and whether the context's pair is an entry of the engine's default shader tables (renderDev + 0x3f0 / + 0x8e0, 16 bytes per entry)
+                    u64 mesh_q = 0, render_data_q = 0, inner_q = 0, array_q = 0, first_q = 0, holder_q = 0, target_q = 0, g_ctx = 0, g1 = 0, g2 = 0;
+                    u32 array_count_q = 0;
+                    Rd(e.batch_object + 0x20, mesh_q);
+                    Rd(mesh_q + 0x38, render_data_q);
+                    Rd(render_data_q + 0x20, inner_q);
+                    Rd(inner_q + 0x68, array_count_q);
+                    Rd(inner_q + 0x60, array_q);
+                    Rd(NativeDraw::ImageBase() + (0x069a1b40ull - 0x1000000), g_ctx);
+                    Rd(g_ctx + 0x38, g1);
+                    Rd(g1 + 0x20, g2);
+                    bool bvar54 = false;
+                    if (array_count_q != 0 && Rd(array_q, first_q) && first_q != g2 && first_q != 0) {
+                        Rd(first_q + 0x38, target_q);
+                        bvar54 = target_q != 0;
+                    }
+                    (void)holder_q;
+                    std::string table_text = "not in the default tables";
+                    for (u32 t = 0; t < 64; ++t) {
+                        u64 tv = 0, tp = 0;
+                        const bool vs_hit = Rd(s.render_device + 0x3f8 + u64{t} * 0x10, tv) && tv == real_vs;
+                        const bool ps_hit = Rd(s.render_device + 0x8e8 + u64{t} * 0x10, tp) && tp == real_ps;
+                        if (vs_hit || ps_hit) {
+                            table_text = fmt::format("{}{} at index {}", vs_hit ? "vs in the table at +0x3f0" : "", ps_hit ? " ps in the table at +0x8e0" : "", t);
+                            break;
+                        }
+                    }
+                    u64 dbg_m18 = 0, dbg_dat = 0; Rd(e.material + 0x18, dbg_m18); Rd(NativeDraw::ImageBase() + (0x069ae968ull - 0x1000000), dbg_dat);
+                    s.variant_samples.push_back(fmt::format("material+0x18 {:#x} DAT_069ae968 {:#x}; bVar54 {}; {}; primitive {} of {}; the context's pair is held by {}; this primitive's variant {:#x} key {:#x} {:#x} {:#x} {:#x} head {:#x} {:#x} {:#x} {:#x}", dbg_m18, dbg_dat, bvar54, table_text, e.primitive, prim_count, holder_text, live_variant, k[0], k[1], k[2], k[3], head[0], head[1], head[2], head[3]));
+                }
+                if (false && s.variant_samples.size() < 6) {
                     // which variant of the engine's cache holds the context's pair, and what are the key fields of it and of the stored one?
                     u64 cache = 0;
                     u32 cache_count = 0;
@@ -1165,6 +1241,13 @@ nlohmann::json Report() {
                 }
                 shadow["wrong_pairs_over_time"] = over_time;
             }
+            {
+                nlohmann::json sites = nlohmann::json::array();
+                for (const auto& [site, counts] : s.callers) {
+                    sites.push_back(fmt::format("call site {:#x}: {} draws, {} wrong", site, counts[0], counts[1]));
+                }
+                shadow["draw_call_sites_in_the_pass"] = sites;
+            }
             shadow["first_use_rule"] = {{"keys_with_a_variant_object", s.variants.size()},
                                         {"draws_where_the_keys_variant_object_is_the_one_the_loop_chose", s.variant_right},
                                         {"draws_where_it_is_another_object", s.variant_wrong},
@@ -1173,7 +1256,11 @@ nlohmann::json Report() {
                                         {"draws_without_a_readable_variant", s.variant_unreadable},
                                         {"keys_whose_object_changed_its_shader_pair_over_time", changing},
                                         {"changes_of_the_pair_in_all_objects", changes},
+                                        {"draws_where_the_context_pair_changed_between_the_call_entry_and_the_end_of_the_tag", s.pair_changed_inside_tag},
                                         {"wrong_draws", s.wrong_total},
+                                        {"draws_issued_on_another_device_context_than_the_one_at_the_pass_start", s.draws_on_another_context},
+                                        {"wrong_draws_on_another_context", s.wrong_on_another_context},
+                                        {"wrong_draws_on_the_pass_context", s.wrong_on_the_pass_context},
                                         {"wrong_draws_whose_pair_is_the_previous_draws_pair", s.wrong_equal_previous},
                                         {"draws_of_a_material_that_keeps_the_previous_draws_shaders", s.draws_keeping_the_previous_shaders},
                                         {"of_those_the_shadow_contexts_previous_pair_is_the_contexts_pair", s.draws_keeping_right},
