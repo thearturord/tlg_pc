@@ -20,6 +20,7 @@
 #endif
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
+#include "core/native_draw.h"
 #include "core/native_zpass_audit.h"
 
 namespace Core::NativeZPass {
@@ -56,6 +57,7 @@ struct Item {
     u64 material{};      // expected side: the primitive's material
     u64 material_sig{};  // expected side: a hash of the material fields the variant search reads
     u32 material_flag{}; // expected side: material + 0xd4 & 1 (the per-primitive resource set is bound only for these)
+    u64 batch_object{};  // expected side: the batch object
     u64 batch_special{}; // expected side: batch + 0x48 (a special entry that fills the resource table itself)
     u32 mesh_word{};     // expected side: the mesh's vertex format word (mesh + 0x78), part of the variant key
     u32 batch_flags{};   // expected side: the batch flag word (bit 0x10 goes into the variant key)
@@ -90,12 +92,14 @@ struct State {
     size_t cursor{0};
     // audit c: the per-primitive binding. checks: 0 ctx[0x980..0x9c8) = obj[0x450..0x498), 1 ctx[0x9d0..0xa18) = obj[0x498..0x4e0), 2 shader resources at ctx + 0x790, 3 at ctx + 0xb38,
     // 4 constant buffer slots ctx + 0x290 / 0x310, 5 the resource set (renderDev + 0xe80 = material + 0x178)
-    static constexpr u32 Checks = 6;
+    static constexpr u32 Checks = 10;
     std::array<u64, Checks> bind_checked{}, bind_equal{}, bind_not_applicable{}, bind_unreadable{};
     std::vector<std::string> bind_samples;
     std::array<u32, Checks> bind_sample_count{};
     u64 bind_unmatched_draws{0};
     u64 slot_differs_same_object{0}, slot_differs_foreign{0};
+    std::map<u64, u64> unused_texture_slot_values; // value of the slots past the material's texture count -> draws (one value expected: the engine's null texture)
+    u64 unused_slots_not_uniform{0};
     std::map<std::string, u64> slot_differs_by;
     std::vector<std::string> slot_samples;    std::vector<Item> expected;
     std::vector<Item> observed;
@@ -320,6 +324,174 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
     } else {
         not_applicable(5);
     }
+
+    // ---- audit d: the batch level and the texture pointers
+    u64 mesh = 0, render_data = 0;
+    Rd(e.batch_object + 0x20, mesh);
+    Rd(mesh + 0x38, render_data);
+    {
+        // FUN_01c932d0: ctx[0x288] = ctx[0x308] = *(*(batch + 0x68) + 0x130)
+        u64 pass_object = 0, expected_value = 0;
+        if (Rd(e.batch_object + 0x68, pass_object) && Rd(pass_object + 0x130, expected_value)) {
+            std::array<u8, 8> want{};
+            std::memcpy(want.data(), &expected_value, 8);
+            u64 a = 0, b = 0;
+            if (Rd(ctx + 0x288, a) && Rd(ctx + 0x308, b)) {
+                ++s.bind_checked[6];
+                if (a == expected_value && b == expected_value) {
+                    ++s.bind_equal[6];
+                } else if (s.bind_sample_count[6]++ < 3) {
+                    s.bind_samples.push_back(fmt::format("batch pass object (view type {}): context {:#x} / {:#x}, expected {:#x}", s.view_type, a, b, expected_value));
+                }
+            } else {
+                ++s.bind_unreadable[6];
+            }
+        } else {
+            ++s.bind_unreadable[6];
+        }
+    }
+    if (render_data != 0) {
+        u32 entries = 0;
+        Rd(mesh + 0x68, entries);
+        const u32 n = std::min<u32>(entries, 16);
+        u64 inner = 0, defaults_holder = 0, default_object = 0;
+        Rd(render_data + 0x20, inner);
+        const u64 global = NativeDraw::ImageBase() + (0x069a1b40ull - 0x1000000);
+        u64 context_global = 0;
+        Rd(global, context_global);
+        Rd(context_global + 0x38, defaults_holder);
+        Rd(defaults_holder + 0x20, default_object);
+        u64 array = 0;
+        u32 array_count = 0;
+        Rd(inner + 0x60, array);
+        Rd(inner + 0x68, array_count);
+        bool any = false, all = true, unreadable = false;
+        for (u32 j = 0; j < n; ++j) {
+            u64 entry = 0, holder = 0, value = 0;
+            if (j >= array_count || !Rd(array + u64{j} * 8, entry) || entry == default_object || entry == 0 || !Rd(entry + 0x38, holder) || holder == 0 || !Rd(holder + 0x28, value)) {
+                continue; // the loop writes nothing for this entry
+            }
+            u64 held = 0;
+            if (!Rd(ctx + 0x6c0 + u64{j} * 8, held)) {
+                unreadable = true;
+                continue;
+            }
+            any = true;
+            all &= held == value;
+        }
+        if (unreadable) {
+            ++s.bind_unreadable[7];
+        } else if (any) {
+            ++s.bind_checked[7];
+            if (all) {
+                ++s.bind_equal[7];
+            } else if (s.bind_sample_count[7]++ < 3) {
+                s.bind_samples.push_back(fmt::format("batch table entries (view type {}, material {:#x}): the context differs from the mesh render data", s.view_type, e.material));
+            }
+        } else {
+            ++s.bind_not_applicable[7];
+        }
+        // the index buffer view: *(ctx + 0x58) = *(*(*(inner + 0x50) + 0x38) + 0x20) (0 when inner + 0x50 is null), *(ctx + 0x60) = 0x39
+        u64 view_holder = 0, view_inner = 0, view_value = 0;
+        Rd(inner + 0x50, view_holder);
+        if (view_holder != 0) {
+            Rd(view_holder + 0x38, view_inner);
+            Rd(view_inner + 0x20, view_value);
+        }
+        u64 held_view = 0, held_type = 0;
+        if (Rd(ctx + 0x58, held_view) && Rd(ctx + 0x60, held_type)) {
+            ++s.bind_checked[8];
+            if (held_view == view_value && held_type == 0x39) {
+                ++s.bind_equal[8];
+            } else if (s.bind_sample_count[8]++ < 3) {
+                s.bind_samples.push_back(fmt::format("index buffer view (view type {}, material {:#x}): context {:#x} type {:#x}, expected {:#x} type 0x39", s.view_type, e.material, held_view, held_type, view_value));
+            }
+        } else {
+            ++s.bind_unreadable[8];
+        }
+    } else {
+        ++s.bind_unreadable[7];
+        ++s.bind_unreadable[8];
+    }
+    {
+        // FUN_01c92f30: the eight texture pointers go to ctx + 0xa40 (material + 0x170 & 1) and ctx + 0x740 (& 2)
+        u32 texture_flags = 0, texture_count = 0;
+        u64 texture_array = 0;
+        Rd(e.material + 0x170, texture_flags);
+        Rd(e.material + 0x198, texture_count);
+        Rd(e.material + 400, texture_array);
+        u32 token_d = 0;
+        u64 cached_d = 0;
+        Rd(e.material + 0x1bc, token_d);
+        Rd(e.material + 0x48, cached_d);
+        if (e.material_flag == 1 && e.batch_special == 0 && (token_d != 0 || cached_d != 0) && (texture_flags & 3) != 0 && texture_array != 0) {
+            const u64 global = NativeDraw::ImageBase() + (0x069a1b40ull - 0x1000000);
+            u64 context_global = 0, h1 = 0, h2 = 0, default_texture_object = 0, default_render = 0, default_pointer = 0;
+            Rd(global, context_global);
+            Rd(context_global + 0x38, h1);
+            Rd(h1 + 0x38, h2);
+            Rd(h2 + 0x38, default_render);
+            Rd(default_render + 0x48, default_pointer);
+            (void)default_texture_object;
+            std::array<u64, 8> expected_pointers;
+            expected_pointers.fill(default_pointer);
+            const u32 n = std::min<u32>(texture_count, 8);
+            bool readable = true;
+            for (u32 i = 0; i < n; ++i) {
+                u64 object = 0, render = 0, pointer = 0;
+                if (!Rd(texture_array + u64{i} * 8, object) || !Rd(object + 0x38, render)) {
+                    readable = false;
+                    break;
+                }
+                if (render != 0) {
+                    Rd(render + 0x48, pointer);
+                }
+                expected_pointers[i] = pointer != 0 ? pointer : default_pointer;
+            }
+            if (!readable) {
+                ++s.bind_unreadable[9];
+            } else {
+                for (u32 which = 0; which < 2; ++which) {
+                    if ((texture_flags & (1u << which)) == 0) {
+                        continue;
+                    }
+                    std::array<u64, 8> held{};
+                    if (!RdBytes(ctx + (which == 0 ? 0xa40 : 0x740), held.data(), sizeof(held))) {
+                        ++s.bind_unreadable[9];
+                        continue;
+                    }
+                    ++s.bind_checked[9];
+                    bool used_equal = true, unused_uniform = true;
+                    for (u32 i = 0; i < 8; ++i) {
+                        if (i < n) {
+                            used_equal &= held[i] == expected_pointers[i];
+                        } else {
+                            unused_uniform &= held[i] == held[n < 8 ? n : 7];
+                        }
+                    }
+                    if (n < 8) {
+                        ++s.unused_texture_slot_values[held[n]];
+                        if (!unused_uniform) {
+                            ++s.unused_slots_not_uniform;
+                        }
+                    }
+                    if (used_equal && unused_uniform) {
+                        ++s.bind_equal[9];
+                    } else if (s.bind_sample_count[9]++ < 3) {
+                        std::string text;
+                        for (u32 i = 0; i < 8; ++i) {
+                            if (held[i] != expected_pointers[i]) {
+                                text += fmt::format(" [{}] context {:#x} expected {:#x};", i, held[i], expected_pointers[i]);
+                            }
+                        }
+                        s.bind_samples.push_back(fmt::format("texture pointers at +{:#x} (view type {}, material {:#x}, {} textures):{}", which == 0 ? 0xa40 : 0x740, s.view_type, e.material, n, text));
+                    }
+                }
+            }
+        } else {
+            ++s.bind_not_applicable[9];
+        }
+    }
 }
 } // namespace
 
@@ -452,6 +624,7 @@ void PassEnter(u64 render_device, u64 desc) {
             Item item{Plain, u64(triangles) * 3, first, 1, b, p};
             item.material = material;
             Rd(batch + 0x48, item.batch_special);
+            item.batch_object = batch;
             item.material_flag = material_flag;
             item.mesh_word = mesh_word;
             item.batch_flags = batch_flags;
@@ -546,13 +719,22 @@ nlohmann::json Report() {
     {
         static constexpr const char* names[State::Checks] = {"material block 1: context 0x980..0x9c8 = material render object 0x450..0x498", "material block 2: context 0x9d0..0xa18 = object 0x498..0x4e0 (when object + 0x444 is set)",
                                                              "shader resource views: context + 0x790 = the array at object + 0x4f0", "shader resource views 2: context + 0xb38 = the array at object + 0x4e0",
-                                                             "constant buffer slots: context + 0x290 / 0x310 = object 0xc0 + index * 0xb0", "resource set: render device + 0xe80 = material + 0x178 (no special batch entry, bound by FUN_01c92f30)"};
+                                                             "constant buffer slots: context + 0x290 / 0x310 = object 0xc0 + index * 0xb0", "resource set: render device + 0xe80 = material + 0x178 (no special batch entry, bound by FUN_01c92f30)",
+                                                             "batch level (FUN_01c932d0): context + 0x288 / 0x308 = the batch's pass object + 0x130", "batch level: the sampler / resource table entries at context + 0x6c0 + 8 j from the mesh render data",
+                                                             "batch level: the index buffer view, context + 0x58 and the index type +0x60 = 0x39", "texture pointers of the resource set (FUN_01c92f30) in the context slots (+0xa40 and +0x740)"};
         auto& binding = out["binding_audit"] = nlohmann::json::object();
         for (u32 c = 0; c < State::Checks; ++c) {
             binding[names[c]] = {{"checked", s.bind_checked[c]}, {"equal", s.bind_equal[c]}, {"differ", s.bind_checked[c] - s.bind_equal[c]}, {"not_applicable", s.bind_not_applicable[c]}, {"unreadable", s.bind_unreadable[c]}};
         }
         binding["draws_without_a_matching_expected_primitive"] = s.bind_unmatched_draws;
         binding["first_differences"] = s.bind_samples;
+        {
+            nlohmann::json values = nlohmann::json::object();
+            for (const auto& [value, draws] : s.unused_texture_slot_values) {
+                values[fmt::format("{:#x}", value)] = draws;
+            }
+            binding["texture_slots_past_the_material_texture_count"] = {{"distinct_values_and_draws", values}, {"draws_where_they_are_not_all_equal", s.unused_slots_not_uniform}};
+        }
         binding["constant_buffer_slot_differences"] = {{"value_is_another_slot_of_the_same_render_object", s.slot_differs_same_object}, {"value_is_not_in_the_render_object", s.slot_differs_foreign}, {"by_cause", s.slot_differs_by}, {"samples", s.slot_samples}};
     }
     {
