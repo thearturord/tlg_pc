@@ -19,6 +19,10 @@ namespace Core::NativeZPassGen {
 /// `DrawZPass(render_device, desc)` was entered. Returns true when the pass is done (generated, or run by the loop through `original_loop`, the hook's original entry) and the
 /// hooked function must be skipped, false when nothing was done (the view type is not handled: the engine's loop runs).
 bool HandlePass(u64 render_device, u64 desc, u64 original_loop);
+/// N6.6, the G-buffer loop (`RenderDev_DrawGBufferPrimitives`): `TLG_GBUFFER_GEN=1`, verify one pass in `TLG_GBUFFER_GEN_VERIFY` (default 32). Same contract as HandlePass; `param7` is the
+/// byte the loop takes on the stack, `original_loop` the hook's original entry.
+[[nodiscard]] bool GBufferEnabled();
+bool HandleGBuffer(u64 render_device, u64 mode, u64 list, u64 args, u64 flags, u64 query_mode, u64 param7, u64 original_loop);
 /// True while a verify pass runs the engine's loop.
 [[nodiscard]] bool VerifyActive();
 /// A draw of the engine's loop during a verify pass: `caller` is the ghidra address of the call site, kind 0 `DrawIndexedCommon`.

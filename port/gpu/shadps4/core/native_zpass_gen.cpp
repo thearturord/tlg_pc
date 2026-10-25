@@ -202,6 +202,7 @@ struct Target {
     std::vector<Mark> marks;
     u64 batch_owner{0};                          // shadow: the batch whose level words (ctx + 0x580, 0x58, 0x288, 0x308) are being written
     std::unordered_map<size_t, u64> batch_owner_map;
+    u64 indexed_site{0x01c76433}, indirect_site{0x01c7640f}, indexed_a4{1}; // the loop's call sites (ghidra return addresses) and the fifth argument of its indexed draw
     u64 table_entry{0};                          // shadow: the table entry object whose value is being written (ctx + 0x6c0 + 8 j)
     std::unordered_map<size_t, u64> table_owner; // shadow: arena position of an entry -> that table entry object
     u64 slot_material{0};                       // shadow: the material whose resource slot words are being written
@@ -692,9 +693,9 @@ void ScanImpl(ScanArgs& args) {
 void IssueDraw(Target& t, u32 kind, u64 count, u64 first) {
     if (t.live) {
         if (kind == 0) {
-            NativeDraw::IssueIndexedDraw(reinterpret_cast<u64>(t.base), count, first);
+            NativeDraw::IssueIndexedDraw(reinterpret_cast<u64>(t.base), count, first, t.indexed_site, t.indexed_a4);
         } else {
-            NativeDraw::IssueIndirectDraw(reinterpret_cast<u64>(t.base), count, first);
+            NativeDraw::IssueIndirectDraw(reinterpret_cast<u64>(t.base), count, first, t.indirect_site);
         }
     } else {
         t.marks.push_back({t.arena.size(), kind, count, first, t.Get<u64>(0x4698), t.Get<u64>(0x4690)});
@@ -885,11 +886,13 @@ struct Verify {
     Target shadow;
     size_t cursor{0}, arena_pos{0};
     u32 view{0};
+    u64 lo{ZPassBegin}, hi{ZPassEnd}; // the call sites of the loop under verify
     u64 ctx{0};
     u64 compared_draws{0};
     u64 mismatches{0};
     u64 raced{0};
     std::vector<s16> expect;
+    std::vector<u64> owner_of; // per context byte: the material whose render object the shadow copied the byte from (0: none)
 };
 Verify& V() {
     static Verify verify;
@@ -904,6 +907,27 @@ void NoteMismatch(State& s, u32 view, const std::string& kind, const std::string
     }
 }
 
+/// The byte the render object of `material` holds now for the context byte `offset` (the block copies of FUN_01c92b60), or -1.
+int MaterialByte(u64 material, u32 offset) {
+    const u64 object = R<u64>(material + 0x38);
+    if (object == 0) {
+        return -1;
+    }
+    if (offset >= 0x980 && offset < 0x9c8 + 8) {
+        return R<u8>(object + 0x450 + (offset - 0x980));
+    }
+    if (offset >= 0x9d0 && offset < 0xa18) {
+        return R<u8>(object + 0x498 + (offset - 0x9d0));
+    }
+    if (const u64 views = R<u64>(object + 0x4f0); views != 0 && offset >= 0x790 && offset < 0x790 + R<u32>(object + 0x4f8) * 8) {
+        return R<u8>(views + (offset - 0x790));
+    }
+    if (const u64 views = R<u64>(object + 0x4e0); views != 0 && offset >= 0xb38 && offset < 0xb38 + R<u32>(object + 0x4e8) * 8) {
+        return R<u8>(views + (offset - 0xb38));
+    }
+    return -1;
+}
+
 /// Compares the writes the generator made between two draws with the live context. Writes to the same bytes inside the span are applied in order (only the last counts: a batch
 /// that draws nothing rewrites ctx + 0x580, the clear after an instanced batch overwrites the start of the table before it).
 u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, const char* where) {
@@ -911,6 +935,7 @@ u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, cons
     const u8* arena = v.shadow.arena.data();
     if (v.expect.empty()) {
         v.expect.assign(CtxBytes, -1);
+        v.owner_of.assign(CtxBytes, 0);
     }
     std::vector<u32> touched;
     std::map<u32, u8> or_bits;
@@ -955,11 +980,13 @@ u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, cons
             slot_words[offset] = {value, owner->second};
             continue;
         }
+        const u64 material_owner = owner != v.shadow.slot_owner.end() ? owner->second : 0;
         for (u32 i = 0; i < bytes; ++i) {
             if (v.expect[offset + i] < 0) {
                 touched.push_back(offset + i);
             }
             v.expect[offset + i] = expected[i];
+            v.owner_of[offset + i] = material_owner;
         }
     }
     std::sort(touched.begin(), touched.end());
@@ -973,6 +1000,16 @@ u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, cons
             const u32 at_byte = touched[k];
             const u8 live = R<u8>(live_ctx + at_byte);
             if (live != static_cast<u8>(v.expect[at_byte])) {
+                // the dynamic constants of a material's render object are rewritten by the engine's other threads: if the live byte is what the object holds now, shadow and loop only read at
+                // different times
+                if (const u64 material = v.owner_of[at_byte]; material != 0) {
+                    const int now = MaterialByte(material, at_byte);
+                    if (now >= 0 && now == live) {
+                        ++v.raced;
+                        s.raced_words[fmt::format("view {} material block byte {:#x}", v.view, at_byte & ~7u)]++;
+                        continue;
+                    }
+                }
                 u64 a = 0, b = 0;
                 const u32 base = at_byte & ~7u;
                 std::memcpy(&a, reinterpret_cast<const void*>(live_ctx + base), 8);
@@ -990,6 +1027,7 @@ u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, cons
     }
     for (const u32 at_byte : touched) {
         v.expect[at_byte] = -1;
+        v.owner_of[at_byte] = 0;
     }
     for (const auto& [offset, bits] : or_bits) {
         const u8 live = R<u8>(live_ctx + offset);
@@ -1065,6 +1103,406 @@ u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, cons
     return differences;
 }
 
+
+// ------------------------------------------------------------------------------------------------------------------------------- the G-buffer loop (N6.6)
+// RenderDev_DrawGBufferPrimitives(renderDev, mode, list, args, flags, query mode, p7), ghidra 0x01c76710. What the live scenes ask of it (audit /gbuffer): mode 0, query mode 0, the
+// flags 0x20; batches with and without an instance group, with and without a second render data (batch + 0x28); no special entries; every primitive has its variant cached behind its
+// data (+0x40) and a negative +0x24. Everything else is declined. The variant is the cached one, so there is no key table here.
+
+constexpr u64 GBufferBegin = 0x01c76710, GBufferEnd = 0x01c779a0; // DrawGBufferPrimitives and the next function (DrawForwardPass)
+constexpr u64 GBufferIndexedSite = 0x01c777a1, GBufferIndirectSite = 0x01c77788;
+constexpr u64 FunctionHandleLookup = 0x01c59060; // FUN_01c59060(object table, handle) -> object or 0
+constexpr u64 GlobalObjectTable = 0x0689eed8;    // DAT_0689eed8
+
+struct GBatch {
+    BatchLevel level;     // value_580, view_58, pass_object_288, the table; group fields (inner, group_object, g70.., gtable)
+    u64 batch{};
+    u32 flags_value{0};   // ((batch flags & 4) << 4) | the pass flags
+    bool has_second{false};
+    u64 v840{0};
+    bool has_mesh{false};
+    bool pair{false};     // no group: the first table entry is a valid object: ctx + 0x588 / 0x590
+    u64 v588{0}, v590{0};
+    u64 v68_group{0};     // group: ctx + 0x68
+};
+
+struct GStep {
+    u32 index{};
+    u64 record{}, material{}, variant{};
+};
+
+struct GPlan {
+    bool scanned{false};
+    std::vector<const char*> reasons;
+    u64 render_device{0}, ctx{0};
+    u32 mode{0}, flags{0}, query_mode{0};
+    s32 indirect_mode{0};
+    u64 v_b60{0}, v_3c28{0}, v_68{0};
+    std::vector<GBatch> batches;
+    std::vector<GStep> steps;
+    u32 group_batches{0};
+    bool Ok() const { return scanned && reasons.empty(); }
+    void Decline(const char* r) {
+        for (const char* x : reasons) {
+            if (x == r) {
+                return;
+            }
+        }
+        reasons.push_back(r);
+    }
+};
+
+struct GScanArgs {
+    GPlan* plan;
+    u64 render_device, list, args;
+};
+
+void ScanGBuffer(GScanArgs& a) {
+    GPlan& plan = *a.plan;
+    const u64 rd = a.render_device;
+    plan.render_device = rd;
+    plan.ctx = R<u64>(rd + 0x2d8);
+    plan.indirect_mode = R<s32>(rd + 0x38e0);
+    if (plan.ctx == 0 || a.list == 0) {
+        plan.Decline("no list or no device context");
+        return;
+    }
+    if (plan.mode == 1) {
+        plan.Decline("mode 1 (the other binding order, never seen)");
+    }
+    if (plan.query_mode == 1 || plan.query_mode == 2 || plan.query_mode == 5) {
+        plan.Decline("query mode 1, 2, 5 (queries or a target switch)");
+    }
+    for (const u32 offset : {0x4698u, 0x4690u}) {
+        if (const u64 shader = R<u64>(plan.ctx + offset); shader != 0 && R<s64>(shader + 8) <= 1) {
+            plan.Decline("the context holds a shader with a single reference (releasing it destroys it)");
+        }
+    }
+    plan.v_3c28 = R<u64>(rd + 0x3c28);
+    plan.v_68 = R<u64>(rd + 0x3d90 + u64(plan.mode == 1) * 8);
+    {
+        const u64 table = R<u64>(Global(GlobalObjectTable));
+        const u64 handle = R<u64>(R<u64>(a.args + 0x2d0) + 0x30);
+        const u64 object = reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64)>(Global(FunctionHandleLookup))(table, handle);
+        plan.v_b60 = object != 0 ? R<u64>(object + 0x48) : 0;
+    }
+    const u64 context_global = R<u64>(Global(GlobalContext));
+    const u64 default_object = R<u64>(R<u64>(context_global + 0x38) + 0x20);
+    const u64 batch_array = R<u64>(a.list);
+    const u32 batch_count = R<u32>(a.list + 8);
+    if (batch_count != 0 && (batch_array == 0 || batch_count > 100000)) {
+        plan.Decline("batch list unreadable");
+        return;
+    }
+    for (u32 b = 0; b < batch_count; ++b) {
+        const u64 batch = R<u64>(batch_array + u64{b} * 8);
+        if (batch == 0) {
+            plan.Decline("null batch");
+            continue;
+        }
+        GBatch gb;
+        gb.batch = batch;
+        const u16 batch_flags = R<u16>(batch + 0x66);
+        gb.flags_value = (u32{static_cast<u32>(batch_flags & 4)} << 4) | plan.flags;
+        if (R<u64>(batch + 0x48) != 0) {
+            plan.Decline("batch with a special entry");
+            continue;
+        }
+        if (const u64 second = R<u64>(batch + 0x28); second != 0) {
+            const u64 second_data = R<u64>(second + 0x38);
+            if (second_data == 0 || R<u64>(second_data + 0x20) == 0) {
+                plan.Decline("second render data not created yet");
+                continue;
+            }
+            gb.has_second = true;
+            gb.v840 = R<u64>(R<u64>(R<u64>(R<u64>(second_data + 0x20) + 0x48) + 0x38) + 0x28);
+        }
+        const u64 mesh = R<u64>(batch + 0x20);
+        gb.has_mesh = mesh != 0;
+        gb.level.first_step = static_cast<u32>(plan.steps.size());
+        if (!gb.has_mesh) {
+            plan.batches.push_back(gb);
+            continue;
+        }
+        const u64 render_data = R<u64>(mesh + 0x38);
+        if (render_data == 0 || R<u64>(render_data + 0x20) == 0) {
+            plan.Decline("mesh render data not created yet (the loop creates it at first use)");
+            continue;
+        }
+        FillBatchLevel(gb.level, batch, default_object);
+        gb.level.first_step = static_cast<u32>(plan.steps.size());
+        const u64 inner = gb.level.inner;
+        const u64 group = R<u64>(batch + 0x38);
+        if (group == 0) {
+            const u32 count = R<u32>(inner + 0x68);
+            if (count != 0) {
+                const u64 array = R<u64>(inner + 0x60);
+                const u64 first = R<u64>(array);
+                if (first != default_object && first != 0 && R<u64>(first + 0x38) != 0) {
+                    gb.pair = true;
+                    gb.v588 = R<u64>(R<u64>(first + 0x38) + 0x28);
+                    u64 second_entry = R<u64>(array + 8);
+                    if (second_entry == default_object) {
+                        second_entry = 0;
+                    }
+                    if (second_entry == 0) {
+                        plan.Decline("table with a valid first entry and no second one (the loop reads through a null pointer)");
+                        continue;
+                    }
+                    gb.v590 = R<u64>(R<u64>(second_entry + 0x38) + 0x28);
+                }
+            }
+        } else {
+            const u64 group_inner = R<u64>(group + 8);
+            if (group_inner == 0) {
+                plan.Decline("instance group without its inner object");
+                continue;
+            }
+            if (plan.indirect_mode == 0) {
+                plan.Decline("instance group batch without the indirect mode (DrawIndexedInstanced is not hooked)");
+                continue;
+            }
+            const u64 group_object = R<u64>(group_inner + 0x38);
+            u32 instances = 0;
+            if (group_object != 0) {
+                instances = R<u32>(R<u64>(group_object + 0x28) + 0x48);
+            }
+            gb.level.group = true;
+            ++plan.group_batches;
+            if (group_object == 0 || instances == 0) {
+                gb.level.only_580 = true; // the loop leaves the batch after ctx + 0x580
+                plan.batches.push_back(gb);
+                continue;
+            }
+            gb.level.group_object = group_object;
+            gb.level.indirect_buffer = R<u64>(group_object + 0x110);
+            const u32 views_count = R<u32>(group_object + 0xe0);
+            const s32 ring_index = R<s32>(group_object + 0x20);
+            if (views_count > 45 || (ring_index != 0 && ring_index != 1)) {
+                plan.Decline("instance group with an unusual view count or ring index");
+                continue;
+            }
+            const u64 ring_entry = R<u64>(R<u64>(group_object + 0xb8) + u64(ring_index) * 8);
+            const u64 view_object = R<u64>(R<u64>(inner + 0x48) + 0x38);
+            gb.level.g70 = R<u64>(view_object + 0x20);
+            gb.level.g78 = R<u64>(ring_entry + 0x20);
+            gb.level.g170 = R<u32>(view_object + 0x40);
+            gb.level.g174 = R<u32>(ring_entry + 0x40);
+            if (const u64 uploader = R<u64>(group_object + 0xf0); uploader != 0) {
+                gb.level.g340 = R<u64>(R<u64>(uploader) + 0x10);
+                gb.level.g340_set = true;
+            }
+            gb.level.gtable[0] = R<u64>(group_object + 0x1b0); // view type 0
+            gb.level.gtable[1] = R<u64>(group_object + 0x1f8 + u64(ring_index) * 8);
+            gb.level.gtable[2] = R<u64>(group_object + 0x1f8 + u64(1 - ring_index) * 8);
+            const u64 views_array = R<u64>(group_object + 0xd8);
+            for (u32 i = 0; i < views_count; ++i) {
+                const u64 holder = R<u64>(views_array + u64{i} * 8);
+                gb.level.gtable[3 + i] = holder != 0 ? R<u64>(holder + 0x28) : 0;
+            }
+            gb.level.table_dwords = 3 + views_count;
+            gb.v68_group = plan.indirect_mode == 0 ? R<u64>(rd + 0x3da8) : R<u64>(rd + 0x3d90);
+        }
+        const u16 prim_count = R<u16>(batch + 100);
+        const u64 prim_array = R<u64>(batch + 0x58);
+        for (u32 p = 0; p < prim_count; ++p) {
+            const u64 record = prim_array + u64{p} * 0x38;
+            GStep step;
+            step.index = p;
+            step.record = record;
+            step.material = R<u64>(record + 0x18);
+            const u64 data = R<u64>(record + 0x28);
+            if (data == 0 || R<s32>(record + 0x24) >= 0) {
+                plan.Decline(data == 0 ? "primitive record without its per primitive data" : "primitive with a non-negative +0x24 (another draw path)");
+                continue;
+            }
+            step.variant = R<u64>(data + 0x40);
+            if (step.variant == 0 || R<u32>(record + 0x30) != 0) {
+                plan.Decline("primitive without a cached variant (the loop creates it)");
+                continue;
+            }
+            if (R<u64>(step.variant + 8) == 0 || R<u64>(step.variant + 0x18) == 0) {
+                plan.Decline("variant without a shader pair");
+                continue;
+            }
+            const u64 object = R<u64>(step.material + 0x38);
+            if (object == 0) {
+                plan.Decline("material without a render object");
+                continue;
+            }
+            const u32 count_a = R<u32>(object + 0x4f8), count_b = R<u32>(object + 0x4e8);
+            if ((R<u64>(object + 0x4f0) != 0 && (count_a == 0 || count_a > 62)) || (R<u64>(object + 0x4e0) != 0 && (count_b == 0 || count_b > 72)) || (R<u64>(object + 0x440) & 0xffffffffull) >= 64) {
+                plan.Decline("material with a resource count or slot index the engine asserts on");
+                continue;
+            }
+            plan.steps.push_back(step);
+        }
+        gb.level.step_count = static_cast<u32>(plan.steps.size()) - gb.level.first_step;
+        plan.batches.push_back(gb);
+    }
+    plan.scanned = true;
+}
+
+void GenerateGBuffer(Target& t, const GPlan& plan, u32 pass_flags) {
+    const u64 rd = plan.render_device;
+    if (t.Get<u32>(0x4480) != 4) {
+        t.Set<u32>(0x4480, 4);
+        t.Or8(0x447c, 1);
+    }
+    t.Set<u64>(0x68, plan.v_68);
+    t.Set<u64>(0xb60, plan.v_b60);
+    bool raster_flag = false;
+    u32 local_158 = 0, local_150 = pass_flags;
+    for (const GBatch& gb : plan.batches) {
+        const BatchLevel& level = gb.level;
+        if (pass_flags != 0) {
+            local_150 = local_158;
+            if (local_158 != gb.flags_value) {
+                t.Set<u64>(0x46e0, plan.v_3c28);
+                t.Set<u32>(0x46e8, gb.flags_value);
+                t.Set<u8>(0x46ec, 1);
+                local_158 = gb.flags_value;
+                local_150 = gb.flags_value;
+            }
+        }
+        if (gb.has_second) {
+            t.Set<u64>(0x840, gb.v840);
+        }
+        if (!gb.has_mesh) {
+            continue;
+        }
+        t.batch_owner = level.batch;
+        t.Set<u64>(0x580, level.value_580);
+        t.batch_owner = 0;
+        if (!level.group) {
+            t.Set<u64>(0x68, 0);
+            t.batch_owner = level.batch;
+            t.Set<u64>(0x58, level.view_58);
+            t.batch_owner = 0;
+            t.Set<u64>(0x60, 0x39);
+            if (gb.pair) {
+                t.Set<u64>(0x580, level.value_580);
+                t.Set<u64>(0x588, gb.v588);
+                t.Set<u64>(0x590, gb.v590);
+            }
+        } else {
+            if (level.only_580) {
+                continue;
+            }
+            if (t.live) {
+                reinterpret_cast<GuestGroupBind>(Global(FunctionGroupBind))(level.inner, level.group_object, 0);
+            } else {
+                t.Set<u64>(0x70, level.g70);
+                t.Set<u64>(0x78, level.g78);
+                t.Set<u32>(0x170, level.g170);
+                t.Set<u32>(0x174, level.g174);
+                t.Set<u64>(0x1f0, 0);
+                if (level.g340_set) {
+                    t.Set<u64>(0x340, level.g340);
+                }
+                t.Put(0x800, level.gtable.data(), level.table_dwords * 8);
+            }
+            t.Set<u64>(0x68, gb.v68_group);
+            t.batch_owner = level.batch;
+            t.Set<u64>(0x58, level.view_58);
+            t.batch_owner = 0;
+            t.Set<u64>(0x60, 0x39);
+        }
+        // FUN_01c932d0
+        t.batch_owner = level.batch;
+        t.Set<u64>(0x288, level.pass_object_288);
+        t.Set<u64>(0x308, level.pass_object_288);
+        t.batch_owner = 0;
+        for (u32 i = level.table_count; i-- > 0;) {
+            t.table_entry = level.table_entry[i];
+            t.Set<u64>(0x6c0 + level.table[i].first * 8, level.table[i].second);
+            t.table_entry = 0;
+        }
+        for (u32 s = level.first_step; s < level.first_step + level.step_count; ++s) {
+            const GStep& step = plan.steps[s];
+            if (t.live) {
+                reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, 0);
+            }
+            const bool raster = (R<u32>(step.material + 0xd4) & 0x26) != 0;
+            if (raster != raster_flag) {
+                raster_flag = raster;
+                const u64 object = R<u64>(rd + (raster ? 0x3bf8 : 0x3bf0));
+                if (t.Get<u64>(0x46c8) != object) {
+                    t.Set<u64>(0x46c8, object);
+                    t.Set<u8>(0x46d8, 1);
+                }
+            }
+            SetShader(t, 0x4698, R<u64>(step.variant + 8), 1);
+            SetShader(t, 0x4690, R<u64>(step.variant + 0x18), 2);
+            t.slot_material = step.material;
+            BindMaterial(t, step.material);
+            t.slot_material = 0;
+            const s32 triangles = R<s32>(step.record + 0x14);
+            if (level.group) {
+                IssueDraw(t, 1, level.indirect_buffer, u64{step.index} * 0xd8);
+            } else {
+                IssueDraw(t, 0, static_cast<u32>(triangles * 3), R<u32>(step.record + 0x10));
+            }
+            if (t.live) {
+                W<s32>(rd + 0x10, R<s32>(rd + 0x10) + 1);
+                W<s32>(rd + 0x14, R<s32>(rd + 0x14) + triangles);
+            } else {
+                ++t.draws;
+                t.triangles += triangles;
+            }
+        }
+        if (level.group) {
+            const std::array<u8, 0x30> zeros{};
+            t.Put(0x70, zeros.data(), 16);
+            t.Set<u64>(0x170, 0);
+            t.Set<u64>(0x1f0, 0);
+            t.Set<u64>(0x340, 0);
+            t.Put(0x800, zeros.data(), 0x30);
+        }
+    }
+    // epilogue: memset(ctx + 0x580, 0, 0x400), memset(ctx + 0x980, 0, 0x400)
+    {
+        const std::array<u8, 0x400> zeros{};
+        t.Put(0x580, zeros.data(), 0x400);
+        t.Put(0x980, zeros.data(), 0x400);
+    }
+    const u64 object = R<u64>(rd + 0x3bf0);
+    if (t.Get<u64>(0x46c8) != object) {
+        t.Set<u64>(0x46c8, object);
+        t.Set<u8>(0x46d8, 1);
+    }
+    t.Set<u64>(0x46e0, plan.v_3c28);
+    t.Set<u32>(0x46e8, local_150);
+    t.Set<u8>(0x46ec, 1);
+}
+
+struct GConfig {
+    bool on{false};
+    u32 verify_every{32};
+};
+const GConfig& GCfg() {
+    static const GConfig config = [] {
+        GConfig c;
+        const char* e = std::getenv("TLG_GBUFFER_GEN");
+        c.on = e != nullptr && *e != 0 && *e != '0';
+        if (const char* n = std::getenv("TLG_GBUFFER_GEN_VERIFY"); n != nullptr && *n != 0) {
+            c.verify_every = static_cast<u32>(std::atoi(n));
+        }
+        return c;
+    }();
+    return config;
+}
+
+struct GStats {
+    ViewStats v;
+    std::map<u32, u64> arguments; // mode * 1000 + query mode -> passes
+    u64 eligible{0};
+};
+GStats& GS() {
+    static GStats stats;
+    return stats;
+}
+
 } // namespace
 
 bool Enabled() {
@@ -1077,7 +1515,7 @@ bool VerifyActive() {
 
 void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first) {
     Verify& v = V();
-    if (!v.active.load(std::memory_order_relaxed) || caller < ZPassBegin || caller >= ZPassEnd || std::this_thread::get_id() != v.thread) {
+    if (!v.active.load(std::memory_order_relaxed) || caller < v.lo || caller >= v.hi || std::this_thread::get_id() != v.thread) {
         return;
     }
     State& s = S();
@@ -1198,6 +1636,8 @@ bool HandlePass(u64 render_device, u64 desc, u64 original_loop) {
         v.cursor = 0;
         v.arena_pos = 0;
         v.view = plan.view_type;
+        v.lo = ZPassBegin;
+        v.hi = ZPassEnd;
         v.ctx = plan.ctx;
         v.compared_draws = 0;
         v.mismatches = 0;
@@ -1256,6 +1696,122 @@ bool HandlePass(u64 render_device, u64 desc, u64 original_loop) {
     return true;
 }
 
+bool GBufferEnabled() {
+    return GCfg().on;
+}
+
+bool HandleGBuffer(u64 render_device, u64 mode, u64 list, u64 args, u64 flags, u64 query_mode, u64 param7, u64 original_loop) {
+    const GConfig& cfg = GCfg();
+    if (!cfg.on || original_loop == 0) {
+        return false;
+    }
+    (void)param7;
+    using Loop = void(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64);
+    State& s = S();
+    GStats& gs = GS();
+    GPlan plan;
+    plan.mode = static_cast<u32>(mode);
+    plan.flags = static_cast<u32>(flags);
+    plan.query_mode = static_cast<u32>(query_mode);
+    GScanArgs scan_args{&plan, render_device, list, args};
+    {
+        std::scoped_lock lock{s.mutex};
+        ++gs.v.passes;
+        ++gs.arguments[static_cast<u32>(mode) * 1000 + static_cast<u32>(query_mode)];
+        if (gs.v.disabled) {
+            plan.Decline("generator switched off by a verify difference");
+        } else if (!NativeDraw::GuardedCall([](void* p) { ScanGBuffer(*static_cast<GScanArgs*>(p)); }, &scan_args)) {
+            ++gs.v.not_scanned;
+            plan.scanned = false;
+            plan.Decline("scan faulted");
+        }
+        if (!plan.Ok()) {
+            for (const char* r : plan.reasons) {
+                ++gs.v.declines[r];
+            }
+        }
+    }
+    bool verify_pass = false;
+    if (plan.Ok()) {
+        std::scoped_lock lock{s.mutex};
+        ++gs.eligible;
+        verify_pass = cfg.verify_every != 0 && gs.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().active.load();
+    }
+    if (plan.Ok() && !verify_pass) {
+        Target live;
+        live.live = true;
+        live.base = reinterpret_cast<u8*>(plan.ctx);
+        live.indexed_site = GBufferIndexedSite;
+        live.indirect_site = GBufferIndirectSite;
+        live.indexed_a4 = 0;
+        GenerateGBuffer(live, plan, plan.flags);
+        std::scoped_lock lock{s.mutex};
+        ++gs.v.generated;
+        gs.v.generated_batches += plan.batches.size();
+        gs.v.generated_draws += plan.steps.size();
+        gs.v.group_batches += plan.group_batches;
+        return true;
+    }
+    Verify& v = V();
+    if (verify_pass) {
+        v.shadow = Target{};
+        v.shadow.live = false;
+        v.shadow.indexed_site = GBufferIndexedSite;
+        v.shadow.indirect_site = GBufferIndirectSite;
+        v.shadow.indexed_a4 = 0;
+        std::vector<u8> copy(CtxBytes);
+        std::memcpy(copy.data(), reinterpret_cast<const void*>(plan.ctx), CtxBytes);
+        v.shadow.base = copy.data();
+        GenerateGBuffer(v.shadow, plan, plan.flags);
+        v.cursor = 0;
+        v.arena_pos = 0;
+        v.view = 100;
+        v.lo = GBufferBegin;
+        v.hi = GBufferEnd;
+        v.ctx = plan.ctx;
+        v.compared_draws = 0;
+        v.mismatches = 0;
+        v.raced = 0;
+        v.thread = std::this_thread::get_id();
+        const s32 draws_before = R<s32>(render_device + 0x10), triangles_before = R<s32>(render_device + 0x14);
+        v.active.store(true);
+        reinterpret_cast<Loop>(original_loop)(render_device, mode, list, args, flags, query_mode, param7);
+        v.active.store(false);
+        std::scoped_lock lock{s.mutex};
+        if (v.cursor < v.shadow.marks.size()) {
+            ++v.mismatches;
+            NoteMismatch(s, v.view, "missing draw", fmt::format("the generator has {} draws, the loop issued {}", v.shadow.marks.size(), v.cursor));
+        } else {
+            v.mismatches += CompareDelta(s, v, v.arena_pos, v.shadow.arena.size(), plan.ctx, "epilogue");
+        }
+        const s32 draws = R<s32>(render_device + 0x10) - draws_before;
+        const s64 triangles = R<s32>(render_device + 0x14) - triangles_before;
+        if (draws != v.shadow.draws || triangles != v.shadow.triangles) {
+            ++v.mismatches;
+            NoteMismatch(s, v.view, "counters", fmt::format("draws +{} (generator {}), triangles +{} (generator {})", draws, v.shadow.draws, triangles, v.shadow.triangles));
+        }
+        ++gs.v.verify_passes;
+        gs.v.verify_draws += v.compared_draws;
+        gs.v.verify_raced += v.raced;
+        gs.v.group_batches += plan.group_batches;
+        if (v.mismatches == 0) {
+            ++gs.v.verify_clean;
+        } else {
+            ++gs.v.verify_mismatched;
+            gs.v.disabled = true;
+            LOG_ERROR(Render, "G-buffer generator switched off, {} differences against the engine's loop", v.mismatches);
+        }
+        v.shadow = Target{};
+        v.lo = ZPassBegin;
+        v.hi = ZPassEnd;
+    } else {
+        reinterpret_cast<Loop>(original_loop)(render_device, mode, list, args, flags, query_mode, param7);
+        std::scoped_lock lock{s.mutex};
+        ++gs.v.loop_passes;
+    }
+    return true;
+}
+
 nlohmann::json Report() {
     auto& s = S();
     std::scoped_lock lock{s.mutex};
@@ -1303,6 +1859,31 @@ nlohmann::json Report() {
         }
         entry["declined_passes_by_reason"] = declines;
         views[std::to_string(view)] = entry;
+    }
+    {
+        const GStats& gs = GS();
+        const ViewStats& v = gs.v;
+        nlohmann::json g = {{"enabled", GCfg().on},
+                            {"passes", v.passes},
+                            {"generated_passes_without_the_loop", v.generated},
+                            {"generated_batches", v.generated_batches},
+                            {"generated_draws", v.generated_draws},
+                            {"instance_group_batches", v.group_batches},
+                            {"passes_run_by_the_loop", v.loop_passes},
+                            {"verify_passes", v.verify_passes},
+                            {"verify_clean", v.verify_clean},
+                            {"verify_with_differences", v.verify_mismatched},
+                            {"verify_draws_compared", v.verify_draws},
+                            {"verify_words_that_moved", v.verify_raced},
+                            {"switched_off_by_verify", v.disabled},
+                            {"scan_faults", v.not_scanned},
+                            {"passes_by_mode_times_1000_plus_query_mode", gs.arguments}};
+        nlohmann::json declines = nlohmann::json::object();
+        for (const auto& [reason, count] : v.declines) {
+            declines[reason] = count;
+        }
+        g["declined_passes_by_reason"] = declines;
+        out["gbuffer"] = g;
     }
     out["verify_difference_kinds"] = s.mismatch_kinds;
     out["special_entry_classes"] = s.special_classes;

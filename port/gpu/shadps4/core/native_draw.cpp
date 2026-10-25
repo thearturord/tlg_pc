@@ -41,6 +41,7 @@
 #include "core/native_updates.h"
 #include "core/native_zpass_audit.h"
 #include "core/native_zpass_gen.h"
+#include "core/native_gbuffer_audit.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/native_draw_tag.h"
@@ -6757,7 +6758,24 @@ u64 PS4_SYSV_ABI InstanceGroupBind(u64 inner, u64 group, u64 view, u64 a3, u64 a
     return 0;
 }
 
+/// N6.6: RenderDev_DrawGBufferPrimitives(render device, mode, list, a3, flags, query mode, param 7 on the stack): the census of what it is asked to draw (read only).
+u64 PS4_SYSV_ABI GBufferEnter(u64 render_device, u64 mode, u64 list, u64 a3, u64 flags, u64 query_mode, u64 ret, u64 caller_rsp) {
+    (void)ret;
+    const u64 param7 = Rd<u8>(caller_rsp, 0);
+    NativeGBufferAudit::Enter(render_device, mode, list, flags, query_mode, param7);
+    if (NativeZPassGen::GBufferEnabled()) {
+        static const u64 loop_entry = Core::GuestHooks::OriginalEntry("DrawGBufferPrimitives");
+        if (NativeZPassGen::HandleGBuffer(render_device, mode, list, a3, flags, query_mode, param7, loop_entry)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 u64 FindHandler(const std::string& name) {
+    if (name == "gbuffer_enter") {
+        return reinterpret_cast<u64>(&GBufferEnter);
+    }
     if (name == "instance_group_bind") {
         return reinterpret_cast<u64>(&InstanceGroupBind);
     }
@@ -7349,25 +7367,25 @@ bool GuardedCall(void (*fn)(void*), void* argument) {
     return !faulted;
 }
 
-void IssueIndirectDraw(u64 ctx, u64 buffer, u64 offset) {
-    // the draw the depth pass loop makes at its call site 0x01c7640f, through the draw hook
+void IssueIndirectDraw(u64 ctx, u64 buffer, u64 offset, u64 site_ghidra) {
+    // the draw a pass loop makes at its call site (return address `site_ghidra`), through the draw hook
     static const u64 original = Core::GuestHooks::OriginalEntry("DrawIndexedIndirect");
-    const u64 site = ImageBase() + (0x01c7640full - 0x1000000);
+    const u64 site = ImageBase() + (site_ghidra - 0x1000000);
     if (TagIndirect(ctx, buffer, offset, 0, 0, 0, site) != 0 || original == 0) {
         return;
     }
     reinterpret_cast<GuestDraw6>(original)(ctx, buffer, offset, 0, 0, 0);
 }
 
-void IssueIndexedDraw(u64 ctx, u64 count, u64 first) {
-    // the draw the depth pass loop makes (call site 0x01c76433 in RenderDev_DrawZPass), so the draw hook sees the same call site as for a draw of the engine's own loop: the tag, then the original
-    // draw function unless the tag took the draw over
+void IssueIndexedDraw(u64 ctx, u64 count, u64 first, u64 site_ghidra, u64 a4) {
+    // the draw a pass loop makes at its call site (return address `site_ghidra`; a4 is its fifth argument: the depth loop passes 1, the G-buffer loop 0), so the draw hook sees the same call site
+    // as for a draw of the engine's own loop: the tag, then the original draw function unless the tag took the draw over
     static const u64 original = Core::GuestHooks::OriginalEntry("DrawIndexedCommon");
-    const u64 site = ImageBase() + (0x01c76433ull - 0x1000000);
-    if (TagIndexed(ctx, count, first, 0, 1, 0, site) != 0 || original == 0) {
+    const u64 site = ImageBase() + (site_ghidra - 0x1000000);
+    if (TagIndexed(ctx, count, first, 0, a4, 0, site) != 0 || original == 0) {
         return;
     }
-    reinterpret_cast<GuestDraw6>(original)(ctx, count, first, 0, 1, 0);
+    reinterpret_cast<GuestDraw6>(original)(ctx, count, first, 0, a4, 0);
 }
 
 VAddr ImageBase() {
