@@ -94,7 +94,10 @@ struct State {
     std::array<u64, Checks> bind_checked{}, bind_equal{}, bind_not_applicable{}, bind_unreadable{};
     std::vector<std::string> bind_samples;
     std::array<u32, Checks> bind_sample_count{};
-    u64 bind_unmatched_draws{0};    std::vector<Item> expected;
+    u64 bind_unmatched_draws{0};
+    u64 slot_differs_same_object{0}, slot_differs_foreign{0};
+    std::map<std::string, u64> slot_differs_by;
+    std::vector<std::string> slot_samples;    std::vector<Item> expected;
     std::vector<Item> observed;
     u64 frame{0};
     std::map<u32, ViewStats> views;
@@ -279,6 +282,29 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
         const u64 slot = obj + 0xc0 + (index_word & 0xffffffffull) * 0xb0;
         compare(4, ctx + 0x290, slot, 8, "constant buffer slot at +0x290");
         compare(4, ctx + 0x310, slot, 8, "constant buffer slot at +0x310");
+        // where does a different value come from? Is it another slot of the same render object, or something the object does not hold?
+        u64 held = 0, wanted = 0;
+        if (Rd(ctx + 0x290, held) && Rd(slot, wanted) && held != wanted) {
+            s32 other = -1;
+            for (u32 j = 0; j < 64; ++j) {
+                u64 candidate = 0;
+                if (Rd(obj + 0xc0 + u64{j} * 0xb0, candidate) && candidate == held) {
+                    other = static_cast<s32>(j);
+                    break;
+                }
+            }
+            (other >= 0 ? s.slot_differs_same_object : s.slot_differs_foreign)++;
+            u64 ring_pos = 0, high = 0;
+            Rd(obj + 0x440, ring_pos);
+            Rd(ctx + 0x298, high);
+            const std::string key = fmt::format("view {} batch_special {} material_flag {} index {} other {}", s.view_type, e.batch_special != 0, e.material_flag, index_word & 0xffffffffull, other);
+            ++s.slot_differs_by[key];
+            if (s.slot_samples.size() < 6) {
+                u64 expected_second = 0;
+                Rd(obj + 0x2d0 + (index_word & 0xffffffffull) * 0xb0, expected_second);
+                s.slot_samples.push_back(fmt::format("{}: context {:#x} object slot {:#x}; the context's second qword {:#x}, the object's second {:#x}, object word 0x440 {:#x}", key, held, wanted, high, expected_second, ring_pos));
+            }
+        }
     } else {
         not_applicable(4);
     }
@@ -527,6 +553,7 @@ nlohmann::json Report() {
         }
         binding["draws_without_a_matching_expected_primitive"] = s.bind_unmatched_draws;
         binding["first_differences"] = s.bind_samples;
+        binding["constant_buffer_slot_differences"] = {{"value_is_another_slot_of_the_same_render_object", s.slot_differs_same_object}, {"value_is_not_in_the_render_object", s.slot_differs_foreign}, {"by_cause", s.slot_differs_by}, {"samples", s.slot_samples}};
     }
     {
         auto& variant = out["variant_audit"] = nlohmann::json::object();
