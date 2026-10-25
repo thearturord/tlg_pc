@@ -2547,6 +2547,14 @@ nlohmann::json Report() {
                                                                        {"nanoseconds_per_slot", fill * to_ms * 1e6 / static_cast<double>(std::max<u64>(1, slots))}};
             }
         }
+        {
+            std::array<u64, 6> m{};
+            NativeDraw::MergeCensusRead(m);
+            if (m[0] != 0) {
+                census["records equal to an earlier record of the thread except for the draw arguments"] = {{"draws", m[0]}, {"equal_to_the_previous_record", m[1]}, {"equal_to_one_of_the_last_16", m[2]},
+                                                                                                                   {"registers_and_fixed_state_equal_to_the_previous", m[3]}, {"registers_equal_to_the_previous", m[4]}};
+            }
+        }
         out["engine_call_census"] = census;
     }
     out["verify_difference_kinds"] = s.mismatch_kinds;

@@ -4601,6 +4601,82 @@ u64 RebuildAfterGame(u64 ctx, u64 tag_address, u64 a1, u64 a2, u64 a3, u64 a4, u
 /// Phase clock of the tag for the draws the generators issue (`TLG_GEN_CENSUS=1`): 0 hooks and policy, 1 resource tracking (and the registry), 2 signature, 3 record build, 4 the rest
 /// (tag words, execution side effects).
 std::atomic<u64> record_cache_lookups, record_cache_hits_big, record_cache_hits_small;
+
+/// Merge census (`TLG_GEN_CENSUS=1`): could a record be merged into an earlier one of the same thread, i.e. is it equal except for the draw arguments (count, instance count)? Compared:
+/// the registers (not the three draw argument registers), the fixed function state, the flags, the bindings, the descriptor tables (by content), the geometry ids.
+std::atomic<u64> merge_draws, merge_same_as_previous, merge_same_as_last16, merge_first_half_same_as_previous, merge_registers_same_as_previous, merge_bindings_differ_only, merge_group_of_draws_total;
+bool RecordsEqual(const NativeRecord& a, const NativeRecord& b, bool bindings_too, bool registers_only) {
+    if (a.count != b.count || a.kind != b.kind) {
+        return false;
+    }
+    for (u32 i = 0; i < a.count; ++i) {
+        const u32 index = a.regs[i].index;
+        if (index != b.regs[i].index) {
+            return false;
+        }
+        if (index == UconfigBase + 0x24c || index == UconfigBase + 0x24d || index == ContextBase + 0x29e) {
+            continue;
+        }
+        if (a.regs[i].value != b.regs[i].value) {
+            return false;
+        }
+    }
+    if (registers_only) {
+        return true;
+    }
+    if (a.fixed != b.fixed || a.fixed_stale != b.fixed_stale || a.flags != b.flags || a.vs_gnm != b.vs_gnm || a.ps_gnm != b.ps_gnm) {
+        return false;
+    }
+    if (!bindings_too) {
+        return true;
+    }
+    if (a.binding_count != b.binding_count || a.check_count != b.check_count || a.geometry_id_count != b.geometry_id_count) {
+        return false;
+    }
+    if (std::memcmp(a.bindings.data(), b.bindings.data(), a.binding_count * sizeof(RecordBinding)) != 0 || std::memcmp(a.geometry_ids.data(), b.geometry_ids.data(), a.geometry_id_count * sizeof(u64)) != 0) {
+        return false;
+    }
+    for (u32 c = 0; c < a.check_count; ++c) {
+        if (a.checks[c].reg != b.checks[c].reg || a.checks[c].dwords != b.checks[c].dwords ||
+            std::memcmp(reinterpret_cast<const void*>(a.checks[c].address), reinterpret_cast<const void*>(b.checks[c].address), a.checks[c].dwords * sizeof(u32)) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+void CountMerge(u64 seq) {
+    thread_local std::array<u64, 16> recent{};
+    thread_local u32 next = 0;
+    merge_draws.fetch_add(1, std::memory_order_relaxed);
+    const NativeRecord& now = Slot(seq);
+    bool last16 = false;
+    for (u32 i = 0; i < 16; ++i) {
+        const u64 other = recent[(next + 15 - i) & 15];
+        if (other == 0 || Slot(other).seq.load(std::memory_order_acquire) != other) {
+            continue;
+        }
+        const bool equal = RecordsEqual(now, Slot(other), true, false);
+        if (i == 0) {
+            if (equal) {
+                merge_same_as_previous.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (RecordsEqual(now, Slot(other), false, false)) {
+                merge_first_half_same_as_previous.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (RecordsEqual(now, Slot(other), false, true)) {
+                merge_registers_same_as_previous.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (equal) {
+            last16 = true;
+            break;
+        }
+    }
+    if (last16) {
+        merge_same_as_last16.fetch_add(1, std::memory_order_relaxed);
+    }
+    recent[next++ & 15] = seq;
+}
 struct PhaseClock {
     bool on;
     u64 last{0};
@@ -4771,6 +4847,9 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
         SignRecord(Slot(seq), sig, ctx);
     }
     clock.Mark(3);
+    if (seq != 0 && generator_issuing && TagCensus()) {
+        CountMerge(seq);
+    }
     std::memcpy(&words[9], &seq, sizeof(u64));
     words[11] = 0;
     words[12] = 0;
@@ -7509,6 +7588,10 @@ void UserDataCensusRead(u64& scan_ticks, u64& fill_ticks, u64& tables, u64& slot
     fill_ticks = um_ticks[1].load();
     tables = um_ticks[2].load();
     slots = um_ticks[3].load();
+}
+
+void MergeCensusRead(std::array<u64, 6>& values) {
+    values = {merge_draws.load(), merge_same_as_previous.load(), merge_same_as_last16.load(), merge_first_half_same_as_previous.load(), merge_registers_same_as_previous.load(), 0};
 }
 
 void RecordCacheCensusRead(u64& lookups, u64& hits_1m, u64& hits_64k) {
