@@ -4931,7 +4931,7 @@ u64 PS4_SYSV_ABI GarlicPoolPro(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u
 
 u64 PS4_SYSV_ABI TagIndexed(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     if (NativeZPassGen::VerifyActive()) {
-        NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 0, ctx, static_cast<u32>(a1), static_cast<u32>(a2));
+        NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 0, ctx, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a3));
     }
     if (NativeZPass::Enabled()) {
         NativeZPass::NoteDraw(ret - ImageBase() + 0x1000000, 0, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a4), Rd<u64>(ctx, Ctx::VertexShader), Rd<u64>(ctx, Ctx::PixelShader), ctx);
@@ -6543,7 +6543,7 @@ u64 PS4_SYSV_ABI TagDispatchFenced(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 
 }
 u64 PS4_SYSV_ABI TagIndirect(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     if (NativeZPassGen::VerifyActive()) {
-        NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 1, ctx, a1, a2);
+        NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 1, ctx, a1, a2, 0);
     }
     if (NativeZPass::Enabled()) {
         NativeZPass::NoteDraw(ret - ImageBase() + 0x1000000, 1, a1, a2, 0, Rd<u64>(ctx, Ctx::VertexShader), Rd<u64>(ctx, Ctx::PixelShader), ctx);
@@ -6774,8 +6774,14 @@ u64 PS4_SYSV_ABI GBufferEnter(u64 render_device, u64 mode, u64 list, u64 a3, u64
 
 /// N6.7: RenderDev_DrawForwardPass(render device, a2, a3, list, mode): the census of what it is asked to draw (read only).
 u64 PS4_SYSV_ABI ForwardEnter(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 a5, u64 ret) {
-    (void)a1, (void)a2, (void)a5, (void)ret;
+    (void)a5, (void)ret;
     NativeGBufferAudit::EnterForward(render_device, list, mode);
+    if (NativeZPassGen::ForwardEnabled()) {
+        static const u64 loop_entry = Core::GuestHooks::OriginalEntry("DrawForwardPass");
+        if (NativeZPassGen::HandleForward(render_device, a1, a2, list, mode, loop_entry)) {
+            return 1;
+        }
+    }
     return 0;
 }
 
@@ -7387,15 +7393,15 @@ void IssueIndirectDraw(u64 ctx, u64 buffer, u64 offset, u64 site_ghidra) {
     reinterpret_cast<GuestDraw6>(original)(ctx, buffer, offset, 0, 0, 0);
 }
 
-void IssueIndexedDraw(u64 ctx, u64 count, u64 first, u64 site_ghidra, u64 a4) {
+void IssueIndexedDraw(u64 ctx, u64 count, u64 first, u64 site_ghidra, u64 a4, u64 a3) {
     // the draw a pass loop makes at its call site (return address `site_ghidra`; a4 is its fifth argument: the depth loop passes 1, the G-buffer loop 0), so the draw hook sees the same call site
     // as for a draw of the engine's own loop: the tag, then the original draw function unless the tag took the draw over
     static const u64 original = Core::GuestHooks::OriginalEntry("DrawIndexedCommon");
     const u64 site = ImageBase() + (site_ghidra - 0x1000000);
-    if (TagIndexed(ctx, count, first, 0, a4, 0, site) != 0 || original == 0) {
+    if (TagIndexed(ctx, count, first, a3, a4, 0, site) != 0 || original == 0) {
         return;
     }
-    reinterpret_cast<GuestDraw6>(original)(ctx, count, first, 0, a4, 0);
+    reinterpret_cast<GuestDraw6>(original)(ctx, count, first, a3, a4, 0);
 }
 
 VAddr ImageBase() {

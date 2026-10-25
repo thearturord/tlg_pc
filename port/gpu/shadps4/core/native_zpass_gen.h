@@ -26,7 +26,10 @@ bool HandleGBuffer(u64 render_device, u64 mode, u64 list, u64 args, u64 flags, u
 /// True while a verify pass runs the engine's loop.
 [[nodiscard]] bool VerifyActive();
 /// A draw of the engine's loop during a verify pass: `caller` is the ghidra address of the call site, kind 0 `DrawIndexedCommon`.
-void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first);
+void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3);
+/// N6.7, the forward loop (`RenderDev_DrawForwardPass(renderDev, a1, a2, list, mode)`): `TLG_FORWARD_GEN=1`, verify one pass in `TLG_FORWARD_GEN_VERIFY` (default 32). Same contract.
+[[nodiscard]] bool ForwardEnabled();
+bool HandleForward(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 original_loop);
 
 nlohmann::json Report();
 

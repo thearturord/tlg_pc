@@ -107,7 +107,7 @@ bool IsGuarded();
 /// N6.3i: runs `fn(argument)` with the same fault guard as the record builder; false when it faulted.
 bool GuardedCall(void (*fn)(void*), void* argument);
 /// N6.3i (cascade generator): issues `DrawIndexedCommon(ctx, count, first, 0, 1)` as the depth pass loop does at its call site, through the draw hook (the tag, then the engine's function).
-void IssueIndexedDraw(u64 ctx, u64 count, u64 first, u64 site_ghidra, u64 a4);
+void IssueIndexedDraw(u64 ctx, u64 count, u64 first, u64 site_ghidra, u64 a4, u64 a3 = 0);
 /// Same for `DrawIndexedIndirect(ctx, argument buffer object, byte offset)` at the loop's indirect call site.
 void IssueIndirectDraw(u64 ctx, u64 buffer, u64 offset, u64 site_ghidra);
 

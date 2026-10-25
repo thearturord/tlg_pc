@@ -190,7 +190,7 @@ State& S() {
 struct Mark {
     size_t arena_end;
     u32 kind;
-    u64 count, first;
+    u64 count, first, a3;
     u64 vertex_shader, pixel_shader;
 };
 
@@ -690,15 +690,15 @@ void ScanImpl(ScanArgs& args) {
 
 // ------------------------------------------------------------------------------------------------------------------------------- the generator
 
-void IssueDraw(Target& t, u32 kind, u64 count, u64 first) {
+void IssueDraw(Target& t, u32 kind, u64 count, u64 first, u64 a3 = 0) {
     if (t.live) {
         if (kind == 0) {
-            NativeDraw::IssueIndexedDraw(reinterpret_cast<u64>(t.base), count, first, t.indexed_site, t.indexed_a4);
+            NativeDraw::IssueIndexedDraw(reinterpret_cast<u64>(t.base), count, first, t.indexed_site, t.indexed_a4, a3);
         } else {
             NativeDraw::IssueIndirectDraw(reinterpret_cast<u64>(t.base), count, first, t.indirect_site);
         }
     } else {
-        t.marks.push_back({t.arena.size(), kind, count, first, t.Get<u64>(0x4698), t.Get<u64>(0x4690)});
+        t.marks.push_back({t.arena.size(), kind, count, first, a3, t.Get<u64>(0x4698), t.Get<u64>(0x4690)});
     }
 }
 
@@ -1503,6 +1503,341 @@ GStats& GS() {
     return stats;
 }
 
+// ------------------------------------------------------------------------------------------------------------------------------- the forward loop (N6.7)
+// RenderDev_DrawForwardPass(renderDev, a1, a2, list, mode), ghidra 0x01c779a0. Batches with an instance group are skipped by the loop; the others are drawn plain. The variant of every
+// primitive is found or created by the engine's own FUN_01c822c0 (called here, in both the live run and the verify run's shadow, so there is no key table). Live census: mode 0, no
+// special entries, material + 0x158 == 0, the first table entry never a valid object.
+
+constexpr u64 ForwardBegin = 0x01c779a0, ForwardEnd = 0x01c782a0;
+constexpr u64 ForwardIndexedSite = 0x01c7819d;
+constexpr u64 FunctionForwardPrologue = 0x01c710f0; // FUN_01c710f0(renderDev, a1, a2, mode)
+constexpr u64 FunctionFindVariant = 0x01c822c0;     // FUN_01c822c0(renderDev + 1000, material, flags, 0, mesh word, &token, 0) -> variant or 0
+constexpr u64 FunctionHandleFree = 0x01e45a60;      // FUN_01e45a60(handle): the last reference went
+constexpr u64 HandleRefTable = 0x02716240;          // DAT_02716240: 0x20 bytes per handle, the reference count first
+
+void HandleRefInc(u64 handle) {
+    reinterpret_cast<std::atomic<s32>*>(Global(HandleRefTable) + handle * 0x20)->fetch_add(1);
+}
+void HandleRefDec(u64 handle) {
+    if (reinterpret_cast<std::atomic<s32>*>(Global(HandleRefTable) + handle * 0x20)->fetch_sub(1) == 1) {
+        reinterpret_cast<void(PS4_SYSV_ABI*)(u64)>(Global(FunctionHandleFree))(handle);
+    }
+}
+
+struct FBatch {
+    BatchLevel level;
+    u64 batch{};
+    bool has_second{false};
+    u64 v840{0};
+    bool valid_first{false}; // the mesh's first table entry is a valid object (the other branch of the loop)
+    u64 view_g70{0};
+    u32 view_g170{0};
+    u32 mesh_word{0}, base_vertex{0};
+    u32 variant_flags{0};
+    u64 special{0}; // batch + 0x48 (class 0x26dbfc8)
+};
+
+struct FStep {
+    u64 record{}, material{};
+};
+
+struct FPlan {
+    bool scanned{false};
+    std::vector<const char*> reasons;
+    u64 render_device{0}, ctx{0}, a1{0}, a2{0};
+    u32 mode{0};
+    u64 v_3ca8{0}, v_3d90{0};
+    std::vector<FBatch> batches;
+    std::vector<FStep> steps;
+    bool Ok() const { return scanned && reasons.empty(); }
+    void Decline(const char* r) {
+        for (const char* x : reasons) {
+            if (x == r) {
+                return;
+            }
+        }
+        reasons.push_back(r);
+    }
+};
+
+struct FScanArgs {
+    FPlan* plan;
+    u64 list;
+};
+
+void ScanForwardPass(FScanArgs& a) {
+    FPlan& plan = *a.plan;
+    const u64 rd = plan.render_device;
+    plan.ctx = R<u64>(rd + 0x2d8);
+    if (plan.ctx == 0 || a.list == 0) {
+        plan.Decline("no list or no device context");
+        return;
+    }
+    for (const u32 offset : {0x4698u, 0x4690u}) {
+        if (const u64 shader = R<u64>(plan.ctx + offset); shader != 0 && R<s64>(shader + 8) <= 1) {
+            plan.Decline("the context holds a shader with a single reference (releasing it destroys it)");
+        }
+    }
+    plan.v_3ca8 = R<u64>(rd + 0x3ca8);
+    plan.v_3d90 = R<u64>(rd + 0x3d90);
+    const u32 base_flags = plan.mode == 2 ? 0x10000010u : 0x10000000u;
+    const u64 context_global = R<u64>(Global(GlobalContext));
+    const u64 default_object = R<u64>(R<u64>(context_global + 0x38) + 0x20);
+    const u64 batch_array = R<u64>(a.list);
+    const u32 batch_count = R<u32>(a.list + 8);
+    if (batch_count != 0 && (batch_array == 0 || batch_count > 100000)) {
+        plan.Decline("batch list unreadable");
+        return;
+    }
+    for (u32 b = 0; b < batch_count; ++b) {
+        const u64 batch = R<u64>(batch_array + u64{b} * 8);
+        if (batch == 0) {
+            plan.Decline("null batch");
+            continue;
+        }
+        if (R<u64>(batch + 0x38) != 0) {
+            continue; // the forward loop leaves batches with an instance group alone
+        }
+        const u64 mesh = R<u64>(batch + 0x20);
+        if (mesh == 0) {
+            continue;
+        }
+        FBatch fb;
+        fb.batch = batch;
+        fb.variant_flags = base_flags;
+        if (const u64 special = R<u64>(batch + 0x48); special != 0) {
+            if (R<u64>(special) - NativeDraw::ImageBase() + 0x1000000 != 0x26dbfc8) {
+                plan.Decline("batch with a special entry of an unknown class");
+                continue;
+            }
+            fb.special = special;
+            fb.variant_flags |= 0x40;
+        }
+        const u64 render_data = R<u64>(mesh + 0x38);
+        if (render_data == 0 || R<u64>(render_data + 0x20) == 0) {
+            plan.Decline("mesh render data not created yet (the loop creates it at first use)");
+            continue;
+        }
+        if (const u64 second = R<u64>(batch + 0x28); second != 0) {
+            const u64 second_data = R<u64>(second + 0x38);
+            if (second_data == 0 || R<u64>(second_data + 0x20) == 0) {
+                plan.Decline("second render data not created yet");
+                continue;
+            }
+            fb.has_second = true;
+            fb.variant_flags |= 0x80000000u;
+            fb.v840 = R<u64>(R<u64>(R<u64>(R<u64>(second_data + 0x20) + 0x48) + 0x38) + 0x28);
+        }
+        FillBatchLevel(fb.level, batch, default_object);
+        const u64 inner = fb.level.inner;
+        {
+            const u32 count = R<u32>(inner + 0x68);
+            const u64 first = count != 0 ? R<u64>(R<u64>(inner + 0x60)) : 0;
+            fb.valid_first = count != 0 && first != default_object && first != 0 && R<u64>(first + 0x38) != 0;
+            if (fb.valid_first) {
+                fb.variant_flags |= 0x100;
+            } else {
+                const u64 view_object = R<u64>(R<u64>(inner + 0x48) + 0x38);
+                fb.view_g70 = R<u64>(view_object + 0x20);
+                fb.view_g170 = R<u32>(view_object + 0x40);
+            }
+        }
+        fb.mesh_word = R<u32>(mesh + 0x78);
+        fb.base_vertex = R<u32>(batch + 0x60);
+        fb.level.first_step = static_cast<u32>(plan.steps.size());
+        const u16 prim_count = R<u16>(batch + 100);
+        const u64 prim_array = R<u64>(batch + 0x58);
+        for (u32 p = 0; p < prim_count; ++p) {
+            const u64 record = prim_array + u64{p} * 0x38;
+            FStep step;
+            step.record = record;
+            step.material = R<u64>(record + 0x18);
+            const u32 selector = R<u32>(step.material + 0x158);
+            if (selector > 3) {
+                plan.Decline("material + 0x158 above 3");
+                continue;
+            }
+            const u64 object = R<u64>(step.material + 0x38);
+            if (object == 0) {
+                plan.Decline("material without a render object");
+                continue;
+            }
+            const u32 count_a = R<u32>(object + 0x4f8), count_b = R<u32>(object + 0x4e8);
+            if ((R<u64>(object + 0x4f0) != 0 && (count_a == 0 || count_a > 62)) || (R<u64>(object + 0x4e0) != 0 && (count_b == 0 || count_b > 72)) || (R<u64>(object + 0x440) & 0xffffffffull) >= 64) {
+                plan.Decline("material with a resource count or slot index the engine asserts on");
+                continue;
+            }
+            plan.steps.push_back(step);
+        }
+        fb.level.step_count = static_cast<u32>(plan.steps.size()) - fb.level.first_step;
+        plan.batches.push_back(fb);
+    }
+    plan.scanned = true;
+}
+
+void GenerateForward(Target& t, const FPlan& plan) {
+    const u64 rd = plan.render_device;
+    if (t.Get<u32>(0x4480) != 4) {
+        t.Set<u32>(0x4480, 4);
+        t.Or8(0x447c, 1);
+    }
+    if (t.live) {
+        reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64, u64, u64)>(Global(FunctionForwardPrologue))(rd, plan.a1, plan.a2, plan.mode);
+    }
+    const auto state_words = [&](u64 entry) {
+        t.Set<u64>(0x46f0, entry);
+        t.Set<u64>(0x46f8, 0x3f8000003f800000ull);
+        t.Set<u64>(0x4700, 0x3f8000003f800000ull);
+        t.Set<u32>(0x4708, 0xffffffffu);
+        t.Set<u8>(0x470c, 1);
+    };
+    state_words(plan.v_3ca8);
+    t.Set<u64>(0x68, 0);
+    bool raster_flag = false;
+    u32 last_state = 0;
+    for (const FBatch& fb : plan.batches) {
+        const BatchLevel& level = fb.level;
+        if (fb.has_second) {
+            t.Set<u64>(0x840, fb.v840);
+        }
+        t.batch_owner = level.batch;
+        t.Set<u64>(0x580, level.value_580);
+        if (!fb.valid_first) {
+            t.Set<u64>(0x70, fb.view_g70);
+            t.Set<u32>(0x170, fb.view_g170);
+            t.Set<u32>(0x1f0, 0);
+            t.Set<u64>(0x58, level.view_58);
+            t.Set<u64>(0x60, 0x39);
+            t.batch_owner = 0;
+            t.Set<u64>(0x68, plan.v_3d90);
+        } else {
+            t.Set<u64>(0x68, 0);
+            t.Set<u64>(0x58, level.view_58);
+            t.batch_owner = 0;
+            t.Set<u64>(0x60, 0x39);
+        }
+        t.batch_owner = level.batch;
+        t.Set<u64>(0x288, level.pass_object_288);
+        t.Set<u64>(0x308, level.pass_object_288);
+        t.batch_owner = 0;
+        for (u32 i = level.table_count; i-- > 0;) {
+            t.table_entry = level.table_entry[i];
+            t.Set<u64>(0x6c0 + level.table[i].first * 8, level.table[i].second);
+            t.table_entry = 0;
+        }
+        for (u32 s = level.first_step; s < level.first_step + level.step_count; ++s) {
+            const FStep& step = plan.steps[s];
+            const u32 selector = R<u32>(step.material + 0x158);
+            const bool cached_object = R<u64>(step.material + 0x48) != 0;
+            u32 state = 0;
+            if (selector == 3) {
+                state = cached_object ? 0xf : 4;
+            } else if (selector == 2) {
+                state = cached_object ? 0xe : 3;
+            } else if (selector == 1) {
+                state = cached_object ? 0xd : 2;
+            }
+            if (state != last_state) {
+                state_words(R<u64>(rd + 0x3ca8 + u64{state} * 8));
+                last_state = state;
+            }
+            if (t.live) {
+                reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, fb.special);
+            }
+            // the handle sequence of the loop: the material's handle is counted, a special entry replaces it by the handle its virtual +0x48 returns (counted by the virtual), the variant search
+            // gets the resulting handle
+            u64 token = R<u32>(step.material + 0x1bc);
+            HandleRefInc(token);
+            if (fb.special != 0) {
+                std::array<u32, 2> out{0, 0};
+                reinterpret_cast<void(PS4_SYSV_ABI*)(void*, u64, u64)>(R<u64>(R<u64>(fb.special) + 0x48))(out.data(), fb.special, step.material);
+                u64 released = token;
+                if (token != out[0]) {
+                    HandleRefInc(out[0]);
+                    if (token != 0) {
+                        HandleRefDec(token);
+                    }
+                    released = out[0];
+                    token = out[0];
+                }
+                if (released != 0) {
+                    HandleRefDec(released);
+                }
+            }
+            const bool raster = (R<u32>(step.material + 0xd4) & 0x26) != 0;
+            if (raster != raster_flag) {
+                raster_flag = raster;
+                const u64 object = R<u64>(rd + (raster ? 0x3bf8 : 0x3bf0));
+                if (t.Get<u64>(0x46c8) != object) {
+                    t.Set<u64>(0x46c8, object);
+                    t.Set<u8>(0x46d8, 1);
+                }
+            }
+            HandleRefInc(token);
+            std::array<s32, 2> token_slot{static_cast<s32>(token), 0};
+            const u64 variant = reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u32, u32, u32, void*, u64)>(Global(FunctionFindVariant))(rd + 1000, step.material, fb.variant_flags, 0, fb.mesh_word, token_slot.data(), 0);
+            if (token != 0) {
+                HandleRefDec(token);
+            }
+            if (variant != 0) {
+                SetShader(t, 0x4698, R<u64>(variant + 8), 1);
+                SetShader(t, 0x4690, R<u64>(variant + 0x18), 2);
+                t.slot_material = step.material;
+                BindMaterial(t, step.material);
+                t.slot_material = 0;
+                const s32 triangles = R<s32>(step.record + 0x14);
+                IssueDraw(t, 0, static_cast<u32>(triangles * 3), R<u32>(step.record + 0x10), (fb.variant_flags & 0x100) == 0 ? fb.base_vertex : 0);
+                if (t.live) {
+                    W<s32>(rd + 0x10, R<s32>(rd + 0x10) + 1);
+                    W<s32>(rd + 0x14, R<s32>(rd + 0x14) + triangles);
+                } else {
+                    ++t.draws;
+                    t.triangles += triangles;
+                }
+            }
+            if (token != 0) {
+                HandleRefDec(token);
+            }
+        }
+    }
+    {
+        const std::array<u8, 0x400> zeros{};
+        t.Put(0x980, zeros.data(), 0x400);
+        t.Put(0x580, zeros.data(), 0x400);
+    }
+    const u64 object = R<u64>(rd + 0x3bf0);
+    if (t.Get<u64>(0x46c8) != object) {
+        t.Set<u64>(0x46c8, object);
+        t.Set<u8>(0x46d8, 1);
+    }
+}
+
+struct FConfig {
+    bool on{false};
+    u32 verify_every{32};
+};
+const FConfig& FCfg() {
+    static const FConfig config = [] {
+        FConfig c;
+        const char* e = std::getenv("TLG_FORWARD_GEN");
+        c.on = e != nullptr && *e != 0 && *e != '0';
+        if (const char* n = std::getenv("TLG_FORWARD_GEN_VERIFY"); n != nullptr && *n != 0) {
+            c.verify_every = static_cast<u32>(std::atoi(n));
+        }
+        return c;
+    }();
+    return config;
+}
+
+struct FStats {
+    ViewStats v;
+    u64 eligible{0};
+};
+FStats& FS() {
+    static FStats stats;
+    return stats;
+}
+
 } // namespace
 
 bool Enabled() {
@@ -1513,7 +1848,7 @@ bool VerifyActive() {
     return V().active.load(std::memory_order_relaxed);
 }
 
-void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first) {
+void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3) {
     Verify& v = V();
     if (!v.active.load(std::memory_order_relaxed) || caller < v.lo || caller >= v.hi || std::this_thread::get_id() != v.thread) {
         return;
@@ -1528,9 +1863,9 @@ void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first) {
         return;
     }
     const Mark& mark = v.shadow.marks[k];
-    if (mark.kind != kind || mark.count != count || mark.first != first) {
+    if (mark.kind != kind || mark.count != count || mark.first != first || (kind == 0 && mark.a3 != a3)) {
         ++v.mismatches;
-        NoteMismatch(s, v.view, "draw arguments", fmt::format("draw {}: the loop kind {} {:#x} / {:#x}, the generator kind {} {:#x} / {:#x}", k, kind, count, first, mark.kind, mark.count, mark.first));
+        NoteMismatch(s, v.view, "draw arguments", fmt::format("draw {}: the loop kind {} {:#x} / {:#x} / {:#x}, the generator kind {} {:#x} / {:#x} / {:#x}", k, kind, count, first, a3, mark.kind, mark.count, mark.first, mark.a3));
     }
     if (ctx != v.ctx) {
         ++v.mismatches;
@@ -1812,6 +2147,117 @@ bool HandleGBuffer(u64 render_device, u64 mode, u64 list, u64 args, u64 flags, u
     return true;
 }
 
+bool ForwardEnabled() {
+    return FCfg().on;
+}
+
+bool HandleForward(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 original_loop) {
+    const FConfig& cfg = FCfg();
+    if (!cfg.on || original_loop == 0) {
+        return false;
+    }
+    using Loop = void(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64);
+    State& s = S();
+    FStats& fs = FS();
+    FPlan plan;
+    plan.render_device = render_device;
+    plan.a1 = a1;
+    plan.a2 = a2;
+    plan.mode = static_cast<u32>(mode);
+    FScanArgs scan_args{&plan, list};
+    {
+        std::scoped_lock lock{s.mutex};
+        ++fs.v.passes;
+        if (fs.v.disabled) {
+            plan.Decline("generator switched off by a verify difference");
+        } else if (!NativeDraw::GuardedCall([](void* p) { ScanForwardPass(*static_cast<FScanArgs*>(p)); }, &scan_args)) {
+            ++fs.v.not_scanned;
+            plan.scanned = false;
+            plan.Decline("scan faulted");
+        }
+        if (!plan.Ok()) {
+            for (const char* r : plan.reasons) {
+                ++fs.v.declines[r];
+            }
+        }
+    }
+    bool verify_pass = false;
+    if (plan.Ok()) {
+        std::scoped_lock lock{s.mutex};
+        ++fs.eligible;
+        verify_pass = cfg.verify_every != 0 && fs.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().active.load();
+    }
+    if (plan.Ok() && !verify_pass) {
+        Target live;
+        live.live = true;
+        live.base = reinterpret_cast<u8*>(plan.ctx);
+        live.indexed_site = ForwardIndexedSite;
+        live.indexed_a4 = 1;
+        GenerateForward(live, plan);
+        std::scoped_lock lock{s.mutex};
+        ++fs.v.generated;
+        fs.v.generated_batches += plan.batches.size();
+        fs.v.generated_draws += plan.steps.size();
+        return true;
+    }
+    Verify& v = V();
+    if (verify_pass) {
+        v.shadow = Target{};
+        v.shadow.live = false;
+        v.shadow.indexed_site = ForwardIndexedSite;
+        v.shadow.indexed_a4 = 1;
+        std::vector<u8> copy(CtxBytes);
+        std::memcpy(copy.data(), reinterpret_cast<const void*>(plan.ctx), CtxBytes);
+        v.shadow.base = copy.data();
+        GenerateForward(v.shadow, plan);
+        v.cursor = 0;
+        v.arena_pos = 0;
+        v.view = 200;
+        v.lo = ForwardBegin;
+        v.hi = ForwardEnd;
+        v.ctx = plan.ctx;
+        v.compared_draws = 0;
+        v.mismatches = 0;
+        v.raced = 0;
+        v.thread = std::this_thread::get_id();
+        const s32 draws_before = R<s32>(render_device + 0x10), triangles_before = R<s32>(render_device + 0x14);
+        v.active.store(true);
+        reinterpret_cast<Loop>(original_loop)(render_device, a1, a2, list, mode);
+        v.active.store(false);
+        std::scoped_lock lock{s.mutex};
+        if (v.cursor < v.shadow.marks.size()) {
+            ++v.mismatches;
+            NoteMismatch(s, v.view, "missing draw", fmt::format("the generator has {} draws, the loop issued {}", v.shadow.marks.size(), v.cursor));
+        } else {
+            v.mismatches += CompareDelta(s, v, v.arena_pos, v.shadow.arena.size(), plan.ctx, "epilogue");
+        }
+        const s32 draws = R<s32>(render_device + 0x10) - draws_before;
+        const s64 triangles = R<s32>(render_device + 0x14) - triangles_before;
+        if (draws != v.shadow.draws || triangles != v.shadow.triangles) {
+            ++v.mismatches;
+            NoteMismatch(s, v.view, "counters", fmt::format("draws +{} (generator {}), triangles +{} (generator {})", draws, v.shadow.draws, triangles, v.shadow.triangles));
+        }
+        ++fs.v.verify_passes;
+        fs.v.verify_draws += v.compared_draws;
+        fs.v.verify_raced += v.raced;
+        if (v.mismatches == 0) {
+            ++fs.v.verify_clean;
+        } else {
+            ++fs.v.verify_mismatched;
+            fs.v.disabled = true;
+            LOG_ERROR(Render, "forward generator switched off, {} differences against the engine's loop", v.mismatches);
+        }
+        v.shadow = Target{};
+        v.lo = ZPassBegin;
+        v.hi = ZPassEnd;
+    } else {
+        reinterpret_cast<Loop>(original_loop)(render_device, a1, a2, list, mode);
+        std::scoped_lock lock{s.mutex};
+        ++fs.v.loop_passes;
+    }
+    return true;
+}
+
 nlohmann::json Report() {
     auto& s = S();
     std::scoped_lock lock{s.mutex};
@@ -1884,6 +2330,26 @@ nlohmann::json Report() {
         }
         g["declined_passes_by_reason"] = declines;
         out["gbuffer"] = g;
+        const ViewStats& f = FS().v;
+        nlohmann::json fj = {{"enabled", FCfg().on},
+                             {"passes", f.passes},
+                             {"generated_passes_without_the_loop", f.generated},
+                             {"generated_batches", f.generated_batches},
+                             {"generated_draws", f.generated_draws},
+                             {"passes_run_by_the_loop", f.loop_passes},
+                             {"verify_passes", f.verify_passes},
+                             {"verify_clean", f.verify_clean},
+                             {"verify_with_differences", f.verify_mismatched},
+                             {"verify_draws_compared", f.verify_draws},
+                             {"verify_words_that_moved", f.verify_raced},
+                             {"switched_off_by_verify", f.disabled},
+                             {"scan_faults", f.not_scanned}};
+        nlohmann::json fdeclines = nlohmann::json::object();
+        for (const auto& [reason, count] : f.declines) {
+            fdeclines[reason] = count;
+        }
+        fj["declined_passes_by_reason"] = fdeclines;
+        out["forward"] = fj;
     }
     out["verify_difference_kinds"] = s.mismatch_kinds;
     out["special_entry_classes"] = s.special_classes;
