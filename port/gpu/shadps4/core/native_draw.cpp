@@ -39,6 +39,7 @@
 #include "core/native_registry.h"
 #include "core/native_resources.h"
 #include "core/native_updates.h"
+#include "core/native_zpass_audit.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/native_draw_tag.h"
@@ -4847,6 +4848,9 @@ u64 PS4_SYSV_ABI GarlicPoolPro(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u
 }
 
 u64 PS4_SYSV_ABI TagIndexed(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (NativeZPass::Enabled()) {
+        NativeZPass::NoteDraw(ret - ImageBase() + 0x1000000, 0, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a4));
+    }
     return Tag(ctx, a1, a2, a3, ret, 0, (a4 & 0xff) != 0, false, a4, a5);
 }
 bool ExecEligibleCompute(u64 ctx, u64 seq, u64 caller) {
@@ -5561,6 +5565,7 @@ u64 PS4_SYSV_ABI RecordingWrites(u64 device, u64 a1, u64 a2, u64 a3, u64 a4, u64
         return 0;
     }
     Core::NativeUpdates::NoteRenderThread();
+    NativeZPass::FrameBoundary();
     InstallUnmapSlot();
     Guarded([&]() -> u64 {
         for (const u64 field : {u64{0x2830}, u64{0x26e0}}) {
@@ -6452,6 +6457,9 @@ u64 PS4_SYSV_ABI TagDispatchFenced(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 
     return TagCompute(ctx, a1, a2, a3, ret, true);
 }
 u64 PS4_SYSV_ABI TagIndirect(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (NativeZPass::Enabled()) {
+        NativeZPass::NoteDraw(ret - ImageBase() + 0x1000000, 1, 0, 0, 0);
+    }
     return Tag(ctx, a1, a2, a3, ret, 2, true);
 }
 /// PrepareDraw(ctx, 0, 1): its callers are the draw functions (hooked at their own entry) and one inlined copy of the auto
@@ -6614,7 +6622,18 @@ u64 PS4_SYSV_ABI PrimitiveBind(u64 render_device, u64 a1, u64 a2, u64 a3, u64 a4
     return 0;
 }
 
+/// RenderDev_DrawZPass(render device, pass description): the audit builds the draws the loop should issue from the snapshot it reads (native_zpass_audit.h).
+u64 PS4_SYSV_ABI ZPassEnter(u64 render_device, u64 desc, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (NativeZPass::Enabled()) {
+        NativeZPass::PassEnter(render_device, desc);
+    }
+    return 0;
+}
+
 u64 FindHandler(const std::string& name) {
+    if (name == "zpass_enter") {
+        return reinterpret_cast<u64>(&ZPassEnter);
+    }
     if (name == "primitive_bind") {
         return reinterpret_cast<u64>(&PrimitiveBind);
     }

@@ -24,6 +24,7 @@
 #include "core/native_updates.h"
 #include "core/native_drain_audit.h"
 #include "core/native_uploads.h"
+#include "core/native_zpass_audit.h"
 #include "core/native_resources.h"
 #include "core/memory.h"
 #include "core/guest_hooks.h"
@@ -616,6 +617,8 @@ void RegisterBuiltins() {
              [](const Params&) { return Core::NativeUploads::Report(); });
     Register("/drain", "(N6a, TLG_DRAIN_AUDIT=1) the command processor's wait for queued memory writes: did any guest read of the planning touch a pending write",
              [](const Params&) { return Core::DrainAudit::Report(); });
+    Register("/zpass", "(N6.3a, TLG_ZPASS_AUDIT=N) the depth pass loop against the draws built from the snapshot it reads: expected, issued, matched, missing, extra per view type",
+             [](const Params&) { return Core::NativeZPass::Report(); });
     Register("/threads", "CPU use of the busiest threads since the previous call", Threads);
     Register("/memory", "?addr=0x..&size=N (max 65536): guest memory as hex", Memory);
     Register("/log", "?lines=N&filter=text&file=shad_log.txt: tail of a log file", Log);
