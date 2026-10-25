@@ -173,14 +173,18 @@ bool Enabled() {
 }
 
 bool LazyEnabled() {
-    static const bool on = EnvOn("TLG_DRAIN_LAZY");
+    // on by default (verified in the light scene, the heavy scene and a cutscene); TLG_DRAIN_LAZY=0 brings back the full wait before every planning
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_DRAIN_LAZY");
+        return e == nullptr || *e == 0 || *e != '0';
+    }();
     return on;
 }
 
 u32 VerifyEvery() {
     static const u32 every = [] {
         const char* e = std::getenv("TLG_DRAIN_VERIFY");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 64u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 0u; // off by default: the full waits of the verified plannings made the frame rate uneven
     }();
     return every;
 }

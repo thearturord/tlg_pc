@@ -8,9 +8,9 @@
 // N6a, the audit (`TLG_DRAIN_AUDIT=1`, report at /drain): records the ranges of the queued writes and every guest read the planning makes, and for every planning that had
 // to wait it says whether any read touched a pending write. Result in the light scene: none did. The wait still happens.
 //
-// N6b, the lazy wait (`TLG_DRAIN_LAZY=1`): the wait before the planning is gone. Every recorded read (`Read`) checks the writes that are still pending and waits, only then, until
+// N6b, the lazy wait (on by default, `TLG_DRAIN_LAZY=0` turns it off): the wait before the planning is gone. Every recorded read (`Read`) checks the writes that are still pending and waits, only then, until
 // the newest overlapping one has run (the raster thread runs its queue in order). A read the planning makes without recording it is a read this cannot protect, which is
-// why the verify mode exists (`TLG_DRAIN_VERIFY=N`, default 64: one planning in N is checked, alternately two ways):
+// why the verify mode exists (`TLG_DRAIN_VERIFY=N`, default 0 = off: one planning in N is checked, alternately two ways):
 //   bytes: the planning runs lazily; at its end the old full wait is done, and every range the constant or geometry ring copied is compared with guest memory again;
 //   plan:  the planning runs lazily, then the full wait is done, the planning runs again and the two plans (pipeline, stages, user data, flat user data) are compared.
 // A difference is counted and logged; the reports are in /drain under "lazy".
@@ -42,9 +42,9 @@ constexpr u64 NoGuestMemory = ~0ull;
 
 /// The audit is on (TLG_DRAIN_AUDIT=1).
 [[nodiscard]] bool Enabled();
-/// The lazy wait is on (TLG_DRAIN_LAZY=1).
+/// The lazy wait is on (the default; TLG_DRAIN_LAZY=0 turns it off).
 [[nodiscard]] bool LazyEnabled();
-/// One planning in this many is verified (TLG_DRAIN_VERIFY, default 64, 0 = never).
+/// One planning in this many is verified (TLG_DRAIN_VERIFY, default 0 = never; 64 was tried and made the frame rate uneven).
 [[nodiscard]] u32 VerifyEvery();
 /// The ranges of queued writes are kept (audit or lazy wait).
 [[nodiscard]] bool Active();
