@@ -2,8 +2,10 @@
 // N6.3a: read-only audit of the engine's depth pass loop, see native_zpass_audit.h.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
@@ -51,7 +53,22 @@ struct Item {
     u32 kind;
     u64 count, first, instances;
     u32 batch, primitive;
+    u64 material{};      // expected side: the primitive's material
+    u64 material_sig{};  // expected side: a hash of the material fields the variant search reads
+    u32 mesh_word{};     // expected side: the mesh's vertex format word (mesh + 0x78), part of the variant key
+    u32 batch_flags{};   // expected side: the batch flag word (bit 0x10 goes into the variant key)
+    u64 vertex_shader{}, pixel_shader{}; // observed side: the shader objects the device context holds at the draw
 };
+
+/// Audit b: is the pipeline the loop chooses a function of the snapshot? One entry per key.
+struct KeyStat {
+    u64 vertex_shader, pixel_shader;
+    u64 draws{};
+    u64 conflicting_draws{};
+    bool conflict{false};
+};
+constexpr u32 KeyKinds = 5;
+constexpr const char* key_names[KeyKinds] = {"material only", "view type + material", "view type + material + batch flag 0x10 + draw kind", "view type + the material fields the variant search reads + batch flag 0x10 + draw kind", "the same + the mesh vertex format word (mesh + 0x78) + the pass flag bytes (+0x14, +0x1c)"};
 
 struct ViewStats {
     u64 passes{}, batches{}, batches_skipped_by_flag{}, batches_skipped_instance{}, batches_skipped_no_instances_with_flag{}, batches_skipped_no_mesh{}, primitives{}, primitives_filtered{};
@@ -66,11 +83,15 @@ struct State {
     std::mutex mutex;
     bool active{false};
     u32 view_type{0};
+    u32 pass_flags{0};
     std::vector<Item> expected;
     std::vector<Item> observed;
     u64 frame{0};
     std::map<u32, ViewStats> views;
     std::vector<std::string> samples;
+    std::array<std::unordered_map<u64, KeyStat>, KeyKinds> keys;
+    std::map<std::pair<u64, u64>, u64> pipelines; // (vertex shader, pixel shader) -> draws
+    std::vector<std::string> conflict_samples;
 };
 
 State& S() {
@@ -120,6 +141,33 @@ void FinishLocked(State& s) {
             }
         } else {
             (e.kind == Indirect ? v.matched_indirect : v.matched_plain)++;
+            {
+                const auto& o = s.observed[found];
+                ++s.pipelines[{o.vertex_shader, o.pixel_shader}];
+                const u64 ks[KeyKinds] = {
+                    e.material,
+                    e.material * 0x9E3779B97F4A7C15ull ^ s.view_type,
+                    (e.material * 0x9E3779B97F4A7C15ull ^ s.view_type) * 31 + (e.batch_flags & 0x10) * 8 + e.kind,
+                    (e.material_sig * 0x9E3779B97F4A7C15ull ^ s.view_type) * 31 + (e.batch_flags & 0x10) * 8 + e.kind,
+                    ((e.material_sig * 0x9E3779B97F4A7C15ull ^ s.view_type) * 31 + (e.batch_flags & 0x10) * 8 + e.kind) * 0x100000001b3ull + e.mesh_word * 131u + s.pass_flags};
+                for (u32 k = 0; k < KeyKinds; ++k) {
+                    auto [it, fresh] = s.keys[k].try_emplace(ks[k]);
+                    auto& stat = it->second;
+                    if (fresh) {
+                        stat.vertex_shader = o.vertex_shader;
+                        stat.pixel_shader = o.pixel_shader;
+                    }
+                    ++stat.draws;
+                    if (stat.vertex_shader != o.vertex_shader || stat.pixel_shader != o.pixel_shader) {
+                        stat.conflict = true;
+                        ++stat.conflicting_draws;
+                        if (k == KeyKinds - 1 && s.conflict_samples.size() < 8) {
+                            s.conflict_samples.push_back(fmt::format("view type {} material {:#x} batch flags {:#x} kind {}: the key first saw {:#x}/{:#x}, now {:#x}/{:#x}", s.view_type, e.material, e.batch_flags, e.kind, stat.vertex_shader,
+                                                                     stat.pixel_shader, o.vertex_shader, o.pixel_shader));
+                        }
+                    }
+                }
+            }
             for (size_t k = j; k < found; ++k) {
                 (s.observed[k].kind == 1 ? v.extra_indirect : v.extra_plain)++;
             }
@@ -160,6 +208,12 @@ void PassEnter(u64 render_device, u64 desc) {
     }
     s.active = true;
     s.view_type = static_cast<u32>(flags);
+    {
+        u8 flag14 = 0, flag1c = 0;
+        Rd(desc + 0x14, flag14);
+        Rd(desc + 0x1c, flag1c);
+        s.pass_flags = u32{flag14} * 2 + u32{flag1c} * 4;
+    }
     auto& v = s.views[s.view_type];
     ++v.passes;
     s32 indirect_mode = 0;
@@ -175,6 +229,7 @@ void PassEnter(u64 render_device, u64 desc) {
     const u8 flag_hi = static_cast<u8>(flags >> 32);
     const u8 flag_cvar = static_cast<u8>(flags >> 40);
     std::unordered_map<u64, u32> material_flags;
+    std::unordered_map<u64, u64> material_sigs;
     std::vector<u8> prims;
     for (u32 b = 0; b < batch_count; ++b) {
         u64 batch = 0;
@@ -203,6 +258,8 @@ void PassEnter(u64 render_device, u64 desc) {
             ++v.batches_skipped_no_instances_with_flag; // the loop draws nothing for a batch without instance group when the pass flag byte 5 is set
             continue;
         }
+        u16 mesh_word = 0;
+        Rd(mesh + 0x78, mesh_word);
         u32 instances = 0;
         if (group != 0) {
             u64 inner = 0, object = 0, table = 0;
@@ -248,6 +305,25 @@ void PassEnter(u64 render_device, u64 desc) {
             std::memcpy(&first, record + 0x10, 4);
             std::memcpy(&triangles, record + 0x14, 4);
             Item item{Plain, u64(triangles) * 3, first, 1, b, p};
+            item.material = material;
+            item.mesh_word = mesh_word;
+            item.batch_flags = batch_flags;
+            {
+                const auto sig = material_sigs.find(material);
+                if (sig != material_sigs.end()) {
+                    item.material_sig = sig->second;
+                } else {
+                    // the fields of the material the variant search reads: +0x24, +0x28, +0xd0, +0xd4, +0x158, +0x15c, +0x164, +0x1bc (dwords)
+                    u64 h = 0xcbf29ce484222325ull;
+                    for (const u32 offset : {0x24u, 0x28u, 0xd0u, 0xd4u, 0x158u, 0x15cu, 0x164u, 0x1bcu}) {
+                        u32 word = 0;
+                        Rd(material + offset, word);
+                        h = (h ^ word) * 0x100000001b3ull;
+                    }
+                    material_sigs.emplace(material, h);
+                    item.material_sig = h;
+                }
+            }
             if (group != 0) {
                 item.kind = indirect_mode != 0 ? Indirect : Instanced;
                 item.instances = instances;
@@ -258,14 +334,17 @@ void PassEnter(u64 render_device, u64 desc) {
     }
 }
 
-void NoteDraw(u64 caller, u32 kind, u64 count, u64 first, u64 instances) {
+void NoteDraw(u64 caller, u32 kind, u64 count, u64 first, u64 instances, u64 vertex_shader, u64 pixel_shader) {
     if (!Enabled() || !InPass(caller)) {
         return;
     }
     auto& s = S();
     std::scoped_lock lk{s.mutex};
     if (s.active) {
-        s.observed.push_back({kind, count, first, instances, 0, 0});
+        Item item{kind, count, first, instances, 0, 0};
+        item.vertex_shader = vertex_shader;
+        item.pixel_shader = pixel_shader;
+        s.observed.push_back(item);
     }
 }
 
@@ -312,6 +391,21 @@ nlohmann::json Report() {
                                        {"unreadable_snapshot_fields", v.unreadable}};
     }
     out["first_mismatches"] = s.samples;
+    {
+        auto& variant = out["variant_audit"] = nlohmann::json::object();
+        variant["distinct_pipelines_seen_(vertex_shader,_pixel_shader)"] = s.pipelines.size();
+        auto& by_key = variant["is_the_pipeline_a_function_of_the_key"] = nlohmann::json::object();
+        for (u32 k = 0; k < KeyKinds; ++k) {
+            u64 draws = 0, conflicting_keys = 0, conflicting_draws = 0;
+            for (const auto& [key, stat] : s.keys[k]) {
+                draws += stat.draws;
+                conflicting_keys += stat.conflict ? 1 : 0;
+                conflicting_draws += stat.conflicting_draws;
+            }
+            by_key[key_names[k]] = {{"distinct_keys", s.keys[k].size()}, {"keys_that_saw_two_pipelines", conflicting_keys}, {"draws", draws}, {"draws_after_the_first_pipeline_of_a_conflicting_key_that_differ", conflicting_draws}};
+        }
+        variant["conflict_samples"] = s.conflict_samples;
+    }
     return out;
 }
 

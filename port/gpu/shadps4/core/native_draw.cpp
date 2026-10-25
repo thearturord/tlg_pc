@@ -4849,7 +4849,7 @@ u64 PS4_SYSV_ABI GarlicPoolPro(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u
 
 u64 PS4_SYSV_ABI TagIndexed(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     if (NativeZPass::Enabled()) {
-        NativeZPass::NoteDraw(ret - ImageBase() + 0x1000000, 0, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a4));
+        NativeZPass::NoteDraw(ret - ImageBase() + 0x1000000, 0, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a4), Rd<u64>(ctx, Ctx::VertexShader), Rd<u64>(ctx, Ctx::PixelShader));
     }
     return Tag(ctx, a1, a2, a3, ret, 0, (a4 & 0xff) != 0, false, a4, a5);
 }
@@ -6458,7 +6458,7 @@ u64 PS4_SYSV_ABI TagDispatchFenced(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 
 }
 u64 PS4_SYSV_ABI TagIndirect(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     if (NativeZPass::Enabled()) {
-        NativeZPass::NoteDraw(ret - ImageBase() + 0x1000000, 1, 0, 0, 0);
+        NativeZPass::NoteDraw(ret - ImageBase() + 0x1000000, 1, 0, 0, 0, Rd<u64>(ctx, Ctx::VertexShader), Rd<u64>(ctx, Ctx::PixelShader));
     }
     return Tag(ctx, a1, a2, a3, ret, 2, true);
 }
