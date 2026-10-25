@@ -44,8 +44,8 @@ std::atomic<u64> ring_upload_bytes{}, ring_upload_count{}, ring_skipped_bytes{},
 
 constexpr bool Kept(u32 writer) {
     // 0 Map / Unmap, 1 skinning, 2 light constants, 4 BeginRecording, 5 buffer creation: memory of buffers. 3 (command stream copies) are ordered by the stream
-    // itself and 6 (texture initialization) is image memory.
-    return writer == 0 || writer == 1 || writer == 2 || writer == 4 || writer == 5;
+    // itself and 6 (texture initialization) is image memory. 7 (instance group data, N6.4) is the constant data of instanced batches.
+    return writer == 0 || writer == 1 || writer == 2 || writer == 4 || writer == 5 || writer == 7;
 }
 
 } // namespace
@@ -261,8 +261,8 @@ namespace {
 thread_local u32 current_caller = 0;
 thread_local u32 current_detail = 0;
 thread_local u32 current_who = ~0u;
-std::array<std::atomic<u64>, 8> who_by_writer{};          ///< uploads on GPU-written bytes by the announcer that wrote them last (index 7: none found)
-std::array<std::atomic<u64>, 8> who_on_render_thread{};   ///< of those, announced on the render thread
+std::array<std::atomic<u64>, 9> who_by_writer{};          ///< uploads on GPU-written bytes by the announcer that wrote them last (index 8: none found)
+std::array<std::atomic<u64>, 9> who_on_render_thread{};   ///< of those, announced on the render thread
 std::array<std::atomic<u64>, 6> who_age_ms{};             ///< age of that announcement: <1, <4, <16, <64, <512, more
 std::array<std::atomic<u64>, 256> detail_counts{}; ///< in-pass uploads of draw buffers by detail bits
 struct OnDemandBucket {
@@ -318,7 +318,7 @@ void NoteOnDemand(bool pass_open, u64 request_size, u64 uploaded_bytes, u64 addr
         detail_counts[current_detail & 255].fetch_add(1, std::memory_order_relaxed);
         if ((current_detail & 64) != 0) { // bytes the GPU wrote: who wrote them from the CPU side?
             const u32 who = current_who;
-            const u32 writer = who == ~0u ? 7 : (who & 0xff) % 7;
+            const u32 writer = who == ~0u ? 8 : (who & 0xff) % 8;
             who_by_writer[writer].fetch_add(1, std::memory_order_relaxed);
             if (who != ~0u) {
                 if ((who & 0x100) != 0) {
@@ -451,8 +451,8 @@ nlohmann::json Report() {
         }
         {
             auto& w = in_pass["draw_buffer_uploads_on_gpu_written_bytes_by_the_cpu_writer"] = nlohmann::json::object();
-            constexpr const char* names[8] = {"map_unmap", "skinning", "light_constants", "command_stream_copy", "begin_recording", "buffer_creation", "texture_initialization", "no_announcement_found"};
-            for (u32 i = 0; i < 8; ++i) {
+            constexpr const char* names[9] = {"map_unmap", "skinning", "light_constants", "command_stream_copy", "begin_recording", "buffer_creation", "texture_initialization", "instance_group_upload", "no_announcement_found"};
+            for (u32 i = 0; i < 9; ++i) {
                 if (const u64 n = who_by_writer[i].load()) {
                     w[names[i]] = {{"uploads", n}, {"on_the_render_thread", who_on_render_thread[i].load()}};
                 }

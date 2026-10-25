@@ -6541,6 +6541,9 @@ u64 PS4_SYSV_ABI TagDispatchFenced(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 
     return TagCompute(ctx, a1, a2, a3, ret, true);
 }
 u64 PS4_SYSV_ABI TagIndirect(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (NativeZPassGen::VerifyActive()) {
+        NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 1, ctx, a1, a2);
+    }
     if (NativeZPass::Enabled()) {
         NativeZPass::NoteDraw(ret - ImageBase() + 0x1000000, 1, a1, a2, 0, Rd<u64>(ctx, Ctx::VertexShader), Rd<u64>(ctx, Ctx::PixelShader), ctx);
     }
@@ -6730,7 +6733,34 @@ u64 PS4_SYSV_ABI ZPassEnter(u64 render_device, u64 desc, u64 a2, u64 a3, u64 a4,
     return 0;
 }
 
+/// N6.4: `FUN_01ee4e50(inner, instance group, view type)` binds an instance group for a depth / G-buffer batch. It copies the group's instance data (`memcpy` of `uploader[2]` bytes from
+/// `uploader[1]` into `uploader[idx + 3]`, idx = the dword at `uploader + 0x28`, the double buffer toggled by the function) with no Map in between: the write is announced here, before the
+/// function runs (writer 7 of the update list). The uploader is `*(group + 0xf0)`, null for a group without per frame data.
+u64 PS4_SYSV_ABI InstanceGroupBind(u64 inner, u64 group, u64 view, u64 a3, u64 a4, u64 a5, u64 ret) {
+    (void)inner, (void)view, (void)a3, (void)a4, (void)a5, (void)ret;
+    if (!Core::NativeUpdates::enabled.load(std::memory_order_relaxed) || !IsHeapPointer(group)) {
+        return 0;
+    }
+    Guarded([&]() -> u64 {
+        const u64 uploader = Rd<u64>(group, 0xf0);
+        if (!IsHeapPointer(uploader)) {
+            return 0;
+        }
+        const s32 index = Rd<s32>(uploader, 0x28);
+        const s32 bytes = Rd<s32>(uploader, 0x10);
+        if ((index & ~1) != 0 || bytes <= 0) {
+            return 0;
+        }
+        Core::NativeUpdates::NoteWriterRange(7, Rd<u64>(uploader, 0x18 + static_cast<u64>(index) * 8), static_cast<u32>(bytes));
+        return 0;
+    });
+    return 0;
+}
+
 u64 FindHandler(const std::string& name) {
+    if (name == "instance_group_bind") {
+        return reinterpret_cast<u64>(&InstanceGroupBind);
+    }
     if (name == "zpass_enter") {
         return reinterpret_cast<u64>(&ZPassEnter);
     }
@@ -7317,6 +7347,16 @@ bool GuardedCall(void (*fn)(void*), void* argument) {
         },
         &pack, &faulted);
     return !faulted;
+}
+
+void IssueIndirectDraw(u64 ctx, u64 buffer, u64 offset) {
+    // the draw the depth pass loop makes at its call site 0x01c7640f, through the draw hook
+    static const u64 original = Core::GuestHooks::OriginalEntry("DrawIndexedIndirect");
+    const u64 site = ImageBase() + (0x01c7640full - 0x1000000);
+    if (TagIndirect(ctx, buffer, offset, 0, 0, 0, site) != 0 || original == 0) {
+        return;
+    }
+    reinterpret_cast<GuestDraw6>(original)(ctx, buffer, offset, 0, 0, 0);
 }
 
 void IssueIndexedDraw(u64 ctx, u64 count, u64 first) {

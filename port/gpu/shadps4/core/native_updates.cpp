@@ -434,10 +434,10 @@ nlohmann::json Report() {
         }
     }
     {
-        constexpr const char* names[8] = {"map", "skinning", "light_constants", "command_stream_copy", "begin_recording", "buffer_creation", "texture_initialization", "7"};
+        constexpr const char* names[8] = {"map", "skinning", "light_constants", "command_stream_copy", "begin_recording", "buffer_creation", "texture_initialization", "instance_group_upload"};
         auto& t = j["announcements_by_thread"] = nlohmann::json::object();
         t["render_thread_key"] = render_thread.load();
-        for (u32 w = 0; w < 7; ++w) {
+        for (u32 w = 0; w < 8; ++w) {
             auto& o = t[names[w]] = nlohmann::json::object();
             o["on_the_render_thread"] = announced_on_render_thread[w].load();
             o["on_other_threads"] = announced_elsewhere[w].load();
@@ -455,7 +455,7 @@ nlohmann::json Report() {
     f["inside_a_window_by_announcer"] = {{"map", faults.covered_by_writer[0].load()}, {"skinning_FUN_01c93730", faults.covered_by_writer[1].load()}, {"light_constants_FUN_01eeb610", faults.covered_by_writer[2].load()},
                                                        {"command_stream_memory_copy", faults.covered_by_writer[3].load()}, {"begin_recording_direct_stores", faults.covered_by_writer[4].load()},
                                                        {"buffer_creation_with_initial_data", faults.covered_by_writer[5].load()},
-                                                       {"texture_initialization", faults.covered_by_writer[6].load()}};
+                                                       {"texture_initialization", faults.covered_by_writer[6].load()}, {"instance_group_upload_FUN_01ee4e50", faults.covered_by_writer[7].load()}};
     f["inside_an_older_map_window_of_the_same_thread"] = faults.covered_earlier.load();
     f["inside_a_map_window_of_another_thread"] = faults.covered_other_thread.load();
     f["in_no_map_window"] = faults.uncovered.load();

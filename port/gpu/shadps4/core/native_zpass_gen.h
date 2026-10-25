@@ -3,7 +3,7 @@
 // switch names, by native code that reads the same snapshot, writes the same per primitive state into the device context and issues the same draws through the engine's draw entry.
 // Behind switches, off by default:
 //   TLG_ZPASS_GEN=1            the generator runs (the hook of DrawZPass is wrapped; a pass the generator declines is run by the engine's loop through the original entry)
-//   TLG_ZPASS_GEN_VIEWS=5,6,7  the view types it handles (default: the shadow cascades 5, 6, 7)
+//   TLG_ZPASS_GEN_VIEWS=0,1,2,5,6,7  the view types it handles (default: the Z passes 0, 1, 2 and the shadow cascades 5, 6, 7)
 //   TLG_ZPASS_GEN_VERIFY=N     one generated pass in N is run by the engine's loop instead, and compared draw by draw with what the generator would have written (default 32, 0: never);
 //                              a difference switches the generator off for that view type for the rest of the run
 // Report: /zpassgen.

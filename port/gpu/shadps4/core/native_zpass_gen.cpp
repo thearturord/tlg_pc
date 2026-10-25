@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // N6.3i: the cascade generator, see native_zpass_gen.h and documents/tlg/n6-pass-generator-design.md.
 //
-// What the engine's loop does for a pass without instance groups and without special batch entries (RenderDev_DrawZPass, ghidra 0x01c74a00), as native code:
+// N6.4 adds the instance group batches (views 0, 1, 2): FUN_01ee4e50 (the binding of the group and the upload of its data) is the engine's own function, called by the generator and
+// announced to the update list by its hook; the draws are DrawIndexedIndirect through the draw hook; the clear after the batch is plain stores.
+// What the engine's loop does for a pass without special batch entries (RenderDev_DrawZPass, ghidra 0x01c74a00), as native code:
 //   prologue   ctx + 0x4480 = 4 (dirty bit ctx + 0x447c |= 1 when it changed), ctx + 0x68 = 0
 //   per batch  ctx + 0x580, the index buffer view (ctx + 0x58, + 0x60 = 0x39), FUN_01c932d0 (ctx + 0x288 / 0x308 and the table at ctx + 0x6c0)
 //   per prim   the material render object into the context (FUN_01c92b60, and its early copy of the resource slot), the resource set (FUN_01c92f30, the engine's own function, for the
@@ -73,7 +75,7 @@ const Config& Cfg() {
         const char* e = std::getenv("TLG_ZPASS_GEN");
         c.on = e != nullptr && *e != 0 && *e != '0';
         const char* v = std::getenv("TLG_ZPASS_GEN_VIEWS");
-        std::string list = v != nullptr && *v != 0 ? v : "5,6,7";
+        std::string list = v != nullptr && *v != 0 ? v : "0,1,2,5,6,7";
         size_t at = 0;
         while (at < list.size()) {
             const size_t comma = list.find(',', at);
@@ -101,11 +103,26 @@ struct BatchLevel {
     u64 value_580{}, view_58{}, pass_object_288{};
     bool bvar54{false};
     u32 table_count{0};
+    std::array<u64, 16> table_entry{}; // the table entry object each value comes from
     std::array<std::pair<u32, u64>, 16> table{}; // (index j, value for ctx + 0x6c0 + 8 j), ascending j; the engine's loop fills them downwards, the values do not depend on each other
     u32 first_step{0}, step_count{0};
+    // instance group batches (N6.4)
+    bool visibility{false}; // pass kind 3 with desc + 0x1d clear and batch flag 0x8: the primitive is skipped when the visibility cache says culled
+    bool group{false};
+    bool only_580{false};   // the loop writes ctx + 0x580 and nothing else for this batch (its group has no instances or no object)
+    u64 inner{0};           // the mesh render data's inner object (first argument of FUN_01ee4e50)
+    u64 group_object{0};
+    u64 indirect_buffer{0}; // the argument buffer object of the group (group object + 0x110)
+    // what FUN_01ee4e50 writes into the context (the verify run applies these; the generator calls the function)
+    u64 g70{0}, g78{0}, g340{0};
+    u32 g170{0}, g174{0};
+    bool g340_set{false};
+    u32 table_dwords{0};
+    std::array<u64, 64> gtable{};
 };
 
 struct Step {
+    u32 index{};    // the primitive's index in its batch (the indirect arguments are addressed with it)
     u64 record{};   // the primitive record (0x38 bytes)
     u64 material{};
     u64 key{};
@@ -119,8 +136,11 @@ struct Plan {
     u32 view_type{0}, kind{0};
     u64 render_device{0}, ctx{0};
     u32 flag14{0}, flag1c{0};
+    s32 indirect_mode{0};
+    u64 visibility_owner{0}; // desc + 0x28: the object whose +0x790 is the id the cache is keyed with
     std::vector<BatchLevel> batches;
     std::vector<Step> steps;
+    u32 group_batches{0}, group_batches_skipped{0};
     bool Ok() const { return scanned && reasons.empty(); }
     void Decline(const char* reason) {
         for (const char* r : reasons) {
@@ -143,6 +163,8 @@ struct ViewStats {
     u64 not_scanned{};
     bool disabled{false};
     std::map<std::string, u64> declines;
+    std::map<u32, u64> kinds; // passes by desc + 0x10
+    u64 group_batches{}, group_batches_skipped{}, verify_raced{};
 };
 
 struct State {
@@ -152,6 +174,7 @@ struct State {
     std::vector<u64> cache_seen;
     u64 table_resets{0}, learned{0}, conflicts{0}, learn_not_in_cache{0}, learn_faults{0}, scan_faults{0};
     std::map<std::string, u64> mismatch_kinds;
+    std::map<std::string, u64> raced_words; // verify: words where the live value differed from the shadow read but equals what the object holds when compared
     std::vector<std::string> samples;
 };
 State& S() {
@@ -163,7 +186,8 @@ State& S() {
 
 struct Mark {
     size_t arena_end;
-    u32 count, first;
+    u32 kind;
+    u64 count, first;
     u64 vertex_shader, pixel_shader;
 };
 
@@ -173,6 +197,12 @@ struct Target {
     u8* base{nullptr};
     std::vector<u8> arena; // shadow: entries [u32 offset][u32 size][bytes]
     std::vector<Mark> marks;
+    u64 batch_owner{0};                          // shadow: the batch whose level words (ctx + 0x580, 0x58, 0x288, 0x308) are being written
+    std::unordered_map<size_t, u64> batch_owner_map;
+    u64 table_entry{0};                          // shadow: the table entry object whose value is being written (ctx + 0x6c0 + 8 j)
+    std::unordered_map<size_t, u64> table_owner; // shadow: arena position of an entry -> that table entry object
+    u64 slot_material{0};                       // shadow: the material whose resource slot words are being written
+    std::unordered_map<size_t, u64> slot_owner; // shadow: arena position of an entry -> that material
     s32 draws{0};
     s64 triangles{0};
 
@@ -184,6 +214,15 @@ struct Target {
     }
     void Log(u32 offset, u32 size, const void* bytes) {
         const size_t at = arena.size();
+        if (slot_material != 0) {
+            slot_owner[at] = slot_material;
+        }
+        if (table_entry != 0) {
+            table_owner[at] = table_entry;
+        }
+        if (batch_owner != 0) {
+            batch_owner_map[at] = batch_owner;
+        }
         arena.resize(at + 8 + (size & ~OrMask));
         std::memcpy(arena.data() + at, &offset, 4);
         std::memcpy(arena.data() + at + 4, &size, 4);
@@ -224,6 +263,8 @@ void ReaderUnlock(u64 address) {
 
 using GuestBind = void(PS4_SYSV_ABI*)(u64, u64, u64, u64);
 using GuestRelease = void(PS4_SYSV_ABI*)(u64);
+using GuestGroupBind = void(PS4_SYSV_ABI*)(u64, u64, u64);
+constexpr u64 FunctionGroupBind = 0x01ee4e50; // FUN_01ee4e50(inner, instance group object, view type)
 
 /// The engine's reference counted shader slot (ctx + 0x4698 vertex, ctx + 0x4690 pixel): release the old object, store the new one, count it, set the dirty bit.
 void SetShader(Target& t, u32 offset, u64 object, u8 dirty_bit) {
@@ -355,6 +396,7 @@ void FillBatchLevel(BatchLevel& level, u64 batch, u64 default_object) {
     const u64 render_data = R<u64>(mesh + 0x38);
     const u64 inner = R<u64>(render_data + 0x20);
     level.batch = batch;
+    level.inner = inner;
     level.value_580 = R<u64>(R<u64>(R<u64>(inner + 0x48) + 0x38) + 0x28);
     level.pass_object_288 = R<u64>(R<u64>(batch + 0x68) + 0x130);
     level.view_58 = 0;
@@ -384,11 +426,12 @@ void FillBatchLevel(BatchLevel& level, u64 batch, u64 default_object) {
         if (holder == 0) {
             continue;
         }
+        level.table_entry[level.table_count] = entry;
         level.table[level.table_count++] = {j, R<u64>(holder + 0x28)};
     }
 }
 
-u64 StepKey(u64 material_hash, const Plan& plan, u16 batch_flags, bool bvar54, u16 mesh_word) {
+u64 StepKey(u64 material_hash, const Plan& plan, u16 batch_flags, bool bvar54, u16 mesh_word, u64 group_bits) {
     u64 h = material_hash;
     h = Mix(h, plan.view_type);
     h = Mix(h, plan.flag14);
@@ -396,7 +439,31 @@ u64 StepKey(u64 material_hash, const Plan& plan, u16 batch_flags, bool bvar54, u
     h = Mix(h, batch_flags & 0x10);
     h = Mix(h, bvar54 ? 1 : 0);
     h = Mix(h, mesh_word);
+    h = Mix(h, group_bits);
     return h;
+}
+
+/// The visibility cache of pass kind 3 (the loop, after the raster state of a primitive of a batch with flag 0x8): the primitive's data object holds 8 hash chains at +0x68 keyed with the id
+/// at owner + 0x790 (the node's first qword is the id in both halves). Returns 0 when there is no node, else the node.
+u64 VisibilityNode(u64 owner, u64 record) {
+    const u32 id = R<u32>(owner + 0x790);
+    const u64 data = R<u64>(record + 0x28);
+    for (u64 node = R<u64>(data + 0x68 + u64(id & 7) * 8); node != 0; node = R<u64>(node + 0x10)) {
+        const u64 key = R<u64>(node);
+        if (static_cast<u32>(key) == id && static_cast<u32>(key >> 32) == id) {
+            return node;
+        }
+    }
+    return 0;
+}
+
+/// True when the loop would not create a cache entry for the primitive: a node exists, or the list of the current slot is full (then it draws without one).
+bool VisibilityKnown(const Plan& plan, u64 rd, u64 record) {
+    if (VisibilityNode(plan.visibility_owner, record) != 0) {
+        return true;
+    }
+    const u32 list = R<u32>(rd + 0x10978);
+    return R<u32>(rd + 0x10988 + u64{list} * 0x18) > 0x7f;
 }
 
 // ------------------------------------------------------------------------------------------------------------------------------- scan (read only, guarded)
@@ -421,15 +488,14 @@ void ScanImpl(ScanArgs& args) {
     const u8 flag_hi = static_cast<u8>(view_word >> 32);
     const u8 flag_cvar = static_cast<u8>(view_word >> 40);
     plan.ctx = R<u64>(rd + 0x2d8);
+    plan.indirect_mode = R<s32>(rd + (plan.view_type == 0 ? 0x38e0 : 0x38e4));
     if (list == 0 || plan.ctx == 0) {
         plan.Decline("no list or no device context");
         return;
     }
-    if (plan.kind == 1 || plan.kind == 2 || plan.kind == 3 || plan.kind == 5) {
-        plan.Decline("pass kind with queries or a target switch (desc + 0x10 in 1, 2, 3, 5)");
-    }
-    if (flag_cvar != 0) {
-        plan.Decline("pass flag byte 5 set (batches without instances are skipped)");
+    const u8 flag_1d = R<u8>(desc + 0x1d);
+    if (plan.kind == 1 || plan.kind == 2 || plan.kind == 5) {
+        plan.Decline("pass kind with queries or a target switch (desc + 0x10 in 1, 2, 5)");
     }
     if (R<u64>(rd + 0x8930) != 0) {
         plan.Decline("the engine's per draw register packet is on (renderDev + 0x8930)");
@@ -463,14 +529,7 @@ void ScanImpl(ScanArgs& args) {
         if (mesh == 0) {
             continue;
         }
-        if (R<u64>(batch + 0x38) != 0) {
-            plan.Decline("batch with an instance group (FUN_01ee4e50 is not modeled)");
-            continue;
-        }
-        if (R<u64>(batch + 0x48) != 0) {
-            plan.Decline("batch with a special entry (a virtual call picks the material index)");
-            continue;
-        }
+        const u64 group = R<u64>(batch + 0x38);
         const u64 render_data = R<u64>(mesh + 0x38);
         if (render_data == 0 || R<u64>(render_data + 0x20) == 0) {
             plan.Decline("mesh render data not created yet (the loop creates it at first use)");
@@ -479,6 +538,89 @@ void ScanImpl(ScanArgs& args) {
         BatchLevel level;
         FillBatchLevel(level, batch, default_object);
         level.first_step = static_cast<u32>(plan.steps.size());
+        if (group == 0 && flag_cvar != 0) {
+            // pass flag byte 5: the loop draws only instance group batches; it has written ctx + 0x580 and leaves
+            level.only_580 = true;
+            plan.batches.push_back(level);
+            continue;
+        }
+        if (R<u64>(batch + 0x48) != 0) {
+            plan.Decline("batch with a special entry (a virtual call picks the material index)");
+            continue;
+        }
+        if (plan.kind == 3 && flag_1d == 0 && (batch_flags & 8) != 0) {
+            level.visibility = true;
+            plan.visibility_owner = R<u64>(desc + 0x28);
+            if (plan.visibility_owner == 0) {
+                plan.Decline("pass kind 3 without the visibility owner (desc + 0x28)");
+                continue;
+            }
+        }
+        u64 group_bits = 0;
+        if (group != 0) {
+            if (plan.indirect_mode == 0) {
+                plan.Decline("instance group batch without the indirect mode (DrawIndexedInstanced is not hooked)");
+                continue;
+            }
+            const u64 group_inner = R<u64>(group + 8);
+            if (group_inner == 0) {
+                if (flag_cvar != 0) {
+                    level.only_580 = true;
+                    plan.batches.push_back(level);
+                } else {
+                    plan.Decline("instance group without its inner object");
+                }
+                continue;
+            }
+            level.group = true;
+            level.bvar54 = false; // the loop's flag for the batch of a group
+            ++plan.group_batches;
+            const u64 group_object = R<u64>(group_inner + 0x38);
+            u32 instances = 0;
+            if (group_object != 0) {
+                instances = R<u32>(R<u64>(group_object + 0x28) + 0x48);
+            }
+            if (group_object == 0 || instances == 0) {
+                level.only_580 = true; // the loop leaves such a batch after writing ctx + 0x580
+                ++plan.group_batches_skipped;
+                level.step_count = 0;
+                plan.batches.push_back(level);
+                continue;
+            }
+            level.group_object = group_object;
+            level.indirect_buffer = R<u64>(group_object + 0x110);
+            const u32 views_count = R<u32>(group_object + 0xe0);
+            if (views_count > 45) {
+                plan.Decline("instance group with more shader resource views than the engine accepts");
+                continue;
+            }
+            // what FUN_01ee4e50 writes (read now for the verify run, and to find stale pointers under the guard)
+            const s32 ring_index = R<s32>(group_object + 0x20);
+            if (ring_index != 0 && ring_index != 1) {
+                plan.Decline("instance group with a ring index outside 0 and 1");
+                continue;
+            }
+            const u64 ring_entry = R<u64>(R<u64>(group_object + 0xb8) + u64(ring_index) * 8);
+            const u64 view_object = R<u64>(R<u64>(level.inner + 0x48) + 0x38);
+            level.g70 = R<u64>(view_object + 0x20);
+            level.g78 = R<u64>(ring_entry + 0x20);
+            level.g170 = R<u32>(view_object + 0x40);
+            level.g174 = R<u32>(ring_entry + 0x40);
+            if (const u64 uploader = R<u64>(group_object + 0xf0); uploader != 0) {
+                level.g340 = R<u64>(R<u64>(uploader) + 0x10);
+                level.g340_set = true;
+            }
+            level.gtable[0] = R<u64>(group_object + 0x1b0 + u64(plan.view_type) * 8);
+            level.gtable[1] = R<u64>(group_object + 0x1f8 + u64(ring_index) * 8);
+            level.gtable[2] = R<u64>(group_object + 0x1f8 + u64(1 - ring_index) * 8);
+            const u64 views_array = R<u64>(group_object + 0xd8);
+            for (u32 i = 0; i < views_count; ++i) {
+                const u64 holder = R<u64>(views_array + u64{i} * 8);
+                level.gtable[3 + i] = holder != 0 ? R<u64>(holder + 0x28) : 0;
+            }
+            level.table_dwords = 3 + views_count;
+            group_bits = (1ull << 40) | (u64(plan.indirect_mode != 0) << 32) | R<u32>(group_inner + 0x40);
+        }
         const u16 mesh_word = R<u16>(mesh + 0x78);
         const u16 prim_count = R<u16>(batch + 100);
         const u64 prim_array = R<u64>(batch + 0x58);
@@ -508,7 +650,11 @@ void ScanImpl(ScanArgs& args) {
             step.record = record;
             step.material = material;
             step.flag = info.flag;
-            step.key = StepKey(info.hash, plan, batch_flags, level.bvar54, mesh_word);
+            step.key = StepKey(info.hash, plan, batch_flags, level.bvar54, mesh_word, group_bits);
+            step.index = p;
+            if (level.visibility && !VisibilityKnown(plan, rd, record)) {
+                plan.Decline("visibility cache entry missing (the loop creates it, with a query around the draw)");
+            }
             const auto entry = args.table->find(step.key);
             if (entry == args.table->end()) {
                 plan.Decline("variant key not learned yet (the loop picks the variant at first use)");
@@ -530,11 +676,15 @@ void ScanImpl(ScanArgs& args) {
 
 // ------------------------------------------------------------------------------------------------------------------------------- the generator
 
-void IssueDraw(Target& t, u32 count, u32 first) {
+void IssueDraw(Target& t, u32 kind, u64 count, u64 first) {
     if (t.live) {
-        NativeDraw::IssueIndexedDraw(reinterpret_cast<u64>(t.base), count, first);
+        if (kind == 0) {
+            NativeDraw::IssueIndexedDraw(reinterpret_cast<u64>(t.base), count, first);
+        } else {
+            NativeDraw::IssueIndirectDraw(reinterpret_cast<u64>(t.base), count, first);
+        }
     } else {
-        t.marks.push_back({t.arena.size(), count, first, t.Get<u64>(0x4698), t.Get<u64>(0x4690)});
+        t.marks.push_back({t.arena.size(), kind, count, first, t.Get<u64>(0x4698), t.Get<u64>(0x4690)});
     }
 }
 
@@ -548,16 +698,41 @@ void Generate(Target& t, const Plan& plan) {
     t.Set<u64>(0x68, 0);
     bool raster_flag = false; // bVar15: which of the two raster state objects the last primitive asked for
     for (const BatchLevel& level : plan.batches) {
+        t.batch_owner = level.batch;
         t.Set<u64>(0x580, level.value_580);
+        t.batch_owner = 0;
+        if (level.only_580) {
+            continue;
+        }
+        if (level.group) {
+            if (t.live) {
+                reinterpret_cast<GuestGroupBind>(Global(FunctionGroupBind))(level.inner, level.group_object, plan.view_type);
+            } else {
+                t.Set<u64>(0x70, level.g70);
+                t.Set<u64>(0x78, level.g78);
+                t.Set<u32>(0x170, level.g170);
+                t.Set<u32>(0x174, level.g174);
+                t.Set<u64>(0x1f0, 0);
+                if (level.g340_set) {
+                    t.Set<u64>(0x340, level.g340);
+                }
+                t.Put(0x800, level.gtable.data(), level.table_dwords * 8);
+            }
+        }
+        t.batch_owner = level.batch;
         t.Set<u64>(0x58, level.view_58);
         t.Set<u64>(0x60, 0x39);
         t.Set<u64>(0x288, level.pass_object_288);
         t.Set<u64>(0x308, level.pass_object_288);
+        t.batch_owner = 0;
         for (u32 i = level.table_count; i-- > 0;) {
+            t.table_entry = level.table_entry[i];
             t.Set<u64>(0x6c0 + level.table[i].first * 8, level.table[i].second);
+            t.table_entry = 0;
         }
         for (u32 s = level.first_step; s < level.first_step + level.step_count; ++s) {
             const Step& step = plan.steps[s];
+            t.slot_material = step.material;
             if (step.flag != 0) {
                 CopyEarlyBlock(t, step.material);
                 if (!level.bvar54 && t.live) {
@@ -565,6 +740,7 @@ void Generate(Target& t, const Plan& plan) {
                 }
             }
             BindMaterial(t, step.material);
+            t.slot_material = 0;
             if (t.live) {
                 W<u64>(R<u64>(step.record + 0x28) + 0x48, step.variant); // the loop stores the variant it chose behind the primitive record
             }
@@ -580,8 +756,17 @@ void Generate(Target& t, const Plan& plan) {
                     t.Set<u8>(0x46d8, 1);
                 }
             }
+            if (level.visibility) {
+                if (const u64 node = VisibilityNode(plan.visibility_owner, step.record); node != 0 && R<s32>(node + 8) == 2) {
+                    continue; // culled by the cache: the loop leaves the primitive after its state is set, before the draw and the counters
+                }
+            }
             const s32 triangles = R<s32>(step.record + 0x14);
-            IssueDraw(t, static_cast<u32>(triangles * 3), R<u32>(step.record + 0x10));
+            if (level.group) {
+                IssueDraw(t, 1, level.indirect_buffer, (u64{step.index} * 9 + plan.view_type) * 0x18);
+            } else {
+                IssueDraw(t, 0, static_cast<u32>(triangles * 3), R<u32>(step.record + 0x10));
+            }
             if (t.live) {
                 W<s32>(rd + 0x10, R<s32>(rd + 0x10) + 1);
                 W<s32>(rd + 0x14, R<s32>(rd + 0x14) + triangles);
@@ -589,6 +774,15 @@ void Generate(Target& t, const Plan& plan) {
                 ++t.draws;
                 t.triangles += triangles;
             }
+        }
+        if (level.group) {
+            // the end of an instanced batch clears the instance state
+            const std::array<u8, 0x30> zeros{};
+            t.Put(0x70, zeros.data(), 16);
+            t.Set<u64>(0x170, 0);
+            t.Set<u64>(0x1f0, 0);
+            t.Set<u64>(0x340, 0);
+            t.Put(0x800, zeros.data(), 0x30);
         }
     }
     // epilogue
@@ -669,6 +863,8 @@ struct Verify {
     u64 ctx{0};
     u64 compared_draws{0};
     u64 mismatches{0};
+    u64 raced{0};
+    std::vector<s16> expect;
 };
 Verify& V() {
     static Verify verify;
@@ -683,10 +879,21 @@ void NoteMismatch(State& s, u32 view, const std::string& kind, const std::string
     }
 }
 
-/// Compares the writes the generator made between two draws with the live context.
+/// Compares the writes the generator made between two draws with the live context. Writes to the same bytes inside the span are applied in order (only the last counts: a batch
+/// that draws nothing rewrites ctx + 0x580, the clear after an instanced batch overwrites the start of the table before it).
 u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, const char* where) {
     u32 differences = 0;
     const u8* arena = v.shadow.arena.data();
+    if (v.expect.empty()) {
+        v.expect.assign(CtxBytes, -1);
+    }
+    std::vector<u32> touched;
+    std::map<u32, u8> or_bits;
+    struct SlotWord {
+        u64 expected;
+        u64 material;
+    };
+    std::map<u32, SlotWord> slot_words, table_words, batch_words;
     size_t at = from;
     while (at < to) {
         u32 offset, size;
@@ -695,25 +902,140 @@ u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, cons
         const bool is_or = (size & OrMask) != 0;
         const u32 bytes = size & ~OrMask;
         const u8* expected = arena + at + 8;
+        const size_t entry_at = at;
         at += 8 + bytes;
-        std::array<u8, 0x400> live{};
-        if (bytes > live.size()) {
+        if (offset + bytes > CtxBytes) {
             continue;
         }
-        std::memcpy(live.data(), reinterpret_cast<const void*>(live_ctx + offset), bytes);
-        bool same = true;
         if (is_or) {
-            same = (live[0] & expected[0]) == expected[0];
-        } else {
-            same = std::memcmp(live.data(), expected, bytes) == 0;
+            or_bits[offset] |= expected[0];
+            continue;
         }
-        if (!same) {
+        if (const auto bowner = v.shadow.batch_owner_map.find(entry_at); bowner != v.shadow.batch_owner_map.end() && bytes == 8 && (offset == 0x580 || offset == 0x58 || offset == 0x288 || offset == 0x308)) {
+            u64 value = 0;
+            std::memcpy(&value, expected, 8);
+            batch_words[offset] = {value, bowner->second};
+            continue;
+        }
+        if (const auto towner = v.shadow.table_owner.find(entry_at); towner != v.shadow.table_owner.end() && bytes == 8) {
+            u64 value = 0;
+            std::memcpy(&value, expected, 8);
+            table_words[offset] = {value, towner->second};
+            continue;
+        }
+        const auto owner = v.shadow.slot_owner.find(entry_at);
+        if (bytes == 8 && owner != v.shadow.slot_owner.end() && (offset == 0x290 || offset == 0x310 || offset == 0x298 || offset == 0x318)) {
+            u64 value = 0;
+            std::memcpy(&value, expected, 8);
+            slot_words[offset] = {value, owner->second};
+            continue;
+        }
+        for (u32 i = 0; i < bytes; ++i) {
+            if (v.expect[offset + i] < 0) {
+                touched.push_back(offset + i);
+            }
+            v.expect[offset + i] = expected[i];
+        }
+    }
+    std::sort(touched.begin(), touched.end());
+    for (size_t i = 0; i < touched.size();) {
+        size_t j = i;
+        while (j + 1 < touched.size() && touched[j + 1] == touched[j] + 1) {
+            ++j;
+        }
+        // one run [touched[i], touched[j]]: report the first differing byte of it
+        for (size_t k = i; k <= j; ++k) {
+            const u32 at_byte = touched[k];
+            const u8 live = R<u8>(live_ctx + at_byte);
+            if (live != static_cast<u8>(v.expect[at_byte])) {
+                u64 a = 0, b = 0;
+                const u32 base = at_byte & ~7u;
+                std::memcpy(&a, reinterpret_cast<const void*>(live_ctx + base), 8);
+                for (u32 q = 0; q < 8; ++q) {
+                    const s16 e = v.expect[base + q];
+                    const u8 value = e >= 0 ? static_cast<u8>(e) : R<u8>(live_ctx + base + q);
+                    b |= u64{value} << (q * 8);
+                }
+                ++differences;
+                NoteMismatch(s, v.view, fmt::format("context word {:#x}", base), fmt::format("{}: the loop left {:#x}, the generator writes {:#x}", where, a, b));
+                break;
+            }
+        }
+        i = j + 1;
+    }
+    for (const u32 at_byte : touched) {
+        v.expect[at_byte] = -1;
+    }
+    for (const auto& [offset, bits] : or_bits) {
+        const u8 live = R<u8>(live_ctx + offset);
+        if ((live & bits) != bits) {
             ++differences;
-            u64 a = 0, b = 0;
-            std::memcpy(&a, live.data(), std::min<u32>(bytes, 8));
-            std::memcpy(&b, expected, std::min<u32>(bytes, 8));
-            NoteMismatch(s, v.view, fmt::format("context word {:#x}", offset), fmt::format("{}: the loop left {:#x}, the generator writes {:#x} ({} bytes{})", where, a, b, bytes, is_or ? ", bits" : ""));
+            NoteMismatch(s, v.view, fmt::format("context word {:#x}", offset), fmt::format("{}: the loop left bits {:#x}, the generator sets {:#x}", where, live, bits));
         }
+    }
+    for (const auto& [offset, word] : batch_words) {
+        const u64 live = R<u64>(live_ctx + offset);
+        if (live == word.expected) {
+            continue;
+        }
+        // the batch level words come from the mesh render data and the pass object; the engine can replace them (a streamed index buffer) between the shadow read and the loop read
+        struct Recompute {
+            u64 batch;
+            u32 offset;
+            u64 value;
+        } recompute{word.material, offset, ~0ull};
+        NativeDraw::GuardedCall(
+            [](void* p) {
+                auto* r = static_cast<Recompute*>(p);
+                const u64 context_global = R<u64>(Global(GlobalContext));
+                const u64 default_object = R<u64>(R<u64>(context_global + 0x38) + 0x20);
+                BatchLevel now;
+                FillBatchLevel(now, r->batch, default_object);
+                r->value = r->offset == 0x580 ? now.value_580 : r->offset == 0x58 ? now.view_58 : now.pass_object_288;
+            },
+            &recompute);
+        if (live == recompute.value) {
+            ++v.raced;
+            ++s.raced_words[fmt::format("view {} {} word {:#x}", v.view, "batch", offset)];
+            continue;
+        }
+        ++differences;
+        NoteMismatch(s, v.view, fmt::format("context word {:#x}", offset), fmt::format("{}: the loop left {:#x}, the generator writes {:#x} (the batch gives {:#x} now)", where, live, word.expected, recompute.value));
+    }
+    for (const auto& [offset, word] : table_words) {
+        const u64 live = R<u64>(live_ctx + offset);
+        if (live == word.expected) {
+            continue;
+        }
+        // the table entry's resource view can be replaced by the engine between the shadow read and the loop read
+        const u64 holder = R<u64>(word.material + 0x38);
+        const u64 now = holder != 0 ? R<u64>(holder + 0x28) : 0;
+        if (live == now) {
+            ++v.raced;
+            ++s.raced_words[fmt::format("view {} {} word {:#x}", v.view, "table", offset)];
+            continue;
+        }
+        ++differences;
+        NoteMismatch(s, v.view, fmt::format("context word {:#x}", offset), fmt::format("{}: the loop left {:#x}, the generator writes {:#x} (the table entry holds {:#x} now)", where, live, word.expected, now));
+    }
+    for (const auto& [offset, word] : slot_words) {
+        const u64 live = R<u64>(live_ctx + offset);
+        if (live == word.expected) {
+            continue;
+        }
+        // the resource slot of a material's render object moves when the engine's writer thread advances the object's ring (the reader lock exists for it): the shadow read it before the
+        // loop ran, the loop after. If the live value is what the object holds now, the loop and the generator agree and the difference is the time between their reads.
+        const u64 object = R<u64>(word.material + 0x38);
+        const u64 index_word = R<u64>(object + 0x440);
+        const u64 index = (index_word & 0xffffffffull) * 0xb0;
+        const u64 now = (offset == 0x290 || offset == 0x310) ? R<u64>(object + 0xc0 + index) : R<u64>(object + 0x2d0 + index);
+        if (live == now) {
+            ++v.raced;
+            ++s.raced_words[fmt::format("view {} {} word {:#x}", v.view, "slot", offset)];
+            continue;
+        }
+        ++differences;
+        NoteMismatch(s, v.view, fmt::format("context word {:#x}", offset), fmt::format("{}: the loop left {:#x}, the generator writes {:#x} (the object holds {:#x} now)", where, live, word.expected, now));
     }
     return differences;
 }
@@ -730,7 +1052,7 @@ bool VerifyActive() {
 
 void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first) {
     Verify& v = V();
-    if (!v.active.load(std::memory_order_relaxed) || kind != 0 || caller < ZPassBegin || caller >= ZPassEnd || std::this_thread::get_id() != v.thread) {
+    if (!v.active.load(std::memory_order_relaxed) || caller < ZPassBegin || caller >= ZPassEnd || std::this_thread::get_id() != v.thread) {
         return;
     }
     State& s = S();
@@ -743,9 +1065,9 @@ void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first) {
         return;
     }
     const Mark& mark = v.shadow.marks[k];
-    if (mark.count != static_cast<u32>(count) || mark.first != static_cast<u32>(first)) {
+    if (mark.kind != kind || mark.count != count || mark.first != first) {
         ++v.mismatches;
-        NoteMismatch(s, v.view, "draw arguments", fmt::format("draw {}: the loop {} / {}, the generator {} / {}", k, static_cast<u32>(count), static_cast<u32>(first), mark.count, mark.first));
+        NoteMismatch(s, v.view, "draw arguments", fmt::format("draw {}: the loop kind {} {:#x} / {:#x}, the generator kind {} {:#x} / {:#x}", k, kind, count, first, mark.kind, mark.count, mark.first));
     }
     if (ctx != v.ctx) {
         ++v.mismatches;
@@ -793,6 +1115,13 @@ bool HandlePass(u64 render_device, u64 desc, u64 original_loop) {
         }
         ViewStats& vs = s.views[view];
         ++vs.passes;
+        struct KindArgs {
+            u64 desc;
+            u32 kind;
+        } kind_args{desc, 0xffffffffu};
+        if (NativeDraw::GuardedCall([](void* p) { auto* k = static_cast<KindArgs*>(p); k->kind = R<u32>(k->desc + 0x10); }, &kind_args)) {
+            ++vs.kinds[kind_args.kind];
+        }
         if (vs.disabled) {
             plan.Decline("generator switched off for this view type by a verify difference");
         } else if (!NativeDraw::GuardedCall([](void* p) { ScanImpl(*static_cast<ScanArgs*>(p)); }, &scan_args)) {
@@ -829,6 +1158,8 @@ bool HandlePass(u64 render_device, u64 desc, u64 original_loop) {
         ++stats->generated;
         stats->generated_batches += plan.batches.size();
         stats->generated_draws += plan.steps.size();
+        stats->group_batches += plan.group_batches;
+        stats->group_batches_skipped += plan.group_batches_skipped;
         return true;
     }
     Verify& v = V();
@@ -845,6 +1176,7 @@ bool HandlePass(u64 render_device, u64 desc, u64 original_loop) {
         v.ctx = plan.ctx;
         v.compared_draws = 0;
         v.mismatches = 0;
+        v.raced = 0;
         v.thread = std::this_thread::get_id();
         const s32 draws_before = R<s32>(render_device + 0x10), triangles_before = R<s32>(render_device + 0x14);
         v.active.store(true);
@@ -866,6 +1198,8 @@ bool HandlePass(u64 render_device, u64 desc, u64 original_loop) {
         }
         ++stats->verify_passes;
         stats->verify_draws += v.compared_draws;
+        stats->verify_raced += v.raced;
+        stats->group_batches += plan.group_batches;
         if (v.mismatches == 0) {
             ++stats->verify_clean;
         } else {
@@ -928,8 +1262,16 @@ nlohmann::json Report() {
                                 {"verify_clean", v.verify_clean},
                                 {"verify_with_differences", v.verify_mismatched},
                                 {"verify_draws_compared", v.verify_draws},
+                                {"verify_slot_words_that_moved_between_the_shadow_read_and_the_loop_read", v.verify_raced},
                                 {"switched_off_by_verify", v.disabled},
-                                {"scan_faults", v.not_scanned}};
+                                {"scan_faults", v.not_scanned},
+                                {"instance_group_batches_generated", v.group_batches},
+                                {"instance_group_batches_with_no_instances", v.group_batches_skipped}};
+        nlohmann::json kinds = nlohmann::json::object();
+        for (const auto& [kind, count] : v.kinds) {
+            kinds[std::to_string(kind)] = count;
+        }
+        entry["passes_by_kind_desc_0x10"] = kinds;
         nlohmann::json declines = nlohmann::json::object();
         for (const auto& [reason, count] : v.declines) {
             declines[reason] = count;
@@ -938,6 +1280,7 @@ nlohmann::json Report() {
         views[std::to_string(view)] = entry;
     }
     out["verify_difference_kinds"] = s.mismatch_kinds;
+    out["verify_words_that_moved_by_view_kind_offset"] = s.raced_words;
     out["verify_difference_samples"] = s.samples;
     return out;
 }

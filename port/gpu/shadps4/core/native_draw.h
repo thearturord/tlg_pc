@@ -108,6 +108,8 @@ bool IsGuarded();
 bool GuardedCall(void (*fn)(void*), void* argument);
 /// N6.3i (cascade generator): issues `DrawIndexedCommon(ctx, count, first, 0, 1)` as the depth pass loop does at its call site, through the draw hook (the tag, then the engine's function).
 void IssueIndexedDraw(u64 ctx, u64 count, u64 first);
+/// Same for `DrawIndexedIndirect(ctx, argument buffer object, byte offset)` at the loop's indirect call site.
+void IssueIndirectDraw(u64 ctx, u64 buffer, u64 offset);
 
 /// N6.3e (shadow generator): builds the record of a draw from `ctx`, which may be a private copy of the device context patched from the snapshot instead of the live one. Returns
 /// the record number, 0 when the build faulted. The record is not tagged into any command stream and nothing refers to it.
