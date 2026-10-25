@@ -55,6 +55,8 @@ struct Item {
     u32 batch, primitive;
     u64 material{};      // expected side: the primitive's material
     u64 material_sig{};  // expected side: a hash of the material fields the variant search reads
+    u32 material_flag{}; // expected side: material + 0xd4 & 1 (the per-primitive resource set is bound only for these)
+    u64 batch_special{}; // expected side: batch + 0x48 (a special entry that fills the resource table itself)
     u32 mesh_word{};     // expected side: the mesh's vertex format word (mesh + 0x78), part of the variant key
     u32 batch_flags{};   // expected side: the batch flag word (bit 0x10 goes into the variant key)
     u64 vertex_shader{}, pixel_shader{}; // observed side: the shader objects the device context holds at the draw
@@ -84,7 +86,15 @@ struct State {
     bool active{false};
     u32 view_type{0};
     u32 pass_flags{0};
-    std::vector<Item> expected;
+    u64 render_device{0};
+    size_t cursor{0};
+    // audit c: the per-primitive binding. checks: 0 ctx[0x980..0x9c8) = obj[0x450..0x498), 1 ctx[0x9d0..0xa18) = obj[0x498..0x4e0), 2 shader resources at ctx + 0x790, 3 at ctx + 0xb38,
+    // 4 constant buffer slots ctx + 0x290 / 0x310, 5 the resource set (renderDev + 0xe80 = material + 0x178)
+    static constexpr u32 Checks = 6;
+    std::array<u64, Checks> bind_checked{}, bind_equal{}, bind_not_applicable{}, bind_unreadable{};
+    std::vector<std::string> bind_samples;
+    std::array<u32, Checks> bind_sample_count{};
+    u64 bind_unmatched_draws{0};    std::vector<Item> expected;
     std::vector<Item> observed;
     u64 frame{0};
     std::map<u32, ViewStats> views;
@@ -128,7 +138,7 @@ void FinishLocked(State& s) {
         size_t found = s.observed.size();
         for (size_t k = j; k < s.observed.size() && k < j + 256; ++k) {
             const auto& o = s.observed[k];
-            if (o.kind == want_kind && (want_kind == 1 || (o.count == e.count && o.first == e.first && o.instances == e.instances))) {
+            if (o.kind == want_kind && o.count == e.count && o.first == e.first && (want_kind == 1 || o.instances == e.instances)) {
                 found = k;
                 break;
             }
@@ -187,9 +197,110 @@ void FinishLocked(State& s) {
 
 } // namespace
 
+namespace {
+void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 ctx) {
+    const u32 want = kind == 1 ? Indirect : Plain;
+    size_t found = s.expected.size();
+    for (size_t k = s.cursor; k < s.expected.size() && k < s.cursor + 64; ++k) {
+        const auto& e = s.expected[k];
+        if (e.kind == Instanced || e.kind != want) {
+            continue;
+        }
+        if (e.count == count && e.first == first && (kind == 1 || e.instances == instances)) {
+            found = k;
+            break;
+        }
+    }
+    if (found == s.expected.size()) {
+        ++s.bind_unmatched_draws;
+        return;
+    }
+    s.cursor = found + 1;
+    const Item& e = s.expected[found];
+    const auto not_applicable = [&](u32 check) { ++s.bind_not_applicable[check]; };
+    const auto compare = [&](u32 check, u64 ctx_address, u64 source, size_t bytes, const char* what) {
+        std::array<u8, 512> a{}, b{};
+        if (bytes > a.size() || !RdBytes(ctx_address, a.data(), bytes) || !RdBytes(source, b.data(), bytes)) {
+            ++s.bind_unreadable[check];
+            return;
+        }
+        ++s.bind_checked[check];
+        if (std::memcmp(a.data(), b.data(), bytes) == 0) {
+            ++s.bind_equal[check];
+        } else if (s.bind_sample_count[check]++ < 3) {
+            std::string differing;
+            for (size_t i = 0; i + 8 <= bytes && differing.size() < 120; i += 8) {
+                if (std::memcmp(a.data() + i, b.data() + i, 8) != 0) {
+                    u64 x = 0, y = 0;
+                    std::memcpy(&x, a.data() + i, 8);
+                    std::memcpy(&y, b.data() + i, 8);
+                    differing += fmt::format(" +{:#x}: context {:#x} object {:#x};", i, x, y);
+                }
+            }
+            s.bind_samples.push_back(fmt::format("{} (view type {}, material {:#x}):{}", what, s.view_type, e.material, differing));
+        }
+    };
+    u64 obj = 0;
+    if (!Rd(e.material + 0x38, obj) || obj == 0) {
+        for (u32 c = 0; c < State::Checks; ++c) {
+            ++s.bind_unreadable[c];
+        }
+        return;
+    }
+    compare(0, ctx + 0x980, obj + 0x450, 0x48, "block 1");
+    u32 flag444 = 0;
+    Rd(obj + 0x444, flag444);
+    if (flag444 != 0) {
+        compare(1, ctx + 0x9d0, obj + 0x498, 0x48, "block 2");
+    } else {
+        not_applicable(1);
+    }
+    u64 views = 0;
+    u32 view_count = 0;
+    Rd(obj + 0x4f0, views);
+    Rd(obj + 0x4f8, view_count);
+    if (views != 0 && view_count != 0 && view_count <= 64) {
+        compare(2, ctx + 0x790, views, size_t{view_count} * 8, "views at +0x790");
+    } else {
+        not_applicable(2);
+    }
+    views = 0;
+    view_count = 0;
+    Rd(obj + 0x4e0, views);
+    Rd(obj + 0x4e8, view_count);
+    if (views != 0 && view_count != 0 && view_count <= 64) {
+        compare(3, ctx + 0xb38, views, size_t{view_count} * 8, "views at +0xb38");
+    } else {
+        not_applicable(3);
+    }
+    u64 index_word = 0;
+    Rd(obj + 0x440, index_word);
+    if ((index_word & 0xffffffffull) < 64) {
+        const u64 slot = obj + 0xc0 + (index_word & 0xffffffffull) * 0xb0;
+        compare(4, ctx + 0x290, slot, 8, "constant buffer slot at +0x290");
+        compare(4, ctx + 0x310, slot, 8, "constant buffer slot at +0x310");
+    } else {
+        not_applicable(4);
+    }
+    u32 token = 0;
+    u64 cached = 0, set = 0;
+    u32 set_count = 0;
+    Rd(e.material + 0x1bc, token);
+    Rd(e.material + 0x48, cached);
+    Rd(e.material + 0x178, set);
+    Rd(e.material + 0x180, set_count);
+    if (e.material_flag == 1 && e.batch_special == 0 && (token != 0 || cached != 0) && set != 0 && set_count != 0) {
+        compare(5, s.render_device + 0x3790, set, size_t{std::min<u32>(set_count, 7)} * 16, "resource set at renderDev + 0x3790");
+    } else {
+        not_applicable(5);
+    }
+}
+} // namespace
+
 bool Enabled() {
     return Every() != 0;
 }
+
 
 void PassEnter(u64 render_device, u64 desc) {
     if (!Enabled()) {
@@ -207,6 +318,8 @@ void PassEnter(u64 render_device, u64 desc) {
         return;
     }
     s.active = true;
+    s.cursor = 0;
+    s.render_device = render_device;
     s.view_type = static_cast<u32>(flags);
     {
         u8 flag14 = 0, flag1c = 0;
@@ -261,6 +374,7 @@ void PassEnter(u64 render_device, u64 desc) {
         u16 mesh_word = 0;
         Rd(mesh + 0x78, mesh_word);
         u32 instances = 0;
+        u64 indirect_buffer = 0;
         if (group != 0) {
             u64 inner = 0, object = 0, table = 0;
             u32 count = 0;
@@ -270,6 +384,11 @@ void PassEnter(u64 render_device, u64 desc) {
                 continue;
             }
             instances = count;
+            if (indirect_mode != 0) {
+                u64 args_holder = 0;
+                Rd(inner + 0x38, args_holder);
+                Rd(args_holder + 0x110, indirect_buffer); // the argument buffer object of the instance group
+            }
         }
         if (prim_count == 0) {
             continue;
@@ -306,6 +425,8 @@ void PassEnter(u64 render_device, u64 desc) {
             std::memcpy(&triangles, record + 0x14, 4);
             Item item{Plain, u64(triangles) * 3, first, 1, b, p};
             item.material = material;
+            Rd(batch + 0x48, item.batch_special);
+            item.material_flag = material_flag;
             item.mesh_word = mesh_word;
             item.batch_flags = batch_flags;
             {
@@ -327,6 +448,10 @@ void PassEnter(u64 render_device, u64 desc) {
             if (group != 0) {
                 item.kind = indirect_mode != 0 ? Indirect : Instanced;
                 item.instances = instances;
+                if (item.kind == Indirect) {
+                    item.count = indirect_buffer; // DrawIndexedIndirect(ctx, buffer, (primitive * 9 + view type) * 0x18)
+                    item.first = (u64(p) * 9 + s.view_type) * 0x18;
+                }
             }
             (item.kind == Plain ? v.expected_plain : item.kind == Instanced ? v.expected_instanced : v.expected_indirect)++;
             s.expected.push_back(item);
@@ -334,13 +459,14 @@ void PassEnter(u64 render_device, u64 desc) {
     }
 }
 
-void NoteDraw(u64 caller, u32 kind, u64 count, u64 first, u64 instances, u64 vertex_shader, u64 pixel_shader) {
+void NoteDraw(u64 caller, u32 kind, u64 count, u64 first, u64 instances, u64 vertex_shader, u64 pixel_shader, u64 ctx) {
     if (!Enabled() || !InPass(caller)) {
         return;
     }
     auto& s = S();
     std::scoped_lock lk{s.mutex};
     if (s.active) {
+        CheckBinding(s, kind, count, first, instances, ctx);
         Item item{kind, count, first, instances, 0, 0};
         item.vertex_shader = vertex_shader;
         item.pixel_shader = pixel_shader;
@@ -391,6 +517,17 @@ nlohmann::json Report() {
                                        {"unreadable_snapshot_fields", v.unreadable}};
     }
     out["first_mismatches"] = s.samples;
+    {
+        static constexpr const char* names[State::Checks] = {"material block 1: context 0x980..0x9c8 = material render object 0x450..0x498", "material block 2: context 0x9d0..0xa18 = object 0x498..0x4e0 (when object + 0x444 is set)",
+                                                             "shader resource views: context + 0x790 = the array at object + 0x4f0", "shader resource views 2: context + 0xb38 = the array at object + 0x4e0",
+                                                             "constant buffer slots: context + 0x290 / 0x310 = object 0xc0 + index * 0xb0", "resource set: render device + 0xe80 = material + 0x178 (no special batch entry, bound by FUN_01c92f30)"};
+        auto& binding = out["binding_audit"] = nlohmann::json::object();
+        for (u32 c = 0; c < State::Checks; ++c) {
+            binding[names[c]] = {{"checked", s.bind_checked[c]}, {"equal", s.bind_equal[c]}, {"differ", s.bind_checked[c] - s.bind_equal[c]}, {"not_applicable", s.bind_not_applicable[c]}, {"unreadable", s.bind_unreadable[c]}};
+        }
+        binding["draws_without_a_matching_expected_primitive"] = s.bind_unmatched_draws;
+        binding["first_differences"] = s.bind_samples;
+    }
     {
         auto& variant = out["variant_audit"] = nlohmann::json::object();
         variant["distinct_pipelines_seen_(vertex_shader,_pixel_shader)"] = s.pipelines.size();

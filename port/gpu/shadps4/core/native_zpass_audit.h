@@ -18,7 +18,8 @@ namespace Core::NativeZPass {
 void PassEnter(u64 render_device, u64 desc);
 /// A draw call of the engine: `caller` is the ghidra address of the call site, kind 0 `DrawIndexedCommon` (count, first index, instances), kind 1 `DrawIndexedIndirect`.
 /// `vertex_shader` / `pixel_shader`: the shader objects the device context holds at the call (the variant the loop chose, audit b).
-void NoteDraw(u64 caller, u32 kind, u64 count, u64 first, u64 instances, u64 vertex_shader, u64 pixel_shader);
+/// `ctx`: the device context at the call (audit c compares the state the per-primitive binding wrote into it with what the material's render object holds).
+void NoteDraw(u64 caller, u32 kind, u64 count, u64 first, u64 instances, u64 vertex_shader, u64 pixel_shader, u64 ctx);
 /// A new frame begins on the render thread: the open pass is closed.
 void FrameBoundary();
 
