@@ -22,6 +22,10 @@ void PassEnter(u64 render_device, u64 desc);
 void NoteDraw(u64 caller, u32 kind, u64 count, u64 first, u64 instances, u64 vertex_shader, u64 pixel_shader, u64 ctx);
 /// A new frame begins on the render thread: the open pass is closed.
 void FrameBoundary();
+/// N6.3h, the end state audit (`TLG_ZPASS_ENDSTATE=1`, needs `TLG_ZPASS_AUDIT`): the hook runs the loop itself (through the original entry) between PassEnter and PassExit, so the live
+/// context can be compared with the context the generator would have produced right after the loop returns.
+[[nodiscard]] bool WrapEnabled();
+void PassExit(u64 render_device);
 /// N6.3e, the shadow generator: the live record of the draw was just built (`seq`). The audit builds the record the same draw would get from a copy of the pass's device context
 /// patched with what the snapshot says (material blocks, batch level, texture pointers, shader pair from the learned key table) and compares the two.
 void RealRecord(u64 ctx, u64 seq, u32 kind, u64 a1, u64 a2, u64 a3);

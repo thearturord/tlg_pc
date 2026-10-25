@@ -67,6 +67,7 @@ struct Item {
     u64 material_sig{};  // expected side: a hash of the material fields the variant search reads
     u32 material_flag{}; // expected side: material + 0xd4 & 1 (the per-primitive resource set is bound only for these)
     u64 batch_object{};  // expected side: the batch object
+    u32 triangles{};       // expected side: the triangle count of the primitive (the loop adds it to renderDev + 0x14 for every draw)
     u64 prim_record{};     // expected side: the address of the primitive record (the loop stores the chosen variant behind it: *(*(record + 0x28) + 0x48))
     u64 instance_object{}; // expected side: the instance group object of an instanced / indirect batch (FUN_01ee4e50 binds it)
     u64 batch_special{}; // expected side: batch + 0x48 (a special entry that fills the resource table itself)
@@ -137,6 +138,34 @@ struct State {
     };
     std::map<std::string, FieldValues> family_fields;
     u64 last_caller{0};
+    // end state audit (N6.3h)
+    s32 rd_draws_before{0}, rd_triangles_before{0};
+    u32 batches_prepared{0}, groups_processed{0}, groups_skipped{0}, last_group_batch_ordinal{0}, last_group_draws{0}, indirect_pass{0};
+    std::map<std::string, std::pair<u64, u64>> group_patterns; // pattern -> {passes, passes whose live 0x70 stayed set}
+    bool pass_has_special{false}, pass_has_resource_set{false};
+    struct PassDiff {
+        std::vector<u32> offsets;
+        bool special;
+    };
+    std::vector<PassDiff> end_pass_diffs; // the differing words of every compared pass (classified when the report is made, with the final draw call noise rates)
+    std::map<std::string, std::pair<u64, u64>> slot2e0_patterns; // pass kind -> {passes, passes where ctx +0x2e0 differs at the end}
+    bool prev_instanced{false};
+    u64 prev_batch{0};
+    bool any_group{false}; // an instanced batch was prepared in this pass: its end clears the instance state
+    // do the draw calls themselves write these words? live value at the previous draw entry against this one, for two plain draws of one batch with no loop write in between
+    static constexpr std::array<u32, 4> WatchOffsets{0x70, 0x170, 0x2e0, 0x360};
+    std::array<u64, 4> watch_previous{};
+    u64 watch_previous_batch{0};
+    bool watch_previous_valid{false};
+    std::array<u64, 4> watch_pairs{}, watch_changes{};
+    u64 last_mesh_batch{0}, last_mesh{0}, last_group{0}; // the last batch the loop prepared (it sets the batch level state before it knows whether the batch draws anything)
+    u64 end_passes{0}, end_passes_clean{0}, end_unreadable{0};
+    u64 end_counter_ok{0}, end_counter_bad{0};
+    struct EndDiff {
+        u64 passes{0}, live{0}, shadow{0};
+    };
+    std::map<u32, EndDiff> end_diffs;
+    std::vector<std::string> end_samples;
     u64 entry_vs{0}, entry_ps{0}; // the shader objects the context held when the draw call was entered (before the record builder's resource tracking could draw internal quads)
     u64 pair_changed_inside_tag{0};
     u64 draws_on_another_context{0}, wrong_on_another_context{0}, wrong_on_the_pass_context{0};
@@ -284,6 +313,21 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
     s.current = e;
     s.current_valid = true;
     s.overlay.clear();
+    {
+        std::array<u64, 4> now{};
+        for (u32 w = 0; w < 4; ++w) {
+            Rd(ctx + State::WatchOffsets[w], now[w]);
+        }
+        if (s.watch_previous_valid && e.batch_object == s.watch_previous_batch && e.instance_object == 0 && e.batch_special == 0 && e.material_flag == 0) {
+            for (u32 w = 0; w < 4; ++w) {
+                ++s.watch_pairs[w];
+                s.watch_changes[w] += now[w] != s.watch_previous[w] ? 1 : 0;
+            }
+        }
+        s.watch_previous = now;
+        s.watch_previous_batch = e.batch_object;
+        s.watch_previous_valid = true;
+    }
     const auto not_applicable = [&](u32 check) { ++s.bind_not_applicable[check]; };
     const auto compare = [&](u32 check, u64 ctx_address, u64 source, size_t bytes, const char* what) {
         std::array<u8, 512> a{}, b{};
@@ -321,6 +365,24 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
         dirty[0] = 1;
         s.overlay.push_back({0x46c8, std::move(bytes)});
         s.overlay.push_back({0x46d8, std::move(dirty)});
+    }
+    // the loop's per batch flag bVar54: the mesh render data's first entry of +0x60 is neither the default object nor null and has a render object (FUN_01c92f30 is called only when it is false)
+    bool bvar54 = false;
+    {
+        u64 mesh_b = 0, rd_b = 0, inner_b = 0, array_b = 0, first_b = 0, target_b = 0, g_ctx_b = 0, g1_b = 0, g2_b = 0;
+        u32 count_b = 0;
+        Rd(e.batch_object + 0x20, mesh_b);
+        Rd(mesh_b + 0x38, rd_b);
+        Rd(rd_b + 0x20, inner_b);
+        Rd(inner_b + 0x68, count_b);
+        Rd(inner_b + 0x60, array_b);
+        Rd(NativeDraw::ImageBase() + (0x069a1b40ull - 0x1000000), g_ctx_b);
+        Rd(g_ctx_b + 0x38, g1_b);
+        Rd(g1_b + 0x20, g2_b);
+        if (count_b != 0 && Rd(array_b, first_b) && first_b != g2_b && first_b != 0) {
+            Rd(first_b + 0x38, target_b);
+            bvar54 = target_b != 0;
+        }
     }
     u64 obj = 0;
     if (!Rd(e.material + 0x38, obj) || obj == 0) {
@@ -403,7 +465,7 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
     Rd(e.material + 0x48, cached);
     Rd(e.material + 0x178, set);
     Rd(e.material + 0x180, set_count);
-    if (e.material_flag == 1 && e.batch_special == 0 && (token != 0 || cached != 0) && set != 0 && set_count != 0) {
+    if (e.material_flag == 1 && !bvar54 && e.batch_special == 0 && (token != 0 || cached != 0) && set != 0 && set_count != 0) {
         compare(5, s.render_device + 0x3790, set, size_t{std::min<u32>(set_count, 7)} * 16, "resource set at renderDev + 0x3790");
         {
             // FUN_01c92f30 ends with ctx[0x5c] = ctx[0x6c] = the constant buffer at renderDev + 0x2910 + 0xef0
@@ -457,6 +519,14 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
                 std::memcpy(bytes.data(), &value, 8);
                 s.overlay.push_back({offset, std::move(bytes)});
             };
+            if (s.prev_instanced && e.batch_object != s.prev_batch) {
+                // the end of an instanced batch clears these (ctx + 0x70.., 0x170, 0x1f0, 0x340, 0x800..0x830)
+                s.overlay.push_back({0x70, std::vector<u8>(16, 0)});
+                put64(0x170, 0);
+                put64(0x1f0, 0);
+                put64(0x340, 0);
+                s.overlay.push_back({0x800, std::vector<u8>(0x30, 0)});
+            }
             if (e.instance_object != 0) {
                 // FUN_01ee4e50(inner, instance group, view type)
                 const u64 group_object = e.instance_object;
@@ -515,14 +585,9 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
                 std::vector<u8> bytes(table.size() * 8);
                 std::memcpy(bytes.data(), table.data(), bytes.size());
                 s.overlay.push_back({0x800, std::move(bytes)});
-            } else {
-                // after an instanced batch the loop clears these (ctx + 0x70.., 0x170, 0x1f0, 0x340, 0x800..0x830)
-                s.overlay.push_back({0x70, std::vector<u8>(16, 0)});
-                put64(0x170, 0);
-                put64(0x1f0, 0);
-                put64(0x340, 0);
-                s.overlay.push_back({0x800, std::vector<u8>(0x30, 0)});
             }
+            s.prev_instanced = e.instance_object != 0;
+            s.prev_batch = e.batch_object;
         }
         {
             // per batch: ctx + 0x580 = *(*(*(inner + 0x48) + 0x38) + 0x28)
@@ -615,7 +680,7 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
         u64 cached_d = 0;
         Rd(e.material + 0x1bc, token_d);
         Rd(e.material + 0x48, cached_d);
-        if (e.material_flag == 1 && e.batch_special == 0 && (token_d != 0 || cached_d != 0) && (texture_flags & 3) != 0 && texture_array != 0) {
+        if (e.material_flag == 1 && !bvar54 && e.batch_special == 0 && (token_d != 0 || cached_d != 0) && (texture_flags & 3) != 0 && texture_array != 0) {
             const u64 global = NativeDraw::ImageBase() + (0x069a1b40ull - 0x1000000);
             u64 context_global = 0, h1 = 0, h2 = 0, default_texture_object = 0, default_render = 0, default_pointer = 0;
             Rd(global, context_global);
@@ -715,6 +780,12 @@ void PassEnter(u64 render_device, u64 desc) {
     s.cursor = 0;
     s.render_device = render_device;
     s.current_valid = false;
+    s.last_mesh_batch = s.last_mesh = s.last_group = 0;
+    s.any_group = false;
+    s.pass_has_special = s.pass_has_resource_set = false;
+    s.prev_instanced = false;
+    s.prev_batch = 0;
+    s.batches_prepared = s.groups_processed = s.groups_skipped = s.last_group_batch_ordinal = s.last_group_draws = 0;
     s.baseline.clear();
     s.shadow.clear(); // a new pass: the shadow context starts from the live one and then follows the loop's writes
     if (Rd(render_device + 0x2d8, s.pass_ctx) && s.pass_ctx != 0) {
@@ -723,6 +794,17 @@ void PassEnter(u64 render_device, u64 desc) {
             s.baseline.clear();
         }
     }
+    if (!s.baseline.empty()) {
+        // the loop's prologue (DrawZPass, first lines): ctx[0x4480] = 4 with the dirty bit ctx[0x447c] |= 1, and ctx[0x68] = 0
+        s.shadow = s.baseline;
+        const u32 four = 4;
+        std::memcpy(s.shadow.data() + 0x4480, &four, 4);
+        s.shadow[0x447c] |= 1;
+        const u64 zero = 0;
+        std::memcpy(s.shadow.data() + 0x68, &zero, 8);
+    }
+    Rd(render_device + 0x10, s.rd_draws_before);
+    Rd(render_device + 0x14, s.rd_triangles_before);
     s.view_type = static_cast<u32>(flags);
     {
         u8 flag14 = 0, flag1c = 0;
@@ -773,6 +855,10 @@ void PassEnter(u64 render_device, u64 desc) {
             ++v.batches_skipped_no_mesh;
             continue;
         }
+        s.last_mesh_batch = batch;
+        s.last_mesh = mesh;
+        s.last_group = group;
+        ++s.batches_prepared;
         if (group == 0 && flag_cvar != 0) {
             ++v.batches_skipped_no_instances_with_flag; // the loop draws nothing for a batch without instance group when the pass flag byte 5 is set
             continue;
@@ -786,6 +872,7 @@ void PassEnter(u64 render_device, u64 desc) {
             if (render_data_q == 0) {
                 reasons.insert("mesh render data not created yet (the loop creates it at first use)");
             }
+            s.pass_has_special |= special_q != 0;
             if (special_q != 0) {
                 reasons.insert("batch with a special entry (a virtual call picks the material index)");
             }
@@ -802,10 +889,15 @@ void PassEnter(u64 render_device, u64 desc) {
             const bool ok = Rd(group + 8, inner) && (flag_cvar == 0 || inner != 0) && Rd(inner + 0x38, object) && object != 0 && Rd(object + 0x28, table) && Rd(table + 0x48, count);
             if (!ok || count == 0) {
                 ++v.batches_skipped_instance;
+                ++s.groups_skipped;
                 continue;
             }
+            ++s.groups_processed;
+            s.last_group_batch_ordinal = s.batches_prepared;
+            s.last_group_draws = 0;
             instances = count;
             instance_object = object;
+            s.any_group = true; // the batch is processed to its end: the clear after it applies
             if (indirect_mode != 0) {
                 u64 args_holder = 0;
                 Rd(inner + 0x38, args_holder);
@@ -847,6 +939,7 @@ void PassEnter(u64 render_device, u64 desc) {
             std::memcpy(&triangles, record + 0x14, 4);
             Item item{Plain, u64(triangles) * 3, first, 1, b, p};
             item.material = material;
+            item.triangles = static_cast<u32>(triangles);
             Rd(batch + 0x48, item.batch_special);
             item.batch_object = batch;
             item.instance_object = instance_object;
@@ -884,6 +977,7 @@ void PassEnter(u64 render_device, u64 desc) {
                 if (s.variants.find(key_q) == s.variants.end()) {
                     reasons.insert("variant key not seen yet (the loop would create the variant)");
                 }
+                s.pass_has_resource_set |= material_flag == 1;
                 u64 kind18 = 0, obj_q = 0;
                 Rd(material + 0x18, kind18);
                 Rd(material + 0x38, obj_q);
@@ -894,6 +988,7 @@ void PassEnter(u64 render_device, u64 desc) {
                     reasons.insert("material without a render object");
                 }
             }
+            s.last_group_draws += group != 0 ? 1 : 0;
             s.expected.push_back(item);
         }
     }
@@ -1190,6 +1285,123 @@ void RealRecord(u64 ctx, u64 seq, u32 kind, u64 a1, u64 a2, u64 a3) {
     }
 }
 
+bool WrapEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_ZPASS_ENDSTATE");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on && Enabled();
+}
+
+void PassExit(u64 render_device) {
+    auto& s = S();
+    std::scoped_lock lk{s.mutex};
+    if (!s.active || s.shadow.empty() || s.pass_ctx == 0) {
+        return;
+    }
+    // the loop's own side effect on the render device: the draw and triangle counters
+    {
+        s32 draws = 0, triangles = 0;
+        Rd(render_device + 0x10, draws);
+        Rd(render_device + 0x14, triangles);
+        u64 expected_triangles = 0, expected_draws = 0;
+        for (const auto& e : s.expected) {
+            if (e.kind == Instanced) {
+                continue;
+            }
+            ++expected_draws;
+            expected_triangles += e.triangles;
+        }
+        if (static_cast<u64>(draws - s.rd_draws_before) == expected_draws && static_cast<u64>(triangles - s.rd_triangles_before) == expected_triangles) {
+            ++s.end_counter_ok;
+        } else {
+            ++s.end_counter_bad;
+            if (s.end_samples.size() < 4) {
+                s.end_samples.push_back(fmt::format("counters: view type {}: draws +{} (expected {}), triangles +{} (expected {})", s.view_type, draws - s.rd_draws_before, expected_draws, triangles - s.rd_triangles_before, expected_triangles));
+            }
+        }
+    }
+    if (s.last_mesh_batch != 0) {
+        // the batch level state of the last batch the loop prepared, and the clear after an instanced batch
+        u64 render_data = 0, inner = 0, x = 0, y = 0, z = 0;
+        Rd(s.last_mesh + 0x38, render_data);
+        Rd(render_data + 0x20, inner);
+        Rd(inner + 0x48, x);
+        Rd(x + 0x38, y);
+        Rd(y + 0x28, z);
+        std::memcpy(s.shadow.data() + 0x580, &z, 8);
+        if (s.any_group) {
+            std::memset(s.shadow.data() + 0x70, 0, 16);
+            std::memset(s.shadow.data() + 0x170, 0, 8);
+            std::memset(s.shadow.data() + 0x1f0, 0, 8);
+            std::memset(s.shadow.data() + 0x340, 0, 8);
+            std::memset(s.shadow.data() + 0x800, 0, 0x30);
+        }
+    }
+    {
+        // the loop's epilogue (the last lines of DrawZPass): ctx[0x980] = 0; ctx[0x46c8] = renderDev[0x3bf0] with the dirty byte ctx[0x46d8] = 1 when it changed
+        const u64 zero = 0;
+        std::memcpy(s.shadow.data() + 0x980, &zero, 8);
+        u64 default_state = 0, held_state = 0;
+        Rd(render_device + 0x3bf0, default_state);
+        std::memcpy(&held_state, s.shadow.data() + 0x46c8, 8);
+        if (held_state != default_state) {
+            std::memcpy(s.shadow.data() + 0x46c8, &default_state, 8);
+            s.shadow[0x46d8] = 1;
+        }
+    }
+    {
+        u64 live70 = 0;
+        Rd(s.pass_ctx + 0x70, live70);
+        u64 shadow70 = 0;
+        std::memcpy(&shadow70, s.shadow.data() + 0x70, 8);
+        const std::string pattern = fmt::format("instanced batches processed {}, skipped {}, the last processed one is {} the last prepared batch, draws of the last processed one {}", s.groups_processed > 0 ? "some" : "none", s.groups_skipped > 0 ? "some" : "none",
+                                                s.last_group_batch_ordinal == s.batches_prepared ? "also" : "not", s.last_group_draws > 0 ? "some" : "none");
+        auto& cell = s.group_patterns[pattern];
+        ++cell.first;
+        cell.second += (live70 != 0 && shadow70 == 0) ? 1 : 0;
+    }
+    {
+        u64 live2e0 = 0, shadow2e0 = 0;
+        Rd(s.pass_ctx + 0x2e0, live2e0);
+        std::memcpy(&shadow2e0, s.shadow.data() + 0x2e0, 8);
+        auto& cell = s.slot2e0_patterns[fmt::format("pass with a special batch entry: {}, with a material that has a resource set: {}", s.pass_has_special ? "yes" : "no", s.pass_has_resource_set ? "yes" : "no")];
+        ++cell.first;
+        cell.second += live2e0 != shadow2e0 ? 1 : 0;
+    }
+    s.live_copy.resize(CtxBytes);
+    if (!RdBytes(s.pass_ctx, s.live_copy.data(), CtxBytes)) {
+        ++s.end_unreadable;
+        return;
+    }
+    ++s.end_passes;
+    bool clean = true;
+    State::PassDiff pass_diff{{}, s.pass_has_special};
+    for (size_t off = 0; off + 8 <= CtxBytes; off += 8) {
+        u64 x, y;
+        std::memcpy(&x, s.live_copy.data() + off, 8);
+        std::memcpy(&y, s.shadow.data() + off, 8);
+        if (x == y) {
+            continue;
+        }
+        pass_diff.offsets.push_back(static_cast<u32>(off));
+        auto& w = s.end_diffs[static_cast<u32>(off)];
+        if (w.passes++ == 0) {
+            w.live = x;
+            w.shadow = y;
+        }
+        // words the draw calls themselves keep changing (differing at more than a fifth of the draw entries) are not the loop's: they do not make a pass unclean
+        const auto noise = s.context_word_diffs.find(static_cast<u32>(off));
+        if (noise == s.context_word_diffs.end() || noise->second.draws * 5 < s.shadow_built) {
+            clean = false;
+        }
+    }
+    s.end_passes_clean += clean ? 1 : 0;
+    if (s.end_pass_diffs.size() < 100000) {
+        s.end_pass_diffs.push_back(std::move(pass_diff));
+    }
+}
+
 void FrameBoundary() {
     if (!Enabled()) {
         return;
@@ -1247,6 +1459,77 @@ nlohmann::json Report() {
         shadow["no_baseline_copy_of_the_context"] = s.shadow_no_baseline;
         shadow["shader_pair_from_the_learned_key_table"] = {{"keys_learned", s.variant_table.size()}, {"draws_predicted_right", s.key_hit}, {"draws_predicted_wrong", s.key_wrong}, {"draws_on_a_key_not_seen_before", s.key_cold}};
         shadow["difference_kinds"] = s.shadow_difference_kinds;
+        {
+            auto& end = out["end_state_audit"] = nlohmann::json::object();
+            end["passes_compared"] = s.end_passes;
+            {
+                // classified now, with the final rates: a word is draw call noise when it differs at more than a fifth of the draw entries
+                u64 identical = 0, only_noise = 0, unclean = 0, unclean_special = 0, unclean_plain = 0, plain_passes = 0, special_passes = 0;
+                for (const auto& pd : s.end_pass_diffs) {
+                    (pd.special ? special_passes : plain_passes)++;
+                    if (pd.offsets.empty()) {
+                        ++identical;
+                        continue;
+                    }
+                    bool noise_only = true;
+                    for (const u32 off : pd.offsets) {
+                        const auto n = s.context_word_diffs.find(off);
+                        if (n == s.context_word_diffs.end() || n->second.draws * 5 < s.shadow_built) {
+                            noise_only = false;
+                            break;
+                        }
+                    }
+                    if (noise_only) {
+                        ++only_noise;
+                    } else {
+                        ++unclean;
+                        (pd.special ? unclean_special : unclean_plain)++;
+                    }
+                }
+                end["final_classification"] = {{"passes", s.end_pass_diffs.size()},
+                                               {"context_identical_to_the_generators", identical},
+                                               {"differs_only_in_words_the_draw_calls_change_themselves", only_noise},
+                                               {"differs_in_other_words", unclean},
+                                               {"of_those_passes_with_a_special_batch_entry", unclean_special},
+                                               {"of_those_passes_without_one", unclean_plain},
+                                               {"passes_without_a_special_batch_entry", plain_passes},
+                                               {"passes_with_a_special_batch_entry", special_passes}};
+            }
+            end["passes_where_every_differing_word_is_one_the_draw_calls_change_anyway_at_the_time"] = s.end_passes_clean;
+            end["passes_with_the_render_device_counters_as_predicted"] = s.end_counter_ok;
+            end["passes_with_other_counters"] = s.end_counter_bad;
+            end["unreadable"] = s.end_unreadable;
+            nlohmann::json only_end = nlohmann::json::array(), also_noise = nlohmann::json::array();
+            std::vector<std::pair<u32, State::EndDiff>> words(s.end_diffs.begin(), s.end_diffs.end());
+            std::sort(words.begin(), words.end(), [](const auto& a, const auto& b) { return a.second.passes > b.second.passes; });
+            for (const auto& [off, w] : words) {
+                nlohmann::json entry = {{"context_offset", fmt::format("{:#x}", off)}, {"passes", w.passes}, {"live_after_the_loop", fmt::format("{:#x}", w.live)}, {"generator_state", fmt::format("{:#x}", w.shadow)}};
+                const auto noise = s.context_word_diffs.find(off);
+                if (noise == s.context_word_diffs.end() || noise->second.draws * 5 < s.shadow_built) {
+                    if (only_end.size() < 40) only_end.push_back(entry);
+                } else if (also_noise.size() < 20) {
+                    also_noise.push_back(entry);
+                }
+            }
+            end["words_that_differ_at_the_end_but_not_at_the_draw_calls"] = only_end;
+            end["words_that_also_differ_at_the_draw_calls"] = also_noise;
+            end["samples"] = s.end_samples;
+            nlohmann::json patterns = nlohmann::json::array();
+            for (const auto& [name, counts] : s.group_patterns) {
+                patterns.push_back(fmt::format("{}: {} passes, {} of them end with context +0x70 still set", name, counts.first, counts.second));
+            }
+            end["instanced_batch_patterns"] = patterns;
+            nlohmann::json slots = nlohmann::json::array();
+            for (const auto& [name, counts] : s.slot2e0_patterns) {
+                slots.push_back(fmt::format("{}: {} passes, {} end with context +0x2e0 different", name, counts.first, counts.second));
+            }
+            end["constant_buffer_slot_0x2e0_by_pass_kind"] = slots;
+            nlohmann::json watch = nlohmann::json::array();
+            for (u32 w = 0; w < 4; ++w) {
+                watch.push_back(fmt::format("context +{:#x}: changed between {} of {} consecutive plain draws of a batch (the loop writes nothing there between them)", State::WatchOffsets[w], s.watch_changes[w], s.watch_pairs[w]));
+            }
+            end["words_the_draw_calls_change_themselves"] = watch;
+        }
         {
             u64 multi = 0, changing = 0, changes = 0;
             for (const auto& [key, v] : s.variants) {

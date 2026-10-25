@@ -6704,8 +6704,18 @@ u64 PS4_SYSV_ABI PrimitiveBind(u64 render_device, u64 a1, u64 a2, u64 a3, u64 a4
 
 /// RenderDev_DrawZPass(render device, pass description): the audit builds the draws the loop should issue from the snapshot it reads (native_zpass_audit.h).
 u64 PS4_SYSV_ABI ZPassEnter(u64 render_device, u64 desc, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    if (NativeZPass::Enabled()) {
-        NativeZPass::PassEnter(render_device, desc);
+    if (!NativeZPass::Enabled()) {
+        return 0;
+    }
+    NativeZPass::PassEnter(render_device, desc);
+    if (NativeZPass::WrapEnabled()) {
+        // run the loop here, so the state right after it returns can be read, then skip the hooked call
+        const u64 entry = Core::GuestHooks::OriginalEntry("DrawZPass");
+        if (entry != 0) {
+            reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64)>(entry)(render_device, desc);
+            NativeZPass::PassExit(render_device);
+            return 1;
+        }
     }
     return 0;
 }
