@@ -91,6 +91,9 @@ public:
     [[nodiscard]] std::unique_ptr<DrawPlan> PlanExecOperation(const Core::NativeDraw::ExecDraw& draw);
     /// The differences between a plan made from the record and the same draw planned from the registers ("" when they agree; the user data under the masks).
     [[nodiscard]] static std::string DiffExecPlans(const DrawPlan& typed, const DrawPlan& reference, u16 vertex_mask, u16 pixel_mask, u32 draw_kind);
+    /// A hash of what the planning read from guest memory and put into the plan: pipeline, per stage the program, user data and flat user data (N6b plan verification).
+    [[nodiscard]] static u64 PlanDigest(const DrawPlan& plan);
+    [[nodiscard]] static u64 PlanDigest(const DispatchPlan& plan);
     [[nodiscard]] std::unique_ptr<DispatchPlan> PlanDispatch(const AmdGpu::ComputeProgram& cs, const AmdGpu::BorderColorBuffer& ta_bc_base);
 
     /// Raster thread: hands a finished plan back for reuse. Allocating a plan for every draw on

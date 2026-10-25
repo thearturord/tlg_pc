@@ -174,6 +174,7 @@ struct Liverpool::RasterOp {
     bool writes_memory{};
     u8 audit_class{0xff}; ///< Core::ResourceAudit: the queue whose command stream pushed this operation
     u32 write_line{}; ///< Source line of the RasterRun call that queued a writes_memory closure.
+    u64 position{};   ///< The queue position (Liverpool::RasterSplit::pushed after the push)
     RasterCall call{};
     Common::UniqueFunction<void> closure{};
     ComputeProgram cs{};
@@ -193,6 +194,7 @@ struct Liverpool::RasterSplit {
     std::atomic<u64> pushed{};
     std::atomic<u64> done{};
     std::atomic<u32> pending_writes{}; ///< Queued closures with writes_memory.
+    std::atomic<u64> write_done{};     ///< The queue position of the newest writes_memory closure the raster thread has finished (`done` moves in batches)
     /// What the front thread is doing (for the raster thread's idle statistics): 0 working,
     /// 1 waiting for the game to submit, 2 waiting for queued memory writes, 3 queue full.
     std::atomic<u8> front_state{0};
@@ -248,6 +250,7 @@ void Liverpool::BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
         split_active = false;
         StopRasterSplit();
         direct_state = front_state;
+        Core::DrainAudit::SetBackend(nullptr, nullptr, {});
         split.reset();
     }
     rasterizer = rasterizer_;
@@ -260,6 +263,15 @@ void Liverpool::StartRasterSplit() {
     split = std::make_unique<RasterSplit>();
     auto& sp = *split;
     sp.verify = EmulatorSettings.GetCpSplitMode() >= 2;
+    Core::DrainAudit::SetBackend(&sp.done, &sp.write_done, [&sp](u64 position) {
+        sp.front_state.store(2, std::memory_order_relaxed);
+        {
+            Core::FrameTimeline::StageScope drain{Core::FrameTimeline::StageFrontDrain};
+            std::unique_lock lk{sp.mutex};
+            sp.done_cv.wait(lk, [&] { return sp.done.load(std::memory_order_acquire) >= position || sp.write_done.load(std::memory_order_acquire) >= position; });
+        }
+        sp.front_state.store(0, std::memory_order_relaxed);
+    });
     split_active = true;
     sp.thread = std::jthread{std::bind_front(&Liverpool::RasterMain, this)};
     sp.housekeeping = std::jthread{[](std::stop_token stoken) {
@@ -794,7 +806,7 @@ void Liverpool::RasterPush(RasterOp&& op, bool wait) {
     const bool audit_write = op.writes_memory;
     const u32 audit_line = op.write_line;
     if (op.has_call) {
-        Core::DrainAudit::Planned(); // N6a: the planning of this operation is done
+        Core::DrainAudit::LookupDone(); // N6: the planning of this operation is done
     } else if (!op.writes_memory) {
         Core::DrainAudit::ClearNextWrite();
     }
@@ -818,6 +830,7 @@ void Liverpool::RasterPush(RasterOp&& op, bool wait) {
             sp.done_cv.wait(lk, [&] { return sp.queue.size() < RasterSplit::MaxQueued; });
         }
         sp.front_state.store(0, std::memory_order_relaxed);
+        op.position = sp.pushed.load(std::memory_order_relaxed) + 1;
         sp.queue.push_back(std::move(op));
         target = sp.pushed.fetch_add(1, std::memory_order_acq_rel) + 1;
         if (audit_write) {
@@ -864,6 +877,34 @@ void Liverpool::DrainRasterWrites(u32 caller) {
     sp.SiteFor(sp.last_write_line)
         ->wait_ns.fetch_add(VideoCore::ReadbackStats::NowNs() - wait_start,
                             std::memory_order_relaxed);
+}
+
+u32 Liverpool::LookupDrain(u32 caller) {
+    if (!Core::DrainAudit::LazyEnabled()) {
+        DrainRasterWrites(caller);
+        return 0;
+    }
+    return static_cast<u32>(Core::DrainAudit::LookupBegin(caller));
+}
+
+std::unique_ptr<Vulkan::DrawPlan> Liverpool::ReplanAfterDrain(std::unique_ptr<Vulkan::DrawPlan> plan, u32 site, const std::function<std::unique_ptr<Vulkan::DrawPlan>()>& make) {
+    const u64 before = plan ? Vulkan::Rasterizer::PlanDigest(*plan) : 0;
+    DrainRasterWrites(site);
+    auto again = make();
+    const u64 after = again ? Vulkan::Rasterizer::PlanDigest(*again) : 0;
+    Core::DrainAudit::NotePlanVerify(site, before == after);
+    rasterizer->RecyclePlan(std::move(plan));
+    return again;
+}
+
+std::unique_ptr<Vulkan::DispatchPlan> Liverpool::ReplanAfterDrain(std::unique_ptr<Vulkan::DispatchPlan> plan, u32 site, const std::function<std::unique_ptr<Vulkan::DispatchPlan>()>& make) {
+    const u64 before = plan ? Vulkan::Rasterizer::PlanDigest(*plan) : 0;
+    DrainRasterWrites(site);
+    auto again = make();
+    const u64 after = again ? Vulkan::Rasterizer::PlanDigest(*again) : 0;
+    Core::DrainAudit::NotePlanVerify(site, before == after);
+    rasterizer->RecyclePlan(std::move(plan));
+    return again;
 }
 
 void Liverpool::RasterDispatch(const RasterCall& call_in) {
@@ -941,8 +982,13 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
     }
     auto& sp = *split;
     // The lookup below reads descriptor tables and shader code from guest memory: closures that
-    // write guest memory (constant engine dumps, WriteData, DMA) must have run first.
-    DrainRasterWrites(0);
+    // write guest memory (constant engine dumps, WriteData, DMA) must have run first. (A draw planned from its record has had this at its own planning.)
+    u32 verify = 0;
+    if (!Core::DrainAudit::LazyEnabled()) {
+        DrainRasterWrites(0);
+    } else if (native_exec_plan == nullptr) {
+        verify = LookupDrain(0);
+    }
     ++sp.stat_calls;
     if (call.kind == RasterCall::Kind::Draw || call.kind == RasterCall::Kind::DrawIndirect) {
         ++sp.stat_draws;
@@ -955,6 +1001,9 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         op.cs = call.cs_override ? *call.cs_override : GetCsRegs();
         // The pipeline lookup runs here, on the command processor thread (stage 2 of the split).
         op.dispatch_plan = rasterizer->PlanDispatch(op.cs, front_state.ta_bc_base);
+        if (verify == 2) {
+            op.dispatch_plan = ReplanAfterDrain(std::move(op.dispatch_plan), 0, [&] { return rasterizer->PlanDispatch(op.cs, front_state.ta_bc_base); });
+        }
     } else {
         const Vulkan::DrawIndirectParams params =
             call.kind == RasterCall::Kind::DrawIndirect
@@ -967,8 +1016,13 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
             op.draw_plan.reset(std::exchange(native_exec_plan, nullptr));
         } else {
             // LEGACY(register-image): the plan made from the shared register image (only when the legacy switch is on)
-            op.draw_plan = rasterizer->PlanDraw(front_state, params, native_fixed, native_fixed_stale,
-                                                native_fixed_verify, native_exec_key, native_inputs_key);
+            const auto make_plan = [&] {
+                return rasterizer->PlanDraw(front_state, params, native_fixed, native_fixed_stale, native_fixed_verify, native_exec_key, native_inputs_key);
+            };
+            op.draw_plan = make_plan();
+            if (verify == 2) {
+                op.draw_plan = ReplanAfterDrain(std::move(op.draw_plan), 0, make_plan);
+            }
         }
         if (native_audit_plan) {
             std::unique_ptr<Vulkan::DrawPlan> typed{std::exchange(native_audit_plan, nullptr)};
@@ -1487,15 +1541,24 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             } else {
                 // an inline draw has its count with the draw packet (index_count), anything else carries it in the record
                 native_inputs_key = draw.inputs_key;
-                DrainRasterWrites(1);
+                const u32 verify = LookupDrain(1);
                 if (native_fixed_verify) {
                     left(3);
-                } else if (auto plan = rasterizer->PlanExecDraw(*draw.fixed, draw.fixed_stale, draw.stage_key, native_inputs_key, exec_vertex_user_data,
-                                                                exec_pixel_user_data, draw, index_count,
-                                                                native_tag_pending.valid ? (native_tag_pending.meta & 0xff) : 15u)) {
-                    take(std::move(plan));
                 } else {
-                    left(4);
+                    const auto make_plan = [&] {
+                        return rasterizer->PlanExecDraw(*draw.fixed, draw.fixed_stale, draw.stage_key, native_inputs_key, exec_vertex_user_data,
+                                                        exec_pixel_user_data, draw, index_count,
+                                                        native_tag_pending.valid ? (native_tag_pending.meta & 0xff) : 15u);
+                    };
+                    auto plan = make_plan();
+                    if (verify == 2) {
+                        plan = ReplanAfterDrain(std::move(plan), 1, make_plan);
+                    }
+                    if (plan) {
+                        take(std::move(plan));
+                    } else {
+                        left(4);
+                    }
                 }
             }
         }
@@ -1579,9 +1642,15 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         if (call.kind == RasterCall::Kind::DrawIndirect) {
             params = Vulkan::DrawIndirectParams{.vertex_sgpr_offset = call.vertex_sgpr_offset, .instance_sgpr_offset = call.instance_sgpr_offset, .is_indirect = true};
         }
-        DrainRasterWrites(2);
+        const u32 verify = LookupDrain(2);
         Core::NativeAudit::SetPlanCaller(native_tag_pending.valid ? Core::NativeDraw::RecordCaller(native_tag_pending.seq) : 0);
-        auto candidate = rasterizer->PlanDraw(exec_state, params, native_fixed, native_fixed_stale, native_fixed_verify, native_exec_key, native_inputs_key);
+        const auto make_candidate = [&] {
+            return rasterizer->PlanDraw(exec_state, params, native_fixed, native_fixed_stale, native_fixed_verify, native_exec_key, native_inputs_key);
+        };
+        auto candidate = make_candidate();
+        if (verify == 2) {
+            candidate = ReplanAfterDrain(std::move(candidate), 2, make_candidate);
+        }
         Core::NativeDraw::Live().state_planned.fetch_add(1, std::memory_order_relaxed);
         if (legacy_registers) {
             native_state_plan = candidate.release();
@@ -1857,6 +1926,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                 (op.writes_memory ? sp.ns_write_closures : sp.ns_other_closures) +=
                     VideoCore::ReadbackStats::NowNs() - op_start;
                 if (op.writes_memory) {
+                    sp.write_done.store(op.position, std::memory_order_release);
                     sp.pending_writes.fetch_sub(1, std::memory_order_acq_rel);
                     std::scoped_lock lk{sp.mutex};
                     sp.done_cv.notify_all();

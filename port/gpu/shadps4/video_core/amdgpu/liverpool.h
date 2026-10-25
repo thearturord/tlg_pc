@@ -14,6 +14,7 @@
 #include <coroutine>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <semaphore>
@@ -302,6 +303,11 @@ private:
     void RasterPush(RasterOp&& op, bool wait);
     /// Blocks until every queued closure that writes guest memory has run.
     void DrainRasterWrites(u32 caller = 3);
+    /// The place of the wait before a planning: the full wait, or with TLG_DRAIN_LAZY=1 no wait (the planning's reads wait where needed, native_drain_audit.h).
+    /// Returns 0, or 1 when the planning is verified by comparing the bytes it copied at its end, or 2 when it must be repeated after a full wait and compared (ReplanAfterDrain).
+    u32 LookupDrain(u32 caller);
+    std::unique_ptr<Vulkan::DrawPlan> ReplanAfterDrain(std::unique_ptr<Vulkan::DrawPlan> plan, u32 site, const std::function<std::unique_ptr<Vulkan::DrawPlan>()>& make);
+    std::unique_ptr<Vulkan::DispatchPlan> ReplanAfterDrain(std::unique_ptr<Vulkan::DispatchPlan> plan, u32 site, const std::function<std::unique_ptr<Vulkan::DispatchPlan>()>& make);
     /// A command processor write to guest memory, done in order with the draws.
     void CpWriteData(void* address, const u32* data, u32 data_size, u32 queue);
     /// Blocks until the raster thread has executed everything queued so far.

@@ -657,6 +657,40 @@ std::string Rasterizer::DiffExecPlans(const DrawPlan& typed, const DrawPlan& ref
     return out;
 }
 
+namespace {
+u64 Mix(u64 h, u64 v) {
+    return (h ^ v) * 0x100000001b3ull;
+}
+
+u64 DigestStage(u64 h, const StagePlan& stage) {
+    h = Mix(h, reinterpret_cast<u64>(stage.info));
+    h = Mix(h, stage.pgm_base);
+    h = Mix(h, stage.user_data_count);
+    for (u32 i = 0; i < stage.user_data_count; ++i) {
+        h = Mix(h, stage.user_data[i]);
+    }
+    h = Mix(h, stage.flat_skipped ? 1 : 0);
+    for (const u32 word : stage.flat) {
+        h = Mix(h, word);
+    }
+    return h;
+}
+} // namespace
+
+u64 Rasterizer::PlanDigest(const DrawPlan& plan) {
+    u64 h = 0xcbf29ce484222325ull;
+    h = Mix(h, reinterpret_cast<u64>(plan.pipeline));
+    h = Mix(h, plan.op_class);
+    for (const auto& stage : plan.stages) {
+        h = DigestStage(h, stage);
+    }
+    return h;
+}
+
+u64 Rasterizer::PlanDigest(const DispatchPlan& plan) {
+    return DigestStage(Mix(0xcbf29ce484222325ull, reinterpret_cast<u64>(plan.pipeline)), plan.stage);
+}
+
 const DrawInputs& Rasterizer::InputsFor(const DrawPlan* plan, DrawInputs& storage) const {
     if (plan == nullptr) {
         storage = MakeDrawInputs(liverpool->RasterRegs());
@@ -2872,6 +2906,7 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
         if (!from_snapshot) {
             memory->CopySparseMemory(address, constant_ring->Data(*offset), size);
         }
+        Core::DrainAudit::Copied(Core::DrainAudit::ReadRingConstant, address, constant_ring->Data(*offset), size);
         constant_ring->Flush(*offset, size);
         stage.ring.push_back({index, static_cast<u32>(size), *offset, address, from_snapshot, desc.is_formatted});
         ring_taken.fetch_add(1, std::memory_order_relaxed);
@@ -2956,6 +2991,7 @@ void Rasterizer::FrontGeometryRing(DrawPlan& plan, u64 done, bool indexed, u32 i
             return;
         }
         memory->CopySparseMemory(address, constant_ring->Data(*offset), size);
+        Core::DrainAudit::Copied(kind == GeometryVertex ? Core::DrainAudit::ReadRingVertex : Core::DrainAudit::ReadRingIndex, address, constant_ring->Data(*offset), size);
         constant_ring->Flush(*offset, size);
         plan.geometry_ring.push_back({kind, static_cast<u32>(size), *offset, address});
         Core::NativeUploads::NoteGeometry(kind == GeometryVertex ? 0 : 1);
@@ -3008,6 +3044,9 @@ void Rasterizer::FrontGeometryRing(DrawPlan& plan, u64 done, bool indexed, u32 i
                 Core::DrainAudit::Read(Core::DrainAudit::ReadFetch, reinterpret_cast<u64>(table + attrib.dword_offset), sizeof(buffer));
             }
             std::memcpy(&buffer, table + attrib.dword_offset, sizeof(buffer));
+            if (attrib.sgpr_base != Shader::IR::NumScalarRegs) {
+                Core::DrainAudit::Copied(Core::DrainAudit::ReadFetch, reinterpret_cast<u64>(table + attrib.dword_offset), &buffer, sizeof(buffer));
+            }
             buffer.base_address += attrib.inst_offset;
             if (buffer.base_address != 0 && buffer.GetSize() > 0) {
                 ranges.push_back({buffer.base_address, buffer.base_address + buffer.GetSize()});
