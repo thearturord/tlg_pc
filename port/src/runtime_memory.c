@@ -802,6 +802,21 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
     read_unlock();
     return ok;
 }
+/* N7.5: where [address, address + size) lives in the backing view. Returns 1 and the view's base address, the offset of the range in it and the size of the section when the whole
+ * range lies in one mapped region (so its bytes are contiguous in the view), else 0. The view is always read/write: a GPU import of its pages sees every CPU write. */
+int runtime_memory_backing_window(uintptr_t address, uint64_t size, void **base, uint64_t *offset, uint64_t *section_bytes) {
+    read_lock();
+    int ok=0;
+    size_t i=vma_index(address);
+    if (i!=vma_count && vmas[i].start<=address && vmas[i].kind!=KIND_RESERVED && address+size<=vmas[i].end) {
+        *base=backing_base;
+        *offset=vmas[i].phys+(address-vmas[i].start);
+        *section_bytes=POOL_SIZE+FLEX_SPAN;
+        ok=1;
+    }
+    read_unlock();
+    return ok;
+}
 /* Reads through the backing view, bypassing GPU page protection; 0 when part of the range has no
  * backing (the caller then reads the guest address directly). GPU-internal threads use it so a
  * read of a page protected for readback (TLG_READBACKS=2) cannot fault into a readback that waits

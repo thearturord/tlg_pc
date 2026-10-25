@@ -7,6 +7,7 @@
 #include "video_core/readback_policy.h"
 
 #include "video_core/amdgpu/draw_state.h"
+#include <deque>
 #include <mutex>
 #include <vector>
 
@@ -22,6 +23,7 @@
 #include "core/native_uploads.h"
 #include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/vk_constant_ring.h"
+#include "video_core/renderer_vulkan/vk_host_import.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -120,6 +122,19 @@ public:
         u64 verified{}, differing{};
     };
     RingStats TakeRingStats() noexcept;
+    /// N7.5, in place buffers (`TLG_INPLACE=1`): read-only buffers up to `TLG_INPLACE_CAP` bytes (default 16 KiB) in guest memory are bound where they are, from an import of the
+    /// runtime's always read/write view of guest memory (`HostImport`), with no copy and no dirty tracking. `TLG_INPLACE_VERIFY=N`: every Nth in place binding keeps a copy of its
+    /// bytes, and when the GPU has finished the submission it was recorded in the guest memory is compared with the copy (the bytes the GPU may have seen changed after the bind).
+    struct InPlaceStats {
+        u64 offered{}, taken{}, bytes{};
+        u64 written{}, special{}, too_large{}, not_in_backing{}, gpu_written{}, image_or_meta{};
+        u64 verified{}, differing{}, verify_dropped{};
+        u64 imported_bytes{}, imported_chunks{}, failed_chunks{};
+    };
+    InPlaceStats TakeInPlaceStats() noexcept;
+    [[nodiscard]] bool InPlaceOn() const noexcept {
+        return inplace_on;
+    }
     void RecyclePlan(std::unique_ptr<DrawPlan>&& plan);
     void RecyclePlan(std::unique_ptr<DispatchPlan>&& plan);
 
@@ -263,6 +278,21 @@ private:
 
     u32 const_ring_level = 0;
     std::unique_ptr<ConstantRing> constant_ring;
+    // N7.5 (raster thread)
+    bool inplace_on = false;
+    u32 inplace_cap = 16384;
+    u32 inplace_verify_interval = 0;
+    u64 inplace_counter = 0;
+    std::unique_ptr<HostImport> host_import;
+    struct InPlaceCheck {
+        VAddr address;
+        u64 tick;
+        std::vector<u8> bytes;
+    };
+    std::deque<InPlaceCheck> inplace_checks;
+    std::atomic<u64> inplace_offered{0}, inplace_taken{0}, inplace_bytes{0}, inplace_written{0}, inplace_special{0}, inplace_too_large{0}, inplace_not_in_backing{0}, inplace_gpu_written{0},
+        inplace_image_or_meta{0}, inplace_verified{0}, inplace_differing{0}, inplace_verify_dropped{0};
+    void CheckInPlaceVerifications();
     // Front thread only:
     struct PendingWrite {
         VAddr begin, end;

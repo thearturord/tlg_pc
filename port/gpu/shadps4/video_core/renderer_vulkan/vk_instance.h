@@ -130,6 +130,11 @@ public:
         return maintenance_6;
     }
 
+    /// Returns true if VK_EXT_external_memory_host is enabled (in place buffers: the GPU reads imported guest memory where it is)
+    bool IsExternalMemoryHostSupported() const {
+        return external_memory_host;
+    }
+
     /// Returns true if VK_KHR_maintenance8 is supported
     bool IsMaintenance8Supported() const {
         return maintenance_8;
@@ -556,6 +561,7 @@ private:
     bool workgroup_memory_explicit_layout{};
     bool maintenance_5{};
     bool maintenance_6{};
+    bool external_memory_host{};
     bool maintenance_8{};
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};

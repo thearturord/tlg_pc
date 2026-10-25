@@ -1956,6 +1956,16 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                 Core::DebugServer::Publish("texture_set_memo", {{"hits", sets.hits}, {"recorded", sets.recorded}, {"miss_no_entry", sets.no_entry}, {"miss_generation", sets.generation},
                                                               {"miss_image_check", sets.image_check}, {"not_eligible", sets.not_eligible}, {"note", "counts per ~5 s interval"}});
             }
+            if (rasterizer->InPlaceOn()) {
+                const auto p = rasterizer->TakeInPlaceStats();
+                Core::DebugServer::Publish("in_place_buffers",
+                                           {{"offered", p.offered}, {"bound_in_place", p.taken}, {"bytes", p.bytes},
+                                            {"refused", {{"written_by_a_shader", p.written}, {"too_large", p.too_large}, {"gpu_written_bytes", p.gpu_written}, {"image_or_metadata", p.image_or_meta},
+                                                         {"not_in_one_mapped_region_or_import_failed", p.not_in_backing}}},
+                                            {"verify", {{"checked_after_the_gpu_finished", p.verified}, {"bytes_changed_since_the_bind", p.differing}, {"dropped", p.verify_dropped}}},
+                                            {"imported", {{"bytes", p.imported_bytes}, {"chunks", p.imported_chunks}, {"failed_chunks", p.failed_chunks}}},
+                                            {"note", "counts per ~5 s interval; imported is cumulative"}});
+            }
             if (rasterizer->ConstRingLevel() != 0) {
                 const auto ring = rasterizer->TakeRingStats();
                 Core::DebugServer::Publish(

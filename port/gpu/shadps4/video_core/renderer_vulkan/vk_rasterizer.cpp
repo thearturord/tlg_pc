@@ -93,6 +93,17 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         ring_verify_interval = static_cast<u32>(std::max(std::atoi(env), 0));
     }
     LOG_INFO(Render, "constant ring: level {}, verify every {}", const_ring_level, ring_verify_interval);
+    if (const char* env = std::getenv("TLG_INPLACE"); env != nullptr && *env != 0 && *env != '0') {
+        host_import = std::make_unique<HostImport>(instance);
+        inplace_on = host_import->Available();
+        if (const char* cap = std::getenv("TLG_INPLACE_CAP"); cap != nullptr && *cap != 0) {
+            inplace_cap = static_cast<u32>(std::clamp(std::atoi(cap), 16, 1 << 20));
+        }
+        if (const char* verify = std::getenv("TLG_INPLACE_VERIFY"); verify != nullptr && *verify != 0) {
+            inplace_verify_interval = static_cast<u32>(std::max(std::atoi(verify), 0));
+        }
+        LOG_INFO(Render, "in place buffers: {}, cap {} bytes, verify every {}", inplace_on ? "on" : "unavailable", inplace_cap, inplace_verify_interval);
+    }
     supersede_target = this;
     Core::NativeUpdates::SetSupersede([](u64 address, u64 size) {
         if (supersede_target != nullptr) {
@@ -1857,6 +1868,41 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     return true;
 }
 
+void Rasterizer::CheckInPlaceVerifications() {
+    // the submissions the GPU has finished: the bytes it read of an in place buffer may have been rewritten by the CPU since the bind; compare with the copy kept at the bind
+    while (!inplace_checks.empty() && scheduler.IsFree(inplace_checks.front().tick)) {
+        const InPlaceCheck& check = inplace_checks.front();
+        std::vector<u8> now(check.bytes.size());
+        memory->CopySparseMemory(check.address, now.data(), now.size());
+        inplace_verified.fetch_add(1, std::memory_order_relaxed);
+        if (std::memcmp(now.data(), check.bytes.data(), now.size()) != 0) {
+            inplace_differing.fetch_add(1, std::memory_order_relaxed);
+        }
+        inplace_checks.pop_front();
+    }
+}
+
+Rasterizer::InPlaceStats Rasterizer::TakeInPlaceStats() noexcept {
+    InPlaceStats s;
+    s.offered = inplace_offered.exchange(0);
+    s.taken = inplace_taken.exchange(0);
+    s.bytes = inplace_bytes.exchange(0);
+    s.written = inplace_written.exchange(0);
+    s.too_large = inplace_too_large.exchange(0);
+    s.not_in_backing = inplace_not_in_backing.exchange(0);
+    s.gpu_written = inplace_gpu_written.exchange(0);
+    s.image_or_meta = inplace_image_or_meta.exchange(0);
+    s.verified = inplace_verified.exchange(0);
+    s.differing = inplace_differing.exchange(0);
+    s.verify_dropped = inplace_verify_dropped.exchange(0);
+    if (host_import) {
+        s.imported_bytes = host_import->ImportedBytes();
+        s.imported_chunks = host_import->ImportedChunks();
+        s.failed_chunks = host_import->FailedChunks();
+    }
+    return s;
+}
+
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     Core::NativeUploads::SetCaller(stage.sw_stage == Shader::SwStage::Compute ? 2 : 1);
@@ -2009,6 +2055,44 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
+                // N7.5: a read-only buffer of guest memory bound where it is (imported view of the runtime's backing), no copy, no dirty tracking
+                bool in_place = false;
+                if (inplace_on) {
+                    CheckInPlaceVerifications();
+                    inplace_offered.fetch_add(1, std::memory_order_relaxed);
+                    if (desc.is_written) {
+                        inplace_written.fetch_add(1, std::memory_order_relaxed);
+                    } else if (size > inplace_cap) {
+                        inplace_too_large.fetch_add(1, std::memory_order_relaxed);
+                    } else if (buffer_cache.IsRangeGpuWritten(vsharp.base_address, size)) {
+                        inplace_gpu_written.fetch_add(1, std::memory_order_relaxed);
+                    } else if (desc.is_formatted && (texture_cache.AnyImageOverlaps(vsharp.base_address, size) || texture_cache.IsMeta(vsharp.base_address))) {
+                        inplace_image_or_meta.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        const auto window = host_import->Find(vsharp.base_address, size);
+                        const u64 aligned = Common::AlignDown(window.offset, alignment);
+                        if (window.buffer && window.offset - aligned + size <= window.chunk_remaining + (window.offset - aligned)) {
+                            in_place = true;
+                            const u64 adjust = window.offset - aligned;
+                            push_data.AddOffset(binding.buffer, adjust);
+                            buffer_infos.emplace_back(window.buffer, aligned, size + adjust);
+                            inplace_taken.fetch_add(1, std::memory_order_relaxed);
+                            inplace_bytes.fetch_add(size, std::memory_order_relaxed);
+                            if (inplace_verify_interval != 0 && ++inplace_counter % inplace_verify_interval == 0) {
+                                if (inplace_checks.size() < 8192) {
+                                    InPlaceCheck check{vsharp.base_address, scheduler.CurrentTick(), std::vector<u8>(size)};
+                                    memory->CopySparseMemory(vsharp.base_address, check.bytes.data(), size);
+                                    inplace_checks.push_back(std::move(check));
+                                } else {
+                                    inplace_verify_dropped.fetch_add(1, std::memory_order_relaxed);
+                                }
+                            }
+                        } else {
+                            inplace_not_in_backing.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                if (!in_place) {
                 // N3c: the immutable engine buffer named by the record's binding (by the engine's id), when the plan resolved one and nothing was registered since
                 Core::NativeResources::ImmutableBuffer* immutable_hint = nullptr;
                 if (record_binding != ~0u && binder_plan->has_handles && (binder_plan->handles[record_binding] != nullptr)) {
@@ -2115,6 +2199,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size, "a written storage buffer view");
                 }
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                }
             }
         }
 
