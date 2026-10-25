@@ -8,6 +8,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -91,6 +92,10 @@ struct ViewStats {
     u64 matched_plain{}, matched_indirect{};
     u64 missing_plain{}, missing_indirect{}, extra_plain{}, extra_indirect{};
     u64 unreadable{};
+    // N6.3g: would the pass qualify for the generator (nothing in it that the generator does not model)?
+    u64 qualifying_passes{}, qualifying_draws{}, all_draws{};
+    std::map<std::string, u64> decline_passes; // reason -> passes it applies to
+    std::map<std::string, u64> decline_draws;  // reason -> draws of the passes it applies to
 };
 
 struct State {
@@ -737,6 +742,9 @@ void PassEnter(u64 render_device, u64 desc) {
         ++v.unreadable;
         return;
     }
+    std::set<std::string> reasons;
+    u64 default_kind = 0;
+    Rd(NativeDraw::ImageBase() + (0x069ae968ull - 0x1000000), default_kind);
     const u8 flag_hi = static_cast<u8>(flags >> 32);
     const u8 flag_cvar = static_cast<u8>(flags >> 40);
     std::unordered_map<u64, u32> material_flags;
@@ -771,6 +779,20 @@ void PassEnter(u64 render_device, u64 desc) {
         }
         u16 mesh_word = 0;
         Rd(mesh + 0x78, mesh_word);
+        {
+            u64 render_data_q = 0, special_q = 0;
+            Rd(mesh + 0x38, render_data_q);
+            Rd(batch + 0x48, special_q);
+            if (render_data_q == 0) {
+                reasons.insert("mesh render data not created yet (the loop creates it at first use)");
+            }
+            if (special_q != 0) {
+                reasons.insert("batch with a special entry (a virtual call picks the material index)");
+            }
+            if (group != 0) {
+                reasons.insert("batch with an instance group (the instance data upload of FUN_01ee4e50 is not modeled)");
+            }
+        }
         u32 instances = 0;
         u64 indirect_buffer = 0;
         u64 instance_object = 0;
@@ -857,7 +879,32 @@ void PassEnter(u64 render_device, u64 desc) {
                 }
             }
             (item.kind == Plain ? v.expected_plain : item.kind == Instanced ? v.expected_instanced : v.expected_indirect)++;
+            {
+                const u64 key_q = ((item.material_sig * 0x9E3779B97F4A7C15ull ^ s.view_type) * 31 + (item.batch_flags & 0x10) * 8 + item.kind) * 0x100000001b3ull + item.mesh_word * 131u + s.pass_flags;
+                if (s.variants.find(key_q) == s.variants.end()) {
+                    reasons.insert("variant key not seen yet (the loop would create the variant)");
+                }
+                u64 kind18 = 0, obj_q = 0;
+                Rd(material + 0x18, kind18);
+                Rd(material + 0x38, obj_q);
+                if (kind18 == default_kind) {
+                    reasons.insert("material of the engine's default kind");
+                }
+                if (obj_q == 0) {
+                    reasons.insert("material without a render object");
+                }
+            }
             s.expected.push_back(item);
+        }
+    }
+    v.all_draws += s.expected.size();
+    if (reasons.empty()) {
+        ++v.qualifying_passes;
+        v.qualifying_draws += s.expected.size();
+    } else {
+        for (const auto& reason : reasons) {
+            ++v.decline_passes[reason];
+            v.decline_draws[reason] += s.expected.size();
         }
     }
 }
@@ -1183,7 +1230,12 @@ nlohmann::json Report() {
                                        {"indirect_matched", v.matched_indirect},
                                        {"indirect_expected_but_not_issued", v.missing_indirect},
                                        {"indirect_issued_but_not_expected", v.extra_indirect},
-                                       {"unreadable_snapshot_fields", v.unreadable}};
+                                       {"unreadable_snapshot_fields", v.unreadable},
+                                       {"generator_would_take_passes", v.qualifying_passes},
+                                       {"generator_would_take_draws", v.qualifying_draws},
+                                       {"draws_in_all_passes", v.all_draws},
+                                       {"passes_declined_by_reason", v.decline_passes},
+                                       {"draws_of_those_passes_by_reason", v.decline_draws}};
     }
     out["first_mismatches"] = s.samples;
     {
