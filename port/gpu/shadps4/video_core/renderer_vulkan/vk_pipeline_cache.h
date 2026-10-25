@@ -111,29 +111,40 @@ constexpr u32 GeometryIndex = 0xFFFFFFFEu;  ///< and of the index range
 /// N6.1: the descriptor words the record holds for the shader load at flat user data `offset` of `stage_s` (0 vertex, 1 pixel): a descriptor put into the user data directly
 /// (`offset` inside the binding), or an entry of a descriptor table behind a user data register, found through the walker's table map of the shader. Null: not in the record.
 inline const u32* FindRecordWords(const Shader::Info& info, const Core::NativeDraw::RecordBinding* list, u32 count, u32 stage_s, u32 kind, u32 offset, u32 dwords, u32* index_out = nullptr) {
-    for (u32 i = 0; i < count; ++i) {
+    u32 root = 0, src = 0;
+    const bool table = info.srt_info.TableSource(offset, root, src);
+    const auto match = [&](u32 i) -> const u32* {
         const auto& b = list[i];
-        if (b.stage == stage_s && b.kind == kind && b.offset != 0xffff && offset >= b.offset && offset + dwords <= u32{b.offset} + b.dwords) {
+        if (b.stage != stage_s || b.kind != kind) {
+            return nullptr;
+        }
+        if (b.offset != 0xffff) {
+            return offset >= b.offset && offset + dwords <= u32{b.offset} + b.dwords ? b.words + (offset - b.offset) : nullptr;
+        }
+        if (table && b.table_sgpr == root && b.entry_dwords != 0 && b.slot == src / b.entry_dwords) {
+            const u32 within = src % b.entry_dwords;
+            return within + dwords <= b.dwords ? b.words + within : nullptr;
+        }
+        return nullptr;
+    };
+    // The same shader asks for the same load in every draw and the record builder lists its descriptors in the same order: the index that served the last such lookup is tried first.
+    static thread_local std::array<u16, 1024> hints{};
+    u16& hint = hints[(((reinterpret_cast<u64>(&info) >> 4) * 0x9E3779B1u) ^ (offset * 131u) ^ (kind * 7u) ^ (stage_s * 3u)) & 1023];
+    if (hint < count) {
+        if (const u32* words = match(hint)) {
+            if (index_out != nullptr) {
+                *index_out = hint;
+            }
+            return words;
+        }
+    }
+    for (u32 i = 0; i < count; ++i) {
+        if (const u32* words = match(i)) {
+            hint = static_cast<u16>(i);
             if (index_out != nullptr) {
                 *index_out = i;
             }
-            return b.words + (offset - b.offset);
-        }
-    }
-    u32 root = 0, src = 0;
-    if (!info.srt_info.TableSource(offset, root, src)) {
-        return nullptr;
-    }
-    for (u32 i = 0; i < count; ++i) {
-        const auto& b = list[i];
-        if (b.stage == stage_s && b.kind == kind && b.table_sgpr == root && b.entry_dwords != 0 && b.slot == src / b.entry_dwords) {
-            const u32 within = src % b.entry_dwords;
-            if (within + dwords <= b.dwords) {
-                if (index_out != nullptr) {
-                    *index_out = i;
-                }
-                return b.words + within;
-            }
+            return words;
         }
     }
     return nullptr;
