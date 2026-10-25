@@ -103,7 +103,7 @@ public:
     }
     /// Front (command processor thread) only: a plan about to be pushed as the operation at queue position `position`; `done` is the position the raster
     /// thread has completed. Notes what the plan writes and, from level 3, copies its small read-only buffers into the ring.
-    void FrontQueueOp(DrawPlan* draw, DispatchPlan* dispatch, u64 position, u64 done, u64 seq = 0);
+    void FrontQueueOp(DrawPlan* draw, DispatchPlan* dispatch, u64 position, u64 done, u64 seq = 0, bool indexed = false, u32 index_offset = 0);
     /// Raster thread: the plan the next draw or dispatch runs from (for the ring bindings); Stamp after it was recorded.
     void BeginRingUse(const DrawPlan* draw, const DispatchPlan* dispatch) noexcept {
         ring_draw = draw;
@@ -270,6 +270,9 @@ private:
     /// `owner`: the draw plan the stage belongs to (null for a dispatch); its record bindings give the V#s of a stage planned without flat user data (N3d).
     void FrontStageNotes(StagePlan& stage, u64 position, const DrawPlan* owner);
     void FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owner, u64 seq);
+    /// N5g: the vertex ranges and the index range of a draw into the ring.
+    void FrontGeometryRing(DrawPlan& plan, u64 done, bool indexed, u32 index_offset);
+    [[nodiscard]] const RingBinding* FindGeometryRing(VAddr address, u64 size, u32 kind) const noexcept;
     // Raster thread:
     const DrawPlan* ring_draw = nullptr;
     const DispatchPlan* ring_dispatch = nullptr;

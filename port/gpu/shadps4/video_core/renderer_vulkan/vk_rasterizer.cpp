@@ -5,6 +5,9 @@
 #include <atomic>
 #include <thread>
 #include "common/arch.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "common/debug.h"
 #include "core/debug_server.h"
 #include "core/guest_hooks.h"
@@ -1426,6 +1429,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         VAddr end_address;
         const VideoCore::Buffer* buffer;
         u64 offset;
+        bool ring{}; ///< N5g: the bytes are in the constant ring (offset is a ring offset, buffer is null)
 
         [[nodiscard]] size_t GetSize() const {
             return end_address - base_address;
@@ -1465,6 +1469,24 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
             continue;
         }
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
+        if (const RingBinding* ring = FindGeometryRing(range.base_address, size, GeometryVertex)) {
+            if (buffer_cache.IsRangeGpuWritten(range.base_address, size)) {
+                Core::NativeUploads::NoteGeometry(4); // the GPU wrote bytes of it after the command processor copied it: the arena has them
+            } else {
+                range.ring = true;
+                range.offset = ring->offset;
+                Core::NativeUploads::NoteGeometry(2);
+                if (ring_verify_interval != 0 && ++ring_verify_counter % ring_verify_interval == 0) {
+                    std::vector<u8> now(size);
+                    memory->CopySparseMemory(range.base_address, now.data(), size);
+                    Core::NativeUploads::NoteGeometry(8);
+                    if (std::memcmp(now.data(), constant_ring->Data(ring->offset), size) != 0) {
+                        Core::NativeUploads::NoteGeometry(9);
+                    }
+                }
+                continue;
+            }
+        }
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
@@ -1485,7 +1507,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
                            buffer.base_address < range.end_address;
                 });
             ASSERT(host_buffer_info != ranges_merged.cend());
-            host_buffers.emplace_back(host_buffer_info->buffer->Handle());
+            host_buffers.emplace_back(host_buffer_info->ring ? constant_ring->Handle() : host_buffer_info->buffer->Handle());
             host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
                                    host_buffer_info->base_address);
         } else {
@@ -1531,7 +1553,31 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
     u32 index_buffer_size = static_cast<u32>(Common::AlignDown(mapped_size, index_size));
     vk::Buffer index_buffer{};
     u64 buffer_offset{};
-    if (index_buffer_size != 0) {
+    const RingBinding* index_ring = index_buffer_size != 0 && !is_indirect ? FindGeometryRing(index_address, index_buffer_size, GeometryIndex) : nullptr;
+    if (index_buffer_size != 0 && !is_indirect && ring_draw != nullptr && Core::NativeUploads::RingGeometry()) {
+        bool has_entry = false;
+        for (const auto& ring : ring_draw->geometry_ring) {
+            has_entry |= ring.index == GeometryIndex;
+        }
+        Core::NativeUploads::NoteGeometry(index_ring != nullptr ? 14 : has_entry ? 15 : 29);
+    }
+    if (index_ring != nullptr && buffer_cache.IsRangeGpuWritten(index_address, index_buffer_size)) {
+        Core::NativeUploads::NoteGeometry(4);
+        index_ring = nullptr;
+    }
+    if (index_ring != nullptr) {
+        index_buffer = constant_ring->Handle();
+        buffer_offset = index_ring->offset;
+        Core::NativeUploads::NoteGeometry(3);
+        if (ring_verify_interval != 0 && ++ring_verify_counter % ring_verify_interval == 0) {
+            std::vector<u8> now(index_buffer_size);
+            memory->CopySparseMemory(index_address, now.data(), index_buffer_size);
+            Core::NativeUploads::NoteGeometry(8);
+            if (std::memcmp(now.data(), constant_ring->Data(index_ring->offset), index_buffer_size) != 0) {
+                Core::NativeUploads::NoteGeometry(9);
+            }
+        }
+    } else if (index_buffer_size != 0) {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
         needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
@@ -2817,7 +2863,180 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
     }
 }
 
-void Rasterizer::FrontQueueOp(DrawPlan* draw, DispatchPlan* dispatch, u64 position, u64 done, u64 seq) {
+namespace {
+/// True when [address, address + size) is committed, readable memory of this process (the vertex descriptor tables of native draws are in memory the runtime's mapping
+/// table does not list, but the raster thread reads them by pointer all the same).
+bool ReadableGuestMemory(VAddr address, size_t size) {
+#ifdef _WIN32
+    // A system call per vertex attribute took 60% of the command processor thread: the regions found readable are remembered (a few per thread, dropped now and then)
+    struct Region {
+        VAddr begin{}, end{};
+    };
+    thread_local std::array<Region, 4> known{};
+    thread_local u32 next = 0, uses = 0;
+    if ((++uses & 4095) == 0) {
+        known = {};
+    }
+    for (const auto& region : known) {
+        if (address >= region.begin && address + size <= region.end) {
+            return true;
+        }
+    }
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == 0) {
+        return false;
+    }
+    constexpr DWORD NoRead = PAGE_NOACCESS | PAGE_GUARD;
+    const VAddr begin = reinterpret_cast<VAddr>(info.BaseAddress);
+    if (info.State != MEM_COMMIT || (info.Protect & NoRead) != 0 || address + size > begin + info.RegionSize) {
+        return false;
+    }
+    known[next++ & 3] = {begin, begin + info.RegionSize};
+    return true;
+#else
+    return true;
+#endif
+}
+} // namespace
+
+void Rasterizer::FrontGeometryRing(DrawPlan& plan, u64 done, bool indexed, u32 index_offset) {
+    plan.geometry_ring.clear();
+    if (!Core::NativeUploads::RingGeometry() || plan.pipeline == nullptr || plan.op_class != 0xff) {
+        return;
+    }
+    const u64 cap = std::min<u64>(Core::NativeUploads::RingGeometryCap(), VideoCore::BufferCache::StreamThreshold() * 64ull);
+    const u64 alignment = std::max<u64>(instance.StorageMinAlignment(), instance.UniformMinAlignment());
+    const auto take = [&](VAddr address, u64 size, u32 kind) {
+        if (address == 0 || size == 0) {
+            return;
+        }
+        const u32 base = kind == GeometryVertex ? 16 : 24;
+        if (size > cap) {
+            Core::NativeUploads::NoteGeometry(5);
+            Core::NativeUploads::NoteGeometry(base + 4);
+            return;
+        }
+        if (Core::NativeResources::ImmutableResidencyEnabled() && Core::NativeResources::FindImmutable(address, size)) {
+            Core::NativeUploads::NoteGeometry(7);
+            Core::NativeUploads::NoteGeometry(base + 0);
+            return;
+        }
+        const bool gpu_written = Core::NativeUploads::RingPrecise() ? buffer_cache.IsRangeGpuWritten(address, size) : buffer_cache.IsRegionGpuModified(address, size);
+        if (gpu_written) {
+            Core::NativeUploads::NoteGeometry(6);
+            Core::NativeUploads::NoteGeometry(base + 1);
+            return;
+        }
+        if (PendingGpuWriteOverlaps(address, size, done)) {
+            Core::NativeUploads::NoteGeometry(7);
+            Core::NativeUploads::NoteGeometry(base + 2);
+            return;
+        }
+        const auto offset = constant_ring->Allocate(size, alignment);
+        if (!offset) {
+            Core::NativeUploads::NoteGeometry(7);
+            Core::NativeUploads::NoteGeometry(base + 3);
+            return;
+        }
+        memory->CopySparseMemory(address, constant_ring->Data(*offset), size);
+        constant_ring->Flush(*offset, size);
+        plan.geometry_ring.push_back({kind, static_cast<u32>(size), *offset, address});
+        Core::NativeUploads::NoteGeometry(kind == GeometryVertex ? 0 : 1);
+    };
+    // the vertex buffers: the V#s of the fetch shader's attributes, read from the vertex stage's user data as the plan holds them
+    const auto& fetch_shader = plan.pipeline->GetFetchShader();
+    const StagePlan* vertex = nullptr;
+    for (const auto& stage : plan.stages) {
+        if (stage.info != nullptr && stage.info->sw_stage == Shader::SwStage::Vertex) {
+            vertex = &stage;
+        }
+    }
+    Core::NativeUploads::NoteGeometry(10);
+    if (vertex == nullptr || fetch_shader.Empty() || fetch_shader.attributes.empty()) {
+        Core::NativeUploads::NoteGeometry(11);
+    }
+    if (vertex != nullptr && !fetch_shader.Empty() && !fetch_shader.attributes.empty()) {
+        struct Range {
+            VAddr begin, end;
+        };
+        boost::container::small_vector<Range, 16> ranges;
+        for (const auto& attrib : fetch_shader.attributes) {
+            const u32* table = vertex->user_data.data();
+            if (attrib.sgpr_base != Shader::IR::NumScalarRegs) {
+                if (attrib.sgpr_base >= vertex->user_data_count) {
+                    Core::NativeUploads::NoteGeometry(12);
+                    static std::atomic<u32> logged{0};
+                    if (logged.fetch_add(1) < 6) {
+                        LOG_ERROR(Core, "geometry ring: attribute reads its table pointer from user data register {} but the vertex stage has {} (attributes {})", attrib.sgpr_base,
+                                 vertex->user_data_count, fetch_shader.attributes.size());
+                    }
+                    return;
+                }
+                u64 pointer = 0;
+                std::memcpy(&pointer, &vertex->user_data[attrib.sgpr_base], sizeof(pointer));
+                table = reinterpret_cast<const u32*>(pointer & 0xFFFFFFFFFFFFULL);
+                const VAddr table_entry = reinterpret_cast<VAddr>(table + attrib.dword_offset);
+                // the descriptor tables of native draws can live in the table arena window, which is no mapping of the runtime
+                if (!ReadableGuestMemory(table_entry, sizeof(AmdGpu::Buffer))) {
+                    Core::NativeUploads::NoteGeometry(12);
+                    static std::atomic<u32> logged_pointer{0};
+                    if (logged_pointer.fetch_add(1) < 6) {
+                        LOG_ERROR(Core, "geometry ring: the vertex table pointer {:#x} (register {}, dword offset {}) is no mapping", pointer, attrib.sgpr_base, attrib.dword_offset);
+                    }
+                    return;
+                }
+            }
+            AmdGpu::Buffer buffer;
+            std::memcpy(&buffer, table + attrib.dword_offset, sizeof(buffer));
+            buffer.base_address += attrib.inst_offset;
+            if (buffer.base_address != 0 && buffer.GetSize() > 0) {
+                ranges.push_back({buffer.base_address, buffer.base_address + buffer.GetSize()});
+            }
+        }
+        std::ranges::sort(ranges, [](const Range& a, const Range& b) { return a.begin < b.begin; });
+        boost::container::small_vector<Range, 16> merged;
+        for (const auto& range : ranges) {
+            if (!merged.empty() && merged.back().end >= range.begin) {
+                merged.back().end = std::max(merged.back().end, range.end);
+            } else {
+                merged.push_back(range);
+            }
+        }
+        for (const auto& range : merged) {
+            if (range.end - range.begin >= (1ull << 30) && !memory->IsValidMapping(range.begin, 1)) {
+                continue;
+            }
+            Core::NativeUploads::NoteGeometry(13);
+            take(range.begin, memory->ClampRangeSize(range.begin, range.end - range.begin), GeometryVertex);
+        }
+    }
+    if (indexed) {
+        const auto& regs = plan.inputs;
+        const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+        const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
+        const VAddr base_address = regs.index_base_address.Address<VAddr>();
+        const VAddr index_address = base_address + u64(index_offset) * index_size;
+        const u64 requested = u64(std::min(regs.num_indices, regs.max_index_size)) * index_size;
+        if (base_address != 0 && requested != 0 && (requested < (1ull << 30) || memory->IsValidMapping(index_address, 1))) {
+            const u64 mapped = memory->ClampRangeSize(index_address, requested);
+            take(index_address, Common::AlignDown(mapped, index_size), GeometryIndex);
+        }
+    }
+}
+
+const RingBinding* Rasterizer::FindGeometryRing(VAddr address, u64 size, u32 kind) const noexcept {
+    if (ring_draw == nullptr || const_ring_level < 4) {
+        return nullptr;
+    }
+    for (const auto& ring : ring_draw->geometry_ring) {
+        if (ring.index == kind && ring.address == address && ring.size == size) {
+            return &ring;
+        }
+    }
+    return nullptr;
+}
+
+void Rasterizer::FrontQueueOp(DrawPlan* draw, DispatchPlan* dispatch, u64 position, u64 done, u64 seq, bool indexed, u32 index_offset) {
     if (const_ring_level == 0 || (!draw && !dispatch)) {
         return;
     }
@@ -2837,6 +3056,7 @@ void Rasterizer::FrontQueueOp(DrawPlan* draw, DispatchPlan* dispatch, u64 positi
         for (auto& stage : draw->stages) {
             FrontStageRing(stage, done, draw, seq);
         }
+        FrontGeometryRing(*draw, done, indexed, index_offset);
         draw->ring_end = constant_ring->Position();
     } else {
         FrontStageRing(dispatch->stage, done, nullptr, seq);

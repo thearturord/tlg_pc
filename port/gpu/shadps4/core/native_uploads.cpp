@@ -318,6 +318,29 @@ void NoteOnDemand(bool pass_open, u64 request_size, u64 uploaded_bytes, u64 addr
     entry.second += uploaded_bytes;
 }
 
+namespace {
+std::atomic<u64> geometry_counters[40]{};
+}
+bool RingGeometry() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_RING_GEOMETRY");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+
+u64 RingGeometryCap() {
+    static const u64 cap = [] {
+        const char* e = std::getenv("TLG_RING_GEOMETRY_CAP");
+        return e != nullptr && *e != 0 ? static_cast<u64>(std::strtoull(e, nullptr, 10)) : u64{1} << 20;
+    }();
+    return cap;
+}
+
+void NoteGeometry(u32 what) {
+    geometry_counters[what % 40].fetch_add(1, std::memory_order_relaxed);
+}
+
 bool RingFormatted() {
     static const bool on = [] {
         const char* e = std::getenv("TLG_RING_FORMATTED");
@@ -427,6 +450,34 @@ nlohmann::json Report() {
                          {"formatted_buffers_bound_from_the_ring", ring_precise_counters[4].load()},
                          {"formatted_ring_copies_ignored_at_bind_an_image_or_metadata_covers_the_range", ring_precise_counters[5].load()},
                          {"formatted_ring_copies_ignored_at_bind_the_gpu_wrote_the_bytes", ring_precise_counters[6].load()}};
+    j["ring_geometry"] = {{"enabled", RingGeometry()},
+                          {"vertex_ranges_copied_by_the_front", geometry_counters[0].load()},
+                          {"index_ranges_copied_by_the_front", geometry_counters[1].load()},
+                          {"vertex_ranges_bound_from_the_ring", geometry_counters[2].load()},
+                          {"index_ranges_bound_from_the_ring", geometry_counters[3].load()},
+                          {"ring_copies_ignored_at_bind_the_gpu_wrote_the_bytes", geometry_counters[4].load()},
+                          {"refused_over_the_cap", geometry_counters[5].load()},
+                          {"refused_bytes_are_gpu_written", geometry_counters[6].load()},
+                          {"refused_immutable_or_pending_write_or_ring_full", geometry_counters[7].load()},
+                          {"bound_ranges_compared_with_guest_memory", geometry_counters[8].load()},
+                          {"bound_ranges_differing_from_guest_memory", geometry_counters[9].load()},
+                          {"index_bind_matched_the_ring_entry", geometry_counters[14].load()},
+                          {"index_bind_had_an_entry_that_did_not_match_address_or_size", geometry_counters[15].load()},
+                          {"index_bind_had_no_entry_at_all", geometry_counters[29].load()},
+                          {"vertex_draws_seen", geometry_counters[10].load()},
+                          {"vertex_stopped_no_fetch_shader_or_stage", geometry_counters[11].load()},
+                          {"vertex_stopped_bad_table_pointer", geometry_counters[12].load()},
+                          {"vertex_merged_ranges_considered", geometry_counters[13].load()},
+                          {"vertex_refused_immutable", geometry_counters[16].load()},
+                          {"vertex_refused_gpu_written", geometry_counters[17].load()},
+                          {"vertex_refused_pending_write", geometry_counters[18].load()},
+                          {"vertex_refused_ring_full", geometry_counters[19].load()},
+                          {"vertex_refused_over_cap", geometry_counters[20].load()},
+                          {"index_refused_immutable", geometry_counters[24].load()},
+                          {"index_refused_gpu_written", geometry_counters[25].load()},
+                          {"index_refused_pending_write", geometry_counters[26].load()},
+                          {"index_refused_ring_full", geometry_counters[27].load()},
+                          {"index_refused_over_cap", geometry_counters[28].load()}};
     j["journal_peak_entries"] = journal_peak.load();
     j["frame_ring_uploads_at_draw_time_bytes"] = ring_upload_bytes.load();
     j["frame_ring_uploads_by_the_pre_synchronization_bytes"] = ring_upload_presync_bytes.load();

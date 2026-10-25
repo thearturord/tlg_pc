@@ -82,6 +82,13 @@ bool RingPrecise();
 /// buffer cache treats a formatted read as a possible read of an image's memory (a depth or colour surface, HTile, CMask), so the raster thread checks at bind time that no
 /// cached image covers the range and that it is no metadata surface, else it ignores the ring copy.
 bool RingFormatted();
+/// `TLG_RING_GEOMETRY=1` (N5g): the vertex buffers and the index buffer of a draw go through the constant ring too (up to `RingGeometryCap()` bytes each, default 1 MiB,
+/// `TLG_RING_GEOMETRY_CAP`). Same rules as the shader buffers: not GPU written by bytes, not immutable, no pending GPU write; the raster thread checks the bytes again at bind.
+bool RingGeometry();
+u64 RingGeometryCap();
+/// 0 vertex range copied by the front, 1 index range copied, 2 vertex range bound from the ring, 3 index range bound, 4 ignored at bind (the GPU wrote the bytes),
+/// 5 refused: over the cap, 6 refused: GPU written bytes, 7 refused: immutable or pending write or ring full, 8 verified against guest memory, 9 differs from it.
+void NoteGeometry(u32 what);
 /// 0 a range the page flag would have refused went through the ring (its bytes were never written by the GPU), 1 the GPU wrote bytes of a ring-bound range between the
 /// plan and the bind (the ring served guest bytes the GPU had changed since), 2 refused because its bytes are GPU written.
 void NoteRingPrecise(u32 what);

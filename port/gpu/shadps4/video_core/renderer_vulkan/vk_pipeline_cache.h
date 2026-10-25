@@ -105,6 +105,9 @@ struct RingBinding {
     bool formatted{}; ///< N5f: a formatted (texel) buffer: the raster thread checks at bind time that no image or metadata surface covers the range
 };
 
+constexpr u32 GeometryVertex = 0xFFFFFFFDu; ///< RingBinding::index of a vertex range in DrawPlan::geometry_ring
+constexpr u32 GeometryIndex = 0xFFFFFFFEu;  ///< and of the index range
+
 struct StagePlan {
     boost::container::small_vector<RingBinding, 8> ring; ///< T1: filled by the command processor thread, read by the raster thread
     Shader::Info* info{};
@@ -139,6 +142,8 @@ struct DrawPlan {
     std::array<Core::NativeResources::ImmutableBuffer*, Core::NativeDraw::MaxRecordBindings> handles{};
     u64 handle_epoch{};
     bool has_handles{};
+    /// N5g: vertex ranges (`index` = GeometryVertex) and the index range (`GeometryIndex`) the command processor copied into the constant ring
+    boost::container::small_vector<RingBinding, 4> geometry_ring;
 };
 
 struct DispatchPlan {
