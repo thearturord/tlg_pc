@@ -142,6 +142,10 @@ void AuditBinding(u32 sw_stage, bool image, u32 offset, const u32* words, u32 dw
 /// The native binder (N3): 0 buffer descriptor taken from the record, 1 image descriptor taken from the record, 2 buffer fell back to the flat user data, 3 image fell back,
 /// 4 buffer descriptor differed from the legacy one (verify mode), 5 image differed, 6 a stage without flat user data needed one (must stay 0), 7 sampler taken from the record.
 void NoteBinder(u32 what);
+/// N6.1: why a stage of a draw of class `draw_class` (0 z / shadow, 1 g-buffer, 2 forward, 3 other, 4 indirect) kept the flat user data (record_stage 0 vertex, 1 pixel, 2 the whole draw):
+/// reason 1 the record's binding list is not complete, 2 the shader has a flat constant buffer, 3 the shader has FMasks, 4 a buffer is not a single load, 5 a buffer load is not in the
+/// record, 6 an image is not a single load, 7 an image load is not in the record, 8 a sampler cannot be built from words, 9 a sampler is not in the record.
+void NoteBinderReason(u32 draw_class, u32 record_stage, u32 reason);
 /// Returns true when the draw has a description and it does not explain this buffer.
 /// `shader_constant`: the descriptor is built from immediates and the stage's program base (constants stored with the shader code), so it belongs to the shader
 /// variant, not to the draw's engine objects.

@@ -8,14 +8,16 @@
 
 namespace Core::NativeDraw {
 
-constexpr u32 MaxRecordBindings = 24;
+constexpr u32 MaxRecordBindings = 64; // N6.1: the entries of the descriptor tables are in the list too
 
 struct RecordBinding {
     u8 stage;    ///< 0 vertex, 1 pixel
     u8 kind;     ///< 1 buffer descriptor (V#), 2 image descriptor (T#), 3 sampler (S#)
-    u16 offset;  ///< flat user data index of the first dword
-    u16 slot;    ///< the engine slot the object was found in
+    u16 offset;  ///< flat user data index of the first dword; 0xffff: an entry of a table behind a user data register (`table_sgpr`)
+    u16 slot;    ///< the engine slot the object was found in (for a table entry: its index in the table)
     u16 dwords;
+    u8 table_sgpr;    ///< table entry: the user data register that points to the table (0xff: not a table entry)
+    u8 entry_dwords;  ///< table entry: dwords per entry of the table (8 resource table, 4 sampler / constant buffer table)
     u64 id;      ///< the engine's unique id of the resource (the registry's key)
     u32 words[8];
 };

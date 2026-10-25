@@ -108,6 +108,37 @@ struct RingBinding {
 constexpr u32 GeometryVertex = 0xFFFFFFFDu; ///< RingBinding::index of a vertex range in DrawPlan::geometry_ring
 constexpr u32 GeometryIndex = 0xFFFFFFFEu;  ///< and of the index range
 
+/// N6.1: the descriptor words the record holds for the shader load at flat user data `offset` of `stage_s` (0 vertex, 1 pixel): a descriptor put into the user data directly
+/// (`offset` inside the binding), or an entry of a descriptor table behind a user data register, found through the walker's table map of the shader. Null: not in the record.
+inline const u32* FindRecordWords(const Shader::Info& info, const Core::NativeDraw::RecordBinding* list, u32 count, u32 stage_s, u32 kind, u32 offset, u32 dwords, u32* index_out = nullptr) {
+    for (u32 i = 0; i < count; ++i) {
+        const auto& b = list[i];
+        if (b.stage == stage_s && b.kind == kind && b.offset != 0xffff && offset >= b.offset && offset + dwords <= u32{b.offset} + b.dwords) {
+            if (index_out != nullptr) {
+                *index_out = i;
+            }
+            return b.words + (offset - b.offset);
+        }
+    }
+    u32 root = 0, src = 0;
+    if (!info.srt_info.TableSource(offset, root, src)) {
+        return nullptr;
+    }
+    for (u32 i = 0; i < count; ++i) {
+        const auto& b = list[i];
+        if (b.stage == stage_s && b.kind == kind && b.table_sgpr == root && b.entry_dwords != 0 && b.slot == src / b.entry_dwords) {
+            const u32 within = src % b.entry_dwords;
+            if (within + dwords <= b.dwords) {
+                if (index_out != nullptr) {
+                    *index_out = i;
+                }
+                return b.words + within;
+            }
+        }
+    }
+    return nullptr;
+}
+
 struct StagePlan {
     boost::container::small_vector<RingBinding, 8> ring; ///< T1: filled by the command processor thread, read by the raster thread
     Shader::Info* info{};
@@ -180,7 +211,7 @@ public:
     /// registers. False when there is no entry (the caller plans the old way).
     /// skip_flat_for (N3b): the draw's record; a stage whose every descriptor it covers gets no flat user data.
     bool PlanGraphicsTyped(u64 exec_key, const FixedState& fixed, std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data, DrawPlan& plan,
-                           const Core::NativeDraw::ExecDraw* skip_flat_for = nullptr);
+                           const Core::NativeDraw::ExecDraw* skip_flat_for = nullptr, u32 draw_class = 15);
     void PlanCompute(const AmdGpu::ComputeProgram& cs, DispatchPlan& plan);
     /// Raster thread: writes the captured state into the stage Infos the pipeline uses.
     static void ApplyPlan(const DrawPlan& plan);

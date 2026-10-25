@@ -552,7 +552,10 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u32
     // the verify mode reads the flat user data of the plan; the constant ring takes the V#s of a stage without it from the record's bindings (N3d)
     const u32 binder_mode = NativeBinderMode();
     const bool skip_flat = (binder_mode == 1 || binder_mode == 2) && draw.bindings_complete && (binder_mode == 2 || draw_class == 0);
-    if (!pipeline_cache.PlanGraphicsTyped(exec_key, plan->fixed, vertex_user_data, pixel_user_data, *plan, skip_flat ? &draw : nullptr)) {
+    if ((binder_mode == 1 || binder_mode == 2) && !draw.bindings_complete) {
+        Core::NativeRegistry::NoteBinderReason(draw_class, 2, draw.bindings_overflow ? 10 : 1); // the whole draw keeps the flat user data: its binding list is not complete
+    }
+    if (!pipeline_cache.PlanGraphicsTyped(exec_key, plan->fixed, vertex_user_data, pixel_user_data, *plan, skip_flat ? &draw : nullptr, draw_class)) {
         RecyclePlan(std::move(plan));
         return nullptr;
     }
@@ -1401,16 +1404,7 @@ const u32* Rasterizer::BinderWords(const Shader::Info& stage, u32 offset, u32 dw
     if (s > 1) {
         return nullptr;
     }
-    for (u32 i = 0; i < binder_plan->binding_count; ++i) {
-        const auto& b = binder_plan->bindings[i];
-        if (b.stage == s && b.kind == kind && offset >= b.offset && offset + dwords <= u32{b.offset} + b.dwords) {
-            if (binding_index != nullptr) {
-                *binding_index = i;
-            }
-            return b.words + (offset - b.offset);
-        }
-    }
-    return nullptr;
+    return FindRecordWords(stage, binder_plan->bindings.data(), binder_plan->binding_count, s, kind, offset, dwords, binding_index);
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed) {
@@ -2736,10 +2730,9 @@ AmdGpu::Buffer PlanBufferSharp(const DrawPlan* owner, const StagePlan& stage, co
     }
     const u32 s = stage.info->sw_stage == Shader::SwStage::Vertex ? 0 : stage.info->sw_stage == Shader::SwStage::Fragment ? 1 : 2;
     const u32 offset = desc.sharp_fetch.offsets[0];
-    for (u32 i = 0; s <= 1 && i < owner->binding_count; ++i) {
-        const auto& b = owner->bindings[i];
-        if (b.stage == s && b.kind == 1 && offset >= b.offset && offset + 4 <= u32{b.offset} + b.dwords) {
-            return desc.FromWords(b.words + (offset - b.offset), view);
+    if (s <= 1) {
+        if (const u32* words = FindRecordWords(*stage.info, owner->bindings.data(), owner->binding_count, s, 1, offset, 4)) {
+            return desc.FromWords(words, view);
         }
     }
     Core::NativeRegistry::NoteBinder(6); // must not happen: the cover test of the plan promised a binding

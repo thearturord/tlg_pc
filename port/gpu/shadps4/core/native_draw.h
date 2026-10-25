@@ -131,6 +131,7 @@ struct ExecDraw {
     std::array<RecordBinding, MaxRecordBindings> bindings;
     u32 binding_count{};
     bool bindings_complete{};
+    bool bindings_overflow{}; ///< the list did not fit (MaxRecordBindings)
     std::array<ExecRegister, MaxRegisters> regs;
     u32 count{};
     /// The first `grouped` registers are stored by group (group g is regs[group_begin[g]] to regs[group_begin[g + 1]]), the rest always applies.

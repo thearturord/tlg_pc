@@ -1225,7 +1225,7 @@ void SetLastDescriptorObject(u64 object, bool sampler = false) {
 
 /// The record whose user data are being built (NativeDraw v2 bindings go into it).
 thread_local struct NativeRecord* binding_record = nullptr;
-void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* words, u32 dwords) {
+void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* words, u32 dwords, u32 table_sgpr = 0xff, u32 entry_dwords = 0) {
     if (binding_record == nullptr || stage > 1) {
         return;
     }
@@ -1241,6 +1241,8 @@ void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* word
     binding.offset = static_cast<u16>(offset);
     binding.slot = static_cast<u16>(slot);
     binding.dwords = static_cast<u16>(std::min<u32>(dwords, 8));
+    binding.table_sgpr = static_cast<u8>(table_sgpr);
+    binding.entry_dwords = static_cast<u8>(entry_dwords);
     binding.id = last_descriptor_object.id;
     for (u32 i = 0; i < binding.dwords; ++i) {
         binding.words[i] = words[i];
@@ -1248,9 +1250,9 @@ void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* word
 }
 
 /// Adds the descriptor just built to the draw's binding list (`offset` 0xffff: an entry of a table behind a pointer).
-void NoteBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* words, u32 dwords) {
-    if (last_descriptor_object.object != 0 && offset != 0xffff) {
-        AddRecordBinding(stage, kind, slot, offset, words, dwords);
+void NoteBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* words, u32 dwords, u32 table_sgpr = 0xff, u32 entry_dwords = 0) {
+    if (last_descriptor_object.object != 0 && (offset != 0xffff || table_sgpr != 0xff)) {
+        AddRecordBinding(stage, kind, slot, offset, words, dwords, table_sgpr, entry_dwords);
     }
     if (v2_collect == nullptr || last_descriptor_object.object == 0) {
         return;
@@ -1676,18 +1678,21 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 shader_block, u64 gnm, u64 input
             slots = std::max(slots, 1u);
             const u32 entry = type == 19 || type == 25 ? 8 : 4;
             u32* table = AllocTable(slots * entry);
+            // N6.1: only the entries the shader reads go into the record's list (the table holds up to 128 slots); an entry the mask misses is not found by a binder, which then keeps the flat user data
+            const auto used_slots = EngineUsedSlots(shader_block, type);
             for (u32 s = 0; s < slots; ++s) {
+                const u32 in_record = (s < 128 && ((used_slots[s >> 6] >> (s & 63)) & 1) != 0) ? start : 0xffu;
                 if (type == 19) {
                     const u32 got = ResourceDescriptor(ctx, stage, s, table + s * 8, 8);
-                    NoteBinding(stage, got == 8 ? 2 : 1, s, 0xffff, table + s * 8, got);
+                    NoteBinding(stage, got == 8 ? 2 : 1, s, 0xffff, table + s * 8, got, in_record, 8);
                 } else if (type == 25) {
                     UavDescriptor(ctx, s, table + s * 8, 8);
                 } else if (type == 22) {
                     ConstBufferDescriptor(ctx, stage, s, table + s * 4);
-                    NoteBinding(stage, 1, s, 0xffff, table + s * 4, 4);
+                    NoteBinding(stage, 1, s, 0xffff, table + s * 4, 4, in_record, 4);
                 } else {
                     SamplerDescriptor(ctx, stage, s, table + s * 4);
-                    NoteBinding(stage, 3, s, 0xffff, table + s * 4, 4);
+                    NoteBinding(stage, 3, s, 0xffff, table + s * 4, 4, in_record, 4);
                 }
             }
             const u64 address = reinterpret_cast<u64>(table);
@@ -3732,6 +3737,7 @@ bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed) {
     }
     out.binding_count = 0;
     out.bindings_complete = false;
+    out.bindings_overflow = slot.bindings_for == seq && slot.bindings_overflow;
     if (slot.kind <= 2 && slot.bindings_for == seq && !slot.bindings_overflow && slot.binding_count != 0) {
         out.binding_count = slot.binding_count;
         out.bindings_complete = true;

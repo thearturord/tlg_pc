@@ -363,6 +363,13 @@ void NoteBinder(u32 what) {
     binder_counters[what & 15].fetch_add(1, std::memory_order_relaxed);
 }
 
+namespace {
+std::array<std::array<std::array<std::atomic<u64>, 12>, 3>, 16> binder_reasons{};
+}
+void NoteBinderReason(u32 draw_class, u32 record_stage, u32 reason) {
+    binder_reasons[draw_class & 15][std::min<u32>(record_stage, 2)][std::min<u32>(reason, 11)].fetch_add(1, std::memory_order_relaxed);
+}
+
 void AuditBinding(u32 sw_stage, bool image, u32 offset, const u32* words, u32 dwords) {
     if (!enabled.load(std::memory_order_relaxed)) {
         return;
@@ -1012,6 +1019,22 @@ nlohmann::json Report() {
                           {"skipped_stage_needed_the_flat_user_data", binder_counters[6].load()}, {"samplers_from_the_record", binder_counters[7].load()},
                           {"sampler_descriptors_differing_from_the_legacy_ones", binder_counters[8].load()},
                           {"stages_planned_without_the_flat_user_data", binder_counters[9].load()}, {"stages_planned_with_the_flat_user_data_not_covered", binder_counters[10].load()}};
+    {
+        constexpr const char* class_names[5] = {"z_prepass_shadow", "g_buffer", "forward", "compute_other", "indirect_draws"};
+        constexpr const char* stage_names[3] = {"vertex_stage", "pixel_stage", "whole_draw"};
+        constexpr const char* reason_names[11] = {"covered", "record_list_not_complete", "shader_has_flat_constant_buffer", "shader_has_fmasks", "buffer_not_a_single_load",
+                                                  "buffer_load_not_in_the_record", "image_not_a_single_load", "image_load_not_in_the_record", "sampler_not_from_words", "sampler_not_in_the_record", "binding_list_overflow"};
+        auto& kept = j["kept_flat_user_data_by_class_and_reason"] = nlohmann::json::object();
+        for (u32 c = 0; c < 5; ++c) {
+            for (u32 s = 0; s < 3; ++s) {
+                for (u32 r = 1; r < 11; ++r) {
+                    if (const u64 n = binder_reasons[c][s][r].load()) {
+                        kept[class_names[c]][stage_names[s]][reason_names[r]] = n;
+                    }
+                }
+            }
+        }
+    }
     {
         auto& v2b = j["binding_audit"] = nlohmann::json::object();
         constexpr const char* names[16] = {"z_prepass_shadow", "g_buffer", "forward", "compute_other", "indirect_draws", "", "", "", "", "", "", "", "", "", "", "untagged"};

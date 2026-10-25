@@ -28,6 +28,22 @@ struct PersistentSrtInfo {
     size_t walker_func_size{};
     u32 flattened_bufsize_dw = 16; // NumUserDataRegs
 
+    /// N6.1: where the walker takes each dword of the flat user data from, for the dwords it copies out of a table that one user data register points to (one level, constant
+    /// offset): flat offset `16 + i` comes from dword `table_src[i]` of the table behind user data register `table_root_plus1[i] - 1` (0: not such a copy). A record that holds the
+    /// table's entries can serve the load without running the walker.
+    static constexpr u32 MaxTableMap = 384;
+    u8 table_root_plus1[MaxTableMap]{};
+    u16 table_src[MaxTableMap]{};
+    /// True and the register / dword when flat offset `flat_offset` is such a copy.
+    bool TableSource(u32 flat_offset, u32& root_sgpr, u32& src_dword) const noexcept {
+        if (flat_offset < 16 || flat_offset - 16 >= MaxTableMap || table_root_plus1[flat_offset - 16] == 0) {
+            return false;
+        }
+        root_sgpr = table_root_plus1[flat_offset - 16] - 1u;
+        src_dword = table_src[flat_offset - 16];
+        return true;
+    }
+
     void Serialize(Serialization::Archive& ar) const;
     bool Deserialize(Serialization::Archive& ar);
 };

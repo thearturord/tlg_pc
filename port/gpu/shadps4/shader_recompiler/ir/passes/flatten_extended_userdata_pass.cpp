@@ -591,7 +591,7 @@ static inline void PopPtr(Xbyak::CodeGenerator& c) {
 }
 
 static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& pass_info,
-                         Xbyak::CodeGenerator& c) {
+                         Xbyak::CodeGenerator& c, PersistentSrtInfo& srt, u32 depth, u32 root_sgpr) {
     if (subtree->GetOpcode() == IR::Opcode::ReadConst && subtree->Flags<u16>() == 0 ||
         subtree->GetOpcode() == IR::Opcode::ReadConstBuffer &&
             subtree->Flags<IR::BufferInstInfo>().flatbuf_off_dw == 0) {
@@ -624,6 +624,11 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
         }
         c.mov(ptr[rsi + (pass_info.dst_off_dw << 2)], r10d);
 
+        if (depth == 1 && src_off_dw.IsImmediate() && pass_info.dst_off_dw >= NUM_USER_DATA_REGS &&
+            pass_info.dst_off_dw - NUM_USER_DATA_REGS < PersistentSrtInfo::MaxTableMap && root_sgpr < 255 && src_off_dw.U32() <= 0xffff) {
+            srt.table_root_plus1[pass_info.dst_off_dw - NUM_USER_DATA_REGS] = static_cast<u8>(root_sgpr + 1);
+            srt.table_src[pass_info.dst_off_dw - NUM_USER_DATA_REGS] = static_cast<u16>(src_off_dw.U32());
+        }
         SetFlatbufOffset(use, pass_info.dst_off_dw);
         pass_info.dst_off_dw++;
     }
@@ -631,7 +636,7 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
     // Then visit any children used as pointers
     for (const auto [src_off_dw, use] : *use_list) {
         if (pass_info.GetUsesAsPointer(use)) {
-            VisitPointer(src_off_dw, use, pass_info, c);
+            VisitPointer(src_off_dw, use, pass_info, c, srt, depth + 1, root_sgpr);
         }
     }
 
@@ -660,7 +665,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
 
     for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
-        VisitPointer(IR::Value(static_cast<u32>(sgpr_base)), root, pass_info, c);
+        VisitPointer(IR::Value(static_cast<u32>(sgpr_base)), root, pass_info, c, info.srt_info, 1, static_cast<u32>(sgpr_base));
     }
 
     c.ret();

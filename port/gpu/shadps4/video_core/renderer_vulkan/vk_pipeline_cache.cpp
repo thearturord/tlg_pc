@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
 #include <ranges>
+#include <set>
+#include <tuple>
 
 #include "common/hash.h"
 #include "common/io_file.h"
@@ -529,18 +532,39 @@ void PipelineCache::CapturePlan(StagePlan& out, Shader::Info* clone, const Shade
 namespace {
 /// N3b: true when every descriptor the stage's shader reads from the flat user data is a single load that the draw's record has a binding for (or is built from
 /// immediates), so the flat user data is not needed: no flat buffer for the shader, no FMask, no sampler post operation that reads another descriptor.
-bool StageCoveredByRecord(const Shader::Info& info, u32 record_stage, const Core::NativeDraw::ExecDraw& draw) {
-    if (!draw.bindings_complete || info.has_flatbuf || !info.fmasks.empty()) {
-        return false;
+/// N6.1 diagnostics: the first distinct loads of a stage that the record does not cover are logged with the record's list for that stage.
+void LogUncovered(const Shader::Info& info, u32 record_stage, const Core::NativeDraw::ExecDraw& draw, u32 kind, u32 offset, u32 dwords) {
+    static std::mutex mutex;
+    static std::set<std::tuple<u64, u32, u32>> seen;
+    static u32 logged = 0;
+    std::scoped_lock lk{mutex};
+    if (logged >= 80 || !seen.insert({info.pgm_hash, kind, offset}).second) {
+        return;
+    }
+    ++logged;
+    std::string list;
+    for (u32 i = 0; i < draw.binding_count; ++i) {
+        const auto& b = draw.bindings[i];
+        if (b.stage == record_stage) {
+            list += b.offset == 0xffff ? fmt::format(" {}:t{}[{}]", b.kind, b.table_sgpr, b.slot) : fmt::format(" {}:{}+{}", b.kind, b.offset, b.dwords);
+        }
+    }
+    LOG_ERROR(Render_Vulkan, "N6.1 uncovered: shader {:#x} stage {} kind {} (1 buffer 2 image 3 sampler) offset {} dwords {}; the record lists (kind:offset+dwords){}", info.pgm_hash, record_stage, kind, offset, dwords, list);
+}
+
+/// 0 covered, else why not (Core::NativeRegistry::NoteBinderReason).
+u32 StageCoverage(const Shader::Info& info, u32 record_stage, const Core::NativeDraw::ExecDraw& draw) {
+    if (!draw.bindings_complete) {
+        return 1;
+    }
+    if (info.has_flatbuf) {
+        return 2;
+    }
+    if (!info.fmasks.empty()) {
+        return 3;
     }
     const auto covered = [&](u32 kind, u32 offset, u32 dwords) {
-        for (u32 i = 0; i < draw.binding_count; ++i) {
-            const auto& b = draw.bindings[i];
-            if (b.stage == record_stage && b.kind == kind && offset >= b.offset && offset + dwords <= u32{b.offset} + b.dwords) {
-                return true;
-            }
-        }
-        return false;
+        return FindRecordWords(info, draw.bindings.data(), draw.binding_count, record_stage, kind, offset, dwords) != nullptr;
     };
     for (const auto& desc : info.buffers) {
         if (desc.IsSpecial()) {
@@ -549,21 +573,32 @@ bool StageCoveredByRecord(const Shader::Info& info, u32 record_stage, const Core
         if (desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::MultiLoad && desc.sharp_fetch.load_mask == 0) {
             continue; // built from immediates (and the program base)
         }
-        if (desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad || !covered(1, desc.sharp_fetch.offsets[0], 4)) {
-            return false;
+        if (desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
+            return 4;
+        }
+        if (!covered(1, desc.sharp_fetch.offsets[0], 4)) {
+            LogUncovered(info, record_stage, draw, 1, desc.sharp_fetch.offsets[0], 4);
+            return 5;
         }
     }
     for (const auto& desc : info.images) {
-        if (desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad || !covered(2, desc.sharp_fetch.offsets[0], desc.is_r128 ? 4 : 8)) {
-            return false;
+        if (desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad) {
+            return 6;
+        }
+        if (!covered(2, desc.sharp_fetch.offsets[0], desc.is_r128 ? 4 : 8)) {
+            LogUncovered(info, record_stage, draw, 2, desc.sharp_fetch.offsets[0], desc.is_r128 ? 4 : 8);
+            return 7;
         }
     }
     for (const auto& desc : info.samplers) {
-        if (!desc.FromWordsPossible() || !covered(3, desc.sharp_fetch.offsets[0], 4)) {
-            return false;
+        if (!desc.FromWordsPossible()) {
+            return 8;
+        }
+        if (!covered(3, desc.sharp_fetch.offsets[0], 4)) {
+            return 9;
         }
     }
-    return true;
+    return 0;
 }
 } // namespace
 
@@ -595,7 +630,7 @@ static u64 ExecKeyOf(u64 key, const FixedState& fixed) {
 }
 
 bool PipelineCache::PlanGraphicsTyped(u64 exec_key, const FixedState& fixed, std::span<const u32, 16> vertex_user_data,
-                                      std::span<const u32, 16> pixel_user_data, DrawPlan& plan, const Core::NativeDraw::ExecDraw* skip_flat_for) {
+                                      std::span<const u32, 16> pixel_user_data, DrawPlan& plan, const Core::NativeDraw::ExecDraw* skip_flat_for, u32 draw_class) {
     const auto found = exec_pipelines.find(ExecKeyOf(exec_key, fixed));
     if (found == exec_pipelines.end() || found->second.epoch != exec_epoch) {
         return false;
@@ -620,7 +655,11 @@ bool PipelineCache::PlanGraphicsTyped(u64 exec_key, const FixedState& fixed, std
         info->user_data = entry.stage_hw[s] == static_cast<u32>(HwStage::Vertex) ? vertex_user_data : pixel_user_data;
         if (skip_flat_for != nullptr) {
             const u32 record_stage = entry.stage_hw[s] == static_cast<u32>(HwStage::Vertex) ? 0 : 1;
-            skip_flat[s] = StageCoveredByRecord(*info, record_stage, *skip_flat_for);
+            const u32 coverage = StageCoverage(*info, record_stage, *skip_flat_for);
+            skip_flat[s] = coverage == 0;
+            if (coverage != 0) {
+                Core::NativeRegistry::NoteBinderReason(draw_class, record_stage, coverage);
+            }
             plan.any_flat_skipped |= skip_flat[s];
             Core::NativeRegistry::NoteBinder(skip_flat[s] ? 9 : 10);
         }
