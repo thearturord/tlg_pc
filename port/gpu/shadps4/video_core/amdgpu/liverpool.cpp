@@ -24,6 +24,7 @@
 #include "core/native_direct.h"
 #include "core/native_draw.h"
 #include "core/native_uploads.h"
+#include "core/native_drain_audit.h"
 #include "core/native_readbacks.h"
 #include "core/native_entry_dump.h"
 #include "core/native_resources.h"
@@ -790,6 +791,13 @@ void Liverpool::DrainRaster() {
 void Liverpool::RasterPush(RasterOp&& op, bool wait) {
     auto& sp = *split;
     op.audit_class = Core::ResourceAudit::front_class;
+    const bool audit_write = op.writes_memory;
+    const u32 audit_line = op.write_line;
+    if (op.has_call) {
+        Core::DrainAudit::Planned(); // N6a: the planning of this operation is done
+    } else if (!op.writes_memory) {
+        Core::DrainAudit::ClearNextWrite();
+    }
     if (op.writes_memory) {
         sp.pending_writes.fetch_add(1, std::memory_order_acq_rel);
         sp.last_write_line = op.write_line;
@@ -812,6 +820,9 @@ void Liverpool::RasterPush(RasterOp&& op, bool wait) {
         sp.front_state.store(0, std::memory_order_relaxed);
         sp.queue.push_back(std::move(op));
         target = sp.pushed.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (audit_write) {
+            Core::DrainAudit::WriteQueued(target, audit_line);
+        }
         sp.work_cv.notify_all();
         if (wait || sp.verify) {
             sp.done_cv.wait(lk, [&] { return sp.done.load(std::memory_order_acquire) >= target; });
@@ -832,11 +843,13 @@ void Liverpool::RasterRun(Common::UniqueFunction<void>&& func, bool wait, bool w
     RasterPush(std::move(op), wait);
 }
 
-void Liverpool::DrainRasterWrites() {
+void Liverpool::DrainRasterWrites(u32 caller) {
     auto& sp = *split;
     if (sp.pending_writes.load(std::memory_order_acquire) == 0) {
+        Core::DrainAudit::DrainNothingPending();
         return;
     }
+    Core::DrainAudit::DrainBegin(sp.done.load(std::memory_order_acquire), caller);
     ++sp.stat_write_drains;
     sp.front_state.store(2, std::memory_order_relaxed);
     const u64 wait_start = VideoCore::ReadbackStats::NowNs();
@@ -847,6 +860,7 @@ void Liverpool::DrainRasterWrites() {
                         [&] { return sp.pending_writes.load(std::memory_order_acquire) == 0; });
     }
     sp.front_state.store(0, std::memory_order_relaxed);
+    Core::DrainAudit::DrainWaited(VideoCore::ReadbackStats::NowNs() - wait_start);
     sp.SiteFor(sp.last_write_line)
         ->wait_ns.fetch_add(VideoCore::ReadbackStats::NowNs() - wait_start,
                             std::memory_order_relaxed);
@@ -928,7 +942,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
     auto& sp = *split;
     // The lookup below reads descriptor tables and shader code from guest memory: closures that
     // write guest memory (constant engine dumps, WriteData, DMA) must have run first.
-    DrainRasterWrites();
+    DrainRasterWrites(0);
     ++sp.stat_calls;
     if (call.kind == RasterCall::Kind::Draw || call.kind == RasterCall::Kind::DrawIndirect) {
         ++sp.stat_draws;
@@ -1152,6 +1166,11 @@ void Liverpool::ExecuteDma(const PM4DmaData& dma_packet) {
         return;
     }
     ASSERT(dma_data->command.das == 0);
+    if (dma_data->dst_sel == DmaDataDst::Memory || dma_data->dst_sel == DmaDataDst::MemoryUsingL2) {
+        Core::DrainAudit::SetNextWrite(dma_data->DstAddress<VAddr>(), dma_data->NumBytes());
+    } else {
+        Core::DrainAudit::SetNextWrite(Core::DrainAudit::NoGuestMemory, 0);
+    }
     RasterRun(
         [this, dma = *dma_data] {
             const auto* dma_data = &dma;
@@ -1212,6 +1231,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         // memory copy: destination, source and the number of bytes travel in the record
         native_tag_pending.valid = false;
         if (rasterizer) {
+            Core::DrainAudit::SetNextWrite(draw.args_addr, draw.a1);
             RasterRun(
                 [this, destination = static_cast<VAddr>(draw.args_addr), source = static_cast<VAddr>(draw.extra_addr), bytes = draw.a1,
                  staging = draw.dst_usage == 3 && Core::NativeReadbacks::ExplicitEnabled()] {
@@ -1225,6 +1245,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         // append / consume counter read-back: four bytes of GDS to the buffer's memory
         native_tag_pending.valid = false;
         if (rasterizer) {
+            Core::DrainAudit::SetNextWrite(draw.args_addr, sizeof(u32));
             RasterRun(
                 [this, destination = static_cast<VAddr>(draw.args_addr), source = draw.start_index,
                  staging = draw.dst_usage == 3 && Core::NativeReadbacks::ExplicitEnabled()] {
@@ -1238,6 +1259,11 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         // buffer fill (kind 8: GDS, an append / consume counter): destination, value and the number of dwords travel in the record
         native_tag_pending.valid = false;
         if (rasterizer) {
+            if (draw.kind == 8) {
+                Core::DrainAudit::SetNextWrite(Core::DrainAudit::NoGuestMemory, 0);
+            } else {
+                Core::DrainAudit::SetNextWrite(draw.args_addr, draw.a1 * 4u);
+            }
             RasterRun(
                 [this, destination = static_cast<VAddr>(draw.args_addr), value = draw.start_index, bytes = draw.a1 * 4u,
                  gds = draw.kind == 8] {
@@ -1301,6 +1327,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         // the device's buffer copy shader: a memory copy (two images of the same layout are copied as images)
         native_tag_pending.valid = false;
         if (rasterizer) {
+            Core::DrainAudit::SetNextWrite(draw.copy_destination, draw.copy_bytes);
             RasterRun(
                 [this, destination = static_cast<VAddr>(draw.copy_destination), source = static_cast<VAddr>(draw.copy_source),
                  bytes = draw.copy_bytes] { rasterizer->CopyBuffer(destination, source, bytes, false, false); },
@@ -1460,7 +1487,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             } else {
                 // an inline draw has its count with the draw packet (index_count), anything else carries it in the record
                 native_inputs_key = draw.inputs_key;
-                DrainRasterWrites();
+                DrainRasterWrites(1);
                 if (native_fixed_verify) {
                     left(3);
                 } else if (auto plan = rasterizer->PlanExecDraw(*draw.fixed, draw.fixed_stale, draw.stage_key, native_inputs_key, exec_vertex_user_data,
@@ -1552,7 +1579,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         if (call.kind == RasterCall::Kind::DrawIndirect) {
             params = Vulkan::DrawIndirectParams{.vertex_sgpr_offset = call.vertex_sgpr_offset, .instance_sgpr_offset = call.instance_sgpr_offset, .is_indirect = true};
         }
-        DrainRasterWrites();
+        DrainRasterWrites(2);
         Core::NativeAudit::SetPlanCaller(native_tag_pending.valid ? Core::NativeDraw::RecordCaller(native_tag_pending.seq) : 0);
         auto candidate = rasterizer->PlanDraw(exec_state, params, native_fixed, native_fixed_stale, native_fixed_verify, native_exec_key, native_inputs_key);
         Core::NativeDraw::Live().state_planned.fetch_add(1, std::memory_order_relaxed);
@@ -1600,9 +1627,11 @@ void Liverpool::CpWriteData(void* address, const u32* data, u32 data_size, u32 q
         }
         return;
     }
+    Core::DrainAudit::SetNextWrite(reinterpret_cast<u64>(address), data_size);
     RasterRun([note, address, data_size] { note(address, data_size); }, false, true);
     // Whether a fence write to the label is held back is decided here, in stream order.
     if (!DeferWriteBehindFences(address, data, data_size, queue)) {
+        Core::DrainAudit::SetNextWrite(reinterpret_cast<u64>(address), data_size);
         RasterRun(
             [address, words = std::vector<u32>(data, data + data_size / sizeof(u32)), data_size, queue] {
                 std::memcpy(address, words.data(), data_size);
@@ -2545,6 +2574,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                 // A command processor write to guest memory: done in order with the draws.
                 void* dst = dump_const->Address<void*>();
                 const u8* src = cblock.constants_heap.data() + dump_const->Offset();
+                Core::DrainAudit::SetNextWrite(reinterpret_cast<u64>(dst), dump_const->Size());
                 RasterRun(
                     [dst, bytes = std::vector<u8>(src, src + dump_const->Size())] {
                         std::memcpy(dst, bytes.data(), bytes.size());
@@ -3842,12 +3872,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, st
             }
             ASSERT(dma_data->command.das == 0);
             if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
+                Core::DrainAudit::SetNextWrite(Core::DrainAudit::NoGuestMemory, 0);
                 RasterRun([this, dma = *dma_data] {
                     rasterizer->FillBuffer(dma.dst_addr_lo, dma.NumBytes(), dma.data, true);
                 }, false, true);
             } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
                         dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                        dma_data->dst_sel == DmaDataDst::Gds) {
+                Core::DrainAudit::SetNextWrite(Core::DrainAudit::NoGuestMemory, 0);
                 RasterRun([this, dma = *dma_data] {
                     rasterizer->CopyBuffer(dma.dst_addr_lo, dma.SrcAddress<VAddr>(),
                                            dma.NumBytes(), true, false);
@@ -3855,6 +3887,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, st
             } else if (dma_data->src_sel == DmaDataSrc::Data &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                Core::DrainAudit::SetNextWrite(dma_data->DstAddress<VAddr>(), dma_data->NumBytes());
                 RasterRun([this, dma = *dma_data] {
                     rasterizer->FillBuffer(dma.DstAddress<VAddr>(), dma.NumBytes(), dma.data,
                                            false);
@@ -3862,6 +3895,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, st
             } else if (dma_data->src_sel == DmaDataSrc::Gds &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                Core::DrainAudit::SetNextWrite(dma_data->DstAddress<VAddr>(), dma_data->NumBytes());
                 RasterRun([this, dma = *dma_data] {
                     rasterizer->CopyBuffer(dma.DstAddress<VAddr>(), dma.src_addr_lo,
                                            dma.NumBytes(), false, true);
@@ -3880,6 +3914,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, st
                     header->type == 3 && header->type3.opcode == PM4ItOpcode::DispatchDirect) {
                     indirect_patches.emplace_back(header, src_addr);
                 } else {
+                    Core::DrainAudit::SetNextWrite(dst_addr, num_bytes);
                     RasterRun([this, dst_addr, src_addr, num_bytes] {
                         rasterizer->CopyBuffer(dst_addr, src_addr, num_bytes, false, false);
                     }, false, true);

@@ -9,6 +9,7 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "core/native_drain_audit.h"
 #include "core/native_draw.h"
 #include "core/native_registry.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -32,6 +33,30 @@ using Shader::Output;
 using Shader::SwStage;
 
 namespace {
+
+// N6a (TLG_DRAIN_AUDIT): the guest reads of the planning, see core/native_drain_audit.h
+void NoteCode(const Shader::ShaderParams& params) {
+    Core::DrainAudit::Read(Core::DrainAudit::ReadCode, reinterpret_cast<u64>(params.code.data()), params.code.size_bytes());
+}
+
+void NoteFlat(const Shader::Info& info) {
+    if (info.srt_info.walker_func && Core::DrainAudit::Enabled()) {
+        Core::DrainAudit::WalkerRead(info.user_data.data(), static_cast<u32>(info.user_data.size()));
+    }
+}
+
+void NoteFetch(const Shader::Gcn::VertexAttribute& attrib, const Shader::Info& info) {
+    if (attrib.sgpr_base == Shader::IR::NumScalarRegs || !Core::DrainAudit::Enabled()) {
+        return;
+    }
+    const auto ud = info.UserData();
+    if (attrib.sgpr_base + 1u >= ud.size()) {
+        return;
+    }
+    u64 pointer = 0;
+    std::memcpy(&pointer, &ud[attrib.sgpr_base], sizeof(pointer));
+    Core::DrainAudit::Read(Core::DrainAudit::ReadFetch, (pointer & 0xFFFFFFFFFFFFULL) + u64(attrib.dword_offset) * 4, sizeof(AmdGpu::Buffer));
+}
 
 } // Anonymous namespace
 
@@ -370,10 +395,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                     break;
                 }
                 const auto stage_params = AmdGpu::GetParams(*pgm);
+                NoteCode(stage_params);
                 auto* info = const_cast<Shader::Info*>(infos[s]);
                 info->pgm_base = stage_params.Base();
                 info->user_data = stage_params.user_data;
                 info->RefreshFlatBuf();
+                NoteFlat(*info);
             }
             if (resolved_all) {
                 live.stage_key_hits.fetch_add(1, std::memory_order_relaxed);
@@ -599,6 +626,7 @@ bool PipelineCache::PlanGraphicsTyped(u64 exec_key, const FixedState& fixed, std
         }
         if (!skip_flat[s]) {
             info->RefreshFlatBuf();
+            NoteFlat(*info);
         }
     }
     plan.pipeline = entry.pipeline;
@@ -841,6 +869,7 @@ bool PipelineCache::RefreshGraphicsStages() {
         }
 
         const auto params = AmdGpu::GetParams(*pgm);
+        NoteCode(params);
         stage_hw[stage_out_idx] = stage_in_idx;
         stage_base[stage_out_idx] = params.Base();
         std::tie(infos[stage_out_idx], modules[stage_out_idx], key.stage_hashes[stage_out_idx]) =
@@ -927,6 +956,7 @@ bool PipelineCache::RefreshGraphicsStages() {
         // Stride will still be handled outside the pipeline using dynamic state.
         u32 vertex_binding = 0;
         for (const auto& attrib : fetch_shader->attributes) {
+            NoteFetch(attrib, *vs_info);
             const auto& buffer = attrib.GetSharp(*vs_info);
             ASSERT_MSG(vertex_binding < MaxVertexBufferCount,
                        "Vertex attribute binding count exceeded limit: {} >= {}", vertex_binding,
@@ -943,6 +973,7 @@ bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = *lookup_cs;
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
+    NoteCode(cs_params);
     std::tie(infos[0], modules[0], compute_key.value) =
         GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
     return true;
@@ -1015,6 +1046,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     {
         VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StageFlatBuf};
         info.RefreshFlatBuf();
+        NoteFlat(info);
     }
 
     // Most lookups pick the same variant as the previous one: check it first, without building

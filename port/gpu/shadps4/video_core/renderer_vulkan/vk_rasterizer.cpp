@@ -17,6 +17,7 @@
 #include "core/native_resources.h"
 #include "core/native_pass.h"
 #include "core/native_updates.h"
+#include "core/native_drain_audit.h"
 #include "core/native_uploads.h"
 #include "core/native_registry.h"
 #include "core/resource_audit.h"
@@ -2810,6 +2811,8 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
             ring_immutable.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
+        // N6a: the decisions below read the buffer cache's state of this range (GPU written, pending writes) and then its bytes; a queued write to the range changes both
+        Core::DrainAudit::Read(Core::DrainAudit::ReadRingConstant, address, size);
         if (Core::NativeUploads::RingPrecise()) {
             // N5e: the bytes decide, not the 4 KB page that holds them
             if (buffer_cache.IsRangeGpuWritten(address, size)) {
@@ -2934,6 +2937,7 @@ void Rasterizer::FrontGeometryRing(DrawPlan& plan, u64 done, bool indexed, u32 i
             Core::NativeUploads::NoteGeometry(base + 0);
             return;
         }
+        Core::DrainAudit::Read(kind == GeometryVertex ? Core::DrainAudit::ReadRingVertex : Core::DrainAudit::ReadRingIndex, address, size); // N6a: state and bytes of the range
         const bool gpu_written = Core::NativeUploads::RingPrecise() ? buffer_cache.IsRangeGpuWritten(address, size) : buffer_cache.IsRegionGpuModified(address, size);
         if (gpu_written) {
             Core::NativeUploads::NoteGeometry(6);
@@ -3000,6 +3004,9 @@ void Rasterizer::FrontGeometryRing(DrawPlan& plan, u64 done, bool indexed, u32 i
                 }
             }
             AmdGpu::Buffer buffer;
+            if (attrib.sgpr_base != Shader::IR::NumScalarRegs) {
+                Core::DrainAudit::Read(Core::DrainAudit::ReadFetch, reinterpret_cast<u64>(table + attrib.dword_offset), sizeof(buffer));
+            }
             std::memcpy(&buffer, table + attrib.dword_offset, sizeof(buffer));
             buffer.base_address += attrib.inst_offset;
             if (buffer.base_address != 0 && buffer.GetSize() > 0) {

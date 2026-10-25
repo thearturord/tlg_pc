@@ -22,6 +22,7 @@
 #include "core/native_pass.h"
 #include "core/native_registry.h"
 #include "core/native_updates.h"
+#include "core/native_drain_audit.h"
 #include "core/native_uploads.h"
 #include "core/native_resources.h"
 #include "core/memory.h"
@@ -613,6 +614,8 @@ void RegisterBuiltins() {
              });
     Register("/uploads", "(N5c, TLG_NATIVE_UPLOADS=1) announced writes, how many were published, queued before records and uploaded before the draws that use them",
              [](const Params&) { return Core::NativeUploads::Report(); });
+    Register("/drain", "(N6a, TLG_DRAIN_AUDIT=1) the command processor's wait for queued memory writes: did any guest read of the planning touch a pending write",
+             [](const Params&) { return Core::DrainAudit::Report(); });
     Register("/threads", "CPU use of the busiest threads since the previous call", Threads);
     Register("/memory", "?addr=0x..&size=N (max 65536): guest memory as hex", Memory);
     Register("/log", "?lines=N&filter=text&file=shad_log.txt: tail of a log file", Log);

@@ -301,7 +301,7 @@ private:
     bool native_follow_pending{}; ///< an executed draw waits for its draw packet (index count)
     void RasterPush(RasterOp&& op, bool wait);
     /// Blocks until every queued closure that writes guest memory has run.
-    void DrainRasterWrites();
+    void DrainRasterWrites(u32 caller = 3);
     /// A command processor write to guest memory, done in order with the draws.
     void CpWriteData(void* address, const u32* data, u32 data_size, u32 queue);
     /// Blocks until the raster thread has executed everything queued so far.
