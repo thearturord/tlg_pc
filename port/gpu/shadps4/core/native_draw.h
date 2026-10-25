@@ -104,6 +104,10 @@ void SetImageBase(VAddr base);
 VAddr ImageBase();
 /// True on a thread that is running a guarded record build: a fault there is handled by the builder, not fatal.
 bool IsGuarded();
+/// N6.3i: runs `fn(argument)` with the same fault guard as the record builder; false when it faulted.
+bool GuardedCall(void (*fn)(void*), void* argument);
+/// N6.3i (cascade generator): issues `DrawIndexedCommon(ctx, count, first, 0, 1)` as the depth pass loop does at its call site, through the draw hook (the tag, then the engine's function).
+void IssueIndexedDraw(u64 ctx, u64 count, u64 first);
 
 /// N6.3e (shadow generator): builds the record of a draw from `ctx`, which may be a private copy of the device context patched from the snapshot instead of the live one. Returns
 /// the record number, 0 when the build faulted. The record is not tagged into any command stream and nothing refers to it.

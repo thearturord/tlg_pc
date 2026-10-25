@@ -40,6 +40,7 @@
 #include "core/native_resources.h"
 #include "core/native_updates.h"
 #include "core/native_zpass_audit.h"
+#include "core/native_zpass_gen.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/native_draw_tag.h"
@@ -4928,6 +4929,9 @@ u64 PS4_SYSV_ABI GarlicPoolPro(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u
 }
 
 u64 PS4_SYSV_ABI TagIndexed(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (NativeZPassGen::VerifyActive()) {
+        NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 0, ctx, static_cast<u32>(a1), static_cast<u32>(a2));
+    }
     if (NativeZPass::Enabled()) {
         NativeZPass::NoteDraw(ret - ImageBase() + 0x1000000, 0, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a4), Rd<u64>(ctx, Ctx::VertexShader), Rd<u64>(ctx, Ctx::PixelShader), ctx);
     }
@@ -6704,6 +6708,12 @@ u64 PS4_SYSV_ABI PrimitiveBind(u64 render_device, u64 a1, u64 a2, u64 a3, u64 a4
 
 /// RenderDev_DrawZPass(render device, pass description): the audit builds the draws the loop should issue from the snapshot it reads (native_zpass_audit.h).
 u64 PS4_SYSV_ABI ZPassEnter(u64 render_device, u64 desc, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (NativeZPassGen::Enabled()) {
+        static const u64 loop_entry = Core::GuestHooks::OriginalEntry("DrawZPass");
+        if (NativeZPassGen::HandlePass(render_device, desc, loop_entry)) {
+            return 1;
+        }
+    }
     if (!NativeZPass::Enabled()) {
         return 0;
     }
@@ -7291,6 +7301,33 @@ u32 CompareRecords(u64 seq_a, u64 seq_b, std::vector<std::string>& differences) 
 
 bool IsGuarded() {
     return guard_active;
+}
+
+bool GuardedCall(void (*fn)(void*), void* argument) {
+    struct Pack {
+        void (*fn)(void*);
+        void* argument;
+    } pack{fn, argument};
+    bool faulted = false;
+    RunGuarded(
+        [](void* p) -> u64 {
+            auto* pack = static_cast<Pack*>(p);
+            pack->fn(pack->argument);
+            return 0;
+        },
+        &pack, &faulted);
+    return !faulted;
+}
+
+void IssueIndexedDraw(u64 ctx, u64 count, u64 first) {
+    // the draw the depth pass loop makes (call site 0x01c76433 in RenderDev_DrawZPass), so the draw hook sees the same call site as for a draw of the engine's own loop: the tag, then the original
+    // draw function unless the tag took the draw over
+    static const u64 original = Core::GuestHooks::OriginalEntry("DrawIndexedCommon");
+    const u64 site = ImageBase() + (0x01c76433ull - 0x1000000);
+    if (TagIndexed(ctx, count, first, 0, 1, 0, site) != 0 || original == 0) {
+        return;
+    }
+    reinterpret_cast<GuestDraw6>(original)(ctx, count, first, 0, 1, 0);
 }
 
 VAddr ImageBase() {
