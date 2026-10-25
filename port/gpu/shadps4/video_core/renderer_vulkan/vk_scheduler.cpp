@@ -145,9 +145,9 @@ void SchedulerCore::RecordStamp(u8 kind, u64 detail) {
     CommandBuffer().record([pool, index](vk::CommandBuffer cmdbuf) { cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, index); });
 }
 
-void SchedulerCore::StampDispatch(bool begin) {
+void SchedulerCore::StampDispatch(bool begin, u64 program) {
     if (CaptureStamps()) {
-        RecordStamp(begin ? GpuStampDispatchBegin : GpuStampDispatchEnd, 0);
+        RecordStamp(begin ? GpuStampDispatchBegin : GpuStampDispatchEnd, program);
     }
 }
 

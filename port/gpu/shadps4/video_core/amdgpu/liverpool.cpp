@@ -2084,7 +2084,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                     total_ns += s->ns;
                     total_count += s->count;
                 }
-                for (size_t i = 0; i < list.size() && i < 40; ++i) {
+                for (size_t i = 0; i < list.size() && i < 200; ++i) {
                     const auto& s = *list[i];
                     out.push_back({{"ghidra_caller", s.caller ? s.caller - Core::NativeDraw::ImageBase() + 0x1000000 : 0},
                                    {"program", fmt::format("{:#x}", s.program)},

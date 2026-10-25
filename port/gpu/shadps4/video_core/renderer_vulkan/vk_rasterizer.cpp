@@ -1209,10 +1209,10 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    scheduler.StampDispatch(true);
+    scheduler.StampDispatch(true, cs_program.address);
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
-    scheduler.StampDispatch(false);
+    scheduler.StampDispatch(false, cs_program.address);
     DebugState.IncDispatch();
     ++recorded_work;
 

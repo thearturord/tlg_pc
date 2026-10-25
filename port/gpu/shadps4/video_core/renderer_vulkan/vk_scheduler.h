@@ -413,7 +413,7 @@ public:
     void NoteDraw() noexcept {
         ++pass_draws;
     }
-    void StampDispatch(bool begin);
+    void StampDispatch(bool begin, u64 program = 0);
 
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
@@ -707,8 +707,8 @@ public:
     void NoteDraw() noexcept {
         Active().NoteDraw();
     }
-    void StampDispatch(bool begin) {
-        Active().StampDispatch(begin);
+    void StampDispatch(bool begin, u64 program = 0) {
+        Active().StampDispatch(begin, program);
     }
     const RenderState& GetRenderState() const {
         return ActiveConst().GetRenderState();
