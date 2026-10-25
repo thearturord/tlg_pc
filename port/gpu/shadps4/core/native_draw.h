@@ -4,6 +4,7 @@
 #pragma once
 
 #include <vector>
+#include <nlohmann/json_fwd.hpp>
 
 #include <array>
 #include <string>
@@ -113,6 +114,8 @@ void IssueIndirectDraw(u64 ctx, u64 buffer, u64 offset, u64 site_ghidra);
 /// Census of the draws the generators issue (`TLG_GEN_CENSUS=1`): kind 0 indexed, 1 indirect; calls, ticks in the tag, ticks in the engine draw function, draws the tag took over.
 void TagCensusRead(std::array<u64, 5>& ticks, u64& calls);
 void UserDataCensusRead(u64& scan_ticks, u64& fill_ticks, u64& tables, u64& slots);
+/// N7 groundwork: the shader input table audit of the generated draws (native_draw.cpp, AuditBindings).
+void InputTableAuditRead(nlohmann::json& out);
 void MergeCensusRead(std::array<u64, 6>& values);
 void RecordCacheCensusRead(u64& lookups, u64& hits_1m, u64& hits_64k);
 void MakeRecordCensusRead(std::array<u64, 6>& ticks, u64& calls);

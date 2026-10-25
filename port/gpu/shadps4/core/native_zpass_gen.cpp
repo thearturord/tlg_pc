@@ -2557,6 +2557,11 @@ nlohmann::json Report() {
         }
         out["engine_call_census"] = census;
     }
+    if (CensusOn()) {
+        nlohmann::json audit = nlohmann::json::object();
+        NativeDraw::InputTableAuditRead(audit);
+        out["input_table_audit"] = audit;
+    }
     out["verify_difference_kinds"] = s.mismatch_kinds;
     out["special_entry_classes"] = s.special_classes;
     out["verify_words_that_moved_by_view_kind_offset"] = s.raced_words;

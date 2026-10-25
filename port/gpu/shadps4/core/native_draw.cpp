@@ -4644,6 +4644,149 @@ bool RecordsEqual(const NativeRecord& a, const NativeRecord& b, bool bindings_to
     }
     return true;
 }
+/// Shader input table audit (N7 groundwork, `TLG_GEN_CENSUS=1`): per pipeline (vertex and pixel shader binaries) of the generated draws, the entries of both input usage tables and, per binding
+/// a record carries (stage, kind, slot, table or immediate), how many draws used it and how many different resources / descriptor contents it saw. A slot whose resource or contents change
+/// from draw to draw is per draw data; one that never changes within a pass is per pass data.
+struct InputEntry {
+    u8 type, slot, start, flags;
+};
+struct BindingStat {
+    u64 draws{0};
+    std::unordered_set<u64> ids, contents;
+    u32 dwords{0};
+    bool table_entry{false};
+    u8 table_sgpr{0xff};
+    u64 changes{0}; ///< draws whose descriptor contents differ from the previous draw of the same thread in the same pipeline
+};
+struct PipelineAudit {
+    u64 draws{0};
+    u32 pass_class{0};
+    std::vector<InputEntry> vs, ps;
+    std::map<u32, BindingStat> bindings; // stage << 24 | kind << 16 | slot
+};
+std::mutex audit_mutex;
+std::map<std::pair<u64, u64>, PipelineAudit> audit_pipelines;
+void AuditBindings(u64 seq, u32 pass_class) {
+    const NativeRecord& r = Slot(seq);
+    if (r.vs_gnm == 0 || r.ps_gnm == 0) {
+        return;
+    }
+    std::scoped_lock lock{audit_mutex};
+    const std::pair<u64, u64> p_key{r.vs_gnm, r.ps_gnm};
+    auto [it, fresh] = audit_pipelines.try_emplace(p_key);
+    PipelineAudit& p = it->second;
+    if (fresh) {
+        p.pass_class = pass_class;
+        for (u32 stage = 0; stage < 2; ++stage) {
+            const u64 gnm = stage == 0 ? r.vs_gnm : r.ps_gnm;
+            const u64 offset = stage == 0 ? 0x28 : 0x3c;
+            const u32 count = std::min<u32>(Rd<u8>(gnm, 3), 40);
+            for (u32 i = 0; i < count; ++i) {
+                const u64 e = gnm + offset + i * 4;
+                (stage == 0 ? p.vs : p.ps).push_back({Rd<u8>(e, 0), Rd<u8>(e, 1), Rd<u8>(e, 2), Rd<u8>(e, 3)});
+            }
+        }
+    }
+    ++p.draws;
+    for (u32 i = 0; i < r.binding_count; ++i) {
+        const RecordBinding& b = r.bindings[i];
+        BindingStat& s = p.bindings[u32{b.stage} << 24 | u32{b.kind} << 16 | (b.offset != 0xffff ? 0x8000u | b.offset : b.slot)];
+        ++s.draws;
+        s.dwords = b.dwords;
+        s.table_entry = b.offset == 0xffff;
+        s.table_sgpr = b.table_sgpr;
+        if (s.ids.size() < 4096) {
+            s.ids.insert(b.id);
+        }
+        u64 h = 0xcbf29ce484222325ull;
+        for (u32 w = 0; w < b.dwords && w < 8; ++w) {
+            h = (h ^ b.words[w]) * 0x100000001b3ull;
+        }
+        if (s.contents.size() < 4096) {
+            s.contents.insert(h);
+        }
+        thread_local std::map<std::tuple<u64, u64, u32>, u64> last;
+        auto& previous = last[{p_key.first, p_key.second, u32{b.stage} << 24 | u32{b.kind} << 16 | (b.offset != 0xffff ? 0x8000u | b.offset : b.slot)}];
+        if (previous != h) {
+            if (previous != 0) {
+                ++s.changes;
+            }
+            previous = h;
+        }
+    }
+}
+void InputAuditRead(nlohmann::json& out) {
+    std::scoped_lock lock{audit_mutex};
+    static constexpr const char* classes[4] = {"depth", "g_buffer", "forward", "other"};
+    nlohmann::json pipelines = nlohmann::json::array();
+    struct Aggregate {
+        u32 pipelines{0};
+        u64 draws{0};
+        u64 max_ids{0}, max_contents{0};
+        u64 varying_pipelines{0}; // pipelines in which the slot saw more than one resource or content
+    };
+    std::map<std::tuple<u32, u32, u32, u32>, Aggregate> aggregate;
+    std::vector<const std::pair<const std::pair<u64, u64>, PipelineAudit>*> sorted;
+    for (const auto& entry : audit_pipelines) {
+        sorted.push_back(&entry);
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const auto* a, const auto* b) { return a->second.draws > b->second.draws; });
+    for (const auto* entry : sorted) {
+        const PipelineAudit& p = entry->second;
+        for (const auto& [key, s] : p.bindings) {
+            auto& a = aggregate[{p.pass_class, key >> 24, (key >> 16) & 0xff, key & 0xffff}];
+            ++a.pipelines;
+            a.draws += s.draws;
+            a.max_ids = std::max<u64>(a.max_ids, s.ids.size());
+            a.max_contents = std::max<u64>(a.max_contents, s.contents.size());
+            a.varying_pipelines += (s.ids.size() > 1 || s.contents.size() > 1) ? 1 : 0;
+        }
+    }
+    nlohmann::json agg = nlohmann::json::array();
+    for (const auto& [key, a] : aggregate) {
+        agg.push_back({{"pass", classes[std::get<0>(key)]},
+                       {"stage", std::get<1>(key) == 0 ? "vertex" : "pixel"},
+                       {"kind", std::get<2>(key) == 1 ? "buffer" : std::get<2>(key) == 2 ? "image" : "sampler"},
+                       {"slot_or_user_data_start", (std::get<3>(key) & 0x8000) != 0 ? fmt::format("user data {}", std::get<3>(key) & 0x7fff) : fmt::format("table slot {}", std::get<3>(key))},
+                       {"pipelines_using_it", a.pipelines},
+                       {"draws", a.draws},
+                       {"pipelines_where_it_varies_between_draws", a.varying_pipelines},
+                       {"max_distinct_resources_in_a_pipeline", a.max_ids},
+                       {"max_distinct_descriptor_contents_in_a_pipeline", a.max_contents}});
+    }
+    out["by_pass_stage_kind_slot"] = agg;
+    for (size_t n = 0; n < sorted.size() && n < 24; ++n) {
+        const PipelineAudit& p = sorted[n]->second;
+        nlohmann::json j = {{"pass", classes[p.pass_class]}, {"vertex_shader_binary", fmt::format("{:#x}", sorted[n]->first.first)}, {"pixel_shader_binary", fmt::format("{:#x}", sorted[n]->first.second)}, {"draws", p.draws}};
+        const auto dump = [](const std::vector<InputEntry>& entries) {
+            nlohmann::json a = nlohmann::json::array();
+            for (const auto& e : entries) {
+                a.push_back(fmt::format("type {} slot {} start {} flags {:#x}", e.type, e.slot, e.start, e.flags));
+            }
+            return a;
+        };
+        j["vertex_input_table"] = dump(p.vs);
+        j["pixel_input_table"] = dump(p.ps);
+        nlohmann::json b = nlohmann::json::array();
+        for (const auto& [key, s] : p.bindings) {
+            b.push_back({{"stage", (key >> 24) == 0 ? "vertex" : "pixel"},
+                         {"kind", ((key >> 16) & 0xff) == 1 ? "buffer" : ((key >> 16) & 0xff) == 2 ? "image" : "sampler"},
+                         {"slot_or_user_data_start", (key & 0x8000) != 0 ? fmt::format("user data {}", key & 0x7fff) : fmt::format("table slot {}", key & 0xffff)},
+                         {"draws", s.draws},
+                         {"dwords", s.dwords},
+                         {"in_a_table", s.table_entry},
+                         {"table_sgpr", s.table_sgpr},
+                         {"distinct_resources", s.ids.size()},
+                         {"distinct_descriptor_contents", s.contents.size()},
+                         {"draws_that_differ_from_the_previous_draw", s.changes}});
+        }
+        j["bindings"] = b;
+        pipelines.push_back(j);
+    }
+    out["pipelines_by_draws"] = pipelines;
+    out["pipelines_total"] = sorted.size();
+}
+
 void CountMerge(u64 seq) {
     thread_local std::array<u64, 16> recent{};
     thread_local u32 next = 0;
@@ -4849,6 +4992,7 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
     clock.Mark(3);
     if (seq != 0 && generator_issuing && TagCensus()) {
         CountMerge(seq);
+        AuditBindings(seq, cls);
     }
     std::memcpy(&words[9], &seq, sizeof(u64));
     words[11] = 0;
@@ -7588,6 +7732,10 @@ void UserDataCensusRead(u64& scan_ticks, u64& fill_ticks, u64& tables, u64& slot
     fill_ticks = um_ticks[1].load();
     tables = um_ticks[2].load();
     slots = um_ticks[3].load();
+}
+
+void InputTableAuditRead(nlohmann::json& out) {
+    InputAuditRead(out);
 }
 
 void MergeCensusRead(std::array<u64, 6>& values) {
