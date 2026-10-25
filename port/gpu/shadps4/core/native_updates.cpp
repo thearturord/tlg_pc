@@ -175,8 +175,20 @@ bool SupersedeEnabled() {
     return on;
 }
 
+namespace {
+std::atomic<bool> audit_faults{[] {
+    const char* e = std::getenv("TLG_UPDATE_AUDIT");
+    return e != nullptr && *e != 0 && *e != '0';
+}()};
+} // namespace
+
+bool AuditFaults() {
+    return audit_faults.load(std::memory_order_relaxed);
+}
+
 void Start() {
     enabled.store(true, std::memory_order_relaxed);
+    audit_faults.store(true, std::memory_order_relaxed);
 }
 
 
@@ -197,7 +209,9 @@ void NoteUnmap(u64 resource_id) {
 
 void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u64 memory, u64 caller, u64 requested_size) {
     (void)caller;
-    NoteAnnouncerThread(0);
+    if (AuditFaults()) {
+        NoteAnnouncerThread(0);
+    }
     maps.total.fetch_add(1, std::memory_order_relaxed);
     maps.by_type[map_type < 8 ? map_type : 7].fetch_add(1, std::memory_order_relaxed);
     maps.by_usage[usage < 4 ? usage : 3].fetch_add(1, std::memory_order_relaxed);
@@ -221,12 +235,17 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread) {
     if (address == 0 || size == 0) {
         return;
     }
-    NoteAnnouncerThread(writer);
+    if (AuditFaults()) {
+        NoteAnnouncerThread(writer);
+    }
     NativeUploads::Announce(writer, address, size, thread == render_thread.load(std::memory_order_relaxed), NativeDraw::NextSeq());
     if (supersede_fn != nullptr && SupersedeEnabled() && (writer == 5 || writer == 6 || (writer == 0 && thread == render_thread.load(std::memory_order_relaxed)))) {
         supersede_fn(address, size);
         superseded_ranges.fetch_add(1, std::memory_order_relaxed);
         superseded_bytes.fetch_add(size, std::memory_order_relaxed);
+    }
+    if (!AuditFaults()) {
+        return; // the windows below only serve the fault audit
     }
     const u64 now = NowNs();
     std::scoped_lock lock{mutex};

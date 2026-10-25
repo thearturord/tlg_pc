@@ -15,6 +15,9 @@
 namespace Core::NativeUpdates {
 
 extern std::atomic<bool> enabled;
+/// True only for the audit (`TLG_UPDATE_AUDIT=1`, `/updates?start=1`): the per fault classification, the announcement windows and the thread census. The announcements
+/// themselves (uploads, supersede) run with `enabled` alone and cost much less.
+[[nodiscard]] bool AuditFaults();
 
 void Start();
 /// Called on the render thread (the thread of RenderDev::BeginRecording): announcements are counted as made on that thread or elsewhere.

@@ -3437,7 +3437,7 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     Core::DebugServer::NoteWriteFault(addr);
     Core::NativeResources::NoteCpuWrite(addr, size);
-    if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
+    if (Core::NativeUpdates::AuditFaults()) {
         Core::NativeUpdates::NoteFault(addr, size);
         if (Core::NativeUploads::OnDemandAudit() && buffer_cache.IsRangeGpuWritten(addr, size)) {
             Core::NativeUpdates::NoteGpuWrittenDirtied(addr, size);

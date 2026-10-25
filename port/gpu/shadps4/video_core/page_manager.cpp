@@ -497,7 +497,7 @@ struct SignalImpl : public PageManager::Impl {
                     std::memcpy(stack_words, reinterpret_cast<const void*>(rsp), sizeof(stack_words));
                 }
 #endif
-                if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
+                if (Core::NativeUpdates::AuditFaults()) {
                     // update audit: the stack words are the first three return-address-looking words of the game image above the stack pointer (a leaf routine such as
                     // memcpy has no useful frame), so the writer can be named
                     const u64 image = Core::NativeDraw::ImageBase();
