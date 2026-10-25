@@ -105,6 +105,13 @@ VAddr ImageBase();
 /// True on a thread that is running a guarded record build: a fault there is handled by the builder, not fatal.
 bool IsGuarded();
 
+/// N6.3e (shadow generator): builds the record of a draw from `ctx`, which may be a private copy of the device context patched from the snapshot instead of the live one. Returns
+/// the record number, 0 when the build faulted. The record is not tagged into any command stream and nothing refers to it.
+u64 ShadowBuildRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3);
+/// Compares two records (the one built from the live context and the one built from the shadow context) and appends one line per difference: registers (except the pointers to the
+/// per draw tables), bindings, geometry ids, the descriptor key, flags and extents. Returns the number of differences.
+u32 CompareRecords(u64 seq_a, u64 seq_b, std::vector<std::string>& differences);
+
 /// Raster thread: compares the register state recorded for tagged draw `seq` with the raster thread's register file
 /// (`reg_array`, index = register dword offset) and counts the differences (shadow mode).
 void VerifyRecord(u64 seq, const u32* reg_array);

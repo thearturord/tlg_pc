@@ -2500,6 +2500,83 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
 /// Guest thread: the record of a dispatch from the device context's compute stage (the shader at ctx + 0x4670,
 /// resource tables of API stage 5, unordered access views at ctx + 0x2098): the user data registers and the
 /// program registers the compute constant update engine writes, and the dispatch arguments.
+u64 ShadowBuildRecordImpl(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3) {
+    auto* saved = v2_collect;
+    v2_collect = nullptr;
+    const u64 seq = Guarded([&] { return MakeRecord(ctx, kind, a1, a2, a3, 0); });
+    v2_collect = saved;
+    return seq;
+}
+
+u32 CompareRecordsImpl(u64 seq_a, u64 seq_b, std::vector<std::string>& out) {
+    const auto& a = Slot(seq_a);
+    const auto& b = Slot(seq_b);
+    u32 differences = 0;
+    const auto note = [&](std::string text) {
+        ++differences;
+        out.push_back(std::move(text));
+    };
+    if (a.kind != b.kind) {
+        note("kind");
+    }
+    if (a.flags != b.flags) {
+        note(fmt::format("flags {:#x} / {:#x}", a.flags, b.flags));
+    }
+    if (a.reason != b.reason) {
+        note(fmt::format("reason {:#x} / {:#x}", a.reason, b.reason));
+    }
+    if (a.desc_key != b.desc_key) {
+        note("descriptor key");
+    }
+    if (a.cb_extent != b.cb_extent || a.cb_extent_mask != b.cb_extent_mask || a.db_extent != b.db_extent) {
+        note("render target extents");
+    }
+    if (a.fixed != b.fixed) {
+        note("fixed state object");
+    }
+    // registers that point to a per draw table differ by address: leave them out
+    std::array<bool, 65536> skip{};
+    for (u32 i = 0; i < a.check_count && i < a.checks.size(); ++i) {
+        const u32 reg = a.checks[i].reg;
+        if (reg < skip.size()) {
+            skip[reg] = true;
+        }
+        if (reg + 1 < skip.size()) {
+            skip[reg + 1] = true;
+        }
+    }
+    if (a.count != b.count) {
+        note(fmt::format("register count {} / {}", a.count, b.count));
+    } else {
+        for (u32 i = 0; i < a.count; ++i) {
+            if (a.regs[i].index != b.regs[i].index) {
+                note(fmt::format("register #{} index {:#x} / {:#x}", i, a.regs[i].index, b.regs[i].index));
+                break;
+            }
+            if (a.regs[i].value != b.regs[i].value && !(a.regs[i].index < skip.size() && skip[a.regs[i].index])) {
+                note(fmt::format("register {:#x} value {:#x} / {:#x}", a.regs[i].index, a.regs[i].value, b.regs[i].value));
+            }
+        }
+    }
+    if (a.binding_count != b.binding_count || a.bindings_overflow != b.bindings_overflow) {
+        note(fmt::format("binding count {} / {}", a.binding_count, b.binding_count));
+    } else {
+        for (u32 i = 0; i < a.binding_count; ++i) {
+            const auto& x = a.bindings[i];
+            const auto& y = b.bindings[i];
+            if (x.stage != y.stage || x.kind != y.kind || x.offset != y.offset || x.slot != y.slot || x.dwords != y.dwords || x.table_sgpr != y.table_sgpr || x.id != y.id ||
+                std::memcmp(x.words, y.words, sizeof(x.words)) != 0) {
+                note(fmt::format("binding {} (stage {} kind {} slot {} offset {:#x} id {:#x} / id {:#x})", i, x.stage, x.kind, x.slot, x.offset, x.id, y.id));
+                break;
+            }
+        }
+    }
+    if (a.geometry_id_count != b.geometry_id_count || std::memcmp(a.geometry_ids.data(), b.geometry_ids.data(), a.geometry_id_count * sizeof(u64)) != 0) {
+        note(fmt::format("geometry ids ({} / {})", a.geometry_id_count, b.geometry_id_count));
+    }
+    return differences;
+}
+
 u64 MakeComputeRecord(u64 ctx, u64 x, u64 y, u64 z, u64 caller) {
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
     BeginTables(seq);
@@ -4575,6 +4652,9 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
     v2_collect = v2;
     const u64 seq = policy.native_synth_verify.load(std::memory_order_relaxed) != 0 ? Guarded([&] { return MakeRecord(ctx, kind, a1, a2, a3, ret); }) : 0;
     v2_collect = nullptr;
+    if (seq != 0 && NativeZPass::Enabled()) {
+        NativeZPass::RealRecord(ctx, seq, kind, a1, a2, a3);
+    }
     if (seq != 0) {
         const auto& record = Slot(seq);
         std::array<StreamProbe::TableView, 8> views{};
@@ -7189,6 +7269,14 @@ std::string DescribeEntry(const void* header) {
 
 u64 EngineDevice() {
     return ResolveDevice().device;
+}
+
+u64 ShadowBuildRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3) {
+    return ShadowBuildRecordImpl(ctx, kind, a1, a2, a3);
+}
+
+u32 CompareRecords(u64 seq_a, u64 seq_b, std::vector<std::string>& differences) {
+    return CompareRecordsImpl(seq_a, seq_b, differences);
 }
 
 bool IsGuarded() {

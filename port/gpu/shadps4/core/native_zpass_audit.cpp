@@ -50,6 +50,14 @@ bool RdBytes(u64 address, void* out, size_t size) {
 
 enum ExpectedKind : u32 { Plain = 0, Instanced = 1, Indirect = 2 };
 
+constexpr size_t CtxBytes = 0x14000; // the part of the device context the record builder reads
+
+/// A write into the shadow context: the field the loop's per primitive binding sets, taken from the snapshot.
+struct Overlay {
+    u64 offset;
+    std::vector<u8> bytes;
+};
+
 struct Item {
     u32 kind;
     u64 count, first, instances;
@@ -58,6 +66,7 @@ struct Item {
     u64 material_sig{};  // expected side: a hash of the material fields the variant search reads
     u32 material_flag{}; // expected side: material + 0xd4 & 1 (the per-primitive resource set is bound only for these)
     u64 batch_object{};  // expected side: the batch object
+    u64 instance_object{}; // expected side: the instance group object of an instanced / indirect batch (FUN_01ee4e50 binds it)
     u64 batch_special{}; // expected side: batch + 0x48 (a special entry that fills the resource table itself)
     u32 mesh_word{};     // expected side: the mesh's vertex format word (mesh + 0x78), part of the variant key
     u32 batch_flags{};   // expected side: the batch flag word (bit 0x10 goes into the variant key)
@@ -97,6 +106,20 @@ struct State {
     std::vector<std::string> bind_samples;
     std::array<u32, Checks> bind_sample_count{};
     u64 bind_unmatched_draws{0};
+    // shadow generator (N6.3e)
+    std::vector<u8> baseline, shadow;
+    u64 pass_ctx{0};
+    bool current_valid{false};
+    Item current;
+    std::vector<Overlay> overlay;
+    std::unordered_map<u64, std::pair<u64, u64>> variant_table; // key -> (vertex shader, pixel shader), learned from the loop
+    u64 shadow_built{0}, shadow_failed{0}, shadow_equal{0}, shadow_differ{0}, key_hit{0}, key_cold{0}, key_wrong{0}, shadow_no_baseline{0};
+    std::map<std::string, u64> shadow_difference_kinds;
+    // which 8-byte words of the device context differ between the live context at the draw and the patched copy: offset -> {draws, a sample live value, a sample shadow value}
+    struct WordDiff { u64 draws{0}, live{0}, shadow{0}; };
+    std::map<u32, WordDiff> context_word_diffs;
+    std::vector<u8> live_copy;
+    std::vector<std::string> shadow_samples;
     u64 slot_differs_same_object{0}, slot_differs_foreign{0};
     std::map<u64, u64> unused_texture_slot_values; // value of the slots past the material's texture count -> draws (one value expected: the engine's null texture)
     u64 unused_slots_not_uniform{0};
@@ -206,6 +229,7 @@ void FinishLocked(State& s) {
 
 namespace {
 void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 ctx) {
+    s.current_valid = false;
     const u32 want = kind == 1 ? Indirect : Plain;
     size_t found = s.expected.size();
     for (size_t k = s.cursor; k < s.expected.size() && k < s.cursor + 64; ++k) {
@@ -224,12 +248,18 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
     }
     s.cursor = found + 1;
     const Item& e = s.expected[found];
+    s.current = e;
+    s.current_valid = true;
+    s.overlay.clear();
     const auto not_applicable = [&](u32 check) { ++s.bind_not_applicable[check]; };
     const auto compare = [&](u32 check, u64 ctx_address, u64 source, size_t bytes, const char* what) {
         std::array<u8, 512> a{}, b{};
         if (bytes > a.size() || !RdBytes(ctx_address, a.data(), bytes) || !RdBytes(source, b.data(), bytes)) {
             ++s.bind_unreadable[check];
             return;
+        }
+        if (check != 5) {
+            s.overlay.push_back({ctx_address - ctx, std::vector<u8>(b.begin(), b.begin() + bytes)});
         }
         ++s.bind_checked[check];
         if (std::memcmp(a.data(), b.data(), bytes) == 0) {
@@ -247,6 +277,18 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
             s.bind_samples.push_back(fmt::format("{} (view type {}, material {:#x}):{}", what, s.view_type, e.material, differing));
         }
     };
+    {
+        // the raster state object follows the material flags (renderDev + 0x3bf0, or + 0x3bf8 when material + 0xd4 has bits 0x2e), the dirty byte is set
+        u32 word = 0;
+        Rd(e.material + 0xd4, word);
+        u64 state_object = 0;
+        Rd(s.render_device + ((word & 0x2e) != 0 ? 0x3bf8 : 0x3bf0), state_object);
+        std::vector<u8> bytes(8), dirty(8, 0);
+        std::memcpy(bytes.data(), &state_object, 8);
+        dirty[0] = 1;
+        s.overlay.push_back({0x46c8, std::move(bytes)});
+        s.overlay.push_back({0x46d8, std::move(dirty)});
+    }
     u64 obj = 0;
     if (!Rd(e.material + 0x38, obj) || obj == 0) {
         for (u32 c = 0; c < State::Checks; ++c) {
@@ -284,6 +326,15 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
     Rd(obj + 0x440, index_word);
     if ((index_word & 0xffffffffull) < 64) {
         const u64 slot = obj + 0xc0 + (index_word & 0xffffffffull) * 0xb0;
+        if ((index_word >> 32) != 0) {
+            u64 second = 0;
+            if (Rd(obj + 0x2d0 + (index_word & 0xffffffffull) * 0xb0, second)) {
+                std::vector<u8> bytes(8);
+                std::memcpy(bytes.data(), &second, 8);
+                s.overlay.push_back({0x298, bytes});
+                s.overlay.push_back({0x318, std::move(bytes)});
+            }
+        }
         compare(4, ctx + 0x290, slot, 8, "constant buffer slot at +0x290");
         compare(4, ctx + 0x310, slot, 8, "constant buffer slot at +0x310");
         // where does a different value come from? Is it another slot of the same render object, or something the object does not hold?
@@ -321,6 +372,15 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
     Rd(e.material + 0x180, set_count);
     if (e.material_flag == 1 && e.batch_special == 0 && (token != 0 || cached != 0) && set != 0 && set_count != 0) {
         compare(5, s.render_device + 0x3790, set, size_t{std::min<u32>(set_count, 7)} * 16, "resource set at renderDev + 0x3790");
+        {
+            // FUN_01c92f30 ends with ctx[0x5c] = ctx[0x6c] = the constant buffer at renderDev + 0x2910 + 0xef0
+            u64 constant_buffer = 0;
+            Rd(s.render_device + 0x3800, constant_buffer);
+            std::vector<u8> bytes(8);
+            std::memcpy(bytes.data(), &constant_buffer, 8);
+            s.overlay.push_back({0x2e0, bytes});
+            s.overlay.push_back({0x360, std::move(bytes)});
+        }
     } else {
         not_applicable(5);
     }
@@ -335,6 +395,8 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
         if (Rd(e.batch_object + 0x68, pass_object) && Rd(pass_object + 0x130, expected_value)) {
             std::array<u8, 8> want{};
             std::memcpy(want.data(), &expected_value, 8);
+            s.overlay.push_back({0x288, std::vector<u8>(want.begin(), want.end())});
+            s.overlay.push_back({0x308, std::vector<u8>(want.begin(), want.end())});
             u64 a = 0, b = 0;
             if (Rd(ctx + 0x288, a) && Rd(ctx + 0x308, b)) {
                 ++s.bind_checked[6];
@@ -356,6 +418,89 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
         const u32 n = std::min<u32>(entries, 16);
         u64 inner = 0, defaults_holder = 0, default_object = 0;
         Rd(render_data + 0x20, inner);
+        {
+            const auto put64 = [&](u64 offset, u64 value) {
+                std::vector<u8> bytes(8);
+                std::memcpy(bytes.data(), &value, 8);
+                s.overlay.push_back({offset, std::move(bytes)});
+            };
+            if (e.instance_object != 0) {
+                // FUN_01ee4e50(inner, instance group, view type)
+                const u64 group_object = e.instance_object;
+                s32 ring_index = 0;
+                u64 ring_array = 0, ring_entry = 0, view_holder = 0, view_object = 0, next_holder = 0;
+                Rd(group_object + 0x20, ring_index);
+                Rd(group_object + 0xb8, ring_array);
+                Rd(ring_array + u64(ring_index) * 8, ring_entry);
+                Rd(inner + 0x48, view_holder);
+                Rd(view_holder + 0x38, view_object);
+                u64 a = 0, b = 0;
+                u32 c = 0, dd = 0;
+                Rd(view_object + 0x20, a);
+                Rd(ring_entry + 0x20, b);
+                Rd(view_object + 0x40, c);
+                Rd(ring_entry + 0x40, dd);
+                put64(0x70, a);
+                put64(0x78, b);
+                {
+                    std::vector<u8> bytes(8);
+                    std::memcpy(bytes.data(), &c, 4);
+                    std::memcpy(bytes.data() + 4, &dd, 4);
+                    s.overlay.push_back({0x170, std::move(bytes)});
+                }
+                put64(0x1f0, 0);
+                u64 uploader = 0;
+                Rd(group_object + 0xf0, uploader);
+                if (uploader != 0) {
+                    u64 first = 0, buffer = 0;
+                    Rd(uploader, first);
+                    Rd(first + 0x10, buffer);
+                    put64(0x340, buffer);
+                }
+                std::vector<u64> table;
+                u64 v = 0;
+                Rd(group_object + 0x1b0 + u64{s.view_type} * 8, v);
+                table.push_back(v);
+                v = 0;
+                Rd(group_object + 0x1f8 + u64(ring_index) * 8, v);
+                table.push_back(v);
+                v = 0;
+                Rd(group_object + 0x1f8 + u64(1 - ring_index) * 8, v);
+                table.push_back(v);
+                u32 views_count = 0;
+                u64 views_array = 0;
+                Rd(group_object + 0xe0, views_count);
+                Rd(group_object + 0xd8, views_array);
+                for (u32 i = 0; i < views_count && i < 60; ++i) {
+                    u64 holder = 0, value = 0;
+                    Rd(views_array + u64{i} * 8, holder);
+                    if (holder != 0) {
+                        Rd(holder + 0x28, value);
+                    }
+                    table.push_back(value);
+                }
+                std::vector<u8> bytes(table.size() * 8);
+                std::memcpy(bytes.data(), table.data(), bytes.size());
+                s.overlay.push_back({0x800, std::move(bytes)});
+            } else {
+                // after an instanced batch the loop clears these (ctx + 0x70.., 0x170, 0x1f0, 0x340, 0x800..0x830)
+                s.overlay.push_back({0x70, std::vector<u8>(16, 0)});
+                put64(0x170, 0);
+                put64(0x1f0, 0);
+                put64(0x340, 0);
+                s.overlay.push_back({0x800, std::vector<u8>(0x30, 0)});
+            }
+        }
+        {
+            // per batch: ctx + 0x580 = *(*(*(inner + 0x48) + 0x38) + 0x28)
+            u64 x = 0, y = 0, z = 0;
+            Rd(inner + 0x48, x);
+            Rd(x + 0x38, y);
+            Rd(y + 0x28, z);
+            std::vector<u8> bytes(8);
+            std::memcpy(bytes.data(), &z, 8);
+            s.overlay.push_back({0x580, std::move(bytes)});
+        }
         const u64 global = NativeDraw::ImageBase() + (0x069a1b40ull - 0x1000000);
         u64 context_global = 0;
         Rd(global, context_global);
@@ -370,6 +515,11 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
             u64 entry = 0, holder = 0, value = 0;
             if (j >= array_count || !Rd(array + u64{j} * 8, entry) || entry == default_object || entry == 0 || !Rd(entry + 0x38, holder) || holder == 0 || !Rd(holder + 0x28, value)) {
                 continue; // the loop writes nothing for this entry
+            }
+            {
+                std::vector<u8> bytes(8);
+                std::memcpy(bytes.data(), &value, 8);
+                s.overlay.push_back({0x6c0 + u64{j} * 8, std::move(bytes)});
             }
             u64 held = 0;
             if (!Rd(ctx + 0x6c0 + u64{j} * 8, held)) {
@@ -397,6 +547,14 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
         if (view_holder != 0) {
             Rd(view_holder + 0x38, view_inner);
             Rd(view_inner + 0x20, view_value);
+        }
+        {
+            std::vector<u8> bytes(8), type_bytes(8);
+            std::memcpy(bytes.data(), &view_value, 8);
+            const u64 index_type = 0x39;
+            std::memcpy(type_bytes.data(), &index_type, 8);
+            s.overlay.push_back({0x58, std::move(bytes)});
+            s.overlay.push_back({0x60, std::move(type_bytes)});
         }
         u64 held_view = 0, held_type = 0;
         if (Rd(ctx + 0x58, held_view) && Rd(ctx + 0x60, held_type)) {
@@ -454,6 +612,11 @@ void CheckBinding(State& s, u32 kind, u64 count, u64 first, u64 instances, u64 c
                 for (u32 which = 0; which < 2; ++which) {
                     if ((texture_flags & (1u << which)) == 0) {
                         continue;
+                    }
+                    {
+                        std::vector<u8> bytes(sizeof(u64) * 8);
+                        std::memcpy(bytes.data(), expected_pointers.data(), bytes.size());
+                        s.overlay.push_back({which == 0 ? 0xa40u : 0x740u, std::move(bytes)});
                     }
                     std::array<u64, 8> held{};
                     if (!RdBytes(ctx + (which == 0 ? 0xa40 : 0x740), held.data(), sizeof(held))) {
@@ -518,6 +681,15 @@ void PassEnter(u64 render_device, u64 desc) {
     s.active = true;
     s.cursor = 0;
     s.render_device = render_device;
+    s.current_valid = false;
+    s.baseline.clear();
+    s.shadow.clear(); // a new pass: the shadow context starts from the live one and then follows the loop's writes
+    if (Rd(render_device + 0x2d8, s.pass_ctx) && s.pass_ctx != 0) {
+        s.baseline.resize(CtxBytes);
+        if (!RdBytes(s.pass_ctx, s.baseline.data(), CtxBytes)) {
+            s.baseline.clear();
+        }
+    }
     s.view_type = static_cast<u32>(flags);
     {
         u8 flag14 = 0, flag1c = 0;
@@ -573,6 +745,7 @@ void PassEnter(u64 render_device, u64 desc) {
         Rd(mesh + 0x78, mesh_word);
         u32 instances = 0;
         u64 indirect_buffer = 0;
+        u64 instance_object = 0;
         if (group != 0) {
             u64 inner = 0, object = 0, table = 0;
             u32 count = 0;
@@ -582,6 +755,7 @@ void PassEnter(u64 render_device, u64 desc) {
                 continue;
             }
             instances = count;
+            instance_object = object;
             if (indirect_mode != 0) {
                 u64 args_holder = 0;
                 Rd(inner + 0x38, args_holder);
@@ -625,6 +799,7 @@ void PassEnter(u64 render_device, u64 desc) {
             item.material = material;
             Rd(batch + 0x48, item.batch_special);
             item.batch_object = batch;
+            item.instance_object = instance_object;
             item.material_flag = material_flag;
             item.mesh_word = mesh_word;
             item.batch_flags = batch_flags;
@@ -659,17 +834,108 @@ void PassEnter(u64 render_device, u64 desc) {
 }
 
 void NoteDraw(u64 caller, u32 kind, u64 count, u64 first, u64 instances, u64 vertex_shader, u64 pixel_shader, u64 ctx) {
-    if (!Enabled() || !InPass(caller)) {
+    if (!Enabled()) {
         return;
     }
     auto& s = S();
     std::scoped_lock lk{s.mutex};
+    if (!InPass(caller)) {
+        s.current_valid = false; // a draw of another pass: the shadow generator has nothing for it
+        return;
+    }
     if (s.active) {
         CheckBinding(s, kind, count, first, instances, ctx);
         Item item{kind, count, first, instances, 0, 0};
         item.vertex_shader = vertex_shader;
         item.pixel_shader = pixel_shader;
         s.observed.push_back(item);
+    }
+}
+
+void RealRecord(u64 ctx, u64 seq, u32 kind, u64 a1, u64 a2, u64 a3) {
+    if (!Enabled()) {
+        return;
+    }
+    auto& s = S();
+    std::scoped_lock lk{s.mutex};
+    if (!s.active || !s.current_valid) {
+        return;
+    }
+    if (s.baseline.empty()) {
+        ++s.shadow_no_baseline;
+        return;
+    }
+    if (s.shadow.size() != s.baseline.size()) {
+        s.shadow = s.baseline;
+    }
+    for (const auto& o : s.overlay) {
+        if (o.offset + o.bytes.size() <= s.shadow.size()) {
+            std::memcpy(s.shadow.data() + o.offset, o.bytes.data(), o.bytes.size());
+        }
+    }
+    // the shader pair: from the key table the audit learns from the loop; a key the table does not know yet is learned from this draw (and counted)
+    u64 real_vs = 0, real_ps = 0;
+    Rd(ctx + 0x4698, real_vs);
+    Rd(ctx + 0x4690, real_ps);
+    const Item& e = s.current;
+    const u64 key = ((e.material_sig * 0x9E3779B97F4A7C15ull ^ s.view_type) * 31 + (e.batch_flags & 0x10) * 8 + e.kind) * 0x100000001b3ull + e.mesh_word * 131u + s.pass_flags;
+    u64 vs = real_vs, ps = real_ps;
+    if (const auto it = s.variant_table.find(key); it != s.variant_table.end()) {
+        vs = it->second.first;
+        ps = it->second.second;
+        ++(vs == real_vs && ps == real_ps ? s.key_hit : s.key_wrong);
+    } else {
+        s.variant_table.emplace(key, std::make_pair(real_vs, real_ps));
+        ++s.key_cold;
+    }
+    std::memcpy(s.shadow.data() + 0x4698, &vs, 8);
+    std::memcpy(s.shadow.data() + 0x4690, &ps, 8);
+    {
+        s.live_copy.resize(CtxBytes);
+        if (RdBytes(ctx, s.live_copy.data(), CtxBytes)) {
+            for (size_t off = 0; off + 8 <= CtxBytes; off += 8) {
+                u64 x, y;
+                std::memcpy(&x, s.live_copy.data() + off, 8);
+                std::memcpy(&y, s.shadow.data() + off, 8);
+                if (x != y) {
+                    auto& w = s.context_word_diffs[static_cast<u32>(off)];
+                    if (w.draws++ == 0) {
+                        w.live = x;
+                        w.shadow = y;
+                    }
+                }
+            }
+        }
+    }
+    const u64 shadow_seq = NativeDraw::ShadowBuildRecord(reinterpret_cast<u64>(s.shadow.data()), kind, a1, a2, a3);
+    if (shadow_seq == 0) {
+        ++s.shadow_failed;
+        return;
+    }
+    ++s.shadow_built;
+    std::vector<std::string> differences;
+    if (NativeDraw::CompareRecords(seq, shadow_seq, differences) == 0) {
+        ++s.shadow_equal;
+        return;
+    }
+    ++s.shadow_differ;
+    for (const auto& text : differences) {
+        // group by the kind of difference: the text up to the first number
+        std::string group = text;
+        for (size_t i = 0; i < group.size(); ++i) {
+            if (group[i] >= '0' && group[i] <= '9') {
+                group.resize(i);
+                break;
+            }
+        }
+        ++s.shadow_difference_kinds[group];
+    }
+    if (s.shadow_samples.size() < 12) {
+        std::string joined = fmt::format("view type {} material {:#x}:", s.view_type, e.material);
+        for (size_t i = 0; i < differences.size() && i < 4; ++i) {
+            joined += " [" + differences[i] + "]";
+        }
+        s.shadow_samples.push_back(joined);
     }
 }
 
@@ -716,6 +982,26 @@ nlohmann::json Report() {
                                        {"unreadable_snapshot_fields", v.unreadable}};
     }
     out["first_mismatches"] = s.samples;
+    {
+        auto& shadow = out["shadow_generator"] = nlohmann::json::object();
+        shadow["records_built_from_the_patched_pass_context"] = s.shadow_built;
+        shadow["equal_to_the_record_of_the_live_context"] = s.shadow_equal;
+        shadow["different"] = s.shadow_differ;
+        shadow["build_failed"] = s.shadow_failed;
+        shadow["no_baseline_copy_of_the_context"] = s.shadow_no_baseline;
+        shadow["shader_pair_from_the_learned_key_table"] = {{"keys_learned", s.variant_table.size()}, {"draws_predicted_right", s.key_hit}, {"draws_predicted_wrong", s.key_wrong}, {"draws_on_a_key_not_seen_before", s.key_cold}};
+        shadow["difference_kinds"] = s.shadow_difference_kinds;
+        {
+            std::vector<std::pair<u32, State::WordDiff>> words(s.context_word_diffs.begin(), s.context_word_diffs.end());
+            std::sort(words.begin(), words.end(), [](const auto& a, const auto& b) { return a.second.draws > b.second.draws; });
+            nlohmann::json list = nlohmann::json::array();
+            for (size_t i = 0; i < words.size() && i < 60; ++i) {
+                list.push_back({{"context_offset", fmt::format("{:#x}", words[i].first)}, {"draws_that_differ", words[i].second.draws}, {"live_sample", fmt::format("{:#x}", words[i].second.live)}, {"patched_copy_sample", fmt::format("{:#x}", words[i].second.shadow)}});
+            }
+            shadow["context_words_that_differ_most_often"] = list;
+        }
+        shadow["first_differences"] = s.shadow_samples;
+    }
     {
         static constexpr const char* names[State::Checks] = {"material block 1: context 0x980..0x9c8 = material render object 0x450..0x498", "material block 2: context 0x9d0..0xa18 = object 0x498..0x4e0 (when object + 0x444 is set)",
                                                              "shader resource views: context + 0x790 = the array at object + 0x4f0", "shader resource views 2: context + 0xb38 = the array at object + 0x4e0",
