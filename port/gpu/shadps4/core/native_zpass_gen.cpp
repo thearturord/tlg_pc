@@ -763,7 +763,60 @@ void ScanImpl(ScanArgs& args) {
 
 // ------------------------------------------------------------------------------------------------------------------------------- the generator
 
+/// Reuse census (`TLG_GEN_CENSUS=1`): how many draws find the device context, as far as the generators and the record builder look at it, exactly as the previous draw of the pass
+/// left it (ctx bytes 0 to 0xd80, the shader pair, the raster state object); only the draw arguments differ then.
+struct ReuseCensus {
+    std::atomic<u64> draws{0}, same_as_previous{0}, same_as_one_of_last_8{0};
+};
+ReuseCensus& Reuse() {
+    static ReuseCensus census;
+    return census;
+}
+std::array<std::atomic<u64>, 0xd80 / 8> reuse_changed_words;
+void CountReuse(const Target& t) {
+    thread_local std::array<u64, 0xd80 / 8> previous{};
+    for (u32 i = 0; i < 0xd80 / 8; ++i) {
+        u64 word;
+        std::memcpy(&word, t.base + i * 8, 8);
+        if (word != previous[i]) {
+            reuse_changed_words[i].fetch_add(1, std::memory_order_relaxed);
+            previous[i] = word;
+        }
+    }
+    thread_local std::array<u64, 8> recent{};
+    thread_local u32 next = 0;
+    thread_local u64 last = 0;
+    u64 h = 0xcbf29ce484222325ull;
+    for (u32 offset = 0; offset < 0xd80; offset += 8) {
+        u64 word;
+        std::memcpy(&word, t.base + offset, 8);
+        h = (h ^ word) * 0x100000001b3ull;
+    }
+    for (const u32 offset : {0x4690u, 0x4698u, 0x46c8u}) {
+        u64 word;
+        std::memcpy(&word, t.base + offset, 8);
+        h = (h ^ word) * 0x100000001b3ull;
+    }
+    auto& r = Reuse();
+    r.draws.fetch_add(1, std::memory_order_relaxed);
+    if (h == last) {
+        r.same_as_previous.fetch_add(1, std::memory_order_relaxed);
+    }
+    bool seen = false;
+    for (const u64 x : recent) {
+        seen |= x == h;
+    }
+    if (seen) {
+        r.same_as_one_of_last_8.fetch_add(1, std::memory_order_relaxed);
+    }
+    last = h;
+    recent[next++ & 7] = h;
+}
+
 void IssueDraw(Target& t, u32 kind, u64 count, u64 first, u64 a3 = 0) {
+    if (t.live && CensusOn()) {
+        CountReuse(t);
+    }
     if (t.live) {
         Timed(CallId::DrawIssue, [&] {
         if (kind == 0) {
@@ -2453,6 +2506,45 @@ nlohmann::json Report() {
                                               "tag phase 3: record build (MakeRecord, SignRecord)", "tag phase 4: tag words, execution eligibility, native execution side effects"};
             for (u32 i = 0; i < 5 && calls != 0; ++i) {
                 census[names[i]] = {{"calls", calls}, {"total_ms", ticks[i] * to_ms}, {"microseconds_per_call", ticks[i] * to_ms * 1000.0 / static_cast<double>(calls)}};
+            }
+        }
+        {
+            std::vector<std::pair<u64, u32>> changed;
+            for (u32 i = 0; i < reuse_changed_words.size(); ++i) {
+                if (const u64 n = reuse_changed_words[i].load()) {
+                    changed.emplace_back(n, i * 8);
+                }
+            }
+            std::sort(changed.rbegin(), changed.rend());
+            nlohmann::json words = nlohmann::json::object();
+            for (size_t i = 0; i < changed.size() && i < 40; ++i) {
+                words[fmt::format("{:#x}", changed[i].second)] = changed[i].first;
+            }
+            census["context words (0 to 0xd80) that changed between consecutive draws: offset -> draws"] = words;
+        }
+        census["context state equal to the previous draw's (only the draw arguments differ)"] = {{"draws", Reuse().draws.load()}, {"same_as_previous", Reuse().same_as_previous.load()}, {"same_as_one_of_the_last_8", Reuse().same_as_one_of_last_8.load()}};
+        {
+            std::array<u64, 6> ticks{};
+            u64 calls = 0;
+            NativeDraw::MakeRecordCensusRead(ticks, calls);
+            constexpr const char* names[6] = {"record build 0: setup", "record build 1: Synthesize (registers)", "record build 2: Fixed::Build (fixed function state)", "record build 3: user data bindings, vertex stage",
+                                              "record build 4: user data bindings, pixel stage", "record build 5: draw argument registers and the rest"};
+            for (u32 i = 0; i < 6 && calls != 0; ++i) {
+                census[names[i]] = {{"calls", calls}, {"total_ms", ticks[i] * to_ms}, {"microseconds_per_call", ticks[i] * to_ms * 1000.0 / static_cast<double>(calls)}};
+            }
+        }
+        {
+            u64 lookups, hits_big, hits_small;
+            NativeDraw::RecordCacheCensusRead(lookups, hits_big, hits_small);
+            census["a cache of records keyed by the whole signature (all groups but the draw arguments), direct mapped"] = {{"lookups", lookups}, {"hits_with_1M_entries", hits_big}, {"hits_with_64K_entries", hits_small}};
+        }
+        {
+            u64 scan, fill, tables, slots;
+            NativeDraw::UserDataCensusRead(scan, fill, tables, slots);
+            if (tables != 0) {
+                census["user data tables (resource, constant buffer, sampler pointers): the slot scan"] = {{"tables", tables}, {"total_ms", scan * to_ms}, {"microseconds_per_table", scan * to_ms * 1000.0 / static_cast<double>(tables)}};
+                census["user data tables: filling the descriptors"] = {{"tables", tables}, {"slots_filled", slots}, {"total_ms", fill * to_ms}, {"microseconds_per_table", fill * to_ms * 1000.0 / static_cast<double>(tables)},
+                                                                       {"nanoseconds_per_slot", fill * to_ms * 1e6 / static_cast<double>(std::max<u64>(1, slots))}};
             }
         }
         out["engine_call_census"] = census;

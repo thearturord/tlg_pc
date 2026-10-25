@@ -1367,6 +1367,26 @@ u32* AllocTable(u32 dwords) {
     return table;
 }
 
+thread_local bool generator_issuing = false;
+std::atomic<u64> tag_phase_ticks[5];
+std::atomic<u64> tag_phase_calls;
+bool TagCensus() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_GEN_CENSUS");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+u64 TagNow() {
+    LARGE_INTEGER value;
+    QueryPerformanceCounter(&value);
+    return static_cast<u64>(value.QuadPart);
+}
+std::atomic<u64> um_ticks[4]; ///< census: ticks in the slot scan, ticks filling the tables, tables built, slots filled
+u64 UserDataClock() {
+    return generator_issuing && TagCensus() ? TagNow() : 0;
+}
+
 // Descriptors of the objects bound in the context's tables (api stage 0 = vertex, 1 = pixel).
 /// Writes up to `max_dwords` of the descriptor of shader resource slot `slot`; returns the descriptor size in dwords.
 u32 ResourceDescriptor(u64 ctx, u32 stage, u32 slot, u32* out, u32 max_dwords) {
@@ -1689,6 +1709,7 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 shader_block, u64 gnm, u64 input
                 break;
             }
             u32 slots = 0;
+            const u64 um_t0 = UserDataClock();
             for (u32 s = 0; s < (type == 19 ? 128u : type == 25 ? 8u : 16u); ++s) {
                 const u64 obj = type == 19 ? Obj(Rd<u64>(ctx, Ctx::ShaderResourceTable(stage) + s * 8))
                                 : type == 25 ? Obj(Rd<u64>(ctx, 0x2098 + s * 8))
@@ -1699,6 +1720,7 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 shader_block, u64 gnm, u64 input
                 }
             }
             slots = std::max(slots, 1u);
+            const u64 um_t1 = UserDataClock();
             const u32 entry = type == 19 || type == 25 ? 8 : 4;
             u32* table = AllocTable(slots * entry);
             // N6.1: only the entries the shader reads go into the record's list (the table holds up to 128 slots); an entry the mask misses is not found by a binder, which then keeps the flat user data
@@ -1717,6 +1739,13 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 shader_block, u64 gnm, u64 input
                     SamplerDescriptor(ctx, stage, s, table + s * 4);
                     NoteBinding(stage, 3, s, 0xffff, table + s * 4, 4, in_record, 4);
                 }
+            }
+            const u64 um_t2 = UserDataClock();
+            if (um_t0 != 0) {
+                um_ticks[0].fetch_add(um_t1 - um_t0, std::memory_order_relaxed);
+                um_ticks[1].fetch_add(um_t2 - um_t1, std::memory_order_relaxed);
+                um_ticks[2].fetch_add(1, std::memory_order_relaxed);
+                um_ticks[3].fetch_add(slots, std::memory_order_relaxed);
             }
             const u64 address = reinterpret_cast<u64>(table);
             if (start < 15) {
@@ -2380,8 +2409,31 @@ void SignRecord(NativeRecord& slot, const Signature& sig, u64 ctx) {
     slot.group_sig[AmdGpu::Liverpool::GroupOther] = sign({sig.group[States], sig.group[InputObjects], sig.group[Shaders], sig.group[Targets]});
 }
 
+/// Phase clock of MakeRecord for the draws the generators issue: 0 setup, 1 Synthesize (registers), 2 Fixed::Build, 3 user data of the vertex stage, 4 user data of the pixel stage, 5 the rest.
+std::atomic<u64> mr_phase_ticks[6];
+std::atomic<u64> mr_phase_calls;
+struct PhaseClockMr {
+    bool on;
+    u64 last{0};
+    PhaseClockMr() : on(generator_issuing && TagCensus()) {
+        if (on) {
+            last = TagNow();
+            mr_phase_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    void Mark(u32 phase) {
+        if (on) {
+            const u64 now = TagNow();
+            mr_phase_ticks[phase].fetch_add(now - last, std::memory_order_relaxed);
+            last = now;
+        }
+    }
+    ~PhaseClockMr() { Mark(5); }
+};
+
 /// Guest thread: builds the record of a draw. Returns its number.
 u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
+    PhaseClockMr mr;
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
     BeginTables(seq);
     auto& slot = Slot(seq);
@@ -2392,11 +2444,14 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     synth_flags = 0;
     synth_reason = 0;
     synth_cb_extent_mask = 0;
+    mr.Mark(0);
     slot.count = Synthesize(ctx, slot.regs.data(), &slot.vs_gnm, &slot.ps_gnm);
+    mr.Mark(1);
     slot.fixed = nullptr;
     if (kind <= 2 && Fixed::Enabled()) {
         slot.fixed = Fixed::Build(ctx, ResolveDevice(), slot.fixed_stale);
     }
+    mr.Mark(2);
     slot.cb_extent = synth_cb_extent;
     slot.cb_extent_mask = synth_cb_extent_mask;
     slot.db_extent = synth_db_extent;
@@ -2420,7 +2475,9 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
         slot.bindings_for = seq;
         binding_record = &slot;
         SynthesizeUserData(ctx, 0, vertex_shader + 0x30, slot.vs_gnm, 0x28, ShBase + 0x4c, slot.regs.data(), n, slot);
+        mr.Mark(3);
         SynthesizeUserData(ctx, 1, pixel_shader + 0x30, slot.ps_gnm, 0x3c, ShBase + 0x0c, slot.regs.data(), n, slot);
+        mr.Mark(4);
         binding_record = nullptr;
         slot.desc_key = synth_desc_key;
         // draw arguments: VGT_NUM_INDICES / VGT_NUM_INSTANCES, then for indexed draws the index buffer view
@@ -4543,21 +4600,7 @@ u64 RebuildAfterGame(u64 ctx, u64 tag_address, u64 a1, u64 a2, u64 a3, u64 a4, u
 /// skips PrepareDraw and makes the caller skip the draw (it does the counters the caller would have done).
 /// Phase clock of the tag for the draws the generators issue (`TLG_GEN_CENSUS=1`): 0 hooks and policy, 1 resource tracking (and the registry), 2 signature, 3 record build, 4 the rest
 /// (tag words, execution side effects).
-thread_local bool generator_issuing = false;
-std::atomic<u64> tag_phase_ticks[5];
-std::atomic<u64> tag_phase_calls;
-bool TagCensus() {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_GEN_CENSUS");
-        return e != nullptr && *e != 0 && *e != '0';
-    }();
-    return on;
-}
-u64 TagNow() {
-    LARGE_INTEGER value;
-    QueryPerformanceCounter(&value);
-    return static_cast<u64>(value.QuadPart);
-}
+std::atomic<u64> record_cache_lookups, record_cache_hits_big, record_cache_hits_small;
 struct PhaseClock {
     bool on;
     u64 last{0};
@@ -4676,6 +4719,26 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
     clock.Mark(1);
     const Signature sig = Compute(ctx, a1, a2, a3, kind);
     clock.Mark(2);
+    if (generator_issuing && TagCensus()) {
+        // would a cache of records keyed by the whole signature (every group but the draw arguments) have hit?
+        u64 key = 0xcbf29ce484222325ull;
+        for (u32 g = 0; g < NumGroups; ++g) {
+            if (g != Args) {
+                key = (key ^ sig.group[g]) * 0x100000001b3ull;
+            }
+        }
+        key = (key ^ sig.pipeline_key ^ kind) * 0x100000001b3ull;
+        static std::array<std::atomic<u64>, 1u << 20> big;
+        static std::array<std::atomic<u64>, 1u << 16> small;
+        const u32 bi = static_cast<u32>(key >> 44), si = static_cast<u32>(key >> 48);
+        record_cache_lookups.fetch_add(1, std::memory_order_relaxed);
+        if (big[bi].exchange(key, std::memory_order_relaxed) == key) {
+            record_cache_hits_big.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (small[si].exchange(key, std::memory_order_relaxed) == key) {
+            record_cache_hits_small.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
     const u64 k1 = sig.pipeline_key;
     Hasher h2, h3;
@@ -7440,6 +7503,26 @@ bool IssueCensus() {
     return on;
 }
 } // namespace
+
+void UserDataCensusRead(u64& scan_ticks, u64& fill_ticks, u64& tables, u64& slots) {
+    scan_ticks = um_ticks[0].load();
+    fill_ticks = um_ticks[1].load();
+    tables = um_ticks[2].load();
+    slots = um_ticks[3].load();
+}
+
+void RecordCacheCensusRead(u64& lookups, u64& hits_1m, u64& hits_64k) {
+    lookups = record_cache_lookups.load();
+    hits_1m = record_cache_hits_big.load();
+    hits_64k = record_cache_hits_small.load();
+}
+
+void MakeRecordCensusRead(std::array<u64, 6>& ticks, u64& calls) {
+    for (u32 i = 0; i < 6; ++i) {
+        ticks[i] = mr_phase_ticks[i].load();
+    }
+    calls = mr_phase_calls.load();
+}
 
 void TagCensusRead(std::array<u64, 5>& ticks, u64& calls) {
     for (u32 i = 0; i < 5; ++i) {
