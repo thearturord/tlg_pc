@@ -110,6 +110,9 @@ bool GuardedCall(void (*fn)(void*), void* argument);
 void IssueIndexedDraw(u64 ctx, u64 count, u64 first, u64 site_ghidra, u64 a4, u64 a3 = 0);
 /// Same for `DrawIndexedIndirect(ctx, argument buffer object, byte offset)` at the loop's indirect call site.
 void IssueIndirectDraw(u64 ctx, u64 buffer, u64 offset, u64 site_ghidra);
+/// Census of the draws the generators issue (`TLG_GEN_CENSUS=1`): kind 0 indexed, 1 indirect; calls, ticks in the tag, ticks in the engine draw function, draws the tag took over.
+void TagCensusRead(std::array<u64, 5>& ticks, u64& calls);
+void IssueCensusRead(u32 kind, u64& calls, u64& tag_ticks, u64& original_ticks, u64& taken_by_tag);
 
 /// N6.3e (shadow generator): builds the record of a draw from `ctx`, which may be a private copy of the device context patched from the snapshot instead of the live one. Returns
 /// the record number, 0 when the build faulted. The record is not tagged into any command stream and nothing refers to it.

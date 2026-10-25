@@ -4541,7 +4541,44 @@ u64 RebuildAfterGame(u64 ctx, u64 tag_address, u64 a1, u64 a2, u64 a3, u64 a4, u
 
 /// `inline_draw`: the draw is an inlined copy of a draw function; PrepareDraw is what is hooked. With execution the hook
 /// skips PrepareDraw and makes the caller skip the draw (it does the counters the caller would have done).
+/// Phase clock of the tag for the draws the generators issue (`TLG_GEN_CENSUS=1`): 0 hooks and policy, 1 resource tracking (and the registry), 2 signature, 3 record build, 4 the rest
+/// (tag words, execution side effects).
+thread_local bool generator_issuing = false;
+std::atomic<u64> tag_phase_ticks[5];
+std::atomic<u64> tag_phase_calls;
+bool TagCensus() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_GEN_CENSUS");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+u64 TagNow() {
+    LARGE_INTEGER value;
+    QueryPerformanceCounter(&value);
+    return static_cast<u64>(value.QuadPart);
+}
+struct PhaseClock {
+    bool on;
+    u64 last{0};
+    PhaseClock() : on(generator_issuing && TagCensus()) {
+        if (on) {
+            last = TagNow();
+            tag_phase_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    void Mark(u32 phase) {
+        if (on) {
+            const u64 now = TagNow();
+            tag_phase_ticks[phase].fetch_add(now - last, std::memory_order_relaxed);
+            last = now;
+        }
+    }
+    ~PhaseClock() { Mark(4); }
+};
+
 u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inline_draw = false, u64 a4 = 0, u64 a5 = 0) {
+    PhaseClock clock;
     FrameTimeline::Hook();
     if (ctx != 0) {
         StreamProbe::AtHook(ctx);
@@ -4564,6 +4601,7 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
             }
         }
     }
+    clock.Mark(0);
     // The game's resource tracking runs first (as it does at the start of PrepareDraw): it may update view descriptors
     // and write barrier packets or draw internal quads, which then come before the tag.
     if (policy.native_synth_verify.load(std::memory_order_relaxed) != 0) {
@@ -4635,7 +4673,9 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
             });
         }
     }
+    clock.Mark(1);
     const Signature sig = Compute(ctx, a1, a2, a3, kind);
+    clock.Mark(2);
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
     const u64 k1 = sig.pipeline_key;
     Hasher h2, h3;
@@ -4667,6 +4707,7 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
         StreamProbe::AtRecord(ret - ImageBase() + 0x1000000, views.data(), std::min<u32>(record.check_count, static_cast<u32>(views.size())));
         SignRecord(Slot(seq), sig, ctx);
     }
+    clock.Mark(3);
     std::memcpy(&words[9], &seq, sizeof(u64));
     words[11] = 0;
     words[12] = 0;
@@ -7383,14 +7424,61 @@ bool GuardedCall(void (*fn)(void*), void* argument) {
     return !faulted;
 }
 
+namespace {
+std::atomic<u64> issue_ticks[2][3]; // [indexed, indirect][calls, tag ticks, original draw ticks]
+std::atomic<u64> issue_taken_by_tag[2];
+u64 IssueNow() {
+    LARGE_INTEGER value;
+    QueryPerformanceCounter(&value);
+    return static_cast<u64>(value.QuadPart);
+}
+bool IssueCensus() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_GEN_CENSUS");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+} // namespace
+
+void TagCensusRead(std::array<u64, 5>& ticks, u64& calls) {
+    for (u32 i = 0; i < 5; ++i) {
+        ticks[i] = tag_phase_ticks[i].load();
+    }
+    calls = tag_phase_calls.load();
+}
+
+void IssueCensusRead(u32 kind, u64& calls, u64& tag_ticks, u64& original_ticks, u64& taken_by_tag) {
+    calls = issue_ticks[kind][0].load();
+    tag_ticks = issue_ticks[kind][1].load();
+    original_ticks = issue_ticks[kind][2].load();
+    taken_by_tag = issue_taken_by_tag[kind].load();
+}
+
 void IssueIndirectDraw(u64 ctx, u64 buffer, u64 offset, u64 site_ghidra) {
     // the draw a pass loop makes at its call site (return address `site_ghidra`), through the draw hook
     static const u64 original = Core::GuestHooks::OriginalEntry("DrawIndexedIndirect");
     const u64 site = ImageBase() + (site_ghidra - 0x1000000);
-    if (TagIndirect(ctx, buffer, offset, 0, 0, 0, site) != 0 || original == 0) {
+    const bool census = IssueCensus();
+    const u64 t0 = census ? IssueNow() : 0;
+    generator_issuing = true;
+    const bool taken = TagIndirect(ctx, buffer, offset, 0, 0, 0, site) != 0;
+    generator_issuing = false;
+    const u64 t1 = census ? IssueNow() : 0;
+    if (taken || original == 0) {
+        if (census) {
+            issue_ticks[1][0]++;
+            issue_ticks[1][1] += t1 - t0;
+            issue_taken_by_tag[1]++;
+        }
         return;
     }
     reinterpret_cast<GuestDraw6>(original)(ctx, buffer, offset, 0, 0, 0);
+    if (census) {
+        issue_ticks[1][0]++;
+        issue_ticks[1][1] += t1 - t0;
+        issue_ticks[1][2] += IssueNow() - t1;
+    }
 }
 
 void IssueIndexedDraw(u64 ctx, u64 count, u64 first, u64 site_ghidra, u64 a4, u64 a3) {
@@ -7398,10 +7486,26 @@ void IssueIndexedDraw(u64 ctx, u64 count, u64 first, u64 site_ghidra, u64 a4, u6
     // as for a draw of the engine's own loop: the tag, then the original draw function unless the tag took the draw over
     static const u64 original = Core::GuestHooks::OriginalEntry("DrawIndexedCommon");
     const u64 site = ImageBase() + (site_ghidra - 0x1000000);
-    if (TagIndexed(ctx, count, first, a3, a4, 0, site) != 0 || original == 0) {
+    const bool census = IssueCensus();
+    const u64 t0 = census ? IssueNow() : 0;
+    generator_issuing = true;
+    const bool taken = TagIndexed(ctx, count, first, a3, a4, 0, site) != 0;
+    generator_issuing = false;
+    const u64 t1 = census ? IssueNow() : 0;
+    if (taken || original == 0) {
+        if (census) {
+            issue_ticks[0][0]++;
+            issue_ticks[0][1] += t1 - t0;
+            issue_taken_by_tag[0]++;
+        }
         return;
     }
     reinterpret_cast<GuestDraw6>(original)(ctx, count, first, a3, a4, 0);
+    if (census) {
+        issue_ticks[0][0]++;
+        issue_ticks[0][1] += t1 - t0;
+        issue_ticks[0][2] += IssueNow() - t1;
+    }
 }
 
 VAddr ImageBase() {

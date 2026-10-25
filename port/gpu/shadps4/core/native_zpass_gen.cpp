@@ -64,6 +64,71 @@ u64 Global(u64 ghidra_address) {
     return NativeDraw::ImageBase() + (ghidra_address - 0x1000000);
 }
 
+/// Cost census of what the generators call (`TLG_GEN_CENSUS=1`, /zpassgen key `engine_call_census`): calls and wall time of every engine function the generators still call, and of the
+/// parts of the generator itself, per call kind. The time of a call includes everything it calls.
+enum class CallId : u32 {
+    ResourceSet,       // FUN_01c92f30
+    GroupBind,         // FUN_01ee4e50
+    ForwardPrologue,   // FUN_01c710f0
+    FindVariant,       // FUN_01c822c0
+    HandleLookup,      // FUN_01c59060 (the G-buffer prologue's)
+    SpecialToken,      // the special entry's virtual +0x48
+    HandleFree,        // FUN_01e45a60
+    DrawIssue,         // the draw hook (tag, the engine's draw function)
+    MaterialBlock,     // FUN_01c92b60 as plain stores (with the reader lock)
+    ShaderPair,        // SetShader x2
+    PassDepth,         // a whole generated depth pass
+    PassGBuffer,       // a whole generated G-buffer pass
+    PassForward,       // a whole generated forward pass
+    ScanDepth,
+    ScanGBuffer,
+    ScanForward,
+    Count
+};
+constexpr const char* CallNames[static_cast<u32>(CallId::Count)] = {"FUN_01c92f30 resource set", "FUN_01ee4e50 instance group bind", "FUN_01c710f0 forward prologue", "FUN_01c822c0 variant find", "FUN_01c59060 handle lookup (G-buffer prologue)",
+                                                                      "special entry virtual +0x48", "FUN_01e45a60 handle free", "draw issue (hook, tag, engine draw)", "FUN_01c92b60 material block (plain stores)",
+                                                                      "shader pair (2 x SetShader)", "generated depth pass (whole)", "generated G-buffer pass (whole)", "generated forward pass (whole)", "scan, depth", "scan, G-buffer", "scan, forward"};
+struct CallCensus {
+    std::atomic<u64> calls{0}, ticks{0};
+};
+bool CensusOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_GEN_CENSUS");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+std::array<CallCensus, static_cast<u32>(CallId::Count)>& Census() {
+    static std::array<CallCensus, static_cast<u32>(CallId::Count)> census;
+    return census;
+}
+u64 Ticks() {
+#ifdef _WIN32
+    LARGE_INTEGER value;
+    QueryPerformanceCounter(&value);
+    return static_cast<u64>(value.QuadPart);
+#else
+    return 0;
+#endif
+}
+template <class F>
+auto Timed(CallId id, F&& body) {
+    if (!CensusOn()) {
+        return body();
+    }
+    const u64 t0 = Ticks();
+    struct Done {
+        CallId id;
+        u64 t0;
+        ~Done() {
+            auto& c = Census()[static_cast<u32>(id)];
+            c.calls.fetch_add(1, std::memory_order_relaxed);
+            c.ticks.fetch_add(Ticks() - t0, std::memory_order_relaxed);
+        }
+    } done{id, t0};
+    return body();
+}
+
 struct Config {
     bool on{false};
     std::array<bool, 16> views{};
@@ -312,7 +377,15 @@ void CopyEarlyBlock(Target& t, u64 material) {
     }
 }
 
+void BindMaterialImpl(Target& t, u64 material);
 void BindMaterial(Target& t, u64 material) {
+    if (!t.live) {
+        BindMaterialImpl(t, material);
+        return;
+    }
+    Timed(CallId::MaterialBlock, [&] { BindMaterialImpl(t, material); });
+}
+void BindMaterialImpl(Target& t, u64 material) {
     if (t.live) {
         ReaderLock(material + 0x1e0);
     }
@@ -692,11 +765,13 @@ void ScanImpl(ScanArgs& args) {
 
 void IssueDraw(Target& t, u32 kind, u64 count, u64 first, u64 a3 = 0) {
     if (t.live) {
+        Timed(CallId::DrawIssue, [&] {
         if (kind == 0) {
             NativeDraw::IssueIndexedDraw(reinterpret_cast<u64>(t.base), count, first, t.indexed_site, t.indexed_a4, a3);
         } else {
             NativeDraw::IssueIndirectDraw(reinterpret_cast<u64>(t.base), count, first, t.indirect_site);
         }
+        });
     } else {
         t.marks.push_back({t.arena.size(), kind, count, first, a3, t.Get<u64>(0x4698), t.Get<u64>(0x4690)});
     }
@@ -720,7 +795,7 @@ void Generate(Target& t, const Plan& plan) {
         }
         if (level.group) {
             if (t.live) {
-                reinterpret_cast<GuestGroupBind>(Global(FunctionGroupBind))(level.inner, level.group_object, plan.view_type);
+                Timed(CallId::GroupBind, [&] { reinterpret_cast<GuestGroupBind>(Global(FunctionGroupBind))(level.inner, level.group_object, plan.view_type); });
             } else {
                 t.Set<u64>(0x70, level.g70);
                 t.Set<u64>(0x78, level.g78);
@@ -750,7 +825,7 @@ void Generate(Target& t, const Plan& plan) {
             if (step.flag != 0) {
                 CopyEarlyBlock(t, step.material);
                 if (!level.bvar54 && t.live) {
-                    reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, level.special);
+                    Timed(CallId::ResourceSet, [&] { reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, level.special); });
                 }
             }
             if (level.special != 0) {
@@ -762,7 +837,7 @@ void Generate(Target& t, const Plan& plan) {
                     BindMaterial(t, step.material);
                 }
                 if (t.live) {
-                    reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, level.special);
+                    Timed(CallId::ResourceSet, [&] { reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, level.special); });
                 }
             }
             BindMaterial(t, step.material);
@@ -1183,7 +1258,7 @@ void ScanGBuffer(GScanArgs& a) {
     {
         const u64 table = R<u64>(Global(GlobalObjectTable));
         const u64 handle = R<u64>(R<u64>(a.args + 0x2d0) + 0x30);
-        const u64 object = reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64)>(Global(FunctionHandleLookup))(table, handle);
+        const u64 object = Timed(CallId::HandleLookup, [&] { return reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64)>(Global(FunctionHandleLookup))(table, handle); });
         plan.v_b60 = object != 0 ? R<u64>(object + 0x48) : 0;
     }
     const u64 context_global = R<u64>(Global(GlobalContext));
@@ -1390,7 +1465,7 @@ void GenerateGBuffer(Target& t, const GPlan& plan, u32 pass_flags) {
                 continue;
             }
             if (t.live) {
-                reinterpret_cast<GuestGroupBind>(Global(FunctionGroupBind))(level.inner, level.group_object, 0);
+                Timed(CallId::GroupBind, [&] { reinterpret_cast<GuestGroupBind>(Global(FunctionGroupBind))(level.inner, level.group_object, 0); });
             } else {
                 t.Set<u64>(0x70, level.g70);
                 t.Set<u64>(0x78, level.g78);
@@ -1421,7 +1496,7 @@ void GenerateGBuffer(Target& t, const GPlan& plan, u32 pass_flags) {
         for (u32 s = level.first_step; s < level.first_step + level.step_count; ++s) {
             const GStep& step = plan.steps[s];
             if (t.live) {
-                reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, 0);
+                Timed(CallId::ResourceSet, [&] { reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, 0); });
             }
             const bool raster = (R<u32>(step.material + 0xd4) & 0x26) != 0;
             if (raster != raster_flag) {
@@ -1520,7 +1595,7 @@ void HandleRefInc(u64 handle) {
 }
 void HandleRefDec(u64 handle) {
     if (reinterpret_cast<std::atomic<s32>*>(Global(HandleRefTable) + handle * 0x20)->fetch_sub(1) == 1) {
-        reinterpret_cast<void(PS4_SYSV_ABI*)(u64)>(Global(FunctionHandleFree))(handle);
+        Timed(CallId::HandleFree, [&] { reinterpret_cast<void(PS4_SYSV_ABI*)(u64)>(Global(FunctionHandleFree))(handle); });
     }
 }
 
@@ -1682,7 +1757,7 @@ void GenerateForward(Target& t, const FPlan& plan) {
         t.Or8(0x447c, 1);
     }
     if (t.live) {
-        reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64, u64, u64)>(Global(FunctionForwardPrologue))(rd, plan.a1, plan.a2, plan.mode);
+        Timed(CallId::ForwardPrologue, [&] { reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64, u64, u64)>(Global(FunctionForwardPrologue))(rd, plan.a1, plan.a2, plan.mode); });
     }
     const auto state_words = [&](u64 entry) {
         t.Set<u64>(0x46f0, entry);
@@ -1742,7 +1817,7 @@ void GenerateForward(Target& t, const FPlan& plan) {
                 last_state = state;
             }
             if (t.live) {
-                reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, fb.special);
+                Timed(CallId::ResourceSet, [&] { reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, fb.special); });
             }
             // the handle sequence of the loop: the material's handle is counted, a special entry replaces it by the handle its virtual +0x48 returns (counted by the virtual), the variant search
             // gets the resulting handle
@@ -1750,7 +1825,7 @@ void GenerateForward(Target& t, const FPlan& plan) {
             HandleRefInc(token);
             if (fb.special != 0) {
                 std::array<u32, 2> out{0, 0};
-                reinterpret_cast<void(PS4_SYSV_ABI*)(void*, u64, u64)>(R<u64>(R<u64>(fb.special) + 0x48))(out.data(), fb.special, step.material);
+                Timed(CallId::SpecialToken, [&] { reinterpret_cast<void(PS4_SYSV_ABI*)(void*, u64, u64)>(R<u64>(R<u64>(fb.special) + 0x48))(out.data(), fb.special, step.material); });
                 u64 released = token;
                 if (token != out[0]) {
                     HandleRefInc(out[0]);
@@ -1775,7 +1850,7 @@ void GenerateForward(Target& t, const FPlan& plan) {
             }
             HandleRefInc(token);
             std::array<s32, 2> token_slot{static_cast<s32>(token), 0};
-            const u64 variant = reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u32, u32, u32, void*, u64)>(Global(FunctionFindVariant))(rd + 1000, step.material, fb.variant_flags, 0, fb.mesh_word, token_slot.data(), 0);
+            const u64 variant = Timed(CallId::FindVariant, [&] { return reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u32, u32, u32, void*, u64)>(Global(FunctionFindVariant))(rd + 1000, step.material, fb.variant_flags, 0, fb.mesh_word, token_slot.data(), 0); });
             if (token != 0) {
                 HandleRefDec(token);
             }
@@ -1922,7 +1997,7 @@ bool HandlePass(u64 render_device, u64 desc, u64 original_loop) {
         }
         if (vs.disabled) {
             plan.Decline("generator switched off for this view type by a verify difference");
-        } else if (!NativeDraw::GuardedCall([](void* p) { ScanImpl(*static_cast<ScanArgs*>(p)); }, &scan_args)) {
+        } else if (!Timed(CallId::ScanDepth, [&] { return NativeDraw::GuardedCall([](void* p) { ScanImpl(*static_cast<ScanArgs*>(p)); }, &scan_args); })) {
             ++s.scan_faults;
             ++vs.not_scanned;
             plan.scanned = false;
@@ -1951,7 +2026,7 @@ bool HandlePass(u64 render_device, u64 desc, u64 original_loop) {
         Target live;
         live.live = true;
         live.base = reinterpret_cast<u8*>(plan.ctx);
-        Generate(live, plan);
+        Timed(CallId::PassDepth, [&] { Generate(live, plan); });
         std::scoped_lock lock{s.mutex};
         ++stats->generated;
         stats->generated_batches += plan.batches.size();
@@ -2055,7 +2130,7 @@ bool HandleGBuffer(u64 render_device, u64 mode, u64 list, u64 args, u64 flags, u
         ++gs.arguments[static_cast<u32>(mode) * 1000 + static_cast<u32>(query_mode)];
         if (gs.v.disabled) {
             plan.Decline("generator switched off by a verify difference");
-        } else if (!NativeDraw::GuardedCall([](void* p) { ScanGBuffer(*static_cast<GScanArgs*>(p)); }, &scan_args)) {
+        } else if (!Timed(CallId::ScanGBuffer, [&] { return NativeDraw::GuardedCall([](void* p) { ScanGBuffer(*static_cast<GScanArgs*>(p)); }, &scan_args); })) {
             ++gs.v.not_scanned;
             plan.scanned = false;
             plan.Decline("scan faulted");
@@ -2079,7 +2154,7 @@ bool HandleGBuffer(u64 render_device, u64 mode, u64 list, u64 args, u64 flags, u
         live.indexed_site = GBufferIndexedSite;
         live.indirect_site = GBufferIndirectSite;
         live.indexed_a4 = 0;
-        GenerateGBuffer(live, plan, plan.flags);
+        Timed(CallId::PassGBuffer, [&] { GenerateGBuffer(live, plan, plan.flags); });
         std::scoped_lock lock{s.mutex};
         ++gs.v.generated;
         gs.v.generated_batches += plan.batches.size();
@@ -2170,7 +2245,7 @@ bool HandleForward(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 or
         ++fs.v.passes;
         if (fs.v.disabled) {
             plan.Decline("generator switched off by a verify difference");
-        } else if (!NativeDraw::GuardedCall([](void* p) { ScanForwardPass(*static_cast<FScanArgs*>(p)); }, &scan_args)) {
+        } else if (!Timed(CallId::ScanForward, [&] { return NativeDraw::GuardedCall([](void* p) { ScanForwardPass(*static_cast<FScanArgs*>(p)); }, &scan_args); })) {
             ++fs.v.not_scanned;
             plan.scanned = false;
             plan.Decline("scan faulted");
@@ -2193,7 +2268,7 @@ bool HandleForward(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 or
         live.base = reinterpret_cast<u8*>(plan.ctx);
         live.indexed_site = ForwardIndexedSite;
         live.indexed_a4 = 1;
-        GenerateForward(live, plan);
+        Timed(CallId::PassForward, [&] { GenerateForward(live, plan); });
         std::scoped_lock lock{s.mutex};
         ++fs.v.generated;
         fs.v.generated_batches += plan.batches.size();
@@ -2350,6 +2425,37 @@ nlohmann::json Report() {
         }
         fj["declined_passes_by_reason"] = fdeclines;
         out["forward"] = fj;
+    }
+    if (CensusOn()) {
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        nlohmann::json census = nlohmann::json::object();
+        const double to_ms = 1000.0 / static_cast<double>(frequency.QuadPart);
+        for (u32 i = 0; i < static_cast<u32>(CallId::Count); ++i) {
+            const u64 calls = Census()[i].calls.load(), ticks = Census()[i].ticks.load();
+            if (calls != 0) {
+                census[CallNames[i]] = {{"calls", calls}, {"total_ms", ticks * to_ms}, {"microseconds_per_call", ticks * to_ms * 1000.0 / static_cast<double>(calls)}};
+            }
+        }
+        for (u32 kind = 0; kind < 2; ++kind) {
+            u64 calls, tag, original, taken;
+            NativeDraw::IssueCensusRead(kind, calls, tag, original, taken);
+            if (calls != 0) {
+                census[kind == 0 ? "draw issue, indexed: the tag (TagIndexed)" : "draw issue, indirect: the tag (TagIndirect)"] = {{"calls", calls}, {"total_ms", tag * to_ms}, {"microseconds_per_call", tag * to_ms * 1000.0 / static_cast<double>(calls)}, {"draws_the_tag_took_over", taken}};
+                census[kind == 0 ? "draw issue, indexed: the engine's draw function after the tag" : "draw issue, indirect: the engine's draw function after the tag"] = {{"calls", calls - taken}, {"total_ms", original * to_ms}, {"microseconds_per_call", original * to_ms * 1000.0 / static_cast<double>(std::max<u64>(1, calls - taken))}};
+            }
+        }
+        {
+            std::array<u64, 5> ticks{};
+            u64 calls = 0;
+            NativeDraw::TagCensusRead(ticks, calls);
+            constexpr const char* names[5] = {"tag phase 0: probes, policy, class checks", "tag phase 1: resource tracking (the engine's, RefreshTargets) and the registry", "tag phase 2: signature of the context (Compute)",
+                                              "tag phase 3: record build (MakeRecord, SignRecord)", "tag phase 4: tag words, execution eligibility, native execution side effects"};
+            for (u32 i = 0; i < 5 && calls != 0; ++i) {
+                census[names[i]] = {{"calls", calls}, {"total_ms", ticks[i] * to_ms}, {"microseconds_per_call", ticks[i] * to_ms * 1000.0 / static_cast<double>(calls)}};
+            }
+        }
+        out["engine_call_census"] = census;
     }
     out["verify_difference_kinds"] = s.mismatch_kinds;
     out["special_entry_classes"] = s.special_classes;
