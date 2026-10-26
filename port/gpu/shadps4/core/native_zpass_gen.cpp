@@ -257,6 +257,10 @@ struct Mark {
     u32 kind;
     u64 count, first, a3;
     u64 vertex_shader, pixel_shader;
+    // A3 (FUN_01c92f30 natively): what the resource set before this draw left in the device (the matrices block and the constant buffer it fills), for the verify run
+    bool rs_valid{false};
+    u32 rs_n{0}, rs_size{0};
+    std::array<u8, 112> rs_bytes{};
 };
 
 /// Where the generator writes: the live device context, or a private copy of it that logs every write (the verify run).
@@ -274,6 +278,9 @@ struct Target {
     std::unordered_map<size_t, u64> slot_owner; // shadow: arena position of an entry -> that material
     s32 draws{0};
     s64 triangles{0};
+    bool rs_pending{false}; // shadow: the native resource set ran since the last draw
+    u32 rs_n{0}, rs_size{0};
+    std::array<u8, 112> rs_bytes{};
 
     template <class T>
     T Get(u32 offset) const {
@@ -827,11 +834,23 @@ void IssueDraw(Target& t, u32 kind, u64 count, u64 first, u64 a3 = 0) {
         });
     } else {
         t.marks.push_back({t.arena.size(), kind, count, first, a3, t.Get<u64>(0x4698), t.Get<u64>(0x4690)});
+        if (t.rs_pending) {
+            Mark& m = t.marks.back();
+            m.rs_valid = true;
+            m.rs_n = t.rs_n;
+            m.rs_size = t.rs_size;
+            m.rs_bytes = t.rs_bytes;
+            t.rs_pending = false;
+        }
     }
 }
 
+u64 HandleLookup(u64 render_device, u64 object);
+void ResourceSetStep(Target& t, u64 rd, u64 material, u64 special, bool shadow_ok);
+
 void Generate(Target& t, const Plan& plan) {
     const u64 rd = plan.render_device;
+    const bool pure_pass = std::none_of(plan.batches.begin(), plan.batches.end(), [](const BatchLevel& b) { return b.special != 0; });
     // prologue
     if (t.Get<u32>(0x4480) != 4) {
         t.Set<u32>(0x4480, 4);
@@ -877,8 +896,8 @@ void Generate(Target& t, const Plan& plan) {
             t.slot_material = step.material;
             if (step.flag != 0) {
                 CopyEarlyBlock(t, step.material);
-                if (!level.bvar54 && t.live) {
-                    Timed(CallId::ResourceSet, [&] { reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, level.special); });
+                if (!level.bvar54) {
+                    Timed(CallId::ResourceSet, [&] { ResourceSetStep(t, rd, step.material, level.special, pure_pass); });
                 }
             }
             if (level.special != 0) {
@@ -889,9 +908,7 @@ void Generate(Target& t, const Plan& plan) {
                 if (early) {
                     BindMaterial(t, step.material);
                 }
-                if (t.live) {
-                    Timed(CallId::ResourceSet, [&] { reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, level.special); });
-                }
+                Timed(CallId::ResourceSet, [&] { ResourceSetStep(t, rd, step.material, level.special, pure_pass); });
             }
             BindMaterial(t, step.material);
             t.slot_material = 0;
@@ -1016,6 +1033,7 @@ struct Verify {
     u32 view{0};
     u64 lo{ZPassBegin}, hi{ZPassEnd}; // the call sites of the loop under verify
     u64 ctx{0};
+    u64 rd{0};
     u64 compared_draws{0};
     u64 mismatches{0};
     u64 raced{0};
@@ -1035,6 +1053,32 @@ void NoteMismatch(State& s, u32 view, const std::string& kind, const std::string
         s.samples.push_back(fmt::format("view type {}: {}: {}", view, kind, detail));
         LOG_ERROR(Render, "cascade generator verify: view type {}: {}: {}", view, kind, detail);
     }
+}
+
+u64 RenderDataOf(u64 render_device, u64 object);
+constexpr u64 GlobalObjectTableForRace = 0x0689eed8, GlobalContextForRace = 0x069a1b40;
+/// The byte the native resource set would put in the context byte `offset` (the texture render data slots at 0xa40 and 0x740) from the material's list as it is now, or -1. The
+/// engine's other threads swap textures of a material (streaming): shadow and loop then read the list at different times.
+int ResourceSlotByte(u64 material, u32 offset) {
+    int index = -1;
+    if (offset >= 0xa40 && offset < 0xa80) {
+        index = static_cast<int>((offset - 0xa40) / 8);
+    } else if (offset >= 0x740 && offset < 0x780) {
+        index = static_cast<int>((offset - 0x740) / 8);
+    }
+    if (index < 0) {
+        return -1;
+    }
+    const u64 table = R<u64>(Global(GlobalObjectTableForRace));
+    const u64 list = R<u64>(R<u64>(Global(GlobalContextForRace)) + 0x38);
+    u64 value = RenderDataOf(table, R<u64>(list + 0x30));
+    if (static_cast<u32>(index) < std::min<u32>(8, R<u32>(material + 0x198))) {
+        value = RenderDataOf(table, R<u64>(R<u64>(material + 400) + u64{static_cast<u32>(index)} * 8));
+        if (value == 0) {
+            value = RenderDataOf(table, R<u64>(list + 0x38));
+        }
+    }
+    return static_cast<int>((value >> ((offset & 7) * 8)) & 0xff);
 }
 
 /// The byte the render object of `material` holds now for the context byte `offset` (the block copies of FUN_01c92b60), or -1.
@@ -1133,7 +1177,10 @@ u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, cons
                 // the dynamic constants of a material's render object are rewritten by the engine's other threads: if the live byte is what the object holds now, shadow and loop only read at
                 // different times
                 if (const u64 material = v.owner_of[at_byte]; material != 0) {
-                    const int now = MaterialByte(material, at_byte);
+                    int now = MaterialByte(material, at_byte);
+                    if (now < 0) {
+                        now = ResourceSlotByte(material, at_byte);
+                    }
                     if (now >= 0 && now == live) {
                         ++v.raced;
                         s.raced_words[fmt::format("view {} material block byte {:#x}", v.view, at_byte & ~7u)]++;
@@ -1600,9 +1647,7 @@ void GenerateGBuffer(Target& t, const GPlan& plan, u32 pass_flags) {
         }
         for (u32 s = level.first_step; s < level.first_step + level.step_count; ++s) {
             const GStep& step = plan.steps[s];
-            if (t.live) {
-                Timed(CallId::ResourceSet, [&] { reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, 0); });
-            }
+            Timed(CallId::ResourceSet, [&] { ResourceSetStep(t, rd, step.material, 0, true); });
             const bool raster = (R<u32>(step.material + 0xd4) & 0x26) != 0;
             if (raster != raster_flag) {
                 raster_flag = raster;
@@ -1705,6 +1750,7 @@ u32 Fnv1a(const char* text) {
     }
     return hash;
 }
+std::atomic<u64> last_forward_ctx{0}; // study: the device context seen by the forward generator (the report lists its vtable)
 struct VariantStats {
     std::atomic<u64> native{}, engine{}, verified{}, differing{};
 };
@@ -1785,11 +1831,130 @@ void HandleRefDec(u64 handle) {
     }
 }
 
+// A3: FUN_01c92f30(renderDev + 0x2910, ctx, material, special), the per primitive resource set, read off the decompilation (stages/a3-engine-functions.md). `TLG_GEN_NATIVE_LEAF=4`
+// makes it natively for a primitive without a special entry, with the constant buffer of the matrices updated the way the context's UpdateSubresource (vtable + 0xd0,
+// FUN_02480f90) does it for the dynamic buffer kind; any other shape runs the engine's function. In the verify run's shadow the effects on the device (the matrices block, the
+// buffer's descriptor and ring block) cannot be applied: the shadow computes the expected bytes, the first draw after the call compares them with what the engine's loop left
+// (`NoteLoopDraw`), and a pass with a special entry is not modelled in the shadow at all (as before).
+constexpr u64 FunctionAllocFrameGarlic = 0x02476350; // JsDevice_AllocFrameGarlic(allocator, size, align)
+constexpr u64 GlobalDeviceHolder = 0x06b03558;       // DAT_06b03558: holder of the frame allocator (+ 0x10238)
+u64 RenderDataOf(u64 render_device, u64 object);
+struct RsStatsT {
+    std::atomic<u64> native{}, engine_special{}, engine_shape{}, compared{}, differing{};
+};
+RsStatsT& RsStats() {
+    static RsStatsT stats;
+    return stats;
+}
+bool NativeResourceSetOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_GEN_NATIVE_LEAF");
+        return e != nullptr && *e != 0 && std::atoi(e) >= 4;
+    }();
+    return on;
+}
+void ResourceSetStep(Target& t, u64 rd, u64 material, u64 special, bool shadow_ok) {
+    const u64 rd2910 = rd + 0x2910;
+    const auto engine = [&] { reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd2910, reinterpret_cast<u64>(t.base), material, special); };
+    const bool native = NativeResourceSetOn() && special == 0;
+    if (!native) {
+        if (special != 0 && NativeResourceSetOn()) {
+            RsStats().engine_special.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (t.live) {
+            engine();
+        }
+        return;
+    }
+    if (!t.live && !shadow_ok) {
+        return;
+    }
+    if (!(R<s32>(material + 0x1bc) != 0 || R<u64>(material + 0x48) != 0)) {
+        RsStats().native.fetch_add(1, std::memory_order_relaxed); // the engine's function does nothing for this material
+        return;
+    }
+    const u64 buffer = R<u64>(rd2910 + 0xef0);
+    if (buffer == 0 || R<s32>(buffer + 0x124) != 1 || (R<u8>(buffer + 0x188) & 4) == 0 || R<u32>(buffer + 0x180) < 112) {
+        RsStats().engine_shape.fetch_add(1, std::memory_order_relaxed);
+        if (t.live) {
+            engine();
+        }
+        return;
+    }
+    const u64 table = R<u64>(Global(GlobalObjectTable));
+    const u64 list = R<u64>(R<u64>(Global(GlobalContext)) + 0x38);
+    std::array<u64, 8> slot;
+    slot.fill(RenderDataOf(table, R<u64>(list + 0x30)));
+    // the matrices: up to seven 16 byte entries from the material into the block at renderDev + 0x3790 (the shadow keeps its own copy)
+    const u32 n = std::min<u32>(7, R<u32>(material + 0x180));
+    std::array<u8, 112> matrices{};
+    if (n != 0) {
+        std::memcpy(matrices.data(), reinterpret_cast<const void*>(R<u64>(material + 0x178)), n * 16);
+    }
+    // the textures: the material's list is read under its spin lock
+    auto* lock = reinterpret_cast<std::atomic<s32>*>(material + 0x1a4);
+    for (;;) {
+        s32 expected = 0;
+        if (lock->compare_exchange_strong(expected, 1)) {
+            break;
+        }
+        std::this_thread::yield();
+    }
+    const u32 count = std::min<u32>(8, R<u32>(material + 0x198));
+    const u64 entries = R<u64>(material + 400);
+    for (u32 i = 0; i < count; ++i) {
+        u64 data = RenderDataOf(table, R<u64>(entries + u64{i} * 8));
+        if (data == 0) {
+            data = RenderDataOf(table, R<u64>(list + 0x38));
+        }
+        slot[i] = data;
+    }
+    {
+        s32 expected = 1;
+        lock->compare_exchange_strong(expected, 0);
+    }
+    const u32 mask = R<u32>(material + 0x170);
+    if ((mask & 1) != 0) {
+        for (u32 i = 0; i < 8; ++i) {
+            t.Set<u64>(0xa40 + i * 8, slot[i]);
+        }
+    }
+    if ((mask & 2) != 0) {
+        for (u32 i = 0; i < 8; ++i) {
+            t.Set<u64>(0x740 + i * 8, slot[i]);
+        }
+    }
+    const u32 size = R<u32>(buffer + 0x180);
+    if (t.live) {
+        // UpdateSubresource on the dynamic buffer: the whole block at renderDev + 0x3790 goes to a block of the frame ring, the buffer's descriptor points at it
+        if (n != 0) {
+            std::memcpy(reinterpret_cast<void*>(rd2910 + 0xe80), matrices.data(), n * 16);
+        }
+        W<u32>(buffer + 0x2c, t.Get<u32>(0x47ac));
+        const u64 holder = R<u64>(Global(GlobalDeviceHolder));
+        void* block = reinterpret_cast<void*>(reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u64)>(Global(FunctionAllocFrameGarlic))(R<u64>(holder + 0x10238), size, 0x10));
+        std::memcpy(block, reinterpret_cast<const void*>(rd2910 + 0xe80), size);
+        const u64 address = reinterpret_cast<u64>(block);
+        W<u32>(buffer + 0x60, static_cast<u32>(address));
+        W<u32>(buffer + 0x64, static_cast<u32>(address >> 32) & 0xfffu | 0x100000u);
+        W<u32>(buffer + 0x6c, 0x20077facu);
+        W<u32>(buffer + 0x68, (size + 0xfu) >> 4);
+        const s64 version = reinterpret_cast<std::atomic<s64>*>(holder + 0x302a0)->fetch_add(1);
+        W<s64>(buffer + 0x160, version);
+    } else {
+        t.rs_pending = true;
+        t.rs_n = n;
+        t.rs_size = size;
+        t.rs_bytes = matrices;
+    }
+    t.Set<u64>(0x2e0, buffer);
+    t.Set<u64>(0x360, buffer);
+    RsStats().native.fetch_add(1, std::memory_order_relaxed);
+}
+
 // A3: FUN_01c710f0 and FUN_01c70cc0 (the forward prologue), read off the decompilation (documents/tlg/native plan/stages/a3-engine-functions.md). `TLG_GEN_NATIVE_LEAF=2`
 // (the lookup too): the prologue is made natively, in the live run and in the verify run's shadow. The shadow cannot take a block from the frame ring: it builds the block in
 // `Verify::forward_block` and the first draw of the engine's loop compares it with the block the engine's prologue put in the ring (`NoteLoopDraw`).
-constexpr u64 FunctionAllocFrameGarlic = 0x02476350; // JsDevice_AllocFrameGarlic(allocator, size, align)
-constexpr u64 GlobalDeviceHolder = 0x06b03558;       // DAT_06b03558: holder of the frame allocator (+ 0x10238)
 bool NativePrologueOn() {
     static const bool on = [] {
         const char* e = std::getenv("TLG_GEN_NATIVE_LEAF");
@@ -2029,6 +2194,7 @@ void ScanForwardPass(FScanArgs& a) {
 
 void GenerateForward(Target& t, const FPlan& plan) {
     const u64 rd = plan.render_device;
+    const bool pure_pass = std::none_of(plan.batches.begin(), plan.batches.end(), [](const FBatch& b) { return b.special != 0; });
     if (t.Get<u32>(0x4480) != 4) {
         t.Set<u32>(0x4480, 4);
         t.Or8(0x447c, 1);
@@ -2095,9 +2261,7 @@ void GenerateForward(Target& t, const FPlan& plan) {
                 state_words(R<u64>(rd + 0x3ca8 + u64{state} * 8));
                 last_state = state;
             }
-            if (t.live) {
-                Timed(CallId::ResourceSet, [&] { reinterpret_cast<GuestBind>(Global(FunctionBindResources))(rd + 0x2910, reinterpret_cast<u64>(t.base), step.material, fb.special); });
-            }
+            Timed(CallId::ResourceSet, [&] { ResourceSetStep(t, rd, step.material, fb.special, pure_pass); });
             // the handle sequence of the loop: the material's handle is counted, a special entry replaces it by the handle its virtual +0x48 returns (counted by the virtual), the variant search
             // gets the resulting handle
             u64 token = R<u32>(step.material + 0x1bc);
@@ -2242,6 +2406,24 @@ void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3) {
             NoteMismatch(s, v.view, "forward prologue block", fmt::format("the engine's block at {:#x} differs from the native one", block));
         }
     }
+    if (mark.rs_valid) {
+        // A3: what the engine's FUN_01c92f30 left in the device before this draw against what the native resource set computed
+        RsStats().compared.fetch_add(1, std::memory_order_relaxed);
+        const u64 matrices = v.rd + 0x3790, buffer = R<u64>(v.rd + 0x3800);
+        bool same = std::memcmp(reinterpret_cast<const void*>(matrices), mark.rs_bytes.data(), mark.rs_n * 16) == 0;
+        std::string why = same ? "" : "the matrices block";
+        if (same && buffer != 0) {
+            const u64 block = u64{R<u32>(buffer + 0x60)} | (u64{R<u32>(buffer + 0x64) & 0xfffu} << 32);
+            same = R<u32>(buffer + 0x68) == ((mark.rs_size + 0xfu) >> 4) && R<u32>(buffer + 0x6c) == 0x20077facu && block != 0 &&
+                   std::memcmp(reinterpret_cast<const void*>(block), mark.rs_bytes.data(), mark.rs_n * 16) == 0;
+            why = same ? "" : "the constant buffer";
+        }
+        if (!same) {
+            RsStats().differing.fetch_add(1, std::memory_order_relaxed);
+            ++v.mismatches;
+            NoteMismatch(s, v.view, "resource set", fmt::format("draw {}: {} differs from the native one", k, why));
+        }
+    }
     v.mismatches += CompareDelta(s, v, v.arena_pos, mark.arena_end, ctx, fmt::format("draw {}", k).c_str());
     v.arena_pos = mark.arena_end;
 }
@@ -2339,6 +2521,7 @@ bool HandlePass(u64 render_device, u64 desc, u64 original_loop) {
         v.lo = ZPassBegin;
         v.hi = ZPassEnd;
         v.ctx = plan.ctx;
+        v.rd = plan.render_device;
         v.compared_draws = 0;
         v.mismatches = 0;
         v.raced = 0;
@@ -2469,6 +2652,7 @@ bool HandleGBuffer(u64 render_device, u64 mode, u64 list, u64 args, u64 flags, u
         v.lo = GBufferBegin;
         v.hi = GBufferEnd;
         v.ctx = plan.ctx;
+        v.rd = plan.render_device;
         v.compared_draws = 0;
         v.mismatches = 0;
         v.raced = 0;
@@ -2529,6 +2713,7 @@ bool HandleForward(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 or
     plan.a1 = a1;
     plan.a2 = a2;
     plan.mode = static_cast<u32>(mode);
+    last_forward_ctx.store(R<u64>(render_device + 0x2d8), std::memory_order_relaxed);
     FScanArgs scan_args{&plan, list};
     {
         std::scoped_lock lock{s.mutex};
@@ -2581,6 +2766,7 @@ bool HandleForward(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 or
         v.lo = ForwardBegin;
         v.hi = ForwardEnd;
         v.ctx = plan.ctx;
+        v.rd = plan.render_device;
         v.compared_draws = 0;
         v.mismatches = 0;
         v.raced = 0;
@@ -2808,6 +2994,17 @@ nlohmann::json Report() {
                                                 {"forward_prologue_blocks_differing", Leaf().block_differing.load()}};
     out["native_variant_find_FUN_01c822c0"] = {{"answered_natively_from_the_cached_variant", VStats().native.load()}, {"engine_calls_search_or_create", VStats().engine.load()},
                                                {"verify_calls_of_the_engine", VStats().verified.load()}, {"verify_differences", VStats().differing.load()}};
+    if (const u64 ctx = last_forward_ctx.load(); ctx != 0) {
+        nlohmann::json vt = nlohmann::json::object();
+        const u64 table = R<u64>(ctx);
+        for (u32 slot = 0; slot < 0x120 / 8; ++slot) {
+            vt[fmt::format("{:#x}", slot * 8)] = fmt::format("{:#x}", R<u64>(table + slot * 8) - NativeDraw::ImageBase() + 0x1000000);
+        }
+        out["study_device_context_vtable_as_ghidra_addresses"] = vt;
+    }
+    out["native_resource_set_FUN_01c92f30"] = {{"made_natively", RsStats().native.load()}, {"engine_special_entry", RsStats().engine_special.load()},
+                                              {"engine_other_buffer_shape", RsStats().engine_shape.load()}, {"verify_draws_compared", RsStats().compared.load()},
+                                              {"verify_draws_differing", RsStats().differing.load()}};
     out["verify_difference_kinds"] = s.mismatch_kinds;
     out["special_entry_classes"] = s.special_classes;
     out["verify_words_that_moved_by_view_kind_offset"] = s.raced_words;
