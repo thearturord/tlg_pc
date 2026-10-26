@@ -18,6 +18,7 @@
 #endif
 #include <nlohmann/json.hpp>
 
+#include "core/native_draw.h"
 #include "core/native_registry.h"
 #include "core/native_resources.h"
 
@@ -847,6 +848,11 @@ bool AuditBuffer(u64 address, u64 size, bool written, bool shader_constant) {
     return unexplained_flag;
 }
 
+namespace {
+std::mutex unexplained_image_mutex;
+std::map<std::pair<u64, u64>, u64> unexplained_compute_images; ///< (caller ghidra address, address) -> requests; ///< B2: image start addresses a dispatch bound that its record's descriptors did not name
+} // namespace
+
 void AuditImage(u64 address) {
     if (!enabled.load(std::memory_order_relaxed)) {
         return;
@@ -863,6 +869,14 @@ void AuditImage(u64 address) {
                 explained = draw->images[i] == address;
             }
             (explained ? explained_images : unexplained_images)[draw_class].fetch_add(1, std::memory_order_relaxed);
+            if (!explained && draw_class == 3) {
+                std::scoped_lock lock{unexplained_image_mutex};
+                const u64 caller = NativeDraw::RecordCaller(current_draw_seq);
+                const std::pair<u64, u64> key{caller != 0 ? caller - NativeDraw::ImageBase() + 0x1000000 : 0, address};
+                if (unexplained_compute_images.size() < 4096 || unexplained_compute_images.contains(key)) {
+                    ++unexplained_compute_images[key];
+                }
+            }
         }
     }
     bool found = false, in_buffer = false;
@@ -1214,6 +1228,13 @@ nlohmann::json Report() {
                 list.push_back({{"address", fmt::format("{:#x}", top[i].first)}, {"requests", top[i].second.count}, {"block", NativeResources::DescribeAddress(top[i].first)}});
             }
             j["audit_images"]["distinct_not_registered"] = image_misses.size();
+            std::scoped_lock lock{unexplained_image_mutex};
+            std::vector<std::pair<std::pair<u64, u64>, u64>> unexplained(unexplained_compute_images.begin(), unexplained_compute_images.end());
+            std::ranges::sort(unexplained, [](const auto& a, const auto& b) { return a.second > b.second; });
+            auto& ulist = j["unexplained_compute_images"] = nlohmann::json::array();
+            for (size_t i = 0; i < unexplained.size() && i < 12; ++i) {
+                ulist.push_back({{"caller", fmt::format("{:#x}", unexplained[i].first.first)}, {"address", fmt::format("{:#x}", unexplained[i].first.second)}, {"requests", unexplained[i].second}});
+            }
         }
     }
     return j;

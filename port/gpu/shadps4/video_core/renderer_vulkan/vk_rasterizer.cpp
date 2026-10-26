@@ -779,6 +779,7 @@ void Rasterizer::RecyclePlan(std::unique_ptr<DispatchPlan>&& plan) {
     }
     plan->pipeline = nullptr;
     plan->ring_end = 0;
+    plan->native_seq = 0;
     ResetStage(plan->stage);
     std::scoped_lock lk{plan_pool_mutex};
     if (dispatch_plan_pool.size() < 512) {
@@ -1192,7 +1193,7 @@ void Rasterizer::SetExplicitImageReadback(bool on) {
 void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     RENDERER_TRACE;
     Core::NativeRegistry::SetDrawClass(3);
-    Core::NativeRegistry::SetCurrentDraw(0);
+    Core::NativeRegistry::SetCurrentDraw(plan != nullptr ? plan->native_seq : 0, plan != nullptr && plan->native_seq != 0);
 
     scheduler.PopPendingOperations();
 
@@ -1239,7 +1240,7 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const DispatchPlan* plan) {
     RENDERER_TRACE;
     Core::NativeRegistry::SetDrawClass(3);
-    Core::NativeRegistry::SetCurrentDraw(0);
+    Core::NativeRegistry::SetCurrentDraw(plan != nullptr ? plan->native_seq : 0, plan != nullptr && plan->native_seq != 0);
 
     scheduler.PopPendingOperations();
 

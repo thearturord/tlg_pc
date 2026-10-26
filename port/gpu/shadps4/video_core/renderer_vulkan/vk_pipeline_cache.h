@@ -198,6 +198,7 @@ struct DispatchPlan {
     AmdGpu::BorderColorBuffer ta_bc_base{}; ///< The custom border colour table the dispatch's samplers use.
     StagePlan stage{};
     u64 ring_end{}; ///< T1: the constant ring position after this plan's copies
+    u64 native_seq{}; ///< B2: the record this dispatch was planned from (the registry audit names its resources by it)
 };
 
 class PipelineCache {

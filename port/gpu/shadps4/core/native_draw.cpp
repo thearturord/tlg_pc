@@ -1247,7 +1247,7 @@ void AddGeometryId(NativeRecord& record, u64 object) {
     record.geometry_ids[record.geometry_id_count++] = id;
 }
 void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* words, u32 dwords, u32 table_sgpr = 0xff, u32 entry_dwords = 0) {
-    if (binding_record == nullptr || stage > 1) {
+    if (binding_record == nullptr || (stage > 1 && stage != 5)) { // B2: the compute stage (5) names its resources too
         return;
     }
     auto& record = *binding_record;
@@ -1424,6 +1424,10 @@ u32 UavDescriptor(u64 ctx, u32 slot, u32* out, u32 max_dwords) {
         for (u32 i = 0; i < size && i < max_dwords; ++i) {
             out[i] = Rd<u32>(src, i * 4);
         }
+        NoteDescriptor(5, buffer ? 1 : 2, out);
+        SetLastDescriptorObject(view);
+    } else {
+        SetLastDescriptorObject(0);
     }
     for (u32 i = size; i < max_dwords; ++i) {
         out[i] = 0;
@@ -1632,8 +1636,9 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 shader_block, u64 gnm, u64 input
             break;
         case 4: { // immediate RW resource (compute)
             const u32 size = (flags & 1) ? 8 : 4;
-            UavDescriptor(ctx, slot, words.data(), size);
+            const u32 got = UavDescriptor(ctx, slot, words.data(), size);
             put(start, words.data(), size);
+            NoteBinding(stage, got == 8 ? 2 : 1, slot, start, words.data(), size);
             break;
         }
         case 26: { // pointer to the global internal resource table (CUE field)
@@ -1732,7 +1737,8 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 shader_block, u64 gnm, u64 input
                     const u32 got = ResourceDescriptor(ctx, stage, s, table + s * 8, 8);
                     NoteBinding(stage, got == 8 ? 2 : 1, s, 0xffff, table + s * 8, got, in_record, 8);
                 } else if (type == 25) {
-                    UavDescriptor(ctx, s, table + s * 8, 8);
+                    const u32 got = UavDescriptor(ctx, s, table + s * 8, 8);
+                    NoteBinding(stage, got == 8 ? 2 : 1, s, 0xffff, table + s * 8, got, in_record, 8);
                 } else if (type == 22) {
                     ConstBufferDescriptor(ctx, stage, s, table + s * 4);
                     NoteBinding(stage, 1, s, 0xffff, table + s * 4, 4, in_record, 4);
@@ -2901,8 +2907,14 @@ u64 MakeComputeRecord(u64 ctx, u64 x, u64 y, u64 z, u64 caller) {
         cs_reg(0x0d, 0);
         cs_reg(0x12, Rd<u32>(regs, 8)); // COMPUTE_PGM_RSRC1 / RSRC2
         cs_reg(0x13, Rd<u32>(regs, 12));
+        slot.binding_count = 0;
+        slot.geometry_id_count = 0;
+        slot.bindings_overflow = false;
+        slot.bindings_for = seq;
+        binding_record = &slot;
         SynthesizeUserData(ctx, 5, shader + 0x30, gnm, 0x28, Core::NativeDraw::ComputeRegisterBase + 0x40, slot.regs.data(),
                            n, slot);
+        binding_record = nullptr;
     }
     slot.flags = (table_overflow || bad_object_seen ? SpecialPipeline : 0u) | synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
     slot.count = n;
@@ -2945,6 +2957,14 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
     BeginTables(seq);
     auto& slot = Slot(seq);
+    slot.binding_count = 0;
+    slot.geometry_id_count = 0;
+    slot.bindings_overflow = false;
+    slot.bindings_for = seq;
+    binding_record = &slot;
+    struct BindingScope {
+        ~BindingScope() { binding_record = nullptr; }
+    } binding_scope;
     slot.seq.store(0, std::memory_order_release);
     slot.check_count = 0;
     slot.unsupported_inputs = 0;
@@ -3008,6 +3028,9 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
                 break;
             }
             read_descriptor(sampler + 0x64, 4);
+            NoteDescriptor(5, 3, descriptor.data());
+            SetLastDescriptorObject(sampler, true);
+            NoteBinding(5, 3, index, Rd<u16>(offs, 0x142 + index * 2), descriptor.data(), 4);
             place(Rd<u16>(offs, 0x142 + index * 2), descriptor.data(), 4);
         }
     }
@@ -3019,6 +3042,9 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
                 break;
             }
             read_descriptor(buffer + 0x60, 4);
+            NoteDescriptor(5, 1, descriptor.data());
+            SetLastDescriptorObject(buffer);
+            NoteBinding(5, 1, index, Rd<u16>(offs, 0x162 + index * 2), descriptor.data(), 4);
             place(Rd<u16>(offs, 0x162 + index * 2), descriptor.data(), 4);
         }
     }
@@ -3035,9 +3061,15 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
                 descriptor[1] = (Rd<u32>(view, 0x7c) & 0xffff0fffu) | 0xb000u;
                 descriptor[2] = Rd<u32>(view, 0x80);
                 descriptor[3] = (Rd<u32>(view, 0x84) & 0xc7ffffffu) | 0x18000000u;
+                NoteDescriptor(5, 1, descriptor.data());
+                SetLastDescriptorObject(view);
+                NoteBinding(5, 1, index, Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 4);
                 place(Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 4);
             } else {
                 read_descriptor(view + 0x58, 8);
+                NoteDescriptor(5, 2, descriptor.data());
+                SetLastDescriptorObject(view);
+                NoteBinding(5, 2, index, Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 8);
                 place(Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 8);
             }
         }
@@ -3052,6 +3084,9 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
             }
             if (Rd<u32>(view, 0x44) == 1) {
                 read_descriptor(view + 0x74, 4);
+                NoteDescriptor(5, 1, descriptor.data());
+                SetLastDescriptorObject(view);
+                NoteBinding(5, 1, index, Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 4);
                 place(Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 4);
                 if ((Rd<u8>(view, 0x50) & 2) != 0) {
                     if (const u32 init = Rd<u32>(jcc, 0x2158 + index * 4); init != 0xffffffffu) {
@@ -3067,6 +3102,9 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
                 }
             } else {
                 read_descriptor(view + 0x54, 8);
+                NoteDescriptor(5, 2, descriptor.data());
+                SetLastDescriptorObject(view);
+                NoteBinding(5, 2, index, Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 8);
                 place(Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 8);
             }
         }
@@ -5546,7 +5584,19 @@ u64 TagCompute(u64 ctx, u64 x, u64 y, u64 z, u64 ret, bool exec_capable) {
     if (Rd<u64>(ctx, 0x4670) != 0) {
         RunComputeTracking(ctx);
     }
+    static thread_local NativeRegistry::DrawResources dispatch_resources;
+    NativeRegistry::DrawResources* v2 = nullptr;
+    if (NativeRegistry::enabled.load(std::memory_order_relaxed)) {
+        dispatch_resources = {};
+        v2 = &dispatch_resources;
+    }
+    v2_collect = v2;
     const u64 seq = Guarded([&] { return MakeComputeRecord(ctx, x, y, z, ret); });
+    v2_collect = nullptr;
+    if (v2 != nullptr && seq != 0) {
+        v2->seq = seq;
+        NativeRegistry::StoreDraw(*v2);
+    }
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
     words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
     words[1] = VideoCore::NativeTagMagic;
@@ -5591,7 +5641,19 @@ u64 PS4_SYSV_ABI TagDispatchIndirect(u64 ctx, u64 buffer, u64 offset, u64 a3, u6
         return 0;
     }
     RunComputeTracking(ctx);
+    static thread_local NativeRegistry::DrawResources indirect_resources;
+    NativeRegistry::DrawResources* v2 = nullptr;
+    if (NativeRegistry::enabled.load(std::memory_order_relaxed)) {
+        indirect_resources = {};
+        v2 = &indirect_resources;
+    }
+    v2_collect = v2;
     const u64 seq = Guarded([&] { return MakeComputeRecord(ctx, 1, 1, 1, ret); });
+    v2_collect = nullptr;
+    if (v2 != nullptr && seq != 0) {
+        v2->seq = seq;
+        NativeRegistry::StoreDraw(*v2);
+    }
     auto& slot = Slot(seq);
     if (slot.seq.load(std::memory_order_acquire) != seq) {
         return 0;
@@ -6511,7 +6573,19 @@ u64 TagAsc(u64 jcc, u64 x, u64 y, u64 z, u64 ret, bool allow_exec = true) {
     if (NativeRegistry::enabled.load(std::memory_order_relaxed)) {
         Guarded([&] { ObserveAscContext(jcc); return u64{0}; });
     }
+    static thread_local NativeRegistry::DrawResources asc_resources;
+    NativeRegistry::DrawResources* v2 = nullptr;
+    if (NativeRegistry::enabled.load(std::memory_order_relaxed)) {
+        asc_resources = {};
+        v2 = &asc_resources;
+    }
+    v2_collect = v2;
     const u64 seq = Guarded([&] { return MakeAscRecord(jcc, x, y, z, ret); });
+    v2_collect = nullptr;
+    if (v2 != nullptr && seq != 0) {
+        v2->seq = seq;
+        NativeRegistry::StoreDraw(*v2);
+    }
     if (seq == 0) {
         {
             static std::mutex mutex;

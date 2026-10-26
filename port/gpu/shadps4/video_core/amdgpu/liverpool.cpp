@@ -1004,6 +1004,9 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         if (verify == 2) {
             op.dispatch_plan = ReplanAfterDrain(std::move(op.dispatch_plan), 0, [&] { return rasterizer->PlanDispatch(op.cs, front_state.ta_bc_base); });
         }
+        if (op.dispatch_plan && call.tag.valid) {
+            op.dispatch_plan->native_seq = call.tag.seq;
+        }
     } else {
         const Vulkan::DrawIndirectParams params =
             call.kind == RasterCall::Kind::DrawIndirect
@@ -1424,6 +1427,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             live.cs_audit_differing.fetch_add(differs ? 1 : 0, std::memory_order_relaxed);
         }
         RasterCall dispatch{};
+        dispatch.tag = native_tag_pending;
         dispatch.kind = RasterCall::Kind::DispatchDirect;
         if (draw.fill_dwords != 0 && asc_vqid == ~0u && Core::NativeResources::ImageCopyEnabled()) {
             dispatch.fill_destination = static_cast<VAddr>(draw.fill_destination);
