@@ -27,9 +27,10 @@ std::atomic<bool> enabled{[] {
     const char* u = std::getenv("TLG_NATIVE_UPLOADS");
     const char* s = std::getenv("TLG_SNAPSHOTS");
     const char* r = std::getenv("TLG_RING_SUPERSEDE");
+    const char* res = std::getenv("TLG_RESIDENT_BUFFERS");
     // the announcements are also what the native uploads and the snapshots are made of
     return (e != nullptr && *e != 0 && *e != '0') || (u != nullptr && *u != 0 && *u != '0') || (s != nullptr && *s != 0 && *s != '0') ||
-           (r != nullptr && *r != 0 && *r != '0');
+           (r != nullptr && *r != 0 && *r != '0') || (res != nullptr && *res != 0 && *res != '0');
 }()};
 
 namespace {
@@ -243,6 +244,7 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread) {
     if (address == 0 || size == 0) {
         return;
     }
+    NativeResources::NoteAnnouncedWrite(address, size); // C1: resident buffers on those pages are not synchronized any more
     if (AuditFaults()) {
         NoteAnnouncerThread(writer);
     }

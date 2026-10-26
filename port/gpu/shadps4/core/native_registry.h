@@ -136,6 +136,8 @@ void NoteShPacket(u32 reg_offset, const u32* words, u32 count);
 
 /// The pass class of what the raster thread is binding for (0 z prepass / shadow, 1 g-buffer, 2 forward, 3 compute / other, 15 untagged).
 void SetDrawClass(u32 draw_class);
+/// C5 (hazard audit): the draw class the raster thread is working on (0 z / shadow, 1 g-buffer, 2 forward, 3 compute, 4 indirect, 15 untagged).
+u32 CurrentDrawClass();
 /// NativeDraw v2 audit (raster thread): the legacy backend reads the descriptor of a shader resource from the flat user data at `offset` (`words`, `dwords` of them;
 /// offset 0xffff: it is not a single load of consecutive dwords). Compares it with the binding of the current draw's record at that offset: same words.
 void AuditBinding(u32 sw_stage, bool image, u32 offset, const u32* words, u32 dwords);

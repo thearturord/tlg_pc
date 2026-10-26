@@ -686,6 +686,10 @@ void SetCurrentDraw(u64 seq, bool from_plan) {
     current_draw_seq = seq;
 }
 
+u32 CurrentDrawClass() {
+    return draw_class;
+}
+
 void SetDrawClass(u32 draw_class_) {
     draw_class = draw_class_ & 15;
 }

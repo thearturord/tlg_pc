@@ -26,6 +26,7 @@
 #include "video_core/renderer_vulkan/vk_host_import.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace AmdGpu {
@@ -135,6 +136,8 @@ public:
     /// C0 census (read only, counts per ~5 s interval): how every buffer and image binding, and every vertex / index buffer, of the draws and dispatches was resolved
     /// by the consumer. Index = (compute ? 32 : 0) + kind for the shader bindings, 24 + kind for the geometry (graphics only); see `CensusKind` in vk_rasterizer.cpp.
     std::array<u64, 64> TakeConsumerCensus() noexcept;
+    [[nodiscard]] bool HazardAuditOn() const noexcept;
+    Runtime::HazardAudit TakeHazardAudit();
     [[nodiscard]] bool InPlaceOn() const noexcept {
         return inplace_on;
     }

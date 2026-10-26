@@ -564,10 +564,38 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         } else {
             immutable = Core::NativeResources::FindImmutable(device_addr, size);
         }
+        if (immutable != nullptr && immutable->usage != 1 && IsRegionGpuModified(device_addr, size)) {
+            // a resident (mutable usage) buffer the GPU modified: the normal path decides
+            Core::NativeResources::NoteResident(4);
+            immutable = nullptr;
+        }
         if (immutable != nullptr) {
-            if (immutable->synced.load(std::memory_order_acquire) && !Core::NativeResources::ImmutableCheck(*immutable)) {
+            // a resident buffer is also asked of the tracker: the fault handler marks a page after it bumped the generation (the mark can land after a synchronization that
+            // saw nothing), so the generation alone is not enough; the tracker's dirty bit is the safety net of the engine's own knowledge
+            if (immutable->synced.load(std::memory_order_acquire) && !Core::NativeResources::ImmutableCheck(*immutable) &&
+                (immutable->usage == 1 || !memory_tracker->IsRegionCpuModified(device_addr, size))) {
                 const auto* arena = GetArena(device_addr >> block_shift, (device_addr + size - 1) >> block_shift);
                 Core::NativeResources::NoteImmutableHit();
+                if (immutable->usage != 1) {
+                    Core::NativeResources::NoteResident(0);
+                    const u32 interval = Core::NativeResources::ResidentVerifyInterval();
+                    static std::atomic<u64> resident_hits{0};
+                    if (interval != 0 && resident_hits.fetch_add(1, std::memory_order_relaxed) % interval == 0) {
+                        // verify: one synchronization of the request; anything it has to upload means the answer without it would have been stale
+                        last_upload_bytes = 0;
+                        EnsureResident(arena, device_addr >> block_shift, (device_addr + size - 1) >> block_shift);
+                        SynchronizeMemory(arena, device_addr, size, false, false);
+                        Core::NativeResources::NoteResident(2);
+                        if (last_upload_bytes != 0) {
+                            Core::NativeResources::NoteResident(3);
+                            immutable->synced.store(false, std::memory_order_release);
+                            static std::atomic<u32> logged{0};
+                            if (logged.fetch_add(1) < 12) {
+                                LOG_ERROR(Render, "resident buffer {:#x}+{} (engine buffer {:#x}..{:#x}, usage {}) was stale: {} bytes had to be uploaded", device_addr, size, immutable->begin, immutable->end, immutable->usage, last_upload_bytes);
+                            }
+                        }
+                    }
+                }
                 return {arena, arena->Offset(device_addr)};
             }
             const u32 generation = immutable->generation.load(std::memory_order_acquire);
@@ -582,6 +610,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             }
             Core::NativeResources::ImmutableSynced(*immutable, generation);
             Core::NativeResources::NoteImmutableSync();
+            if (immutable->usage != 1) {
+                Core::NativeResources::NoteResident(1);
+            }
             return {arena, arena->Offset(device_addr)};
         }
     }

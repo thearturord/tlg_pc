@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -131,6 +132,7 @@ std::atomic<u64> image_copies_done{};
 std::array<std::atomic<u64>, 3> image_copies_refused;
 std::atomic<u64> immutable_hits{}, immutable_syncs{}, immutable_drops{}, immutable_checks{}, immutable_stale{};
 std::array<std::atomic<u64>, 16> immutable_handle_counters{};
+std::array<std::atomic<u64>, 8> resident_counters{};
 
 u64 NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -297,6 +299,7 @@ bool ReadResource(u64 object, Resource& out) {
 
 void AddImmutable(const Resource& resource) {
     auto entry = std::make_shared<ImmutableBuffer>();
+    entry->usage = static_cast<u8>(resource.usage);
     entry->begin = resource.address;
     entry->end = resource.address + ((u64{resource.width} + 3) & ~u64{3});
     entry->object = resource.object;
@@ -508,6 +511,10 @@ void NoteBufferObject(u64 object) {
         // kind 1 = buffer, usage 1 = immutable; buffers on memory the caller provided (misc bit 19) are owned elsewhere
         if (resource.kind == 1 && resource.usage == 1 && (resource.misc & 0x80000) == 0 && resource.width != 0) {
             AddImmutable(resource);
+        } else if (resource.kind == 1 && (resource.usage == 0 || resource.usage == 2) && (resource.misc & 0x80000) == 0 && resource.width != 0 && resource.width <= ResidentCap() &&
+                   ResidentBuffersEnabled()) {
+            AddImmutable(resource); // C1: resident default / dynamic buffer
+            NoteResident(5);
         }
     }
 }
@@ -598,16 +605,24 @@ void NoteCpuWrite(VAddr address, u64 size) {
     {
         std::shared_lock lock{immutable_mutex};
         if (!immutables.empty()) {
-            auto it = immutables.upper_bound(address);
+            // the page protection is per 4 KiB page: the first write to a page faults, the others do not until the page is protected again, so a resident (mutable) buffer
+            // on that page may have been written without a fault of its own; immutable buffers keep the exact range
+            const VAddr page_begin = address & ~VAddr{4095};
+            const VAddr page_end = (address + size + 4095) & ~VAddr{4095};
+            auto it = immutables.upper_bound(page_begin);
             if (it != immutables.begin()) {
                 --it;
             }
-            for (; it != immutables.end() && it->first < address + size; ++it) {
+            for (; it != immutables.end() && it->first < page_end; ++it) {
                 ImmutableBuffer& buffer = *it->second;
-                if (buffer.end > address) {
+                const bool hit = buffer.usage == 1 ? (buffer.end > address && buffer.begin < address + size) : (buffer.end > page_begin && buffer.begin < page_end);
+                if (hit) {
                     buffer.generation.fetch_add(1, std::memory_order_acq_rel);
                     if (buffer.synced.exchange(false, std::memory_order_acq_rel)) {
                         immutable_drops.fetch_add(1, std::memory_order_relaxed);
+                        if (buffer.usage != 1) {
+                            NoteResident(7);
+                        }
                     }
                 }
             }
@@ -706,6 +721,67 @@ ImmutableBuffer* FindImmutable(VAddr address, u32 size) {
 
 u64 ImmutableEpoch() {
     return immutable_epoch.load(std::memory_order_acquire);
+}
+
+bool ResidentBuffersEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_RESIDENT_BUFFERS");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+
+u32 ResidentCap() {
+    static const u32 cap = [] {
+        const char* e = std::getenv("TLG_RESIDENT_CAP");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 16)) : 262144u;
+    }();
+    return cap;
+}
+
+u32 ResidentVerifyInterval() {
+    static const u32 interval = [] {
+        const char* e = std::getenv("TLG_RESIDENT_VERIFY");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 64u;
+    }();
+    return interval;
+}
+
+void NoteResident(u32 what) {
+    resident_counters[what & 7].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::array<u64, 8> TakeResidentCounters() {
+    std::array<u64, 8> out{};
+    for (u32 i = 0; i < 8; ++i) {
+        out[i] = resident_counters[i].exchange(0, std::memory_order_relaxed);
+    }
+    return out;
+}
+
+void NoteAnnouncedWrite(VAddr address, u64 size) {
+    if (!ResidentBuffersEnabled() || size == 0) {
+        return;
+    }
+    std::shared_lock lock{immutable_mutex};
+    if (immutables.empty()) {
+        return;
+    }
+    const VAddr page_begin = address & ~VAddr{4095};
+    const VAddr page_end = (address + size + 4095) & ~VAddr{4095};
+    auto it = immutables.upper_bound(page_begin);
+    if (it != immutables.begin()) {
+        --it;
+    }
+    for (; it != immutables.end() && it->first < page_end; ++it) {
+        ImmutableBuffer& buffer = *it->second;
+        if (buffer.usage != 1 && buffer.end > page_begin && buffer.begin < page_end) {
+            buffer.generation.fetch_add(1, std::memory_order_acq_rel);
+            if (buffer.synced.exchange(false, std::memory_order_acq_rel)) {
+                NoteResident(6);
+            }
+        }
+    }
 }
 
 void NoteHandle(u32 what) {

@@ -1885,6 +1885,14 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     return true;
 }
 
+bool Rasterizer::HazardAuditOn() const noexcept {
+    return runtime.HazardAuditOn();
+}
+
+Runtime::HazardAudit Rasterizer::TakeHazardAudit() {
+    return runtime.TakeHazardAudit();
+}
+
 std::array<u64, 64> Rasterizer::TakeConsumerCensus() noexcept {
     std::array<u64, 64> out{};
     for (u32 i = 0; i < 64; ++i) {

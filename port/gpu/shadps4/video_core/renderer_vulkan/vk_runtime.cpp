@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/native_pass.h"
+#include "core/native_registry.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -103,6 +104,59 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     memory_barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
     memory_barrier.dstAccessMask =
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+    if (const char* e = std::getenv("TLG_HAZARD_AUDIT"); e != nullptr && *e != 0 && *e != '0') {
+        hazard_audit_on = true;
+    }
+}
+
+namespace {
+struct HazardScope {
+    u32& slot;
+    u32 saved;
+    HazardScope(u32& s, bool on, u32 value) : slot{s}, saved{s} {
+        if (on) {
+            slot = value;
+        }
+    }
+    ~HazardScope() {
+        slot = saved;
+    }
+};
+
+u32 HazardLayoutIndex(vk::ImageLayout layout) {
+    switch (layout) {
+    case vk::ImageLayout::eUndefined:
+        return 0;
+    case vk::ImageLayout::eGeneral:
+        return 1;
+    case vk::ImageLayout::eColorAttachmentOptimal:
+        return 2;
+    case vk::ImageLayout::eDepthStencilAttachmentOptimal:
+        return 3;
+    case vk::ImageLayout::eDepthStencilReadOnlyOptimal:
+        return 4;
+    case vk::ImageLayout::eShaderReadOnlyOptimal:
+        return 5;
+    case vk::ImageLayout::eTransferSrcOptimal:
+        return 6;
+    case vk::ImageLayout::eTransferDstOptimal:
+        return 7;
+    default:
+        return 8;
+    }
+}
+} // namespace
+
+u32 Runtime::HazardSource() const {
+    if (hazard_override != ~0u) {
+        return hazard_override;
+    }
+    const u32 draw_class = Core::NativeRegistry::CurrentDrawClass();
+    return draw_class <= 4 ? draw_class : 5;
+}
+
+Runtime::HazardAudit Runtime::TakeHazardAudit() {
+    return std::exchange(hazard, HazardAudit{});
 }
 
 void Runtime::TickFrame() {
@@ -111,6 +165,7 @@ void Runtime::TickFrame() {
 
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                          std::span<const vk::BufferCopy> copies) {
+    const HazardScope hazard_scope{hazard_override, hazard_audit_on, 6};
     Core::NativePass::SetEndSite(__builtin_return_address(0));
     scheduler.EndRendering();
 
@@ -135,6 +190,7 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
 }
 
 void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32 value) {
+    const HazardScope hazard_scope{hazard_override, hazard_audit_on, 7};
     scheduler.EndRendering();
 
     if (IsBufferAccessed(dst, offset, size, true)) {
@@ -149,6 +205,7 @@ void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32
 }
 
 void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
+    const HazardScope hazard_scope{hazard_override, hazard_audit_on, 7};
     scheduler.EndRendering();
 
     if (IsBufferAccessed(dst, offset, sizeof(value), true)) {
@@ -166,12 +223,22 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
+    const u32 layout_before = hazard_audit_on && image->backing ? HazardLayoutIndex(image->backing->state.layout) : 0;
     image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
-    return image_barriers.size() != prev_num_barriers;
+    const bool result = image_barriers.size() != prev_num_barriers;
+    if (hazard_audit_on) {
+        ++hazard.image_calls;
+        if (result) {
+            ++hazard.image_true;
+            ++hazard.image_true_by_layouts[layout_before][HazardLayoutIndex(dst_layout)][HazardSource()];
+        }
+    }
+    return result;
 }
 
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                           std::span<const vk::BufferImageCopy> upload_copies) {
+    const HazardScope hazard_scope{hazard_override, hazard_audit_on, 8};
     SetBackingSamples(dst, dst->info.num_samples, false);
     scheduler.EndRendering();
 
@@ -201,6 +268,7 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
 
 void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                             std::span<const vk::BufferImageCopy> download_copies) {
+    const HazardScope hazard_scope{hazard_override, hazard_audit_on, 8};
     SetBackingSamples(src, src->info.num_samples);
     scheduler.EndRendering();
 
@@ -721,8 +789,24 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
                                bool check_read_access) {
     MakeCurrent(handle);
     bool has_access = resource->write_ranges.Overlaps(offset, offset + size);
+    bool by_read = false;
     if (check_read_access && !has_access) {
         has_access |= resource->read_ranges.Overlaps(offset, offset + size);
+        by_read = has_access;
+    }
+    if (hazard_audit_on) {
+        ++hazard.buffer_queries;
+        if (has_access) {
+            ++hazard.buffer_true;
+            u32 writer = HazardAudit::Sources - 1; // unknown unless a record is found
+            for (auto it = resource->audit.rbegin(); it != resource->audit.rend(); ++it) {
+                if (it->write == !by_read && it->start < offset + size && offset < it->end) {
+                    writer = it->source;
+                    break;
+                }
+            }
+            ++hazard.buffer_true_by_writer_reader[writer][HazardSource()][check_read_access ? 1 : 0];
+        }
     }
     return has_access;
 }
@@ -781,6 +865,19 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
     }
     if (src_access & READ_MASK) {
         add_range(resource->read_ranges, range);
+    }
+    if (hazard_audit_on) {
+        auto& audit = resource->audit;
+        if (audit.size() >= 512) {
+            audit.erase(audit.begin(), audit.begin() + 256);
+        }
+        const u8 source = static_cast<u8>(HazardSource());
+        if (src_access & WRITE_MASK) {
+            audit.push_back({offset, offset + size, source, true});
+        }
+        if (src_access & READ_MASK) {
+            audit.push_back({offset, offset + size, source, false});
+        }
     }
 
     memory_barrier.srcStageMask |= src_stage;

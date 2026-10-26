@@ -1976,6 +1976,53 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                 out["note"] = "C0 census, counts per ~5 s interval (read only)";
                 Core::DebugServer::Publish("consumer_census", std::move(out));
             }
+            if (Core::NativeResources::ResidentBuffersEnabled()) {
+                const auto r = Core::NativeResources::TakeResidentCounters();
+                static std::array<u64, 8> resident_total{};
+                for (u32 i = 0; i < 8; ++i) {
+                    resident_total[i] += r[i];
+                }
+                Core::DebugServer::Publish("resident_buffers",
+                                           {{"answered_without_a_synchronization", r[0]}, {"synchronized_first_use_or_after_a_write", r[1]}, {"verify_runs", r[2]},
+                                            {"verify_runs_that_found_something_to_upload_stale_answers", r[3]}, {"left_to_the_normal_path_gpu_modified", r[4]}, {"registered_buffers", r[5]},
+                                            {"dropped_by_announced_writes", r[6]}, {"dropped_by_cpu_write_faults", r[7]},
+                                            {"since_start", {{"answered_without_a_synchronization", resident_total[0]}, {"synchronized", resident_total[1]}, {"verify_runs", resident_total[2]}, {"stale_answers_found_by_verify", resident_total[3]}, {"registered_buffers", resident_total[5]}}},
+                                            {"note", "C1 / C3, counts per ~5 s interval; since_start is cumulative"}});
+            }
+            if (rasterizer->HazardAuditOn()) {
+                const auto h = rasterizer->TakeHazardAudit();
+                static constexpr const char* sources[] = {"z_shadow_draws", "g_buffer_draws", "forward_draws", "compute", "indirect_draws", "untagged_draws", "buffer_copies", "fills_and_inline_data", "image_copies_and_uploads", "unknown_merged_ranges"};
+                static constexpr const char* layouts[] = {"undefined", "general", "color_attachment", "depth_stencil_attachment", "depth_stencil_read_only", "shader_read_only", "transfer_src", "transfer_dst", "other"};
+                nlohmann::json out = nlohmann::json::object();
+                out["buffer_queries"] = h.buffer_queries;
+                out["buffer_true"] = h.buffer_true;
+                nlohmann::json buffers = nlohmann::json::object();
+                for (u32 w = 0; w < Vulkan::Runtime::HazardAudit::Sources; ++w) {
+                    for (u32 r = 0; r < Vulkan::Runtime::HazardAudit::Sources; ++r) {
+                        for (u32 rw = 0; rw < 2; ++rw) {
+                            if (const u64 n = h.buffer_true_by_writer_reader[w][r][rw]) {
+                                buffers[std::string(sources[w]) + " -> " + sources[r] + (rw ? " (writes)" : " (reads)")] = n;
+                            }
+                        }
+                    }
+                }
+                out["buffer_true_by_earlier_access_then_asking_access"] = std::move(buffers);
+                out["image_transit_calls"] = h.image_calls;
+                out["image_transit_true"] = h.image_true;
+                nlohmann::json images = nlohmann::json::object();
+                for (u32 a = 0; a < Vulkan::Runtime::HazardAudit::Layouts; ++a) {
+                    for (u32 b = 0; b < Vulkan::Runtime::HazardAudit::Layouts; ++b) {
+                        for (u32 s = 0; s < Vulkan::Runtime::HazardAudit::Sources; ++s) {
+                            if (const u64 n = h.image_true_by_layouts[a][b][s]) {
+                                images[std::string(layouts[a]) + " -> " + layouts[b] + " by " + sources[s]] = n;
+                            }
+                        }
+                    }
+                }
+                out["image_true_by_layout_change_and_asking_access"] = std::move(images);
+                out["note"] = "C5 hazard audit, counts per ~5 s interval (read only)";
+                Core::DebugServer::Publish("hazard_audit", std::move(out));
+            }
             if (rasterizer->InPlaceOn()) {
                 const auto p = rasterizer->TakeInPlaceStats();
                 Core::DebugServer::Publish("in_place_buffers",

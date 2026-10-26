@@ -78,6 +78,21 @@ public:
 
     void FlushBarriers();
 
+    /// C5, the hazard audit (`TLG_HAZARD_AUDIT=1`, read only): which access made which later access need a barrier. Sources: 0 z / shadow draws, 1 g-buffer, 2 forward, 3 compute,
+    /// 4 indirect draws, 5 untagged draws, 6 buffer copies (the buffer cache's uploads), 7 fills and inline data, 8 image copies and uploads, 9 unknown (ranges merged by the bound).
+    /// Layouts: 0 undefined, 1 general, 2 color attachment, 3 depth stencil attachment, 4 depth stencil read only, 5 shader read only, 6 transfer src, 7 transfer dst, 8 other.
+    struct HazardAudit {
+        static constexpr u32 Sources = 10, Layouts = 9;
+        u64 buffer_queries{}, buffer_true{};
+        u64 buffer_true_by_writer_reader[Sources][Sources][2]{}; ///< [the access that left the range][the access that asked][the asker writes]
+        u64 image_calls{}, image_true{};
+        u64 image_true_by_layouts[Layouts][Layouts][Sources]{}; ///< [layout before][layout asked][the source asking]
+    };
+    [[nodiscard]] bool HazardAuditOn() const noexcept {
+        return hazard_audit_on;
+    }
+    HazardAudit TakeHazardAudit();
+
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);
 
@@ -86,13 +101,23 @@ private:
     Scheduler& scheduler;
     std::unique_ptr<VideoCore::BlitHelper> blit_helper;
     StagingBufferPool staging_pool;
+    struct HazardRecord {
+        u64 start, end;
+        u8 source;
+        bool write;
+    };
     struct BufferBarriers {
         const VideoCore::Buffer* handle;
         using AccessList = IntervalList<Interval>;
         AccessList read_ranges;
         AccessList write_ranges;
+        std::vector<HazardRecord> audit; ///< hazard audit only
     };
     BufferBarriers* resource{};
+    bool hazard_audit_on{};
+    u32 hazard_override{~0u}; ///< set inside the runtime's own copies, fills and image transfers
+    HazardAudit hazard{};
+    u32 HazardSource() const;
     std::vector<BufferBarriers> resources;
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <string>
 #include <nlohmann/json_fwd.hpp>
@@ -51,7 +52,23 @@ struct ImmutableBuffer {
     std::atomic<u32> generation{0}; ///< bumped by every CPU write to the range
     std::atomic<u64> hash{0};       ///< hash of the guest memory at the first check after the synchronization (0: not taken yet)
     std::atomic<u32> requests{0};
+    u8 usage{1}; ///< 1 immutable (the engine writes it once); 0 default and 2 dynamic only with `TLG_RESIDENT_BUFFERS` (C1, see below)
 };
+
+/// C1 / C3: resident engine buffers (`TLG_RESIDENT_BUFFERS=1`). The residency of the immutable buffers (a buffer synchronized once is read from the arena with no tracker query)
+/// is extended to the engine's `default` and `dynamic` usage buffers up to `TLG_RESIDENT_CAP` bytes (default 262144) that the GPU does not write. They are found by the engine id
+/// of the record's binding (no address walk), and a request is answered from the arena while nothing announced a write and no CPU write fault touched the page of the buffer
+/// since the last synchronization: the generation of the buffer is bumped by `NoteCpuWrite` (the whole 4 KiB page, as the page protection is per page) and by `NoteAnnouncedWrite`.
+/// `TLG_RESIDENT_VERIFY=N` (default 64): every Nth answer without a synchronization is checked with one (nothing may have to be uploaded: else the answer would have been stale).
+bool ResidentBuffersEnabled();
+u32 ResidentCap();
+u32 ResidentVerifyInterval();
+/// An engine writer announced a write of [address, address + size): the resident buffers on those pages are not synchronized any more.
+void NoteAnnouncedWrite(VAddr address, u64 size);
+/// Counters (0 answered without a synchronization, 1 synchronized (first use or after a write), 2 verify run, 3 verify run that found something to upload (stale answer),
+/// 4 request left to the normal path because the GPU modified the range, 5 buffer registered, 6 written by an announcement, 7 dropped by a CPU write fault).
+void NoteResident(u32 what);
+std::array<u64, 8> TakeResidentCounters();
 
 /// True when native_sdk_strip bit 65536 is set.
 bool ImmutableResidencyEnabled();
