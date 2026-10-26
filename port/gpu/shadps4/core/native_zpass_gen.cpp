@@ -87,11 +87,14 @@ enum class CallId : u32 {
     PassDecal,
     ScanDecal,
     DecalUpdate, // the decal loop's UpdateSubresource (context virtual + 0xd0)
+    PassSkin,
+    ScanSkin,
+    SkinUpdate,
     Count
 };
 constexpr const char* CallNames[static_cast<u32>(CallId::Count)] = {"FUN_01c92f30 resource set", "FUN_01ee4e50 instance group bind", "FUN_01c710f0 forward prologue", "FUN_01c822c0 variant find", "FUN_01c59060 handle lookup (G-buffer prologue)",
                                                                       "special entry virtual +0x48", "FUN_01e45a60 handle free", "draw issue (hook, tag, engine draw)", "FUN_01c92b60 material block (plain stores)",
-                                                                      "shader pair (2 x SetShader)", "generated depth pass (whole)", "generated G-buffer pass (whole)", "generated forward pass (whole)", "scan, depth", "scan, G-buffer", "scan, forward", "generated decal pass (whole)", "scan, decal", "decal constant buffer update (UpdateSubresource)"};
+                                                                      "shader pair (2 x SetShader)", "generated depth pass (whole)", "generated G-buffer pass (whole)", "generated forward pass (whole)", "scan, depth", "scan, G-buffer", "scan, forward", "generated decal pass (whole)", "scan, decal", "decal constant buffer update (UpdateSubresource)", "generated skinning loop (whole)", "scan, skinning", "skinning constant buffer update (UpdateSubresource)"};
 struct CallCensus {
     std::atomic<u64> calls{0}, ticks{0};
 };
@@ -270,6 +273,8 @@ struct Mark {
     u32 gb_n{0};
     // A7: the decal loop's constant block (renderDev + 0x3990) at this draw, index into Target::stages
     s32 stage{-1};
+    // B3: the constant blocks (live address, bytes) the skinning loop updated buffers from before this dispatch
+    std::vector<std::pair<u64, std::vector<u8>>> blocks;
 };
 
 /// Where the generator writes: the live device context, or a private copy of it that logs every write (the verify run).
@@ -289,6 +294,7 @@ struct Target {
     s64 triangles{0};
     std::vector<std::array<u8, DecalStageBytes>> stages; // shadow (A7): the decal loop's constant block as the generator built it, one per updated primitive
     s32 stage_pending{-1};
+    std::vector<std::pair<u64, std::vector<u8>>> blocks; // shadow (B3): blocks staged since the last dispatch
     bool rs_pending{false}; // shadow: the native resource set ran since the last draw
     u32 rs_n{0}, rs_size{0};
     std::array<u8, 112> rs_bytes{};
@@ -2946,6 +2952,633 @@ DStats& DS() {
     return stats;
 }
 
+// ------------------------------------------------------------------------------------------------------------------------------- the skinning loop (B3)
+// FUN_01c93730(skin system S, scene F, async flag): for every skinned object of the scene (the list at F + 0x29e00) one skinning dispatch (CS_Skinning, 24 variants), then, for the objects
+// with the normal flag, three more (CS_FixVertexNormal: clear, calculate, normalize). It talks to the device context only through virtual calls that are table writes
+// (SetShader: ctx + 0x4670; SetConstantBuffers: ctx + 0x500; SetShaderResources: ctx + 0x1980; SetUnorderedAccessViews: ctx + 0x2098) and UpdateSubresource of its own constant block (S + 0x50),
+// plus the dispatches. The generator makes the same table writes, the same constant blocks (compared byte by byte at every dispatch in the verify run), the same dispatches
+// (through the dispatch hook, from the loop's own call sites). Decompiled and annotated in documents/tlg/native plan/stages/b3-skinning.md.
+constexpr u64 SkinBegin = 0x01c93730, SkinEnd = 0x01c95550; // the loop and the next function
+constexpr u64 GlobalDevice = 0x0689eed8;                    // DAT_0689eed8: the render device (the value)
+constexpr u64 SkinSiteDispatch = 0x01c94f44, SkinSiteClear = 0x01c951ea, SkinSiteCalculate = 0x01c952f3, SkinSiteNormalize = 0x01c95426;
+constexpr u32 SkinBlockOffset = 0x50, SkinBlockBytes = 0x120; // the constant block UpdateSubresource sends from S + 0x50 (the buffer's byte width is checked at the scan)
+
+struct SkinNode {
+    u64 node{};
+    bool active{false}; // objects 1, 2 and 8 exist: the loop makes bone matrices and a dispatch for it
+    u64 rd1{}, rd2{}, rd3{}, rd8{}, rd5{}, rd35{};
+    u64 inner1{};
+    u64 v20{}, v21{}, v59{}, v60{}, v63{}, v64{}, v65{}, v66{}, v69{}, v180{}, v50{};
+    bool has_object4{false}, b70{false}, b74{false}, b75{false};
+    u64 v_a0{0}; // SRV 8 (only with the object at +0x108)
+    s32 count46{0};
+    u32 variant{0};
+    bool normals{false};
+    u64 normals_rd{0}; // render data of the object at node + 0x20 (pass 3)
+};
+
+struct SkinPlan {
+    bool scanned{false};
+    bool no_work{false};
+    std::vector<const char*> reasons;
+    u64 device{0}, ctx{0}, system{0}, scene{0}, def{0}, context_global{0};
+    u64 camera{0}, camera_object{0}, view{0};
+    bool async{false};
+    bool run_normals{false};
+    std::vector<SkinNode> nodes;
+    bool Ok() const { return scanned && reasons.empty(); }
+    void Decline(const char* r) {
+        for (const char* x : reasons) {
+            if (x == r) {
+                return;
+            }
+        }
+        reasons.push_back(r);
+    }
+};
+
+struct SkinScanArgs {
+    SkinPlan* plan;
+};
+
+void ScanSkin(SkinScanArgs& a) {
+    SkinPlan& p = *a.plan;
+    p.device = R<u64>(Global(GlobalDevice));
+    p.context_global = R<u64>(Global(GlobalContext));
+    p.def = R<u64>(R<u64>(p.context_global + 0x38) + 0x20);
+    // the graphics device context, or the async compute context (its tables differ: shader + 0x1d10, constant buffers + 0x21f8, shader resources + 0x1d18, unordered access + 0x2118)
+    p.ctx = p.async ? R<u64>(R<u64>(p.device + 0x2c8) + 0x30258) : R<u64>(p.device + 0x2d8);
+    const u64 first = R<u64>(p.scene + 0x29e00);
+    if (first == 0) {
+        p.no_work = true;
+        p.scanned = true;
+        return;
+    }
+    if (p.ctx == 0) {
+        p.Decline("no device context");
+        return;
+    }
+    const u64 S = p.system;
+    for (const u32 offset : {0x1d0u, 0x230u, 0x340u, 0x360u, 0x380u}) {
+        if (R<u64>(S + offset) == 0) {
+            p.Decline("the system's constant buffers are not created");
+            return;
+        }
+    }
+    if (R<u32>(R<u64>(S + 0x1d0) + 0x180) < SkinBlockBytes) {
+        p.Decline("the constant buffer is smaller than the block");
+        return;
+    }
+    p.camera_object = R<u64>(R<u64>(p.context_global + 0x108) + 0x2c8);
+    p.camera = R<u64>(R<u64>(R<u64>(p.context_global + 0x108) + 0x2e0) + 0x2c0);
+    if (p.camera == 0 || p.camera_object == 0) {
+        p.Decline("no camera");
+        return;
+    }
+    const u64 slot_count = R<u32>(p.scene + 0x29dd0);
+    p.view = 0;
+    if (slot_count != 0) {
+        u64 slot = p.scene + 0x5d0;
+        for (u64 k = 1;; ++k) {
+            const bool taken = R<s32>(R<u64>(slot + 0x290) + 0x40) != 0;
+            if (!taken) {
+                p.view = slot;
+                break;
+            }
+            if (slot_count <= k) {
+                break;
+            }
+            slot += 0xa60;
+        }
+    }
+    const auto render_data = [&](u64 object) { return object != 0 ? R<u64>(object + 0x38) : 0ull; };
+    const auto zero_or_default = [&](u64 object) { return object == p.def ? 0ull : object != 0 ? R<u64>(object + 0x38) : 0ull; };
+    u32 guard = 0;
+    for (u64 node = first; node != 0 && guard < 100000; node = R<u64>(node), ++guard) {
+        SkinNode n;
+        n.node = node;
+        const u64 o1 = R<u64>(node + 8), o2 = R<u64>(node + 0x10), o3 = R<u64>(node + 0x18), o4 = R<u64>(node + 0x20), o5 = R<u64>(node + 0x28), o8 = R<u64>(node + 0x40),
+                  o35 = R<u64>(node + 0x118);
+        if (o1 != 0) {
+            n.rd1 = render_data(o1);
+            if (n.rd1 == 0) {
+                p.Decline("mesh render data not created yet (the skinning loop creates it at first use)");
+            }
+        }
+        if (o1 != 0 && o2 != 0) {
+            n.rd2 = render_data(o2);
+            if (n.rd2 == 0) {
+                p.Decline("mesh render data not created yet (the skinning loop creates it at first use)");
+            }
+            if (o3 != 0) {
+                n.rd3 = render_data(o3);
+                if (n.rd3 == 0) {
+                    p.Decline("mesh render data not created yet (the skinning loop creates it at first use)");
+                }
+            }
+            if (o8 != 0) {
+                n.rd8 = render_data(o8);
+                if (n.rd8 == 0) {
+                    p.Decline("mesh render data not created yet (the skinning loop creates it at first use)");
+                }
+            }
+        }
+        n.active = o1 != 0 && o2 != 0 && o8 != 0;
+        if (n.active && !p.reasons.empty()) {
+            p.nodes.push_back(n);
+            continue;
+        }
+        if (n.active) {
+            if (o5 != 0) {
+                n.rd5 = render_data(o5);
+                if (n.rd5 == 0) {
+                    p.Decline("mesh render data not created yet (the skinning loop creates it at first use)");
+                }
+            }
+            if (o35 != 0) {
+                n.rd35 = render_data(o35);
+                if (n.rd35 == 0) {
+                    p.Decline("mesh render data not created yet (the skinning loop creates it at first use)");
+                }
+            }
+            u64 object4_data = 0;
+            if (o4 != 0) {
+                object4_data = render_data(o4);
+                if (object4_data == 0) {
+                    p.Decline("mesh render data not created yet (the skinning loop creates it at first use)");
+                }
+            }
+            if (!p.reasons.empty()) {
+                p.nodes.push_back(n);
+                continue;
+            }
+            n.inner1 = R<u64>(n.rd1 + 0x20);
+            n.has_object4 = o4 != 0;
+            u64 inner4 = 0;
+            if (n.has_object4) {
+                inner4 = R<u64>(object4_data + 0x20);
+                const u32 count = R<u32>(inner4 + 0x68);
+                if (count >= 9) {
+                    const u64 array = R<u64>(inner4 + 0x60);
+                    n.v69 = zero_or_default(R<u64>(array + 0x40));
+                    if (count >= 0x24) {
+                        n.v180 = zero_or_default(R<u64>(array + 0x118));
+                    }
+                    if (count >= 0xb) {
+                        const u64 x = R<u64>(array + 0x50);
+                        n.v50 = (x == p.def || x == 0) ? 0 : R<u64>(x + 0x38);
+                    }
+                }
+            }
+            if (n.inner1 == 0 || R<u64>(n.rd2 + 0x20) == 0) {
+                p.Decline("render data without its inner object");
+                p.nodes.push_back(n);
+                continue;
+            }
+            if (R<u32>(n.inner1 + 0x68) > 0xb) {
+                const u64 x = R<u64>(R<u64>(n.inner1 + 0x60) + 0x58);
+                n.v63 = zero_or_default(x);
+            }
+            n.v20 = R<u64>(R<u64>(n.inner1 + 0x48) + 0x38);
+            n.v21 = R<u64>(R<u64>(R<u64>(n.rd2 + 0x20) + 0x48) + 0x38);
+            n.v59 = n.rd3 != 0 ? R<u64>(R<u64>(R<u64>(n.rd3 + 0x20) + 0x48) + 0x38) : 0;
+            if (n.has_object4) {
+                n.v66 = R<u64>(R<u64>(inner4 + 0x48) + 0x38);
+                const u32 count = R<u32>(inner4 + 0x68);
+                if (count >= 0x25) {
+                    n.v60 = zero_or_default(R<u64>(R<u64>(inner4 + 0x60) + 0x120));
+                    if (count >= 0x26) {
+                        const u64 x = R<u64>(R<u64>(inner4 + 0x60) + 0x128);
+                        n.v65 = (x == p.def || x == 0) ? 0 : R<u64>(x + 0x38);
+                    }
+                }
+            }
+            n.v64 = R<u64>(n.inner1 + 0x58) != 0 ? R<u64>(R<u64>(n.inner1 + 0x58) + 0x38) : 0;
+            n.count46 = R<s32>(n.rd8 + 0x40);
+            n.b74 = !p.async && R<u64>(node + 0xa0) != 0;
+            n.b75 = n.v69 != 0 && R<u64>(n.v69 + 0x30) != 0;
+            n.b70 = R<u64>(node + 0x108) != 0 && !n.b74;
+            if (n.b70) {
+                if (!n.has_object4) {
+                    p.Decline("constants object without the object at +0x20");
+                } else {
+                    const u64 candidate = R<u64>(R<u64>(inner4 + 0x60) + 0x108);
+                    if (candidate == p.def || candidate == 0 || R<u64>(candidate + 0x38) == 0) {
+                        p.Decline("constants object without render data");
+                    } else {
+                        n.v_a0 = R<u64>(R<u64>(candidate + 0x38) + 0x28);
+                    }
+                }
+            }
+            const bool flag54 = (R<u32>(node + 0x54) >> 1 & 1) != 0;
+            const bool o5set = n.rd5 != 0, o35set = n.rd35 != 0, o4set = n.has_object4;
+            (void)o4set;
+            u32 v;
+            const bool all_three = n.rd5 != 0 && n.v64 != 0 && n.rd3 != 0;
+            if (all_three) {
+                v = (n.count46 == 0x40 ? 1u : 0u) | 0x5a;
+            } else if (R<u64>(node + 0x108) == 0 || n.b74) {
+                if (n.b74) {
+                    if (n.b75) {
+                        if (n.v180 == 0) {
+                            v = (o35set ? 2u : 0u) + 0x4d;
+                            if (n.count46 == 0x40) {
+                                v = (o35set ? 2u : 0u) + 0x4e;
+                            }
+                        } else {
+                            v = (o35set ? 2u : 0u) + 0x51;
+                            if (n.count46 == 0x40) {
+                                v = (o35set ? 2u : 0u) + 0x52;
+                            }
+                        }
+                    } else {
+                        v = 0x4c;
+                        if (n.count46 != 0x40) {
+                            v = (flag54 ? 1u : 0u) | 0x4a;
+                        }
+                    }
+                } else if (n.count46 == 0x40) {
+                    v = 0x49;
+                    if (!flag54) {
+                        u32 high = (n.v60 != 0 ? 1u : 0u) + 0x58;
+                        v = (n.v60 != 0 ? 1u : 0u) | 0x56;
+                        if (n.v180 != 0) {
+                            v = high;
+                        }
+                    }
+                } else {
+                    v = 0x48;
+                    if (!flag54) {
+                        v = n.v60 != 0 ? 0x55u : 0x47u;
+                    }
+                }
+                (void)o5set;
+            } else {
+                const u32 high = (n.v60 != 0 ? 1u : 0u) + 0x5e;
+                v = (n.v60 != 0 ? 1u : 0u) | 0x5c;
+                if (n.v180 != 0) {
+                    v = high;
+                }
+            }
+            n.variant = v;
+            if (R<u64>(p.device + 0x1008 + u64{v} * 0x10) == 0) {
+                p.Decline("shader variant not loaded");
+            }
+        }
+        p.nodes.push_back(n);
+    }
+    if (guard >= 100000) {
+        p.Decline("node list unreadable");
+    }
+    // pass 3: the normals
+    p.run_normals = !p.async && R<u32>(p.camera + 0x24) != 0;
+    if (p.run_normals) {
+        for (SkinNode& n : p.nodes) {
+            const u64 node = n.node;
+            if (R<u64>(node + 0xa0) != 0 && (R<u8>(node + 0x54) & 8) != 0) {
+                const u64 object = R<u64>(node + 0x20);
+                if (object != 0) {
+                    n.normals = true;
+                    n.normals_rd = R<u64>(object + 0x38);
+                    if (n.normals_rd == 0) {
+                        p.Decline("mesh render data not created yet (the skinning loop creates it at first use)");
+                    } else if (R<u64>(n.normals_rd + 0x20) == 0) {
+                        p.Decline("render data without its inner object");
+                    }
+                }
+            }
+        }
+        for (const u32 offset : {0x1448u, 0x1458u, 0x1468u}) {
+            if (R<u64>(p.device + offset) == 0) {
+                p.Decline("normal shader not loaded");
+            }
+        }
+    }
+    p.scanned = true;
+}
+
+/// The 4x4 inverse the loop makes of a node's matrix (node + 0xb0, row major) with the engine's own order of operations (read off the disassembly: cofactors as `(a*b - c*d) + e*f` per lane,
+/// scaled by 1 / determinant with alternating signs); a determinant under 1e-5 gives the engine's constant block. `out` is 16 floats (S + 0xe0 .. 0x11f).
+void SkinInverse(u64 node, float* out) {
+    const float m00 = R<float>(node + 0xb0), m01 = R<float>(node + 0xb4), m02 = R<float>(node + 0xb8), m03 = R<float>(node + 0xbc);
+    const float m10 = R<float>(node + 0xc0), m11 = R<float>(node + 0xc4), m12 = R<float>(node + 0xc8), m13 = R<float>(node + 0xcc);
+    const float m20 = R<float>(node + 0xd0), m21 = R<float>(node + 0xd4), m22 = R<float>(node + 0xd8), m23 = R<float>(node + 0xdc);
+    const float m30 = R<float>(node + 0xe0), m31 = R<float>(node + 0xe4), m32 = R<float>(node + 0xe8), m33 = R<float>(node + 0xec);
+    const float a1 = m13 * m02 - m12 * m03;
+    const float a2 = m23 * m02 - m22 * m03;
+    const float x = m33 * m02 - m32 * m03;
+    const float a3 = m23 * m12 - m22 * m13;
+    const float b3 = m33 * m12 - m32 * m13;
+    const float a5 = m33 * m22 - m32 * m23;
+    const float c0 = (m11 * a5 - m21 * b3) + m31 * a3;
+    const float c1 = (m31 * a2 - m21 * x) + m01 * a5;
+    const float c2 = (m31 * a1 - m11 * x) + m01 * b3;
+    const float c3 = (m21 * a1 - m11 * a2) + m01 * a3;
+    const float sum_a = c2 * m20 + c0 * m00;
+    const float sum_b = c1 * m10 + c3 * m30;
+    const float det = sum_a - sum_b;
+    const float abs_det = 0.0f < det ? det : sum_b - sum_a;
+    const float threshold = R<float>(Global(0x024f15dc));
+    if (!(threshold < abs_det)) {
+        std::memcpy(out, reinterpret_cast<const void*>(Global(0x024ff720)), 32);      // S + 0xe0
+        std::memcpy(out + 8, reinterpret_cast<const void*>(Global(0x024ff700)), 32); // S + 0x100
+        return;
+    }
+    const float e1 = m11 * m00 - m01 * m10;
+    const float e2 = m21 * m00 - m20 * m01;
+    const float e3 = m31 * m00 - m30 * m01;
+    const float e4 = m10 * m21 - m20 * m11;
+    const float e5 = m10 * m31 - m30 * m11;
+    const float e6 = m20 * m31 - m30 * m21;
+    const float c4 = (m10 * a5 - m20 * b3) + m30 * a3;
+    const float c5 = (m00 * a5 - m20 * x) + m30 * a2;
+    const float c6 = (m00 * b3 - m10 * x) + m30 * a1;
+    const float c7 = (m00 * a3 - m10 * a2) + m20 * a1;
+    const float d0 = (e6 * m13 + e4 * m33) - e5 * m23;
+    const float d1 = (e6 * m03 + e2 * m33) - e3 * m23;
+    const float d2 = (e5 * m03 + e1 * m33) - e3 * m13;
+    const float d3 = (e4 * m03 + e1 * m23) - e2 * m13;
+    const float d4 = (e6 * m12 + e4 * m32) - e5 * m22;
+    const float d5 = (e6 * m02 + e2 * m32) - e3 * m22;
+    const float d6 = (e5 * m02 + e1 * m32) - e3 * m12;
+    const float d7 = (e4 * m02 + e1 * m22) - e2 * m12;
+    const float r = R<float>(Global(0x024f15e0)) / det;
+    const float n = -r;
+    out[0] = r * c0;
+    out[1] = n * c1;
+    out[2] = r * c2;
+    out[3] = n * c3;
+    out[4] = n * c4;
+    out[5] = r * c5;
+    out[6] = n * c6;
+    out[7] = r * c7;
+    out[8] = r * d0;
+    out[9] = d1 * n;
+    out[10] = r * d2;
+    out[11] = d3 * n;
+    out[12] = d4 * n;
+    out[13] = r * d5;
+    out[14] = d6 * n;
+    out[15] = r * d7;
+}
+
+void GenerateSkin(Target& t, const SkinPlan& p) {
+    const u64 device = p.device, scene = p.scene, S_live = p.system;
+    const u64 ctx = p.ctx;
+    // the system object: live, the loop's own; verify, a private copy of the first 0x400 bytes (its staging area is written by the loop)
+    std::array<u8, 0x400> shadow_system{};
+    u8* sb = reinterpret_cast<u8*>(S_live);
+    if (!t.live) {
+        std::memcpy(shadow_system.data(), reinterpret_cast<const void*>(S_live), shadow_system.size());
+        sb = shadow_system.data();
+    }
+    const auto sget = [&]<class T>(u32 offset) { T v; std::memcpy(&v, sb + offset, sizeof(T)); return v; };
+    const auto sput = [&]<class T>(u32 offset, T value) { std::memcpy(sb + offset, &value, sizeof(T)); };
+    const auto sput_from = [&](u32 offset, u64 source, u32 bytes) { std::memcpy(sb + offset, reinterpret_cast<const void*>(source), bytes); };
+    // the ring index and the bone matrices
+    const s32 old_index = sget.template operator()<s32>(0x40);
+    const s32 index = (old_index + 1) % 4;
+    if (t.live) {
+        W<s32>(S_live + 0x40, index);
+    }
+    const u64 ring_memory = R<u64>(R<u64>(S_live + u64{static_cast<u32>(index)} * 8) + 0x30);
+    if (t.live) {
+        u32 offset = 0;
+        for (const SkinNode& n : p.nodes) {
+            if (n.active) {
+                std::memcpy(reinterpret_cast<void*>(ring_memory + u64{offset} * 0x40), reinterpret_cast<const void*>(R<u64>(n.node + 0x48)), u64{R<u32>(n.node + 0x50)} << 6);
+                offset += R<u32>(n.node + 0x50);
+            }
+        }
+    }
+    const std::array<u64, 3> cb_array{R<u64>(S_live + 0x1d0), R<u64>(S_live + 0x230), R<u64>(S_live + 0x340)};
+    const u32 set_shader_offset = p.async ? 0x1d10 : 0x4670, cb_table = p.async ? 0x21f8 : 0x500, srv_table = p.async ? 0x1d18 : 0x1980, uav_table = p.async ? 0x2118 : 0x2098;
+    const auto update_subresource = [&](u64 buffer, u32 source_offset, u32 bytes) {
+        if (t.live) {
+            Timed(CallId::SkinUpdate, [&] {
+                reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64)>(R<u64>(R<u64>(ctx) + 0xd0))(ctx, buffer, 0, 0, S_live + source_offset, 0, 0);
+            });
+        } else {
+            std::vector<u8> block(bytes);
+            std::memcpy(block.data(), sb + source_offset, bytes);
+            t.blocks.push_back({S_live + source_offset, std::move(block)});
+        }
+    };
+    const auto dispatch = [&](u32 x, bool fenced, u64 site) {
+        if (t.live) {
+            Timed(CallId::DrawIssue, [&] { NativeDraw::IssueDispatch(ctx, x, 1, 1, fenced, site, p.async); });
+        } else {
+            t.marks.push_back({t.arena.size(), p.async ? 4u : 3u, x, 1, 1, t.Get<u64>(set_shader_offset), 0});
+            t.marks.back().blocks = std::move(t.blocks);
+            t.blocks.clear();
+        }
+        ++t.draws;
+    };
+    const auto flush_wait = [&] {
+        if (t.live) {
+            reinterpret_cast<void(PS4_SYSV_ABI*)(u64)>(R<u64>(R<u64>(ctx) + 0x78))(ctx);
+        }
+    };
+    const auto set_cb = [&](u32 start, u32 count, const u64* values) { t.Put(cb_table + start * 8, values, count * 8); };
+    const auto set_srv = [&](u32 start, u32 count, const u64* values) { t.Put(srv_table + start * 8, values, count * 8); };
+    const auto set_uav = [&](u32 start, u32 count, const u64* values) {
+        t.Put(uav_table + start * 8, values, count * 8);
+        if (p.async && t.live) {
+            for (u32 i = 0; i < count; ++i) {
+                if (values[i] != 0) {
+                    W<u32>(values[i] + 0x88, 0xffffffffu); // the async context resets the counter index of every view it is given (no counter array)
+                }
+            }
+        }
+    };
+    const auto set_shader = [&](u64 shader) { t.Set<u64>(set_shader_offset, shader); };
+    // pass 2: one dispatch per object
+    u32 matrix_offset = 0;
+    const float one_e5 = R<float>(Global(0x024f15dc));
+    for (const SkinNode& n : p.nodes) {
+        if (!n.active) {
+            continue;
+        }
+        const u64 node = n.node;
+        set_shader(R<u64>(device + 0x1008 + u64{n.variant} * 0x10));
+        if (n.b70) {
+            u32 dwords = R<u32>(node + 0x110);
+            if (dwords > 0x3f) {
+                dwords = 0x40;
+            }
+            sput_from(0x240, R<u64>(node + 0x108), dwords << 2);
+            update_subresource(cb_array[2], 0x240, std::min<u32>(R<u32>(cb_array[2] + 0x180), 0x100));
+        }
+        if (p.view == 0) {
+            const u64 cam = p.camera_object;
+            const float f2 = R<float>(cam + 0x90), f3 = R<float>(cam + 0x98), f77 = -R<float>(cam + 0x94);
+            sput.template operator()<float>(0x60, (f77 * R<float>(node + 0xb4) - f2 * R<float>(node + 0xb0)) - f3 * R<float>(node + 0xb8));
+            sput.template operator()<float>(0x64, (f77 * R<float>(node + 0xc4) - f2 * R<float>(node + 0xc0)) - f3 * R<float>(node + 0xc8));
+            sput.template operator()<float>(0x68, (f77 * R<float>(node + 0xd4) - f2 * R<float>(node + 0xd0)) - f3 * R<float>(node + 0xd8));
+            sput.template operator()<u32>(0x6c, 0x3f800000u);
+            sput_from(0x170, cam + 0xf0, 16);
+        } else {
+            const u64 view = p.view;
+            sput_from(0x190, view + 0x80, 64);
+            sput.template operator()<u32>(0x60, R<u32>(view + 0x2a0) ^ 0x80000000u);
+            sput.template operator()<u32>(0x64, R<u32>(view + 0x2a4) ^ 0x80000000u);
+            sput.template operator()<u32>(0x68, R<u32>(view + 0x2a8) ^ 0x80000000u);
+            sput.template operator()<u32>(0x6c, R<u32>(view + 0x2ac));
+            sput_from(0x170, view + 0x140, 16);
+        }
+        sput_from(0x180, p.camera + 0x30, 16);
+        sput.template operator()<u32>(0x50, R<u32>(node + 0x30));
+        sput.template operator()<u32>(0x54, R<u32>(node + 0x50));
+        sput.template operator()<u32>(0x58, matrix_offset);
+        sput.template operator()<u32>(0x5c, !(R<float>(p.context_global + 0x19c) < one_e5) ? 1u : 0u);
+        const u64 camera_flags = R<u64>(p.camera + 0x40);
+        sput.template operator()<u32>(0x70, static_cast<u32>(camera_flags));
+        sput.template operator()<u32>(0x74, static_cast<u32>(camera_flags >> 32));
+        sput.template operator()<u64>(0x78, 0);
+        sput_from(0x90, node + 0xf0, 16);
+        sput_from(0xa0, node + 0xb0, 64);
+        {
+            std::array<float, 16> inverse{};
+            SkinInverse(node, inverse.data());
+            std::memcpy(sb + 0xe0, inverse.data(), 64);
+        }
+        if (const u64 holder = R<u64>(node + 0xa0); holder != 0) {
+            sput.template operator()<float>(0x80, 1.0f / R<float>(holder + 0x30));
+            sput.template operator()<u32>(0x84, R<u32>(holder + 0x34));
+            sput.template operator()<u32>(0x88, 0);
+            sput.template operator()<u32>(0x8c, R<u32>(holder + 0x38));
+            sput_from(0x120, node + 0x70, 16);
+            const u64 w80 = R<u64>(node + 0x80), w88 = R<u64>(node + 0x88);
+            sput.template operator()<u32>(0x130, static_cast<u32>(w80));
+            sput.template operator()<u32>(0x134, static_cast<u32>(w80 >> 32));
+            sput.template operator()<u32>(0x138, static_cast<u32>(w88));
+            sput.template operator()<u32>(0x13c, R<u32>(holder + 0x48));
+            sput_from(0x140, node + 0x90, 16);
+            const u64 h40 = R<u64>(holder + 0x40), h58 = R<u64>(holder + 0x58);
+            sput.template operator()<u32>(0x150, static_cast<u32>(h40));
+            sput.template operator()<u32>(0x154, static_cast<u32>(h58));
+            sput.template operator()<u32>(0x158, static_cast<u32>(h40 >> 32));
+            sput.template operator()<u32>(0x15c, static_cast<u32>(h58 >> 32));
+        }
+        sput.template operator()<u32>(0x160, R<u32>(node + 0x100));
+        sput.template operator()<u64>(0x164, 0);
+        sput.template operator()<u32>(0x16c, 0);
+        update_subresource(cb_array[0], 0x50, std::min<u32>(R<u32>(cb_array[0] + 0x180), SkinBlockBytes));
+        matrix_offset += R<u32>(node + 0x50);
+        set_cb(0, 3, cb_array.data());
+        // the views and the targets
+        std::array<u64, 11> srv{};
+        srv[0] = R<u64>(n.v20 + 0x28);
+        srv[1] = R<u64>(n.rd8 + 0x28);
+        srv[2] = R<u64>(S_live + 0x20 + u64{static_cast<u32>(index)} * 8);
+        srv[3] = n.v64 != 0 ? R<u64>(n.v64 + 0x28) : 0;
+        srv[4] = n.v59 != 0 ? R<u64>(n.v59 + 0x28) : 0;
+        if (const u64 holder = R<u64>(node + 0xa0); holder != 0) {
+            const u64 data = HandleLookup(device, R<u64>(holder + 0x50));
+            srv[5] = R<u64>(data + 0x48);
+        }
+        srv[6] = n.v63 != 0 ? R<u64>(n.v63 + 0x28) : 0;
+        srv[7] = n.rd35 != 0 ? R<u64>(n.rd35 + 0x28) : 0;
+        srv[8] = n.b70 ? n.v_a0 : 0;
+        srv[9] = n.v180 != 0 ? R<u64>(n.v180 + 0x28) : 0;
+        srv[10] = n.v60 != 0 ? R<u64>(n.v60 + 0x28) : 0;
+        set_srv(4, 11, srv.data());
+        std::array<u64, 8> uav{};
+        uav[0] = R<u64>(n.v21 + 0x30);
+        uav[2] = n.has_object4 ? R<u64>(n.v66 + 0x30) : 0;
+        uav[3] = n.rd5 != 0 ? R<u64>(n.rd5 + 0x30) : 0;
+        uav[5] = n.v69 != 0 ? R<u64>(n.v69 + 0x30) : 0;
+        uav[6] = n.b70 ? R<u64>(n.v50 + 0x30) : 0;
+        uav[7] = n.v65 != 0 ? R<u64>(n.v65 + 0x30) : 0;
+        set_uav(0, 8, uav.data());
+        dispatch((R<u32>(node + 0x34) + 0x3f) >> 6, false, SkinSiteDispatch);
+    }
+    flush_wait();
+    {
+        const std::array<u64, 11> zeros{};
+        set_srv(0, 4, zeros.data());
+        set_srv(4, 11, zeros.data());
+        set_uav(0, 8, zeros.data());
+        set_cb(0, 3, zeros.data());
+        set_shader(0);
+    }
+    // pass 3
+    if (p.run_normals) {
+        for (const SkinNode& n : p.nodes) {
+            if (!n.normals) {
+                continue;
+            }
+            const u64 node = n.node;
+            const u64 object = R<u64>(node + 0x20);
+            const u64 rd = n.normals_rd;
+            const u64 w38 = R<u64>(node + 0x38);
+            const u32 triangles = static_cast<u32>(w38 >> 32), vertices = R<u32>(node + 0x34);
+            sput.template operator()<u32>(0x350, static_cast<u32>(w38));
+            sput.template operator()<u32>(0x354, 0);
+            const u64 cb360 = R<u64>(S_live + 0x360);
+            update_subresource(cb360, 0x350, std::min<u32>(R<u32>(cb360 + 0x180), 0x10));
+            set_cb(0, 1, &cb360);
+            const u64 uav380 = R<u64>(S_live + 0x380);
+            set_uav(0, 1, &uav380);
+            set_shader(R<u64>(device + 0x1448));
+            const u32 groups = (vertices + 0x3f) >> 6;
+            dispatch(groups, true, SkinSiteClear);
+            const u64 inner = R<u64>(rd + 0x20);
+            const std::array<u64, 2> srv_a{R<u64>(R<u64>(R<u64>(inner + 0x50) + 0x38) + 0x28), R<u64>(R<u64>(R<u64>(inner + 0x48) + 0x38) + 0x28)};
+            set_srv(0, 2, srv_a.data());
+            set_shader(R<u64>(device + 0x1458));
+            dispatch(((triangles / 3) + 0x3f) >> 6, true, SkinSiteCalculate);
+            const u64 zero = 0;
+            set_uav(0, 1, &zero);
+            const std::array<u64, 2> srv_b{R<u64>(S_live + 0x378), 0};
+            set_srv(0, 2, srv_b.data());
+            const u64 uav_normal = R<u64>(R<u64>(R<u64>(inner + 0x48) + 0x38) + 0x30);
+            set_uav(0, 1, &uav_normal);
+            set_shader(R<u64>(device + 0x1468));
+            dispatch(groups, true, SkinSiteNormalize);
+            set_uav(0, 1, &zero);
+            const std::array<u64, 2> srv_c{};
+            set_srv(0, 2, srv_c.data());
+            (void)object;
+        }
+        flush_wait();
+        const std::array<u64, 11> zeros{};
+        set_srv(0, 11, zeros.data());
+        set_uav(0, 8, zeros.data());
+        const u64 zero = 0;
+        set_cb(0, 1, &zero);
+        set_shader(0);
+    }
+}
+
+struct SConfig {
+    bool on{false};
+    u32 verify_every{32};
+};
+const SConfig& SCfg() {
+    static const SConfig config = [] {
+        SConfig c;
+        const char* e = std::getenv("TLG_SKIN_GEN");
+        c.on = e != nullptr && *e != 0 && *e != '0';
+        if (const char* n = std::getenv("TLG_SKIN_GEN_VERIFY"); n != nullptr && *n != 0) {
+            c.verify_every = static_cast<u32>(std::atoi(n));
+        }
+        return c;
+    }();
+    return config;
+}
+
+struct SStats {
+    ViewStats v;
+    u64 eligible{0};
+    u64 loops_without_work{0};
+};
+SStats& SS() {
+    static SStats stats;
+    return stats;
+}
+
+
 } // namespace
 
 bool Enabled() {
@@ -2980,8 +3613,29 @@ void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3) {
         NoteMismatch(s, v.view, "context", fmt::format("draw {}: another device context", k));
         return;
     }
+    if (kind == 3 || kind == 4) {
+        // B3: a dispatch: the compute shader of the context and the constant blocks the loop updated its buffers from
+        const u32 shader_offset = kind == 4 ? 0x1d10 : 0x4670;
+        if (R<u64>(ctx + shader_offset) != mark.vertex_shader) {
+            ++v.mismatches;
+            NoteMismatch(s, v.view, "compute shader", fmt::format("draw {}: the loop {:#x}, the generator {:#x}", k, R<u64>(ctx + shader_offset), mark.vertex_shader));
+        }
+        for (const auto& [address, bytes] : mark.blocks) {
+            if (std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) != 0) {
+                u32 at = 0;
+                while (at + 4 <= bytes.size() && std::memcmp(reinterpret_cast<const void*>(address + at), bytes.data() + at, 4) == 0) {
+                    at += 4;
+                }
+                u32 a = 0, b = 0;
+                std::memcpy(&a, reinterpret_cast<const void*>(address + at), 4);
+                std::memcpy(&b, bytes.data() + at, 4);
+                ++v.mismatches;
+                NoteMismatch(s, v.view, "skinning constants", fmt::format("dispatch {}: dword {:#x} of the block at {:#x}: the loop {:#x}, the generator {:#x}", k, at, address, a, b));
+            }
+        }
+    }
     const u64 vs = R<u64>(ctx + 0x4698), ps = R<u64>(ctx + 0x4690);
-    if (vs != mark.vertex_shader || ps != mark.pixel_shader) {
+    if (kind != 3 && kind != 4 && (vs != mark.vertex_shader || ps != mark.pixel_shader)) {
         ++v.mismatches;
         NoteMismatch(s, v.view, "shader pair", fmt::format("draw {}: the loop {:#x} / {:#x}, the generator {:#x} / {:#x}", k, vs, ps, mark.vertex_shader, mark.pixel_shader));
     }
@@ -3554,6 +4208,115 @@ bool HandleDecal(u64 render_device, u64 view, u64 a3, u64 a4, u64 desc, u32 flag
     return true;
 }
 
+bool SkinEnabled() {
+    return SCfg().on;
+}
+
+bool HandleSkin(u64 system, u64 scene, u64 async_flag, u64 original_loop) {
+    const SConfig& cfg = SCfg();
+    if (!cfg.on || original_loop == 0) {
+        return false;
+    }
+    using Loop = void(PS4_SYSV_ABI*)(u64, u64, u64);
+    State& s = S();
+    SStats& ss = SS();
+    SkinPlan plan;
+    plan.system = system;
+    plan.scene = scene;
+    plan.async = (async_flag & 0xff) != 0;
+    const auto run_loop = [&] { reinterpret_cast<Loop>(original_loop)(system, scene, async_flag); };
+    SkinScanArgs scan_args{&plan};
+    {
+        std::scoped_lock lock{s.mutex};
+        if (ss.v.disabled) {
+            plan.Decline("generator switched off by a verify difference");
+        } else if (!Timed(CallId::ScanSkin, [&] { return NativeDraw::GuardedCall([](void* p) { ScanSkin(*static_cast<SkinScanArgs*>(p)); }, &scan_args); })) {
+            ++ss.v.not_scanned;
+            plan.scanned = false;
+            plan.Decline("scan faulted");
+        }
+        if (plan.no_work) {
+            ++ss.loops_without_work;
+        } else {
+            ++ss.v.passes;
+            if (!plan.Ok()) {
+                for (const char* r : plan.reasons) {
+                    ++ss.v.declines[r];
+                }
+            }
+        }
+    }
+    if (plan.no_work) {
+        run_loop();
+        return true;
+    }
+    bool verify_pass = false;
+    if (plan.Ok()) {
+        std::scoped_lock lock{s.mutex};
+        ++ss.eligible;
+        verify_pass = cfg.verify_every != 0 && ss.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().active.load();
+    }
+    if (plan.Ok() && !verify_pass) {
+        Target live;
+        live.live = true;
+        live.base = reinterpret_cast<u8*>(plan.ctx);
+        Timed(CallId::PassSkin, [&] { GenerateSkin(live, plan); });
+        std::scoped_lock lock{s.mutex};
+        ++ss.v.generated;
+        ss.v.generated_batches += plan.nodes.size();
+        ss.v.generated_draws += live.draws;
+        return true;
+    }
+    Verify& v = V();
+    if (verify_pass) {
+        v.shadow = Target{};
+        v.shadow.live = false;
+        std::vector<u8> copy(CtxBytes);
+        std::memcpy(copy.data(), reinterpret_cast<const void*>(plan.ctx), CtxBytes);
+        v.shadow.base = copy.data();
+        GenerateSkin(v.shadow, plan);
+        v.cursor = 0;
+        v.arena_pos = 0;
+        v.view = 202;
+        v.lo = SkinBegin;
+        v.hi = SkinEnd;
+        v.ctx = plan.ctx;
+        v.rd = plan.device;
+        v.compared_draws = 0;
+        v.mismatches = 0;
+        v.raced = 0;
+        v.thread = std::this_thread::get_id();
+        v.active.store(true);
+        run_loop();
+        v.active.store(false);
+        std::scoped_lock lock{s.mutex};
+        if (v.cursor < v.shadow.marks.size()) {
+            ++v.mismatches;
+            NoteMismatch(s, v.view, "missing draw", fmt::format("the generator has {} dispatches, the loop issued {}", v.shadow.marks.size(), v.cursor));
+        } else {
+            v.mismatches += CompareDelta(s, v, v.arena_pos, v.shadow.arena.size(), plan.ctx, "epilogue");
+        }
+        ++ss.v.verify_passes;
+        ss.v.verify_draws += v.compared_draws;
+        ss.v.verify_raced += v.raced;
+        if (v.mismatches == 0) {
+            ++ss.v.verify_clean;
+        } else {
+            ++ss.v.verify_mismatched;
+            ss.v.disabled = true;
+            LOG_ERROR(Render, "skinning generator switched off, {} differences against the engine's loop", v.mismatches);
+        }
+        v.shadow = Target{};
+        v.lo = ZPassBegin;
+        v.hi = ZPassEnd;
+    } else {
+        run_loop();
+        std::scoped_lock lock{s.mutex};
+        ++ss.v.loop_passes;
+    }
+    return true;
+}
+
 nlohmann::json Report() {
     auto& s = S();
     std::scoped_lock lock{s.mutex};
@@ -3667,6 +4430,26 @@ nlohmann::json Report() {
         }
         dd["declined_passes_by_reason"] = ddeclines;
         out["decal"] = dd;
+        const ViewStats& sj = SS().v;
+        nlohmann::json sk = {{"enabled", SCfg().on},
+                             {"passes", sj.passes},
+                             {"loops_without_work", SS().loops_without_work},
+                             {"generated_passes_without_the_loop", sj.generated},
+                             {"generated_dispatches", sj.generated_draws},
+                             {"passes_run_by_the_loop", sj.loop_passes},
+                             {"verify_passes", sj.verify_passes},
+                             {"verify_clean", sj.verify_clean},
+                             {"verify_with_differences", sj.verify_mismatched},
+                             {"verify_dispatches_compared", sj.verify_draws},
+                             {"verify_draws_compared", sj.verify_draws},
+                             {"switched_off_by_verify", sj.disabled},
+                             {"scan_faults", sj.not_scanned}};
+        nlohmann::json sdeclines = nlohmann::json::object();
+        for (const auto& [reason, count] : sj.declines) {
+            sdeclines[reason] = count;
+        }
+        sk["declined_passes_by_reason"] = sdeclines;
+        out["skinning"] = sk;
     }
     if (CensusOn()) {
         LARGE_INTEGER frequency;

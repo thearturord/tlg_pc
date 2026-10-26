@@ -35,6 +35,10 @@ bool HandleForward(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 or
 [[nodiscard]] bool DecalEnabled();
 bool HandleDecal(u64 render_device, u64 view, u64 a3, u64 a4, u64 desc, u32 flags, s32 type, u32 width, u32 height, u64 original_loop);
 
+/// B3, the skinning loop (`FUN_01c93730(system, scene, async)`): `TLG_SKIN_GEN=1`, verify one pass in `TLG_SKIN_GEN_VERIFY` (default 32). Same contract.
+[[nodiscard]] bool SkinEnabled();
+bool HandleSkin(u64 system, u64 scene, u64 async_flag, u64 original_loop);
+
 nlohmann::json Report();
 
 } // namespace Core::NativeZPassGen

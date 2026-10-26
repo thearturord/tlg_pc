@@ -6220,11 +6220,28 @@ using GuestMap7 = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64);
 /// and a matrix count at +0x50, 64 bytes each) with memcpy into the memory of one of four buffers of a ring (the buffer object at ring + 4 * index, index = the counter at
 /// ring + 0x40 after its increment; the memory pointer at buffer + 0x30), without any Map. The writes are announced here, before the function runs: the range is the
 /// buffer memory from the start for the sum of the counts (jobs the function skips make the range larger than what it writes, never smaller).
+void SkinWritesAnnounce(u64 ring, u64 scene);
 u64 PS4_SYSV_ABI SkinWrites(u64 ring, u64 scene, u64 flag, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
-    (void)flag, (void)a3, (void)a4, (void)a5, (void)ret, (void)caller_rsp;
+    (void)a3, (void)a4, (void)a5, (void)ret, (void)caller_rsp;
+    if (NativeZPassGen::SkinEnabled() && IsHeapPointer(ring) && IsHeapPointer(scene)) {
+        // B3: the loop is generated; the announcement of its writes stays (it reads the same objects)
+        static const u64 loop_entry = Core::GuestHooks::OriginalEntry("SkinWrites");
+        if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
+            SkinWritesAnnounce(ring, scene);
+        }
+        if (NativeZPassGen::HandleSkin(ring, scene, flag, loop_entry)) {
+            return 1;
+        }
+        return 0;
+    }
     if (!Core::NativeUpdates::enabled.load(std::memory_order_relaxed) || !IsHeapPointer(ring) || !IsHeapPointer(scene)) {
         return 0;
     }
+    SkinWritesAnnounce(ring, scene);
+    return 0;
+}
+
+void SkinWritesAnnounce(u64 ring, u64 scene) {
     Guarded([&]() -> u64 {
         const u64 first = Rd<u64>(scene, 0x29e00);
         if (first == 0) {
@@ -6244,7 +6261,6 @@ u64 PS4_SYSV_ABI SkinWrites(u64 ring, u64 scene, u64 flag, u64 a3, u64 a4, u64 a
         Core::NativeUpdates::NoteWriterRange(1, memory, matrices * 64);
         return 0;
     });
-    return 0;
 }
 
 /// N5b: `FUN_01eeb610(object, source)` fills a 160 byte light constant structure from the source (colour, position, ...) straight into the memory of a buffer of a ring of
@@ -7168,6 +7184,9 @@ u64 PS4_SYSV_ABI MeasureExCsDepthCopy(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u
 }
 
 u64 PS4_SYSV_ABI TagAscDispatch(u64 jcc, u64 x, u64 y, u64 z, u64 a4, u64 a5, u64 ret) {
+    if (NativeZPassGen::VerifyActive()) {
+        NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 4, jcc, static_cast<u32>(x), static_cast<u32>(y), static_cast<u32>(z));
+    }
     return TagAsc(jcc, x & 0xffffffff, y & 0xffffffff, z & 0xffffffff, ret);
 }
 u64 PS4_SYSV_ABI TagAscDispatchRecordOnly(u64 jcc, u64 x, u64 y, u64 z, u64 a4, u64 a5, u64 ret) {
@@ -7175,12 +7194,18 @@ u64 PS4_SYSV_ABI TagAscDispatchRecordOnly(u64 jcc, u64 x, u64 y, u64 z, u64 a4, 
 }
 
 u64 PS4_SYSV_ABI TagDispatch(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (NativeZPassGen::VerifyActive()) {
+        NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 3, ctx, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a3));
+    }
     return TagCompute(ctx, a1, a2, a3, ret, true);
 }
 /// The fenced dispatch wrapper adds an in-stream scratch label that the dispatch writes at its end and a wait on it: a
 /// command processor stall that only orders the dispatch against later commands. The raster thread runs everything in
 /// order, so with execution the wait and its label are not needed (game-visible fences are other packets).
 u64 PS4_SYSV_ABI TagDispatchFenced(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (NativeZPassGen::VerifyActive()) {
+        NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 3, ctx, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a3));
+    }
     return TagCompute(ctx, a1, a2, a3, ret, true);
 }
 u64 PS4_SYSV_ABI TagIndirect(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
@@ -8535,6 +8560,22 @@ void InlineAutoDrawTail(u64 ctx, u32 count, u32 instances) {
     Wr<u32>(ctx, 0x38, Rd<u32>(ctx, 0x38) + instances * count);
 }
 } // namespace
+
+void IssueDispatch(u64 ctx, u64 x, u64 y, u64 z, bool fenced, u64 site_ghidra, bool async) {
+    static const u64 original_plain = Core::GuestHooks::OriginalEntry("Dispatch_0247e340");
+    static const u64 original_fenced = Core::GuestHooks::OriginalEntry("Dispatch_02479810");
+    static const u64 original_asc = Core::GuestHooks::OriginalEntry("AscDispatch");
+    static const u64 original_asc_fenced = Core::GuestHooks::OriginalEntry("AscDispatchFenced");
+    const u64 original = async ? (fenced ? original_asc_fenced : original_asc) : (fenced ? original_fenced : original_plain);
+    const u64 site = ImageBase() + (site_ghidra - 0x1000000);
+    generator_issuing = true;
+    const bool taken = (async ? TagAscDispatch(ctx, x, y, z, 0, 0, site) : fenced ? TagDispatchFenced(ctx, x, y, z, 0, 0, site) : TagDispatch(ctx, x, y, z, 0, 0, site)) != 0;
+    generator_issuing = false;
+    if (taken || original == 0) {
+        return;
+    }
+    reinterpret_cast<GuestDraw6>(original)(ctx, x, y, z, 0, 0);
+}
 
 void IssueInlineAutoDraw(u64 ctx, u32 count, u64 site_ghidra) {
     static const u64 original_prepare = Core::GuestHooks::OriginalEntry("PrepareDraw");

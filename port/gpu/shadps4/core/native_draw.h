@@ -118,6 +118,9 @@ void IssueIndirectDraw(u64 ctx, u64 buffer, u64 offset, u64 site_ghidra);
 void IssueInlineAutoDraw(u64 ctx, u32 count, u64 site_ghidra);
 /// True when the draw hook acts on an inlined auto draw of `count` vertices (the loop's draw then reaches `NoteLoopDraw`); otherwise the game's own path runs it.
 [[nodiscard]] bool InlineAutoDrawTagged(u32 count);
+/// B3 (skinning generator): `Dispatch(ctx, x, y, z)` as the loop makes it at its call site (return address `site_ghidra`), through the dispatch hook: the tag, then the engine's
+/// function unless the tag took the dispatch over. `fenced`: the context's fenced dispatch (virtual + 0x50) instead of the plain one (virtual + 0x58).
+void IssueDispatch(u64 ctx, u64 x, u64 y, u64 z, bool fenced, u64 site_ghidra, bool async = false);
 /// Census of the draws the generators issue (`TLG_GEN_CENSUS=1`): kind 0 indexed, 1 indirect; calls, ticks in the tag, ticks in the engine draw function, draws the tag took over.
 void TagCensusRead(std::array<u64, 5>& ticks, u64& calls);
 void UserDataCensusRead(u64& scan_ticks, u64& fill_ticks, u64& tables, u64& slots);
