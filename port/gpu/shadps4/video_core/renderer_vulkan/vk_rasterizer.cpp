@@ -124,6 +124,16 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 
 Rasterizer::~Rasterizer() = default;
 
+namespace {
+/// Census kinds of the consumer (C0). Shader bindings: index = (compute ? 32 : 0) + kind; geometry (graphics only): 24 + kind.
+enum CensusKind : u32 {
+    CBufferTotal = 0, CBufferRing, CBufferSpecial, CBufferNull, CBufferHandle, CBufferAddrRead, CBufferAddrWritten, CBufferAddrReadLe256, CBufferAddrReadLe4k,
+    CBufferAddrReadLe64k, CBufferAddrReadBig, CBufferBarrierQuery, CBufferBarrierTrue, CImageTotal, CImageNull, CImageSetHit, CImageLookupHit, CImageFind,
+    CImageStorage, CImageTransit, CImageTransitTrue, CBindResources, CBufferInPlace,
+    CGeometryVertexRing = 24, CGeometryVertexHandle, CGeometryVertexAddress, CGeometryIndexRing, CGeometryIndexHandle, CGeometryIndexAddress,
+};
+} // namespace
+
 void Rasterizer::MaybeFlushRecorded() {
     const u32 limit =
         VideoCore::ReadbackPolicy::Get().flush_commands.load(std::memory_order_relaxed);
@@ -1473,6 +1483,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
     set_writes.clear();
     buffer_infos.clear();
     image_infos.clear();
+    Census((fixed != nullptr ? 0u : 32u) + CBindResources);
 
     bool uses_dma = false;
 
@@ -1570,6 +1581,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
             } else {
                 range.ring = true;
                 range.offset = ring->offset;
+                Census(CGeometryVertexRing);
                 Core::NativeUploads::NoteGeometry(2);
                 if (ring_verify_interval != 0 && ++ring_verify_counter % ring_verify_interval == 0) {
                     std::vector<u8> now(size);
@@ -1582,8 +1594,10 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
                 continue;
             }
         }
+        auto* vertex_handle = GeometryHandle(range.base_address, size);
+        Census(vertex_handle != nullptr ? CGeometryVertexHandle : CGeometryVertexAddress);
         std::tie(range.buffer, range.offset) =
-            buffer_cache.ObtainBuffer(range.base_address, size, false, false, GeometryHandle(range.base_address, size), NativeHandleMode() == 2);
+            buffer_cache.ObtainBuffer(range.base_address, size, false, false, vertex_handle, NativeHandleMode() == 2);
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
         bound_buffers.emplace_back(range.buffer, range.offset, size,
                                    vk::AccessFlagBits2::eVertexAttributeRead);
@@ -1661,6 +1675,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
         index_ring = nullptr;
     }
     if (index_ring != nullptr) {
+        Census(CGeometryIndexRing);
         index_buffer = constant_ring->Handle();
         buffer_offset = index_ring->offset;
         Core::NativeUploads::NoteGeometry(3);
@@ -1673,8 +1688,10 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
             }
         }
     } else if (index_buffer_size != 0) {
+        auto* index_handle = GeometryHandle(index_address, index_buffer_size);
+        Census(index_handle != nullptr ? CGeometryIndexHandle : CGeometryIndexAddress);
         const auto [buffer, offset] =
-            buffer_cache.ObtainBuffer(index_address, index_buffer_size, false, false, GeometryHandle(index_address, index_buffer_size), NativeHandleMode() == 2);
+            buffer_cache.ObtainBuffer(index_address, index_buffer_size, false, false, index_handle, NativeHandleMode() == 2);
         needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
         bound_buffers.emplace_back(buffer, offset, index_buffer_size,
                                    vk::AccessFlagBits2::eIndexRead);
@@ -1868,6 +1885,14 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     return true;
 }
 
+std::array<u64, 64> Rasterizer::TakeConsumerCensus() noexcept {
+    std::array<u64, 64> out{};
+    for (u32 i = 0; i < 64; ++i) {
+        out[i] = consumer_census[i].exchange(0, std::memory_order_relaxed);
+    }
+    return out;
+}
+
 void Rasterizer::CheckInPlaceVerifications() {
     // the submissions the GPU has finished: the bytes it read of an in place buffer may have been rewritten by the CPU since the bind; compare with the copy kept at the bind
     while (!inplace_checks.empty() && scheduler.IsFree(inplace_checks.front().tick)) {
@@ -1907,8 +1932,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                              Shader::PushData& push_data) {
     Core::NativeUploads::SetCaller(stage.sw_stage == Shader::SwStage::Compute ? 2 : 1);
     const u64 alignment = instance.StorageMinAlignment();
+    const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
+        Census(census_base + CBufferTotal);
         const auto src_access =
             vk::AccessFlagBits2::eShaderRead |
             (desc.is_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eNone);
@@ -1930,6 +1957,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
         }
         if (ring) {
+            Census(census_base + CBufferRing);
             // Copied by the command processor thread into the constant ring (read-only, small, not written by queued work).
             if (!desc.IsSpecial()) {
                 push_data.AddOffset(binding.buffer, 0);
@@ -1956,6 +1984,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
             }
         } else if (desc.IsSpecial()) {
+            Census(census_base + CBufferSpecial);
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
                 buffer_infos.emplace_back(gds_buf->Handle(), 0, gds_buf->SizeBytes());
@@ -2044,6 +2073,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
             const AmdGpu::Buffer vsharp = chosen_sharp;
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+                Census(census_base + CBufferNull);
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else if (vsharp.GetSize() >= (1ull << 30) && !memory->IsValidMapping(vsharp.base_address)) {
                 LOG_ERROR(Render, "buffer sharp at unmapped address {:#x} of {} bytes for stage {:#x}: bound as null", vsharp.base_address,
@@ -2073,6 +2103,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         const u64 aligned = Common::AlignDown(window.offset, alignment);
                         if (window.buffer && window.offset - aligned + size <= window.chunk_remaining + (window.offset - aligned)) {
                             in_place = true;
+                            Census(census_base + CBufferInPlace);
                             const u64 adjust = window.offset - aligned;
                             push_data.AddOffset(binding.buffer, adjust);
                             buffer_infos.emplace_back(window.buffer, aligned, size + adjust);
@@ -2101,6 +2132,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     } else {
                         Core::NativeResources::NoteHandle(1);
                     }
+                }
+                if (immutable_hint != nullptr) {
+                    Census(census_base + CBufferHandle);
+                } else if (desc.is_written) {
+                    Census(census_base + CBufferAddrWritten);
+                } else {
+                    Census(census_base + CBufferAddrRead);
+                    Census(census_base + (size <= 256 ? CBufferAddrReadLe256 : size <= 4096 ? CBufferAddrReadLe4k : size <= 65536 ? CBufferAddrReadLe64k : CBufferAddrReadBig));
                 }
                 Core::NativeUploads::SetDetail((desc.is_written ? 1u : 0u) | (desc.is_formatted ? 2u : 0u) | (size > VideoCore::BufferCache::StreamThreshold() ? 4u : 0u) |
                                                ((ring_draw || ring_dispatch) ? 16u : 0u) |
@@ -2198,7 +2237,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     }
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size, "a written storage buffer view");
                 }
-                needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                Census(census_base + CBufferBarrierQuery);
+                if (runtime.IsBufferAccessed(buffer, offset, size, desc.is_written)) {
+                    Census(census_base + CBufferBarrierTrue);
+                    needs_barrier = true;
+                }
                 }
             }
         }
@@ -2291,6 +2334,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set,
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     const u32 first_image_idx = image_infos.size();
+    const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
@@ -2336,6 +2380,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
             set_slot = &texture_sets[key % TextureSetSlots];
             if (BindTexturesFromSet(stage, *set_slot, set_raws.data(), set_flags.data(), stage_images, binding)) {
+                Census(census_base + CImageTotal, stage_images);
+                Census(census_base + CImageSetHit, stage_images);
                 BindSamplers(stage, binding);
                 return;
             }
@@ -2391,7 +2437,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const auto tsharp = chosen_tsharp;
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
+        Census(census_base + CImageTotal);
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
+            Census(census_base + CImageNull);
             image_bindings[num_images++].image_id = {};
             image_descriptor_array_sizes.push_back(1);
             continue;
@@ -2438,6 +2486,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 2;
             if (native_reuse && cached.valid && cached.key == key &&
                 cached.generation == texture_cache.ImageGeneration()) {
+                Census(census_base + CImageLookupHit);
                 std::construct_at(&desc, cached.desc);
                 image_id = cached.image_id;
                 texture_cache.TouchFoundImage(image_id);
@@ -2453,6 +2502,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     desc.view_info.range.extent.levels = 1;
                 }
 
+                Census(census_base + CImageFind);
                 image_id = texture_cache.FindImage(desc);
                 if (native_reuse) {
                     cached.valid = true;
@@ -2498,6 +2548,17 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
 
             bound_images.emplace_back(image_id);
+            const auto transit = [&](auto&&... args) {
+                Census(census_base + CImageTransit);
+                const bool result = runtime.Transit(std::forward<decltype(args)>(args)...);
+                if (result) {
+                    Census(census_base + CImageTransitTrue);
+                }
+                return result;
+            };
+            if (is_storage) {
+                Census(census_base + CImageStorage);
+            }
 
             auto& image = texture_cache.GetImage(image_id);
             auto& image_view = texture_cache.FindTexture(image_id, desc);
@@ -2508,18 +2569,18 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             // storage and feedback loop doesn't make sense for them
             if ((binding.force_general || binding.is_target) && !image.info.props.is_depth) {
                 if (instance.IsAttachmentFeedbackLoopLayoutSupported() && image.binding.is_target) {
-                    needs_barrier |= runtime.Transit(
+                    needs_barrier |= transit(
                         &image, vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
                         vk::PipelineStageFlagBits2::eAllGraphics, vk::AccessFlagBits2::eShaderRead);
                 } else {
-                    needs_barrier |= runtime.Transit(
+                    needs_barrier |= transit(
                         &image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
                         vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
                         desc.view_info.range);
                 }
             } else {
                 if (is_storage) {
-                    needs_barrier |= runtime.Transit(
+                    needs_barrier |= transit(
                         &image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
                         vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
                         desc.view_info.range);
@@ -2527,7 +2588,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     const auto new_layout = image.info.props.is_depth
                                                 ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                                 : vk::ImageLayout::eShaderReadOnlyOptimal;
-                    needs_barrier |= runtime.Transit(
+                    needs_barrier |= transit(
                         &image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
                         vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
                 }

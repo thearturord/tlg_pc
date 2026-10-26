@@ -132,6 +132,9 @@ public:
         u64 imported_bytes{}, imported_chunks{}, failed_chunks{};
     };
     InPlaceStats TakeInPlaceStats() noexcept;
+    /// C0 census (read only, counts per ~5 s interval): how every buffer and image binding, and every vertex / index buffer, of the draws and dispatches was resolved
+    /// by the consumer. Index = (compute ? 32 : 0) + kind for the shader bindings, 24 + kind for the geometry (graphics only); see `CensusKind` in vk_rasterizer.cpp.
+    std::array<u64, 64> TakeConsumerCensus() noexcept;
     [[nodiscard]] bool InPlaceOn() const noexcept {
         return inplace_on;
     }
@@ -293,6 +296,10 @@ private:
     std::atomic<u64> inplace_offered{0}, inplace_taken{0}, inplace_bytes{0}, inplace_written{0}, inplace_special{0}, inplace_too_large{0}, inplace_not_in_backing{0}, inplace_gpu_written{0},
         inplace_image_or_meta{0}, inplace_verified{0}, inplace_differing{0}, inplace_verify_dropped{0};
     void CheckInPlaceVerifications();
+    std::array<std::atomic<u64>, 64> consumer_census{};
+    void Census(u32 index, u64 n = 1) noexcept {
+        consumer_census[index & 63].fetch_add(n, std::memory_order_relaxed);
+    }
     // Front thread only:
     struct PendingWrite {
         VAddr begin, end;

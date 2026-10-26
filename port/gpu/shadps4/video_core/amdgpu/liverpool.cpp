@@ -1956,6 +1956,26 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                 Core::DebugServer::Publish("texture_set_memo", {{"hits", sets.hits}, {"recorded", sets.recorded}, {"miss_no_entry", sets.no_entry}, {"miss_generation", sets.generation},
                                                               {"miss_image_check", sets.image_check}, {"not_eligible", sets.not_eligible}, {"note", "counts per ~5 s interval"}});
             }
+            {
+                const auto c = rasterizer->TakeConsumerCensus();
+                nlohmann::json out = nlohmann::json::object();
+                static constexpr const char* shader_names[] = {"buffers", "buffers_ring", "buffers_special", "buffers_null", "buffers_by_engine_handle", "buffers_by_address_read_only",
+                                                               "buffers_by_address_written", "address_read_le256", "address_read_le4k", "address_read_le64k", "address_read_bigger",
+                                                               "buffer_barrier_queries", "buffer_barrier_true", "images", "images_null", "images_from_texture_set_memo",
+                                                               "images_from_lookup_cache", "images_find_image", "images_storage", "image_transits", "image_transits_true",
+                                                               "bind_resources_calls", "buffers_in_place"};
+                for (u32 side = 0; side < 2; ++side) {
+                    nlohmann::json part = nlohmann::json::object();
+                    for (u32 k = 0; k < std::size(shader_names); ++k) {
+                        part[shader_names[k]] = c[(side ? 32 : 0) + k];
+                    }
+                    out[side ? "compute" : "graphics"] = std::move(part);
+                }
+                out["geometry"] = {{"vertex_ring", c[24]}, {"vertex_by_engine_handle", c[25]}, {"vertex_by_address", c[26]},
+                                   {"index_ring", c[27]}, {"index_by_engine_handle", c[28]}, {"index_by_address", c[29]}};
+                out["note"] = "C0 census, counts per ~5 s interval (read only)";
+                Core::DebugServer::Publish("consumer_census", std::move(out));
+            }
             if (rasterizer->InPlaceOn()) {
                 const auto p = rasterizer->TakeInPlaceStats();
                 Core::DebugServer::Publish("in_place_buffers",
