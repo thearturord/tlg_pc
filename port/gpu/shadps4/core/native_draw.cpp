@@ -2409,6 +2409,39 @@ void SignRecord(NativeRecord& slot, const Signature& sig, u64 ctx) {
     slot.group_sig[AmdGpu::Liverpool::GroupOther] = sign({sig.group[States], sig.group[InputObjects], sig.group[Shaders], sig.group[Targets]});
 }
 
+/// A1: census of the tagged draws by call site.
+struct SiteEntry {
+    std::atomic<u32> site{0};
+    std::atomic<u64> draws{0}, generated{0}, executed{0}, packet_path{0};
+    std::atomic<u32> kinds{0};
+};
+std::array<SiteEntry, 512> site_table;
+bool SiteCensusOn() {
+    static const bool on = [] {
+        const char* a = std::getenv("TLG_SITE_CENSUS");
+        const char* b = std::getenv("TLG_GEN_CENSUS");
+        return (a != nullptr && *a != 0 && *a != '0') || (b != nullptr && *b != 0 && *b != '0');
+    }();
+    return on;
+}
+SiteEntry* SiteFor(u32 site) {
+    u32 index = (site * 0x9E3779B1u) >> 23; // 9 bits
+    for (u32 probe = 0; probe < site_table.size(); ++probe, index = (index + 1) & 511) {
+        SiteEntry& e = site_table[index];
+        u32 current = e.site.load(std::memory_order_acquire);
+        if (current == site) {
+            return &e;
+        }
+        if (current == 0) {
+            u32 expected = 0;
+            if (e.site.compare_exchange_strong(expected, site, std::memory_order_acq_rel) || expected == site) {
+                return &e;
+            }
+        }
+    }
+    return nullptr;
+}
+
 /// Phase clock of MakeRecord for the draws the generators issue: 0 setup, 1 Synthesize (registers), 2 Fixed::Build, 3 user data of the vertex stage, 4 user data of the pixel stage, 5 the rest.
 std::atomic<u64> mr_phase_ticks[6];
 std::atomic<u64> mr_phase_calls;
@@ -4864,6 +4897,14 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
         }
     }
     clock.Mark(0);
+    SiteEntry* census_site = SiteCensusOn() ? SiteFor(static_cast<u32>(ret - ImageBase() + 0x1000000)) : nullptr;
+    if (census_site != nullptr) {
+        census_site->draws.fetch_add(1, std::memory_order_relaxed);
+        census_site->kinds.fetch_or(1u << (kind & 31), std::memory_order_relaxed);
+        if (generator_issuing) {
+            census_site->generated.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     // The game's resource tracking runs first (as it does at the start of PrepareDraw): it may update view descriptors
     // and write barrier packets or draw internal quads, which then come before the tag.
     if (policy.native_synth_verify.load(std::memory_order_relaxed) != 0) {
@@ -5002,6 +5043,9 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
         NativeRegistry::StoreDraw(*v2);
     }
     const bool exec = seq != 0 && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligible(ctx, seq, ret);
+    if (census_site != nullptr) {
+        (exec ? census_site->executed : census_site->packet_path).fetch_add(1, std::memory_order_relaxed);
+    }
     if (exec) {
         words[2] |= ExecFlag;
     } else {
@@ -7831,6 +7875,35 @@ void UserDataCensusRead(u64& scan_ticks, u64& fill_ticks, u64& tables, u64& slot
 
 void InputTableAuditRead(nlohmann::json& out) {
     InputAuditRead(out);
+}
+
+void DrawSiteCensusRead(nlohmann::json& out) {
+    struct Row {
+        u32 site;
+        u64 draws, generated, executed, packet_path;
+        u32 kinds;
+    };
+    std::vector<Row> rows;
+    u64 total = 0, generated = 0;
+    for (const auto& e : site_table) {
+        const u32 site = e.site.load(std::memory_order_acquire);
+        if (site != 0) {
+            rows.push_back({site, e.draws.load(), e.generated.load(), e.executed.load(), e.packet_path.load(), e.kinds.load()});
+            total += rows.back().draws;
+            generated += rows.back().generated;
+        }
+    }
+    std::ranges::sort(rows, [](const Row& a, const Row& b) { return a.draws > b.draws; });
+    out["total_draws"] = total;
+    out["generated_draws"] = generated;
+    out["not_generated_draws"] = total - generated;
+    nlohmann::json list = nlohmann::json::array();
+    for (const auto& r : rows) {
+        const Class cls = Classify(ImageBase() + (r.site - 0x1000000));
+        list.push_back({{"ghidra_site", fmt::format("{:#x}", r.site)}, {"class", ClassNames[cls]}, {"draws", r.draws}, {"generated", r.generated}, {"executed_natively", r.executed},
+                        {"packet_path", r.packet_path}, {"kinds_bitmask", r.kinds}});
+    }
+    out["sites"] = std::move(list);
 }
 
 void MergeCensusRead(std::array<u64, 6>& values) {
