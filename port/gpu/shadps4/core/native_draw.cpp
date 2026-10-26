@@ -1030,9 +1030,12 @@ struct SynthReg {
     u32 value;
 };
 
+struct StatePackage;
 struct NativeRecord {
     std::atomic<u64> seq{0};
     u32 count{};
+    const StatePackage* package{}; ///< A5.3: the state package the first `package->count` registers are a copy of (valid when `package_for` is this record's number)
+    u64 package_for{};
     std::array<u64, MaxGeometryIds> geometry_ids{}; ///< N6.2: engine ids of the vertex and index buffers of the draw
     u32 geometry_id_count{};
     u64 vs_gnm{}; ///< Gnm shader binaries of the draw (for the shader input dump)
@@ -2688,6 +2691,11 @@ struct StatePackage {
     u32 flags{0}, reason{0}, cb_extent_mask{0}, db_extent{0}, rt_info{0};
     std::array<u32, 8> cb_extent{};
     u64 vs_gnm{0}, ps_gnm{0}, dbg_vs{0}, dbg_fetch{0}, fetch_address{0}, synth_vs{0};
+    // A5.3: the registers by register group (the order TakeExecDraw gives a typed draw), the hash of the groups the render target inputs come from
+    bool lazy_ok{false};
+    std::array<SynthReg, MaxSynthRegs> grouped_regs{};
+    std::array<u16, NumRegisterGroups + 1> begin{};
+    u64 inputs_key{0};
 };
 constexpr u32 PackageSlots = 1u << 13;
 std::unique_ptr<StatePackage[]> packages;
@@ -2767,6 +2775,42 @@ StatePackage* FindPackage(u64 key) {
     return nullptr;
 }
 
+/// The grouped form of the package's registers and the hash of the render target input groups, the way TakeExecDraw makes them for a typed draw. Not usable (`lazy_ok` false) when
+/// a register belongs to a user data group (those go into the typed arrays).
+void GroupPackage(StatePackage& p) {
+    const auto& table = GroupTable();
+    std::array<u16, NumRegisterGroups> counts{};
+    p.lazy_ok = true;
+    for (u32 i = 0; i < p.count; ++i) {
+        const u32 g = table[p.regs[i].index & 0xffff];
+        if (g == AmdGpu::Liverpool::GroupVsUserData || g == AmdGpu::Liverpool::GroupPsUserData || p.regs[i].index >= 65536) {
+            p.lazy_ok = false;
+        }
+        ++counts[g];
+    }
+    p.begin[0] = 0;
+    for (u32 g = 0; g < NumRegisterGroups; ++g) {
+        p.begin[g + 1] = p.begin[g] + counts[g];
+    }
+    std::array<u16, NumRegisterGroups> next{};
+    for (u32 g = 0; g < NumRegisterGroups; ++g) {
+        next[g] = p.begin[g];
+    }
+    for (u32 i = 0; i < p.count; ++i) {
+        p.grouped_regs[next[table[p.regs[i].index & 0xffff]]++] = p.regs[i];
+    }
+    Hasher values;
+    for (const u32 group : {static_cast<u32>(AmdGpu::Liverpool::GroupTargets), static_cast<u32>(AmdGpu::Liverpool::GroupOther),
+                            static_cast<u32>(AmdGpu::Liverpool::GroupVsProgram)}) {
+        values.Add(group);
+        for (u32 i = p.begin[group]; i < p.begin[group + 1]; ++i) {
+            values.Add(p.grouped_regs[i].index);
+            values.Add(p.grouped_regs[i].value);
+        }
+    }
+    p.inputs_key = values.h | 1;
+}
+
 void StorePackage(u64 key, const NativeRecord& slot) {
     std::call_once(packages_once, [] { packages = std::make_unique<StatePackage[]>(PackageSlots); });
     u32 index = static_cast<u32>(key >> 51);
@@ -2788,6 +2832,7 @@ void StorePackage(u64 key, const NativeRecord& slot) {
             p.dbg_fetch = dbg_fetch;
             p.fetch_address = synth_fetch_address;
             p.synth_vs = synth_vs_gnm;
+            GroupPackage(p);
             p.ready.store(1, std::memory_order_release);
             return;
         }
@@ -2830,6 +2875,7 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     slot.check_count = 0;
     slot.unsupported_inputs = 0;
     slot.unsupported_mask = 0;
+    slot.package_for = 0;
     synth_flags = 0;
     synth_reason = 0;
     synth_cb_extent_mask = 0;
@@ -2861,6 +2907,10 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
                 dbg_fetch = package->dbg_fetch;
                 synth_fetch_address = package->fetch_address;
                 synth_vs_gnm = package->synth_vs;
+                if (package->lazy_ok) {
+                    slot.package = package;
+                    slot.package_for = seq;
+                }
                 nl_used.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -4361,9 +4411,14 @@ const std::array<u8, 65536>& GroupTable() {
 }
 } // namespace
 
-bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed) {
+namespace {
+std::atomic<u64> lazy_taken{0}, lazy_declined{0}, lazy_verified{0}, lazy_differences{0}, lazy_materialized{0};
+std::atomic<u32> lazy_logged{0};
+} // namespace
+
+static bool TakeExecDrawImpl(u64 seq, ExecDraw& out, bool typed, bool allow_lazy) {
     out.seq = seq;
-    NoteConsumed(seq);
+    out.lazy = nullptr;
     auto& slot = Slot(seq);
     if (slot.seq.load(std::memory_order_acquire) != seq) {
         return false;
@@ -4401,7 +4456,53 @@ bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed) {
     };
     const bool grouped = slot.kind <= 2 && slot.grouped != 0 && slot.grouped == slot.count && slot.count <= ExecDraw::MaxRegisters - 2 * slot.check_count;
     out.inputs_key = 0;
-    if (grouped) {
+    // A5.3: the first registers of the record are the copy of a state package: the groups, their order and the hash of the render target inputs are the package's, only the
+    // registers the record added to it (the arguments group, the user data) are sorted here
+    bool lazy_done = false;
+    if (allow_lazy && typed && grouped && slot.package_for == seq && slot.package != nullptr) {
+        const StatePackage& p = *slot.package;
+        const auto& table = GroupTable();
+        std::array<u16, NumRegisterGroups> extra{};
+        bool usable = p.count <= slot.count;
+        for (u32 i = p.count; usable && i < slot.count; ++i) {
+            const u32 g = table[slot.regs[i].index & 0xffff];
+            if (g == AmdGpu::Liverpool::GroupVsUserData || g == AmdGpu::Liverpool::GroupPsUserData) {
+                continue;
+            }
+            if (g == AmdGpu::Liverpool::GroupTargets || g == AmdGpu::Liverpool::GroupOther || g == AmdGpu::Liverpool::GroupVsProgram) {
+                usable = false; // the hash of the package covers these groups
+                break;
+            }
+            ++extra[g];
+        }
+        if (usable) {
+            out.typed = true;
+            out.group_begin[0] = 0;
+            std::array<u16, NumRegisterGroups> next{};
+            for (u32 g = 0; g < NumRegisterGroups; ++g) {
+                const u32 held = p.begin[g + 1] - p.begin[g];
+                next[g] = out.group_begin[g] + held;
+                out.group_begin[g + 1] = out.group_begin[g] + held + extra[g];
+            }
+            for (u32 i = p.count; i < slot.count; ++i) {
+                if (user_data_slot(slot.regs[i].index, slot.regs[i].value)) {
+                    continue;
+                }
+                out.regs[next[table[slot.regs[i].index & 0xffff]]++] = {slot.regs[i].index, slot.regs[i].value};
+            }
+            n = out.group_begin[NumRegisterGroups];
+            out.grouped = n;
+            out.group_sig = slot.group_sig;
+            out.inputs_key = p.inputs_key;
+            out.lazy = &p;
+            lazy_done = true;
+        } else {
+            lazy_declined.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (lazy_done) {
+        // nothing more: the groups are in place
+    } else if (grouped) {
         // The registers go out by group (stable within a group, so the last write of a register still wins); with `typed` the user data of the two stages go into
         // the typed arrays instead.
         const auto& group_table = GroupTable();
@@ -4512,6 +4613,81 @@ bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed) {
     out.fixed_stale = slot.fixed_stale;
     out.dst_usage = slot.kind == 9 || slot.kind == 10 ? slot.dst_usage : ~0u;
     return slot.seq.load(std::memory_order_acquire) == seq;
+}
+
+void MaterializeRegs(ExecDraw& d) {
+    if (d.lazy == nullptr) {
+        return;
+    }
+    const auto& p = *static_cast<const StatePackage*>(d.lazy);
+    for (u32 g = 0; g < NumRegisterGroups; ++g) {
+        for (u32 k = 0; k < static_cast<u32>(p.begin[g + 1] - p.begin[g]); ++k) {
+            const SynthReg& r = p.grouped_regs[p.begin[g] + k];
+            d.regs[d.group_begin[g] + k] = {r.index, r.value};
+        }
+    }
+    d.lazy = nullptr;
+    lazy_materialized.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed) {
+    NoteConsumed(seq);
+    const bool ok = TakeExecDrawImpl(seq, out, typed, NativeListOn());
+    if (!ok || out.lazy == nullptr) {
+        return ok;
+    }
+    lazy_taken.fetch_add(1, std::memory_order_relaxed);
+    // every Nth lazy draw is also taken the full way and compared field by field
+    thread_local u32 tick = 0;
+    const u32 every = NativeListVerifyEvery();
+    if (every == 0 || ++tick % every != 0) {
+        return ok;
+    }
+    thread_local std::unique_ptr<ExecDraw> check;
+    if (!check) {
+        check = std::make_unique<ExecDraw>();
+    }
+    *check = ExecDraw{};
+    MaterializeRegs(out);
+    if (!TakeExecDrawImpl(seq, *check, typed, false)) {
+        return ok; // the record was recycled meanwhile
+    }
+    lazy_verified.fetch_add(1, std::memory_order_relaxed);
+    const char* what = nullptr;
+    if (check->count != out.count || check->grouped != out.grouped) {
+        what = "count";
+    } else if (check->group_begin != out.group_begin) {
+        what = "group begin";
+    } else if (check->group_sig != out.group_sig) {
+        what = "group signature";
+    } else if (check->inputs_key != out.inputs_key) {
+        what = "inputs key";
+    } else if (check->stage_key != out.stage_key) {
+        what = "stage key";
+    } else if (check->typed != out.typed || check->vs_user_data_mask != out.vs_user_data_mask || check->ps_user_data_mask != out.ps_user_data_mask) {
+        what = "user data masks";
+    } else {
+        for (u32 i = 0; i < 16 && what == nullptr; ++i) {
+            if (((out.vs_user_data_mask >> i) & 1) != 0 && check->vs_user_data[i] != out.vs_user_data[i]) {
+                what = "vertex user data";
+            }
+            if (((out.ps_user_data_mask >> i) & 1) != 0 && check->ps_user_data[i] != out.ps_user_data[i]) {
+                what = "pixel user data";
+            }
+        }
+        for (u32 i = 0; i < out.count && what == nullptr; ++i) {
+            if (check->regs[i].index != out.regs[i].index || check->regs[i].value != out.regs[i].value) {
+                what = "registers";
+            }
+        }
+    }
+    if (what != nullptr) {
+        lazy_differences.fetch_add(1, std::memory_order_relaxed);
+        if (lazy_logged.fetch_add(1) < 12) {
+            LOG_ERROR(Core, "native list: the lazy draw {} differs from the full one ({})", seq, what);
+        }
+    }
+    return ok;
 }
 
 namespace {
@@ -8651,6 +8827,11 @@ void NativeListRead(nlohmann::json& out) {
     out["verify_runs_synthesis_compared_with_the_package"] = nl_verified.load();
     out["verify_differences"] = nl_mismatch.load();
     out["package_table_full"] = nl_table_full.load();
+    out["draws_taken_with_lazy_registers"] = lazy_taken.load();
+    out["lazy_declined_for_a_register_in_a_hashed_group"] = lazy_declined.load();
+    out["lazy_registers_materialized"] = lazy_materialized.load();
+    out["lazy_verify_full_take_compared"] = lazy_verified.load();
+    out["lazy_verify_differences"] = lazy_differences.load();
 }
 
 void MergeCensusRead(std::array<u64, 6>& values) {

@@ -178,6 +178,9 @@ struct ExecDraw {
     std::array<u64, MaxGeometryIds> geometry_ids{};
     u32 geometry_id_count{};
     std::array<ExecRegister, MaxRegisters> regs;
+    /// A5.3: the state package the register groups of a typed draw come from. The groups the package holds are not copied into `regs` until `MaterializeRegs` (the plan of a
+    /// draw whose inputs are cached reads only the arguments group); `group_begin`, `group_sig`, `inputs_key` and `stage_key` are complete.
+    const void* lazy{};
     u32 count{};
     /// The first `grouped` registers are stored by group (group g is regs[group_begin[g]] to regs[group_begin[g + 1]]), the rest always applies.
     /// `group_sig[g]` identifies what the group's values come from (the engine's objects); 0: no identity, always apply.
@@ -219,6 +222,9 @@ struct ExecDraw {
     u32 fixed_stale{};                 ///< FixedStateStale groups of `fixed` the hardware keeps from earlier draws
     u32 dst_usage{~0u};                ///< copy and counter read-back records: Usage of the destination resource (3 staging)
 };
+
+/// A5.3: copies the registers a lazy draw holds in its state package into `regs` (a draw that needs the full register list: a plan cache miss, the register image, the audits).
+void MaterializeRegs(ExecDraw& draw);
 
 /// Command processor: the index / vertex count the record's draw was called with (0xffffffff when the record is gone).
 u32 RecordDrawCount(u64 seq);

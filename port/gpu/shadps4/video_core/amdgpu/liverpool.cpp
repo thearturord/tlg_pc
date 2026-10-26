@@ -1594,6 +1594,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         }
     }
     if (!planned_from_record) {
+        Core::NativeDraw::MaterializeRegs(draw); // A5.3: the register groups of a draw whose plan comes from the registers
         if (!draw.cb_extents_only) {
             ExecApplyRecord(draw, !native_fixed_verify, index_count); // a fast clear eliminate's registers are for that operation only (its plan comes from the record)
         }
