@@ -132,6 +132,13 @@ enum CensusKind : u32 {
     CImageStorage, CImageTransit, CImageTransitTrue, CBindResources, CBufferInPlace,
     CGeometryVertexRing = 24, CGeometryVertexHandle, CGeometryVertexAddress, CGeometryIndexRing, CGeometryIndexHandle, CGeometryIndexAddress,
 };
+bool DescCensusOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_DESC_CENSUS");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
 } // namespace
 
 void Rasterizer::MaybeFlushRecorded() {
@@ -1498,8 +1505,17 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
         BindBuffers(*stage, binding, push_data);
+        const u32 images_before = static_cast<u32>(image_infos.size());
         BindTextures(*stage, binding);
+        if (fixed != nullptr && DescCensusOn() && !pipeline->IsCompute()) {
+            for (u32 i = images_before; i < image_infos.size() && i - images_before < 16; ++i) {
+                DescriptorNoteImage(static_cast<u32>(stage->sw_stage), i - images_before, image_infos[i].imageView);
+            }
+        }
         uses_dma |= stage->uses_dma;
+    }
+    if (fixed != nullptr && DescCensusOn() && !pipeline->IsCompute()) {
+        DescriptorEndDraw();
     }
 
     if (uses_dma) {
@@ -1893,6 +1909,82 @@ Runtime::HazardAudit Rasterizer::TakeHazardAudit() {
     return runtime.TakeHazardAudit();
 }
 
+void Rasterizer::DescriptorNoteBuffer(u32 stage, u32 index, const vk::DescriptorBufferInfo& info) noexcept {
+    if (stage >= desc_prev_buffers.size() || index >= desc_prev_buffers[0].size()) {
+        return;
+    }
+    auto& prev = desc_prev_buffers[stage][index];
+    auto count = [&](DescKind k) { descriptor_census[k].fetch_add(1, std::memory_order_relaxed); };
+    count(DBuffers);
+    if (!info.buffer) {
+        count(DBufferNull);
+    }
+    if (prev.buffer == info.buffer && prev.offset == info.offset && prev.range == info.range) {
+        count(DBufferSame);
+    } else if (prev.buffer == info.buffer && prev.range == info.range) {
+        count(DBufferOffsetOnly);
+        desc_draw_same = false;
+        desc_draw_buffers_changed = true;
+    } else if (prev.buffer == info.buffer) {
+        count(DBufferOtherRange);
+        desc_draw_same = false;
+        desc_draw_same_but_offsets = false;
+        desc_draw_buffers_changed = true;
+    } else {
+        count(DBufferOtherBuffer);
+        desc_draw_same = false;
+        desc_draw_same_but_offsets = false;
+        desc_draw_buffers_changed = true;
+    }
+    prev = {info.buffer, info.offset, info.range};
+}
+
+void Rasterizer::DescriptorNoteImage(u32 stage, u32 index, vk::ImageView view) noexcept {
+    if (stage >= desc_prev_views.size() || index >= desc_prev_views[0].size()) {
+        return;
+    }
+    auto& prev = desc_prev_views[stage][index];
+    descriptor_census[DImages].fetch_add(1, std::memory_order_relaxed);
+    if (!view) {
+        descriptor_census[DImageNull].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (prev == view) {
+        descriptor_census[DImageSame].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        descriptor_census[DImageOther].fetch_add(1, std::memory_order_relaxed);
+        desc_draw_same = false;
+        desc_draw_same_but_offsets = false;
+        desc_draw_images_changed = true;
+    }
+    prev = view;
+}
+
+void Rasterizer::DescriptorEndDraw() noexcept {
+    descriptor_census[DDraws].fetch_add(1, std::memory_order_relaxed);
+    if (desc_draw_same) {
+        descriptor_census[DDrawsAllSame].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (desc_draw_same_but_offsets) {
+        descriptor_census[DDrawsSameButOffsets].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (desc_draw_buffers_changed && !desc_draw_images_changed) {
+        descriptor_census[DDrawsBuffersOnlyChanged].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (desc_draw_images_changed && !desc_draw_buffers_changed) {
+        descriptor_census[DDrawsImagesOnlyChanged].fetch_add(1, std::memory_order_relaxed);
+    }
+    desc_draw_same = desc_draw_same_but_offsets = true;
+    desc_draw_buffers_changed = desc_draw_images_changed = false;
+}
+
+std::array<u64, 16> Rasterizer::TakeDescriptorCensus() noexcept {
+    std::array<u64, 16> out{};
+    for (u32 i = 0; i < DCount; ++i) {
+        out[i] = descriptor_census[i].exchange(0, std::memory_order_relaxed);
+    }
+    return out;
+}
+
 std::array<u64, 64> Rasterizer::TakeConsumerCensus() noexcept {
     std::array<u64, 64> out{};
     for (u32 i = 0; i < 64; ++i) {
@@ -2254,6 +2346,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
         }
 
+        if (census_base == 0 && DescCensusOn()) {
+            DescriptorNoteBuffer(static_cast<u32>(stage.sw_stage), buffer_index, buffer_infos.back());
+        }
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified++;

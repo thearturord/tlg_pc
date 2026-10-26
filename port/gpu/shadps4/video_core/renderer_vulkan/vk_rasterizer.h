@@ -136,6 +136,7 @@ public:
     /// C0 census (read only, counts per ~5 s interval): how every buffer and image binding, and every vertex / index buffer, of the draws and dispatches was resolved
     /// by the consumer. Index = (compute ? 32 : 0) + kind for the shader bindings, 24 + kind for the geometry (graphics only); see `CensusKind` in vk_rasterizer.cpp.
     std::array<u64, 64> TakeConsumerCensus() noexcept;
+    std::array<u64, 16> TakeDescriptorCensus() noexcept;
     [[nodiscard]] bool HazardAuditOn() const noexcept;
     Runtime::HazardAudit TakeHazardAudit();
     [[nodiscard]] bool InPlaceOn() const noexcept {
@@ -300,6 +301,22 @@ private:
         inplace_image_or_meta{0}, inplace_verified{0}, inplace_differing{0}, inplace_verify_dropped{0};
     void CheckInPlaceVerifications();
     std::array<std::atomic<u64>, 64> consumer_census{};
+    // A5 / N7 groundwork (`TLG_DESC_CENSUS=1`): how often a graphics draw's descriptors repeat the previous draw's at the same (stage, binding) place.
+    enum DescKind : u32 {
+        DDraws, DDrawsAllSame, DDrawsSameButOffsets, DBuffers, DBufferNull, DBufferSame, DBufferOffsetOnly, DBufferOtherRange, DBufferOtherBuffer, DImages, DImageNull, DImageSame, DImageOther,
+        DDrawsBuffersOnlyChanged, DDrawsImagesOnlyChanged, DCount
+    };
+    struct PrevBuffer {
+        vk::Buffer buffer;
+        u64 offset, range;
+    };
+    std::array<std::atomic<u64>, DCount> descriptor_census{};
+    std::array<std::array<PrevBuffer, 32>, 8> desc_prev_buffers{};
+    std::array<std::array<vk::ImageView, 16>, 8> desc_prev_views{};
+    bool desc_draw_same{true}, desc_draw_same_but_offsets{true}, desc_draw_buffers_changed{false}, desc_draw_images_changed{false};
+    void DescriptorNoteBuffer(u32 stage, u32 index, const vk::DescriptorBufferInfo& info) noexcept;
+    void DescriptorNoteImage(u32 stage, u32 index, vk::ImageView view) noexcept;
+    void DescriptorEndDraw() noexcept;
     void Census(u32 index, u64 n = 1) noexcept {
         consumer_census[index & 63].fetch_add(n, std::memory_order_relaxed);
     }

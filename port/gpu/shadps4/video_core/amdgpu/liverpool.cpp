@@ -1976,6 +1976,15 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                 out["note"] = "C0 census, counts per ~5 s interval (read only)";
                 Core::DebugServer::Publish("consumer_census", std::move(out));
             }
+            if (const char* e = std::getenv("TLG_DESC_CENSUS"); e != nullptr && *e != 0 && *e != '0') {
+                const auto d = rasterizer->TakeDescriptorCensus();
+                Core::DebugServer::Publish("descriptor_census",
+                                           {{"graphics_draws", d[0]}, {"draws_all_descriptors_same_as_previous_draw", d[1]}, {"draws_same_except_buffer_offsets", d[2]},
+                                            {"draws_where_only_buffers_changed", d[13]}, {"draws_where_only_images_changed", d[14]},
+                                            {"buffer_bindings", d[3]}, {"buffer_null", d[4]}, {"buffer_same", d[5]}, {"buffer_only_offset_differs", d[6]}, {"buffer_same_vk_buffer_other_range", d[7]},
+                                            {"buffer_other_vk_buffer", d[8]}, {"image_bindings", d[9]}, {"image_null", d[10]}, {"image_same_view", d[11]}, {"image_other_view", d[12]},
+                                            {"note", "per ~5 s interval, compared with the previous graphics draw at the same (stage, binding); read only"}});
+            }
             if (Core::NativeResources::ResidentBuffersEnabled()) {
                 const auto r = Core::NativeResources::TakeResidentCounters();
                 static std::array<u64, 8> resident_total{};
