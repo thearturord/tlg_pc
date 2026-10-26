@@ -1056,6 +1056,8 @@ void CheckCacheImpl(CacheArgs& args) {
 
 struct Verify {
     std::atomic<bool> active{false};
+    // one verify pass at a time over the one shadow: taken when a pass is chosen for verify (before the shadow is built, long before `active`), given back when it is done
+    std::atomic<bool> claimed{false};
     std::thread::id thread;
     Target shadow;
     size_t cursor{0}, arena_pos{0};
@@ -3764,7 +3766,7 @@ bool HandlePass(u64 render_device, u64 desc, u64 original_loop) {
         stats = &s.views[plan.view_type];
         if (plan.Ok()) {
             ++stats->eligible;
-            verify_pass = cfg.verify_every != 0 && stats->eligible % cfg.verify_every == cfg.verify_every - 1 && !V().active.load();
+            verify_pass = cfg.verify_every != 0 && stats->eligible % cfg.verify_every == cfg.verify_every - 1 && !V().claimed.exchange(true);
         }
     }
     if (plan.Ok() && !verify_pass) {
@@ -3829,6 +3831,7 @@ bool HandlePass(u64 render_device, u64 desc, u64 original_loop) {
             LOG_ERROR(Render, "cascade generator: view type {} switched off, {} differences against the engine's loop", v.view, v.mismatches);
         }
         v.shadow = Target{};
+        v.claimed.store(false);
     } else {
         reinterpret_cast<Loop>(original_loop)(render_device, desc);
     }
@@ -3891,7 +3894,7 @@ bool HandleGBuffer(u64 render_device, u64 mode, u64 list, u64 args, u64 flags, u
     if (plan.Ok()) {
         std::scoped_lock lock{s.mutex};
         ++gs.eligible;
-        verify_pass = cfg.verify_every != 0 && gs.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().active.load();
+        verify_pass = cfg.verify_every != 0 && gs.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().claimed.exchange(true);
     }
     if (plan.Ok() && !verify_pass) {
         Target live;
@@ -3961,6 +3964,7 @@ bool HandleGBuffer(u64 render_device, u64 mode, u64 list, u64 args, u64 flags, u
         v.shadow = Target{};
         v.lo = ZPassBegin;
         v.hi = ZPassEnd;
+        v.claimed.store(false);
     } else {
         reinterpret_cast<Loop>(original_loop)(render_device, mode, list, args, flags, query_mode, param7);
         std::scoped_lock lock{s.mutex};
@@ -4008,7 +4012,7 @@ bool HandleForward(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 or
     if (plan.Ok()) {
         std::scoped_lock lock{s.mutex};
         ++fs.eligible;
-        verify_pass = cfg.verify_every != 0 && fs.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().active.load();
+        verify_pass = cfg.verify_every != 0 && fs.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().claimed.exchange(true);
     }
     if (plan.Ok() && !verify_pass) {
         Target live;
@@ -4075,6 +4079,7 @@ bool HandleForward(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 or
         v.shadow = Target{};
         v.lo = ZPassBegin;
         v.hi = ZPassEnd;
+        v.claimed.store(false);
     } else {
         reinterpret_cast<Loop>(original_loop)(render_device, a1, a2, list, mode);
         std::scoped_lock lock{s.mutex};
@@ -4137,7 +4142,7 @@ bool HandleDecal(u64 render_device, u64 view, u64 a3, u64 a4, u64 desc, u32 flag
     if (plan.Ok()) {
         std::scoped_lock lock{s.mutex};
         ++ds.eligible;
-        verify_pass = cfg.verify_every != 0 && ds.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().active.load();
+        verify_pass = cfg.verify_every != 0 && ds.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().claimed.exchange(true);
     }
     if (plan.Ok() && !verify_pass) {
         Target live;
@@ -4200,6 +4205,7 @@ bool HandleDecal(u64 render_device, u64 view, u64 a3, u64 a4, u64 desc, u32 flag
         v.shadow = Target{};
         v.lo = ZPassBegin;
         v.hi = ZPassEnd;
+        v.claimed.store(false);
     } else {
         run_loop();
         std::scoped_lock lock{s.mutex};
@@ -4254,7 +4260,7 @@ bool HandleSkin(u64 system, u64 scene, u64 async_flag, u64 original_loop) {
     if (plan.Ok()) {
         std::scoped_lock lock{s.mutex};
         ++ss.eligible;
-        verify_pass = cfg.verify_every != 0 && ss.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().active.load();
+        verify_pass = cfg.verify_every != 0 && ss.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().claimed.exchange(true);
     }
     if (plan.Ok() && !verify_pass) {
         Target live;
@@ -4309,6 +4315,7 @@ bool HandleSkin(u64 system, u64 scene, u64 async_flag, u64 original_loop) {
         v.shadow = Target{};
         v.lo = ZPassBegin;
         v.hi = ZPassEnd;
+        v.claimed.store(false);
     } else {
         run_loop();
         std::scoped_lock lock{s.mutex};
@@ -4540,6 +4547,11 @@ nlohmann::json Report() {
         if (sites["total_draws"].get<u64>() != 0) {
             out["draw_site_census"] = std::move(sites);
         }
+    }
+    {
+        nlohmann::json list = nlohmann::json::object();
+        NativeDraw::NativeListRead(list);
+        out["native_list"] = std::move(list);
     }
     {
         nlohmann::json audit = nlohmann::json::object();

@@ -2661,6 +2661,165 @@ void SynthAuditNote(const Signature& sig, u32 kind, const NativeRecord& slot) {
     synth_audit_no_slot.fetch_add(1, std::memory_order_relaxed);
 }
 
+// ---- A5.2: the state half of a record by key ---------------------------------------------------------------------------------------------------
+// Synthesize (the register groups of the targets, the fixed function state, the vertex and pixel program, the extents and flags of a record) is a function of the engine's state: the
+// objects the context holds (identity), the engine's cached copies of what PrepareDraw wrote, the vertex shader's fetch object and the content of the target blocks (A5.1 audit:
+// 0 differences over 7.5 M records). A package of its output is made at the first sight of a key; a record whose key is known takes the package instead of synthesizing. One record in
+// `TLG_NATIVE_LIST_VERIFY` is synthesized as well and compared with the package; a difference drops the package (and is counted).
+bool NativeListOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_NATIVE_LIST");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+u32 NativeListVerifyEvery() {
+    static const u32 every = [] {
+        const char* e = std::getenv("TLG_NATIVE_LIST_VERIFY");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 64u;
+    }();
+    return every;
+}
+struct StatePackage {
+    std::atomic<u64> key{0};
+    std::atomic<u32> ready{0}; // 1 usable, 2 dropped by a verify difference
+    u32 count{0};
+    std::array<SynthReg, MaxSynthRegs> regs{};
+    u32 flags{0}, reason{0}, cb_extent_mask{0}, db_extent{0}, rt_info{0};
+    std::array<u32, 8> cb_extent{};
+    u64 vs_gnm{0}, ps_gnm{0}, dbg_vs{0}, dbg_fetch{0}, fetch_address{0}, synth_vs{0};
+};
+constexpr u32 PackageSlots = 1u << 13;
+std::unique_ptr<StatePackage[]> packages;
+std::once_flag packages_once;
+std::atomic<u64> nl_records{0}, nl_used{0}, nl_first{0}, nl_verified{0}, nl_mismatch{0}, nl_table_full{0};
+std::atomic<u32> nl_logged{0};
+
+u64 StateKeyOf(u64 ctx, const Signature& sig, u32 kind) {
+    Hasher h;
+    for (u32 g = 0; g < NumGroups; ++g) {
+        if (g == Shaders || g == InputObjects || g == Targets || g == States) {
+            h.Add(sig.group[g]);
+        }
+    }
+    h.Add(sig.pipeline_key);
+    h.Add(kind);
+    h.Add(Rd<u64>(ctx, 0x4440));
+    for (const u32 offset : {0x4448u, 0x46d0u, 0x4710u, 0x4714u, 0x130c8u}) {
+        h.Add(Rd<u32>(ctx, offset));
+    }
+    h.Add(Rd<u8>(ctx, 0x46d8));
+    h.Add(Rd<u64>(ctx, 0x4450));
+    h.Add(Rd<u64>(ctx, 0x4680));
+    h.Add(Rd<u64>(ctx, 0x4688));
+    if (const u64 vs = Rd<u64>(ctx, Ctx::VertexShader)) {
+        h.Add(Rd<u64>(vs, 0x420));
+        if (const u64 fetch = Rd<u64>(vs + 0x30, 0xe0)) {
+            h.Add(Rd<u64>(fetch, 0x30));
+            h.Add(Rd<u32>(fetch, 0x40));
+            h.Add(Rd<u32>(fetch, 0x48));
+            h.Add(Rd<u32>(fetch, 0x4c));
+        }
+    }
+    // the target blocks by content (the register values of CB_COLORi_* come from them)
+    const auto block = [&](u64 view) {
+        h.Add(view);
+        if (view != 0) {
+            for (u32 k = 0; k < 16; ++k) {
+                h.Add(Rd<u32>(view + 0x54, k * 4));
+            }
+        }
+    };
+    for (u32 slot = 0; slot < 7; ++slot) {
+        block(Rd<u64>(ctx, Ctx::RenderTargets + slot * 8));
+    }
+    block(Rd<u64>(ctx, 0x130e0));
+    if (const u64 dsv = Rd<u64>(ctx, Ctx::DepthStencilView)) {
+        for (u32 k = 0; k < 13; ++k) {
+            h.Add(Rd<u32>(dsv + 0x58, k * 4));
+        }
+        if (const u64 resource = Rd<u64>(dsv, 0x30); resource != 0) {
+            h.Add(resource);
+            if (Rd<u64>(resource, 0x48) != 0) {
+                h.Add(Rd<u32>(resource, 0x158));
+                h.Add(Rd<u8>(resource, 0x15c));
+                h.Add(Rd<u32>(resource, 0x178));
+                h.Add(Rd<u32>(resource, 0x17c));
+            }
+        }
+    }
+    return h.h | 4; // never 0 or 1
+}
+
+StatePackage* FindPackage(u64 key) {
+    std::call_once(packages_once, [] { packages = std::make_unique<StatePackage[]>(PackageSlots); });
+    u32 index = static_cast<u32>(key >> 51);
+    for (u32 probe = 0; probe < 16; ++probe, index = (index + 1) & (PackageSlots - 1)) {
+        StatePackage& p = packages[index];
+        const u64 current = p.key.load(std::memory_order_acquire);
+        if (current == key && p.ready.load(std::memory_order_acquire) == 1) {
+            return &p;
+        }
+        if (current == 0) {
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
+
+void StorePackage(u64 key, const NativeRecord& slot) {
+    std::call_once(packages_once, [] { packages = std::make_unique<StatePackage[]>(PackageSlots); });
+    u32 index = static_cast<u32>(key >> 51);
+    for (u32 probe = 0; probe < 16; ++probe, index = (index + 1) & (PackageSlots - 1)) {
+        StatePackage& p = packages[index];
+        u64 expected = 0;
+        if (p.key.compare_exchange_strong(expected, key, std::memory_order_acq_rel)) {
+            p.count = slot.count;
+            std::copy_n(slot.regs.begin(), slot.count, p.regs.begin());
+            p.flags = synth_flags;
+            p.reason = synth_reason;
+            p.cb_extent_mask = synth_cb_extent_mask;
+            p.db_extent = synth_db_extent;
+            p.rt_info = synth_rt_info;
+            p.cb_extent = synth_cb_extent;
+            p.vs_gnm = slot.vs_gnm;
+            p.ps_gnm = slot.ps_gnm;
+            p.dbg_vs = dbg_vs;
+            p.dbg_fetch = dbg_fetch;
+            p.fetch_address = synth_fetch_address;
+            p.synth_vs = synth_vs_gnm;
+            p.ready.store(1, std::memory_order_release);
+            return;
+        }
+        if (expected == key && p.ready.load(std::memory_order_acquire) == 1) {
+            return; // another thread made it
+        }
+    }
+    nl_table_full.fetch_add(1, std::memory_order_relaxed);
+}
+
+/// The package's content equals what the synthesis just produced (`slot` and the thread's synthesis outputs).
+const char* ComparePackage(const StatePackage& p, const NativeRecord& slot) {
+    if (p.count != slot.count || std::memcmp(p.regs.data(), slot.regs.data(), slot.count * sizeof(SynthReg)) != 0) {
+        return "registers";
+    }
+    if (p.flags != synth_flags || p.reason != synth_reason) {
+        return "flags";
+    }
+    if (p.cb_extent_mask != synth_cb_extent_mask || p.db_extent != synth_db_extent || p.rt_info != synth_rt_info) {
+        return "extents";
+    }
+    for (u32 i = 0; i < 8; ++i) {
+        if (((p.cb_extent_mask >> i) & 1) != 0 && p.cb_extent[i] != synth_cb_extent[i]) {
+            return "extents";
+        }
+    }
+    if (p.vs_gnm != slot.vs_gnm || p.ps_gnm != slot.ps_gnm || p.dbg_vs != dbg_vs || p.dbg_fetch != dbg_fetch || p.fetch_address != synth_fetch_address || p.synth_vs != synth_vs_gnm) {
+        return "shader pointers";
+    }
+    return nullptr;
+}
+
 /// Guest thread: builds the record of a draw. Returns its number.
 u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     PhaseClockMr mr;
@@ -2675,7 +2834,55 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     synth_reason = 0;
     synth_cb_extent_mask = 0;
     mr.Mark(0);
-    slot.count = Synthesize(ctx, slot.regs.data(), &slot.vs_gnm, &slot.ps_gnm);
+    bool state_from_package = false;
+    u64 package_key = 0;
+    StatePackage* package = nullptr;
+    bool verify_package = false;
+    if (kind <= 2 && record_sig != nullptr && NativeListOn()) {
+        nl_records.fetch_add(1, std::memory_order_relaxed);
+        package_key = StateKeyOf(ctx, *record_sig, kind);
+        package = FindPackage(package_key);
+        if (package != nullptr) {
+            thread_local u32 counter = 0;
+            verify_package = NativeListVerifyEvery() != 0 && ++counter % NativeListVerifyEvery() == 0;
+            if (!verify_package) {
+                state_from_package = true;
+                slot.count = package->count;
+                std::copy_n(package->regs.begin(), package->count, slot.regs.begin());
+                slot.vs_gnm = package->vs_gnm;
+                slot.ps_gnm = package->ps_gnm;
+                synth_flags = package->flags;
+                synth_reason = package->reason;
+                synth_cb_extent_mask = package->cb_extent_mask;
+                synth_db_extent = package->db_extent;
+                synth_rt_info = package->rt_info;
+                synth_cb_extent = package->cb_extent;
+                dbg_vs = package->dbg_vs;
+                dbg_fetch = package->dbg_fetch;
+                synth_fetch_address = package->fetch_address;
+                synth_vs_gnm = package->synth_vs;
+                nl_used.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    if (!state_from_package) {
+        slot.count = Synthesize(ctx, slot.regs.data(), &slot.vs_gnm, &slot.ps_gnm);
+        if (package_key != 0 && slot.count != 0) {
+            if (package == nullptr) {
+                nl_first.fetch_add(1, std::memory_order_relaxed);
+                StorePackage(package_key, slot);
+            } else if (verify_package) {
+                nl_verified.fetch_add(1, std::memory_order_relaxed);
+                if (const char* what = ComparePackage(*package, slot)) {
+                    nl_mismatch.fetch_add(1, std::memory_order_relaxed);
+                    if (nl_logged.fetch_add(1) < 12) {
+                        LOG_ERROR(Core, "native list: package {:#x} differs from the synthesis ({})", package_key, what);
+                    }
+                    package->ready.store(2, std::memory_order_release); // dropped: the next record of the key makes a new one
+                }
+            }
+        }
+    }
     if (kind <= 2 && record_sig != nullptr && SynthAuditOn()) {
         synth_audit_ctx = ctx;
         SynthAuditNote(*record_sig, kind, slot);
@@ -8434,6 +8641,16 @@ void SynthAuditRead(nlohmann::json& out) {
         pj[fmt::format("{:#x}", presence[i].second)] = presence[i].first;
     }
     out["registers_present_in_only_one_of_two_records"] = pj;
+}
+
+void NativeListRead(nlohmann::json& out) {
+    out["enabled"] = NativeListOn();
+    out["records_with_a_state"] = nl_records.load();
+    out["state_taken_from_a_package"] = nl_used.load();
+    out["packages_made_at_first_sight"] = nl_first.load();
+    out["verify_runs_synthesis_compared_with_the_package"] = nl_verified.load();
+    out["verify_differences"] = nl_mismatch.load();
+    out["package_table_full"] = nl_table_full.load();
 }
 
 void MergeCensusRead(std::array<u64, 6>& values) {

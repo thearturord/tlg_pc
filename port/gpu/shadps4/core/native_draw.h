@@ -133,6 +133,9 @@ void DrawSiteCensusRead(nlohmann::json& out);
 /// A5.1 (`TLG_SYNTH_AUDIT=1`): is what `Synthesize` produces (the register groups, flags, extents, shader pointers) a function of the context's engine signature (shaders, input objects,
 /// targets, fixed function state, pipeline key)? Counts the records whose signature was seen before and the components that differed.
 void SynthAuditRead(nlohmann::json& out);
+/// A5.2 (`TLG_NATIVE_LIST=1`, verify `TLG_NATIVE_LIST_VERIFY=N`, default 64): the state half of a record (the register groups of the targets, the fixed function state, the vertex and pixel
+/// program, the target extents, the flags) is taken from a package built at the first sight of the engine's state key instead of being synthesized again; counters.
+void NativeListRead(nlohmann::json& out);
 void RecordCacheCensusRead(u64& lookups, u64& hits_1m, u64& hits_64k);
 void MakeRecordCensusRead(std::array<u64, 6>& ticks, u64& calls);
 void IssueCensusRead(u32 kind, u64& calls, u64& tag_ticks, u64& original_ticks, u64& taken_by_tag);

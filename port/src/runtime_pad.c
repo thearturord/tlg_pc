@@ -599,7 +599,7 @@ static void read_inject(void) {
     printf("Runtime: pad file: buttons 0x%x sticks %d %d %d %d\n",injected.buttons,
            injected.stick[0],injected.stick[1],injected.stick[2],injected.stick[3]);
 }
-/* TLG_AUTO_START=1: passes the title screen and picks Continue by itself, without a window in front or a keyboard (for automated runs and tests). The game's
+/* TLG_AUTO_START=1 (also on with TLG_HEADLESS=1 unless TLG_AUTO_START=0): passes the title screen and picks Continue by itself, without a window in front or a keyboard (for automated runs and tests). The game's
  * menu manager (CUSA03627: *(*(image + 0x5832568) + 0xd0), Ghidra 0x6832568) tells the state: +0xe0 counts while a title or menu screen waits for input
  * (0 during start-up and in the level), +0x218 becomes 1 once Continue is chosen and stays 1. The pad presses Cross for 150 ms every
  * TLG_AUTO_START_GAP ms (default 2500) while a screen waits, and stops for good once Continue is chosen (or after TLG_AUTO_START_LIMIT seconds, default 300).
@@ -633,7 +633,9 @@ static int auto_menu(uint32_t *counter, uint32_t *selected) {
 static uint32_t auto_start_buttons(void) {
     static int mode=-1, done; static uint64_t first, next_press, pulse_end; static uint64_t gap_us=2500000, limit_us=300000000;
     if (mode<0) {
-        const char *e=getenv("TLG_AUTO_START"); mode=e && *e && strcmp(e,"0");
+        const char *e=getenv("TLG_AUTO_START"), *h=getenv("TLG_HEADLESS");
+        /* TLG_HEADLESS=1 implies the auto start (a hidden window has nobody to press Continue); TLG_AUTO_START=0 turns it off again */
+        mode=e && *e ? strcmp(e,"0")!=0 : (h && *h && strcmp(h,"0"));
         const char *g=getenv("TLG_AUTO_START_GAP"), *l=getenv("TLG_AUTO_START_LIMIT");
         if (g && atoi(g)>0) gap_us=(uint64_t)atoi(g)*1000u;
         if (l && atoi(l)>0) limit_us=(uint64_t)atoi(l)*1000000u;
