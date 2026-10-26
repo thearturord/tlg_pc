@@ -1021,6 +1021,8 @@ struct Verify {
     u64 raced{0};
     std::vector<s16> expect;
     std::vector<u64> owner_of; // per context byte: the material whose render object the shadow copied the byte from (0: none)
+    std::array<u8, 0x340> forward_block{}; // A3: the block the native forward prologue built in the shadow (compared with the engine's at the first draw)
+    bool forward_block_set{false};
 };
 Verify& V() {
     static Verify verify;
@@ -1247,6 +1249,7 @@ constexpr u64 FunctionHandleLookup = 0x01c59060; // FUN_01c59060(render device, 
 // `TLG_GEN_NATIVE_LEAF_VERIFY=N` (default 64) runs the engine's function instead for one call in N and compares its result with the native answer.
 struct LeafStats {
     std::atomic<u64> native{}, engine_creating{}, engine_null{}, verified{}, differing{};
+    std::atomic<u64> prologue_native{}, block_compared{}, block_differing{};
 };
 LeafStats& Leaf() {
     static LeafStats stats;
@@ -1701,6 +1704,97 @@ void HandleRefDec(u64 handle) {
     }
 }
 
+// A3: FUN_01c710f0 and FUN_01c70cc0 (the forward prologue), read off the decompilation (documents/tlg/native plan/stages/a3-engine-functions.md). `TLG_GEN_NATIVE_LEAF=2`
+// (the lookup too): the prologue is made natively, in the live run and in the verify run's shadow. The shadow cannot take a block from the frame ring: it builds the block in
+// `Verify::forward_block` and the first draw of the engine's loop compares it with the block the engine's prologue put in the ring (`NoteLoopDraw`).
+constexpr u64 FunctionAllocFrameGarlic = 0x02476350; // JsDevice_AllocFrameGarlic(allocator, size, align)
+constexpr u64 GlobalDeviceHolder = 0x06b03558;       // DAT_06b03558: holder of the frame allocator (+ 0x10238)
+bool NativePrologueOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_GEN_NATIVE_LEAF");
+        return e != nullptr && *e != 0 && std::atoi(e) >= 2;
+    }();
+    return on;
+}
+u64 RenderDataOf(u64 render_device, u64 object) {
+    const u64 data = object != 0 ? HandleLookup(render_device, object) : 0;
+    return data != 0 ? R<u64>(data + 0x48) : 0;
+}
+/// FUN_01c70cc0(renderDev, ctx, 0, desc): ten render targets -> ctx + 0xac0 .. 0xb08.
+void TargetSlotsNative(Target& t, u64 rd, u64 desc) {
+    const u64 list = R<u64>(R<u64>(Global(GlobalContext)) + 0x38); // DAT_069a1b40 holds the pointer
+    const u32 count = R<u32>(list + 0x88);
+    const u64 array = R<u64>(list + 0x80);
+    std::array<u64, 10> slot{};
+    for (u32 i = 0; i < 10; ++i) {
+        slot[i] = RenderDataOf(rd, i < count ? R<u64>(array + u64{i} * 8) : 0);
+    }
+    if (const u64 d = R<u64>(desc + 0x458); d != 0 && R<s32>(d + 0x270) == 3 && R<s32>(d + 0x258) == 7) {
+        const u64 colour = R<u64>(d + 0x250), depth = R<u64>(d + 0x268);
+        for (u32 i = 0; i < 7; ++i) {
+            slot[i] = RenderDataOf(rd, R<u64>(colour + u64{i} * 8));
+        }
+        for (u32 i = 0; i < 3; ++i) {
+            slot[7 + i] = RenderDataOf(rd, R<u64>(depth + u64{i} * 8));
+        }
+    }
+    for (u32 i = 0; i < 10; ++i) {
+        t.Set<u64>(0xac0 + i * 8, slot[i]);
+    }
+}
+/// FUN_01c710f0(renderDev, a1, a2, mode).
+void ForwardPrologueNative(Target& t, u64 rd, u64 a1, u64 a2, u32 mode) {
+    Leaf().prologue_native.fetch_add(1, std::memory_order_relaxed);
+    TargetSlotsNative(t, rd, a2);
+    const u64 second = mode == 2 ? 1 : 0;
+    t.Set<u64>(0xa80, R<u64>(R<u64>(R<u64>(a1 + 0x20) + 0x20) + 0x48));
+    t.Set<u64>(0xa88, R<u64>(rd + 0x4448));
+    t.Set<u64>(0xa90, R<u64>(rd + 0x4458));
+    t.Set<u64>(0xa98, R<u64>(R<u64>(a1 + 0x38) + 0x18));
+    t.Set<u64>(0xaa0, R<u64>(rd + 0x87e8 + second * 0x28));
+    t.Set<u64>(0xaa8, R<u64>(rd + 0x4460 + second * 8));
+    t.Set<u64>(0xab0, R<u64>(R<u64>(a1 + 0x38) + 0x38 + second * 8));
+    const u64 target_desc = R<u64>(a2 + 0x448);
+    const u64 object5 = R<u64>(target_desc + 0x240), object6 = R<u64>(target_desc + 0x248);
+    const u64 data5 = RenderDataOf(rd, object5), data6 = RenderDataOf(rd, object6);
+    std::array<u8, 0x340> local{};
+    u8* block = local.data();
+    if (t.live) {
+        const u64 holder = R<u64>(Global(GlobalDeviceHolder));
+        block = reinterpret_cast<u8*>(reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u64)>(Global(FunctionAllocFrameGarlic))(R<u64>(holder + 0x10238), 0x340, 4));
+    }
+    std::memcpy(block, reinterpret_cast<const void*>(rd + 0x2910), 0x2b0);
+    std::memcpy(block + 0x2b0, reinterpret_cast<const void*>(rd + 0x2dc0), 0x50);
+    if (data5 != 0) {
+        std::memcpy(block + 0x300, reinterpret_cast<const void*>(data5 + 0x58), 0x20);
+    } else {
+        std::memset(block + 0x300, 0, 0x20);
+    }
+    if (data6 != 0) {
+        std::memcpy(block + 0x320, reinterpret_cast<const void*>(data6 + 0x58), 0x20);
+    } else {
+        std::memset(block + 0x320, 0, 0x20);
+    }
+    if (t.Get<u32>(0x13088) < 2) {
+        t.Set<u32>(0x13088, 2);
+    }
+    if (t.Get<u32>(0x13060) < 2) {
+        t.Set<u32>(0x13060, 2);
+    }
+    if (t.live) {
+        t.Set<u64>(0x13070, reinterpret_cast<u64>(block));
+        t.Set<u64>(0x13048, reinterpret_cast<u64>(block));
+    } else {
+        Verify& v = V();
+        v.forward_block = local;
+        v.forward_block_set = true;
+    }
+    t.Set<u64>(0xa28, data5);
+    t.Set<u64>(0xa30, data6);
+    t.Set<u64>(0xbb0, 0);
+    t.Set<u64>(0xbb8, R<u64>(rd + 0x87c0));
+}
+
 struct FBatch {
     BatchLevel level;
     u64 batch{};
@@ -1858,7 +1952,9 @@ void GenerateForward(Target& t, const FPlan& plan) {
         t.Set<u32>(0x4480, 4);
         t.Or8(0x447c, 1);
     }
-    if (t.live) {
+    if (NativePrologueOn() && R<u64>(rd + 0x2d8) == plan.ctx) {
+        Timed(CallId::ForwardPrologue, [&] { ForwardPrologueNative(t, rd, plan.a1, plan.a2, plan.mode); });
+    } else if (t.live) {
         Timed(CallId::ForwardPrologue, [&] { reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64, u64, u64)>(Global(FunctionForwardPrologue))(rd, plan.a1, plan.a2, plan.mode); });
     }
     const auto state_words = [&](u64 entry) {
@@ -2053,6 +2149,17 @@ void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3) {
     if (vs != mark.vertex_shader || ps != mark.pixel_shader) {
         ++v.mismatches;
         NoteMismatch(s, v.view, "shader pair", fmt::format("draw {}: the loop {:#x} / {:#x}, the generator {:#x} / {:#x}", k, vs, ps, mark.vertex_shader, mark.pixel_shader));
+    }
+    if (k == 0 && v.forward_block_set && v.view == 200) {
+        // A3: the 0x340 byte block the engine's forward prologue put in the frame ring (ctx + 0x13048) against the one the native prologue built
+        v.forward_block_set = false;
+        const u64 block = R<u64>(ctx + 0x13048);
+        Leaf().block_compared.fetch_add(1, std::memory_order_relaxed);
+        if (block == 0 || std::memcmp(reinterpret_cast<const void*>(block), v.forward_block.data(), v.forward_block.size()) != 0) {
+            Leaf().block_differing.fetch_add(1, std::memory_order_relaxed);
+            ++v.mismatches;
+            NoteMismatch(s, v.view, "forward prologue block", fmt::format("the engine's block at {:#x} differs from the native one", block));
+        }
     }
     v.mismatches += CompareDelta(s, v, v.arena_pos, mark.arena_end, ctx, fmt::format("draw {}", k).c_str());
     v.arena_pos = mark.arena_end;
@@ -2401,6 +2508,7 @@ bool HandleForward(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 or
         v.active.store(true);
         reinterpret_cast<Loop>(original_loop)(render_device, a1, a2, list, mode);
         v.active.store(false);
+        v.forward_block_set = false;
         std::scoped_lock lock{s.mutex};
         if (v.cursor < v.shadow.marks.size()) {
             ++v.mismatches;
@@ -2613,7 +2721,10 @@ nlohmann::json Report() {
     }
     out["native_handle_lookup_FUN_01c59060"] = {{"answered_natively", Leaf().native.load()}, {"engine_creates_the_render_data", Leaf().engine_creating.load()},
                                                 {"null_object", Leaf().engine_null.load()}, {"verify_calls_of_the_engine", Leaf().verified.load()},
-                                                {"verify_differences", Leaf().differing.load()}};
+                                                {"verify_differences", Leaf().differing.load()},
+                                                {"forward_prologues_made_natively_live_and_shadow", Leaf().prologue_native.load()},
+                                                {"forward_prologue_blocks_compared_with_the_engines", Leaf().block_compared.load()},
+                                                {"forward_prologue_blocks_differing", Leaf().block_differing.load()}};
     out["verify_difference_kinds"] = s.mismatch_kinds;
     out["special_entry_classes"] = s.special_classes;
     out["verify_words_that_moved_by_view_kind_offset"] = s.raced_words;
