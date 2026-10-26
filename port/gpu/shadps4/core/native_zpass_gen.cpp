@@ -1692,6 +1692,87 @@ constexpr u64 ForwardBegin = 0x01c779a0, ForwardEnd = 0x01c782a0;
 constexpr u64 ForwardIndexedSite = 0x01c7819d;
 constexpr u64 FunctionForwardPrologue = 0x01c710f0; // FUN_01c710f0(renderDev, a1, a2, mode)
 constexpr u64 FunctionFindVariant = 0x01c822c0;     // FUN_01c822c0(renderDev + 1000, material, flags, 0, mesh word, &token, 0) -> variant or 0
+constexpr u64 StringTable = 0x02716230;             // PTR_DAT_02716230: 0x20 bytes per entry, the name pointer first
+
+// A3: FUN_01c822c0, the case the engine answers from `material + 0x1d0` (the variant it found last time) without touching its caches or any lock: the key is made of material
+// fields, the flags and two FNV-1a hashes of names from the string table; when the cached variant carries the same four key words it is returned. Everything else (search of the
+// engine's cache lists under its lock, creation) stays the engine's. `TLG_GEN_NATIVE_LEAF=3` (3 includes 1 and 2); verify: the engine's function is called for one hit in
+// `TLG_GEN_NATIVE_LEAF_VERIFY` and must return the same variant (it has no side effect in this case).
+u32 Fnv1a(const char* text) {
+    u32 hash = 0x811c9dc5u;
+    for (; *text != 0; ++text) {
+        hash = (static_cast<u32>(static_cast<s32>(static_cast<s8>(*text))) ^ hash) * 0x1000193u;
+    }
+    return hash;
+}
+struct VariantStats {
+    std::atomic<u64> native{}, engine{}, verified{}, differing{};
+};
+VariantStats& VStats() {
+    static VariantStats stats;
+    return stats;
+}
+u64 FindVariant(u64 cache, u64 material, u32 flags, u32 flags2, u32 mesh_word, u32* token) {
+    static const bool native_on = [] {
+        const char* e = std::getenv("TLG_GEN_NATIVE_LEAF");
+        return e != nullptr && *e != 0 && std::atoi(e) >= 3;
+    }();
+    static const u32 verify_every = [] {
+        const char* e = std::getenv("TLG_GEN_NATIVE_LEAF_VERIFY");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 64u;
+    }();
+    const auto engine = [&] { return reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u32, u32, u32, void*, u64)>(Global(FunctionFindVariant))(cache, material, flags, flags2, mesh_word, token, 0); };
+    if (!native_on) {
+        return engine();
+    }
+    const u64 cached = R<u64>(material + 0x1d0);
+    if (cached != 0) {
+        const s32 selector_164 = R<s32>(material + 0x164);
+        const bool is_default = R<u64>(material + 0x18) == R<u64>(Global(GlobalDefaultKind));
+        u32 key = flags | flags2 | (is_default ? 0x200u : 0u);
+        const s32 mode = R<s32>(material + 0x15c);
+        if (mode == 2) {
+            key = ((flags | flags2) & 0xffffff6fu) | (is_default ? 0x200u : 0u) | 0x80u;
+        } else {
+            if (mode == 4) {
+                key |= 0x20u;
+            }
+            if (mode == 3) {
+                key |= 0x8080u;
+            }
+        }
+        if (R<s32>(material + 0x158) != 0) {
+            key |= 0x20000000u;
+        }
+        u32 name_hash = 0;
+        const u64 shared = R<u64>(material + 0x48);
+        if (shared != 0) {
+            if (const u32 index = R<u32>(shared + 0x24); index != 0) {
+                if (const u64 name = R<u64>(Global(StringTable) + u64{index} * 0x20); name != 0) {
+                    name_hash = Fnv1a(reinterpret_cast<const char*>(name));
+                }
+            }
+        }
+        if (token[0] != 0) {
+            name_hash = Fnv1a(reinterpret_cast<const char*>(R<u64>(Global(StringTable) + u64{token[0]} * 0x20)));
+        }
+        if (R<s32>(cached + 0x20) == selector_164 && R<u32>(cached + 0x24) == key && R<u32>(cached + 0x28) == (mesh_word & 0xffffu) && R<u32>(cached + 0x2c) == name_hash) {
+            thread_local u32 counter = 0;
+            if (verify_every != 0 && (++counter % verify_every) == 0) {
+                const u64 result = engine();
+                VStats().verified.fetch_add(1, std::memory_order_relaxed);
+                if (result != cached) {
+                    VStats().differing.fetch_add(1, std::memory_order_relaxed);
+                }
+                return result;
+            }
+            VStats().native.fetch_add(1, std::memory_order_relaxed);
+            return cached;
+        }
+    }
+    VStats().engine.fetch_add(1, std::memory_order_relaxed);
+    return engine();
+}
 constexpr u64 FunctionHandleFree = 0x01e45a60;      // FUN_01e45a60(handle): the last reference went
 constexpr u64 HandleRefTable = 0x02716240;          // DAT_02716240: 0x20 bytes per handle, the reference count first
 
@@ -2048,7 +2129,7 @@ void GenerateForward(Target& t, const FPlan& plan) {
             }
             HandleRefInc(token);
             std::array<s32, 2> token_slot{static_cast<s32>(token), 0};
-            const u64 variant = Timed(CallId::FindVariant, [&] { return reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u32, u32, u32, void*, u64)>(Global(FunctionFindVariant))(rd + 1000, step.material, fb.variant_flags, 0, fb.mesh_word, token_slot.data(), 0); });
+            const u64 variant = Timed(CallId::FindVariant, [&] { return FindVariant(rd + 1000, step.material, fb.variant_flags, 0, fb.mesh_word, reinterpret_cast<u32*>(token_slot.data())); });
             if (token != 0) {
                 HandleRefDec(token);
             }
@@ -2725,6 +2806,8 @@ nlohmann::json Report() {
                                                 {"forward_prologues_made_natively_live_and_shadow", Leaf().prologue_native.load()},
                                                 {"forward_prologue_blocks_compared_with_the_engines", Leaf().block_compared.load()},
                                                 {"forward_prologue_blocks_differing", Leaf().block_differing.load()}};
+    out["native_variant_find_FUN_01c822c0"] = {{"answered_natively_from_the_cached_variant", VStats().native.load()}, {"engine_calls_search_or_create", VStats().engine.load()},
+                                               {"verify_calls_of_the_engine", VStats().verified.load()}, {"verify_differences", VStats().differing.load()}};
     out["verify_difference_kinds"] = s.mismatch_kinds;
     out["special_entry_classes"] = s.special_classes;
     out["verify_words_that_moved_by_view_kind_offset"] = s.raced_words;
