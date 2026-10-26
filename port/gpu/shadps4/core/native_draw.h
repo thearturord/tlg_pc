@@ -127,6 +127,9 @@ void MergeCensusRead(std::array<u64, 6>& values);
 /// A1 (`TLG_SITE_CENSUS=1`, also on with `TLG_GEN_CENSUS=1`): the draws the hook tagged, by the call site that made them (ghidra return address): draws, generated ones (issued by one of the
 /// generators), draws executed natively from their record, the kinds seen. Written into `out` ranked by draws.
 void DrawSiteCensusRead(nlohmann::json& out);
+/// A5.1 (`TLG_SYNTH_AUDIT=1`): is what `Synthesize` produces (the register groups, flags, extents, shader pointers) a function of the context's engine signature (shaders, input objects,
+/// targets, fixed function state, pipeline key)? Counts the records whose signature was seen before and the components that differed.
+void SynthAuditRead(nlohmann::json& out);
 void RecordCacheCensusRead(u64& lookups, u64& hits_1m, u64& hits_64k);
 void MakeRecordCensusRead(std::array<u64, 6>& ticks, u64& calls);
 void IssueCensusRead(u32 kind, u64& calls, u64& tag_ticks, u64& original_ticks, u64& taken_by_tag);

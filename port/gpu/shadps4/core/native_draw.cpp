@@ -2465,6 +2465,196 @@ struct PhaseClockMr {
     ~PhaseClockMr() { Mark(5); }
 };
 
+// ---- A5.1: is Synthesize a function of the engine signature? ----------------------------------------------------------------------------------------
+const std::array<u8, 65536>& GroupTable();
+thread_local const Signature* record_sig = nullptr;
+thread_local u64 synth_audit_ctx = 0;
+constexpr u32 SynthComponents = NumRegisterGroups + 6; // the register groups, then flags, reason, color extents, depth extent, target info, shader pointers
+struct SynthAuditEntry {
+    std::atomic<u64> key{0};
+    std::atomic<u32> ready{0};
+    std::array<u64, SynthComponents> comp{};
+};
+std::array<SynthAuditEntry, 1u << 18> synth_audit_table;
+std::atomic<u64> synth_audit_records{0}, synth_audit_seen_before{0}, synth_audit_no_slot{0}, synth_audit_violating_records{0};
+std::array<std::atomic<u64>, SynthComponents> synth_audit_component_violations;
+std::atomic<u32> synth_audit_logged{0};
+/// diagnosis: the registers of the first draw of a signature (a smaller table) and, per register index, how often a later draw with the same signature had another value
+struct SynthAuditRegs {
+    std::atomic<u64> key{0};
+    u32 count{0};
+    std::array<ExecRegister, 400> regs{};
+};
+std::vector<SynthAuditRegs>* synth_audit_regs = nullptr;
+std::array<std::atomic<u64>, 65536> synth_audit_reg_diffs;
+std::array<std::atomic<u32>, 65536> synth_audit_reg_example;
+std::atomic<u64> synth_audit_count_differs{0}, synth_audit_order_differs{0};
+std::array<std::atomic<u64>, 65536> synth_audit_reg_presence;
+bool SynthAuditOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_SYNTH_AUDIT");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+void SynthAuditNote(const Signature& sig, u32 kind, const NativeRecord& slot) {
+    std::array<u64, SynthComponents> comp{};
+    const auto& table = GroupTable();
+    std::array<Hasher, NumRegisterGroups> groups;
+    for (u32 i = 0; i < slot.count; ++i) {
+        const u32 g = table[slot.regs[i].index & 0xffff];
+        groups[g].Add(slot.regs[i].index);
+        groups[g].Add(slot.regs[i].value);
+    }
+    for (u32 g = 0; g < NumRegisterGroups; ++g) {
+        comp[g] = groups[g].h | 1;
+    }
+    {
+        Hasher h;
+        h.Add(synth_flags);
+        comp[NumRegisterGroups + 0] = h.h | 1;
+    }
+    {
+        Hasher h;
+        h.Add(synth_reason);
+        comp[NumRegisterGroups + 1] = h.h | 1;
+    }
+    {
+        Hasher h;
+        for (const u32 e : synth_cb_extent) {
+            h.Add(e);
+        }
+        h.Add(synth_cb_extent_mask);
+        comp[NumRegisterGroups + 2] = h.h | 1;
+    }
+    {
+        Hasher h;
+        h.Add(synth_db_extent);
+        comp[NumRegisterGroups + 3] = h.h | 1;
+    }
+    {
+        Hasher h;
+        h.Add(synth_rt_info);
+        comp[NumRegisterGroups + 4] = h.h | 1;
+    }
+    {
+        Hasher h;
+        h.Add(slot.vs_gnm);
+        h.Add(slot.ps_gnm);
+        comp[NumRegisterGroups + 5] = h.h | 1;
+    }
+    u64 key = 0xcbf29ce484222325ull;
+    for (u32 g = 0; g < NumGroups; ++g) {
+        if (g != Args && g != ConstantBuffers && g != ShaderResources && g != Samplers && g != VertexBuffers) {
+            key = (key ^ sig.group[g]) * 0x100000001b3ull;
+        }
+    }
+    key = (key ^ sig.pipeline_key ^ kind) * 0x100000001b3ull;
+    key = (key ^ Rd<u64>(synth_audit_ctx, 0x4440)) * 0x100000001b3ull;
+    key = (key ^ Rd<u32>(synth_audit_ctx, 0x4448)) * 0x100000001b3ull;
+    key = (key ^ Rd<u64>(synth_audit_ctx, 0x4450)) * 0x100000001b3ull;
+    // the engine's cached copies of what PrepareDraw last wrote (the registers are only emitted when the cached copy differs) and the objects the registers come from
+    for (const u32 offset : {0x46d0u, 0x4710u, 0x4714u, 0x130c8u}) {
+        key = (key ^ Rd<u32>(synth_audit_ctx, offset)) * 0x100000001b3ull;
+    }
+    key = (key ^ Rd<u8>(synth_audit_ctx, 0x46d8)) * 0x100000001b3ull;
+    key = (key ^ Rd<u64>(synth_audit_ctx, 0x4680) ^ (Rd<u64>(synth_audit_ctx, 0x4688) << 1)) * 0x100000001b3ull;
+    if (const u64 vs = Rd<u64>(synth_audit_ctx, Ctx::VertexShader)) {
+        key = (key ^ Rd<u64>(vs, 0x420)) * 0x100000001b3ull;
+        if (const u64 fetch = Rd<u64>(vs + 0x30, 0xe0)) {
+            key = (key ^ Rd<u64>(fetch, 0x30)) * 0x100000001b3ull;
+            for (const u32 offset : {0x40u, 0x48u, 0x4cu}) {
+                key = (key ^ Rd<u32>(fetch, offset)) * 0x100000001b3ull;
+            }
+        }
+    }
+    for (const u32 e : synth_cb_extent) {
+        key = (key ^ e) * 0x100000001b3ull;
+    }
+    key = (key ^ synth_cb_extent_mask ^ (u64{synth_db_extent} << 32)) * 0x100000001b3ull;
+    key |= 1;
+    synth_audit_records.fetch_add(1, std::memory_order_relaxed);
+    {
+        static std::once_flag once;
+        std::call_once(once, [] { synth_audit_regs = new std::vector<SynthAuditRegs>(1u << 14); });
+        auto& r = (*synth_audit_regs)[static_cast<u32>(key >> 50)];
+        u64 expected = 0;
+        if (r.key.load(std::memory_order_acquire) == key) {
+            if (r.count != std::min<u32>(slot.count, 400)) {
+                synth_audit_count_differs.fetch_add(1, std::memory_order_relaxed);
+                std::bitset<65536> a, b;
+                for (u32 i = 0; i < r.count; ++i) {
+                    a.set(r.regs[i].index & 0xffff);
+                }
+                for (u32 i = 0; i < slot.count && i < 400; ++i) {
+                    b.set(slot.regs[i].index & 0xffff);
+                }
+                const auto only = a ^ b;
+                for (u32 i = 0; i < 65536; ++i) {
+                    if (only[i]) {
+                        synth_audit_reg_presence[i].fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            } else {
+                for (u32 i = 0; i < slot.count; ++i) {
+                    if (r.regs[i].index != slot.regs[i].index) {
+                        synth_audit_order_differs.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    }
+                }
+            }
+            for (u32 i = 0; i < slot.count && i < r.count; ++i) {
+                if (r.regs[i].index == slot.regs[i].index && r.regs[i].value != slot.regs[i].value) {
+                    synth_audit_reg_diffs[slot.regs[i].index & 0xffff].fetch_add(1, std::memory_order_relaxed);
+                    synth_audit_reg_example[slot.regs[i].index & 0xffff].store(slot.regs[i].value, std::memory_order_relaxed);
+                }
+            }
+        } else if (r.key.compare_exchange_strong(expected, ~0ull)) {
+            r.count = std::min<u32>(slot.count, 400);
+            for (u32 i = 0; i < r.count; ++i) {
+                r.regs[i] = {slot.regs[i].index, slot.regs[i].value};
+            }
+            r.key.store(key, std::memory_order_release);
+        }
+    }
+    u32 index = static_cast<u32>(key >> 46);
+    for (u32 probe = 0; probe < 16; ++probe, index = (index + 1) & (synth_audit_table.size() - 1)) {
+        auto& e = synth_audit_table[index];
+        u64 current = e.key.load(std::memory_order_acquire);
+        if (current == 0) {
+            u64 expected = 0;
+            if (e.key.compare_exchange_strong(expected, key, std::memory_order_acq_rel)) {
+                e.comp = comp;
+                e.ready.store(1, std::memory_order_release);
+                return;
+            }
+            current = expected;
+        }
+        if (current != key) {
+            continue;
+        }
+        if (e.ready.load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        synth_audit_seen_before.fetch_add(1, std::memory_order_relaxed);
+        bool violated = false;
+        for (u32 c = 0; c < SynthComponents; ++c) {
+            if (e.comp[c] != comp[c]) {
+                violated = true;
+                synth_audit_component_violations[c].fetch_add(1, std::memory_order_relaxed);
+                if (synth_audit_logged.fetch_add(1) < 12) {
+                    LOG_ERROR(Core, "synth audit: signature {:#x} component {} differs ({:#x} / {:#x}) kind {}", key, c, e.comp[c], comp[c], kind);
+                }
+            }
+        }
+        if (violated) {
+            synth_audit_violating_records.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    synth_audit_no_slot.fetch_add(1, std::memory_order_relaxed);
+}
+
 /// Guest thread: builds the record of a draw. Returns its number.
 u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     PhaseClockMr mr;
@@ -2480,6 +2670,10 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     synth_cb_extent_mask = 0;
     mr.Mark(0);
     slot.count = Synthesize(ctx, slot.regs.data(), &slot.vs_gnm, &slot.ps_gnm);
+    if (kind <= 2 && record_sig != nullptr && SynthAuditOn()) {
+        synth_audit_ctx = ctx;
+        SynthAuditNote(*record_sig, kind, slot);
+    }
     mr.Mark(1);
     slot.fixed = nullptr;
     if (kind <= 2 && Fixed::Enabled()) {
@@ -5016,7 +5210,9 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
     std::memcpy(&words[5], &k2, sizeof(u64));
     std::memcpy(&words[7], &k3, sizeof(u64));
     v2_collect = v2;
+    record_sig = &sig;
     const u64 seq = policy.native_synth_verify.load(std::memory_order_relaxed) != 0 ? Guarded([&] { return MakeRecord(ctx, kind, a1, a2, a3, ret); }) : 0;
+    record_sig = nullptr;
     v2_collect = nullptr;
     if (seq != 0 && NativeZPass::Enabled()) {
         NativeZPass::RealRecord(ctx, seq, kind, a1, a2, a3);
@@ -7931,6 +8127,45 @@ void DrawSiteCensusRead(nlohmann::json& out) {
                         {"packet_path", r.packet_path}, {"kinds_bitmask", r.kinds}});
     }
     out["sites"] = std::move(list);
+}
+
+void SynthAuditRead(nlohmann::json& out) {
+    out["records"] = synth_audit_records.load();
+    out["records_whose_signature_was_seen_before"] = synth_audit_seen_before.load();
+    out["records_with_a_difference"] = synth_audit_violating_records.load();
+    out["no_table_slot"] = synth_audit_no_slot.load();
+    nlohmann::json comps = nlohmann::json::object();
+    static constexpr const char* names[SynthComponents] = {"group 0", "group 1", "group 2", "group 3", "group 4", "group 5", "group 6", "group 7", "flags", "reason", "color_extents", "depth_extent", "target_info", "shader_pointers"};
+    for (u32 c = 0; c < SynthComponents; ++c) {
+        comps[names[c]] = synth_audit_component_violations[c].load();
+    }
+    out["differences_by_component"] = comps;
+    std::vector<std::pair<u64, u32>> top;
+    for (u32 i = 0; i < synth_audit_reg_diffs.size(); ++i) {
+        if (const u64 n = synth_audit_reg_diffs[i].load()) {
+            top.emplace_back(n, i);
+        }
+    }
+    std::sort(top.rbegin(), top.rend());
+    nlohmann::json regs = nlohmann::json::object();
+    for (size_t i = 0; i < top.size() && i < 24; ++i) {
+        regs[fmt::format("{:#x}", top[i].second)] = {{"differing_draws", top[i].first}, {"last_value", fmt::format("{:#x}", synth_audit_reg_example[top[i].second].load())}};
+    }
+    out["registers_that_differ_within_a_signature"] = regs;
+    out["records_with_another_register_count"] = synth_audit_count_differs.load();
+    out["records_with_the_same_count_and_another_order"] = synth_audit_order_differs.load();
+    std::vector<std::pair<u64, u32>> presence;
+    for (u32 i = 0; i < synth_audit_reg_presence.size(); ++i) {
+        if (const u64 n = synth_audit_reg_presence[i].load()) {
+            presence.emplace_back(n, i);
+        }
+    }
+    std::sort(presence.rbegin(), presence.rend());
+    nlohmann::json pj = nlohmann::json::object();
+    for (size_t i = 0; i < presence.size() && i < 24; ++i) {
+        pj[fmt::format("{:#x}", presence[i].second)] = presence[i].first;
+    }
+    out["registers_present_in_only_one_of_two_records"] = pj;
 }
 
 void MergeCensusRead(std::array<u64, 6>& values) {
