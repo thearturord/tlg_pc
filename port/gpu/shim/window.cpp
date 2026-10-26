@@ -74,6 +74,15 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height_);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_VULKAN_BOOLEAN, true);
+    // tlg: TLG_HEADLESS=1 (development): the window is created hidden and cannot take the focus, so a test run draws everything (the swapchain exists, frames are
+    // presented to a window nobody sees) without a window on the desktop and without taking the keyboard. The display mode stays windowed.
+    const char* headless_env = std::getenv("TLG_HEADLESS");
+    const bool headless = headless_env && *headless_env && std::strcmp(headless_env, "0") != 0;
+    if (headless) {
+        SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_HIDDEN_BOOLEAN, true);
+        SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FOCUSABLE_BOOLEAN, false);
+        std::printf("Window: TLG_HEADLESS=1, the window is hidden\n");
+    }
     base_title = title;
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
@@ -110,7 +119,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
         TlgSettings::Get().display_mode == TlgGraphics::Windowed) {
         TlgSettings::Get().display_mode = TlgGraphics::Borderless;
     }
-    ApplyDisplayMode(TlgSettings::Get().display_mode);
+    ApplyDisplayMode(headless ? static_cast<int>(TlgGraphics::Windowed) : static_cast<int>(TlgSettings::Get().display_mode));
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(window, &w, &h);
     width = w;
