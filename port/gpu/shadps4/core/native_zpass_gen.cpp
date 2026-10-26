@@ -1239,7 +1239,56 @@ u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, cons
 
 constexpr u64 GBufferBegin = 0x01c76710, GBufferEnd = 0x01c779a0; // DrawGBufferPrimitives and the next function (DrawForwardPass)
 constexpr u64 GBufferIndexedSite = 0x01c777a1, GBufferIndirectSite = 0x01c77788;
-constexpr u64 FunctionHandleLookup = 0x01c59060; // FUN_01c59060(object table, handle) -> object or 0
+constexpr u64 FunctionHandleLookup = 0x01c59060; // FUN_01c59060(render device, object) -> the object's render data or 0 (creates it at first use)
+
+// A3 (documents/tlg/native plan/stages/a3-engine-functions.md): FUN_01c59060 is, once the object has its render data, three reads: `data = object[7]`; when `(int)object[4]` is
+// not zero the virtual at `vtable + 0x28` is called with the object (a pending update; the value read before the call is the one returned); `data` is returned. The creation
+// of the render data (operator new, vtable 0x026e7670, FUN_01c96930, FUN_01c98930) stays the engine's. `TLG_GEN_NATIVE_LEAF=1` takes the first case natively;
+// `TLG_GEN_NATIVE_LEAF_VERIFY=N` (default 64) runs the engine's function instead for one call in N and compares its result with the native answer.
+struct LeafStats {
+    std::atomic<u64> native{}, engine_creating{}, engine_null{}, verified{}, differing{};
+};
+LeafStats& Leaf() {
+    static LeafStats stats;
+    return stats;
+}
+u64 HandleLookup(u64 render_device, u64 object) {
+    static const bool native_on = [] {
+        const char* e = std::getenv("TLG_GEN_NATIVE_LEAF");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    static const u32 verify_every = [] {
+        const char* e = std::getenv("TLG_GEN_NATIVE_LEAF_VERIFY");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 64u;
+    }();
+    const auto engine = [&] { return reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64)>(Global(FunctionHandleLookup))(render_device, object); };
+    if (!native_on) {
+        return engine();
+    }
+    if (object == 0) {
+        Leaf().engine_null.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    const u64 existing = R<u64>(object + 0x38);
+    if (existing == 0) {
+        Leaf().engine_creating.fetch_add(1, std::memory_order_relaxed);
+        return engine();
+    }
+    thread_local u32 counter = 0;
+    if (verify_every != 0 && (++counter % verify_every) == 0) {
+        const u64 result = engine();
+        Leaf().verified.fetch_add(1, std::memory_order_relaxed);
+        if (result != existing) {
+            Leaf().differing.fetch_add(1, std::memory_order_relaxed);
+        }
+        return result;
+    }
+    if (R<s32>(object + 0x20) != 0) {
+        reinterpret_cast<void(PS4_SYSV_ABI*)(u64)>(R<u64>(R<u64>(object) + 0x28))(object);
+    }
+    Leaf().native.fetch_add(1, std::memory_order_relaxed);
+    return existing;
+}
 constexpr u64 GlobalObjectTable = 0x0689eed8;    // DAT_0689eed8
 
 struct GBatch {
@@ -1311,7 +1360,7 @@ void ScanGBuffer(GScanArgs& a) {
     {
         const u64 table = R<u64>(Global(GlobalObjectTable));
         const u64 handle = R<u64>(R<u64>(a.args + 0x2d0) + 0x30);
-        const u64 object = Timed(CallId::HandleLookup, [&] { return reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64)>(Global(FunctionHandleLookup))(table, handle); });
+        const u64 object = Timed(CallId::HandleLookup, [&] { return HandleLookup(table, handle); });
         plan.v_b60 = object != 0 ? R<u64>(object + 0x48) : 0;
     }
     const u64 context_global = R<u64>(Global(GlobalContext));
@@ -2562,6 +2611,9 @@ nlohmann::json Report() {
         NativeDraw::InputTableAuditRead(audit);
         out["input_table_audit"] = audit;
     }
+    out["native_handle_lookup_FUN_01c59060"] = {{"answered_natively", Leaf().native.load()}, {"engine_creates_the_render_data", Leaf().engine_creating.load()},
+                                                {"null_object", Leaf().engine_null.load()}, {"verify_calls_of_the_engine", Leaf().verified.load()},
+                                                {"verify_differences", Leaf().differing.load()}};
     out["verify_difference_kinds"] = s.mismatch_kinds;
     out["special_entry_classes"] = s.special_classes;
     out["verify_words_that_moved_by_view_kind_offset"] = s.raced_words;
