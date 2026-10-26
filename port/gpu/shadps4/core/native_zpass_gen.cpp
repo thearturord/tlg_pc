@@ -261,6 +261,9 @@ struct Mark {
     bool rs_valid{false};
     u32 rs_n{0}, rs_size{0};
     std::array<u8, 112> rs_bytes{};
+    // A3 (FUN_01ee4e50 natively): the uploader buffer the group bind filled: the node's buffer and the staged data it was filled from
+    u64 gb_buffer{0}, gb_src{0};
+    u32 gb_n{0};
 };
 
 /// Where the generator writes: the live device context, or a private copy of it that logs every write (the verify run).
@@ -281,6 +284,8 @@ struct Target {
     bool rs_pending{false}; // shadow: the native resource set ran since the last draw
     u32 rs_n{0}, rs_size{0};
     std::array<u8, 112> rs_bytes{};
+    u64 gb_buffer{0}, gb_src{0}; // shadow: the native group bind ran since the last draw
+    u32 gb_n{0};
 
     template <class T>
     T Get(u32 offset) const {
@@ -842,11 +847,19 @@ void IssueDraw(Target& t, u32 kind, u64 count, u64 first, u64 a3 = 0) {
             m.rs_bytes = t.rs_bytes;
             t.rs_pending = false;
         }
+        if (t.gb_buffer != 0) {
+            Mark& m = t.marks.back();
+            m.gb_buffer = t.gb_buffer;
+            m.gb_src = t.gb_src;
+            m.gb_n = t.gb_n;
+            t.gb_buffer = 0;
+        }
     }
 }
 
 u64 HandleLookup(u64 render_device, u64 object);
 void ResourceSetStep(Target& t, u64 rd, u64 material, u64 special, bool shadow_ok);
+bool GroupBindNative(Target& t, const BatchLevel& level);
 
 void Generate(Target& t, const Plan& plan) {
     const u64 rd = plan.render_device;
@@ -866,7 +879,9 @@ void Generate(Target& t, const Plan& plan) {
             continue;
         }
         if (level.group) {
-            if (t.live) {
+            if (Timed(CallId::GroupBind, [&] { return GroupBindNative(t, level); })) {
+                // done natively (the context words below the engine's function would have written, and the uploader)
+            } else if (t.live) {
                 Timed(CallId::GroupBind, [&] { reinterpret_cast<GuestGroupBind>(Global(FunctionGroupBind))(level.inner, level.group_object, plan.view_type); });
             } else {
                 t.Set<u64>(0x70, level.g70);
@@ -1616,7 +1631,9 @@ void GenerateGBuffer(Target& t, const GPlan& plan, u32 pass_flags) {
             if (level.only_580) {
                 continue;
             }
-            if (t.live) {
+            if (Timed(CallId::GroupBind, [&] { return GroupBindNative(t, level); })) {
+                // done natively
+            } else if (t.live) {
                 Timed(CallId::GroupBind, [&] { reinterpret_cast<GuestGroupBind>(Global(FunctionGroupBind))(level.inner, level.group_object, 0); });
             } else {
                 t.Set<u64>(0x70, level.g70);
@@ -1952,6 +1969,80 @@ void ResourceSetStep(Target& t, u64 rd, u64 material, u64 special, bool shadow_o
     RsStats().native.fetch_add(1, std::memory_order_relaxed);
 }
 
+// A3: FUN_01ee4e50(inner, group, view type), the instance group bind. The context words and the table are the values the scan already read (the shadow writes the same); what is
+// left is the uploader: the staged instance data goes into the uploader's ring block, the node's buffer is updated like the context's UpdateSubresource does it for a dynamic
+// buffer, and the double buffer index toggles. `TLG_GEN_NATIVE_LEAF=5`. A buffer of another shape runs the engine's function (returns false).
+int LeafLevel() {
+    static const int level = [] {
+        const char* e = std::getenv("TLG_GEN_NATIVE_LEAF");
+        return e != nullptr && *e != 0 ? std::atoi(e) : 0;
+    }();
+    return level;
+}
+struct GbStatsT {
+    std::atomic<u64> native{}, engine_shape{}, compared{}, differing{};
+};
+GbStatsT& GbStats() {
+    static GbStatsT stats;
+    return stats;
+}
+bool GroupBindNative(Target& t, const BatchLevel& level) {
+    if (LeafLevel() < 5) {
+        return false;
+    }
+    const u64 uploader = R<u64>(level.group_object + 0xf0);
+    u64 node = 0, buffer = 0, value = 0, staged = 0;
+    s32 staged_bytes = 0;
+    if (uploader != 0) {
+        node = R<u64>(uploader);
+        buffer = R<u64>(node + 0x10);
+        const s32 index = R<s32>(uploader + 0x28);
+        value = R<u64>(uploader + 0x18 + static_cast<u64>(index & 1) * 8);
+        staged = R<u64>(uploader + 8);
+        staged_bytes = R<s32>(uploader + 0x10);
+        if ((index != 0 && index != 1) || buffer == 0 || R<s32>(buffer + 0x124) != 1 || (R<u8>(buffer + 0x188) & 4) == 0 || R<u32>(buffer + 0x180) == 0 || staged_bytes < 0 ||
+            level.g340 != buffer) {
+            GbStats().engine_shape.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    t.Set<u64>(0x70, level.g70);
+    t.Set<u64>(0x78, level.g78);
+    t.Set<u32>(0x170, level.g170);
+    t.Set<u32>(0x174, level.g174);
+    t.Set<u64>(0x1f0, 0);
+    if (uploader != 0) {
+        if (t.live) {
+            std::memcpy(reinterpret_cast<void*>(value), reinterpret_cast<const void*>(staged), static_cast<size_t>(staged_bytes));
+            W<u64>(node, value);
+            const u32 size = R<u32>(buffer + 0x180);
+            W<u32>(buffer + 0x2c, t.Get<u32>(0x47ac));
+            const u64 holder = R<u64>(Global(GlobalDeviceHolder));
+            void* block = reinterpret_cast<void*>(reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u64)>(Global(FunctionAllocFrameGarlic))(R<u64>(holder + 0x10238), size, 0x10));
+            std::memcpy(block, reinterpret_cast<const void*>(value), size);
+            const u64 address = reinterpret_cast<u64>(block);
+            W<u32>(buffer + 0x60, static_cast<u32>(address));
+            W<u32>(buffer + 0x64, static_cast<u32>(address >> 32) & 0xfffu | 0x100000u);
+            W<u32>(buffer + 0x6c, 0x20077facu);
+            W<u32>(buffer + 0x68, (size + 0xfu) >> 4);
+            W<s64>(buffer + 0x160, reinterpret_cast<std::atomic<s64>*>(holder + 0x302a0)->fetch_add(1));
+            W<u8>(uploader + 0x28, R<u8>(uploader + 0x28) ^ 1);
+        } else {
+            t.gb_buffer = buffer;
+            t.gb_src = staged;
+            t.gb_n = std::min<u32>(static_cast<u32>(staged_bytes), R<u32>(buffer + 0x180));
+        }
+        t.Set<u64>(0x340, level.g340);
+    }
+    t.Put(0x800, level.gtable.data(), level.table_dwords * 8);
+    GbStats().native.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+// A3: FUN_0198c730, the special entry's virtual +0x48 (forward pass): the handle token and its reference count. The case with the static VERTEX_MODIFIER handle already created
+// is answered natively (`TLG_GEN_NATIVE_LEAF=5`); the first use (the function-static guard still clear) is the engine's.
+bool SpecialTokenNative(u32* out, u64 special, u64 material);
+
 // A3: FUN_01c710f0 and FUN_01c70cc0 (the forward prologue), read off the decompilation (documents/tlg/native plan/stages/a3-engine-functions.md). `TLG_GEN_NATIVE_LEAF=2`
 // (the lookup too): the prologue is made natively, in the live run and in the verify run's shadow. The shadow cannot take a block from the frame ring: it builds the block in
 // `Verify::forward_block` and the first draw of the engine's loop compares it with the block the engine's prologue put in the ring (`NoteLoopDraw`).
@@ -2039,6 +2130,22 @@ void ForwardPrologueNative(Target& t, u64 rd, u64 a1, u64 a2, u32 mode) {
     t.Set<u64>(0xa30, data6);
     t.Set<u64>(0xbb0, 0);
     t.Set<u64>(0xbb8, R<u64>(rd + 0x87c0));
+}
+
+constexpr u64 GlobalModifierGuard = 0x06888938, GlobalModifierHandle = 0x06888940; // DAT_06888938 / DAT_06888940: the function-static VERTEX_MODIFIER handle
+bool SpecialTokenNative(u32* out, u64 special, u64 material) {
+    if (LeafLevel() < 5) {
+        return false;
+    }
+    if (R<u64>(special + 0x40) == 0) {
+        out[0] = R<u32>(material + 0x1bc);
+    } else if (R<u8>(Global(GlobalModifierGuard)) != 0) {
+        out[0] = R<u32>(Global(GlobalModifierHandle));
+    } else {
+        return false;
+    }
+    HandleRefInc(out[0]);
+    return true;
 }
 
 struct FBatch {
@@ -2268,7 +2375,11 @@ void GenerateForward(Target& t, const FPlan& plan) {
             HandleRefInc(token);
             if (fb.special != 0) {
                 std::array<u32, 2> out{0, 0};
-                Timed(CallId::SpecialToken, [&] { reinterpret_cast<void(PS4_SYSV_ABI*)(void*, u64, u64)>(R<u64>(R<u64>(fb.special) + 0x48))(out.data(), fb.special, step.material); });
+                Timed(CallId::SpecialToken, [&] {
+                    if (!SpecialTokenNative(out.data(), fb.special, step.material)) {
+                        reinterpret_cast<void(PS4_SYSV_ABI*)(void*, u64, u64)>(R<u64>(R<u64>(fb.special) + 0x48))(out.data(), fb.special, step.material);
+                    }
+                });
                 u64 released = token;
                 if (token != out[0]) {
                     HandleRefInc(out[0]);
@@ -2422,6 +2533,19 @@ void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3) {
             RsStats().differing.fetch_add(1, std::memory_order_relaxed);
             ++v.mismatches;
             NoteMismatch(s, v.view, "resource set", fmt::format("draw {}: {} differs from the native one", k, why));
+        }
+    }
+    if (mark.gb_buffer != 0) {
+        // A3: the instance group's uploader buffer after the engine's FUN_01ee4e50 against the staged data the native group bind would have copied
+        GbStats().compared.fetch_add(1, std::memory_order_relaxed);
+        const u64 buffer = mark.gb_buffer;
+        const u64 block = u64{R<u32>(buffer + 0x60)} | (u64{R<u32>(buffer + 0x64) & 0xfffu} << 32);
+        const bool same = block != 0 && R<u32>(buffer + 0x6c) == 0x20077facu && R<u32>(buffer + 0x68) == ((R<u32>(buffer + 0x180) + 0xfu) >> 4) &&
+                          std::memcmp(reinterpret_cast<const void*>(block), reinterpret_cast<const void*>(mark.gb_src), mark.gb_n) == 0;
+        if (!same) {
+            GbStats().differing.fetch_add(1, std::memory_order_relaxed);
+            ++v.mismatches;
+            NoteMismatch(s, v.view, "group bind", fmt::format("draw {}: the uploader buffer differs from the staged data", k));
         }
     }
     v.mismatches += CompareDelta(s, v, v.arena_pos, mark.arena_end, ctx, fmt::format("draw {}", k).c_str());
@@ -3005,6 +3129,8 @@ nlohmann::json Report() {
     out["native_resource_set_FUN_01c92f30"] = {{"made_natively", RsStats().native.load()}, {"engine_special_entry", RsStats().engine_special.load()},
                                               {"engine_other_buffer_shape", RsStats().engine_shape.load()}, {"verify_draws_compared", RsStats().compared.load()},
                                               {"verify_draws_differing", RsStats().differing.load()}};
+    out["native_group_bind_FUN_01ee4e50"] = {{"made_natively", GbStats().native.load()}, {"engine_other_buffer_shape", GbStats().engine_shape.load()},
+                                            {"verify_draws_compared", GbStats().compared.load()}, {"verify_draws_differing", GbStats().differing.load()}};
     out["verify_difference_kinds"] = s.mismatch_kinds;
     out["special_entry_classes"] = s.special_classes;
     out["verify_words_that_moved_by_view_kind_offset"] = s.raced_words;
