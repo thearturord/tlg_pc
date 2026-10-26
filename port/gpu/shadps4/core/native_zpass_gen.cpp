@@ -48,6 +48,7 @@ constexpr u64 GlobalDefaultKind = 0x069ae968;                 // DAT_069ae968: t
 constexpr u64 GlobalContext = 0x069a1b40;                     // DAT_069a1b40: the render context object (its +0x38 holder has the default objects)
 constexpr u64 FunctionBindResources = 0x01c92f30;             // FUN_01c92f30(renderDev + 0x2910, ctx, material, special)
 constexpr size_t CtxBytes = 0x14000;
+constexpr u32 DecalStageBytes = 0x1f0; // A7: the decal loop's constant block (renderDev + 0x3990 .. 0x3b80)
 constexpr u32 OrMask = 0x80000000u; // arena entry size flag: the entry is an OR of bits (dirty bytes), compared as "these bits are set"
 
 template <class T>
@@ -83,11 +84,14 @@ enum class CallId : u32 {
     ScanDepth,
     ScanGBuffer,
     ScanForward,
+    PassDecal,
+    ScanDecal,
+    DecalUpdate, // the decal loop's UpdateSubresource (context virtual + 0xd0)
     Count
 };
 constexpr const char* CallNames[static_cast<u32>(CallId::Count)] = {"FUN_01c92f30 resource set", "FUN_01ee4e50 instance group bind", "FUN_01c710f0 forward prologue", "FUN_01c822c0 variant find", "FUN_01c59060 handle lookup (G-buffer prologue)",
                                                                       "special entry virtual +0x48", "FUN_01e45a60 handle free", "draw issue (hook, tag, engine draw)", "FUN_01c92b60 material block (plain stores)",
-                                                                      "shader pair (2 x SetShader)", "generated depth pass (whole)", "generated G-buffer pass (whole)", "generated forward pass (whole)", "scan, depth", "scan, G-buffer", "scan, forward"};
+                                                                      "shader pair (2 x SetShader)", "generated depth pass (whole)", "generated G-buffer pass (whole)", "generated forward pass (whole)", "scan, depth", "scan, G-buffer", "scan, forward", "generated decal pass (whole)", "scan, decal", "decal constant buffer update (UpdateSubresource)"};
 struct CallCensus {
     std::atomic<u64> calls{0}, ticks{0};
 };
@@ -264,6 +268,8 @@ struct Mark {
     // A3 (FUN_01ee4e50 natively): the uploader buffer the group bind filled: the node's buffer and the staged data it was filled from
     u64 gb_buffer{0}, gb_src{0};
     u32 gb_n{0};
+    // A7: the decal loop's constant block (renderDev + 0x3990) at this draw, index into Target::stages
+    s32 stage{-1};
 };
 
 /// Where the generator writes: the live device context, or a private copy of it that logs every write (the verify run).
@@ -281,6 +287,8 @@ struct Target {
     std::unordered_map<size_t, u64> slot_owner; // shadow: arena position of an entry -> that material
     s32 draws{0};
     s64 triangles{0};
+    std::vector<std::array<u8, DecalStageBytes>> stages; // shadow (A7): the decal loop's constant block as the generator built it, one per updated primitive
+    s32 stage_pending{-1};
     bool rs_pending{false}; // shadow: the native resource set ran since the last draw
     u32 rs_n{0}, rs_size{0};
     std::array<u8, 112> rs_bytes{};
@@ -2467,6 +2475,477 @@ FStats& FS() {
     return stats;
 }
 
+// ------------------------------------------------------------------------------------------------------------------------------- the decal pass loop (A7)
+// FUN_01c71680(renderDev, view, a3, a4, desc, flags, type, width, height) draws the decals of one view type: `desc + 0x480 + type * 0x18` batches (list at + 0x478), every primitive of a batch
+// is one decal object (record + 0x18) drawn with an inlined `DrawIndexAuto`. The loop writes the pass constants once (the block at renderDev + 0x39f0 .. 0x3a3c and 0x3b40 .. 0x3b7c), then per
+// primitive the block at renderDev + 0x3990 .. 0x3b3c from the decal object, updates the constant buffer at renderDev + 0x3b80 from the whole block (UpdateSubresource, the context's virtual +
+// 0xd0), puts five render data views into the context (0xa38 .. 0xa58), asks the variant cache for the shader pair and draws. Decompiled in documents/tlg/native plan/stages/a7-decal-pass.md.
+// The generator makes the same context writes (live: into the device context; verify: into the shadow copy, compared word by word at every draw), the same block (compared byte by byte at
+// every draw against the block the engine's loop left) and the same draws. What stays the engine's: the handle lookups that create render data at first use (`FUN_01c59060`), the variant
+// search, the buffer update (UpdateSubresource) and the index buffer call (`FUN_02488430`).
+constexpr u64 DecalBegin = 0x01c71680, DecalEnd = 0x01c72a20; // the loop and the next function
+constexpr u64 DecalDrawSite = 0x01c727a7;                     // the return address of its inlined PrepareDraw
+constexpr u64 FunctionSetIndexBuffer = 0x02488430;            // FUN_02488430(ctx, index buffer): emits a SET_INDEX_BASE when the base changed (the loop passes 0)
+constexpr u32 DecalStageBase = 0x3990;                        // renderDev + 0x3990 .. + 0x3b80: the constant block the buffer at renderDev + 0x3b80 is updated from
+
+struct DStep {
+    u64 record{}, decal{};
+    u32 index{};
+};
+struct DBatch {
+    u64 batch{};
+    bool set_580{false};
+    u64 value_580{};
+    u32 first_step{0}, step_count{0};
+};
+struct DPlan {
+    bool scanned{false};
+    bool no_work{false}; // desc + 0x480 + type * 0x18 is zero: the function does nothing at all
+    bool any_mesh{false};
+    std::vector<const char*> reasons;
+    u64 render_device{0}, ctx{0}, view{0}, a3{0}, a4{0}, desc{0};
+    u32 flags{0}, width{0}, height{0};
+    s32 type{0};
+    std::vector<DBatch> batches;
+    std::vector<DStep> steps;
+    bool Ok() const { return scanned && reasons.empty(); }
+    void Decline(const char* r) {
+        for (const char* x : reasons) {
+            if (x == r) {
+                return;
+            }
+        }
+        reasons.push_back(r);
+    }
+};
+
+struct DScanArgs {
+    DPlan* plan;
+};
+
+void ScanDecalPass(DScanArgs& a) {
+    DPlan& plan = *a.plan;
+    const u64 rd = plan.render_device;
+    const u64 desc = plan.desc;
+    if (plan.type < 0 || plan.type > 64) {
+        plan.Decline("view type out of range");
+        return;
+    }
+    const u64 list_count_at = desc + 0x480 + u64{static_cast<u32>(plan.type)} * 0x18, list_array_at = desc + 0x478 + u64{static_cast<u32>(plan.type)} * 0x18;
+    const u32 count = R<u32>(list_count_at);
+    if (count == 0) {
+        plan.no_work = true;
+        plan.scanned = true;
+        return;
+    }
+    plan.ctx = R<u64>(rd + 0x2d8);
+    if (plan.ctx == 0) {
+        plan.Decline("no device context");
+        return;
+    }
+    for (const u32 offset : {0x4698u, 0x4690u}) {
+        if (const u64 shader = R<u64>(plan.ctx + offset); shader != 0 && R<s64>(shader + 8) <= 1) {
+            plan.Decline("the context holds a shader with a single reference (releasing it destroys it)");
+        }
+    }
+    if (!NativeDraw::InlineAutoDrawTagged(1)) {
+        plan.Decline("native draw execution is off (the draw hook does not take the inlined auto draw)");
+    }
+    if (R<u64>(desc + 0x298) == 0 || R<u64>(desc + 0x448) == 0 || R<u64>(R<u64>(desc + 0x448) + 0x2b0) == 0) {
+        plan.Decline("pass description without its constants object or target description");
+        return;
+    }
+    const u64 array = R<u64>(list_array_at);
+    if (array == 0 || count > 100000) {
+        plan.Decline("batch list unreadable");
+        return;
+    }
+    u64 last_mesh = 0;
+    for (u32 b = 0; b < count; ++b) {
+        const u64 batch = R<u64>(array + u64{b} * 8);
+        if (batch == 0) {
+            plan.Decline("null batch");
+            continue;
+        }
+        const u64 mesh = R<u64>(batch + 0x20);
+        DBatch db;
+        db.batch = batch;
+        bool enter = false;
+        if (mesh == last_mesh) {
+            if (mesh == 0) {
+                plan.Decline("first batch without a mesh");
+                continue;
+            }
+            enter = true;
+        } else if (mesh != 0) {
+            const u64 render_data = R<u64>(mesh + 0x38);
+            if (render_data == 0) {
+                plan.Decline("mesh render data not created yet (the loop creates it at first use)");
+                continue;
+            }
+            const u64 inner = R<u64>(render_data + 0x20);
+            if (inner == 0 || R<u64>(inner + 0x48) == 0 || R<u64>(R<u64>(inner + 0x48) + 0x38) == 0) {
+                plan.Decline("mesh render data without its inner object");
+                continue;
+            }
+            if (R<u64>(inner + 0x50) == 0) {
+                db.set_580 = true;
+                db.value_580 = R<u64>(R<u64>(R<u64>(inner + 0x48) + 0x38) + 0x28);
+                last_mesh = mesh;
+                enter = true;
+            }
+        }
+        if (!enter) {
+            continue; // the loop leaves the batch alone
+        }
+        db.first_step = static_cast<u32>(plan.steps.size());
+        const u16 prim_count = R<u16>(batch + 100);
+        const u64 prim_array = R<u64>(batch + 0x58);
+        for (u32 p = 0; p < prim_count; ++p) {
+            const u64 record = prim_array + u64{p} * 0x38;
+            if (R<s32>(record + 0x14) == 0) {
+                continue;
+            }
+            const u64 decal = R<u64>(record + 0x18);
+            if (decal == 0) {
+                continue;
+            }
+            if (R<u64>(decal + 0x1e8) == 0 || R<u64>(decal + 0x230) == 0 || R<u64>(decal + 0x248) == 0 || R<u64>(decal + 0x218) == 0 || (R<u32>(decal + 0x2b8) >= 2 && R<u64>(decal + 0x200) == 0)) {
+                plan.Decline("decal object without one of its resource lists");
+                continue;
+            }
+            plan.steps.push_back({record, decal, p});
+        }
+        db.step_count = static_cast<u32>(plan.steps.size()) - db.first_step;
+        plan.batches.push_back(db);
+    }
+    plan.any_mesh = last_mesh != 0;
+    plan.scanned = true;
+}
+
+void GenerateDecal(Target& t, const DPlan& plan) {
+    const u64 rd = plan.render_device, desc = plan.desc;
+    const bool wide_state = plan.type == 10 || plan.type == 7; // the loop's two state object families
+    std::array<u8, DecalStageBytes> shadow_stage{};
+    u8* stage = shadow_stage.data();
+    if (t.live) {
+        stage = reinterpret_cast<u8*>(rd + DecalStageBase);
+    } else {
+        std::memcpy(stage, reinterpret_cast<const void*>(rd + DecalStageBase), DecalStageBytes);
+    }
+    const auto put32 = [&](u32 offset, u32 value) { std::memcpy(stage + (offset - DecalStageBase), &value, 4); };
+    const auto putf = [&](u32 offset, float value) { std::memcpy(stage + (offset - DecalStageBase), &value, 4); };
+    const auto put_from = [&](u32 offset, u64 source, u32 bytes) { std::memcpy(stage + (offset - DecalStageBase), reinterpret_cast<const void*>(source), bytes); };
+    const auto raster_object = [&](u64 object) {
+        if (t.Get<u64>(0x46c8) != object) {
+            t.Set<u64>(0x46c8, object);
+            t.Set<u8>(0x46d8, 1);
+        }
+    };
+    const auto state_words = [&](u64 entry) {
+        t.Set<u64>(0x46f0, entry);
+        t.Set<u64>(0x46f8, 0x3f8000003f800000ull);
+        t.Set<u64>(0x4700, 0x3f8000003f800000ull);
+        t.Set<u32>(0x4708, 0xffffffffu);
+        t.Set<u8>(0x470c, 1);
+    };
+    // ----- prologue
+    raster_object(R<u64>(rd + 0x3bf8));
+    state_words(R<u64>(rd + (wide_state ? 0x3cb0 : 0x3d30)));
+    t.Set<u64>(0x46e0, R<u64>(rd + 0x3c40));
+    t.Set<u32>(0x46e8, 0);
+    t.Set<u8>(0x46ec, 1);
+    t.Set<u64>(0x68, 0);
+    const u64 object_list = R<u64>(R<u64>(Global(GlobalContext)) + 0x38);
+    HandleLookup(rd, R<u64>(object_list + 0x50)); // the loop calls it for its side effect (the render data of the default object)
+    const auto view_of = [&](u64 object) -> u64 {
+        const u64 data = HandleLookup(rd, object);
+        return data != 0 ? R<u64>(data + 0x48) : 0;
+    };
+    const u64 desc_targets = R<u64>(desc + 0x448);
+    const u64 target_set = R<u64>(desc_targets + 0x2b0);
+    const u64 w_988 = R<u64>(rd + 0x41b0);
+    const u64 w_990 = R<u64>(R<u64>(R<u64>(plan.view + 0x40) + 0x90) + 0x48);
+    const u64 w_998 = view_of(R<u64>(target_set + 0x140));
+    const u64 w_9a0 = view_of(R<u64>(target_set + 0x148));
+    u64 w_9c8 = 0;
+    if (const u64 list = R<u64>(plan.view + 0x50); list != 0) {
+        w_9c8 = R<u64>(R<u64>(list + 0x18 + u64{R<u32>(list + 0x14)} * 8) + 0x48);
+    }
+    const std::array<u64, 5> w_9d0 = {R<u64>(rd + 0x4448), R<u64>(rd + 0x4458), R<u64>(rd + 0x8898), R<u64>(rd + 0x88a0), R<u64>(rd + 0x4060)};
+    const std::array<u64, 5> w_a10 = {R<u64>(rd + 0x87e8), R<u64>(rd + 0x4460), R<u64>(rd + 0x88a8), R<u64>(rd + 0x4080), R<u64>(R<u64>(R<u64>(rd + 0x3a8) + 0x50) + 0x48)};
+    const std::array<u64, 4> w_9a8 = {R<u64>(rd + 0x4188), R<u64>(rd + 0x4190), R<u64>(rd + 0x4198), R<u64>(rd + 0x41a0)};
+    // the pass constants
+    const u64 constants = R<u64>(desc + 0x298);
+    const float depth_a = R<float>(constants + 0x1f8), depth_b = R<float>(constants + 0x1fc);
+    const std::array<u64, 6> q = {R<u64>(constants + 0x10), R<u64>(constants + 0x18), R<u64>(constants + 0x20), R<u64>(constants + 0x28), R<u64>(constants + 0x30), R<u64>(constants + 0x38)};
+    const u32 one = 0x3f800000u;
+    put32(0x39f0, static_cast<u32>(q[0]));
+    put32(0x39f4, static_cast<u32>(q[0] >> 32));
+    put32(0x39f8, static_cast<u32>(q[1]));
+    put32(0x39fc, one);
+    put32(0x3a00, static_cast<u32>(q[2]));
+    put32(0x3a04, static_cast<u32>(q[2] >> 32));
+    put32(0x3a08, static_cast<u32>(q[3]));
+    put32(0x3a0c, one);
+    put32(0x3a10, static_cast<u32>(q[4]));
+    put32(0x3a14, static_cast<u32>(q[4] >> 32));
+    put32(0x3a18, static_cast<u32>(q[5]));
+    put32(0x3a1c, one);
+    putf(0x3a20, depth_a);
+    putf(0x3a24, depth_b);
+    putf(0x3a28, 1.0f / depth_a);
+    putf(0x3a2c, (depth_a - depth_b) / (depth_b * depth_a));
+    put_from(0x3b40, desc + 0x210, 0x40);
+    putf(0x3a30, static_cast<float>(plan.width));
+    putf(0x3a34, static_cast<float>(plan.height));
+    putf(0x3a38, 1.0f / static_cast<float>(plan.width));
+    putf(0x3a3c, 1.0f / static_cast<float>(plan.height));
+    {
+        const u64 buffer_a = R<u64>(rd + 0x3980), buffer_b = R<u64>(rd + 0x3b80);
+        t.Set<u64>(0x2e0, buffer_a);
+        t.Set<u64>(0x2e8, buffer_b);
+        t.Set<u64>(0x360, buffer_a);
+        t.Set<u64>(0x368, buffer_b);
+    }
+    const float scale = (plan.flags & 2) != 0 ? 1.0f : 0.0f;
+    if (NativePrologueOn() && R<u64>(rd + 0x2d8) == plan.ctx) {
+        Timed(CallId::ForwardPrologue, [&] { ForwardPrologueNative(t, rd, plan.view, desc, 0); });
+    } else if (t.live) {
+        Timed(CallId::ForwardPrologue, [&] { reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64, u64, u64)>(Global(FunctionForwardPrologue))(rd, plan.view, desc, 0); });
+    }
+    const u64 desc_targets_after = R<u64>(desc + 0x448);
+    const u64 w_9f8 = R<u64>(desc_targets_after + 0x240) != 0 ? view_of(R<u64>(desc_targets_after + 0x240)) : 0;
+    const u64 w_a00 = R<u64>(desc_targets_after + 0x248) != 0 ? view_of(R<u64>(desc_targets_after + 0x248)) : 0;
+    t.Set<u64>(0x980, plan.a3);
+    t.Set<u64>(0x988, w_988);
+    t.Set<u64>(0x990, w_990);
+    t.Set<u64>(0x998, w_998);
+    t.Set<u64>(0x9a0, w_9a0);
+    for (u32 i = 0; i < 4; ++i) {
+        t.Set<u64>(0x9a8 + i * 8, w_9a8[i]);
+    }
+    t.Set<u64>(0x9c8, w_9c8);
+    for (u32 i = 0; i < 5; ++i) {
+        t.Set<u64>(0x9d0 + i * 8, w_9d0[i]);
+    }
+    t.Set<u64>(0x9f8, w_9f8);
+    t.Set<u64>(0xa00, w_a00);
+    t.Set<u64>(0xa08, plan.a4);
+    for (u32 i = 0; i < 5; ++i) {
+        t.Set<u64>(0xa10 + i * 8, w_a10[i]);
+    }
+    // ----- the batches
+    u32 last_state = 1;
+    for (const DBatch& db : plan.batches) {
+        if (db.set_580) {
+            t.batch_owner = db.batch;
+            t.Set<u64>(0x580, db.value_580);
+            t.batch_owner = 0;
+        }
+        for (u32 s = db.first_step; s < db.first_step + db.step_count; ++s) {
+            const DStep& step = plan.steps[s];
+            const u64 d = step.decal, record = step.record;
+            const u64 p = step.index;
+            const u64 image_object = R<u64>(R<u64>(d + 0x1e8) + p * 8);
+            const u64 view_0 = view_of(image_object);
+            const u64 view_1 = view_of(R<u64>(R<u64>(d + 0x230) + p * 8));
+            const u64 view_2 = view_of(R<u64>(R<u64>(d + 0x248) + p * 8));
+            if (view_0 == 0) {
+                continue;
+            }
+            u64 view_d = view_0;
+            if (R<u32>(d + 0x2b8) >= 2) {
+                const u64 object = R<u64>(R<u64>(d + 0x200) + p * 8);
+                if (object == 0) {
+                    continue;
+                }
+                view_d = view_of(object);
+            }
+            const u64 data_e = HandleLookup(rd, R<u64>(R<u64>(d + 0x218) + p * 8));
+            if (data_e == 0) {
+                continue;
+            }
+            const u64 view_e = R<u64>(data_e + 0x48);
+            if (view_e == 0) {
+                continue;
+            }
+            // the state object the primitive's flag byte selects
+            const u32 flag_byte = R<u8>(record + 0x21);
+            if (flag_byte != last_state) {
+                u64 object;
+                if (wide_state) {
+                    object = (flag_byte & 1) != 0 ? R<u64>(rd + 0x3cb0) : (flag_byte & 2) != 0 ? R<u64>(rd + 0x3b90) : (flag_byte & 4) != 0 ? R<u64>(rd + 0x3b98) : R<u64>(rd + 0x3ca8);
+                } else {
+                    object = (flag_byte & 1) != 0 ? R<u64>(rd + 0x3d30) : (flag_byte & 2) != 0 ? R<u64>(rd + 0x3d38) : (flag_byte & 4) != 0 ? R<u64>(rd + 0x3d40) : R<u64>(rd + 0x3d48);
+                }
+                state_words(object);
+                last_state = flag_byte;
+            }
+            // the constant block
+            put_from(0x39c0, d + 0x110, 16);
+            const u64 target_view = R<u64>(image_object + 0x68);
+            const u32 size_a = target_view != 0 ? R<u32>(target_view + 0x10) : R<u32>(image_object + 0x84);
+            const u32 size_b = target_view != 0 ? R<u32>(target_view + 0x14) : R<u32>(image_object + 0x88);
+            putf(0x39d0, static_cast<float>(R<s32>(d + 0x2cc)));
+            putf(0x39d4, static_cast<float>(size_a));
+            putf(0x39d8, static_cast<float>(size_b));
+            put32(0x39dc, 0);
+            const u32 vertices = R<u32>(d + (R<s32>(d + 0x2c4) != 0 ? 0x2c0 : 0x2b4));
+            const float radius = R<float>(d + 0xa4);
+            put32(0x3a40, R<u32>(d + 0x2c8));
+            putf(0x3a44, static_cast<float>(vertices));
+            putf(0x3a48, radius * radius);
+            put32(0x3a4c, R<u32>(d + 0x5bc));
+            put_from(0x3a50, d + 0x540, 16);
+            put32(0x3a60, R<u32>(d + 0x5c0));
+            put32(0x3a64, R<u32>(d + 0x5c4));
+            put32(0x3a68, 0);
+            put32(0x3a6c, 0);
+            put_from(0x3a90, d + 0x2d0, 0x40);
+            const u32 first = R<u32>(record + 0x10);
+            put32(0x3990, R<u32>(d + 0x29c));
+            put32(0x3994, R<u32>(d + 0x284));
+            put32(0x3998, R<u32>(d + 0x294));
+            put32(0x399c, R<u32>(d + 0x298));
+            const u64 holder = R<u64>(d + 0x1d8);
+            const s32 holder_value = holder != 0 ? R<s32>(holder + 0x24) : 0;
+            const u64 word_288 = R<u64>(d + 0x288);
+            put32(0x39a0, static_cast<u32>(word_288));
+            put32(0x39a4, static_cast<u32>(word_288 >> 32));
+            putf(0x39a8, static_cast<float>(holder_value));
+            put32(0x39ac, R<u32>(d + 0x2a0));
+            put32(0x39b0, R<u32>(target_set + 0x2d4));
+            put32(0x39b4, R<u32>(target_set + 0x2d8));
+            put32(0x39b8, R<u32>(target_set + 0x2dc));
+            put32(0x39bc, R<u32>(d + 0x290));
+            put32(0x39e0, R<u32>(d + 0x278));
+            put32(0x39e4, R<u32>(d + 0x27c));
+            put32(0x39e8, R<u32>(d + 0x280));
+            putf(0x39ec, static_cast<float>(first));
+            put32(0x3a70, R<u32>(d + 0x260));
+            put32(0x3a74, R<u32>(d + 0x264));
+            put32(0x3a78, R<u32>(d + 0x270));
+            put32(0x3a7c, R<u32>(d + 0x274));
+            putf(0x3a80, scale * R<float>(d + 0x268));
+            putf(0x3a84, scale * R<float>(d + 0x26c));
+            put32(0x3a88, R<u32>(d + 0x2a8));
+            put32(0x3a8c, R<u32>(d + 0x2a4));
+            put32(0x3ad0, R<u32>(d + 0x550));
+            put32(0x3ad4, R<u32>(d + 0x554));
+            put32(0x3ad8, R<u32>(d + 0x558));
+            put32(0x3adc, 0);
+            put32(0x3ae0, R<u32>(d + 0x55c));
+            put32(0x3ae4, R<u32>(d + 0x560));
+            put32(0x3ae8, R<u32>(d + 0x564));
+            put32(0x3aec, 0);
+            put_from(0x3af0, d + 0x570, 0x40);
+            put32(0x3b30, first);
+            put32(0x3b34, 0);
+            put32(0x3b38, 0);
+            put32(0x3b3c, 0);
+            if (t.live) {
+                Timed(CallId::DecalUpdate, [&] {
+                    reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64)>(R<u64>(R<u64>(plan.ctx) + 0xd0))(plan.ctx, R<u64>(rd + 0x3b80), 0, 0, rd + DecalStageBase, 0, 0);
+                });
+            } else {
+                t.stages.push_back(shadow_stage);
+                t.stage_pending = static_cast<s32>(t.stages.size()) - 1;
+            }
+            t.Set<u64>(0xa38, view_0);
+            t.Set<u64>(0xa40, view_d);
+            t.Set<u64>(0xa48, view_e);
+            t.Set<u64>(0xa50, view_1);
+            t.Set<u64>(0xa58, view_2);
+            t.Set<u64>(0x58, 0);
+            t.Set<u64>(0x60, 0x39);
+            if (t.Get<u32>(0x4480) != 5) {
+                t.Set<u32>(0x4480, 5);
+                t.Or8(0x447c, 1);
+            }
+            std::array<s32, 2> token{0, 0};
+            const u64 variant = Timed(CallId::FindVariant, [&] {
+                return reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u32, u32, u32, void*, u64)>(Global(FunctionFindVariant))(rd + 1000, d, 0, 0, 0, token.data(), 0);
+            });
+            if (variant == 0) {
+                continue;
+            }
+            SetShader(t, 0x4698, R<u64>(variant + 8), 1);
+            SetShader(t, 0x4690, R<u64>(variant + 0x18), 2);
+            const s32 instances = R<s32>(record + 0x14);
+            if (t.Get<s32>(0x4724) != instances) {
+                t.Set<s32>(0x4724, instances);
+            }
+            if (t.live) {
+                reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64)>(Global(FunctionSetIndexBuffer))(plan.ctx, 0);
+            } else if (t.Get<u32>(0x278) != 0x200) {
+                // FUN_02488430(ctx, 0): the index buffer base and type the loop last set go back to zero (the packets it emits are not modelled)
+                if (t.Get<u64>(0x4470) != 0) {
+                    t.Set<u64>(0x4470, 0);
+                }
+                if (t.Get<s32>(0x4478) != 0) {
+                    t.Set<s32>(0x4478, 0);
+                }
+            }
+            t.Set<u64>(0x479c, 0);
+            if (t.live) {
+                Timed(CallId::DrawIssue, [&] { NativeDraw::IssueInlineAutoDraw(plan.ctx, vertices, DecalDrawSite); });
+            } else if (NativeDraw::InlineAutoDrawTagged(vertices)) {
+                t.marks.push_back({t.arena.size(), 2, vertices, 0, static_cast<u64>(instances), t.Get<u64>(0x4698), t.Get<u64>(0x4690)});
+                if (t.stage_pending >= 0) {
+                    t.marks.back().stage = t.stage_pending;
+                }
+            }
+            t.stage_pending = -1;
+            if (t.live) {
+                W<s32>(rd + 0x10, R<s32>(rd + 0x10) + 1);
+                W<s32>(rd + 0x14, R<s32>(rd + 0x14) + instances * 2);
+            } else {
+                ++t.draws;
+                t.triangles += instances * 2;
+            }
+        }
+    }
+    // ----- epilogue
+    {
+        const std::array<u8, 0x400> zeros{};
+        t.Put(0x580, zeros.data(), 0x400);
+        t.Put(0x980, zeros.data(), 0x400);
+        if (plan.any_mesh) {
+            t.Set<u64>(0x580, 0);
+            t.Put(0x980, zeros.data(), 0xe0);
+            raster_object(R<u64>(rd + 0x3bf0));
+        }
+    }
+}
+
+struct DConfig {
+    bool on{false};
+    u32 verify_every{32};
+};
+const DConfig& DCfg() {
+    static const DConfig config = [] {
+        DConfig c;
+        const char* e = std::getenv("TLG_DECAL_GEN");
+        c.on = e != nullptr && *e != 0 && *e != '0';
+        if (const char* n = std::getenv("TLG_DECAL_GEN_VERIFY"); n != nullptr && *n != 0) {
+            c.verify_every = static_cast<u32>(std::atoi(n));
+        }
+        return c;
+    }();
+    return config;
+}
+
+struct DStats {
+    ViewStats v;
+    u64 eligible{0};
+    u64 loops_without_work{0};
+};
+DStats& DS() {
+    static DStats stats;
+    return stats;
+}
+
 } // namespace
 
 bool Enabled() {
@@ -2492,7 +2971,7 @@ void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3) {
         return;
     }
     const Mark& mark = v.shadow.marks[k];
-    if (mark.kind != kind || mark.count != count || mark.first != first || (kind == 0 && mark.a3 != a3)) {
+    if (mark.kind != kind || mark.count != count || mark.first != first || ((kind == 0 || kind == 2) && mark.a3 != a3)) {
         ++v.mismatches;
         NoteMismatch(s, v.view, "draw arguments", fmt::format("draw {}: the loop kind {} {:#x} / {:#x} / {:#x}, the generator kind {} {:#x} / {:#x} / {:#x}", k, kind, count, first, a3, mark.kind, mark.count, mark.first, mark.a3));
     }
@@ -2506,7 +2985,7 @@ void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3) {
         ++v.mismatches;
         NoteMismatch(s, v.view, "shader pair", fmt::format("draw {}: the loop {:#x} / {:#x}, the generator {:#x} / {:#x}", k, vs, ps, mark.vertex_shader, mark.pixel_shader));
     }
-    if (k == 0 && v.forward_block_set && v.view == 200) {
+    if (k == 0 && v.forward_block_set && (v.view == 200 || v.view == 201)) {
         // A3: the 0x340 byte block the engine's forward prologue put in the frame ring (ctx + 0x13048) against the one the native prologue built
         v.forward_block_set = false;
         const u64 block = R<u64>(ctx + 0x13048);
@@ -2515,6 +2994,22 @@ void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3) {
             Leaf().block_differing.fetch_add(1, std::memory_order_relaxed);
             ++v.mismatches;
             NoteMismatch(s, v.view, "forward prologue block", fmt::format("the engine's block at {:#x} differs from the native one", block));
+        }
+    }
+    if (mark.stage >= 0) {
+        // A7: the constant block of the decal loop (renderDev + 0x3990) at this draw against the block the generator built
+        const auto& built = v.shadow.stages[static_cast<size_t>(mark.stage)];
+        const u8* now = reinterpret_cast<const u8*>(v.rd + DecalStageBase);
+        if (std::memcmp(now, built.data(), built.size()) != 0) {
+            u32 at = 0;
+            while (at + 4 <= built.size() && std::memcmp(now + at, built.data() + at, 4) == 0) {
+                at += 4;
+            }
+            u32 a = 0, b = 0;
+            std::memcpy(&a, now + at, 4);
+            std::memcpy(&b, built.data() + at, 4);
+            ++v.mismatches;
+            NoteMismatch(s, v.view, "decal constants", fmt::format("draw {}: dword {:#x} of the block: the loop {:#x}, the generator {:#x}", k, DecalStageBase + at, a, b));
         }
     }
     if (mark.rs_valid) {
@@ -2934,6 +3429,131 @@ bool HandleForward(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 or
     return true;
 }
 
+bool DecalEnabled() {
+    return DCfg().on;
+}
+
+bool HandleDecal(u64 render_device, u64 view, u64 a3, u64 a4, u64 desc, u32 flags, s32 type, u32 width, u32 height, u64 original_loop) {
+    const DConfig& cfg = DCfg();
+    if (!cfg.on || original_loop == 0) {
+        return false;
+    }
+    using Loop = void(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64, u64, u64);
+    const auto run_loop = [&] {
+        reinterpret_cast<Loop>(original_loop)(render_device, view, a3, a4, desc, flags, static_cast<u64>(static_cast<u32>(type)), width, height);
+    };
+    State& s = S();
+    DStats& ds = DS();
+    DPlan plan;
+    plan.render_device = render_device;
+    plan.view = view;
+    plan.a3 = a3;
+    plan.a4 = a4;
+    plan.desc = desc;
+    plan.flags = flags;
+    plan.type = type;
+    plan.width = width;
+    plan.height = height;
+    DScanArgs scan_args{&plan};
+    {
+        std::scoped_lock lock{s.mutex};
+        if (ds.v.disabled) {
+            plan.Decline("generator switched off by a verify difference");
+        } else if (!Timed(CallId::ScanDecal, [&] { return NativeDraw::GuardedCall([](void* p) { ScanDecalPass(*static_cast<DScanArgs*>(p)); }, &scan_args); })) {
+            ++ds.v.not_scanned;
+            plan.scanned = false;
+            plan.Decline("scan faulted");
+        }
+        if (plan.no_work) {
+            ++ds.loops_without_work;
+        } else {
+            ++ds.v.passes;
+            if (!plan.Ok()) {
+                for (const char* r : plan.reasons) {
+                    ++ds.v.declines[r];
+                }
+            }
+        }
+    }
+    if (plan.no_work) {
+        run_loop(); // the engine's function does nothing for an empty list
+        return true;
+    }
+    bool verify_pass = false;
+    if (plan.Ok()) {
+        std::scoped_lock lock{s.mutex};
+        ++ds.eligible;
+        verify_pass = cfg.verify_every != 0 && ds.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().active.load();
+    }
+    if (plan.Ok() && !verify_pass) {
+        Target live;
+        live.live = true;
+        live.base = reinterpret_cast<u8*>(plan.ctx);
+        Timed(CallId::PassDecal, [&] { GenerateDecal(live, plan); });
+        std::scoped_lock lock{s.mutex};
+        ++ds.v.generated;
+        ds.v.generated_batches += plan.batches.size();
+        ds.v.generated_draws += plan.steps.size();
+        return true;
+    }
+    Verify& v = V();
+    if (verify_pass) {
+        v.shadow = Target{};
+        v.shadow.live = false;
+        std::vector<u8> copy(CtxBytes);
+        std::memcpy(copy.data(), reinterpret_cast<const void*>(plan.ctx), CtxBytes);
+        v.shadow.base = copy.data();
+        GenerateDecal(v.shadow, plan);
+        v.cursor = 0;
+        v.arena_pos = 0;
+        v.view = 201;
+        v.lo = DecalBegin;
+        v.hi = DecalEnd;
+        v.ctx = plan.ctx;
+        v.rd = plan.render_device;
+        v.compared_draws = 0;
+        v.mismatches = 0;
+        v.raced = 0;
+        v.thread = std::this_thread::get_id();
+        const s32 draws_before = R<s32>(render_device + 0x10), triangles_before = R<s32>(render_device + 0x14);
+        v.active.store(true);
+        run_loop();
+        v.active.store(false);
+        v.forward_block_set = false;
+        std::scoped_lock lock{s.mutex};
+        if (v.cursor < v.shadow.marks.size()) {
+            ++v.mismatches;
+            NoteMismatch(s, v.view, "missing draw", fmt::format("the generator has {} draws, the loop issued {}", v.shadow.marks.size(), v.cursor));
+        } else {
+            v.mismatches += CompareDelta(s, v, v.arena_pos, v.shadow.arena.size(), plan.ctx, "epilogue");
+        }
+        const s32 draws = R<s32>(render_device + 0x10) - draws_before;
+        const s64 triangles = R<s32>(render_device + 0x14) - triangles_before;
+        if (draws != v.shadow.draws || triangles != v.shadow.triangles) {
+            ++v.mismatches;
+            NoteMismatch(s, v.view, "counters", fmt::format("draws +{} (generator {}), triangles +{} (generator {})", draws, v.shadow.draws, triangles, v.shadow.triangles));
+        }
+        ++ds.v.verify_passes;
+        ds.v.verify_draws += v.compared_draws;
+        ds.v.verify_raced += v.raced;
+        if (v.mismatches == 0) {
+            ++ds.v.verify_clean;
+        } else {
+            ++ds.v.verify_mismatched;
+            ds.v.disabled = true;
+            LOG_ERROR(Render, "decal generator switched off, {} differences against the engine's loop", v.mismatches);
+        }
+        v.shadow = Target{};
+        v.lo = ZPassBegin;
+        v.hi = ZPassEnd;
+    } else {
+        run_loop();
+        std::scoped_lock lock{s.mutex};
+        ++ds.v.loop_passes;
+    }
+    return true;
+}
+
 nlohmann::json Report() {
     auto& s = S();
     std::scoped_lock lock{s.mutex};
@@ -3026,6 +3646,27 @@ nlohmann::json Report() {
         }
         fj["declined_passes_by_reason"] = fdeclines;
         out["forward"] = fj;
+        const ViewStats& dj = DS().v;
+        nlohmann::json dd = {{"enabled", DCfg().on},
+                             {"passes", dj.passes},
+                             {"loops_without_work", DS().loops_without_work},
+                             {"generated_passes_without_the_loop", dj.generated},
+                             {"generated_batches", dj.generated_batches},
+                             {"generated_draws", dj.generated_draws},
+                             {"passes_run_by_the_loop", dj.loop_passes},
+                             {"verify_passes", dj.verify_passes},
+                             {"verify_clean", dj.verify_clean},
+                             {"verify_with_differences", dj.verify_mismatched},
+                             {"verify_draws_compared", dj.verify_draws},
+                             {"verify_words_that_moved", dj.verify_raced},
+                             {"switched_off_by_verify", dj.disabled},
+                             {"scan_faults", dj.not_scanned}};
+        nlohmann::json ddeclines = nlohmann::json::object();
+        for (const auto& [reason, count] : dj.declines) {
+            ddeclines[reason] = count;
+        }
+        dd["declined_passes_by_reason"] = ddeclines;
+        out["decal"] = dd;
     }
     if (CensusOn()) {
         LARGE_INTEGER frequency;

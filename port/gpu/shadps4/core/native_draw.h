@@ -113,6 +113,11 @@ bool GuardedCall(void (*fn)(void*), void* argument);
 void IssueIndexedDraw(u64 ctx, u64 count, u64 first, u64 site_ghidra, u64 a4, u64 a3 = 0);
 /// Same for `DrawIndexedIndirect(ctx, argument buffer object, byte offset)` at the loop's indirect call site.
 void IssueIndirectDraw(u64 ctx, u64 buffer, u64 offset, u64 site_ghidra);
+/// A7 (decal generator): the inlined `DrawIndexAuto` of the decal loop (`FUN_01c71680`, call site 0x01c727a7): `PrepareDraw(ctx, 0, 1)` through the draw hook, then, when the tag did not take the
+/// draw over, what the loop does with the game's packet path. The caller has set `ctx + 0x4724` (instances) and `ctx + 0x479c` (first vertex 0) and made the index buffer call.
+void IssueInlineAutoDraw(u64 ctx, u32 count, u64 site_ghidra);
+/// True when the draw hook acts on an inlined auto draw of `count` vertices (the loop's draw then reaches `NoteLoopDraw`); otherwise the game's own path runs it.
+[[nodiscard]] bool InlineAutoDrawTagged(u32 count);
 /// Census of the draws the generators issue (`TLG_GEN_CENSUS=1`): kind 0 indexed, 1 indirect; calls, ticks in the tag, ticks in the engine draw function, draws the tag took over.
 void TagCensusRead(std::array<u64, 5>& ticks, u64& calls);
 void UserDataCensusRead(u64& scan_ticks, u64& fill_ticks, u64& tables, u64& slots);

@@ -33,6 +33,7 @@
 #include "core/emulator_settings.h"
 #include "core/guest_hooks.h"
 #include "core/libraries/kernel/process.h"
+#include "core/libraries/gnmdriver/gnmdriver.h"
 #include "core/frame_timeline.h"
 #include "core/native_draw.h"
 #include "core/native_readbacks.h"
@@ -6923,19 +6924,30 @@ u64 PS4_SYSV_ABI TagIndirect(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u6
 }
 /// PrepareDraw(ctx, 0, 1): its callers are the draw functions (hooked at their own entry) and one inlined copy of the auto
 /// draw in a render pass function, which is where this hook acts.
+/// The hook's work for the inlined auto draw at 0x1c727a7 (the decal loop): the tag, which takes the draw over (result with bit 63: PrepareDraw returns false, the caller does not draw), or the
+/// note and 0 (the game's PrepareDraw runs). A verify pass of the decal generator sees the engine loop's draw here.
+u64 InlineAutoPrepare(u64 ctx, u32 count, u64 ret) {
+    if (ctx != 0 && InlineAutoDrawTagged(count)) {
+        const u32 instances = Rd<u32>(ctx, 0x4724);
+        if (NativeZPassGen::VerifyActive()) {
+            NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 2, ctx, count, 0, instances);
+        }
+        inline_instances = instances;
+        const u64 result = Tag(ctx, count, 0, 0, ret, 1, true, true);
+        inline_instances = 0;
+        if (result != 0) {
+            return result;
+        }
+    }
+    return PrepareNote(ctx, 0, 1, 0, 0, 0, ret);
+}
 u64 PS4_SYSV_ABI PrepareDrawHook(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
     const VAddr base = image_base.load(std::memory_order_relaxed);
-    if (ctx != 0 && base != 0 && ret - base + 0x1000000 == 0x1c727a7 &&
-        VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0) {
+    if (ctx != 0 && base != 0 && ret - base + 0x1000000 == 0x1c727a7) {
         // the vertex count sits in the caller's frame ([rsp + 0x108], stored just before the call)
-        const u64 count = Rd<u32>(caller_rsp, 0x108);
-        if (count != 0 && count < 0x1000000) {
-            inline_instances = Rd<u32>(ctx, 0x4724);
-            const u64 result = Tag(ctx, count, 0, 0, ret, 1, true, true);
-            inline_instances = 0;
-            if (result != 0) {
-                return result;
-            }
+        const u32 count = Rd<u32>(caller_rsp, 0x108);
+        if (InlineAutoDrawTagged(count)) {
+            return InlineAutoPrepare(ctx, count, ret);
         }
     }
     return PrepareNote(ctx, a1, a2, a3, a4, a5, ret);
@@ -7248,9 +7260,24 @@ u64 PS4_SYSV_ABI ForwardEnter(u64 render_device, u64 a1, u64 a2, u64 list, u64 m
     return 0;
 }
 
+/// A7: the decal pass loop `FUN_01c71680(render device, view, a3, a4, desc, flags, type, width, height)`: the last three arguments are on the stack.
+u64 PS4_SYSV_ABI DecalEnter(u64 render_device, u64 view, u64 a3, u64 a4, u64 desc, u64 flags, u64 ret, u64 caller_rsp) {
+    (void)ret;
+    if (NativeZPassGen::DecalEnabled()) {
+        static const u64 loop_entry = Core::GuestHooks::OriginalEntry("DrawDecalPass");
+        if (NativeZPassGen::HandleDecal(render_device, view, a3, a4, desc, static_cast<u32>(flags), Rd<s32>(caller_rsp, 0), Rd<u32>(caller_rsp, 8), Rd<u32>(caller_rsp, 0x10), loop_entry)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 u64 FindHandler(const std::string& name) {
     if (name == "forward_enter") {
         return reinterpret_cast<u64>(&ForwardEnter);
+    }
+    if (name == "decal_enter") {
+        return reinterpret_cast<u64>(&DecalEnter);
     }
     if (name == "gbuffer_enter") {
         return reinterpret_cast<u64>(&GBufferEnter);
@@ -7987,6 +8014,61 @@ void IssueIndexedDraw(u64 ctx, u64 count, u64 first, u64 site_ghidra, u64 a4, u6
         issue_ticks[0][0]++;
         issue_ticks[0][1] += t1 - t0;
         issue_ticks[0][2] += IssueNow() - t1;
+    }
+}
+
+bool InlineAutoDrawTagged(u32 count) {
+    return image_base.load(std::memory_order_relaxed) != 0 && count != 0 && count < 0x1000000 &&
+           VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0;
+}
+namespace {
+/// FUN_024a4ab0 (the constant update engine's pre draw) and the draw packet: what the inlined auto draw does after a PrepareDraw that returned true (the draw was not taken over).
+void InlineAutoDrawTail(u64 ctx, u32 count, u32 instances) {
+    reinterpret_cast<void(PS4_SYSV_ABI*)(u64)>(ImageBase() + (0x24a4ab0 - 0x1000000))(ctx + 0x4aa8);
+    u64 cursor = Rd<u64>(ctx, 0x47d0);
+    bool ok = true;
+    if (static_cast<u32>((Rd<u64>(ctx, 0x47c8) - cursor) >> 2) < 7) {
+        const u64 grow = Rd<u64>(ctx, 0x47d8);
+        ok = (reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u64)>(grow)(ctx + 0x47c0, 7, Rd<u64>(ctx, 0x47e0)) & 0xff) != 0;
+        if (ok) {
+            cursor = Rd<u64>(ctx, 0x47d0);
+        }
+    }
+    if (ok) {
+        if (Libraries::GnmDriver::sceGnmDrawIndexAuto(reinterpret_cast<u32*>(cursor), 7, count, Rd<u32>(ctx, 0x47e8) & 1) == 0) {
+            Wr<u64>(ctx, 0x47d0, Rd<u64>(ctx, 0x47d0) + 0x1c);
+        }
+    }
+    if ((Rd<u8>(ctx, 0x13009) & 1) != 0) {
+        const u64 buffer = Rd<u64>(ctx, 0x4aa8);
+        u64 at = Rd<u64>(buffer, 0x10);
+        bool room = true;
+        if (static_cast<u32>((Rd<u64>(buffer, 8) - at) >> 2) < 2) {
+            room = (reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u64)>(Rd<u64>(buffer, 0x18))(buffer, 2, Rd<u64>(buffer, 0x20)) & 0xff) != 0;
+            at = Rd<u64>(buffer, 0x10);
+        }
+        if (room) {
+            Wr<u32>(at, 0, 0xc0008500u);
+            Wr<u64>(buffer, 0x10, Rd<u64>(buffer, 0x10) + 8);
+        }
+        Wr<u16>(ctx, 0x13009, 0x100);
+    }
+    Wr<u32>(ctx, 0x30, Rd<u32>(ctx, 0x30) + 1);
+    Wr<u32>(ctx, 0x38, Rd<u32>(ctx, 0x38) + instances * count);
+}
+} // namespace
+
+void IssueInlineAutoDraw(u64 ctx, u32 count, u64 site_ghidra) {
+    static const u64 original_prepare = Core::GuestHooks::OriginalEntry("PrepareDraw");
+    const u64 site = ImageBase() + (site_ghidra - 0x1000000);
+    generator_issuing = true;
+    const u64 result = InlineAutoPrepare(ctx, count, site);
+    generator_issuing = false;
+    if (result != 0 || original_prepare == 0) {
+        return; // the tag took the draw over: PrepareDraw returns false
+    }
+    if ((reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u64)>(original_prepare)(ctx, 0, 1) & 0xff) != 0) {
+        InlineAutoDrawTail(ctx, count, Rd<u32>(ctx, 0x4724));
     }
 }
 

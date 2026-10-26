@@ -31,6 +31,10 @@ void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3);
 [[nodiscard]] bool ForwardEnabled();
 bool HandleForward(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 original_loop);
 
+/// A7, the decal pass loop (`FUN_01c71680(renderDev, view, a3, a4, desc, flags, type, width, height)`): `TLG_DECAL_GEN=1`, verify one pass in `TLG_DECAL_GEN_VERIFY` (default 32). Same contract.
+[[nodiscard]] bool DecalEnabled();
+bool HandleDecal(u64 render_device, u64 view, u64 a3, u64 a4, u64 desc, u32 flags, s32 type, u32 width, u32 height, u64 original_loop);
+
 nlohmann::json Report();
 
 } // namespace Core::NativeZPassGen
