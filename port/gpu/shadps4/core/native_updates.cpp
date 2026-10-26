@@ -97,6 +97,8 @@ struct Site {
     u32 usage_class{};
     u32 registry{}; ///< BufferContaining of the sample
     u64 in_registered{}; ///< faults of this site inside a registered buffer (the ones that can change what the GPU reads)
+    std::array<u64, 8> host_stack{}; ///< exe offsets of the host frames at the first fault of a site that has no guest frame (a copy made by the runtime)
+    u32 host_frames{};
 };
 struct PendingFault {
     u64 address, size, time_ns, thread;
@@ -346,6 +348,19 @@ void NoteFault(u64 address, u64 size) {
                 site.sample_address = address;
                 site.usage_class = usage_class;
                 site.registry = registry_class;
+#ifdef _WIN32
+                if (GuestHooks::FaultStack(0) == 0) {
+                    void* frames[16] = {};
+                    const USHORT n = CaptureStackBackTrace(1, 16, frames, nullptr);
+                    const u64 exe = reinterpret_cast<u64>(GetModuleHandleA(nullptr));
+                    for (USHORT i = 0; i < n && site.host_frames < 8; ++i) {
+                        const u64 at = reinterpret_cast<u64>(frames[i]);
+                        if (at >= exe && at < exe + 0x10000000) {
+                            site.host_stack[site.host_frames++] = at - exe;
+                        }
+                    }
+                }
+#endif
             }
             if (registry_class == 1 || registry_class == 2) {
                 ++site.in_registered;
@@ -470,7 +485,7 @@ nlohmann::json Report() {
     f["inside_a_map_window_of_the_same_thread_within_200ms"] = faults.covered_now.load();
     f["inside_a_window_by_announcer"] = {{"map", faults.covered_by_writer[0].load()}, {"skinning_FUN_01c93730", faults.covered_by_writer[1].load()}, {"light_constants_FUN_01eeb610", faults.covered_by_writer[2].load()},
                                                        {"command_stream_memory_copy", faults.covered_by_writer[3].load()}, {"begin_recording_direct_stores", faults.covered_by_writer[4].load()},
-                                                       {"buffer_creation_with_initial_data", faults.covered_by_writer[5].load()},
+                                                       {"buffer_creation_and_host_file_reads", faults.covered_by_writer[5].load()},
                                                        {"texture_initialization", faults.covered_by_writer[6].load()}, {"instance_group_upload_FUN_01ee4e50", faults.covered_by_writer[7].load()}};
     f["inside_an_older_map_window_of_the_same_thread"] = faults.covered_earlier.load();
     f["inside_a_map_window_of_another_thread"] = faults.covered_other_thread.load();
@@ -542,7 +557,8 @@ nlohmann::json Report() {
         auto& out = f["unannounced_writes_into_registered_buffers"] = nlohmann::json::array();
         for (size_t i = 0; i < relevant.size() && i < 32; ++i) {
             out.push_back({{"rip", relevant[i].first.rip}, {"stack0", relevant[i].first.st0}, {"stack1", relevant[i].first.st1}, {"faults_inside_registered_buffers", relevant[i].second.in_registered},
-                           {"faults", relevant[i].second.count}, {"sample_address", relevant[i].second.sample_address}});
+                           {"faults", relevant[i].second.count}, {"sample_address", relevant[i].second.sample_address},
+                           {"host_exe_rva_stack", std::vector<u64>(relevant[i].second.host_stack.begin(), relevant[i].second.host_stack.begin() + relevant[i].second.host_frames)}});
         }
     }
     auto& list = f["unannounced_writes_by_faulting_instruction"] = nlohmann::json::array();

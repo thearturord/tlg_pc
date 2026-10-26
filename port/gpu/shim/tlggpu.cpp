@@ -5,6 +5,7 @@
 #include "core/frame_timeline.h"
 #include "core/guest_heap.h"
 #include "core/native_draw.h"
+#include "core/native_updates.h"
 #include "core/emulator_settings.h"
 #include "tlg_write_log.h"
 // tlg: glue between the C loader and the vendored shadPS4 video core.
@@ -307,6 +308,12 @@ extern "C" uintptr_t tlggpu_resolve(const char* scoped_nid) {
         }
     }
     return 0;
+}
+
+extern "C" void tlggpu_note_host_write(const void* address, uint64_t size) {
+    if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
+        Core::NativeUpdates::NoteWriterRange(5, reinterpret_cast<u64>(address), size);
+    }
 }
 
 extern "C" int tlggpu_handle_fault(void* ucontext, void* address) {

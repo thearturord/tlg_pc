@@ -25,6 +25,9 @@ uintptr_t tlggpu_resolve(const char *scoped_nid);
 void tlggpu_install_hooks(uintptr_t image_base, uint64_t image_size);
 /* Called first by the loader's SIGSEGV handler: 1 when a GPU page-tracking fault was handled. */
 int tlggpu_handle_fault(void *ucontext, void *address);
+/* The runtime wrote `size` bytes at `address` of guest memory on its own (a file read into a game buffer): the update audit and the announced uploads count it as a
+ * write by an announced writer. No-op unless the update audit or the announced uploads are on. */
+void tlggpu_note_host_write(const void *address, uint64_t size);
 /* TLG_WRITE_LOG=1: prints the logged GPU-side writes to guest memory near the fault. */
 void tlggpu_dump_guest_writes(void *ucontext);
 /* Keyboard text entry through the game window (IME dialog). begin returns 0 when

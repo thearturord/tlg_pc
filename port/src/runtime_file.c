@@ -5,6 +5,7 @@
  * Paths containing ".." components are rejected rather than normalized. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "gpu/tlggpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -344,7 +345,7 @@ static ssize_t bounce_read(int h,unsigned char *at,uint64_t size,int64_t offset)
     if (!bounce && !(bounce=malloc(BOUNCE_BYTES))) return -2;   /* no buffer: read directly */
     uint64_t want=size<BOUNCE_BYTES ? size : BOUNCE_BYTES;
     ssize_t n=offset<0 ? host_read(h,bounce,want) : pread(h,bounce,want,offset);
-    if (n>0) memcpy(at,bounce,(size_t)n);
+    if (n>0) { memcpy(at,bounce,(size_t)n); tlggpu_note_host_write(at,(uint64_t)n); }
     return n;
 }
 #endif
@@ -358,6 +359,7 @@ static ssize_t full_io(int h,void *buffer,uint64_t size,int64_t offset) {
         if (n==-2) {
             touch_for_write(at+done,size-done);
             n=offset<0 ? host_read(h,at+done,size-done) : pread(h,at+done,size-done,offset+(int64_t)done);
+            if (n>0) tlggpu_note_host_write(at+done,(uint64_t)n);
         }
 #else
         touch_for_write(at+done,size-done);

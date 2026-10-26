@@ -7070,10 +7070,11 @@ u64 PS4_SYSV_ABI ZPassEnter(u64 render_device, u64 desc, u64 a2, u64 a3, u64 a4,
 namespace {
 std::atomic<u64> scene_slot_frame{0};
 std::atomic<u32> scene_slot_announced{0};
+std::atomic<u32> scene_slot_group{0};
 constexpr u64 SceneSlotRingGhidra = 0x69b1630, SceneSlotGroupGhidra = 0x69b1678;
 constexpr u64 SceneSlotStride = 0x140, SceneSlotBytes = 0x130;
 
-void AnnounceSceneSlotRange(u64 frame, u32 upto) {
+void AnnounceSceneSlotRange(u64 frame, u32 upto, bool remember_group) {
     if (!Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
         return;
     }
@@ -7090,9 +7091,13 @@ void AnnounceSceneSlotRange(u64 frame, u32 upto) {
     }
     Guarded([&]() -> u64 {
         const u64 ring_globals = base + SceneSlotRingGhidra - 0x1000000;
+        // the group variable is written at two places of the frame (FUN_01d169b0, FUN_01cf7a40): the remembered group of the last call was tried and left more faults uncovered than the current one
         const u32 group = Rd<u32>(base + SceneSlotGroupGhidra - 0x1000000, 0);
         if (group >= 3) {
             return 0;
+        }
+        if (remember_group) {
+            scene_slot_group.store(group, std::memory_order_relaxed);
         }
         const u64 ring = Rd<u64>(ring_globals, static_cast<u64>(group) * 0x18);
         if (!IsHeapPointer(ring)) {
@@ -7131,7 +7136,7 @@ u64 PS4_SYSV_ABI SceneSlotWrites(u64 frame, u64 a1, u64 a2, u64 a3, u64 a4, u64 
     if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && IsHeapPointer(frame)) {
         scene_slot_frame.store(frame, std::memory_order_relaxed);
         Guarded([&]() -> u64 {
-            AnnounceSceneSlotRange(frame, Rd<u32>(frame, 0x31ea4));
+            AnnounceSceneSlotRange(frame, Rd<u32>(frame, 0x31ea4), true);
             return 0;
         });
     }
@@ -7142,7 +7147,7 @@ void FlushSceneSlotAnnouncements() {
     const u64 frame = scene_slot_frame.load(std::memory_order_relaxed);
     if (frame != 0 && Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
         Guarded([&]() -> u64 {
-            AnnounceSceneSlotRange(frame, Rd<u32>(frame, 0x31ea4));
+            AnnounceSceneSlotRange(frame, Rd<u32>(frame, 0x31ea4), false);
             return 0;
         });
     }
