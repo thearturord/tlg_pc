@@ -6938,8 +6938,9 @@ u64 PS4_SYSV_ABI ResourceBufferCreated(u64 device, u64 description, u64 initial,
         const u64 created = Guarded([&] { return Rd<u64>(out, 0); });
         NativeResources::NoteBufferObject(created);
         NativeRegistry::NoteBufferCreated(created);
-        if (NativeUpdates::enabled.load(std::memory_order_relaxed) && initial != 0) {
-            // N5b: a buffer created with initial data: the engine copied the data into the new memory before returning (announced after the write)
+        if (NativeUpdates::enabled.load(std::memory_order_relaxed)) {
+            // N5b: a buffer created with initial data: the engine copied the data into the new memory before returning (announced after the write).
+            // C4: also without initial data (the argument is 0 at the creation sites seen in the update audit): the creation still writes into the new memory (a host memset / copy inside the call)
             Guarded([&]() -> u64 {
                 const u64 width = Rd<u32>(created, 0x180);
                 if (width != 0 && width <= (1ull << 30)) {
@@ -7061,6 +7062,92 @@ u64 PS4_SYSV_ABI ZPassEnter(u64 render_device, u64 desc, u64 a2, u64 a3, u64 a4,
     return 0;
 }
 
+/// C4: the scene's per object constant slots. `FUN_01e05330(float, frameData, ...)` takes the next slot of a ring (`DAT_069b1630`, three groups of 8192 slot objects, the group
+/// in `DAT_069b1678`; the consumed count is `frameData + 0x31ea4`) and writes the object's constants straight into the slot's buffer memory (`slot + 0x130` is the D3D buffer,
+/// its `+0x30` the memory, 0x130 bytes, the stamp at `+0xd0` is the write the update audit saw first), with no Map in between. The buffers' memory is one block, 0x140 bytes apart
+/// and descending. The function takes a float in xmm0, so it is not wrapped: this entry only sees the count the earlier calls consumed (their writes are complete) and
+/// announces those slots as one range (writer 4, direct stores); `FlushSceneSlotAnnouncements` (frame start) announces the tail of the last call.
+namespace {
+std::atomic<u64> scene_slot_frame{0};
+std::atomic<u32> scene_slot_announced{0};
+constexpr u64 SceneSlotRingGhidra = 0x69b1630, SceneSlotGroupGhidra = 0x69b1678;
+constexpr u64 SceneSlotStride = 0x140, SceneSlotBytes = 0x130;
+
+void AnnounceSceneSlotRange(u64 frame, u32 upto) {
+    if (!Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const u32 first = scene_slot_announced.load(std::memory_order_relaxed);
+    if (upto <= first || upto > 8192) {
+        if (upto < first) {
+            scene_slot_announced.store(0, std::memory_order_relaxed); // the ring was reset: a new frame
+        }
+        return;
+    }
+    const VAddr base = image_base.load(std::memory_order_relaxed);
+    if (base == 0) {
+        return;
+    }
+    Guarded([&]() -> u64 {
+        const u64 ring_globals = base + SceneSlotRingGhidra - 0x1000000;
+        const u32 group = Rd<u32>(base + SceneSlotGroupGhidra - 0x1000000, 0);
+        if (group >= 3) {
+            return 0;
+        }
+        const u64 ring = Rd<u64>(ring_globals, static_cast<u64>(group) * 0x18);
+        if (!IsHeapPointer(ring)) {
+            return 0;
+        }
+        const auto memory_of = [&](u32 i) -> u64 {
+            const u64 slot = Rd<u64>(ring, static_cast<u64>(i) * 8);
+            if (!IsHeapPointer(slot)) {
+                return 0;
+            }
+            const u64 buffer = Rd<u64>(slot, 0x130);
+            return IsHeapPointer(buffer) ? Rd<u64>(buffer, 0x30) : 0;
+        };
+        const u64 first_memory = memory_of(first);
+        const u64 last_memory = memory_of(upto - 1);
+        if (first_memory == 0 || last_memory == 0) {
+            return 0;
+        }
+        if (first_memory - last_memory == static_cast<u64>(upto - 1 - first) * SceneSlotStride) {
+            Core::NativeUpdates::NoteWriterRange(4, last_memory, first_memory - last_memory + SceneSlotBytes); // one block
+        } else {
+            for (u32 i = first; i < upto; ++i) {
+                if (const u64 memory = memory_of(i)) {
+                    Core::NativeUpdates::NoteWriterRange(4, memory, SceneSlotBytes);
+                }
+            }
+        }
+        scene_slot_announced.store(upto, std::memory_order_relaxed);
+        return 0;
+    });
+}
+} // namespace
+
+u64 PS4_SYSV_ABI SceneSlotWrites(u64 frame, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    (void)a1, (void)a2, (void)a3, (void)a4, (void)a5, (void)ret;
+    if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && IsHeapPointer(frame)) {
+        scene_slot_frame.store(frame, std::memory_order_relaxed);
+        Guarded([&]() -> u64 {
+            AnnounceSceneSlotRange(frame, Rd<u32>(frame, 0x31ea4));
+            return 0;
+        });
+    }
+    return 0;
+}
+
+void FlushSceneSlotAnnouncements() {
+    const u64 frame = scene_slot_frame.load(std::memory_order_relaxed);
+    if (frame != 0 && Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
+        Guarded([&]() -> u64 {
+            AnnounceSceneSlotRange(frame, Rd<u32>(frame, 0x31ea4));
+            return 0;
+        });
+    }
+}
+
 /// N6.4: `FUN_01ee4e50(inner, instance group, view type)` binds an instance group for a depth / G-buffer batch. It copies the group's instance data (`memcpy` of `uploader[2]` bytes from
 /// `uploader[1]` into `uploader[idx + 3]`, idx = the dword at `uploader + 0x28`, the double buffer toggled by the function) with no Map in between: the write is announced here, before the
 /// function runs (writer 7 of the update list). The uploader is `*(group + 0xf0)`, null for a group without per frame data.
@@ -7121,6 +7208,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "instance_group_bind") {
         return reinterpret_cast<u64>(&InstanceGroupBind);
+    }
+    if (name == "scene_slot_writes") {
+        return reinterpret_cast<u64>(&SceneSlotWrites);
     }
     if (name == "zpass_enter") {
         return reinterpret_cast<u64>(&ZPassEnter);

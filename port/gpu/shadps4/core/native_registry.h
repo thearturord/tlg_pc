@@ -150,6 +150,8 @@ void NoteBinderReason(u32 draw_class, u32 record_stage, u32 reason);
 /// `shader_constant`: the descriptor is built from immediates and the stage's program base (constants stored with the shader code), so it belongs to the shader
 /// variant, not to the draw's engine objects.
 bool AuditBuffer(u64 address, u64 size, bool written, bool shader_constant = false);
+/// C4 (update audit): is [address, address + size) inside a buffer the registry knows? 0 none, 1 inside, 2 partly, 3 the registry is off (`TLG_REGISTRY=1` turns it on).
+u32 BufferContaining(u64 address, u64 size);
 void AuditImage(u64 address);
 
 void Start();

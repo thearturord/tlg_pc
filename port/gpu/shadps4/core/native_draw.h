@@ -103,6 +103,8 @@ u64 NextSeq();
 void SetImageBase(VAddr base);
 /// Load address of the game's main module (0 until known).
 VAddr ImageBase();
+/// C4 (update audit): announces the scene's per object constant slots the engine wrote since the last call (see `SceneSlotWrites`); called at the start of a frame.
+void FlushSceneSlotAnnouncements();
 /// True on a thread that is running a guarded record build: a fault there is handled by the builder, not fatal.
 bool IsGuarded();
 /// N6.3i: runs `fn(argument)` with the same fault guard as the record builder; false when it faulted.

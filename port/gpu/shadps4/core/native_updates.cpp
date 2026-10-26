@@ -15,6 +15,7 @@
 #include <nlohmann/json.hpp>
 #include "core/guest_hooks.h"
 #include "core/native_draw.h"
+#include "core/native_registry.h"
 #include "core/native_resources.h"
 #include "core/native_uploads.h"
 #include "core/native_updates.h"
@@ -87,17 +88,21 @@ struct FaultCounters {
     std::array<std::atomic<u64>, 8> covered_by_writer{}; ///< covered_now by the announcing writer (0: a Map)
     std::array<std::atomic<u64>, 16> uncovered_by_class{};
     std::array<std::atomic<u64>, 16> covered_by_class{};
+    std::array<std::atomic<u64>, 4> uncovered_by_registry{}; ///< C4: the faults no announcement covers, by whether the written bytes are inside a registered buffer
 } faults;
 
 struct Site {
     u64 count{};
     u64 sample_address{};
     u32 usage_class{};
+    u32 registry{}; ///< BufferContaining of the sample
+    u64 in_registered{}; ///< faults of this site inside a registered buffer (the ones that can change what the GPU reads)
 };
 struct PendingFault {
     u64 address, size, time_ns, thread;
     u32 usage_class;
     u64 rip, st0, st1;
+    u32 registry;
 };
 std::array<PendingFault, 8192> pending{}; ///< faults that no announcement covered yet (a writer announces after it wrote): recent ones, newest last
 u64 pending_count = 0;
@@ -143,6 +148,7 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread);
 
 void NoteRenderThread() {
     render_thread.store(std::hash<std::thread::id>{}(std::this_thread::get_id()), std::memory_order_relaxed);
+    NativeDraw::FlushSceneSlotAnnouncements(); // C4: the last scene slots of the frame that just ended
     // a Map that was never unmapped (the engine keeps some pointers for the whole frame): its window is announced at the next frame start, for the thread that mapped it
     std::vector<std::pair<u64, OpenMap>> stale;
     {
@@ -262,8 +268,12 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread) {
         faults.covered_by_writer[writer & 7].fetch_add(1, std::memory_order_relaxed);
         faults.uncovered_by_class[p.usage_class].fetch_sub(1, std::memory_order_relaxed);
         faults.covered_by_class[p.usage_class].fetch_add(1, std::memory_order_relaxed);
+        faults.uncovered_by_registry[p.registry & 3].fetch_sub(1, std::memory_order_relaxed);
         if (const auto site = uncovered_sites.find(SiteKey{p.rip, p.st0, p.st1}); site != uncovered_sites.end() && site->second.count > 0) {
             --site->second.count;
+            if ((p.registry == 1 || p.registry == 2) && site->second.in_registered > 0) {
+                --site->second.in_registered;
+            }
         }
         p.address = 0;
     }
@@ -282,6 +292,7 @@ void NoteFault(u64 address, u64 size) {
     }
 #endif
     const u32 usage_class = NativeResources::UsageClassOf(address) & 15;
+    const u32 registry_class = NativeRegistry::BufferContaining(address, size);
     const u64 now = NowNs();
     const u64 thread = ThreadKey();
     enum class Kind { None, Now, Earlier, Other } kind = Kind::None;
@@ -329,11 +340,15 @@ void NoteFault(u64 address, u64 size) {
             }
         }
         if (kind == Kind::None) {
-            pending[pending_count++ % pending.size()] = {address, size, now, thread, usage_class, GuestHooks::FaultRip(), GuestHooks::FaultStack(0), GuestHooks::FaultStack(1)};
+            pending[pending_count++ % pending.size()] = {address, size, now, thread, usage_class, GuestHooks::FaultRip(), GuestHooks::FaultStack(0), GuestHooks::FaultStack(1), registry_class};
             Site& site = uncovered_sites[{GuestHooks::FaultRip(), GuestHooks::FaultStack(0), GuestHooks::FaultStack(1)}];
             if (site.count++ == 0) {
                 site.sample_address = address;
                 site.usage_class = usage_class;
+                site.registry = registry_class;
+            }
+            if (registry_class == 1 || registry_class == 2) {
+                ++site.in_registered;
             }
         }
     }
@@ -350,6 +365,7 @@ void NoteFault(u64 address, u64 size) {
         break;
     case Kind::None:
         faults.uncovered.fetch_add(1, std::memory_order_relaxed);
+        faults.uncovered_by_registry[registry_class & 3].fetch_add(1, std::memory_order_relaxed);
         break;
     }
     (kind == Kind::None ? faults.uncovered_by_class : faults.covered_by_class)[usage_class].fetch_add(1, std::memory_order_relaxed);
@@ -459,6 +475,8 @@ nlohmann::json Report() {
     f["inside_an_older_map_window_of_the_same_thread"] = faults.covered_earlier.load();
     f["inside_a_map_window_of_another_thread"] = faults.covered_other_thread.load();
     f["in_no_map_window"] = faults.uncovered.load();
+    f["unannounced_by_registered_buffer"] = {{"outside_every_registered_buffer", faults.uncovered_by_registry[0].load()}, {"inside_a_registered_buffer", faults.uncovered_by_registry[1].load()},
+                                             {"partly_inside_a_registered_buffer", faults.uncovered_by_registry[2].load()}, {"registry_off", faults.uncovered_by_registry[3].load()}};
     f["written_by_our_own_native_code_tags_in_command_buffers"] = faults.own_host_writes.load();
     if (total != 0) {
         f["percent_announced_by_a_map_on_the_same_thread_within_200ms"] = 100.0 * static_cast<double>(faults.covered_now.load()) / static_cast<double>(total);
@@ -513,6 +531,20 @@ nlohmann::json Report() {
                            {"sample_address", mapped[i].second.sample_address}});
         }
     }
+    {
+        std::vector<std::pair<SiteKey, Site>> relevant;
+        for (const auto& s : sites) {
+            if (s.second.in_registered > 0) {
+                relevant.push_back(s);
+            }
+        }
+        std::ranges::sort(relevant, [](const auto& a, const auto& b) { return a.second.in_registered > b.second.in_registered; });
+        auto& out = f["unannounced_writes_into_registered_buffers"] = nlohmann::json::array();
+        for (size_t i = 0; i < relevant.size() && i < 32; ++i) {
+            out.push_back({{"rip", relevant[i].first.rip}, {"stack0", relevant[i].first.st0}, {"stack1", relevant[i].first.st1}, {"faults_inside_registered_buffers", relevant[i].second.in_registered},
+                           {"faults", relevant[i].second.count}, {"sample_address", relevant[i].second.sample_address}});
+        }
+    }
     auto& list = f["unannounced_writes_by_faulting_instruction"] = nlohmann::json::array();
     for (size_t i = 0; i < sites.size() && i < 24; ++i) {
 #ifdef _WIN32
@@ -522,7 +554,7 @@ nlohmann::json Report() {
         const u64 rip_rva = 0;
 #endif
         list.push_back({{"rip", sites[i].first.rip}, {"host_exe_rva", rip_rva}, {"stack0", sites[i].first.st0}, {"stack1", sites[i].first.st1}, {"faults", sites[i].second.count}, {"sample_address", sites[i].second.sample_address},
-                        {"memory_class", NativeResources::UsageClassNameOf(sites[i].second.usage_class)}});
+                        {"memory_class", NativeResources::UsageClassNameOf(sites[i].second.usage_class)}, {"sample_in_registered_buffer", sites[i].second.registry}});
     }
     return j;
 }

@@ -690,6 +690,23 @@ void SetDrawClass(u32 draw_class_) {
     draw_class = draw_class_ & 15;
 }
 
+u32 BufferContaining(u64 address, u64 size) {
+    if (!enabled.load(std::memory_order_relaxed)) {
+        return 3;
+    }
+    std::shared_lock lock{registry_mutex};
+    auto it = buffer_intervals.upper_bound(address);
+    if (it == buffer_intervals.begin()) {
+        return 0;
+    }
+    --it;
+    const auto e = by_id.find(it->second);
+    if (e == by_id.end() || address < e->second.address || address >= e->second.address + e->second.size) {
+        return 0;
+    }
+    return address + size <= e->second.address + e->second.size ? 1 : 2;
+}
+
 bool AuditBuffer(u64 address, u64 size, bool written, bool shader_constant) {
     bool unexplained_flag = false;
     if (!enabled.load(std::memory_order_relaxed)) {
