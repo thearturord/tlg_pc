@@ -275,6 +275,8 @@ struct Mark {
     s32 stage{-1};
     // B3: the constant blocks (live address, bytes) the skinning loop updated buffers from before this dispatch
     std::vector<std::pair<u64, std::vector<u8>>> blocks;
+    // B3: dword 3 of the block at flag_block is a flag computed from the float at flag_source, which the engine's main thread changes: the verify run re-reads it
+    u64 flag_source{0}, flag_block{0};
 };
 
 /// Where the generator writes: the live device context, or a private copy of it that logs every write (the verify run).
@@ -288,6 +290,9 @@ struct Target {
     u64 indexed_site{0x01c76433}, indirect_site{0x01c7640f}, indexed_a4{1}; // the loop's call sites (ghidra return addresses) and the fifth argument of its indexed draw
     u64 table_entry{0};                          // shadow: the table entry object whose value is being written (ctx + 0x6c0 + 8 j)
     std::unordered_map<size_t, u64> table_owner; // shadow: arena position of an entry -> that table entry object
+    u64 direct_object{0};                        // shadow: the engine object whose word (at direct_offset) the value being written was read from
+    u32 direct_offset{0};
+    std::unordered_map<size_t, std::pair<u64, u32>> direct_owner; // shadow: arena position of an entry -> (object, offset) it was read from
     u64 slot_material{0};                       // shadow: the material whose resource slot words are being written
     std::unordered_map<size_t, u64> slot_owner; // shadow: arena position of an entry -> that material
     s32 draws{0};
@@ -314,6 +319,9 @@ struct Target {
         }
         if (table_entry != 0) {
             table_owner[at] = table_entry;
+        }
+        if (direct_object != 0) {
+            direct_owner[at] = {direct_object, direct_offset};
         }
         if (batch_owner != 0) {
             batch_owner_map[at] = batch_owner;
@@ -1149,6 +1157,12 @@ u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, cons
         u64 material;
     };
     std::map<u32, SlotWord> slot_words, table_words, batch_words;
+    struct DirectWord {
+        u64 expected;
+        u64 object;
+        u32 offset;
+    };
+    std::map<u32, DirectWord> direct_words;
     size_t at = from;
     while (at < to) {
         u32 offset, size;
@@ -1170,6 +1184,12 @@ u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, cons
             u64 value = 0;
             std::memcpy(&value, expected, 8);
             batch_words[offset] = {value, bowner->second};
+            continue;
+        }
+        if (const auto downer = v.shadow.direct_owner.find(entry_at); downer != v.shadow.direct_owner.end() && bytes == 8) {
+            u64 value = 0;
+            std::memcpy(&value, expected, 8);
+            direct_words[offset] = {value, downer->second.first, downer->second.second};
             continue;
         }
         if (const auto towner = v.shadow.table_owner.find(entry_at); towner != v.shadow.table_owner.end() && bytes == 8) {
@@ -1272,6 +1292,21 @@ u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, cons
         }
         ++differences;
         NoteMismatch(s, v.view, fmt::format("context word {:#x}", offset), fmt::format("{}: the loop left {:#x}, the generator writes {:#x} (the batch gives {:#x} now)", where, live, word.expected, recompute.value));
+    }
+    for (const auto& [offset, word] : direct_words) {
+        const u64 live = R<u64>(live_ctx + offset);
+        if (live == word.expected) {
+            continue;
+        }
+        // a view the engine's other threads replace in the object between the shadow read and the loop read
+        const u64 now = R<u64>(word.object + word.offset);
+        if (live == now) {
+            ++v.raced;
+            ++s.raced_words[fmt::format("view {} {} word {:#x}", v.view, "object", offset)];
+            continue;
+        }
+        ++differences;
+        NoteMismatch(s, v.view, fmt::format("context word {:#x}", offset), fmt::format("{}: the loop left {:#x}, the generator writes {:#x} (the object holds {:#x} now)", where, live, word.expected, now));
     }
     for (const auto& [offset, word] : table_words) {
         const u64 live = R<u64>(live_ctx + offset);
@@ -1381,6 +1416,7 @@ struct GBatch {
     bool has_mesh{false};
     bool pair{false};     // no group: the first table entry is a valid object: ctx + 0x588 / 0x590
     u64 v588{0}, v590{0};
+    u64 e588{0}, e590{0}; // the table entry objects the two values come from
     u64 v68_group{0};     // group: ctx + 0x68
 };
 
@@ -1499,6 +1535,7 @@ void ScanGBuffer(GScanArgs& a) {
                 if (first != default_object && first != 0 && R<u64>(first + 0x38) != 0) {
                     gb.pair = true;
                     gb.v588 = R<u64>(R<u64>(first + 0x38) + 0x28);
+                    gb.e588 = first;
                     u64 second_entry = R<u64>(array + 8);
                     if (second_entry == default_object) {
                         second_entry = 0;
@@ -1508,6 +1545,7 @@ void ScanGBuffer(GScanArgs& a) {
                         continue;
                     }
                     gb.v590 = R<u64>(R<u64>(second_entry + 0x38) + 0x28);
+                    gb.e590 = second_entry;
                 }
             }
         } else {
@@ -1640,8 +1678,11 @@ void GenerateGBuffer(Target& t, const GPlan& plan, u32 pass_flags) {
             t.Set<u64>(0x60, 0x39);
             if (gb.pair) {
                 t.Set<u64>(0x580, level.value_580);
+                t.table_entry = gb.e588;
                 t.Set<u64>(0x588, gb.v588);
+                t.table_entry = gb.e590;
                 t.Set<u64>(0x590, gb.v590);
+                t.table_entry = 0;
             }
         } else {
             if (level.only_580) {
@@ -2862,7 +2903,10 @@ void GenerateDecal(Target& t, const DPlan& plan) {
             }
             t.Set<u64>(0xa38, view_0);
             t.Set<u64>(0xa40, view_d);
+            t.direct_object = data_e;
+            t.direct_offset = 0x48;
             t.Set<u64>(0xa48, view_e);
+            t.direct_object = 0;
             t.Set<u64>(0xa50, view_1);
             t.Set<u64>(0xa58, view_2);
             t.Set<u64>(0x58, 0);
@@ -3373,6 +3417,8 @@ void GenerateSkin(Target& t, const SkinPlan& p) {
             t.marks.push_back({t.arena.size(), p.async ? 4u : 3u, x, 1, 1, t.Get<u64>(set_shader_offset), 0});
             t.marks.back().blocks = std::move(t.blocks);
             t.blocks.clear();
+            t.marks.back().flag_source = p.context_global + 0x19c;
+            t.marks.back().flag_block = S_live + 0x50;
         }
         ++t.draws;
     };
@@ -3622,7 +3668,20 @@ void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3) {
             ++v.mismatches;
             NoteMismatch(s, v.view, "compute shader", fmt::format("draw {}: the loop {:#x}, the generator {:#x}", k, R<u64>(ctx + shader_offset), mark.vertex_shader));
         }
-        for (const auto& [address, bytes] : mark.blocks) {
+        for (const auto& [address, generated] : mark.blocks) {
+            std::vector<u8> bytes = generated;
+            if (mark.flag_source != 0 && address == mark.flag_block && bytes.size() >= 0x10) {
+                // the flag in dword 3 comes from a float the main thread updates: if the live value is what the float gives now, the loop and the generator read it at different times
+                u32 live_flag = 0, generated_flag = 0;
+                std::memcpy(&live_flag, reinterpret_cast<const void*>(address + 0xc), 4);
+                std::memcpy(&generated_flag, bytes.data() + 0xc, 4);
+                const u32 now = !(R<float>(mark.flag_source) < R<float>(Global(0x024f15dc))) ? 1u : 0u;
+                if (live_flag != generated_flag && live_flag == now) {
+                    std::memcpy(bytes.data() + 0xc, &live_flag, 4);
+                    ++v.raced;
+                    ++s.raced_words[fmt::format("view {} skinning flag word {:#x}", v.view, 0xc)];
+                }
+            }
             if (std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) != 0) {
                 u32 at = 0;
                 while (at + 4 <= bytes.size() && std::memcmp(reinterpret_cast<const void*>(address + at), bytes.data() + at, 4) == 0) {
