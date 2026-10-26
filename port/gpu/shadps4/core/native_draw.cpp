@@ -7405,6 +7405,160 @@ void FlushSceneSlotAnnouncements() {
     }
 }
 
+/// B1: names of the engine's shader programs. The shader loader (`FUN_01c872e0`) builds, per shader class, a description (index at +8, file name at +0x10, entry point at +0x18, the
+/// variants' defines at +0x20) and compiles it with one of three functions (`FUN_01c8e930`, `FUN_01c8ef20`, `FUN_01c8f500`, one per family); the shader objects land in the table at
+/// `*DAT_0689eed8 + 0x1008` (0x10 bytes per entry, the object first). The hook runs the original and then reads the entries that are new: their program address (object + 0xb8) gets the
+/// class name. Published as `/stats` key `shader_names`.
+struct ShaderName {
+    u64 program{};      ///< code address >> 8, the figure the dispatch census lists
+    u32 id{};           ///< the object's unique id (+0x10)
+    u32 tag{};          ///< class tag (+0x18)
+    u32 family{};
+    u32 klass_index{};
+    std::string file, entry, defines, first_resource;
+};
+std::mutex shader_names_mutex;
+std::vector<ShaderName> shader_names;
+std::set<u32> shader_names_seen_ids;
+
+std::string ReadCString(u64 address, size_t limit) {
+    std::string out;
+    if (!IsHeapPointer(address) && address < ImageBase()) {
+        return out;
+    }
+    for (size_t i = 0; i < limit; ++i) {
+        const u8 c = Rd<u8>(address, i);
+        if (c == 0) {
+            break;
+        }
+        out.push_back(c >= 0x20 && c < 0x7f ? static_cast<char>(c) : '?');
+    }
+    return out;
+}
+
+void PublishShaderNames();
+template <u32 Family>
+u64 PS4_SYSV_ABI ShaderClassCompile(u64 klass, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    static const u64 original = Core::GuestHooks::OriginalEntry(Family == 1 ? "ShaderClassCompile1" : Family == 2 ? "ShaderClassCompile2" : "ShaderClassCompile3");
+    if (original == 0) {
+        return 0;
+    }
+    // the compile function frees what it is given: read the class first
+    std::string file, entry, defines;
+    u32 index = 0;
+    Guarded([&]() -> u64 {
+        file = ReadCString(Rd<u64>(klass, 0x10), 96);
+        entry = ReadCString(Rd<u64>(klass, 0x18), 96);
+        if (const u64 variants = Rd<u64>(klass, 0x20); variants != 0) {
+            for (u32 i = 0; i < 32; ++i) {
+                const std::string name = ReadCString(Rd<u64>(variants, i * 16), 48);
+                if (name.empty()) {
+                    break;
+                }
+                defines += (defines.empty() ? "" : " ") + name;
+                if (const std::string value = ReadCString(Rd<u64>(variants, i * 16 + 8), 32); !value.empty()) {
+                    defines += "=" + value;
+                }
+            }
+        }
+        index = Rd<u32>(klass, 8);
+        return 0;
+    });
+    reinterpret_cast<GuestDraw6>(original)(klass, a1, a2, a3, a4, a5);
+    Guarded([&]() -> u64 {
+        const u64 device = Rd<u64>(ImageBase() + (0x0689eed8 - 0x1000000), 0);
+        if (!IsHeapPointer(device)) {
+            return 0;
+        }
+        std::scoped_lock lock{shader_names_mutex};
+        // the shader manager is the render device + 0x3e8; its three tables of 0x10 byte entries: 79, 114 and 135 shader classes
+        constexpr u32 TableOffset = Family == 1 ? 0x3e8 + 0x10 : Family == 2 ? 0x3e8 + 0x500 : 0x3e8 + 0xc20;
+        constexpr u32 TableEntries = Family == 1 ? 79 : Family == 2 ? 114 : 135;
+        for (u32 i = 0; i < TableEntries; ++i) {
+            const u64 object = Rd<u64>(device + TableOffset, i * 16);
+            if (!IsHeapPointer(object)) {
+                continue;
+            }
+            const u32 id = Rd<u32>(object, 0x10), tag = Rd<u32>(object, 0x18);
+            const u64 code = Rd<u64>(object, 0xb8);
+            if (code == 0 || (tag & 0xff) < 0xb || (tag & 0xff) > 0xd || !shader_names_seen_ids.insert(id).second) { // 0xb vertex, 0xc pixel, 0xd compute
+                continue;
+            }
+            ShaderName n;
+            n.program = code >> 8;
+            n.id = id;
+            n.tag = tag;
+            n.family = Family;
+            n.klass_index = index;
+            n.file = file;
+            n.entry = entry;
+            n.defines = defines;
+            n.first_resource = ReadCString(Rd<u64>(object, 0xa8), 40);
+            shader_names.push_back(std::move(n));
+        }
+        return 0;
+    });
+    PublishShaderNames();
+    return 1;
+}
+
+/// The system shader sets (`FUN_01c8fa50`, `FUN_01c8fbc0`: two names, a cache key, the three outputs at param_4[1], [3], [5]: vertex, pixel and embedded compute shader objects)
+/// are loaded from `data_trico/ps4_shader_cache/system/<set>_<name>_<kind>_<key>.sb`. The two names and the key name every shader the call creates.
+template <u32 Which>
+u64 PS4_SYSV_ABI ShaderCacheLoad(u64 name1, u64 name2, u64 entry, u64 outputs, u64 a4, u64 a5, u64 ret) {
+    static const u64 original = Core::GuestHooks::OriginalEntry(Which == 0 ? "ShaderCacheLoad0" : "ShaderCacheLoad1");
+    if (original == 0) {
+        return 0;
+    }
+    std::string first, second;
+    u32 key = 0;
+    Guarded([&]() -> u64 {
+        first = ReadCString(name1, 64);
+        second = ReadCString(name2, 64);
+        key = Rd<u32>(entry, 8);
+        return 0;
+    });
+    const u64 result = reinterpret_cast<GuestDraw6>(original)(name1, name2, entry, outputs, a4, a5);
+    Guarded([&]() -> u64 {
+        std::scoped_lock lock{shader_names_mutex};
+        for (u32 slot = 1; slot <= 5; slot += 2) {
+            const u64 object = Rd<u64>(outputs, slot * 8);
+            if (!IsHeapPointer(object)) {
+                continue;
+            }
+            const u32 id = Rd<u32>(object, 0x10), tag = Rd<u32>(object, 0x18);
+            const u64 code = Rd<u64>(object, 0xb8);
+            if (code == 0 || !shader_names_seen_ids.insert(id).second) {
+                continue;
+            }
+            ShaderName n;
+            n.program = code >> 8;
+            n.id = id;
+            n.tag = tag;
+            n.family = 10 + Which;
+            n.klass_index = key;
+            n.file = first;
+            n.entry = second;
+            n.defines = slot == 1 ? "vs" : slot == 3 ? "ps" : "cs";
+            n.first_resource = ReadCString(Rd<u64>(object, 0xa8), 40);
+            shader_names.push_back(std::move(n));
+        }
+        return 0;
+    });
+    PublishShaderNames();
+    return 0x8000000000000000ull | (result & 0x7fffffffffffffffull);
+}
+
+void PublishShaderNames() {
+    std::scoped_lock lock{shader_names_mutex};
+    nlohmann::json list = nlohmann::json::array();
+    for (const auto& n : shader_names) {
+        list.push_back({{"program", fmt::format("{:#x}", n.program)}, {"id", n.id}, {"tag", fmt::format("{:#x}", n.tag)}, {"family", n.family}, {"class_index", n.klass_index},
+                        {"file", n.file}, {"entry", n.entry}, {"defines", n.defines}, {"first_resource", n.first_resource}});
+    }
+    Core::DebugServer::Publish("shader_names", {{"count", shader_names.size()}, {"shaders", std::move(list)}});
+}
+
 /// N6.4: `FUN_01ee4e50(inner, instance group, view type)` binds an instance group for a depth / G-buffer batch. It copies the group's instance data (`memcpy` of `uploader[2]` bytes from
 /// `uploader[1]` into `uploader[idx + 3]`, idx = the dword at `uploader + 0x28`, the double buffer toggled by the function) with no Map in between: the write is announced here, before the
 /// function runs (writer 7 of the update list). The uploader is `*(group + 0xf0)`, null for a group without per frame data.
@@ -7471,6 +7625,21 @@ u64 PS4_SYSV_ABI DecalEnter(u64 render_device, u64 view, u64 a3, u64 a4, u64 des
 u64 FindHandler(const std::string& name) {
     if (name == "forward_enter") {
         return reinterpret_cast<u64>(&ForwardEnter);
+    }
+    if (name == "shader_cache_load_0") {
+        return reinterpret_cast<u64>(&ShaderCacheLoad<0>);
+    }
+    if (name == "shader_cache_load_1") {
+        return reinterpret_cast<u64>(&ShaderCacheLoad<1>);
+    }
+    if (name == "shader_class_compile_1") {
+        return reinterpret_cast<u64>(&ShaderClassCompile<1>);
+    }
+    if (name == "shader_class_compile_2") {
+        return reinterpret_cast<u64>(&ShaderClassCompile<2>);
+    }
+    if (name == "shader_class_compile_3") {
+        return reinterpret_cast<u64>(&ShaderClassCompile<3>);
     }
     if (name == "decal_enter") {
         return reinterpret_cast<u64>(&DecalEnter);
