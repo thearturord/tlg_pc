@@ -34,7 +34,7 @@ u64 Global(u64 ghidra) {
     return NativeDraw::ImageBase() + (ghidra - 0x1000000);
 }
 bool Plausible(u64 pointer) {
-    return pointer > 0x100000ull && pointer < (1ull << 47); // not 4 GB: the guest's stack can be mapped below it (the table pointers of some sites point into it)
+    return pointer > 0x100000000ull && pointer < (1ull << 47);
 }
 
 struct Config {

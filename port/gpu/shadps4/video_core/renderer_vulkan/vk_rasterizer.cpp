@@ -526,11 +526,11 @@ static u32 NativeHandleMode() {
 }
 
 /// B9 (`TLG_DISPATCH_BINDER`): the descriptors of a dispatch come from its record's typed bindings. 0 off, 2 the record serves every descriptor it holds, 3 like 2 but every
-/// descriptor is compared with the guest's (the guest's wins on a difference: the audit of the record against stale table reads). Default 3 until the owner plays with 2.
+/// descriptor is compared with the guest's (the guest's wins on a difference: the audit of the record against stale table reads). Default 0 (off): mode 2 caused a GPU device lost on 2026-10-28; 3 is a controlled test only.
 static u32 DispatchBinderMode() {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_DISPATCH_BINDER");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 3u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 0u;
     }();
     return mode;
 }
