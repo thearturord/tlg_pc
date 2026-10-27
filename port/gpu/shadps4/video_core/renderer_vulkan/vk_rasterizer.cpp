@@ -552,6 +552,16 @@ static bool DispatchTrustCheck(u64 key, T& chosen, F&& guest) {
     if (std::memcmp(&legacy, &chosen, sizeof(legacy)) == 0) {
         t.equal = std::min<u32>(t.equal + 1, 64);
     } else {
+        if (!t.bad) {
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1) < 80) {
+                u32 l[8] = {}, r[8] = {};
+                std::memcpy(l, &legacy, std::min<size_t>(sizeof(legacy), 32));
+                std::memcpy(r, &chosen, std::min<size_t>(sizeof(chosen), 32));
+                LOG_ERROR(Render_Vulkan, "B9 trust broken: caller {:#x} key kind {} program {:#x} offset {} after {} equal uses, guest {:08x} {:08x} {:08x} {:08x} record {:08x} {:08x} {:08x} {:08x}",
+                          (key >> 40) & 0xfffffffu, key >> 60, (key >> 8) & 0xffffffffu, key & 0xff, t.equal, l[0], l[1], l[2], l[3], r[0], r[1], r[2], r[3]);
+            }
+        }
         t.bad = true;
         g_identity_audit.dispatch_diff[6].fetch_add(1, std::memory_order_relaxed);
     }
