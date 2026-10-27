@@ -763,8 +763,79 @@ void Apply6(const Plan& p, Writer& w) {
     }
 }
 
-std::array<Site, 7>& Sites() {
-    static std::array<Site, 7> sites{{
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Site 7: the piece of `FUN_01d7d260` (the vertex cluster function) before its object loops, 0x01d7e0a1 .. 0x01d7e1bd, resumes at 0x01d7e1c0 (one dispatch per frame). The system is in r12
+// (copied from r15), the graphics context in r14: the holder `[system + 0xb0]` gives two constant buffers (`[holder + 0x78]`, `[holder + 0x60]`) to the stack slots 0x90 / 0x98, five
+// shader resources (`[[holder + 0x30 / 0x38 / 0x40 / 0x48 / 0x28] + 0x28]`, a null holder pointer gives 0) to 0x60 .. 0x80, one unordered access view (`[[holder] + 0x30]`) to 0x58;
+// SetConstantBuffers (0, 2), SetShaderResources (0, 6), SetUnorderedAccessViews (0, 1), SetShader (`[device + 0x1648]`), dispatch of ([system + 0xc0] + 63) / 64 groups.
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool Scan7(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    p.rsp = c->rsp;
+    const u64 system = c->r12;
+    p.context = c->r14;
+    if (!Plausible(system) || !Plausible(p.context) || !Plausible(R<u64>(p.context)) || !Plausible(R<u64>(R<u64>(p.context) + 0x58))) {
+        reason = "an object is not set";
+        return false;
+    }
+    const u64 holder = R<u64>(system + 0xb0);
+    if (!Plausible(holder)) {
+        reason = "no holder";
+        return false;
+    }
+    const u32 n = R<u32>(system + 0xc0);
+    if (n == 0) {
+        no_work = true;
+        return false;
+    }
+    const auto field = [&](u64 owner, u64 offset) -> u64 { return owner != 0 ? R<u64>(owner + offset) : 0; };
+    p.v[0] = R<u64>(holder + 0x78);
+    p.v[1] = R<u64>(holder + 0x60);
+    p.v[2] = field(R<u64>(holder + 0x30), 0x28); // [rsp + 0x60]
+    p.v[3] = field(R<u64>(holder + 0x38), 0x28); // [rsp + 0x68]
+    p.v[4] = field(R<u64>(holder + 0x40), 0x28); // [rsp + 0x70]
+    p.v[5] = field(R<u64>(holder + 0x48), 0x28); // [rsp + 0x78]
+    p.v[6] = field(R<u64>(holder + 0x28), 0x28); // [rsp + 0x80]
+    p.v[7] = field(R<u64>(holder), 0x30);        // [rsp + 0x58]
+    p.v[8] = R<u64>(p.rsp + 0x88);               // the sixth slot, not touched by the piece
+    const u64 device = R<u64>(Global(0x0689eed8));
+    p.v[9] = Plausible(device) ? R<u64>(device + 0x1648) : 0;
+    if (p.v[9] == 0) {
+        reason = "the shader is not set";
+        return false;
+    }
+    p.groups = (n + 63u) >> 6;
+    p.site_ghidra = 0x01d7e1c0;
+    p.async = false;
+    p.context_words.emplace_back(0x500, p.v[0]);
+    p.context_words.emplace_back(0x508, p.v[1]);
+    for (int i = 0; i < 5; ++i) {
+        p.context_words.emplace_back(0x1980 + 8 * i, p.v[2 + i]);
+    }
+    p.context_words.emplace_back(0x1980 + 40, p.v[8]);
+    p.context_words.emplace_back(0x2098, p.v[7]);
+    p.context_words.emplace_back(0x4670, p.v[9]);
+    p.registers = {{RBX, p.context}, {R15, p.context}};
+    return true;
+}
+void Apply7(const Plan& p, Writer& w) {
+    w.Put<u64>(p.rsp + 0x90, p.v[0]);
+    w.Put<u64>(p.rsp + 0x98, p.v[1]);
+    for (int i = 0; i < 5; ++i) {
+        w.Put<u64>(p.rsp + 0x60 + 8 * i, p.v[2 + i]);
+    }
+    w.Put<u64>(p.rsp + 0x58, p.v[7]);
+    if (w.Live()) {
+        const u64 vtable = R<u64>(p.context);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x28))(p.context, 0, 2, p.rsp + 0x90, 0, 0, 0);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x40))(p.context, 0, 6, p.rsp + 0x60, 0, 0, 0);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x48))(p.context, 0, 1, p.rsp + 0x58, 0, 0, 0);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x38))(p.context, p.v[9], 0, 0, 0, 0, 0); // SetShader
+        NativeDraw::IssueDispatch(p.context, p.groups, 1, 1, false, p.site_ghidra, false);
+    }
+}
+
+std::array<Site, 8>& Sites() {
+    static std::array<Site, 8> sites{{
         {"begin_recording_loop_1", 0x01c49e40, &Scan0, &Apply0, {}},
         {"begin_recording_loop_2", 0x01c4a9e3, &Scan1, &Apply1, {}},
         {"vertex_cluster_loop_1", 0x01d7e334, &Scan2, &Apply2, {}},
@@ -772,6 +843,7 @@ std::array<Site, 7>& Sites() {
         {"emitter_system_loop_e", 0x01bcc400, &Scan4, &Apply4, {}},
         {"emitter_system_loop_c", 0x01bcbf02, &Scan5, &Apply5, {}},
         {"emitter_system_loop_a", 0x01bcbb60, &Scan6, &Apply6, {}},
+        {"vertex_cluster_pre", 0x01d7e1c0, &Scan7, &Apply7, {}},
     }};
     return sites;
 }
@@ -1025,6 +1097,12 @@ u64 FindHandler(const char* name) {
     }
     if (n == "site_bottom_6") {
         return reinterpret_cast<u64>(&Bottom<6>);
+    }
+    if (n == "site_top_7") {
+        return reinterpret_cast<u64>(&Top<7>);
+    }
+    if (n == "site_bottom_7") {
+        return reinterpret_cast<u64>(&Bottom<7>);
     }
     return 0;
 }
