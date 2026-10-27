@@ -834,8 +834,192 @@ void Apply7(const Plan& p, Writer& w) {
     }
 }
 
-std::array<Site, 8>& Sites() {
-    static std::array<Site, 8> sites{{
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Sites 8 and 9: the third and fourth system loop of RenderDev_vfn18_BeginRecording, async context in `[rsp + 0x88]` (loop 3, rbx) or r14 (loop 4), the holder `[rsp + 0xa8]` (r14 /
+// r15). Same shape as sites 0 and 1: seven words at `holder + 0x27c0 ..` from the system, the sum of the part sizes and the entry of the array `[rsp + 0xa0]` (loop 3) or the loop
+// index and three counters (loop 4), the 64 bytes at `[rsp + 0x140]` copied to the staging block `[rsp + 0x18]`, UpdateSubresource of the constant buffer `[holder + 0x2820]`, the
+// views `[[rsp + 0x98] + 0x28]`, `[[rsp + 0x80] + 0x28]`, `[holder + 0x2848]` (loop 4 also `[holder + 0x2858]`) written through the stack at `[rsp + 0x100]` to the context's table at
+// `+ 0x1d18` (five entries), the shader (`[device + 0x1778]` / `0x1788`) at `+ 0x1d10` and a direct call of the async dispatch `0x024711c0`.
+// Loop 3: top at 0x01c4b590 (eax = the sum), resumes at 0x01c4b6ea. Loop 4 (first piece): top at 0x01c4bd40 (ebx = the sum), resumes at 0x01c4bea6; the piece only dispatches when the
+// counter `[[rsp + 0x40]]` is not zero (otherwise the engine runs it). The loop's second piece (0x01c4bea6 .. 0x01c4bfa8, shader 0x1798) is not reached in the default scene (0 per frame).
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool Scan8(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    p.rsp = c->rsp;
+    const u64 system = c->r13;
+    const u64 holder = R<u64>(p.rsp + 0xa8);
+    p.context = R<u64>(p.rsp + 0x88);
+    const u64 array = R<u64>(p.rsp + 0xa0);
+    const u64 entry = array + c->r15;
+    const u64 view0_owner = R<u64>(p.rsp + 0x98);
+    const u64 view1_owner = R<u64>(p.rsp + 0x80);
+    const u64 staging = R<u64>(p.rsp + 0x18);
+    const u64 update_source = R<u64>(p.rsp + 0x28);
+    if (!Plausible(system) || !Plausible(holder) || !Plausible(p.context) || !Plausible(array) || !Plausible(view0_owner) || !Plausible(view1_owner) || !Plausible(staging) ||
+        !Plausible(update_source)) {
+        reason = "an object of the loop is not set";
+        return false;
+    }
+    const u64 vtable = R<u64>(p.context);
+    if (!Plausible(vtable) || !Plausible(R<u64>(vtable + 0xd0))) {
+        reason = "the context has no virtual table";
+        return false;
+    }
+    const u32 size = R<u32>(entry + 0x10);
+    if (size == 0) {
+        no_work = true;
+        return false;
+    }
+    const u64 chain_source = R<u64>(p.rsp + 0xc0);
+    const u64 chain = chain_source != 0 ? chain_source : system;
+    const u64 device = R<u64>(Global(0x0689eed8));
+    p.v[0] = holder;
+    p.v[1] = staging;
+    p.v[2] = update_source;
+    p.v[3] = R<u32>(system + 0x50);
+    p.v[4] = R<u32>(chain + 0x54);
+    p.v[5] = static_cast<u32>(c->rax); // the sum of the part sizes
+    p.v[6] = R<u32>(entry + 0xc);
+    p.v[7] = R<u32>(entry + 0x10);
+    p.v[8] = R<u32>(entry + 0x8);
+    p.v[9] = R<u64>(holder + 0x2820); // the constant buffer
+    p.v[10] = R<u64>(view0_owner + 0x28);
+    p.v[11] = R<u64>(view1_owner + 0x28);
+    p.v[12] = R<u64>(holder + 0x2848);
+    p.v[13] = Plausible(device) ? R<u64>(device + 0x1778) : 0;
+    p.v[14] = entry;
+    if (p.v[13] == 0) {
+        reason = "the shader is not set";
+        return false;
+    }
+    p.groups = (size + 63u) >> 6;
+    p.site_ghidra = 0x01c4b6ea;
+    p.async = true;
+    p.context_words.emplace_back(0x1d10, p.v[13]);
+    p.context_words.emplace_back(0x1d18, p.v[10]);
+    p.context_words.emplace_back(0x1d20, p.v[11]);
+    p.context_words.emplace_back(0x1d28, p.v[12]);
+    p.context_words.emplace_back(0x1d30, 0);
+    p.context_words.emplace_back(0x1d38, 0);
+    p.registers = {{RBX, p.context}, {R13, entry + 0x10}, {R14, holder}};
+    return true;
+}
+void Apply8(const Plan& p, Writer& w) {
+    const u64 holder = p.v[0];
+    w.Put<u32>(holder + 0x27c0, static_cast<u32>(p.v[3]));
+    w.Put<u32>(holder + 0x27c4, static_cast<u32>(p.v[4]));
+    w.Put<u32>(holder + 0x27c8, static_cast<u32>(p.v[5]));
+    w.Put<u32>(holder + 0x27d0, static_cast<u32>(p.v[6]));
+    w.Put<u32>(holder + 0x27d4, static_cast<u32>(p.v[7]));
+    w.Put<u32>(holder + 0x27d8, 0);
+    w.Put<u32>(holder + 0x27dc, static_cast<u32>(p.v[8]));
+    u8 block[64];
+    std::memcpy(block, reinterpret_cast<const void*>(p.rsp + 0x140), 64);
+    w.Put(p.v[1], block, 32);
+    w.Put(p.v[1] + 0x20, block + 32, 32);
+    w.Put<u32>(p.rsp, 0); // the seventh argument slot
+    if (w.Live()) {
+        reinterpret_cast<Virtual>(R<u64>(R<u64>(p.context) + 0xd0))(p.context, p.v[9], 0, 0, p.v[2], 0, 0); // UpdateSubresource
+    }
+    u64 views[5] = {p.v[10], p.v[11], p.v[12], 0, 0};
+    w.Put(p.rsp + 0x100, views, 40);
+    w.Put(p.context + 0x1d18, views, 40);
+    w.Put<u64>(p.context + 0x1d10, p.v[13]);
+    if (w.Live()) {
+        NativeDraw::IssueDispatch(p.context, p.groups, 1, 1, false, p.site_ghidra, true);
+    }
+}
+
+bool Scan9(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    p.rsp = c->rsp;
+    const u64 system = c->r12;
+    const u64 holder = c->r15;
+    p.context = c->r14;
+    const u64 counter = R<u64>(p.rsp + 0x40);
+    const u64 view0_owner = R<u64>(p.rsp + 0x98);
+    const u64 view1_owner = R<u64>(p.rsp + 0x80);
+    const u64 staging = R<u64>(p.rsp + 0x18);
+    const u64 update_source = R<u64>(p.rsp + 0x28);
+    const u64 count_a = R<u64>(p.rsp + 0x58);
+    const u64 count_b = R<u64>(p.rsp + 0x50);
+    const u64 count_c = R<u64>(p.rsp + 0x48);
+    if (!Plausible(system) || !Plausible(holder) || !Plausible(p.context) || !Plausible(counter) || !Plausible(view0_owner) || !Plausible(view1_owner) || !Plausible(staging) ||
+        !Plausible(update_source) || !Plausible(count_a) || !Plausible(count_b) || !Plausible(count_c)) {
+        reason = "an object of the loop is not set";
+        return false;
+    }
+    const u64 vtable = R<u64>(p.context);
+    if (!Plausible(vtable) || !Plausible(R<u64>(vtable + 0xd0))) {
+        reason = "the context has no virtual table";
+        return false;
+    }
+    const u32 sum = static_cast<u32>(c->rbx);
+    if (R<u32>(counter) == 0 || sum == 0) {
+        no_work = true; // the piece writes the holder and does not dispatch
+        return false;
+    }
+    const u64 chain_source = R<u64>(p.rsp + 0xc0);
+    const u64 chain = chain_source != 0 ? chain_source : system;
+    const u64 device = R<u64>(Global(0x0689eed8));
+    p.v[0] = holder;
+    p.v[1] = staging;
+    p.v[2] = update_source;
+    p.v[3] = R<u32>(system + 0x50);
+    p.v[4] = R<u32>(chain + 0x54);
+    p.v[5] = sum;
+    p.v[6] = R<u32>(count_a);
+    p.v[7] = R<u32>(count_b);
+    p.v[8] = R<u32>(count_c);
+    p.v[9] = R<u64>(holder + 0x2820);
+    p.v[10] = R<u64>(view0_owner + 0x28);
+    p.v[11] = R<u64>(view1_owner + 0x28);
+    p.v[12] = R<u64>(holder + 0x2848);
+    p.v[13] = Plausible(device) ? R<u64>(device + 0x1788) : 0;
+    p.v[14] = R<u64>(holder + 0x2858);
+    p.v[15] = static_cast<u32>(c->r13); // the loop index
+    if (p.v[13] == 0) {
+        reason = "the shader is not set";
+        return false;
+    }
+    p.groups = (sum + 63u) >> 6;
+    p.site_ghidra = 0x01c4bea6;
+    p.async = true;
+    p.context_words.emplace_back(0x1d10, p.v[13]);
+    p.context_words.emplace_back(0x1d18, p.v[10]);
+    p.context_words.emplace_back(0x1d20, p.v[11]);
+    p.context_words.emplace_back(0x1d28, p.v[12]);
+    p.context_words.emplace_back(0x1d30, p.v[14]);
+    p.context_words.emplace_back(0x1d38, 0);
+    p.registers = {{R14, p.context}, {RBX, sum}};
+    return true;
+}
+void Apply9(const Plan& p, Writer& w) {
+    const u64 holder = p.v[0];
+    w.Put<u32>(holder + 0x27c0, static_cast<u32>(p.v[3]));
+    w.Put<u32>(holder + 0x27c4, static_cast<u32>(p.v[4]));
+    w.Put<u32>(holder + 0x27c8, static_cast<u32>(p.v[5]));
+    w.Put<u32>(holder + 0x27d0, static_cast<u32>(p.v[6]));
+    w.Put<u32>(holder + 0x27d4, static_cast<u32>(p.v[7]));
+    w.Put<u32>(holder + 0x27d8, static_cast<u32>(p.v[15]));
+    w.Put<u32>(holder + 0x27dc, static_cast<u32>(p.v[8]));
+    u8 block[64];
+    std::memcpy(block, reinterpret_cast<const void*>(p.rsp + 0x140), 64);
+    w.Put(p.v[1], block, 32);
+    w.Put(p.v[1] + 0x20, block + 32, 32);
+    w.Put<u32>(p.rsp, 0); // the seventh argument slot
+    if (w.Live()) {
+        reinterpret_cast<Virtual>(R<u64>(R<u64>(p.context) + 0xd0))(p.context, p.v[9], 0, 0, p.v[2], 0, 0); // UpdateSubresource
+    }
+    u64 views[5] = {p.v[10], p.v[11], p.v[12], p.v[14], 0};
+    w.Put(p.rsp + 0x100, views, 40);
+    w.Put(p.context + 0x1d18, views, 40);
+    w.Put<u64>(p.context + 0x1d10, p.v[13]);
+    if (w.Live()) {
+        NativeDraw::IssueDispatch(p.context, p.groups, 1, 1, false, p.site_ghidra, true);
+    }
+}
+
+std::array<Site, 10>& Sites() {
+    static std::array<Site, 10> sites{{
         {"begin_recording_loop_1", 0x01c49e40, &Scan0, &Apply0, {}},
         {"begin_recording_loop_2", 0x01c4a9e3, &Scan1, &Apply1, {}},
         {"vertex_cluster_loop_1", 0x01d7e334, &Scan2, &Apply2, {}},
@@ -844,6 +1028,8 @@ std::array<Site, 8>& Sites() {
         {"emitter_system_loop_c", 0x01bcbf02, &Scan5, &Apply5, {}},
         {"emitter_system_loop_a", 0x01bcbb60, &Scan6, &Apply6, {}},
         {"vertex_cluster_pre", 0x01d7e1c0, &Scan7, &Apply7, {}},
+        {"begin_recording_loop_3", 0x01c4b6ea, &Scan8, &Apply8, {}},
+        {"begin_recording_loop_4", 0x01c4bea6, &Scan9, &Apply9, {}},
     }};
     return sites;
 }
@@ -1103,6 +1289,18 @@ u64 FindHandler(const char* name) {
     }
     if (n == "site_bottom_7") {
         return reinterpret_cast<u64>(&Bottom<7>);
+    }
+    if (n == "site_top_8") {
+        return reinterpret_cast<u64>(&Top<8>);
+    }
+    if (n == "site_bottom_8") {
+        return reinterpret_cast<u64>(&Bottom<8>);
+    }
+    if (n == "site_top_9") {
+        return reinterpret_cast<u64>(&Top<9>);
+    }
+    if (n == "site_bottom_9") {
+        return reinterpret_cast<u64>(&Bottom<9>);
     }
     return 0;
 }
