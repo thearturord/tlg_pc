@@ -80,7 +80,7 @@ void MigrateLegacyCache(const std::filesystem::path& cache_path) {
 // keys (and the unkeyed <serial>) are removed, in the port's own cache folder only.
 bool IndexedBuild() {
     const char* e = std::getenv("TLG_INDEXED_DATA");
-    return e != nullptr && *e != 0 && *e != '0';
+    return e == nullptr || *e != '0'; // default on
 }
 bool EndsWithIdx(const std::string& name) {
     // "-idx" with an optional revision digit: the revision changes with the indexed SPIR-V
@@ -112,7 +112,7 @@ std::filesystem::path GameCacheDir() {
     const std::string serial{Common::ElfInfo::Instance().GameSerial()};
 #ifdef TLG_SHADER_CACHE_KEY
     const char* indexed = std::getenv("TLG_INDEXED_DATA");
-    const bool indexed_build = indexed != nullptr && *indexed != 0 && *indexed != '0';
+    const bool indexed_build = indexed == nullptr || *indexed != '0'; // default on
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
            (serial + "-" + TLG_SHADER_CACHE_KEY + (indexed_build ? "-idx5" : ""));
 #else

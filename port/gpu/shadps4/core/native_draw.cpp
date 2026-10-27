@@ -2673,14 +2673,14 @@ void SynthAuditNote(const Signature& sig, u32 kind, const NativeRecord& slot) {
 bool NativeListOn() {
     static const bool on = [] {
         const char* e = std::getenv("TLG_NATIVE_LIST");
-        return e != nullptr && *e != 0 && *e != '0';
+        return e == nullptr || *e != '0'; // default on since 2026-10-27 (the owner's play test); TLG_NATIVE_LIST=0 turns it off
     }();
     return on;
 }
 u32 NativeListVerifyEvery() {
     static const u32 every = [] {
         const char* e = std::getenv("TLG_NATIVE_LIST_VERIFY");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 64u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 256u;
     }();
     return every;
 }

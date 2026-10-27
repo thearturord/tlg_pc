@@ -519,7 +519,7 @@ void ApplyExecRegisters(DrawInputs& in, const Core::NativeDraw::ExecDraw& draw, 
 static u32 NativeHandleMode() {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_NATIVE_HANDLES");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 0u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 2u; // default 2 since 2026-10-27 (the owner's play test); 0 turns it off
     }();
     return mode;
 }
@@ -527,7 +527,7 @@ static u32 NativeHandleMode() {
 static u32 NativeBinderMode() {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_NATIVE_BINDER");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 0u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 2u; // default 2 since 2026-10-27 (the owner's play test); 0 turns it off
     }();
     return mode;
 }

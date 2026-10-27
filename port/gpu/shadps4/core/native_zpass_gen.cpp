@@ -144,13 +144,13 @@ auto Timed(CallId id, F&& body) {
 struct Config {
     bool on{false};
     std::array<bool, 16> views{};
-    u32 verify_every{32};
+    u32 verify_every{256}; // default: one pass in 256 is checked against the engine's loop
 };
 const Config& Cfg() {
     static const Config config = [] {
         Config c;
         const char* e = std::getenv("TLG_ZPASS_GEN");
-        c.on = e != nullptr && *e != 0 && *e != '0';
+        c.on = e == nullptr || *e != '0'; // default on since 2026-10-27 (the owner's play test); TLG_ZPASS_GEN=0 turns it off
         const char* v = std::getenv("TLG_ZPASS_GEN_VIEWS");
         std::string list = v != nullptr && *v != 0 ? v : "0,1,2,5,6,7";
         size_t at = 0;
@@ -1818,13 +1818,13 @@ void GenerateGBuffer(Target& t, const GPlan& plan, u32 pass_flags) {
 
 struct GConfig {
     bool on{false};
-    u32 verify_every{32};
+    u32 verify_every{256}; // default: one pass in 256 is checked against the engine's loop
 };
 const GConfig& GCfg() {
     static const GConfig config = [] {
         GConfig c;
         const char* e = std::getenv("TLG_GBUFFER_GEN");
-        c.on = e != nullptr && *e != 0 && *e != '0';
+        c.on = e == nullptr || *e != '0'; // default on since 2026-10-27 (the owner's play test); TLG_GBUFFER_GEN=0 turns it off
         if (const char* n = std::getenv("TLG_GBUFFER_GEN_VERIFY"); n != nullptr && *n != 0) {
             c.verify_every = static_cast<u32>(std::atoi(n));
         }
@@ -2541,13 +2541,13 @@ void GenerateForward(Target& t, const FPlan& plan) {
 
 struct FConfig {
     bool on{false};
-    u32 verify_every{32};
+    u32 verify_every{256}; // default: one pass in 256 is checked against the engine's loop
 };
 const FConfig& FCfg() {
     static const FConfig config = [] {
         FConfig c;
         const char* e = std::getenv("TLG_FORWARD_GEN");
-        c.on = e != nullptr && *e != 0 && *e != '0';
+        c.on = e == nullptr || *e != '0'; // default on since 2026-10-27 (the owner's play test); TLG_FORWARD_GEN=0 turns it off
         if (const char* n = std::getenv("TLG_FORWARD_GEN_VERIFY"); n != nullptr && *n != 0) {
             c.verify_every = static_cast<u32>(std::atoi(n));
         }
@@ -3024,13 +3024,13 @@ void GenerateDecal(Target& t, const DPlan& plan) {
 
 struct DConfig {
     bool on{false};
-    u32 verify_every{32};
+    u32 verify_every{256}; // default: one pass in 256 is checked against the engine's loop
 };
 const DConfig& DCfg() {
     static const DConfig config = [] {
         DConfig c;
         const char* e = std::getenv("TLG_DECAL_GEN");
-        c.on = e != nullptr && *e != 0 && *e != '0';
+        c.on = e == nullptr || *e != '0'; // default on since 2026-10-27 (the owner's play test); TLG_DECAL_GEN=0 turns it off
         if (const char* n = std::getenv("TLG_DECAL_GEN_VERIFY"); n != nullptr && *n != 0) {
             c.verify_every = static_cast<u32>(std::atoi(n));
         }
@@ -3652,13 +3652,13 @@ void GenerateSkin(Target& t, const SkinPlan& p) {
 
 struct SConfig {
     bool on{false};
-    u32 verify_every{32};
+    u32 verify_every{256}; // default: one pass in 256 is checked against the engine's loop
 };
 const SConfig& SCfg() {
     static const SConfig config = [] {
         SConfig c;
         const char* e = std::getenv("TLG_SKIN_GEN");
-        c.on = e != nullptr && *e != 0 && *e != '0';
+        c.on = e == nullptr || *e != '0'; // default on since 2026-10-27 (the owner's play test); TLG_SKIN_GEN=0 turns it off
         if (const char* n = std::getenv("TLG_SKIN_GEN_VERIFY"); n != nullptr && *n != 0) {
             c.verify_every = static_cast<u32>(std::atoi(n));
         }
@@ -4301,13 +4301,13 @@ void GenerateWet(Target& t, const WetPlan& p) {
 
 struct WConfig {
     bool on{false};
-    u32 verify_every{32};
+    u32 verify_every{256}; // default: one pass in 256 is checked against the engine's loop
 };
 const WConfig& WCfg() {
     static const WConfig config = [] {
         WConfig c;
         const char* e = std::getenv("TLG_WET_GEN");
-        c.on = e != nullptr && *e != 0 && *e != '0';
+        c.on = e == nullptr || *e != '0'; // default on since 2026-10-27 (the owner's play test); TLG_WET_GEN=0 turns it off
         if (const char* n = std::getenv("TLG_WET_GEN_VERIFY"); n != nullptr && *n != 0) {
             c.verify_every = static_cast<u32>(std::atoi(n));
         }
@@ -4746,13 +4746,13 @@ void GenerateInst(Target& t, const InstPlan& p) {
 
 struct IConfig {
     bool on{false};
-    u32 verify_every{32};
+    u32 verify_every{256}; // default: one pass in 256 is checked against the engine's loop
 };
 const IConfig& ICfg() {
     static const IConfig config = [] {
         IConfig c;
         const char* e = std::getenv("TLG_INST_GEN");
-        c.on = e != nullptr && *e != 0 && *e != '0';
+        c.on = e == nullptr || *e != '0'; // default on since 2026-10-27 (the owner's play test); TLG_INST_GEN=0 turns it off
         if (const char* n = std::getenv("TLG_INST_GEN_VERIFY"); n != nullptr && *n != 0) {
             c.verify_every = static_cast<u32>(std::atoi(n));
         }

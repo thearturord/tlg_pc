@@ -18,7 +18,7 @@ namespace Vulkan {
 bool IndexedData::RequestedByEnvironment() {
     static const bool on = [] {
         const char* e = std::getenv("TLG_INDEXED_DATA");
-        return e != nullptr && *e != 0 && *e != '0';
+        return e == nullptr || *e != '0'; // default on since 2026-10-27 (the owner's play test); TLG_INDEXED_DATA=0 turns it off
     }();
     return on;
 }
