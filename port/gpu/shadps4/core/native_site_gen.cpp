@@ -111,7 +111,7 @@ private:
 /// One thing a straight line piece does (the step based sites build a list of them in the scan and `ApplySteps` does them in the engine's order: stack slot writes, the virtuals of
 /// the context, the dispatch).
 struct Step {
-    enum Kind : u8 { PutStack64, PutStack32, PutAbs64, PutAbs32, Update, SetCb, SetUav, SetSrv, SetShader, Dispatch } kind;
+    enum Kind : u8 { PutStack64, PutStack32, PutAbs64, PutAbs32, PutAbs8, PutAbsZero, Update, SetCb, SetUav, SetSrv, SetShader, Dispatch } kind;
     u64 a{}, b{}, c{}, d{}, e{};
     // PutStack*: a = offset from rsp, b = value. PutAbs*: a = address, b = value. Update: a = constant buffer, b = source (the seventh argument slot at [rsp] is zeroed).
     // SetCb / SetUav / SetSrv: a = first slot, b = count, c = offset from rsp of the array. SetShader: a = shader. Dispatch: a, b, c = groups, d = call site (ghidra), e = fenced.
@@ -1272,6 +1272,12 @@ void ApplySteps(const Plan& p, Writer& w) {
         case Step::PutStack32: w.Put<u32>(p.rsp + s.a, static_cast<u32>(s.b)); break;
         case Step::PutAbs64: w.Put<u64>(s.a, s.b); break;
         case Step::PutAbs32: w.Put<u32>(s.a, static_cast<u32>(s.b)); break;
+        case Step::PutAbs8: w.Put<u8>(s.a, static_cast<u8>(s.b)); break;
+        case Step::PutAbsZero: {
+            u8 zeros[64]{};
+            w.Put(s.a, zeros, s.b); // s.b <= 64 bytes
+            break;
+        }
         case Step::Update:
             w.Put<u32>(p.rsp, 0); // the seventh argument slot
             if (w.Live()) {
@@ -1497,6 +1503,9 @@ struct StepList {
     void shader(u64 value) { p.steps.push_back({Step::SetShader, value}); }
     void dispatch(u64 x, u64 y, u64 site, bool fenced = true) { p.steps.push_back({Step::Dispatch, x, y, 1, site, fenced ? 1u : 0u}); }
     void abs(u64 address, u64 value) { p.steps.push_back({Step::PutAbs64, address, value}); }
+    void abs32(u64 address, u64 value) { p.steps.push_back({Step::PutAbs32, address, value}); }
+    void abs8(u64 address, u64 value) { p.steps.push_back({Step::PutAbs8, address, value}); }
+    void zero(u64 address, u64 size) { p.steps.push_back({Step::PutAbsZero, address, size}); }
     void update(u64 buffer, u64 source) { p.steps.push_back({Step::Update, buffer, source}); }
 };
 
@@ -1970,8 +1979,109 @@ bool Scan22(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
     return true;
 }
 
-std::array<Site, 23>& Sites() {
-    static std::array<Site, 23> sites{{
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Site 23: the scene job `0x01c6018a .. 0x01c6024c` of `RenderDev_RenderScene` (graphics context r13, the system `[rsp + 0x3c8]` in rbx, r15d the element count, nonzero): two
+// constant buffers from slot 12 (`[rbx + 0x3980]`, `[rbx + 0x3b80]`), three words of the system (count, 0, 0), UpdateSubresource of `[rbx + 0x3b80]` from `rbx + 0x3990`, the shader
+// `[device + 0x1838]` and a plain dispatch of ((count + 63) / 64, 1, 1). Leaves r15 = the groups, r12 = rbx + 0x3990.
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool Scan23(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    (void)no_work;
+    p.rsp = c->rsp;
+    p.context = c->r13;
+    const u64 system = R<u64>(p.rsp + 0x3c8);
+    const u64 device = R<u64>(Global(0x0689eed8));
+    const u32 count = static_cast<u32>(c->r15);
+    if (!Plausible(system) || !Plausible(device) || count == 0) {
+        reason = "an object is not set";
+        return false;
+    }
+    const u64 shader = R<u64>(device + 0x1838);
+    if (shader == 0) {
+        reason = "the shader is not set";
+        return false;
+    }
+    const u32 gx = (count + 63u) >> 6;
+    StepList s{p};
+    s.put(0x820, R<u64>(system + 0x3980));
+    s.put(0x828, R<u64>(system + 0x3b80));
+    s.cb(12, 2, 0x820);
+    s.abs32(system + 0x3b30, count);
+    s.abs(system + 0x3b34, 0);
+    s.abs32(system + 0x3b3c, 0);
+    s.update(R<u64>(system + 0x3b80), system + 0x3990);
+    s.shader(shader);
+    s.dispatch(gx, 1, 0x01c6024f, false);
+    if (!Finish(p, ContextKind(p.context))) {
+        reason = "the context is not a known context";
+        return false;
+    }
+    p.registers = {{R15, gx}, {R12, system + 0x3990}, {RBX, system}};
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Site 24: a pass that writes straight into the graphics context `[rbx + 0x2d8]` (rbx the device, r12 `[rsp + 0xb8]` the target set, 0x01c636dc .. 0x01c63811, fenced dispatch with the
+// plain call `0x02479810`): the context's bookkeeping words at `+ 0x4484 ..` are cleared and set, the view `[[r12 + 0x20] + 0x50]`, the shader resources from slot 0 (`[rsp + 0x320]`,
+// r13, `[rsp + 0x2e0]`, `[rsp + 0x2d0]`, `[rsp + 0x2c0]`, 0, rsi, zeros, r11, r9, r10, r8), the shader `[rbx + (rax << 4) + 0x1008]`, groups ((w + 7) / 8, (h + 7) / 8, 1).
+// Leaves r12 = the set, r13 = rbx, r15 = rdx.
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool Scan24(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    (void)no_work;
+    p.rsp = c->rsp;
+    const u64 device = c->rbx;
+    const u64 set = R<u64>(p.rsp + 0xb8);
+    if (!Plausible(device) || !Plausible(set)) {
+        reason = "an object is not set";
+        return false;
+    }
+    const u64 ctx = R<u64>(device + 0x2d8);
+    p.context = ctx;
+    const u64 view_owner = R<u64>(set + 0x20);
+    if (!Plausible(ctx) || !Plausible(view_owner)) {
+        reason = "the context or the target is not set";
+        return false;
+    }
+    const u64 shader = R<u64>(device + (c->rax << 4) + 0x1008);
+    if (shader == 0) {
+        reason = "the shader is not set";
+        return false;
+    }
+    const u32 gx = (R<u32>(set + 0x84) + 7u) >> 3;
+    const u32 gy = (R<u32>(set + 0x88) + 7u) >> 3;
+    StepList s{p};
+    s.zero(ctx + 0x44a4, 32);
+    s.zero(ctx + 0x4484, 32);
+    s.abs32(ctx + 0x44c4, 0);
+    s.abs8(ctx + 0x44c8, 1);
+    s.abs(ctx + 0x44d0, 0);
+    s.abs8(ctx + 0x44d8, 1);
+    s.abs(ctx + 0x2098, R<u64>(view_owner + 0x50));
+    s.abs(ctx + 0x1980, R<u64>(p.rsp + 0x320));
+    s.abs(ctx + 0x1988, c->r13);
+    s.abs(ctx + 0x1990, R<u64>(p.rsp + 0x2e0));
+    s.abs(ctx + 0x1998, R<u64>(p.rsp + 0x2d0));
+    s.abs(ctx + 0x19a0, R<u64>(p.rsp + 0x2c0));
+    s.abs(ctx + 0x19a8, 0);
+    s.abs(ctx + 0x19b0, c->rsi);
+    s.zero(ctx + 0x19e8, 32);
+    s.zero(ctx + 0x19d8, 32);
+    s.zero(ctx + 0x19b8, 32);
+    s.abs(ctx + 0x1a08, c->r11);
+    s.abs(ctx + 0x1a10, c->r9);
+    s.abs(ctx + 0x1a18, c->r10);
+    s.abs(ctx + 0x1a20, c->r8);
+    s.abs(ctx + 0x4670, shader);
+    s.dispatch(gx, gy, 0x01c63816);
+    if (!Finish(p, ContextKind(ctx))) {
+        reason = "the context is not a known context";
+        return false;
+    }
+    p.registers = {{R12, set}, {R13, device}, {R15, c->rdx}};
+    return true;
+}
+
+std::array<Site, 25>& Sites() {
+    static std::array<Site, 25> sites{{
         {"begin_recording_loop_1", 0x01c49e40, &Scan0, &Apply0, {}},
         {"begin_recording_loop_2", 0x01c4a9e3, &Scan1, &Apply1, {}},
         {"vertex_cluster_loop_1", 0x01d7e334, &Scan2, &Apply2, {}},
@@ -1995,6 +2105,8 @@ std::array<Site, 23>& Sites() {
         {"render_scene_pass_g", 0x01c6413d, &Scan20, &ApplySteps, {}},
         {"render_scene_pass_h", 0x01c6456d, &Scan21, &ApplySteps, {}},
         {"render_scene_dispatch_tail", 0x01c6e128, &Scan22, &ApplySteps, {}},
+        {"scene_job_1c60", 0x01c6024f, &Scan23, &ApplySteps, {}},
+        {"render_scene_pass_i", 0x01c63816, &Scan24, &ApplySteps, {}},
     }};
     return sites;
 }
@@ -2398,6 +2510,18 @@ u64 FindHandler(const char* name) {
     }
     if (n == "site_bottom_22") {
         return reinterpret_cast<u64>(&Bottom<22>);
+    }
+    if (n == "site_top_23") {
+        return reinterpret_cast<u64>(&Top<23>);
+    }
+    if (n == "site_bottom_23") {
+        return reinterpret_cast<u64>(&Bottom<23>);
+    }
+    if (n == "site_top_24") {
+        return reinterpret_cast<u64>(&Top<24>);
+    }
+    if (n == "site_bottom_24") {
+        return reinterpret_cast<u64>(&Bottom<24>);
     }
     return 0;
 }
