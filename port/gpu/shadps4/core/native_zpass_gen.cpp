@@ -38,6 +38,7 @@
 #include "common/logging/log.h"
 #include "core/native_draw.h"
 #include "core/native_zpass_gen.h"
+#include "core/native_job_gen.h"
 #include "core/debug_server.h"
 
 namespace Core::NativeZPassGen {
@@ -5810,6 +5811,7 @@ nlohmann::json Report() {
     nlohmann::json out = nlohmann::json::object();
     out["enabled"] = cfg.on;
     out["verify_every_n_passes"] = cfg.verify_every;
+    out["job_loop"] = NativeJobGen::Report(); // B7 (core/native_job_gen.cpp)
     nlohmann::json views_on = nlohmann::json::array();
     for (u32 i = 0; i < cfg.views.size(); ++i) {
         if (cfg.views[i]) {

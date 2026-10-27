@@ -38,6 +38,7 @@
 #include "core/libraries/gnmdriver/gnmdriver.h"
 #include "core/frame_timeline.h"
 #include "core/native_draw.h"
+#include "core/native_job_gen.h"
 #include "core/native_readbacks.h"
 #include "core/native_registry.h"
 #include "core/native_resources.h"
@@ -7638,6 +7639,7 @@ u64 PS4_SYSV_ABI MeasureExCsDepthCopy(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u
 }
 
 u64 PS4_SYSV_ABI TagAscDispatch(u64 jcc, u64 x, u64 y, u64 z, u64 a4, u64 a5, u64 ret) {
+    NativeJobGen::NoteAsyncDispatch(jcc, x, y, z, ret); // B7: the verify run compares the engine's dispatch with the generator's prediction
     if (NativeZPassGen::VerifyActive()) {
         NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 4, jcc, static_cast<u32>(x), static_cast<u32>(y), static_cast<u32>(z));
     }
@@ -8032,6 +8034,12 @@ u64 PS4_SYSV_ABI MidProbeB7(Core::GuestHooks::MidContext* ctx) {
             sample["rbx"] = fmt::format("{:#x}", ctx->rbx);
             sample["r13"] = fmt::format("{:#x}", ctx->r13);
             sample["r15"] = fmt::format("{:#x}", ctx->r15);
+            const u64 context = ctx->r13;
+            const u64 vtable = Rd<u64>(context, 0);
+            sample["context"] = fmt::format("{:#x}", context);
+            for (const u32 slot : {0x28u, 0x38u, 0x58u, 0xd0u}) {
+                sample[fmt::format("vfn_{:#x}_ghidra", slot)] = fmt::format("{:#x}", Rd<u64>(vtable, slot) - ImageBase() + 0x1000000);
+            }
             return 0;
         });
         std::scoped_lock lock{samples_mutex};
@@ -8276,6 +8284,12 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "shader_cache_load_1") {
         return reinterpret_cast<u64>(&ShaderCacheLoad<1>);
+    }
+    if (name == "job_loop_top") {
+        return reinterpret_cast<u64>(&NativeJobGen::JobLoopTop);
+    }
+    if (name == "job_loop_bottom") {
+        return reinterpret_cast<u64>(&NativeJobGen::JobLoopBottom);
     }
     if (name == "mid_probe_b7") {
         return reinterpret_cast<u64>(&MidProbeB7);
