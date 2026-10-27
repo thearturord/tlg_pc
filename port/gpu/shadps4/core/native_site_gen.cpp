@@ -2173,8 +2173,49 @@ bool Scan26(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
     return true;
 }
 
-std::array<Site, 27>& Sites() {
-    static std::array<Site, 27> sites{{
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Site 27: a small pass of the system at ghidra 0x01ee4cf3 (frame addressed through rbp, context rbx, r8 the global object `[0x069f53e8]`): UpdateSubresource of `[g + 0x80]` from
+// `g + 0x10`, SetConstantBuffers (slot 10, `[g + 0x80]`), one view `[[g + 0x90] + 0x50]`, one shader resource `[device + 0x41b0]`, the shader `[device + 0x10a8]` and a plain dispatch of
+// (1, `[g + 4]`, 1). Leaves r15 = rbp - 0x60, r14 = rbp - 0x40, r13 = rbp - 0x68. The hook sits one instruction after the global is loaded (that one is relative to the instruction pointer).
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool Scan27(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    (void)no_work;
+    p.rsp = c->rsp;
+    p.context = c->rbx;
+    const u64 global = c->r8;
+    const u64 device = R<u64>(Global(0x0689eed8));
+    if (!Plausible(global) || !Plausible(device) || !Plausible(c->rbp)) {
+        reason = "an object is not set";
+        return false;
+    }
+    const u64 view_owner = R<u64>(global + 0x90);
+    const u64 shader = R<u64>(device + 0x10a8);
+    if (!Plausible(view_owner) || shader == 0) {
+        reason = "the object or the shader is not set";
+        return false;
+    }
+    const auto slot = [&](u64 below) { return c->rbp - below - c->rsp; }; // the offset from rsp of [rbp - below]
+    const u64 cb_slot = slot(0x60), uav_slot = slot(0x40), srv_slot = slot(0x68);
+    StepList s{p};
+    s.update(R<u64>(global + 0x80), global + 0x10);
+    s.put(cb_slot, R<u64>(global + 0x80));
+    s.put(uav_slot, R<u64>(view_owner + 0x50));
+    s.put(srv_slot, R<u64>(device + 0x41b0));
+    s.cbp(10, 1, c->rbp - 0x60);
+    s.uavp(1, c->rbp - 0x40);
+    s.srvp(1, c->rbp - 0x68);
+    s.shader(shader);
+    s.dispatch(1, R<u32>(global + 4), 0x01ee4dd5, false);
+    if (!Finish(p, ContextKind(p.context))) {
+        reason = "the context is not a known context";
+        return false;
+    }
+    p.registers = {{R15, c->rbp - 0x60}, {R14, c->rbp - 0x40}, {R13, c->rbp - 0x68}};
+    return true;
+}
+
+std::array<Site, 28>& Sites() {
+    static std::array<Site, 28> sites{{
         {"begin_recording_loop_1", 0x01c49e40, &Scan0, &Apply0, {}},
         {"begin_recording_loop_2", 0x01c4a9e3, &Scan1, &Apply1, {}},
         {"vertex_cluster_loop_1", 0x01d7e334, &Scan2, &Apply2, {}},
@@ -2202,6 +2243,7 @@ std::array<Site, 27>& Sites() {
         {"render_scene_pass_i", 0x01c63816, &Scan24, &ApplySteps, {}},
         {"emitter_system_loop_b", 0x01bcbc10, &Scan25, &ApplySteps, {}},
         {"emitter_system_loop_d", 0x01bcc200, &Scan26, &ApplySteps, {}},
+        {"system_pass_ee", 0x01ee4dd5, &Scan27, &ApplySteps, {}},
     }};
     return sites;
 }
@@ -2629,6 +2671,12 @@ u64 FindHandler(const char* name) {
     }
     if (n == "site_bottom_26") {
         return reinterpret_cast<u64>(&Bottom<26>);
+    }
+    if (n == "site_top_27") {
+        return reinterpret_cast<u64>(&Top<27>);
+    }
+    if (n == "site_bottom_27") {
+        return reinterpret_cast<u64>(&Bottom<27>);
     }
     return 0;
 }
