@@ -39,6 +39,7 @@
 #include "core/frame_timeline.h"
 #include "core/native_draw.h"
 #include "core/native_job_gen.h"
+#include "core/native_site_gen.h"
 #include "core/native_readbacks.h"
 #include "core/native_registry.h"
 #include "core/native_resources.h"
@@ -7640,6 +7641,7 @@ u64 PS4_SYSV_ABI MeasureExCsDepthCopy(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u
 
 u64 PS4_SYSV_ABI TagAscDispatch(u64 jcc, u64 x, u64 y, u64 z, u64 a4, u64 a5, u64 ret) {
     NativeJobGen::NoteAsyncDispatch(jcc, x, y, z, ret); // B7: the verify run compares the engine's dispatch with the generator's prediction
+    NativeSiteGen::NoteDispatch(jcc, x, y, z, ret);
     if (NativeZPassGen::VerifyActive()) {
         NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 4, jcc, static_cast<u32>(x), static_cast<u32>(y), static_cast<u32>(z));
     }
@@ -8284,6 +8286,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "shader_cache_load_1") {
         return reinterpret_cast<u64>(&ShaderCacheLoad<1>);
+    }
+    if (const u64 site_handler = NativeSiteGen::FindHandler(std::string(name).c_str()); site_handler != 0) {
+        return site_handler;
     }
     if (name == "job_loop_top") {
         return reinterpret_cast<u64>(&NativeJobGen::JobLoopTop);
