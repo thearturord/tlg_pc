@@ -200,6 +200,10 @@ struct DispatchPlan {
     StagePlan stage{};
     u64 ring_end{}; ///< T1: the constant ring position after this plan's copies
     u64 native_seq{}; ///< B2: the record this dispatch was planned from (the registry audit names its resources by it)
+    /// B9: the typed bindings of that record (the descriptors in the dispatch's user data, with the engine ids); complete when none was dropped
+    std::array<Core::NativeDraw::RecordBinding, Core::NativeDraw::MaxRecordBindings> bindings{};
+    u32 binding_count{};
+    bool bindings_complete{};
 };
 
 class PipelineCache {

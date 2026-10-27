@@ -549,6 +549,7 @@ private:
     PendingFill pending_fill{};
     const DrawInputs* draw_inputs{}; ///< of the draw being recorded (Draw / DrawIndirect)
     const DrawPlan* geometry_plan{}; ///< N6.2: the plan of the draw whose vertex and index buffers are being bound (its record names their engine ids)
+    const DispatchPlan* dispatch_audit_plan{}; ///< B9: the plan of the dispatch being bound; its record's descriptors are compared with the guest's (TLG_DISPATCH_AUDIT=1)
     const DrawPlan* binder_plan{};   ///< N3: the plan whose record binds the resources of the draw being recorded (null: from the flat user data)
     bool binder_verify{};
     const DrawPlan* NativeBinderFor(const DrawPlan* plan, u32 draw_class);

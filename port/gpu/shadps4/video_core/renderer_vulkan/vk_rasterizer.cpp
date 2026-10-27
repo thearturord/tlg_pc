@@ -801,6 +801,8 @@ std::unique_ptr<DispatchPlan> Rasterizer::PlanDispatch(const AmdGpu::ComputeProg
         plan = std::make_unique<DispatchPlan>();
     }
     pipeline_cache.PlanCompute(cs, *plan);
+    plan->binding_count = 0;
+    plan->bindings_complete = false;
     plan->cs = cs;
     plan->ta_bc_base = ta_bc_base;
     return plan;
@@ -1215,6 +1217,13 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
         // C1 / C2 audit: the pipeline of a program address
         auto& audit = g_identity_audit;
         audit.dispatches.fetch_add(1, std::memory_order_relaxed);
+        if (plan != nullptr && plan->native_seq != 0) {
+            audit.dispatch_with_record.fetch_add(1, std::memory_order_relaxed);
+            if (plan->bindings_complete) {
+                audit.dispatch_bindings_complete.fetch_add(1, std::memory_order_relaxed);
+                audit.dispatch_binding_entries.fetch_add(plan->binding_count, std::memory_order_relaxed);
+            }
+        }
         const auto [it, is_new] = identity_tables.programs.try_emplace(cs_program.address, pipeline);
         if (is_new) {
             audit.programs_seen.fetch_add(1, std::memory_order_relaxed);
@@ -1231,7 +1240,11 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
         return;
     }
 
-    if (!BindResources(pipeline)) {
+    static const bool dispatch_audit_on = std::getenv("TLG_DISPATCH_AUDIT") != nullptr;
+    dispatch_audit_plan = (dispatch_audit_on && plan != nullptr && plan->bindings_complete) ? plan : nullptr;
+    const bool dispatch_bound = BindResources(pipeline);
+    dispatch_audit_plan = nullptr;
+    if (!dispatch_bound) {
         return;
     }
 
@@ -1267,7 +1280,11 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Dis
         return;
     }
 
-    if (!BindResources(pipeline)) {
+    static const bool dispatch_audit_on = std::getenv("TLG_DISPATCH_AUDIT") != nullptr;
+    dispatch_audit_plan = (dispatch_audit_on && plan != nullptr && plan->bindings_complete) ? plan : nullptr;
+    const bool dispatch_bound = BindResources(pipeline);
+    dispatch_audit_plan = nullptr;
+    if (!dispatch_bound) {
         return;
     }
 
@@ -2203,6 +2220,31 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         if (std::memcmp(&legacy, &chosen_sharp, sizeof(legacy)) != 0) {
                             Core::NativeRegistry::NoteBinder(4);
                             chosen_sharp = legacy;
+                        }
+                    }
+                }
+            }
+            if (!from_record && dispatch_audit_plan != nullptr && stage.sw_stage == Shader::SwStage::Compute &&
+                desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
+                auto& audit = g_identity_audit;
+                audit.dispatch_buffer_loads.fetch_add(1, std::memory_order_relaxed);
+                const u32* words = nullptr;
+                for (u32 s = 0; s < 8 && words == nullptr; ++s) {
+                    words = FindRecordWords(stage, dispatch_audit_plan->bindings.data(), dispatch_audit_plan->binding_count, s, 1, desc.sharp_fetch.offsets[0], 4);
+                }
+                if (words != nullptr) {
+                    audit.dispatch_buffer_record.fetch_add(1, std::memory_order_relaxed);
+                    const auto legacy = desc.GetSharp(stage);
+                    const auto recorded = desc.FromWords(words, stage);
+                    (std::memcmp(&legacy, &recorded, sizeof(legacy)) == 0 ? audit.dispatch_buffer_equal : audit.dispatch_buffer_different).fetch_add(1, std::memory_order_relaxed);
+                    if (std::memcmp(&legacy, &recorded, sizeof(legacy)) != 0) {
+                        static std::atomic<u32> logged{0};
+                        if (logged.fetch_add(1) < 12) {
+                            u32 l[4], r[4];
+                            std::memcpy(l, &legacy, 16);
+                            std::memcpy(r, &recorded, 16);
+                            LOG_ERROR(Render_Vulkan, "B9 dispatch buffer differs: program {:#x} offset {} guest {:08x} {:08x} {:08x} {:08x} record {:08x} {:08x} {:08x} {:08x}", stage.pgm_hash,
+                                      desc.sharp_fetch.offsets[0], l[0], l[1], l[2], l[3], r[0], r[1], r[2], r[3]);
                         }
                     }
                 }

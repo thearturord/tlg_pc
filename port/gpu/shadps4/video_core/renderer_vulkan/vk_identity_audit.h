@@ -17,6 +17,10 @@ struct IdentityAudit {
     std::atomic<u64> image_bindings{0}, image_with_id{0}, image_ids_seen{0}, image_same{0}, image_address_changed{0}, image_other_words_changed{0};
     // compute pipelines by program address
     std::atomic<u64> dispatches{0}, programs_seen{0}, pipeline_same{0}, pipeline_switched{0};
+    // B9: the typed bindings the dispatch records carry (dispatches planned from a record, with a complete list, entries in them)
+    std::atomic<u64> dispatch_with_record{0}, dispatch_bindings_complete{0}, dispatch_binding_entries{0};
+    // B9 compare (TLG_DISPATCH_AUDIT=1): buffer loads of dispatches, served by the record, equal to the guest's descriptor, different
+    std::atomic<u64> dispatch_buffer_loads{0}, dispatch_buffer_record{0}, dispatch_buffer_equal{0}, dispatch_buffer_different{0};
 };
 inline IdentityAudit g_identity_audit;
 

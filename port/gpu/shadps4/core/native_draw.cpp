@@ -4634,6 +4634,26 @@ void MaterializeRegs(ExecDraw& d) {
     lazy_materialized.fetch_add(1, std::memory_order_relaxed);
 }
 
+bool TakeDispatchBindings(u64 seq, RecordBinding* out, u32 max, u32& count) {
+    count = 0;
+    auto& slot = Slot(seq);
+    if (slot.seq.load(std::memory_order_acquire) != seq || slot.kind != 3 || slot.bindings_for != seq) {
+        return false;
+    }
+    const u32 n = slot.binding_count;
+    if (slot.bindings_overflow || n == 0 || n > max) {
+        return false;
+    }
+    for (u32 i = 0; i < n; ++i) {
+        out[i] = slot.bindings[i];
+    }
+    if (slot.seq.load(std::memory_order_acquire) != seq) {
+        return false; // recycled while copying
+    }
+    count = n;
+    return true;
+}
+
 bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed) {
     NoteConsumed(seq);
     const bool ok = TakeExecDrawImpl(seq, out, typed, NativeListOn());
@@ -9044,7 +9064,14 @@ void NativeListRead(nlohmann::json& out) {
         out["identity_audit"] = {{"image_bindings_with_a_record", a.image_bindings.load()}, {"of_them_with_an_engine_id", a.image_with_id.load()}, {"ids_seen", a.image_ids_seen.load()},
                                  {"same_description", a.image_same.load()}, {"address_changed", a.image_address_changed.load()}, {"other_words_changed", a.image_other_words_changed.load()},
                                  {"compute_dispatches", a.dispatches.load()}, {"compute_programs_seen", a.programs_seen.load()}, {"compute_same_pipeline", a.pipeline_same.load()},
-                                 {"compute_pipeline_switched", a.pipeline_switched.load()}};
+                                 {"compute_pipeline_switched", a.pipeline_switched.load()},
+                                 {"dispatch_with_record", a.dispatch_with_record.load()},
+                                 {"dispatch_bindings_complete", a.dispatch_bindings_complete.load()},
+                                 {"dispatch_binding_entries", a.dispatch_binding_entries.load()},
+                                 {"dispatch_buffer_loads", a.dispatch_buffer_loads.load()},
+                                 {"dispatch_buffer_served_by_record", a.dispatch_buffer_record.load()},
+                                 {"dispatch_buffer_equal", a.dispatch_buffer_equal.load()},
+                                 {"dispatch_buffer_different", a.dispatch_buffer_different.load()}};
     }
     {
         const auto& c = Vulkan::g_indexed_census;

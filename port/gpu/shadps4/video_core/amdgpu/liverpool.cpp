@@ -1006,6 +1006,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         }
         if (op.dispatch_plan && call.tag.valid) {
             op.dispatch_plan->native_seq = call.tag.seq;
+            op.dispatch_plan->bindings_complete = Core::NativeDraw::TakeDispatchBindings(call.tag.seq, op.dispatch_plan->bindings.data(), static_cast<u32>(op.dispatch_plan->bindings.size()), op.dispatch_plan->binding_count);
         }
     } else {
         const Vulkan::DrawIndirectParams params =

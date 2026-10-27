@@ -293,6 +293,8 @@ u32 RecordUserData(u64 seq, u32* vs, u32* ps);
 
 /// Command processor: the record of a draw the hook executed natively. False when the record was overwritten.
 bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed = false);
+/// B9: the typed bindings of a dispatch record (kind 3). Fills `out` (up to `max` entries), sets `count`; returns true when the list is complete (none dropped, at least one).
+bool TakeDispatchBindings(u64 seq, RecordBinding* out, u32 max, u32& count);
 
 /// The constants of a synthesized compute record live in the table arena, in host memory. The GPU reads buffer data through guest addresses
 /// below 2^40 and the guest memory backing, so the descriptor of such a constant buffer holds an address in a window of unused guest
