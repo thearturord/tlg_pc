@@ -54,6 +54,10 @@ std::map<std::string, Entry> registry;
 std::unique_ptr<httplib::Server> server;
 std::jthread server_thread;
 std::jthread snapshot_thread;
+std::atomic<bool> snapshot_now{false};
+std::mutex rare_mutex;
+std::map<std::string, u64> rare_counts;
+std::string rare_snapshot_kind; // the tag of the snapshot the next pass of the snapshot thread writes at once
 std::mutex lifecycle_mutex;
 std::mutex published_mutex;
 std::map<std::string, nlohmann::json> published;
@@ -765,10 +769,14 @@ void Start(u16 port) {
     if (snapshot_env == nullptr || *snapshot_env != '0') {
         snapshot_thread = std::jthread{[](std::stop_token stop) {
             const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "last_counters.json";
-            auto temp = path;
-            temp += ".tmp";
-            const auto write_snapshot = [&] {
+            const auto write_snapshot = [&](const std::filesystem::path& target_path) {
+                auto temp = target_path;
+                temp += ".tmp";
                 nlohmann::json out;
+                {
+                    std::scoped_lock lk{rare_mutex};
+                    out["rare_events"] = rare_counts;
+                }
                 out["written_unix_s"] = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
                 for (const char* name : {"/status", "/zpassgen", "/native"}) {
                     Handler handler;
@@ -793,13 +801,26 @@ void Start(u16 port) {
                     file << out.dump(1);
                 }
                 std::error_code ec;
-                std::filesystem::rename(temp, path, ec);
+                std::filesystem::rename(temp, target_path, ec);
             };
+            const bool self_test = std::getenv("TLG_RARE_EVENT_TEST") != nullptr; // development: one made up event after 3 s, to see the file and the snapshot
+            u32 ticks = 0;
             while (!stop.stop_requested()) {
                 for (int i = 0; i < 200 && !stop.stop_requested(); ++i) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    if (self_test && ++ticks == 30) {
+                        Core::RareEvents::Note("self_test", "made up by TLG_RARE_EVENT_TEST");
+                    }
+                    if (snapshot_now.exchange(false)) {
+                        std::string kind;
+                        {
+                            std::scoped_lock lk{rare_mutex};
+                            kind = rare_snapshot_kind;
+                        }
+                        write_snapshot(path.parent_path() / ("rare_" + kind + "_counters.json"));
+                    }
                 }
-                write_snapshot();
+                write_snapshot(path);
             }
         }};
     }
@@ -822,3 +843,32 @@ void Stop() {
 }
 
 } // namespace Core::DebugServer
+
+namespace Core::RareEvents {
+
+void Note(const std::string& kind, const std::string& detail) {
+    u64 n;
+    {
+        std::scoped_lock lk{DebugServer::rare_mutex};
+        n = ++DebugServer::rare_counts[kind];
+        if (n == 1) {
+            DebugServer::rare_snapshot_kind = kind;
+        }
+    }
+    if (n > 5) {
+        return; // counted, not written again
+    }
+    const auto unix_s = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto line = fmt::format("[{}] uptime {:.1f} s, {} #{}: {}\n", unix_s, DebugServer::UptimeMs() / 1000.0, kind, n, detail);
+    {
+        std::scoped_lock lk{DebugServer::rare_mutex};
+        std::ofstream file{Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "rare_events.txt", std::ios::app | std::ios::binary};
+        file << line;
+    }
+    LOG_ERROR(Core, "rare event {} (#{}), saved in user/log/rare_events.txt: {}", kind, n, detail);
+    if (n == 1) {
+        DebugServer::snapshot_now.store(true);
+    }
+}
+
+} // namespace Core::RareEvents

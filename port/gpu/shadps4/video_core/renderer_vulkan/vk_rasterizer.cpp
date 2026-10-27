@@ -2152,6 +2152,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const auto* fault_buffer = buffer_cache.GetFaultBuffer();
                 buffer_infos.emplace_back(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
+                if (indexed_active && stage.indexed) {
+                    Core::RareEvents::Note("c9_shared_memory", fmt::format("compute shader {:#x}: the shared memory is a storage buffer with a slot of its own per dispatch", stage.pgm_hash));
+                }
                 auto& lds_buffer = buffer_cache.GetStreamBuffer();
                 const auto& cs_program = *current_cs;
                 const auto lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();
@@ -2880,7 +2883,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const auto& [_, desc] = image_bindings[image_binding_idx];
         const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (indexed_active && stage.indexed && Shader::Indexed::IsIndexedImage(stage.images[image_desc_idx])) {
+            if (stage.images[image_desc_idx].is_atomic) {
+                Core::RareEvents::Note("c9_atomic_image", fmt::format("shader {:#x} ({}): atomic image in array key {} (format {})", stage.pgm_hash, static_cast<u32>(stage.sw_stage), image_keys[image_desc_idx],
+                                                                       (image_keys[image_desc_idx] - Shader::Indexed::FirstAtomicKey) / 4));
+            }
             if (stage.images[image_desc_idx].mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+                Core::RareEvents::Note("c9_mip_level_run", fmt::format("shader {:#x} ({}): image bound once per mip level, {} levels, array key {}", stage.pgm_hash, static_cast<u32>(stage.sw_stage), array_size,
+                                                                       image_keys[image_desc_idx]));
                 NoteIndexedRun(&image_infos[image_info_idx], array_size, image_keys[image_desc_idx]);
             } else {
                 NoteIndexedImage(image_infos[image_info_idx], image_keys[image_desc_idx]);

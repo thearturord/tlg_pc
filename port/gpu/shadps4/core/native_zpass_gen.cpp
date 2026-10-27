@@ -38,6 +38,7 @@
 #include "common/logging/log.h"
 #include "core/native_draw.h"
 #include "core/native_zpass_gen.h"
+#include "core/debug_server.h"
 
 namespace Core::NativeZPassGen {
 
@@ -3784,6 +3785,7 @@ void ScanWet(WetScanArgs& a) {
         const bool readback = (R<u32>(s + 0x1b8) & 4) != 0;
         if (readback) {
             // the CPU readback (CopyResource, Map, memcpy, Unmap) is written in GenerateWet but no scene of the regression set asks for it, so it has never been verified: the engine keeps it
+            Core::RareEvents::Note("wet_cpu_readback", fmt::format("wet system {:#x}, flags {:#x}, {} jobs: the generator declined, the engine's loop did the readback", s, R<u32>(s + 0x1b8), jobs));
             p.Decline("a CPU readback is pending (the engine's loop does it until the generator's is verified)");
             return;
         }
@@ -4459,6 +4461,9 @@ void GenerateInst(Target& t, const InstPlan& p) {
     };
     const auto dispatch = [&](u32 x, u32 y, u32 z, u64 site) {
         inst_dispatches[site == InstSite1 ? 0 : site == InstSite2 ? 1 : site == InstSite3 ? 2 : site == InstSite4 ? 3 : 4].fetch_add(1, std::memory_order_relaxed);
+        if (site == InstSite1) {
+            Core::RareEvents::Note("instancing_loop1", fmt::format("a dispatch of loop 1 ({}, {} x {} x {}), shader {:#x}: written from the engine's code, never verified before", live ? "generated" : "verify shadow", x, y, z, t.Get<u64>(ShaderWord)));
+        }
         if (live) {
             Timed(CallId::DrawIssue, [&] { NativeDraw::IssueDispatch(ctx, x, y, z, false, site, false); });
         } else {
@@ -4632,6 +4637,7 @@ void GenerateInst(Target& t, const InstPlan& p) {
             flags &= ~0x20000000u;
         }
         if ((flags & 0x2000000u) != 0 && live) {
+            Core::RareEvents::Note("instancing_flag_0x2000000", fmt::format("system {:#x}, flags {:#x}: the second resource copy of loop 2 (never verified before)", sys, flags));
             W<u32>(sys + 0x40, flags & ~0x2000000u);
             vcall(0x88, R<u64>(rd + 0x2a8), R<u64>(rd + 0x2b8), 0, 0, 0);
             W<u32>(rd + 0x2d0, 1);

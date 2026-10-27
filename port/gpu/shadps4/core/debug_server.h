@@ -66,3 +66,10 @@ void NoteWriteFault(VAddr address);
 void NoteWriteFaultTime(VAddr address, u64 nanoseconds);
 
 } // namespace Core::DebugServer
+
+/// Rare events: situations the game was never seen to reach in the test scenes (the wet simulation's CPU readback, the instancing loop 1, the indexed data path's shared memory,
+/// atomic image and mip level image resources). When one comes up it is recorded: the first five of each kind are appended to user/log/rare_events.txt with their details, an error
+/// line goes to the log, and the counters are saved at once to user/log/rare_<kind>_counters.json (the first time). Any thread, cheap when nothing happens.
+namespace Core::RareEvents {
+void Note(const std::string& kind, const std::string& detail);
+}
