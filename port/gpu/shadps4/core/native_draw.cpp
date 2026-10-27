@@ -8911,6 +8911,10 @@ void NativeListRead(nlohmann::json& out) {
     out["lazy_registers_materialized"] = lazy_materialized.load();
     out["lazy_verify_full_take_compared"] = lazy_verified.load();
     out["lazy_verify_differences"] = lazy_differences.load();
+    {
+        const auto& c = Vulkan::g_indexed_census;
+        out["pipeline_stage_census"] = {{"stages", c.stages.load()}, {"mip_level_images", c.mip_run_images.load()}, {"atomic_images", c.atomic_images.load()}, {"shared_memory_buffers", c.shared_memory_buffers.load()}};
+    }
     if (const auto* indexed = Vulkan::IndexedData::Get()) {
         const auto& s = indexed->stats;
         out["indexed_data"] = {{"draws", s.draws.load()}, {"row_entries", s.rows_entries.load()}, {"buffer_slot_hits", s.buffer_hits.load()}, {"buffer_slots_made", s.buffer_new.load()},
@@ -8920,7 +8924,7 @@ void NativeListRead(nlohmann::json& out) {
                                {"image_slot_hits", s.image_hits.load()}, {"image_slots_made", s.image_new.load()}, {"image_slots_freed", s.image_freed.load()}, {"image_slots_live", s.live_image_slots.load()},
                                {"sampler_slot_hits", s.sampler_hits.load()}, {"sampler_slots_made", s.sampler_new.load()}, {"sampler_slots_freed", s.sampler_freed.load()}, {"sampler_slots_live", s.live_sampler_slots.load()},
                                {"image_key_differences", s.key_differences.load()}, {"legacy_descriptor_writes", s.legacy_writes.load()}, {"compute_dispatches", s.compute_dispatches.load()},
-                               {"flat_dwords_in_rows", s.flat_dwords.load()}, {"legacy_flat_buffers", s.legacy_flat.load()}, {"legacy_clip_plane_buffers", s.legacy_clip.load()}, {"legacy_shared_memory_buffers", s.legacy_lds.load()}, {"legacy_images", s.legacy_images.load()}};
+                               {"flat_dwords_in_rows", s.flat_dwords.load()}, {"run_hits", s.run_hits.load()}, {"run_new", s.run_new.load()}, {"run_freed", s.run_freed.load()}, {"legacy_flat_buffers", s.legacy_flat.load()}, {"legacy_clip_plane_buffers", s.legacy_clip.load()}, {"legacy_shared_memory_buffers", s.legacy_lds.load()}, {"legacy_images", s.legacy_images.load()}};
     }
     out["render_data_guard"] = {{"calls_from_the_instancing_loop", render_data_guard_calls.load()}, {"stopped_no_element_size", render_data_guard_stopped[0].load()}, {"stopped_view_without_format", render_data_guard_stopped[1].load()}};
 }

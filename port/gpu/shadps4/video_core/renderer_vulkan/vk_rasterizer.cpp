@@ -2465,6 +2465,31 @@ void Rasterizer::NoteIndexedImage(const vk::DescriptorImageInfo& info, u32 image
     }
 }
 
+void Rasterizer::NoteIndexedRun(const vk::DescriptorImageInfo* infos, u32 count, u32 image_key) {
+    auto* indexed = IndexedData::Get();
+    bool all_null = true;
+    for (u32 i = 0; i < count; ++i) {
+        all_null &= !infos[i].imageView;
+    }
+    const u32 base = all_null ? indexed->NullRun(image_key) : indexed->ImageRun(image_key, infos, count);
+    NoteIndexedRow(base);
+    const u32 every = indexed->VerifyEvery();
+    if (every != 0 && indexed->stats.draws.load(std::memory_order_relaxed) % every == 0) {
+        indexed->stats.verified.fetch_add(1, std::memory_order_relaxed);
+        bool same = true;
+        for (u32 i = 0; i < count; ++i) {
+            vk::ImageView view_of;
+            vk::ImageLayout layout_of;
+            const bool known = indexed->RunOf(image_key, base, i, view_of, layout_of);
+            same &= infos[i].imageView ? (known && view_of == infos[i].imageView && layout_of == infos[i].imageLayout) : (base == indexed->NullRun(image_key) || (known && !view_of));
+        }
+        if (!same) {
+            indexed->stats.verify_differences.fetch_add(1, std::memory_order_relaxed);
+            LOG_ERROR(Render_Vulkan, "indexed data: the run at slot {} (key {}, {} levels) does not stand for the views of the legacy binder", base, image_key, count);
+        }
+    }
+}
+
 void Rasterizer::NoteIndexedSampler(vk::Sampler sampler) {
     auto* indexed = IndexedData::Get();
     const u32 slot = indexed->SamplerSlot(sampler);
@@ -2854,10 +2879,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     for (u32 array_size : image_descriptor_array_sizes) {
         const auto& [_, desc] = image_bindings[image_binding_idx];
         const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
-        if (indexed_active && stage.indexed && array_size == 1 && Shader::Indexed::IsIndexedImage(stage.images[image_desc_idx])) {
-            NoteIndexedImage(image_infos[image_info_idx], image_keys[image_desc_idx]);
-            ++image_info_idx;
-            ++image_binding_idx;
+        if (indexed_active && stage.indexed && Shader::Indexed::IsIndexedImage(stage.images[image_desc_idx])) {
+            if (stage.images[image_desc_idx].mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+                NoteIndexedRun(&image_infos[image_info_idx], array_size, image_keys[image_desc_idx]);
+            } else {
+                NoteIndexedImage(image_infos[image_info_idx], image_keys[image_desc_idx]);
+            }
+            image_info_idx += array_size;
+            image_binding_idx += array_size;
             ++image_desc_idx;
             continue;
         }

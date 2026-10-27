@@ -17,10 +17,20 @@
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
+namespace Shader {
+struct Info;
+}
+
 namespace Vulkan {
 
 class Instance;
 class Scheduler;
+
+/// The census of the pipelines' stages, with or without the indexed path: stages, mip level images, atomic images, shared memory buffers.
+struct IndexedCensus {
+    std::atomic<u64> stages{0}, mip_run_images{0}, atomic_images{0}, shared_memory_buffers{0};
+};
+inline IndexedCensus g_indexed_census;
 class CommandRecorder;
 
 class IndexedData {
@@ -34,6 +44,9 @@ public:
     [[nodiscard]] static IndexedData* Get() noexcept {
         return live.load(std::memory_order_acquire);
     }
+    /// A pipeline was made (new or preloaded) with this stage: counts the rare kinds of resources of indexed shaders (the scenes of a test may never run them).
+    static void NoteShaderKinds(const Shader::Info& info) noexcept;
+
     /// Called by the destructors of the buffers, image views and samplers: the slots that name the object are not looked up any more.
     static void NoteBufferDestroyed(vk::Buffer buffer) noexcept;
     static void NoteViewDestroyed(vk::ImageView view) noexcept;
@@ -55,6 +68,10 @@ public:
     [[nodiscard]] u32 BufferSlot(vk::Buffer buffer, u64 offset, u64 range);
     /// The slot of an image descriptor in the array of the array key (0: the null descriptor).
     [[nodiscard]] u32 ImageSlot(u32 image_key, vk::ImageView view, vk::ImageLayout layout);
+    /// The first slot of a run of consecutive slots holding the images of the mip levels of one image (the array of a storage image array key); the null run when the images are null.
+    [[nodiscard]] u32 ImageRun(u32 image_key, const vk::DescriptorImageInfo* infos, u32 count);
+    [[nodiscard]] u32 NullRun(u32 image_key) const noexcept;
+    [[nodiscard]] bool RunOf(u32 image_key, u32 base, u32 index, vk::ImageView& view, vk::ImageLayout& layout) const;
     /// The slot of a sampler.
     [[nodiscard]] u32 SamplerSlot(vk::Sampler sampler);
     /// What a slot stands for, for the verify (false: not a live slot).
@@ -69,9 +86,16 @@ public:
     /// Binds the global set to the command buffer that records now, once per command buffer and bind point.
     void BindSet(const CommandRecorder& cmdbuf, vk::PipelineBindPoint bind_point, vk::PipelineLayout pipeline_layout);
 
+    struct Run {
+        u32 base{}, count{};
+        u64 hash{};
+        std::vector<std::pair<u64, u64>> items; // (view, layout) of each level
+        u64 last_tick[2]{0, 0};
+        bool active{false};
+    };
     struct Stats {
         std::atomic<u64> draws{0}, rows_entries{0}, buffer_hits{0}, buffer_new{0}, buffer_freed{0}, exhausted{0}, flushes{0}, written{0}, set_binds{0};
-        std::atomic<u64> image_hits{0}, image_new{0}, image_freed{0}, sampler_hits{0}, sampler_new{0}, sampler_freed{0};
+        std::atomic<u64> image_hits{0}, image_new{0}, image_freed{0}, sampler_hits{0}, sampler_new{0}, sampler_freed{0}, run_hits{0}, run_new{0}, run_freed{0};
         std::atomic<u64> verified{0}, verify_differences{0}, key_differences{0}, legacy_writes{0}, compute_dispatches{0}, legacy_flat{0}, legacy_clip{0}, legacy_lds{0}, legacy_images{0}, flat_dwords{0};
         std::atomic<u32> live_buffer_slots{0}, live_image_slots{0}, live_sampler_slots{0};
     };
@@ -104,6 +128,13 @@ private:
         std::vector<SlotInfo> slots;
         std::vector<u32> free;
         std::deque<std::pair<u32, u64>> uses; // (slot, tick of the use), oldest first
+        // the runs of consecutive slots (storage image arrays): the last RunSlots slots
+        u32 run_start{0};
+        std::vector<Run> runs;
+        std::vector<u32> run_free_ids;
+        std::unordered_map<u64, u32> run_map; // hash of the levels -> index in runs
+        std::vector<u8> run_bits;             // slot used, from run_start
+        std::deque<std::pair<u32, u64>> run_uses;
     };
     static constexpr u32 BuffersTable = 0;
     static constexpr u32 SamplersTable = 1;
@@ -116,6 +147,7 @@ private:
     /// Finds or makes the slot of a descriptor in a table; `made` tells that a write must be recorded. Caller holds the mutex.
     u32 Slot(u32 table, const Key& key, bool& made);
     void ForgetHandle(u32 first_table, u32 last_table, u64 handle);
+    void MaintainRuns(Table& t);
 
     const Instance& instance;
     Scheduler& scheduler;

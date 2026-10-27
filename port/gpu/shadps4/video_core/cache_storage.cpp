@@ -114,7 +114,7 @@ std::filesystem::path GameCacheDir() {
     const char* indexed = std::getenv("TLG_INDEXED_DATA");
     const bool indexed_build = indexed != nullptr && *indexed != 0 && *indexed != '0';
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-           (serial + "-" + TLG_SHADER_CACHE_KEY + (indexed_build ? "-idx4" : ""));
+           (serial + "-" + TLG_SHADER_CACHE_KEY + (indexed_build ? "-idx5" : ""));
 #else
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / serial;
 #endif

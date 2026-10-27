@@ -43,6 +43,11 @@ GraphicsPipeline::GraphicsPipeline(
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
     // tlg C9: stages compiled with the indexed data path read their guest buffers through the global set (set 0); the other bindings are set 1
+    for (const auto* info : infos) {
+        if (info != nullptr) {
+            IndexedData::NoteShaderKinds(*info);
+        }
+    }
     indexed = IndexedData::Get() != nullptr && std::ranges::any_of(infos, [](const Shader::Info* info) { return info != nullptr && info->indexed; });
     BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();

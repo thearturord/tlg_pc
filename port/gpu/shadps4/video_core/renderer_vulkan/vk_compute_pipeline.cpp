@@ -33,6 +33,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     };
 
     // tlg C9: a compute shader compiled with the indexed data path finds its indexed resources through the global set (set 0); the other bindings are set 1
+    IndexedData::NoteShaderKinds(*info);
     indexed = IndexedData::Get() != nullptr && info->indexed;
     u32 binding{};
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;

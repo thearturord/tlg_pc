@@ -582,6 +582,8 @@ private:
     void NoteIndexedFlat(const Shader::Info& stage);
     /// The slot of a sampled image / of a sampler for the draw's row, with the verify against what the legacy binder writes.
     void NoteIndexedImage(const vk::DescriptorImageInfo& info, u32 image_key);
+    /// An image bound once per mip level: a run of consecutive slots, the row holds the first.
+    void NoteIndexedRun(const vk::DescriptorImageInfo* infos, u32 count, u32 image_key);
     void NoteIndexedSampler(vk::Sampler sampler);
     std::array<u32, 4096> indexed_row{};
     u32 indexed_row_size{0};

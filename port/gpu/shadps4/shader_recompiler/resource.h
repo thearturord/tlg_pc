@@ -94,19 +94,24 @@ constexpr u32 BufferBinding = 1; ///< the array of storage buffer descriptors
 constexpr u32 SamplerBinding = 2; ///< the array of sampler descriptors
 constexpr u32 ImageBinding = 3;   ///< the first of the arrays of image descriptors, one per array key (below)
 constexpr u32 NumImageKeys = 12;  ///< number class (float, sint, uint) x dimension class (2D, 2D array/cube, 2D multisampled, 3D)
-/// Array keys: 0..11 sampled images, 12..23 storage images (format unknown), 24..35 storage images with an atomic format (R32ui / R32i / R32f by number class).
-constexpr u32 NumImageArrays = 3 * NumImageKeys;
+/// The storage formats an atomic image can have (the SPIR-V image format follows the data and number format of its T#; the backend has the same list in the same order).
+constexpr u32 NumAtomicFormats = 18;
+/// Array keys: 0..11 sampled images, 12..23 storage images (format unknown), 24 + 4 * format + dimension: storage images of an atomic format.
+constexpr u32 NumImageArrays = 2 * NumImageKeys + 4 * NumAtomicFormats;
+constexpr u32 FirstAtomicKey = 2 * NumImageKeys;
 constexpr u32 NoKey = 0xff;       ///< the image stays on the push descriptors
 constexpr u32 MaxBuffers = 1u << 16;
 constexpr u32 MaxImages = 1u << 13;        ///< per sampled image array
-constexpr u32 MaxStorageImages = 1u << 11; ///< per storage image array
+constexpr u32 MaxStorageImages = 1u << 11; ///< per storage image array (the last RunSlots of it are the runs of the mip level images)
+constexpr u32 RunSlots = 1024;             ///< consecutive slots of a storage image array for the images bound once per mip level (MipStorageFallbackMode::DynamicIndex)
+constexpr u32 NullRunLength = 16;          ///< the first slots of the runs are null descriptors, for an image of the kind whose T# is invalid
+constexpr u32 MaxAtomicImages = 1u << 8;   ///< per atomic format array
 constexpr u32 MaxSamplers = 1u << 12;
-/// The buffers found through the table: the guest buffers, the special buffers that are one fixed object, the clip planes (null, or a stream copy that is a slot of its own), and the
-/// flat user data, which is not a descriptor at all: its dwords are copied into the draw's row, behind the slots. Only the shared memory of compute (a stream copy per dispatch) stays
-/// on the push descriptors.
+/// The buffers found through the table: the guest buffers, the special buffers that are one fixed object, the clip planes and the shared memory of compute (null, or a stream copy
+/// that is a slot of its own), and the flat user data, which is not a descriptor at all: its dwords are copied into the draw's row, behind the slots.
 [[nodiscard]] constexpr bool IsIndexedBufferType(BufferType type) {
     return type == BufferType::Guest || type == BufferType::GdsBuffer || type == BufferType::BdaPagetable || type == BufferType::FaultBuffer ||
-           type == BufferType::ClipPlanes || type == BufferType::Flatbuf;
+           type == BufferType::ClipPlanes || type == BufferType::Flatbuf || type == BufferType::SharedMemory;
 }
 } // namespace Indexed
 
@@ -279,25 +284,52 @@ namespace Indexed {
     }
     return number * 4 + dimension;
 }
+/// The index of the format of an atomic image (the order of `AtomicSpvFormats` in the backend), or NumAtomicFormats.
+[[nodiscard]] inline u32 AtomicFormatIndex(const AmdGpu::Image& sharp) noexcept {
+    using D = AmdGpu::DataFormat;
+    using N = AmdGpu::NumberFormat;
+    static constexpr std::array<std::pair<D, N>, NumAtomicFormats> formats{{
+        {D::Format32, N::Uint},
+        {D::Format32, N::Sint},
+        {D::Format32, N::Float},
+        {D::Format32_32, N::Float},
+        {D::Format32_32, N::Uint},
+        {D::Format32_32_32_32, N::Uint},
+        {D::Format16, N::Float},
+        {D::Format16, N::Uint},
+        {D::Format16_16, N::Float},
+        {D::Format16_16, N::Snorm},
+        {D::Format8_8, N::Unorm},
+        {D::Format16_16_16_16, N::Float},
+        {D::Format16_16_16_16, N::Unorm},
+        {D::Format8, N::Unorm},
+        {D::Format8_8_8_8, N::Unorm},
+        {D::Format8_8_8_8, N::Uint},
+        {D::Format10_11_11, N::Float},
+        {D::Format32_32_32_32, N::Float},
+    }};
+    for (u32 i = 0; i < NumAtomicFormats; ++i) {
+        if (sharp.GetDataFmt() == formats[i].first && sharp.GetNumberFmt() == formats[i].second) {
+            return i;
+        }
+    }
+    return NumAtomicFormats;
+}
 /// The array of an image resource with the T# the shader was compiled for (NoKey: it stays on the push descriptors).
 [[nodiscard]] inline u32 ArrayKey(const ImageResource& image, const AmdGpu::Image& sharp) noexcept {
-    if (image.mip_fallback_mode == MipStorageFallbackMode::DynamicIndex) {
-        return NoKey;
-    }
     const u32 key = ImageKey(sharp, image.is_array);
     if (!image.is_written) {
         return key;
     }
     if (!image.is_atomic) {
-        return NumImageKeys + key;
+        return NumImageKeys + key; // (also the images bound once per mip level: a run of consecutive slots)
     }
-    // atomics: the SPIR-V image format follows the data and number format; only the 32 bit single channel formats have an array
-    const auto nfmt = sharp.GetNumberFmt();
-    if (sharp.GetDataFmt() != AmdGpu::DataFormat::Format32 ||
-        (nfmt != AmdGpu::NumberFormat::Uint && nfmt != AmdGpu::NumberFormat::Sint && nfmt != AmdGpu::NumberFormat::Float)) {
+    // atomics: the SPIR-V image format follows the data and number format; one array per format and dimension
+    const u32 format = AtomicFormatIndex(sharp);
+    if (format == NumAtomicFormats || image.mip_fallback_mode == MipStorageFallbackMode::DynamicIndex) {
         return NoKey;
     }
-    return 2 * NumImageKeys + key;
+    return FirstAtomicKey + format * 4 + key % 4;
 }
 } // namespace Indexed
 

@@ -1,9 +1,11 @@
 // tlg C9: see vk_indexed_data.h
 
+#include <algorithm>
 #include <cstdlib>
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "shader_recompiler/info.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/vk_command_recorder.h"
 #include "video_core/renderer_vulkan/vk_indexed_data.h"
@@ -21,10 +23,21 @@ bool IndexedData::RequestedByEnvironment() {
     return on;
 }
 
+void IndexedData::NoteShaderKinds(const Shader::Info& info) noexcept {
+    g_indexed_census.stages.fetch_add(1, std::memory_order_relaxed);
+    for (const auto& image : info.images) {
+        g_indexed_census.mip_run_images.fetch_add(image.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex ? 1 : 0, std::memory_order_relaxed);
+        g_indexed_census.atomic_images.fetch_add(image.is_atomic ? 1 : 0, std::memory_order_relaxed);
+    }
+    for (const auto& buffer : info.buffers) {
+        g_indexed_census.shared_memory_buffers.fetch_add(buffer.buffer_type == Shader::BufferType::SharedMemory ? 1 : 0, std::memory_order_relaxed);
+    }
+}
+
 bool IndexedData::DeviceFits(const Instance& instance) {
     constexpr u32 buffers = 1 + Shader::Indexed::MaxBuffers;
     constexpr u32 images = Shader::Indexed::NumImageKeys * Shader::Indexed::MaxImages;
-    constexpr u32 storage_images = 2 * Shader::Indexed::NumImageKeys * Shader::Indexed::MaxStorageImages;
+    constexpr u32 storage_images = Shader::Indexed::NumImageKeys * Shader::Indexed::MaxStorageImages + 4 * Shader::Indexed::NumAtomicFormats * Shader::Indexed::MaxAtomicImages;
     constexpr u32 samplers = Shader::Indexed::MaxSamplers;
     const auto props = instance.GetPhysicalDevice().getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceVulkan12Properties>();
     const auto& p = props.get<vk::PhysicalDeviceVulkan12Properties>();
@@ -43,15 +56,20 @@ IndexedData::IndexedData(const Instance& instance_, Scheduler& scheduler_) : ins
     if (const char* e = std::getenv("TLG_INDEXED_VERIFY"); e != nullptr && *e != 0) {
         verify_every = static_cast<u32>(std::atoi(e));
     }
-    auto setup = [&](u32 index, u32 binding, vk::DescriptorType type, u32 capacity) {
+    auto setup = [&](u32 index, u32 binding, vk::DescriptorType type, u32 capacity, u32 runs = 0) {
         auto& t = tables[index];
         t.binding = binding;
         t.type = type;
         t.capacity = capacity;
         t.slots.resize(capacity);
         t.free.reserve(capacity);
-        for (u32 slot = capacity - 1; slot >= 1; --slot) {
+        for (u32 slot = capacity - runs - 1; slot >= 1; --slot) {
             t.free.push_back(slot);
+        }
+        if (runs != 0) {
+            t.run_start = capacity - runs;
+            t.run_bits.assign(runs, 0);
+            std::fill_n(t.run_bits.begin(), Shader::Indexed::NullRunLength, u8{1}); // the null run
         }
         t.slots[0].used = true; // slot 0 is the null descriptor (the default sampler for samplers)
     };
@@ -59,8 +77,9 @@ IndexedData::IndexedData(const Instance& instance_, Scheduler& scheduler_) : ins
     setup(SamplersTable, Shader::Indexed::SamplerBinding, vk::DescriptorType::eSampler, Shader::Indexed::MaxSamplers);
     for (u32 key = 0; key < Shader::Indexed::NumImageArrays; ++key) {
         const bool storage = key >= Shader::Indexed::NumImageKeys;
+        const bool atomic = key >= Shader::Indexed::FirstAtomicKey;
         setup(FirstImageTable + key, Shader::Indexed::ImageBinding + key, storage ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eSampledImage,
-              storage ? Shader::Indexed::MaxStorageImages : Shader::Indexed::MaxImages);
+              atomic ? Shader::Indexed::MaxAtomicImages : storage ? Shader::Indexed::MaxStorageImages : Shader::Indexed::MaxImages, storage && !atomic ? Shader::Indexed::RunSlots : 0);
     }
 
     std::array<vk::DescriptorSetLayoutBinding, 1 + NumTables> bindings{};
@@ -89,7 +108,7 @@ IndexedData::IndexedData(const Instance& instance_, Scheduler& scheduler_) : ins
     const std::array<vk::DescriptorPoolSize, 4> pool_sizes{{
         {vk::DescriptorType::eStorageBuffer, 1 + Shader::Indexed::MaxBuffers},
         {vk::DescriptorType::eSampledImage, Shader::Indexed::NumImageKeys * Shader::Indexed::MaxImages},
-        {vk::DescriptorType::eStorageImage, 2 * Shader::Indexed::NumImageKeys * Shader::Indexed::MaxStorageImages},
+        {vk::DescriptorType::eStorageImage, Shader::Indexed::NumImageKeys * Shader::Indexed::MaxStorageImages + 4 * Shader::Indexed::NumAtomicFormats * Shader::Indexed::MaxAtomicImages},
         {vk::DescriptorType::eSampler, Shader::Indexed::MaxSamplers},
     }};
     const vk::DescriptorPoolCreateInfo pool_ci{
@@ -132,12 +151,18 @@ IndexedData::IndexedData(const Instance& instance_, Scheduler& scheduler_) : ins
     for (u32 key = 0; key < Shader::Indexed::NumImageArrays; ++key) {
         pending_image_infos.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
         pending.push_back({FirstImageTable + key, 0, static_cast<u32>(pending_image_infos.size() - 1)});
+        if (tables[FirstImageTable + key].run_start != 0) {
+            for (u32 i = 0; i < Shader::Indexed::NullRunLength; ++i) {
+                pending.push_back({FirstImageTable + key, tables[FirstImageTable + key].run_start + i, static_cast<u32>(pending_image_infos.size() - 1)});
+            }
+        }
     }
     FlushWrites();
     live.store(this, std::memory_order_release);
-    LOG_INFO(Render_Vulkan, "indexed data path: {} buffer slots, {} slots in each of {} sampled image arrays, {} in each of {} storage image arrays, {} sampler slots, verify one draw in {}",
-             Shader::Indexed::MaxBuffers, Shader::Indexed::MaxImages, Shader::Indexed::NumImageKeys, Shader::Indexed::MaxStorageImages, 2 * Shader::Indexed::NumImageKeys,
-             Shader::Indexed::MaxSamplers, verify_every);
+    LOG_INFO(Render_Vulkan,
+             "indexed data path: {} buffer slots, {} slots in each of {} sampled image arrays, {} in each of {} storage image arrays (the last {} for mip level runs), {} in each of {} atomic format arrays, {} sampler slots, verify one draw in {}",
+             Shader::Indexed::MaxBuffers, Shader::Indexed::MaxImages, Shader::Indexed::NumImageKeys, Shader::Indexed::MaxStorageImages, Shader::Indexed::NumImageKeys,
+             Shader::Indexed::RunSlots, Shader::Indexed::MaxAtomicImages, 4 * Shader::Indexed::NumAtomicFormats, Shader::Indexed::MaxSamplers, verify_every);
 }
 
 IndexedData::~IndexedData() {
@@ -244,6 +269,104 @@ u32 IndexedData::SamplerSlot(vk::Sampler sampler) {
     return slot;
 }
 
+u32 IndexedData::NullRun(u32 image_key) const noexcept {
+    return image_key < Shader::Indexed::NumImageArrays ? tables[FirstImageTable + image_key].run_start : 0;
+}
+
+u32 IndexedData::ImageRun(u32 image_key, const vk::DescriptorImageInfo* infos, u32 count) {
+    if (image_key < Shader::Indexed::NumImageKeys || image_key >= Shader::Indexed::FirstAtomicKey || count == 0) {
+        return 0;
+    }
+    std::scoped_lock lock{mutex};
+    const u32 table = FirstImageTable + image_key;
+    auto& t = tables[table];
+    std::vector<std::pair<u64, u64>> items;
+    items.reserve(count);
+    u64 hash = 0x9E3779B97F4A7C15ull * count;
+    for (u32 i = 0; i < count; ++i) {
+        const u64 view = reinterpret_cast<u64>(static_cast<VkImageView>(infos[i].imageView));
+        items.emplace_back(view, static_cast<u64>(infos[i].imageLayout));
+        hash = (hash ^ view) * 0xC2B2AE3D27D4EB4Full;
+        hash ^= hash >> 29;
+        hash = (hash ^ static_cast<u64>(infos[i].imageLayout)) * 0x165667B19E3779F9ull;
+    }
+    const u64 tick = scheduler.CurrentTick();
+    const u32 stream = (tick & Scheduler::SideTag) != 0 ? 1u : 0u;
+    if (const auto it = t.run_map.find(hash); it != t.run_map.end()) {
+        auto& run = t.runs[it->second];
+        if (run.active && run.items == items) {
+            if (run.last_tick[stream] != tick) {
+                run.last_tick[stream] = tick;
+                t.run_uses.emplace_back(it->second, tick);
+            }
+            stats.run_hits.fetch_add(1, std::memory_order_relaxed);
+            return run.base;
+        }
+    }
+    // first fit among the free slots of the run region
+    u32 start = ~0u;
+    for (u32 at = Shader::Indexed::NullRunLength; at + count <= t.run_bits.size(); ++at) {
+        u32 n = 0;
+        while (n < count && !t.run_bits[at + n]) {
+            ++n;
+        }
+        if (n == count) {
+            start = at;
+            break;
+        }
+        at += n; // skip the used slot that stopped the scan
+    }
+    if (start == ~0u) {
+        stats.exhausted.fetch_add(1, std::memory_order_relaxed);
+        return t.run_start; // the null run: the shader's writes are dropped
+    }
+    std::fill_n(t.run_bits.begin() + start, count, u8{1});
+    u32 id;
+    if (!t.run_free_ids.empty()) {
+        id = t.run_free_ids.back();
+        t.run_free_ids.pop_back();
+    } else {
+        id = static_cast<u32>(t.runs.size());
+        t.runs.emplace_back();
+    }
+    auto& run = t.runs[id];
+    run.base = t.run_start + start;
+    run.count = count;
+    run.hash = hash;
+    run.items = std::move(items);
+    run.last_tick[stream] = tick;
+    run.last_tick[1 - stream] = 0;
+    run.active = true;
+    t.run_map[hash] = id;
+    t.run_uses.emplace_back(id, tick);
+    for (u32 i = 0; i < count; ++i) {
+        pending_image_infos.push_back(infos[i]);
+        pending.push_back({table, run.base + i, static_cast<u32>(pending_image_infos.size() - 1)});
+    }
+    stats.run_new.fetch_add(1, std::memory_order_relaxed);
+    return run.base;
+}
+
+bool IndexedData::RunOf(u32 image_key, u32 base, u32 index, vk::ImageView& view, vk::ImageLayout& layout) const {
+    if (image_key < Shader::Indexed::NumImageKeys || image_key >= Shader::Indexed::FirstAtomicKey) {
+        return false;
+    }
+    const auto& t = tables[FirstImageTable + image_key];
+    if (base == t.run_start) {
+        view = vk::ImageView{};
+        layout = vk::ImageLayout::eGeneral;
+        return true; // the null run
+    }
+    for (const auto& run : t.runs) {
+        if (run.active && run.base == base && index < run.count) {
+            view = vk::ImageView{reinterpret_cast<VkImageView>(run.items[index].first)};
+            layout = static_cast<vk::ImageLayout>(run.items[index].second);
+            return true;
+        }
+    }
+    return false;
+}
+
 bool IndexedData::BufferOf(u32 slot, vk::Buffer& buffer, u64& offset, u64& range) const {
     const auto& t = tables[BuffersTable];
     if (slot == 0 || slot >= t.slots.size() || !t.slots[slot].used) {
@@ -304,10 +427,32 @@ void IndexedData::FlushWrites() {
     pending_image_infos.clear();
 }
 
+void IndexedData::MaintainRuns(Table& t) {
+    while (!t.run_uses.empty() && scheduler.IsFree(t.run_uses.front().second)) {
+        const auto [id, tick] = t.run_uses.front();
+        t.run_uses.pop_front();
+        auto& run = t.runs[id];
+        if (!run.active || (run.last_tick[0] != 0 && !scheduler.IsFree(run.last_tick[0])) || (run.last_tick[1] != 0 && !scheduler.IsFree(run.last_tick[1]))) {
+            continue;
+        }
+        if (const auto it = t.run_map.find(run.hash); it != t.run_map.end() && it->second == id) {
+            t.run_map.erase(it);
+        }
+        std::fill_n(t.run_bits.begin() + (run.base - t.run_start), run.count, u8{0});
+        run.active = false;
+        run.items.clear();
+        t.run_free_ids.push_back(id);
+        stats.run_freed.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void IndexedData::Maintain() {
     std::scoped_lock lock{mutex};
     for (u32 index = 0; index < NumTables; ++index) {
         auto& t = tables[index];
+        if (t.run_start != 0) {
+            MaintainRuns(t);
+        }
         while (!t.uses.empty() && scheduler.IsFree(t.uses.front().second)) {
             const auto [slot, tick] = t.uses.front();
             t.uses.pop_front();
@@ -341,6 +486,16 @@ void IndexedData::ForgetHandle(u32 first_table, u32 last_table, u64 handle) {
         auto& map = tables[index].map;
         for (auto it = map.begin(); it != map.end();) {
             it = it->first.a == handle ? map.erase(it) : std::next(it);
+        }
+        // a run that names the view is not found again (its slots stay until the GPU is done with it)
+        auto& t = tables[index];
+        for (u32 id = 0; id < t.runs.size(); ++id) {
+            const auto& run = t.runs[id];
+            if (run.active && std::ranges::any_of(run.items, [&](const auto& item) { return item.first == handle; })) {
+                if (const auto it = t.run_map.find(run.hash); it != t.run_map.end() && it->second == id) {
+                    t.run_map.erase(it);
+                }
+            }
         }
     }
 }

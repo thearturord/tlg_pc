@@ -363,7 +363,9 @@ void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id 
         ASSERT(texture.mip_fallback_mode == MipStorageFallbackMode::DynamicIndex);
         const Id single_image_ptr_type =
             ctx.TypePointer(spv::StorageClass::UniformConstant, texture.image_type);
-        image_ptr = ctx.OpAccessChain(single_image_ptr_type, image_ptr, std::array{lod});
+        // tlg C9: the images of the mip levels are a run of consecutive slots of the descriptor array, from the slot in the draw's row
+        const Id level = Sirit::ValidId(texture.indexed_base) ? ctx.OpIAdd(ctx.U32[1], texture.indexed_base, lod) : lod;
+        image_ptr = ctx.OpAccessChain(single_image_ptr_type, image_ptr, std::array{level});
     }
     const Id image = ctx.OpLoad(texture.image_type, image_ptr);
     const Id texel = texture.is_integer ? ctx.OpBitcast(color_type, color) : color;

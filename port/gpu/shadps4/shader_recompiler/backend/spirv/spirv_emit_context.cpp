@@ -1024,7 +1024,12 @@ void EmitContext::DefineIndexedResources() {
         const Id index{OpIAdd(U32[1], row_base, ConstU32(image.indexed_row))};
         const Id slot{OpLoad(U32[1], OpAccessChain(rows_pointer, indexed_table, u32_zero_value, index))};
         Name(slot, fmt::format("img{}_slot", i));
-        image.id = OpAccessChain(image.indexed_pointer_type, indexed_image_arrays[image.indexed_key], slot);
+        if (image.indexed_run) {
+            image.id = indexed_image_arrays[image.indexed_key];
+            image.indexed_base = slot;
+        } else {
+            image.id = OpAccessChain(image.indexed_pointer_type, indexed_image_arrays[image.indexed_key], slot);
+        }
     }
     for (size_t i = 0; i < sampler_rows.size(); ++i) {
         const Id index{OpIAdd(U32[1], row_base, ConstU32(sampler_rows[i]))};
@@ -1111,6 +1116,14 @@ spv::ImageFormat GetFormat(const AmdGpu::Image& image) {
                     image.GetNumberFmt());
 }
 
+/// The SPIR-V formats of the atomic images, in the order of Indexed::AtomicFormatIndex.
+constexpr std::array<spv::ImageFormat, Indexed::NumAtomicFormats> AtomicSpvFormats{
+    spv::ImageFormat::R32ui,  spv::ImageFormat::R32i,   spv::ImageFormat::R32f,  spv::ImageFormat::Rg32f,         spv::ImageFormat::Rg32ui,
+    spv::ImageFormat::Rgba32ui, spv::ImageFormat::R16f, spv::ImageFormat::R16ui, spv::ImageFormat::Rg16f,        spv::ImageFormat::Rg16Snorm,
+    spv::ImageFormat::Rg8,    spv::ImageFormat::Rgba16f, spv::ImageFormat::Rgba16, spv::ImageFormat::R8,          spv::ImageFormat::Rgba8,
+    spv::ImageFormat::Rgba8ui, spv::ImageFormat::R11fG11fB10f, spv::ImageFormat::Rgba32f,
+};
+
 Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
     const auto image = desc.GetSharp(ctx.info);
     const auto format = desc.is_atomic ? GetFormat(image) : spv::ImageFormat::Unknown;
@@ -1160,6 +1173,9 @@ void EmitContext::DefineImagesAndSamplers() {
                 interfaces.push_back(array_variable);
                 indexed_image_arrays[key] = array_variable;
             }
+            if (image_desc.is_atomic) {
+                ASSERT_MSG(GetFormat(sharp) == AtomicSpvFormats[(key - Indexed::FirstAtomicKey) / 4], "atomic image format table out of step");
+            }
             images.push_back({
                 .data_types = &data_types,
                 .id = Id{},
@@ -1172,6 +1188,7 @@ void EmitContext::DefineImagesAndSamplers() {
                 .indexed_row = binding.indexed++,
                 .indexed_key = key,
                 .indexed_pointer_type = pointer_type,
+                .indexed_run = mip_fallback_mode == MipStorageFallbackMode::DynamicIndex,
             });
             continue;
         }

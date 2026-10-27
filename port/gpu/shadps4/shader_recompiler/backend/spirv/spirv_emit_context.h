@@ -331,6 +331,8 @@ public:
         u32 indexed_row{~0u};   ///< tlg C9: entry of the draw's row (the slot in the descriptor array of the image's key)
         u32 indexed_key{~0u};
         Id indexed_pointer_type{};
+        bool indexed_run{false}; ///< an image bound once per mip level: `id` is the descriptor array, `indexed_base` the first slot of its run
+        Id indexed_base{};
     };
 
     enum class PointerType : u32 {
