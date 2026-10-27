@@ -1033,7 +1033,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
     // tlg C9: graphics shaders find their guest buffers through the indexed data table
-    info.indexed = profile.indexed_resources && info.hw_stage != HwStage::Compute;
+    info.indexed = profile.indexed_resources;
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);

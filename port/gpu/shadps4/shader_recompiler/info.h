@@ -208,9 +208,13 @@ struct Info : InfoPersistent {
     void AddBindings(Backend::Bindings& bnd) const {
         bnd.buffer += buffers.size();
         u32 indexed_buffers = 0;
+        u32 indexed_rows = 0; // entries of the draw's row: a slot per buffer, the dwords of the flat user data for the flat buffer
         if (indexed) {
             for (const auto& buffer : buffers) {
-                indexed_buffers += Indexed::IsIndexedBufferType(buffer.buffer_type) ? 1u : 0u;
+                if (Indexed::IsIndexedBufferType(buffer.buffer_type)) {
+                    ++indexed_buffers;
+                    indexed_rows += buffer.buffer_type == BufferType::Flatbuf ? srt_info.flattened_bufsize_dw : 1u;
+                }
             }
         }
         u32 indexed_images = 0;
@@ -219,7 +223,7 @@ struct Info : InfoPersistent {
                 indexed_images += Indexed::IsIndexedImage(image) ? 1u : 0u;
             }
         }
-        bnd.indexed += indexed_buffers + indexed_images + (indexed ? static_cast<u32>(samplers.size()) : 0u);
+        bnd.indexed += indexed_rows + indexed_images + (indexed ? static_cast<u32>(samplers.size()) : 0u);
         bnd.unified += buffers.size() - indexed_buffers + images.size() - indexed_images + (indexed ? 0u : samplers.size());
     }
 

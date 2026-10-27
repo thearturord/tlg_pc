@@ -182,6 +182,12 @@ public:
     }
 
     Id EmitFlatbufferLoad(Id flatbuf_offset) {
+        if (indexed_flat_row != ~0u) {
+            // tlg C9: the flat user data sits in the draw's row of the table, behind the slots
+            const Id row_base{OpLoad(U32[1], OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]), push_data_block, ConstU32(PushData::RowBaseIndex)))};
+            const Id index{OpIAdd(U32[1], OpIAdd(U32[1], row_base, ConstU32(indexed_flat_row)), flatbuf_offset)};
+            return OpLoad(U32[1], OpAccessChain(TypePointer(spv::StorageClass::StorageBuffer, U32[1]), indexed_table, u32_zero_value, index));
+        }
         const auto& flatbuf_buffer{buffers[flatbuf_index]};
         ASSERT(flatbuf_buffer.binding >= 0 && flatbuf_buffer.buffer_type == BufferType::Flatbuf);
         const auto [flatbuf_buffer_id, flatbuf_pointer_type] =
@@ -373,8 +379,11 @@ public:
 
     Bindings& binding;
     Id indexed_table{};
+    u32 indexed_flat_row{~0u}; ///< the first dword of the flat user data in the draw's row (~0u: the flat buffer is a plain binding)
+    /// The pointer of a buffer's alias where the code runs (helper functions cannot use the pointers the prologue made): the access chain from the row, or the plain alias.
+    std::pair<Id, Id> BufferAliasHere(const BufferDefinition& buffer, PointerType alias);
     std::map<u64, Id> indexed_arrays;
-    std::array<Id, Indexed::NumImageKeys> indexed_image_arrays{};
+    std::array<Id, Indexed::NumImageArrays> indexed_image_arrays{};
     Id indexed_sampler_array{};
     boost::container::small_vector<u32, 4> sampler_rows;
     void EnsureIndexedTable();

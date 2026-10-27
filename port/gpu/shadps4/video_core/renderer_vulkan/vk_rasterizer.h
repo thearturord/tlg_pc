@@ -578,10 +578,12 @@ private:
     bool indexed_active{false};
     /// Puts the slot of one descriptor into the draw's row.
     void NoteIndexedRow(u32 slot);
+    /// The dwords of a stage's flat user data go into the row (as many as the shader reserved), zero padded.
+    void NoteIndexedFlat(const Shader::Info& stage);
     /// The slot of a sampled image / of a sampler for the draw's row, with the verify against what the legacy binder writes.
     void NoteIndexedImage(const vk::DescriptorImageInfo& info, u32 image_key);
     void NoteIndexedSampler(vk::Sampler sampler);
-    std::array<u32, 512> indexed_row{};
+    std::array<u32, 4096> indexed_row{};
     u32 indexed_row_size{0};
 
     struct BoundBuffer {

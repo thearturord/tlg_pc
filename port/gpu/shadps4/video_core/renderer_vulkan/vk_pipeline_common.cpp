@@ -32,7 +32,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
     // tlg C9: the global set (descriptor arrays and the row table) is bound once per command buffer; the bindings that stay plain are set 1
     u32 set_index = 0;
     if (indexed) {
-        IndexedData::Get()->BindSet(cmdbuf, *pipeline_layout);
+        IndexedData::Get()->BindSet(cmdbuf, bind_point, *pipeline_layout);
         set_index = Shader::Indexed::LegacySet;
     }
 

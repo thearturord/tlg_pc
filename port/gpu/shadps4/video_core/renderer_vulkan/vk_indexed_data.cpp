@@ -24,16 +24,17 @@ bool IndexedData::RequestedByEnvironment() {
 bool IndexedData::DeviceFits(const Instance& instance) {
     constexpr u32 buffers = 1 + Shader::Indexed::MaxBuffers;
     constexpr u32 images = Shader::Indexed::NumImageKeys * Shader::Indexed::MaxImages;
+    constexpr u32 storage_images = 2 * Shader::Indexed::NumImageKeys * Shader::Indexed::MaxStorageImages;
     constexpr u32 samplers = Shader::Indexed::MaxSamplers;
     const auto props = instance.GetPhysicalDevice().getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceVulkan12Properties>();
     const auto& p = props.get<vk::PhysicalDeviceVulkan12Properties>();
-    const bool fits = p.maxPerStageDescriptorUpdateAfterBindStorageBuffers >= buffers + 8 && p.maxPerStageDescriptorUpdateAfterBindSampledImages >= images + 64 &&
+    const bool fits = p.maxPerStageDescriptorUpdateAfterBindStorageBuffers >= buffers + 8 && p.maxPerStageDescriptorUpdateAfterBindSampledImages >= images + 64 && p.maxPerStageDescriptorUpdateAfterBindStorageImages >= storage_images + 64 &&
                       p.maxPerStageDescriptorUpdateAfterBindSamplers >= samplers + 64 && p.maxDescriptorSetUpdateAfterBindStorageBuffers >= buffers &&
                       p.maxDescriptorSetUpdateAfterBindSampledImages >= images && p.maxDescriptorSetUpdateAfterBindSamplers >= samplers &&
-                      p.maxPerStageUpdateAfterBindResources >= buffers + images + samplers + 256;
-    LOG_INFO(Render_Vulkan, "indexed data path: device limits (update after bind, per stage) storage buffers {} sampled images {} samplers {} resources {}: {}",
-             p.maxPerStageDescriptorUpdateAfterBindStorageBuffers, p.maxPerStageDescriptorUpdateAfterBindSampledImages, p.maxPerStageDescriptorUpdateAfterBindSamplers,
-             p.maxPerStageUpdateAfterBindResources, fits ? "enough" : "NOT enough");
+                      p.maxDescriptorSetUpdateAfterBindStorageImages >= storage_images && p.maxPerStageUpdateAfterBindResources >= buffers + images + storage_images + samplers + 256;
+    LOG_INFO(Render_Vulkan, "indexed data path: device limits (update after bind, per stage) storage buffers {} sampled images {} storage images {} samplers {} resources {}: {}",
+             p.maxPerStageDescriptorUpdateAfterBindStorageBuffers, p.maxPerStageDescriptorUpdateAfterBindSampledImages, p.maxPerStageDescriptorUpdateAfterBindStorageImages,
+             p.maxPerStageDescriptorUpdateAfterBindSamplers, p.maxPerStageUpdateAfterBindResources, fits ? "enough" : "NOT enough");
     return fits;
 }
 
@@ -56,16 +57,19 @@ IndexedData::IndexedData(const Instance& instance_, Scheduler& scheduler_) : ins
     };
     setup(BuffersTable, Shader::Indexed::BufferBinding, vk::DescriptorType::eStorageBuffer, Shader::Indexed::MaxBuffers);
     setup(SamplersTable, Shader::Indexed::SamplerBinding, vk::DescriptorType::eSampler, Shader::Indexed::MaxSamplers);
-    for (u32 key = 0; key < Shader::Indexed::NumImageKeys; ++key) {
-        setup(FirstImageTable + key, Shader::Indexed::ImageBinding + key, vk::DescriptorType::eSampledImage, Shader::Indexed::MaxImages);
+    for (u32 key = 0; key < Shader::Indexed::NumImageArrays; ++key) {
+        const bool storage = key >= Shader::Indexed::NumImageKeys;
+        setup(FirstImageTable + key, Shader::Indexed::ImageBinding + key, storage ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eSampledImage,
+              storage ? Shader::Indexed::MaxStorageImages : Shader::Indexed::MaxImages);
     }
 
     std::array<vk::DescriptorSetLayoutBinding, 1 + NumTables> bindings{};
     std::array<vk::DescriptorBindingFlags, 1 + NumTables> binding_flags{};
-    bindings[0] = {.binding = Shader::Indexed::TableBinding, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = AllGraphicsStageBits};
+    const vk::ShaderStageFlags stages = AllGraphicsStageBits | vk::ShaderStageFlagBits::eCompute;
+    bindings[0] = {.binding = Shader::Indexed::TableBinding, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = stages};
     binding_flags[0] = vk::DescriptorBindingFlagBits::eUpdateAfterBind;
     for (u32 i = 0; i < NumTables; ++i) {
-        bindings[1 + i] = {.binding = tables[i].binding, .descriptorType = tables[i].type, .descriptorCount = tables[i].capacity, .stageFlags = AllGraphicsStageBits};
+        bindings[1 + i] = {.binding = tables[i].binding, .descriptorType = tables[i].type, .descriptorCount = tables[i].capacity, .stageFlags = stages};
         binding_flags[1 + i] = vk::DescriptorBindingFlagBits::ePartiallyBound | vk::DescriptorBindingFlagBits::eUpdateAfterBind;
     }
     const vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_ci{
@@ -82,9 +86,10 @@ IndexedData::IndexedData(const Instance& instance_, Scheduler& scheduler_) : ins
     ASSERT_MSG(layout_result == vk::Result::eSuccess, "indexed data: the descriptor set layout failed: {}", vk::to_string(layout_result));
     layout = std::move(created_layout);
 
-    const std::array<vk::DescriptorPoolSize, 3> pool_sizes{{
+    const std::array<vk::DescriptorPoolSize, 4> pool_sizes{{
         {vk::DescriptorType::eStorageBuffer, 1 + Shader::Indexed::MaxBuffers},
         {vk::DescriptorType::eSampledImage, Shader::Indexed::NumImageKeys * Shader::Indexed::MaxImages},
+        {vk::DescriptorType::eStorageImage, 2 * Shader::Indexed::NumImageKeys * Shader::Indexed::MaxStorageImages},
         {vk::DescriptorType::eSampler, Shader::Indexed::MaxSamplers},
     }};
     const vk::DescriptorPoolCreateInfo pool_ci{
@@ -124,14 +129,15 @@ IndexedData::IndexedData(const Instance& instance_, Scheduler& scheduler_) : ins
     pending.push_back({BuffersTable, 0, 0});
     pending_image_infos.push_back({*default_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
     pending.push_back({SamplersTable, 0, 0});
-    for (u32 key = 0; key < Shader::Indexed::NumImageKeys; ++key) {
+    for (u32 key = 0; key < Shader::Indexed::NumImageArrays; ++key) {
         pending_image_infos.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
         pending.push_back({FirstImageTable + key, 0, static_cast<u32>(pending_image_infos.size() - 1)});
     }
     FlushWrites();
     live.store(this, std::memory_order_release);
-    LOG_INFO(Render_Vulkan, "indexed data path: {} buffer slots, {} slots in each of {} image arrays, {} sampler slots, verify one draw in {}", Shader::Indexed::MaxBuffers,
-             Shader::Indexed::MaxImages, Shader::Indexed::NumImageKeys, Shader::Indexed::MaxSamplers, verify_every);
+    LOG_INFO(Render_Vulkan, "indexed data path: {} buffer slots, {} slots in each of {} sampled image arrays, {} in each of {} storage image arrays, {} sampler slots, verify one draw in {}",
+             Shader::Indexed::MaxBuffers, Shader::Indexed::MaxImages, Shader::Indexed::NumImageKeys, Shader::Indexed::MaxStorageImages, 2 * Shader::Indexed::NumImageKeys,
+             Shader::Indexed::MaxSamplers, verify_every);
 }
 
 IndexedData::~IndexedData() {
@@ -156,11 +162,12 @@ void IndexedData::SetTable(vk::Buffer buffer, u64 size_bytes) {
 u32 IndexedData::Slot(u32 table, const Key& key, bool& made) {
     auto& t = tables[table];
     const u64 tick = scheduler.CurrentTick();
+    const u32 stream = (tick & Scheduler::SideTag) != 0 ? 1u : 0u;
     made = false;
     if (const auto it = t.map.find(key); it != t.map.end()) {
         auto& info = t.slots[it->second];
-        if (info.last_tick != tick) {
-            info.last_tick = tick;
+        if (info.last_tick[stream] != tick) {
+            info.last_tick[stream] = tick;
             t.uses.emplace_back(it->second, tick);
         }
         return it->second;
@@ -173,7 +180,8 @@ u32 IndexedData::Slot(u32 table, const Key& key, bool& made) {
     t.free.pop_back();
     auto& info = t.slots[slot];
     info.key = key;
-    info.last_tick = tick;
+    info.last_tick[stream] = tick;
+    info.last_tick[1 - stream] = 0;
     info.used = true;
     t.map.emplace(key, slot);
     t.uses.emplace_back(slot, tick);
@@ -200,7 +208,7 @@ u32 IndexedData::BufferSlot(vk::Buffer buffer, u64 offset, u64 range) {
 }
 
 u32 IndexedData::ImageSlot(u32 image_key, vk::ImageView view, vk::ImageLayout layout) {
-    if (!view || image_key >= Shader::Indexed::NumImageKeys) {
+    if (!view || image_key >= Shader::Indexed::NumImageArrays) {
         return 0;
     }
     std::scoped_lock lock{mutex};
@@ -249,7 +257,7 @@ bool IndexedData::BufferOf(u32 slot, vk::Buffer& buffer, u64& offset, u64& range
 }
 
 bool IndexedData::ImageOf(u32 image_key, u32 slot, vk::ImageView& view, vk::ImageLayout& layout) const {
-    if (image_key >= Shader::Indexed::NumImageKeys) {
+    if (image_key >= Shader::Indexed::NumImageArrays) {
         return false;
     }
     const auto& t = tables[FirstImageTable + image_key];
@@ -304,8 +312,9 @@ void IndexedData::Maintain() {
             const auto [slot, tick] = t.uses.front();
             t.uses.pop_front();
             auto& info = t.slots[slot];
-            if (!info.used || info.last_tick != tick) {
-                continue; // used again since
+            // the slot is free when the GPU is done with the last draw of each stream that named it (the last of the other stream has its own entry in the queue)
+            if (!info.used || (info.last_tick[0] != 0 && !scheduler.IsFree(info.last_tick[0])) || (info.last_tick[1] != 0 && !scheduler.IsFree(info.last_tick[1]))) {
+                continue;
             }
             if (const auto it = t.map.find(info.key); it != t.map.end() && it->second == slot) {
                 t.map.erase(it);
@@ -354,13 +363,14 @@ void IndexedData::NoteSamplerDestroyed(vk::Sampler sampler) noexcept {
     }
 }
 
-void IndexedData::BindSet(const CommandRecorder& cmdbuf, vk::PipelineLayout pipeline_layout) {
+void IndexedData::BindSet(const CommandRecorder& cmdbuf, vk::PipelineBindPoint bind_point, vk::PipelineLayout pipeline_layout) {
     const u64 tick = scheduler.CurrentTick();
-    if (tick == bound_tick) {
+    const u32 index = bind_point == vk::PipelineBindPoint::eCompute ? 1u : 0u;
+    if (tick == bound_tick[index]) {
         return;
     }
-    cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, Shader::Indexed::GlobalSet, set, {});
-    bound_tick = tick;
+    cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, Shader::Indexed::GlobalSet, set, {});
+    bound_tick[index] = tick;
     stats.set_binds.fetch_add(1, std::memory_order_relaxed);
 }
 

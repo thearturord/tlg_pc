@@ -92,13 +92,21 @@ constexpr u32 LegacySet = 1;
 constexpr u32 TableBinding = 0;  ///< the row table: u32 slots of the draws
 constexpr u32 BufferBinding = 1; ///< the array of storage buffer descriptors
 constexpr u32 SamplerBinding = 2; ///< the array of sampler descriptors
-constexpr u32 ImageBinding = 3;   ///< the first of the arrays of sampled image descriptors, one per image key (below)
+constexpr u32 ImageBinding = 3;   ///< the first of the arrays of image descriptors, one per array key (below)
 constexpr u32 NumImageKeys = 12;  ///< number class (float, sint, uint) x dimension class (2D, 2D array/cube, 2D multisampled, 3D)
+/// Array keys: 0..11 sampled images, 12..23 storage images (format unknown), 24..35 storage images with an atomic format (R32ui / R32i / R32f by number class).
+constexpr u32 NumImageArrays = 3 * NumImageKeys;
+constexpr u32 NoKey = 0xff;       ///< the image stays on the push descriptors
 constexpr u32 MaxBuffers = 1u << 16;
-constexpr u32 MaxImages = 1u << 13;   ///< per image key
+constexpr u32 MaxImages = 1u << 13;        ///< per sampled image array
+constexpr u32 MaxStorageImages = 1u << 11; ///< per storage image array
 constexpr u32 MaxSamplers = 1u << 12;
+/// The buffers found through the table: the guest buffers, the special buffers that are one fixed object, the clip planes (null, or a stream copy that is a slot of its own), and the
+/// flat user data, which is not a descriptor at all: its dwords are copied into the draw's row, behind the slots. Only the shared memory of compute (a stream copy per dispatch) stays
+/// on the push descriptors.
 [[nodiscard]] constexpr bool IsIndexedBufferType(BufferType type) {
-    return type == BufferType::Guest;
+    return type == BufferType::Guest || type == BufferType::GdsBuffer || type == BufferType::BdaPagetable || type == BufferType::FaultBuffer ||
+           type == BufferType::ClipPlanes || type == BufferType::Flatbuf;
 }
 } // namespace Indexed
 
@@ -167,6 +175,8 @@ struct ImageResource {
     u8 constant_mip_index{};
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};
+    /// tlg C9: the descriptor array the image is read from (Indexed::NoKey: the push descriptors), set by the SPIR-V backend when it declares the image; part of the persistent info.
+    u8 array_key{0xff};
 
     /// The sharp from the eight descriptor words the draw's record holds (a single load), with the same fix ups as `GetSharp`.
     constexpr AmdGpu::Image FromWords(const u32* words) const noexcept {
@@ -234,9 +244,9 @@ struct ImageResource {
 using ImageResourceList = boost::container::static_vector<ImageResource, NUM_IMAGES>;
 
 namespace Indexed {
-/// The sampled images found through the arrays: not written (no storage image), no atomics, no mip level fallback (those stay on the push descriptors, set 1).
+/// The images found through the arrays: every image the backend gave a key (all but the mip level fallback with a dynamic index, and atomics of formats other than R32).
 [[nodiscard]] inline bool IsIndexedImage(const ImageResource& image) noexcept {
-    return !image.is_written && !image.is_atomic && image.mip_fallback_mode == MipStorageFallbackMode::None;
+    return image.array_key != NoKey;
 }
 /// The descriptor array an image of this T# is read from: what the shader declares (the sampled type of its number class, the dimension of its host view type).
 [[nodiscard]] inline u32 ImageKey(const AmdGpu::Image& sharp, bool is_array) noexcept {
@@ -268,6 +278,26 @@ namespace Indexed {
         break;
     }
     return number * 4 + dimension;
+}
+/// The array of an image resource with the T# the shader was compiled for (NoKey: it stays on the push descriptors).
+[[nodiscard]] inline u32 ArrayKey(const ImageResource& image, const AmdGpu::Image& sharp) noexcept {
+    if (image.mip_fallback_mode == MipStorageFallbackMode::DynamicIndex) {
+        return NoKey;
+    }
+    const u32 key = ImageKey(sharp, image.is_array);
+    if (!image.is_written) {
+        return key;
+    }
+    if (!image.is_atomic) {
+        return NumImageKeys + key;
+    }
+    // atomics: the SPIR-V image format follows the data and number format; only the 32 bit single channel formats have an array
+    const auto nfmt = sharp.GetNumberFmt();
+    if (sharp.GetDataFmt() != AmdGpu::DataFormat::Format32 ||
+        (nfmt != AmdGpu::NumberFormat::Uint && nfmt != AmdGpu::NumberFormat::Sint && nfmt != AmdGpu::NumberFormat::Float)) {
+        return NoKey;
+    }
+    return 2 * NumImageKeys + key;
 }
 } // namespace Indexed
 

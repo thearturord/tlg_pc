@@ -216,14 +216,9 @@ EmitContext::SpirvAttribute EmitContext::GetAttributeInfo(AmdGpu::NumberFormat f
 
 Id EmitContext::GetBufferSize(const u32 sharp_idx) {
     // Can this be done with memory access? Like we do now with ReadConst
-    const auto& srt_flatbuf = buffers[flatbuf_index];
-    ASSERT(srt_flatbuf.buffer_type == BufferType::Flatbuf);
-    const auto [id, pointer_type] = srt_flatbuf.Alias(PointerType::U32);
-
-    const auto rsrc1{
-        OpLoad(U32[1], OpAccessChain(pointer_type, id, u32_zero_value, ConstU32(sharp_idx + 1)))};
-    const auto rsrc2{
-        OpLoad(U32[1], OpAccessChain(pointer_type, id, u32_zero_value, ConstU32(sharp_idx + 2)))};
+    ASSERT(buffers[flatbuf_index].buffer_type == BufferType::Flatbuf);
+    const auto rsrc1{EmitFlatbufferLoad(ConstU32(sharp_idx + 1))};
+    const auto rsrc2{EmitFlatbufferLoad(ConstU32(sharp_idx + 2))};
 
     const auto stride{OpBitFieldUExtract(U32[1], rsrc1, ConstU32(16u), ConstU32(14u))};
     const auto num_records{rsrc2};
@@ -878,6 +873,13 @@ void EmitContext::DefineBuffers() {
 
         // Define aliases depending on the shader usage.
         auto& spv_buffer = buffers.emplace_back(binding.buffer++, desc.buffer_type);
+        if (info.indexed && desc.buffer_type == BufferType::Flatbuf) {
+            // tlg C9: no binding at all, the dwords of the flat user data are in the draw's row
+            EnsureIndexedTable();
+            indexed_flat_row = binding.indexed;
+            binding.indexed += info.srt_info.flattened_bufsize_dw;
+            continue;
+        }
         // tlg C9: a guest buffer of an indexed graphics shader is found through the draw's row of slots: its descriptor array replaces the plain binding
         const bool through_table = info.indexed && Indexed::IsIndexedBufferType(desc.buffer_type);
         if (through_table) {
@@ -920,6 +922,7 @@ void EmitContext::EnsureIndexedTable() {
     AddCapability(spv::Capability::StorageBufferArrayDynamicIndexing);
     AddCapability(spv::Capability::StorageBufferArrayNonUniformIndexing);
     AddCapability(spv::Capability::SampledImageArrayDynamicIndexing);
+    AddCapability(spv::Capability::StorageImageArrayDynamicIndexing);
     const Id table_array{TypeRuntimeArray(U32[1])};
     Decorate(table_array, spv::Decoration::ArrayStride, 4U);
     const Id table_struct{TypeStruct(table_array)};
@@ -932,6 +935,21 @@ void EmitContext::EnsureIndexedTable() {
     Decorate(indexed_table, spv::Decoration::DescriptorSet, Indexed::GlobalSet);
     Name(indexed_table, "indexed_rows");
     interfaces.push_back(indexed_table);
+}
+
+std::pair<Id, Id> EmitContext::BufferAliasHere(const BufferDefinition& buffer, PointerType alias) {
+    const u32 a = u32(alias);
+    if (buffer.indexed_row == ~0u || buffer.indexed_array[a].value == 0) {
+        const auto& spv = buffer.aliases[a];
+        return {spv.id, spv.pointer_type};
+    }
+    const Id row_base{OpLoad(U32[1], OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]), push_data_block, ConstU32(PushData::RowBaseIndex)))};
+    const Id index{OpIAdd(U32[1], row_base, ConstU32(buffer.indexed_row))};
+    const Id slot{OpLoad(U32[1], OpAccessChain(TypePointer(spv::StorageClass::StorageBuffer, U32[1]), indexed_table, u32_zero_value, index))};
+    Decorate(slot, spv::Decoration::NonUniform);
+    const Id pointer{OpAccessChain(buffer.indexed_struct_ptr[a], buffer.indexed_array[a], slot)};
+    Decorate(pointer, spv::Decoration::NonUniform);
+    return {pointer, buffer.aliases[a].pointer_type};
 }
 
 /// tlg C9: the element array of a guest buffer's alias in the global descriptor array (one variable per element type, written and coherent flags); the pointer into it is made in the
@@ -1127,10 +1145,12 @@ void EmitContext::DefineImagesAndSamplers() {
         const Id sampled_type = data_types[1];
         const Id image_type{ImageType(*this, image_desc, sampled_type)};
 
-        // tlg C9: a sampled image of an indexed graphics shader is found through the draw's row of slots
-        if (info.indexed && Indexed::IsIndexedImage(image_desc)) {
+        // tlg C9: an image of an indexed shader is found through the draw's row of slots (the key is recorded in the resource: the binder reads it there)
+        const u32 array_key = info.indexed ? Indexed::ArrayKey(image_desc, sharp) : Indexed::NoKey;
+        const_cast<ImageResource&>(image_desc).array_key = static_cast<u8>(array_key);
+        if (array_key != Indexed::NoKey) {
             EnsureIndexedTable();
-            const u32 key = Indexed::ImageKey(sharp, image_desc.is_array);
+            const u32 key = array_key;
             const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
             if (!indexed_image_arrays[key].value) {
                 const Id array_variable{AddGlobalVariable(TypePointer(spv::StorageClass::UniformConstant, TypeRuntimeArray(image_type)), spv::StorageClass::UniformConstant)};
@@ -1143,11 +1163,11 @@ void EmitContext::DefineImagesAndSamplers() {
             images.push_back({
                 .data_types = &data_types,
                 .id = Id{},
-                .sampled_type = TypeSampledImage(image_type),
+                .sampled_type = is_storage ? sampled_type : TypeSampledImage(image_type),
                 .image_type = image_type,
                 .view_type = sharp.GetHostViewType(image_desc.is_array),
                 .is_integer = is_integer,
-                .is_storage = false,
+                .is_storage = is_storage,
                 .mip_fallback_mode = mip_fallback_mode,
                 .indexed_row = binding.indexed++,
                 .indexed_key = key,
@@ -1375,7 +1395,7 @@ Id EmitContext::DefineGetBdaPointer() {
     const auto page{OpShiftRightLogical(U64, address, caching_pagebits)};
     const auto page32{OpUConvert(U32[1], page)};
     const auto& bda_buffer{buffers[bda_pagetable_index]};
-    const auto [bda_buffer_id, bda_pointer_type] = bda_buffer.Alias(PointerType::U64);
+    const auto [bda_buffer_id, bda_pointer_type] = BufferAliasHere(bda_buffer, PointerType::U64);
     const auto bda_ptr{OpAccessChain(bda_pointer_type, bda_buffer_id, u32_zero_value, page32)};
     const auto bda{OpLoad(U64, bda_ptr)};
 
@@ -1387,7 +1407,7 @@ Id EmitContext::DefineGetBdaPointer() {
     // First time acces, mark as fault
     AddLabel(fault_label);
     const auto& fault_buffer{buffers[fault_buffer_index]};
-    const auto [fault_buffer_id, fault_pointer_type] = fault_buffer.Alias(PointerType::U32);
+    const auto [fault_buffer_id, fault_pointer_type] = BufferAliasHere(fault_buffer, PointerType::U32);
     const auto page_div32{OpShiftRightLogical(U32[1], page32, ConstU32(5U))};
     const auto page_mod32{OpBitwiseAnd(U32[1], page32, ConstU32(31U))};
     const auto page_mask{OpShiftLeftLogical(U32[1], u32_one_value, page_mod32)};

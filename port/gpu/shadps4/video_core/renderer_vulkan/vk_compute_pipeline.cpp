@@ -5,6 +5,7 @@
 
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+#include "video_core/renderer_vulkan/vk_indexed_data.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -31,9 +32,14 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .pName = "main",
     };
 
+    // tlg C9: a compute shader compiled with the indexed data path finds its indexed resources through the global set (set 0); the other bindings are set 1
+    indexed = IndexedData::Get() != nullptr && info->indexed;
     u32 binding{};
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
     for (const auto& buffer : info->buffers) {
+        if (indexed && Shader::Indexed::IsIndexedBufferType(buffer.buffer_type)) {
+            continue;
+        }
         // During deserialization, we don't have access to the UD to fetch sharp data. To address
         // this properly we need to track shaprs or portion of them in `sdata`, but since we're
         // interested only in "is storage" flag (which is not even effective atm), we can take a
@@ -47,6 +53,9 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         });
     }
     for (const auto& image : info->images) {
+        if (indexed && Shader::Indexed::IsIndexedImage(image)) {
+            continue;
+        }
         const u32 num_bindings = image.NumBindings(*info);
         bindings.push_back({
             .binding = binding,
@@ -58,6 +67,9 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         binding += num_bindings;
     }
     for (const auto& sampler : info->samplers) {
+        if (indexed) {
+            continue;
+        }
         bindings.push_back({
             .binding = binding++,
             .descriptorType = vk::DescriptorType::eSampler,
@@ -89,10 +101,15 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                vk::to_string(descriptor_set_result));
     desc_layout = std::move(descriptor_set);
 
-    const vk::DescriptorSetLayout set_layout = *desc_layout;
+    std::array<vk::DescriptorSetLayout, 2> set_layouts{};
+    if (indexed) {
+        set_layouts = {IndexedData::Get()->Layout(), *desc_layout};
+    } else {
+        set_layouts[0] = *desc_layout;
+    }
     const vk::PipelineLayoutCreateInfo layout_info = {
-        .setLayoutCount = 1U,
-        .pSetLayouts = &set_layout,
+        .setLayoutCount = indexed ? 2U : 1U,
+        .pSetLayouts = set_layouts.data(),
         .pushConstantRangeCount = 1U,
         .pPushConstantRanges = &push_constants,
     };

@@ -53,7 +53,7 @@ public:
 
     /// The slot of a buffer descriptor (0: the null descriptor). Records the write when the slot is new.
     [[nodiscard]] u32 BufferSlot(vk::Buffer buffer, u64 offset, u64 range);
-    /// The slot of a sampled image descriptor in the array of the image key (0: the null descriptor).
+    /// The slot of an image descriptor in the array of the array key (0: the null descriptor).
     [[nodiscard]] u32 ImageSlot(u32 image_key, vk::ImageView view, vk::ImageLayout layout);
     /// The slot of a sampler.
     [[nodiscard]] u32 SamplerSlot(vk::Sampler sampler);
@@ -66,13 +66,13 @@ public:
     void FlushWrites();
     /// Frees the slots of draws the GPU has finished.
     void Maintain();
-    /// Binds the global set to the command buffer that records now, once per command buffer.
-    void BindSet(const CommandRecorder& cmdbuf, vk::PipelineLayout pipeline_layout);
+    /// Binds the global set to the command buffer that records now, once per command buffer and bind point.
+    void BindSet(const CommandRecorder& cmdbuf, vk::PipelineBindPoint bind_point, vk::PipelineLayout pipeline_layout);
 
     struct Stats {
         std::atomic<u64> draws{0}, rows_entries{0}, buffer_hits{0}, buffer_new{0}, buffer_freed{0}, exhausted{0}, flushes{0}, written{0}, set_binds{0};
         std::atomic<u64> image_hits{0}, image_new{0}, image_freed{0}, sampler_hits{0}, sampler_new{0}, sampler_freed{0};
-        std::atomic<u64> verified{0}, verify_differences{0}, key_differences{0};
+        std::atomic<u64> verified{0}, verify_differences{0}, key_differences{0}, legacy_writes{0}, compute_dispatches{0}, legacy_flat{0}, legacy_clip{0}, legacy_lds{0}, legacy_images{0}, flat_dwords{0};
         std::atomic<u32> live_buffer_slots{0}, live_image_slots{0}, live_sampler_slots{0};
     };
     Stats stats;
@@ -92,7 +92,7 @@ private:
     };
     struct SlotInfo {
         Key key{};
-        u64 last_tick{0};
+        u64 last_tick[2]{0, 0}; // the last draw that named the slot, in the graphics stream and in the asynchronous stream (the slot lives until both are done)
         bool used{false};
     };
     /// One descriptor array: the buffers, the samplers, and one per image key.
@@ -108,7 +108,7 @@ private:
     static constexpr u32 BuffersTable = 0;
     static constexpr u32 SamplersTable = 1;
     static constexpr u32 FirstImageTable = 2;
-    static constexpr u32 NumTables = FirstImageTable + Shader::Indexed::NumImageKeys;
+    static constexpr u32 NumTables = FirstImageTable + Shader::Indexed::NumImageArrays;
     struct PendingWrite {
         u32 table, slot, info;
     };
@@ -132,7 +132,7 @@ private:
     std::vector<vk::DescriptorBufferInfo> pending_buffer_infos;
     std::vector<vk::DescriptorImageInfo> pending_image_infos;
     std::vector<PendingWrite> pending;
-    u64 bound_tick{~0ull};
+    u64 bound_tick[2]{~0ull, ~0ull}; // graphics, compute
 
     static inline std::atomic<IndexedData*> live{nullptr};
 };

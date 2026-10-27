@@ -1529,6 +1529,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
         // tlg C9: the plain bindings are the ones that got a write; the guest buffers are named by the draw's row, copied into the stream buffer the global set's table binding covers
         set_writes.resize(set_write_index);
         auto* indexed = IndexedData::Get();
+        indexed->stats.legacy_writes.fetch_add(set_write_index, std::memory_order_relaxed);
+        if (pipeline->IsCompute()) {
+            indexed->stats.compute_dispatches.fetch_add(1, std::memory_order_relaxed);
+        }
         if (indexed_row_size != 0) {
             auto& table = buffer_cache.GetStreamBuffer();
             indexed->SetTable(table.Handle(), table.SizeBytes());
@@ -2112,6 +2116,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     runtime.IsBufferAccessed(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written);
                 bound_buffers.emplace_back(gds_buf, 0, gds_buf->SizeBytes(), src_access);
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
+                if (indexed_active && stage.indexed) {
+                    NoteIndexedFlat(stage);
+                    ++binding.buffer;
+                    continue;
+                }
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
                 const u64 offset =
@@ -2389,6 +2398,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             ++binding.buffer;
             continue;
         }
+        if (indexed_active && stage.indexed) {
+            auto& st = IndexedData::Get()->stats;
+            (desc.buffer_type == Shader::BufferType::Flatbuf ? st.legacy_flat : desc.buffer_type == Shader::BufferType::ClipPlanes ? st.legacy_clip : st.legacy_lds).fetch_add(1, std::memory_order_relaxed);
+        }
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified++;
@@ -2414,6 +2427,23 @@ void Rasterizer::NoteIndexedRow(u32 slot) {
     } else {
         LOG_ERROR(Render_Vulkan, "indexed data: the row of a draw is longer than {} entries", indexed_row.size());
     }
+}
+
+void Rasterizer::NoteIndexedFlat(const Shader::Info& stage) {
+    const u32 count = stage.srt_info.flattened_bufsize_dw;
+    if (indexed_row_size + count > indexed_row.size()) {
+        LOG_ERROR(Render_Vulkan, "indexed data: the row of a draw is longer than {} entries (flat user data of {} dwords)", indexed_row.size(), count);
+        return;
+    }
+    const u32 have = std::min<u32>(count, static_cast<u32>(stage.flattened_ud_buf.size()));
+    if (have != 0) {
+        std::memcpy(indexed_row.data() + indexed_row_size, stage.flattened_ud_buf.data(), have * sizeof(u32));
+    }
+    if (have < count) {
+        std::memset(indexed_row.data() + indexed_row_size + have, 0, (count - have) * sizeof(u32));
+    }
+    indexed_row_size += count;
+    IndexedData::Get()->stats.flat_dwords.fetch_add(count, std::memory_order_relaxed);
 }
 
 void Rasterizer::NoteIndexedImage(const vk::DescriptorImageInfo& info, u32 image_key) {
@@ -2509,7 +2539,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set,
     }
     for (u32 i = 0; i < count; ++i) {
         if (indexed_active && stage.indexed && Shader::Indexed::IsIndexedImage(stage.images[i])) {
-            NoteIndexedImage(image_infos[first_image_idx + i], set.entries[i].array_key);
+            NoteIndexedImage(image_infos[first_image_idx + i], stage.images[i].array_key);
             continue;
         }
         auto& set_write = set_writes[set_write_index++];
@@ -2631,12 +2661,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const auto num_fmt = tsharp.GetNumberFmt();
         if (indexed_active && stage.indexed) {
             const u32 desc_index = static_cast<u32>(&image_desc - stage.images.data());
-            image_keys[desc_index] = Shader::Indexed::ImageKey(tsharp, image_desc.is_array);
+            image_keys[desc_index] = image_desc.array_key;
             auto* indexed = IndexedData::Get();
             const u32 every = indexed->VerifyEvery();
             if (every != 0 && indexed->stats.draws.load(std::memory_order_relaxed) % every == 0 && tsharp.Address() != 0 && Shader::Indexed::IsIndexedImage(image_desc) &&
                 !StageFlatSkipped(stage) &&
-                Shader::Indexed::ImageKey(image_desc.GetSharp(stage), image_desc.is_array) != image_keys[desc_index]) {
+                Shader::Indexed::ArrayKey(image_desc, tsharp) != image_keys[desc_index]) {
                 // the shader was compiled for another kind of image than this draw's T# (the specialization of the pipeline should have told)
                 indexed->stats.key_differences.fetch_add(1, std::memory_order_relaxed);
             }
@@ -2832,6 +2862,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             continue;
         }
         ++image_desc_idx;
+        if (indexed_active && stage.indexed) {
+            IndexedData::Get()->stats.legacy_images.fetch_add(1, std::memory_order_relaxed);
+        }
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified;

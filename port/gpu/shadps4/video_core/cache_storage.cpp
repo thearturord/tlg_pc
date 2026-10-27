@@ -83,7 +83,9 @@ bool IndexedBuild() {
     return e != nullptr && *e != 0 && *e != '0';
 }
 bool EndsWithIdx(const std::string& name) {
-    return (name.size() > 4 && name.compare(name.size() - 4, 4, "-idx") == 0) || (name.size() > 5 && name.compare(name.size() - 5, 5, "-idx2") == 0);
+    // "-idx" with an optional revision digit: the revision changes with the indexed SPIR-V
+    const auto pos = name.rfind("-idx");
+    return pos != std::string::npos && (pos + 4 == name.size() || (pos + 5 == name.size() && name.back() >= '0' && name.back() <= '9'));
 }
 
 void PruneOtherRevisions(const std::filesystem::path& cache_path) {
@@ -112,7 +114,7 @@ std::filesystem::path GameCacheDir() {
     const char* indexed = std::getenv("TLG_INDEXED_DATA");
     const bool indexed_build = indexed != nullptr && *indexed != 0 && *indexed != '0';
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-           (serial + "-" + TLG_SHADER_CACHE_KEY + (indexed_build ? "-idx2" : ""));
+           (serial + "-" + TLG_SHADER_CACHE_KEY + (indexed_build ? "-idx4" : ""));
 #else
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / serial;
 #endif

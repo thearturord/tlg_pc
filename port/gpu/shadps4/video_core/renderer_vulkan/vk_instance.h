@@ -121,7 +121,8 @@ public:
     bool IsIndexedDataSupported() const {
         return features.shaderStorageBufferArrayDynamicIndexing && features.shaderSampledImageArrayDynamicIndexing && vk12_features.descriptorIndexing &&
                vk12_features.runtimeDescriptorArray && vk12_features.descriptorBindingPartiallyBound && vk12_features.descriptorBindingStorageBufferUpdateAfterBind &&
-               vk12_features.descriptorBindingSampledImageUpdateAfterBind && vk12_features.shaderStorageBufferArrayNonUniformIndexing;
+               vk12_features.descriptorBindingSampledImageUpdateAfterBind && vk12_features.shaderStorageBufferArrayNonUniformIndexing &&
+               features.shaderStorageImageArrayDynamicIndexing && vk12_features.descriptorBindingStorageImageUpdateAfterBind;
     }
 
     /// Returns true if 8-bit ints are supported in shaders
