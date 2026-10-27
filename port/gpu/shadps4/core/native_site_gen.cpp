@@ -303,10 +303,213 @@ void Apply1(const Plan& p, Writer& w) {
     }
 }
 
-std::array<Site, 2>& Sites() {
-    static std::array<Site, 2> sites{{
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Sites 2 and 3: the vertex cluster `FUN_01d7d260` (B6), its two loops over the objects of the system `[holder + 0x110]` (count `[holder + 0x118]`), graphics context. Both build the
+// views on the stack and call SetConstantBuffers (0x28: slot 0, two entries from `[rsp + 0x90]`), SetUnorderedAccessViews (0x48: one entry from `[rsp + 0x58]`),
+// SetShaderResources (0x40: six entries from `[rsp + 0x60]`) and dispatch (count + 63) / 64 groups with context virtual 0x58. Loop 1 (0x01d7e240 .. 0x01d7e334, objects with `[obj + 0xa8]`
+// elements, the shader set before the loop) and loop 2 (0x01d7e3b0 .. 0x01d7e5a9, `[obj + 0xc8]` elements, the shader chosen per object by the system's flag bits 0x20 / 0x10 from the
+// device's table at `+ 0x1008 + 0x10 * index`, 0x66 .. 0x68, and set only when it differs from the one cached at `[rsp + 0x30]`).
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool Scan2(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    p.rsp = c->rsp;
+    const u64 holder = c->r12;
+    p.context = c->r15;
+    const u32 index = static_cast<u32>(c->rbx);
+    if (!Plausible(holder) || !Plausible(p.context)) {
+        reason = "an object of the loop is not set";
+        return false;
+    }
+    const u64 array = R<u64>(holder + 0x110);
+    const u32 count_objects = R<u32>(holder + 0x118);
+    if (!Plausible(array) || index >= count_objects) {
+        reason = "no object array";
+        return false;
+    }
+    const u64 element = R<u64>(array + u64{index} * 8);
+    if (!Plausible(element)) {
+        reason = "the object is not set";
+        return false;
+    }
+    const u32 n = R<u32>(element + 0xa8);
+    if (n == 0 || (R<u8>(element + 0x54) & 4) != 0) {
+        no_work = true; // the loop skips the object
+        return false;
+    }
+    const u64 inner = R<u64>(element + 0x100);
+    if (!Plausible(inner)) {
+        reason = "the object has no render data";
+        return false;
+    }
+    const u64 chain_holder = R<u64>(holder + 0xb0);
+    const u64 chain = Plausible(chain_holder) ? R<u64>(chain_holder) : 0;
+    const u64 srv0 = chain != 0 ? R<u64>(chain + 0x28) : 0;
+    const u64 cb_view = R<u64>(inner + 0x90);
+    const u64 uav_owner = R<u64>(inner + 0x10);
+    if (uav_owner == 0) {
+        no_work = true; // the loop skips the object (no dispatch, no table write)
+        return false;
+    }
+    const u64 uav = R<u64>(uav_owner + 0x30);
+    if (uav == 0 || cb_view == 0) {
+        no_work = true;
+        return false;
+    }
+    if (!Plausible(R<u64>(p.context)) || !Plausible(R<u64>(R<u64>(p.context) + 0x58))) {
+        reason = "the context has no virtual table";
+        return false;
+    }
+    p.v[0] = cb_view;
+    p.v[1] = srv0;
+    p.v[2] = uav;
+    p.v[3] = element;
+    for (int i = 0; i < 5; ++i) {
+        p.v[4 + i] = R<u64>(p.rsp + 0x68 + 8 * i); // the other five view slots, as the loop left them before this object
+    }
+    p.groups = (n + 63u) >> 6;
+    p.site_ghidra = 0x01d7e334;
+    p.async = false;
+    p.context_words.emplace_back(0x500, 0);
+    p.context_words.emplace_back(0x508, cb_view);
+    p.context_words.emplace_back(0x1980, srv0);
+    for (int i = 0; i < 5; ++i) {
+        p.context_words.emplace_back(0x1980 + 8 + 8 * i, p.v[4 + i]);
+    }
+    p.context_words.emplace_back(0x2098, uav);
+    p.registers = {{R13, element}};
+    return true;
+}
+void Apply2(const Plan& p, Writer& w) {
+    w.Put<u64>(p.rsp + 0x90, 0);
+    w.Put<u64>(p.rsp + 0x98, p.v[0]);
+    w.Put<u64>(p.rsp + 0x60, p.v[1]);
+    w.Put<u64>(p.rsp + 0x58, p.v[2]);
+    if (w.Live()) {
+        const u64 vtable = R<u64>(p.context);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x28))(p.context, 0, 2, p.rsp + 0x90, 0, 0, 0); // SetConstantBuffers
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x48))(p.context, 0, 1, p.rsp + 0x58, 0, 0, 0); // SetUnorderedAccessViews
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x40))(p.context, 0, 6, p.rsp + 0x60, 0, 0, 0); // SetShaderResources
+        NativeDraw::IssueDispatch(p.context, p.groups, 1, 1, false, p.site_ghidra, false);
+    }
+}
+
+bool Scan3(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    p.rsp = c->rsp;
+    const u64 holder = c->r15; // the system (loop 2 keeps it in r15 and the context in r14)
+    p.context = c->r14;
+    const u32 index = static_cast<u32>(c->rbx);
+    if (!Plausible(holder) || !Plausible(p.context)) {
+        reason = "an object of the loop is not set";
+        return false;
+    }
+    const u64 array = R<u64>(holder + 0x110);
+    const u32 count_objects = R<u32>(holder + 0x118);
+    if (!Plausible(array) || index >= count_objects) {
+        reason = "no object array";
+        return false;
+    }
+    const u64 element = R<u64>(array + u64{index} * 8);
+    if (!Plausible(element)) {
+        reason = "the object is not set";
+        return false;
+    }
+    const u32 n = R<u32>(element + 0xc8);
+    if (n == 0 || (R<u8>(element + 0x54) & 4) != 0) {
+        no_work = true;
+        return false;
+    }
+    const u64 inner = R<u64>(element + 0x100);
+    if (!Plausible(inner)) {
+        reason = "the object has no render data";
+        return false;
+    }
+    const auto field = [&](u64 owner_pointer, u64 offset) -> u64 { return owner_pointer != 0 ? R<u64>(owner_pointer + offset) : 0; };
+    const u64 chain_holder = R<u64>(holder + 0xb0);
+    const u64 chain = Plausible(chain_holder) ? R<u64>(chain_holder) : 0;
+    p.v[0] = R<u64>(inner + 0xa8);              // the constant buffer view ([rsp + 0x98])
+    p.v[1] = field(chain, 0x28);                // srv 0
+    p.v[2] = field(R<u64>(inner + 0x10), 0x28); // srv 1
+    p.v[3] = field(R<u64>(inner + 0x08), 0x28); // srv 2
+    p.v[4] = field(R<u64>(inner + 0x20), 0x28); // srv 3
+    const u64 device = R<u64>(Global(0x0689eed8));
+    const u64 device_entry = Plausible(device) ? R<u64>(element + 0x108) : 0; // (in loop 2 r12 is the object, r15 the system)
+    u64 srv4 = 0;
+    if (Plausible(device_entry)) {
+        const u64 key = R<u64>(device_entry + 0x50);
+        const u64 found = reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64)>(Global(0x01c59060))(device, key);
+        srv4 = Plausible(found) ? R<u64>(found + 0x48) : 0;
+    }
+    p.v[5] = srv4; // srv 4 ([rsp + 0x80])
+    const u64 uav_owner = R<u64>(inner + 0x18);
+    const u64 uav = uav_owner != 0 ? R<u64>(uav_owner + 0x30) : 0;
+    p.v[6] = uav;
+    if (uav == 0 || p.v[0] == 0 || p.v[2] == 0 || p.v[3] == 0 || p.v[4] == 0 || srv4 == 0) {
+        no_work = true; // the loop skips the object
+        return false;
+    }
+    u32 flags = R<u32>(element + 0x54);
+    u32 shader_index = 0x66;
+    u64 srv1 = p.v[2];
+    if ((flags & 0x20) != 0) {
+        srv1 = 0;
+        shader_index = 0x67;
+        flags = R<u32>(element + 0x54);
+    }
+    if ((flags & 0x10) != 0) {
+        shader_index = 0x68;
+    }
+    p.v[2] = srv1;
+    p.v[7] = shader_index;
+    p.v[8] = R<u32>(p.rsp + 0x30); // the shader index cached by the loop
+    p.v[9] = Plausible(device) ? R<u64>(device + 0x1008 + (u64{shader_index} << 4)) : 0;
+    p.v[10] = element;
+    p.v[11] = R<u64>(p.rsp + 0x88); // the sixth view slot, not touched by the loop
+    if (p.v[9] == 0 || !Plausible(R<u64>(p.context)) || !Plausible(R<u64>(R<u64>(p.context) + 0x58))) {
+        reason = "the shader table or the context is not set";
+        return false;
+    }
+    p.groups = (n + 63u) >> 6;
+    p.site_ghidra = 0x01d7e5a9;
+    p.async = false;
+    p.context_words.emplace_back(0x500, 0);
+    p.context_words.emplace_back(0x508, p.v[0]);
+    for (int i = 0; i < 5; ++i) {
+        p.context_words.emplace_back(0x1980 + 8 * i, p.v[1 + i]);
+    }
+    p.context_words.emplace_back(0x1980 + 40, p.v[11]);
+    p.context_words.emplace_back(0x2098, uav);
+    p.context_words.emplace_back(0x4670, p.v[9]);
+    p.registers = {{R12, element}, {R13, shader_index}};
+    return true;
+}
+void Apply3(const Plan& p, Writer& w) {
+    w.Put<u64>(p.rsp + 0x90, 0);
+    w.Put<u64>(p.rsp + 0x98, p.v[0]);
+    for (int i = 0; i < 5; ++i) {
+        w.Put<u64>(p.rsp + 0x60 + 8 * i, p.v[1 + i]);
+    }
+    w.Put<u64>(p.rsp + 0x58, p.v[6]);
+    const bool set_shader = static_cast<u32>(p.v[8]) != static_cast<u32>(p.v[7]);
+    if (w.Live() && set_shader) {
+        reinterpret_cast<Virtual>(R<u64>(R<u64>(p.context) + 0x38))(p.context, p.v[9], 0, 0, 0, 0, 0); // SetShader
+    }
+    if (set_shader) {
+        w.Put<u32>(p.rsp + 0x30, static_cast<u32>(p.v[7]));
+    }
+    if (w.Live()) {
+        const u64 vtable = R<u64>(p.context);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x28))(p.context, 0, 2, p.rsp + 0x90, 0, 0, 0);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x48))(p.context, 0, 1, p.rsp + 0x58, 0, 0, 0);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x40))(p.context, 0, 6, p.rsp + 0x60, 0, 0, 0);
+        NativeDraw::IssueDispatch(p.context, p.groups, 1, 1, false, p.site_ghidra, false);
+    }
+}
+
+std::array<Site, 4>& Sites() {
+    static std::array<Site, 4> sites{{
         {"begin_recording_loop_1", 0x01c49e40, &Scan0, &Apply0, {}},
         {"begin_recording_loop_2", 0x01c4a9e3, &Scan1, &Apply1, {}},
+        {"vertex_cluster_loop_1", 0x01d7e334, &Scan2, &Apply2, {}},
+        {"vertex_cluster_loop_2", 0x01d7e5b0, &Scan3, &Apply3, {}},
     }};
     return sites;
 }
@@ -530,6 +733,18 @@ u64 FindHandler(const char* name) {
     }
     if (n == "site_bottom_1") {
         return reinterpret_cast<u64>(&Bottom<1>);
+    }
+    if (n == "site_top_2") {
+        return reinterpret_cast<u64>(&Top<2>);
+    }
+    if (n == "site_bottom_2") {
+        return reinterpret_cast<u64>(&Bottom<2>);
+    }
+    if (n == "site_top_3") {
+        return reinterpret_cast<u64>(&Top<3>);
+    }
+    if (n == "site_bottom_3") {
+        return reinterpret_cast<u64>(&Bottom<3>);
     }
     return 0;
 }

@@ -7652,6 +7652,7 @@ u64 PS4_SYSV_ABI TagAscDispatchRecordOnly(u64 jcc, u64 x, u64 y, u64 z, u64 a4, 
 }
 
 u64 PS4_SYSV_ABI TagDispatch(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    NativeSiteGen::NoteDispatch(ctx, a1, a2, a3, ret); // B7: a verify run compares the engine's dispatch with the site generator's prediction
     if (NativeZPassGen::VerifyActive()) {
         NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 3, ctx, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a3));
     }
