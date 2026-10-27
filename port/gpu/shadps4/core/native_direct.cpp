@@ -71,6 +71,12 @@ Classified Classify(const u32* packet, bool markers, u32 queue) {
             return {Class::Packet, opcode, dwords};
         }
     }
+    // C10: the index buffer state of a draw that a record took over (INDEX_BUFFER_SIZE 0x13 and INDEX_BASE 0x26 sit right before the draw's native tag in the spear cutscene's
+    // buffers): the tag's record carries its own index data and nothing else consumes the state. Inert adds no entry (like Other) and only keeps the buffer from being counted as mixed;
+    // an indexed draw packet the walk would execute (0x27 and the like) is still an Other
+    if (queue == 0 && (opcode == 0x13 || opcode == 0x26)) {
+        return {Class::Inert, 0, dwords};
+    }
     if (opcode != 0x10) {
         return {Class::Other, opcode, dwords};
     }
