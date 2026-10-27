@@ -7876,6 +7876,7 @@ namespace {
 std::atomic<u64> scene_slot_frame{0};
 std::atomic<u32> scene_slot_announced{0};
 std::atomic<u32> scene_slot_group{0};
+std::atomic<u32> scene_slot_group_seen{~0u};
 constexpr u64 SceneSlotRingGhidra = 0x69b1630, SceneSlotGroupGhidra = 0x69b1678;
 constexpr u64 SceneSlotStride = 0x140, SceneSlotBytes = 0x130;
 
@@ -7883,24 +7884,34 @@ void AnnounceSceneSlotRange(u64 frame, u32 upto, bool remember_group) {
     if (!Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
         return;
     }
-    const u32 first = scene_slot_announced.load(std::memory_order_relaxed);
-    if (upto <= first || upto > 8192) {
-        if (upto < first) {
-            scene_slot_announced.store(0, std::memory_order_relaxed); // the ring was reset: a new frame
-        }
-        return;
-    }
     const VAddr base = image_base.load(std::memory_order_relaxed);
     if (base == 0) {
         return;
     }
+    // the group variable is written at two places of the frame (FUN_01d169b0, FUN_01cf7a40): the remembered group of the last call was tried and left more faults uncovered than the current one
+    u32 group = 3;
+    Guarded([&]() -> u64 {
+        group = Rd<u32>(base + SceneSlotGroupGhidra - 0x1000000, 0);
+        return 0;
+    });
+    if (group >= 3) {
+        return;
+    }
+    u32 first = scene_slot_announced.load(std::memory_order_relaxed);
+    if (group != scene_slot_group_seen.load(std::memory_order_relaxed)) {
+        // a new ring group: the slots announced so far were the other group's (the announcement runs one slot ahead, so at the first call of a frame it can see the old group)
+        first = 0;
+        scene_slot_group_seen.store(group, std::memory_order_relaxed);
+        scene_slot_announced.store(0, std::memory_order_relaxed);
+    } else if (upto < first) {
+        first = 0; // the ring was reset: a new frame
+        scene_slot_announced.store(0, std::memory_order_relaxed);
+    }
+    if (upto <= first || upto > 8192) {
+        return;
+    }
     Guarded([&]() -> u64 {
         const u64 ring_globals = base + SceneSlotRingGhidra - 0x1000000;
-        // the group variable is written at two places of the frame (FUN_01d169b0, FUN_01cf7a40): the remembered group of the last call was tried and left more faults uncovered than the current one
-        const u32 group = Rd<u32>(base + SceneSlotGroupGhidra - 0x1000000, 0);
-        if (group >= 3) {
-            return 0;
-        }
         if (remember_group) {
             scene_slot_group.store(group, std::memory_order_relaxed);
         }
@@ -7941,11 +7952,31 @@ u64 PS4_SYSV_ABI SceneSlotWrites(u64 frame, u64 a1, u64 a2, u64 a3, u64 a4, u64 
     if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && IsHeapPointer(frame)) {
         scene_slot_frame.store(frame, std::memory_order_relaxed);
         Guarded([&]() -> u64 {
-            AnnounceSceneSlotRange(frame, Rd<u32>(frame, 0x31ea4), true);
+            // the slots the earlier calls consumed, and the one this call is about to take and write (announced before its first store)
+            AnnounceSceneSlotRange(frame, std::min<u32>(Rd<u32>(frame, 0x31ea4) + 1, 8192), true);
             return 0;
         });
     }
     return 0;
+}
+
+/// C4: the engine's GPU memory allocators (`FUN_02475f90` AllocateGarlicMemory(device, size, alignment, type), `FUN_02476730` AllocateOnionMemory(device, size, alignment), JsDevice.cpp):
+/// whatever the engine allocates is initialized by the CPU right after (shader code and headers at shader creation, resource contents): the range is announced as written at the
+/// allocation (writer 5, creation) so the writes that follow are not unannounced. Runs the original; does nothing more unless the update audit or the uploads are on.
+template <u32 Which>
+u64 PS4_SYSV_ABI GpuAlloc(u64 device, u64 size, u64 alignment, u64 type, u64 a4, u64 a5, u64 ret) {
+    static const u64 original = Core::GuestHooks::OriginalEntry(Which == 0 ? "AllocGarlicMemory" : "AllocOnionMemory");
+    (void)ret;
+    if (original == 0) {
+        return 0;
+    }
+    const u64 result = reinterpret_cast<GuestDraw6>(original)(device, size, alignment, type, a4, a5);
+    if (result != 0 && Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
+        if (const u64 bytes = size & 0xffffffffull; bytes != 0) {
+            Core::NativeUpdates::NoteWriterRange(5, result, bytes);
+        }
+    }
+    return (1ull << 63) | result; // skip the guest function (it ran), return its result
 }
 
 void FlushSceneSlotAnnouncements() {
@@ -8184,6 +8215,12 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "shader_cache_load_1") {
         return reinterpret_cast<u64>(&ShaderCacheLoad<1>);
+    }
+    if (name == "alloc_garlic_memory") {
+        return reinterpret_cast<u64>(&GpuAlloc<0>);
+    }
+    if (name == "alloc_onion_memory") {
+        return reinterpret_cast<u64>(&GpuAlloc<1>);
     }
     if (name == "shader_class_compile_1") {
         return reinterpret_cast<u64>(&ShaderClassCompile<1>);
