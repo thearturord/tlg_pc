@@ -504,12 +504,120 @@ void Apply3(const Plan& p, Writer& w) {
     }
 }
 
-std::array<Site, 4>& Sites() {
-    static std::array<Site, 4> sites{{
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Site 4: the particle emitter system `FUN_01bcac40(system, context, scene)` (ghidra 0x01bcac40), its last dispatch loop over the linked list of emitters (`node + 0x38`), 0x01bcc264 ..
+// 0x01bcc3fc, graphics context in r14, the system in `[rsp + 0x80]`, the emitter data in r12 (`[node + 0x108]`): five stack slots are set from it (`[rsp + 0xb8] = [r12 + 0x190]`,
+// `[rsp + 0xc0]` and `[rsp + 0xc8]`, `[rsp + 0xf0]`, `[rsp + 0xf8]`), the shader (0x1e, 0x1f or 0x20 by `[r12 + 0x248]` and `[[r12 + 0x218] + 0x48]`) is set when it differs from the one cached
+// at `[system + 0x78]`, the tables are written through SetConstantBuffers (slot 10, one entry from `[rsp + 0x88]`), SetUnorderedAccessViews (two entries from `[rsp + 0x90]`),
+// SetShaderResources (four entries from `[rsp + 0xa8]`), and one dispatch of ((w + 7) / 8, (h + 7) / 8, 1) groups with `[r12]` = the size. The loop continues at `0x01bcc400`.
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool Scan4(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    p.rsp = c->rsp;
+    const u64 node = c->rbx;
+    p.context = c->r14;
+    const u64 system = R<u64>(p.rsp + 0x80);
+    if (!Plausible(node) || !Plausible(p.context) || !Plausible(system)) {
+        reason = "an object of the loop is not set";
+        return false;
+    }
+    const u64 data = R<u64>(node + 0x108);
+    if (!Plausible(data)) {
+        no_work = true;
+        return false;
+    }
+    const float threshold = R<float>(Global(0x024f108c));
+    if (threshold > R<float>(data + 0x290)) {
+        no_work = true; // the loop skips an emitter that is not alive
+        return false;
+    }
+    const u64 table_pointer_a = R<u64>(p.rsp + 0x88);
+    const u64 table_pointer_b = R<u64>(p.rsp + 0x90);
+    const u64 table_pointer_c = R<u64>(p.rsp + 0xa8);
+    if (!Plausible(table_pointer_a) || !Plausible(table_pointer_b) || !Plausible(table_pointer_c) || !Plausible(R<u64>(p.context)) || !Plausible(R<u64>(R<u64>(p.context) + 0x58))) {
+        reason = "the table pointers of the function are not set";
+        return false;
+    }
+    const auto field = [&](u64 owner, u64 offset) -> u64 { return Plausible(owner) ? R<u64>(owner + offset) : 0; };
+    const u32 pair = R<u32>(data + 0x250) * 2 + R<u32>(data + 0x24c);
+    p.v[0] = R<u64>(data + 0x190);                                   // [rsp + 0xb8]
+    p.v[1] = field(R<u64>(data + 0x1c8 + u64{pair} * 8), 0x48);      // [rsp + 0xc0]
+    p.v[2] = field(R<u64>(data + 0x1f0), 0x50);                      // [rsp + 0xf0]
+    p.v[3] = field(R<u64>(data + 0x1e8), 0x50);                      // [rsp + 0xf8]
+    u32 shader_index = 0x20;
+    u64 view = 0; // [rsp + 0xc8]
+    if (R<u32>(data + 0x248) != 4) {
+        shader_index = 0x1e;
+        const u64 holder = R<u64>(data + 0x218);
+        if (Plausible(holder)) {
+            const u64 found = R<u64>(holder + 0x48);
+            if (found != 0) {
+                shader_index = 0x1f;
+                view = found;
+            }
+        }
+    }
+    p.v[4] = view;
+    p.v[5] = shader_index;
+    p.v[6] = system;
+    p.v[7] = node;
+    p.v[8] = data;
+    p.v[9] = R<u32>(system + 0x78); // the shader index cached by the function
+    const u64 device = R<u64>(Global(0x0689eed8));
+    p.v[10] = Plausible(device) ? R<u64>(device + 0x1008 + (u64{shader_index} << 4)) : 0;
+    p.v[11] = R<u64>(p.rsp + 0xd0); // the entries of the shader resource table the loop does not set
+    p.v[12] = R<u64>(p.rsp + 0xd8);
+    if (p.v[10] == 0) {
+        reason = "the shader table is not set";
+        return false;
+    }
+    const u64 size = R<u64>(data);
+    const u32 width = static_cast<u32>(size);
+    const u32 height = static_cast<u32>(size >> 32);
+    p.groups = (width + 7u) >> 3;
+    p.groups_y = (height + 7u) >> 3;
+    p.site_ghidra = 0x01bcc3fc;
+    p.async = false;
+    p.context_words.emplace_back(0x500 + 10 * 8, p.v[0]);
+    p.context_words.emplace_back(0x1980, p.v[1]);
+    p.context_words.emplace_back(0x1980 + 8, p.v[4]);
+    p.context_words.emplace_back(0x1980 + 16, p.v[11]);
+    p.context_words.emplace_back(0x1980 + 24, p.v[12]);
+    p.context_words.emplace_back(0x2098, p.v[2]);
+    p.context_words.emplace_back(0x2098 + 8, p.v[3]);
+    p.context_words.emplace_back(0x4670, p.v[10]);
+    p.registers = {{R12, data}, {R15, shader_index}};
+    return true;
+}
+void Apply4(const Plan& p, Writer& w) {
+    w.Put<u64>(p.rsp + 0xb8, p.v[0]);
+    w.Put<u64>(p.rsp + 0xc0, p.v[1]);
+    w.Put<u64>(p.rsp + 0xf0, p.v[2]);
+    w.Put<u64>(p.rsp + 0xf8, p.v[3]);
+    w.Put<u64>(p.rsp + 0xc8, p.v[4]);
+    if (w.Live()) {
+        const u64 vtable = R<u64>(p.context);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x28))(p.context, 10, 1, R<u64>(p.rsp + 0x88), 0, 0, 0);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x48))(p.context, 0, 2, R<u64>(p.rsp + 0x90), 0, 0, 0);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x40))(p.context, 0, 4, R<u64>(p.rsp + 0xa8), 0, 0, 0);
+    }
+    if (static_cast<u32>(p.v[9]) != static_cast<u32>(p.v[5])) {
+        w.Put<u32>(p.v[6] + 0x78, static_cast<u32>(p.v[5]));
+        if (w.Live()) {
+            reinterpret_cast<Virtual>(R<u64>(R<u64>(p.context) + 0x38))(p.context, p.v[10], 0, 0, 0, 0, 0); // SetShader
+        }
+    }
+    if (w.Live()) {
+        NativeDraw::IssueDispatch(p.context, p.groups, p.groups_y, 1, false, p.site_ghidra, false);
+    }
+}
+
+std::array<Site, 5>& Sites() {
+    static std::array<Site, 5> sites{{
         {"begin_recording_loop_1", 0x01c49e40, &Scan0, &Apply0, {}},
         {"begin_recording_loop_2", 0x01c4a9e3, &Scan1, &Apply1, {}},
         {"vertex_cluster_loop_1", 0x01d7e334, &Scan2, &Apply2, {}},
         {"vertex_cluster_loop_2", 0x01d7e5b0, &Scan3, &Apply3, {}},
+        {"emitter_system_loop_e", 0x01bcc400, &Scan4, &Apply4, {}},
     }};
     return sites;
 }
@@ -745,6 +853,12 @@ u64 FindHandler(const char* name) {
     }
     if (n == "site_bottom_3") {
         return reinterpret_cast<u64>(&Bottom<3>);
+    }
+    if (n == "site_top_4") {
+        return reinterpret_cast<u64>(&Top<4>);
+    }
+    if (n == "site_bottom_4") {
+        return reinterpret_cast<u64>(&Bottom<4>);
     }
     return 0;
 }
