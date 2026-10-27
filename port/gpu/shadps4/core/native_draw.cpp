@@ -6615,6 +6615,51 @@ u64 PS4_SYSV_ABI WetSim(u64 system, u64 ctx, u64 scene, u64 a3, u64 a4, u64 a5, 
     return 0;
 }
 
+/// Guard for the engine's render data creation `FUN_01c45170(render data, resource, kind, ...)` when the GPU instancing loop `FUN_01ee5130` calls it at first use. A buffer whose usage bits
+/// (high word of resource + 0x58, bits 2 and 3) are not set yet, asked for an unordered access view (kind bit 0x80) without a view format (resource + 0x84) and without raw or structured
+/// bits, gets the format 0 in `FUN_024999e0`, whose element size is 0: an integer divide by zero (seen once in about 50 starts while the game loads; the description of the resource is
+/// not filled in yet). A resource without its element size (resource + 0x44) divides by zero earlier in the same function. Both return failure here, which the instancing loop handles
+/// (it deletes the half made render data and creates it again on the next frame). Other callers treat a failure as fatal and are left alone.
+std::atomic<u64> render_data_guard_calls{0}, render_data_guard_stopped[2];
+u64 PS4_SYSV_ABI RenderDataCreateGuard(u64 render_data, u64 resource, u64 kind, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
+    (void)render_data, (void)a3, (void)a4, (void)a5, (void)caller_rsp;
+    const u64 site = ret - ImageBase() + 0x1000000;
+    if (site < 0x01ee5130 || site >= 0x01ee9ac8 || !IsHeapPointer(resource)) {
+        return 0;
+    }
+    render_data_guard_calls.fetch_add(1, std::memory_order_relaxed);
+    const auto stop = [&](u32 why) {
+        const u64 count = render_data_guard_stopped[why].fetch_add(1, std::memory_order_relaxed);
+        if (count < 3) {
+            LOG_WARNING(Core, "render data guard: the instancing loop asks for a view of resource {:#x} that the engine would divide by zero on ({}): kind {:#x}, +0x40 {:#x}, +0x44 {:#x}, +0x58 {:#x}, +0x60 {:#x}, +0x84 {:#x}",
+                        resource, why == 0 ? "no element size" : "unordered access view without a format", static_cast<u32>(kind), Rd<u32>(resource, 0x40), Rd<u32>(resource, 0x44), Rd<u64>(resource, 0x58),
+                        Rd<u32>(resource, 0x60), Rd<u32>(resource, 0x84));
+        }
+        return 0x8000000000000000ull; // skip the function, it returns 0 (failure)
+    };
+    u64 verdict = 0;
+    Guarded([&]() -> u64 {
+        const u32 element = Rd<u32>(resource, 0x44);
+        if (element == 0) {
+            verdict = stop(0);
+            return 0;
+        }
+        const u64 size = Rd<u64>(resource, 0x58);
+        const u32 low = static_cast<u32>(size);
+        if (low == low % element || (size & 0x2000000000ull) != 0) {
+            return 0; // the engine leaves early
+        }
+        const u32 high = static_cast<u32>(size >> 32);
+        const u32 flags = static_cast<u32>(kind) | Rd<u32>(resource, 0x60);
+        const bool buffer = Rd<u32>(resource, 0x40) - 1u < 2u;
+        if (buffer && ((high >> 2) & 1) == 0 && ((high >> 3) & 1) == 0 && (flags & 0x80) != 0 && (flags & 3) == 0 && Rd<u32>(resource, 0x84) == 0) {
+            verdict = stop(1);
+        }
+        return 0;
+    });
+    return verdict;
+}
+
 /// B4: the GPU instancing loop `FUN_01ee5130(holder, scene)`: a generator behind `TLG_INST_GEN=1` (core/native_zpass_gen.cpp, B4).
 u64 PS4_SYSV_ABI InstanceLoop(u64 holder, u64 scene, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
     (void)a2, (void)a3, (void)a4, (void)a5, (void)ret, (void)caller_rsp;
@@ -8258,6 +8303,9 @@ u64 FindHandler(const std::string& name) {
     if (name == "light_writes") {
         return reinterpret_cast<u64>(&LightWrites);
     }
+    if (name == "render_data_create_guard") {
+        return reinterpret_cast<u64>(&RenderDataCreateGuard);
+    }
     if (name == "instance_loop") {
         return reinterpret_cast<u64>(&InstanceLoop);
     }
@@ -8862,6 +8910,7 @@ void NativeListRead(nlohmann::json& out) {
     out["lazy_registers_materialized"] = lazy_materialized.load();
     out["lazy_verify_full_take_compared"] = lazy_verified.load();
     out["lazy_verify_differences"] = lazy_differences.load();
+    out["render_data_guard"] = {{"calls_from_the_instancing_loop", render_data_guard_calls.load()}, {"stopped_no_element_size", render_data_guard_stopped[0].load()}, {"stopped_view_without_format", render_data_guard_stopped[1].load()}};
 }
 
 void MergeCensusRead(std::array<u64, 6>& values) {
