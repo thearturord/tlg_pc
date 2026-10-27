@@ -9077,7 +9077,9 @@ void NativeListRead(nlohmann::json& out) {
                                  {"dispatch_buffer_loads", a.dispatch_buffer_loads.load()},
                                  {"dispatch_buffer_served_by_record", a.dispatch_buffer_record.load()},
                                  {"dispatch_buffer_equal", a.dispatch_buffer_equal.load()},
-                                 {"dispatch_buffer_different", a.dispatch_buffer_different.load()}};
+                                 {"dispatch_buffer_different", a.dispatch_buffer_different.load()},
+                                 {"dispatch_diff_base_size_other_hasid_bothvalid_recordonly_trustbroken_ambiguous", {a.dispatch_diff[0].load(), a.dispatch_diff[1].load(), a.dispatch_diff[2].load(), a.dispatch_diff[3].load(), a.dispatch_diff[4].load(), a.dispatch_diff[5].load(), a.dispatch_diff[6].load(), a.dispatch_diff[7].load()}},
+                                 {"dispatch_diff_lag_recordlags_guestlags_neither", {a.dispatch_lag[0].load(), a.dispatch_lag[1].load(), a.dispatch_lag[2].load()}}};
     }
     {
         const auto& c = Vulkan::g_indexed_census;

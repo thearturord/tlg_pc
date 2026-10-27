@@ -535,6 +535,33 @@ static u32 DispatchBinderMode() {
     return mode;
 }
 
+/// B9 trust by experience (mode 2): a descriptor of a dispatch's record is served from the record only after it equalled the guest's 64 times in a row for the same (call site, program,
+/// flat offset, kind); every 64th use after that is compared again and one difference ends the trust for good. `chosen` holds the record's descriptor; false: use the guest's.
+template <class T, class F>
+static bool DispatchTrustCheck(u64 key, T& chosen, F&& guest) {
+    struct Trust {
+        u32 equal{}, uses{};
+        bool bad{};
+    };
+    static std::unordered_map<u64, Trust> trust;
+    Trust& t = trust[key];
+    if (!(t.bad || t.equal < 64 || (++t.uses & 63) == 0)) {
+        return true;
+    }
+    const auto legacy = guest();
+    if (std::memcmp(&legacy, &chosen, sizeof(legacy)) == 0) {
+        t.equal = std::min<u32>(t.equal + 1, 64);
+    } else {
+        t.bad = true;
+        g_identity_audit.dispatch_diff[6].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (t.bad || t.equal < 64) {
+        chosen = legacy;
+        return false;
+    }
+    return true;
+}
+
 static u32 NativeBinderMode() {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_NATIVE_BINDER");
@@ -1470,6 +1497,12 @@ const DrawPlan* Rasterizer::DispatchBinderFor(const DispatchPlan* plan) {
     if (mode == 0 || plan == nullptr || !plan->bindings_complete || plan->binding_count == 0) {
         return nullptr;
     }
+    // the pass at 0x01c6456d (RenderScene pass h): all of the buffer descriptors of the record that differ from the guest's come from it (an unrelated buffer at flat offset 96);
+    // until its record is understood the guest's tables serve it (TLG_DISPATCH_BINDER=2 with it included hung the GPU)
+    static const bool include_pass_h = std::getenv("TLG_DISPATCH_BINDER_PASS_H") != nullptr;
+    if (!include_pass_h && Core::NativeDraw::RecordCallerGhidra(plan->native_seq) == 0x01c6456d) {
+        return nullptr;
+    }
     if (!dispatch_binder_plan) {
         dispatch_binder_plan = std::make_unique<DrawPlan>();
     }
@@ -1555,7 +1588,24 @@ const u32* Rasterizer::BinderWords(const Shader::Info& stage, u32 offset, u32 dw
             return nullptr;
         }
     }
-    return FindRecordWords(stage, binder_plan->bindings.data(), binder_plan->binding_count, s, kind, offset, dwords, binding_index);
+    u32 first = 0;
+    const u32* words = FindRecordWords(stage, binder_plan->bindings.data(), binder_plan->binding_count, s, kind, offset, dwords, &first);
+    if (words != nullptr && s == 5) {
+        // a dispatch's record can hold two entries that answer the same flat offset (the tables of the graphics context and the async context share slot numbers): when a second
+        // entry gives other words the record does not say which one the shader reads, and the guest's tables serve it
+        u32 second = 0;
+        const u32* other = first + 1 < binder_plan->binding_count
+                               ? FindRecordWords(stage, binder_plan->bindings.data() + first + 1, binder_plan->binding_count - first - 1, s, kind, offset, dwords, &second)
+                               : nullptr;
+        if (other != nullptr && std::memcmp(words, other, dwords * sizeof(u32)) != 0) {
+            g_identity_audit.dispatch_diff[7].fetch_add(1, std::memory_order_relaxed); // counted as "ambiguous"
+            return nullptr;
+        }
+    }
+    if (binding_index != nullptr) {
+        *binding_index = first;
+    }
+    return words;
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed) {
@@ -2259,6 +2309,31 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (const u32* words = BinderWords(stage, desc.sharp_fetch.offsets[0], 4, 1, &record_binding)) {
                     chosen_sharp = desc.FromWords(words, stage);
                     from_record = true;
+                    if (stage.sw_stage == Shader::SwStage::Compute && DispatchBinderMode() == 2) {
+                        // trust by experience: a (call site, program, flat offset) is served from the record only after 64 uses in a row where it equalled the guest's descriptor;
+                        // every 64th use after that is compared again and one difference ends the trust for good (the guest's descriptor serves it from then on)
+                        struct Trust {
+                            u32 equal{}, uses{};
+                            bool bad{};
+                        };
+                        static std::unordered_map<u64, Trust> trust;
+                        const u64 caller = Core::NativeDraw::RecordCallerGhidra(binder_plan->native_seq);
+                        Trust& t = trust[(caller << 40) ^ (u64{stage.pgm_hash} << 8) ^ desc.sharp_fetch.offsets[0]];
+                        const bool check = t.bad || t.equal < 64 || (++t.uses & 63) == 0;
+                        if (check) {
+                            const auto legacy = desc.GetSharp(stage);
+                            if (std::memcmp(&legacy, &chosen_sharp, sizeof(legacy)) == 0) {
+                                t.equal = std::min<u32>(t.equal + 1, 64);
+                            } else {
+                                t.bad = true;
+                                g_identity_audit.dispatch_diff[6].fetch_add(1, std::memory_order_relaxed);
+                            }
+                            if (t.bad || t.equal < 64) {
+                                chosen_sharp = legacy;
+                                from_record = false;
+                            }
+                        }
+                    }
                     if (binder_verify) {
                         const auto legacy = desc.GetSharp(stage);
                         if (std::memcmp(&legacy, &chosen_sharp, sizeof(legacy)) != 0) {
@@ -2273,15 +2348,41 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 auto& audit = g_identity_audit;
                 audit.dispatch_buffer_loads.fetch_add(1, std::memory_order_relaxed);
                 const u32* words = nullptr;
+                u32 audit_index = 0;
                 for (u32 s = 0; s < 8 && words == nullptr; ++s) {
-                    words = FindRecordWords(stage, dispatch_audit_plan->bindings.data(), dispatch_audit_plan->binding_count, s, 1, desc.sharp_fetch.offsets[0], 4);
+                    words = FindRecordWords(stage, dispatch_audit_plan->bindings.data(), dispatch_audit_plan->binding_count, s, 1, desc.sharp_fetch.offsets[0], 4, &audit_index);
                 }
                 if (words != nullptr) {
                     audit.dispatch_buffer_record.fetch_add(1, std::memory_order_relaxed);
                     const auto legacy = desc.GetSharp(stage);
                     const auto recorded = desc.FromWords(words, stage);
+                    {
+                        // does the record lag by one update? (its base is the guest's base of the previous dispatch of this program and offset)
+                        static std::unordered_map<u64, std::pair<u64, u64>> previous; // key -> (guest base, record base) of the last dispatch
+                        auto& last = previous[(u64{stage.pgm_hash} << 16) ^ desc.sharp_fetch.offsets[0]];
+                        if (std::memcmp(&legacy, &recorded, sizeof(legacy)) != 0) {
+                            audit.dispatch_lag[last.first == recorded.base_address ? 0 : last.second == legacy.base_address ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
+                        }
+                        last = {legacy.base_address, recorded.base_address};
+                    }
                     (std::memcmp(&legacy, &recorded, sizeof(legacy)) == 0 ? audit.dispatch_buffer_equal : audit.dispatch_buffer_different).fetch_add(1, std::memory_order_relaxed);
                     if (std::memcmp(&legacy, &recorded, sizeof(legacy)) != 0) {
+                        audit.dispatch_diff[legacy.base_address != recorded.base_address ? 0 : legacy.GetSize() != recorded.GetSize() ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
+                        {
+                            const u64 rec_size = recorded.GetSize(), leg_size = legacy.GetSize();
+                            const bool rec_ok = memory->ClampRangeSize(recorded.base_address, rec_size) == rec_size;
+                            const bool leg_ok = memory->ClampRangeSize(legacy.base_address, leg_size) == leg_size;
+                            audit.dispatch_diff[rec_ok ? (leg_ok ? 4 : 5) : (leg_ok ? 6 : 7)].fetch_add(1, std::memory_order_relaxed);
+                        }
+                        if (auto* handle = Core::NativeResources::FindImmutableById(dispatch_audit_plan->bindings[audit_index].id)) {
+                            audit.dispatch_diff[3].fetch_add(1, std::memory_order_relaxed);
+                        }
+                        if (false) {
+                            auto* handle = static_cast<Core::NativeResources::ImmutableBuffer*>(nullptr);
+                            audit.dispatch_diff[3].fetch_add(1, std::memory_order_relaxed);
+                            const auto inside = [&](const AmdGpu::Buffer& b) { return b.base_address >= handle->begin && b.base_address + b.GetSize() <= handle->end; };
+                            audit.dispatch_diff[handle->alive.load(std::memory_order_acquire) ? (inside(recorded) ? 4 : inside(legacy) ? 5 : 6) : 7].fetch_add(1, std::memory_order_relaxed);
+                        }
                         static std::atomic<u32> logged{0};
                         if (logged.fetch_add(1) < 12) {
                             u32 l[4], r[4];
@@ -2767,6 +2868,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             if (const u32* words = BinderWords(stage, image_desc.sharp_fetch.offsets[0], image_desc.is_r128 ? 4 : 8, 2, &identity_binding)) {
                 chosen_tsharp = image_desc.FromWords(words);
                 image_from_record = true;
+                if (stage.sw_stage == Shader::SwStage::Compute && DispatchBinderMode() == 2) {
+                    image_from_record = DispatchTrustCheck((Core::NativeDraw::RecordCallerGhidra(binder_plan->native_seq) << 40) ^ (u64{stage.pgm_hash} << 8) ^ image_desc.sharp_fetch.offsets[0] ^ (2ull << 60),
+                                                           chosen_tsharp, [&] { return image_desc.GetSharp(stage); });
+                }
                 {
                     const u32* record_words = words;
                     const auto& raw = chosen_tsharp;
@@ -3073,6 +3178,10 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
         if (record_words != nullptr) {
             ssharp = sampler.FromWords(record_words);
             Core::NativeRegistry::NoteBinder(7);
+            if (stage.sw_stage == Shader::SwStage::Compute && DispatchBinderMode() == 2) {
+                DispatchTrustCheck((Core::NativeDraw::RecordCallerGhidra(binder_plan->native_seq) << 40) ^ (u64{stage.pgm_hash} << 8) ^ sampler.sharp_fetch.offsets[0] ^ (3ull << 60), ssharp,
+                                   [&] { return sampler.GetSharp(stage); });
+            }
             if (binder_verify) {
                 const auto legacy = sampler.GetSharp(stage);
                 if (std::memcmp(&legacy, &ssharp, sizeof(legacy)) != 0) {
