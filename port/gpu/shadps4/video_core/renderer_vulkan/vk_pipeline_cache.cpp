@@ -357,7 +357,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
     if (IndexedData::RequestedByEnvironment()) {
-        if (instance.IsIndexedDataSupported()) {
+        if (instance.IsIndexedDataSupported() && IndexedData::DeviceFits(instance)) {
             indexed_data = std::make_unique<IndexedData>(instance, scheduler);
             profile.indexed_resources = true;
         } else {

@@ -119,9 +119,9 @@ public:
 
     /// tlg C9: descriptor arrays of storage buffers, updated after bind, partially bound, indexed by a value the shader loads
     bool IsIndexedDataSupported() const {
-        return features.shaderStorageBufferArrayDynamicIndexing && vk12_features.descriptorIndexing && vk12_features.runtimeDescriptorArray &&
-               vk12_features.descriptorBindingPartiallyBound && vk12_features.descriptorBindingStorageBufferUpdateAfterBind &&
-               vk12_features.shaderStorageBufferArrayNonUniformIndexing;
+        return features.shaderStorageBufferArrayDynamicIndexing && features.shaderSampledImageArrayDynamicIndexing && vk12_features.descriptorIndexing &&
+               vk12_features.runtimeDescriptorArray && vk12_features.descriptorBindingPartiallyBound && vk12_features.descriptorBindingStorageBufferUpdateAfterBind &&
+               vk12_features.descriptorBindingSampledImageUpdateAfterBind && vk12_features.shaderStorageBufferArrayNonUniformIndexing;
     }
 
     /// Returns true if 8-bit ints are supported in shaders

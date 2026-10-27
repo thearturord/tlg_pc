@@ -91,7 +91,12 @@ constexpr u32 GlobalSet = 0;
 constexpr u32 LegacySet = 1;
 constexpr u32 TableBinding = 0;  ///< the row table: u32 slots of the draws
 constexpr u32 BufferBinding = 1; ///< the array of storage buffer descriptors
+constexpr u32 SamplerBinding = 2; ///< the array of sampler descriptors
+constexpr u32 ImageBinding = 3;   ///< the first of the arrays of sampled image descriptors, one per image key (below)
+constexpr u32 NumImageKeys = 12;  ///< number class (float, sint, uint) x dimension class (2D, 2D array/cube, 2D multisampled, 3D)
 constexpr u32 MaxBuffers = 1u << 16;
+constexpr u32 MaxImages = 1u << 13;   ///< per image key
+constexpr u32 MaxSamplers = 1u << 12;
 [[nodiscard]] constexpr bool IsIndexedBufferType(BufferType type) {
     return type == BufferType::Guest;
 }
@@ -227,6 +232,44 @@ struct ImageResource {
     }
 };
 using ImageResourceList = boost::container::static_vector<ImageResource, NUM_IMAGES>;
+
+namespace Indexed {
+/// The sampled images found through the arrays: not written (no storage image), no atomics, no mip level fallback (those stay on the push descriptors, set 1).
+[[nodiscard]] inline bool IsIndexedImage(const ImageResource& image) noexcept {
+    return !image.is_written && !image.is_atomic && image.mip_fallback_mode == MipStorageFallbackMode::None;
+}
+/// The descriptor array an image of this T# is read from: what the shader declares (the sampled type of its number class, the dimension of its host view type).
+[[nodiscard]] inline u32 ImageKey(const AmdGpu::Image& sharp, bool is_array) noexcept {
+    u32 number = 0;
+    switch (AmdGpu::GetNumberClass(sharp.GetNumberFmt())) {
+    case AmdGpu::NumberClass::Sint:
+        number = 1;
+        break;
+    case AmdGpu::NumberClass::Uint:
+        number = 2;
+        break;
+    default:
+        break;
+    }
+    u32 dimension = 0;
+    switch (sharp.GetHostViewType(is_array)) {
+    case AmdGpu::ImageType::Color1DArray:
+    case AmdGpu::ImageType::Color2DArray:
+    case AmdGpu::ImageType::Cube:
+        dimension = 1;
+        break;
+    case AmdGpu::ImageType::Color2DMsaa:
+        dimension = 2;
+        break;
+    case AmdGpu::ImageType::Color3D:
+        dimension = 3;
+        break;
+    default:
+        break;
+    }
+    return number * 4 + dimension;
+}
+} // namespace Indexed
 
 struct SamplerResource {
     SharpFetch<AmdGpu::Sampler> sharp_fetch{};

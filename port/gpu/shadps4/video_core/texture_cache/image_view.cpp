@@ -5,6 +5,7 @@
 #include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_indexed_data.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
@@ -161,6 +162,8 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         info.range.base.layer + info.range.extent.layers - 1, view_aspect);
 }
 
-ImageView::~ImageView() = default;
+ImageView::~ImageView() {
+    Vulkan::IndexedData::NoteViewDestroyed(*image_view); // tlg C9: no slot of the indexed data path may still name it
+}
 
 } // namespace VideoCore

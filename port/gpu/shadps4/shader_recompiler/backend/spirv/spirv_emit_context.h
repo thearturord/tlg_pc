@@ -322,6 +322,9 @@ public:
         bool is_integer = false;
         bool is_storage = false;
         MipStorageFallbackMode mip_fallback_mode{};
+        u32 indexed_row{~0u};   ///< tlg C9: entry of the draw's row (the slot in the descriptor array of the image's key)
+        u32 indexed_key{~0u};
+        Id indexed_pointer_type{};
     };
 
     enum class PointerType : u32 {
@@ -371,6 +374,10 @@ public:
     Bindings& binding;
     Id indexed_table{};
     std::map<u64, Id> indexed_arrays;
+    std::array<Id, Indexed::NumImageKeys> indexed_image_arrays{};
+    Id indexed_sampler_array{};
+    boost::container::small_vector<u32, 4> sampler_rows;
+    void EnsureIndexedTable();
     BufferSpv DefineIndexedBuffer(BufferDefinition& def, PointerType alias, bool is_written, bool is_coherent, u32 elem_shift, Id data_type);
     [[nodiscard]] u32 LegacySet() const noexcept {
         return info.indexed ? Indexed::LegacySet : 0u;

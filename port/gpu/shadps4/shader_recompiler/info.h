@@ -213,8 +213,14 @@ struct Info : InfoPersistent {
                 indexed_buffers += Indexed::IsIndexedBufferType(buffer.buffer_type) ? 1u : 0u;
             }
         }
-        bnd.indexed += indexed_buffers;
-        bnd.unified += buffers.size() - indexed_buffers + images.size() + samplers.size();
+        u32 indexed_images = 0;
+        if (indexed) {
+            for (const auto& image : images) {
+                indexed_images += Indexed::IsIndexedImage(image) ? 1u : 0u;
+            }
+        }
+        bnd.indexed += indexed_buffers + indexed_images + (indexed ? static_cast<u32>(samplers.size()) : 0u);
+        bnd.unified += buffers.size() - indexed_buffers + images.size() - indexed_images + (indexed ? 0u : samplers.size());
     }
 
     void RefreshFlatBuf() {

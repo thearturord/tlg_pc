@@ -908,6 +908,32 @@ void EmitContext::DefineBuffers() {
     }
 }
 
+/// tlg C9: the table of the draws' rows (set 0, binding 0), declared once, with the capabilities of the descriptor arrays.
+void EmitContext::EnsureIndexedTable() {
+    if (indexed_table.value) {
+        return;
+    }
+    constexpr auto storage_class = spv::StorageClass::StorageBuffer;
+    AddExtension("SPV_EXT_descriptor_indexing");
+    AddCapability(spv::Capability::RuntimeDescriptorArray);
+    AddCapability(spv::Capability::ShaderNonUniform);
+    AddCapability(spv::Capability::StorageBufferArrayDynamicIndexing);
+    AddCapability(spv::Capability::StorageBufferArrayNonUniformIndexing);
+    AddCapability(spv::Capability::SampledImageArrayDynamicIndexing);
+    const Id table_array{TypeRuntimeArray(U32[1])};
+    Decorate(table_array, spv::Decoration::ArrayStride, 4U);
+    const Id table_struct{TypeStruct(table_array)};
+    Decorate(table_struct, spv::Decoration::Block);
+    MemberName(table_struct, 0, "rows");
+    MemberDecorate(table_struct, 0, spv::Decoration::Offset, 0U);
+    MemberDecorate(table_struct, 0, spv::Decoration::NonWritable);
+    indexed_table = AddGlobalVariable(TypePointer(storage_class, table_struct), storage_class);
+    Decorate(indexed_table, spv::Decoration::Binding, Indexed::TableBinding);
+    Decorate(indexed_table, spv::Decoration::DescriptorSet, Indexed::GlobalSet);
+    Name(indexed_table, "indexed_rows");
+    interfaces.push_back(indexed_table);
+}
+
 /// tlg C9: the element array of a guest buffer's alias in the global descriptor array (one variable per element type, written and coherent flags); the pointer into it is made in the
 /// prologue (DefineIndexedResources) from the draw's row.
 EmitContext::BufferSpv EmitContext::DefineIndexedBuffer(BufferDefinition& def, PointerType alias, bool is_written, bool is_coherent, u32 elem_shift, Id data_type) {
@@ -921,25 +947,7 @@ EmitContext::BufferSpv EmitContext::DefineIndexedBuffer(BufferDefinition& def, P
         buf_type_ids.push_back(record_array_type);
     }
     constexpr auto storage_class = spv::StorageClass::StorageBuffer;
-    if (!indexed_table.value) {
-        AddExtension("SPV_EXT_descriptor_indexing");
-        AddCapability(spv::Capability::RuntimeDescriptorArray);
-        AddCapability(spv::Capability::ShaderNonUniform);
-        AddCapability(spv::Capability::StorageBufferArrayDynamicIndexing);
-        AddCapability(spv::Capability::StorageBufferArrayNonUniformIndexing);
-        const Id table_array{TypeRuntimeArray(U32[1])};
-        Decorate(table_array, spv::Decoration::ArrayStride, 4U);
-        const Id table_struct{TypeStruct(table_array)};
-        Decorate(table_struct, spv::Decoration::Block);
-        MemberName(table_struct, 0, "rows");
-        MemberDecorate(table_struct, 0, spv::Decoration::Offset, 0U);
-        MemberDecorate(table_struct, 0, spv::Decoration::NonWritable);
-        indexed_table = AddGlobalVariable(TypePointer(storage_class, table_struct), storage_class);
-        Decorate(indexed_table, spv::Decoration::Binding, Indexed::TableBinding);
-        Decorate(indexed_table, spv::Decoration::DescriptorSet, Indexed::GlobalSet);
-        Name(indexed_table, "indexed_rows");
-        interfaces.push_back(indexed_table);
-    }
+    EnsureIndexedTable();
     const Id struct_pointer_type{TypePointer(storage_class, struct_type)};
     const Id pointer_type = TypePointer(storage_class, data_type);
     const u64 key = (u64{struct_type.value} << 2) | (is_written ? 1u : 0u) | (is_written && is_coherent ? 2u : 0u);
@@ -988,6 +996,23 @@ void EmitContext::DefineIndexedResources() {
             Decorate(pointer, spv::Decoration::NonUniform);
             buffer.aliases[a].id = pointer;
         }
+    }
+    // the sampled images: the pointer into the array of the image's key; the index is the same for every invocation of the draw
+    for (size_t i = 0; i < images.size(); ++i) {
+        auto& image = images[i];
+        if (image.indexed_row == ~0u) {
+            continue;
+        }
+        const Id index{OpIAdd(U32[1], row_base, ConstU32(image.indexed_row))};
+        const Id slot{OpLoad(U32[1], OpAccessChain(rows_pointer, indexed_table, u32_zero_value, index))};
+        Name(slot, fmt::format("img{}_slot", i));
+        image.id = OpAccessChain(image.indexed_pointer_type, indexed_image_arrays[image.indexed_key], slot);
+    }
+    for (size_t i = 0; i < sampler_rows.size(); ++i) {
+        const Id index{OpIAdd(U32[1], row_base, ConstU32(sampler_rows[i]))};
+        const Id slot{OpLoad(U32[1], OpAccessChain(rows_pointer, indexed_table, u32_zero_value, index))};
+        Name(slot, fmt::format("samp{}_slot", i));
+        samplers[i] = OpAccessChain(sampler_pointer_type, indexed_sampler_array, slot);
     }
 }
 
@@ -1102,6 +1127,35 @@ void EmitContext::DefineImagesAndSamplers() {
         const Id sampled_type = data_types[1];
         const Id image_type{ImageType(*this, image_desc, sampled_type)};
 
+        // tlg C9: a sampled image of an indexed graphics shader is found through the draw's row of slots
+        if (info.indexed && Indexed::IsIndexedImage(image_desc)) {
+            EnsureIndexedTable();
+            const u32 key = Indexed::ImageKey(sharp, image_desc.is_array);
+            const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
+            if (!indexed_image_arrays[key].value) {
+                const Id array_variable{AddGlobalVariable(TypePointer(spv::StorageClass::UniformConstant, TypeRuntimeArray(image_type)), spv::StorageClass::UniformConstant)};
+                Decorate(array_variable, spv::Decoration::Binding, Indexed::ImageBinding + key);
+                Decorate(array_variable, spv::Decoration::DescriptorSet, Indexed::GlobalSet);
+                Name(array_variable, fmt::format("{}_gimg{}", hw_stage, key));
+                interfaces.push_back(array_variable);
+                indexed_image_arrays[key] = array_variable;
+            }
+            images.push_back({
+                .data_types = &data_types,
+                .id = Id{},
+                .sampled_type = TypeSampledImage(image_type),
+                .image_type = image_type,
+                .view_type = sharp.GetHostViewType(image_desc.is_array),
+                .is_integer = is_integer,
+                .is_storage = false,
+                .mip_fallback_mode = mip_fallback_mode,
+                .indexed_row = binding.indexed++,
+                .indexed_key = key,
+                .indexed_pointer_type = pointer_type,
+            });
+            continue;
+        }
+
         const u32 num_bindings = image_desc.NumBindings(info);
         Id pointee_type = image_type;
         if (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex) {
@@ -1136,6 +1190,19 @@ void EmitContext::DefineImagesAndSamplers() {
     }
     sampler_type = TypeSampler();
     sampler_pointer_type = TypePointer(spv::StorageClass::UniformConstant, sampler_type);
+    if (info.indexed) {
+        EnsureIndexedTable();
+        indexed_sampler_array = AddGlobalVariable(TypePointer(spv::StorageClass::UniformConstant, TypeRuntimeArray(sampler_type)), spv::StorageClass::UniformConstant);
+        Decorate(indexed_sampler_array, spv::Decoration::Binding, Indexed::SamplerBinding);
+        Decorate(indexed_sampler_array, spv::Decoration::DescriptorSet, Indexed::GlobalSet);
+        Name(indexed_sampler_array, fmt::format("{}_gsamp", hw_stage));
+        interfaces.push_back(indexed_sampler_array);
+        for (size_t i = 0; i < info.samplers.size(); ++i) {
+            sampler_rows.push_back(binding.indexed++);
+            samplers.push_back(Id{});
+        }
+        return;
+    }
     for (const auto& samp_desc : info.samplers) {
         const Id id{AddGlobalVariable(sampler_pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding.unified++);

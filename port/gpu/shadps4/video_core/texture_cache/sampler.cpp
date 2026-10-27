@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_indexed_data.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/sampler.h"
 
@@ -69,6 +70,8 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
     handle = std::move(smplr);
 }
 
-Sampler::~Sampler() = default;
+Sampler::~Sampler() {
+    Vulkan::IndexedData::NoteSamplerDestroyed(*handle); // tlg C9: no slot of the indexed data path may still name it
+}
 
 } // namespace VideoCore

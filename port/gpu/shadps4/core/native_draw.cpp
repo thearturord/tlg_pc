@@ -8916,7 +8916,10 @@ void NativeListRead(nlohmann::json& out) {
         out["indexed_data"] = {{"draws", s.draws.load()}, {"row_entries", s.rows_entries.load()}, {"buffer_slot_hits", s.buffer_hits.load()}, {"buffer_slots_made", s.buffer_new.load()},
                                {"buffer_slots_freed", s.buffer_freed.load()}, {"buffer_slots_live", s.live_buffer_slots.load()}, {"slots_exhausted", s.exhausted.load()},
                                {"descriptor_flushes", s.flushes.load()}, {"descriptors_written", s.written.load()}, {"set_binds", s.set_binds.load()}, {"verified", s.verified.load()},
-                               {"verify_differences", s.verify_differences.load()}};
+                               {"verify_differences", s.verify_differences.load()},
+                               {"image_slot_hits", s.image_hits.load()}, {"image_slots_made", s.image_new.load()}, {"image_slots_freed", s.image_freed.load()}, {"image_slots_live", s.live_image_slots.load()},
+                               {"sampler_slot_hits", s.sampler_hits.load()}, {"sampler_slots_made", s.sampler_new.load()}, {"sampler_slots_freed", s.sampler_freed.load()}, {"sampler_slots_live", s.live_sampler_slots.load()},
+                               {"image_key_differences", s.key_differences.load()}};
     }
     out["render_data_guard"] = {{"calls_from_the_instancing_loop", render_data_guard_calls.load()}, {"stopped_no_element_size", render_data_guard_stopped[0].load()}, {"stopped_view_without_format", render_data_guard_stopped[1].load()}};
 }

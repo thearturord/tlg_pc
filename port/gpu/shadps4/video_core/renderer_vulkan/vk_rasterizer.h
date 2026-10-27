@@ -441,6 +441,7 @@ private:
         const void* backing{};
         VideoCore::SubresourceRange range{};
         bool null_entry{};
+        u32 array_key{}; ///< tlg C9: the image's descriptor array (Shader::Indexed::ImageKey of its T#)
     };
     struct TextureSet {
         static constexpr u32 MaxImages = 16;
@@ -575,7 +576,12 @@ private:
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     /// tlg C9: the draw's row of slot numbers (the indexed buffers of the stages, in the order of the shaders' resources)
     bool indexed_active{false};
-    std::array<u32, 128> indexed_row{};
+    /// Puts the slot of one descriptor into the draw's row.
+    void NoteIndexedRow(u32 slot);
+    /// The slot of a sampled image / of a sampler for the draw's row, with the verify against what the legacy binder writes.
+    void NoteIndexedImage(const vk::DescriptorImageInfo& info, u32 image_key);
+    void NoteIndexedSampler(vk::Sampler sampler);
+    std::array<u32, 512> indexed_row{};
     u32 indexed_row_size{0};
 
     struct BoundBuffer {

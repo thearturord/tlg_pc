@@ -2372,11 +2372,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             auto* indexed = IndexedData::Get();
             const auto& info = buffer_infos.back();
             const u32 slot = indexed->BufferSlot(info.buffer, info.offset, info.range);
-            if (indexed_row_size < indexed_row.size()) {
-                indexed_row[indexed_row_size++] = slot;
-            } else {
-                LOG_ERROR(Render_Vulkan, "indexed data: the row of a draw is longer than {} entries", indexed_row.size());
-            }
+            NoteIndexedRow(slot);
             const u32 every = indexed->VerifyEvery();
             if (every != 0 && indexed->stats.draws.load(std::memory_order_relaxed) % every == 0) {
                 vk::Buffer buffer_of;
@@ -2411,6 +2407,50 @@ u64 ImageUseFlags(const Shader::ImageResource& image_desc) {
            u64(static_cast<u8>(image_desc.post_op)) << 56;
 }
 } // namespace
+
+void Rasterizer::NoteIndexedRow(u32 slot) {
+    if (indexed_row_size < indexed_row.size()) {
+        indexed_row[indexed_row_size++] = slot;
+    } else {
+        LOG_ERROR(Render_Vulkan, "indexed data: the row of a draw is longer than {} entries", indexed_row.size());
+    }
+}
+
+void Rasterizer::NoteIndexedImage(const vk::DescriptorImageInfo& info, u32 image_key) {
+    auto* indexed = IndexedData::Get();
+    const u32 slot = indexed->ImageSlot(image_key, info.imageView, info.imageLayout);
+    NoteIndexedRow(slot);
+    const u32 every = indexed->VerifyEvery();
+    if (every != 0 && indexed->stats.draws.load(std::memory_order_relaxed) % every == 0) {
+        indexed->stats.verified.fetch_add(1, std::memory_order_relaxed);
+        vk::ImageView view_of;
+        vk::ImageLayout layout_of;
+        const bool known = indexed->ImageOf(image_key, slot, view_of, layout_of);
+        const bool same = info.imageView ? (known && view_of == info.imageView && layout_of == info.imageLayout) : slot == 0;
+        if (!same) {
+            indexed->stats.verify_differences.fetch_add(1, std::memory_order_relaxed);
+            LOG_ERROR(Render_Vulkan, "indexed data: image slot {} (key {}) does not stand for the view {:#x} layout {} of the legacy binder", slot, image_key,
+                      reinterpret_cast<u64>(static_cast<VkImageView>(info.imageView)), static_cast<u32>(info.imageLayout));
+        }
+    }
+}
+
+void Rasterizer::NoteIndexedSampler(vk::Sampler sampler) {
+    auto* indexed = IndexedData::Get();
+    const u32 slot = indexed->SamplerSlot(sampler);
+    NoteIndexedRow(slot);
+    const u32 every = indexed->VerifyEvery();
+    if (every != 0 && indexed->stats.draws.load(std::memory_order_relaxed) % every == 0) {
+        indexed->stats.verified.fetch_add(1, std::memory_order_relaxed);
+        vk::Sampler sampler_of;
+        const bool same = indexed->SamplerOf(slot, sampler_of) && sampler_of == sampler;
+        if (!same) {
+            indexed->stats.verify_differences.fetch_add(1, std::memory_order_relaxed);
+            LOG_ERROR(Render_Vulkan, "indexed data: sampler slot {} does not stand for the sampler {:#x} of the legacy binder", slot,
+                      reinterpret_cast<u64>(static_cast<VkSampler>(sampler)));
+        }
+    }
+}
 
 bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set, const AmdGpu::Image* raws, const u64* flags, u32 count,
                                      Shader::Backend::Bindings& binding) {
@@ -2468,6 +2508,10 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set,
         image_infos.emplace_back(VK_NULL_HANDLE, entry.view, image.backing->state.layout);
     }
     for (u32 i = 0; i < count; ++i) {
+        if (indexed_active && stage.indexed && Shader::Indexed::IsIndexedImage(stage.images[i])) {
+            NoteIndexedImage(image_infos[first_image_idx + i], set.entries[i].array_key);
+            continue;
+        }
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified++;
@@ -2542,6 +2586,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 
     u32 num_images{};
+    std::array<u32, Shader::NUM_IMAGES> image_keys{}; // tlg C9: the descriptor array of each image of the stage
     for (const auto& image_desc : stage.images) {
         if (image_desc.is_written) {
             Core::NativePass::NoteWrite(true);
@@ -2584,6 +2629,18 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const auto tsharp = chosen_tsharp;
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
+        if (indexed_active && stage.indexed) {
+            const u32 desc_index = static_cast<u32>(&image_desc - stage.images.data());
+            image_keys[desc_index] = Shader::Indexed::ImageKey(tsharp, image_desc.is_array);
+            auto* indexed = IndexedData::Get();
+            const u32 every = indexed->VerifyEvery();
+            if (every != 0 && indexed->stats.draws.load(std::memory_order_relaxed) % every == 0 && tsharp.Address() != 0 && Shader::Indexed::IsIndexedImage(image_desc) &&
+                !StageFlatSkipped(stage) &&
+                Shader::Indexed::ImageKey(image_desc.GetSharp(stage), image_desc.is_array) != image_keys[desc_index]) {
+                // the shader was compiled for another kind of image than this draw's T# (the specialization of the pipeline should have told)
+                indexed->stats.key_differences.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         Census(census_base + CImageTotal);
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
             Census(census_base + CImageNull);
@@ -2763,9 +2820,18 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     u32 image_info_idx = first_image_idx;
     u32 image_binding_idx = 0;
+    u32 image_desc_idx = 0;
     for (u32 array_size : image_descriptor_array_sizes) {
         const auto& [_, desc] = image_bindings[image_binding_idx];
         const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+        if (indexed_active && stage.indexed && array_size == 1 && Shader::Indexed::IsIndexedImage(stage.images[image_desc_idx])) {
+            NoteIndexedImage(image_infos[image_info_idx], image_keys[image_desc_idx]);
+            ++image_info_idx;
+            ++image_binding_idx;
+            ++image_desc_idx;
+            continue;
+        }
+        ++image_desc_idx;
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified;
@@ -2790,6 +2856,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
             entry.raw = set_raws[i];
             entry.flags = set_flags[i];
+            entry.array_key = image_keys[i];
         }
         set_slot->count = num_images;
         set_slot->generation = set_generation;
@@ -2832,6 +2899,10 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
         }
         const auto vk_sampler =
             texture_cache.GetSampler(ssharp, *current_bc_base, sampler.is_depth);
+        if (indexed_active && stage.indexed) {
+            NoteIndexedSampler(vk_sampler);
+            continue;
+        }
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;

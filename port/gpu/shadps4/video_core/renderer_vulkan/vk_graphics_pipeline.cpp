@@ -43,7 +43,7 @@ GraphicsPipeline::GraphicsPipeline(
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
     // tlg C9: stages compiled with the indexed data path read their guest buffers through the global set (set 0); the other bindings are set 1
-    indexed = !preloading && IndexedData::Get() != nullptr && std::ranges::any_of(infos, [](const Shader::Info* info) { return info != nullptr && info->indexed; });
+    indexed = IndexedData::Get() != nullptr && std::ranges::any_of(infos, [](const Shader::Info* info) { return info != nullptr && info->indexed; });
     BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
 
@@ -501,6 +501,9 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             });
         }
         for (const auto& image : stage->images) {
+            if (indexed && stage->indexed && Shader::Indexed::IsIndexedImage(image)) {
+                continue; // found through the global set
+            }
             const u32 num_bindings = image.NumBindings(*stage);
             bindings.push_back({
                 .binding = binding,
@@ -512,6 +515,9 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             binding += num_bindings;
         }
         for (const auto& sampler : stage->samplers) {
+            if (indexed && stage->indexed) {
+                continue; // found through the global set
+            }
             bindings.push_back({
                 .binding = binding++,
                 .descriptorType = vk::DescriptorType::eSampler,
