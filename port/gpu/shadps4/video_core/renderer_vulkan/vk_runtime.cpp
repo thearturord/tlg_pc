@@ -799,13 +799,18 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
         if (has_access) {
             ++hazard.buffer_true;
             u32 writer = HazardAudit::Sources - 1; // unknown unless a record is found
+            u64 writer_program = 0;
             for (auto it = resource->audit.rbegin(); it != resource->audit.rend(); ++it) {
                 if (it->write == !by_read && it->start < offset + size && offset < it->end) {
                     writer = it->source;
+                    writer_program = it->program;
                     break;
                 }
             }
             ++hazard.buffer_true_by_writer_reader[writer][HazardSource()][check_read_access ? 1 : 0];
+            if (writer == 3 && HazardSource() == 3) {
+                ++hazard.compute_pairs[{writer_program, hazard_program}];
+            }
         }
     }
     return has_access;
@@ -873,10 +878,10 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         }
         const u8 source = static_cast<u8>(HazardSource());
         if (src_access & WRITE_MASK) {
-            audit.push_back({offset, offset + size, source, true});
+            audit.push_back({offset, offset + size, source, true, hazard_program});
         }
         if (src_access & READ_MASK) {
-            audit.push_back({offset, offset + size, source, false});
+            audit.push_back({offset, offset + size, source, false, hazard_program});
         }
     }
 

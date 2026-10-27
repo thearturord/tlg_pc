@@ -2034,6 +2034,20 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                     }
                 }
                 out["image_true_by_layout_change_and_asking_access"] = std::move(images);
+                {
+                    // C5, compute half: the pairs of compute programs that need a barrier between them (the earlier dispatch wrote the range the later one asks for), most frequent first
+                    std::vector<std::pair<u64, std::pair<u64, u64>>> pairs;
+                    for (const auto& [key, n] : h.compute_pairs) {
+                        pairs.push_back({n, key});
+                    }
+                    std::ranges::sort(pairs, std::greater<>{});
+                    nlohmann::json compute = nlohmann::json::array();
+                    for (size_t i = 0; i < pairs.size() && i < 24; ++i) {
+                        compute.push_back({{"count", pairs[i].first}, {"earlier_program", fmt::format("{:#x}", pairs[i].second.first)}, {"asking_program", fmt::format("{:#x}", pairs[i].second.second)}});
+                    }
+                    out["compute_barrier_pairs_top"] = std::move(compute);
+                    out["compute_barrier_pairs_distinct"] = h.compute_pairs.size();
+                }
                 out["note"] = "C5 hazard audit, counts per ~5 s interval (read only)";
                 Core::DebugServer::Publish("hazard_audit", std::move(out));
             }

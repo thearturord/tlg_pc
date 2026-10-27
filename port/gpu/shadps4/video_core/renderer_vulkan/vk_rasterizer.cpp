@@ -10,6 +10,7 @@
 #endif
 #include "common/debug.h"
 #include "core/debug_server.h"
+#include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "core/guest_hooks.h"
 #include "core/native_draw.h"
 #include "core/native_audit.h"
@@ -1208,6 +1209,21 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     const ComputePipeline* pipeline = ResolveDispatchPipeline(plan);
     if (!pipeline) {
         return;
+    }
+    runtime.SetHazardProgram(cs_program.address);
+    {
+        // C1 / C2 audit: the pipeline of a program address
+        auto& audit = g_identity_audit;
+        audit.dispatches.fetch_add(1, std::memory_order_relaxed);
+        const auto [it, is_new] = identity_tables.programs.try_emplace(cs_program.address, pipeline);
+        if (is_new) {
+            audit.programs_seen.fetch_add(1, std::memory_order_relaxed);
+        } else if (it->second == pipeline) {
+            audit.pipeline_same.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            audit.pipeline_switched.fetch_add(1, std::memory_order_relaxed);
+            it->second = pipeline;
+        }
     }
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
@@ -2661,9 +2677,37 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         AmdGpu::Image chosen_tsharp;
         bool image_from_record = false;
         if (binder_plan != nullptr && image_desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad) {
-            if (const u32* words = BinderWords(stage, image_desc.sharp_fetch.offsets[0], image_desc.is_r128 ? 4 : 8, 2)) {
+            u32 identity_binding = ~0u;
+            if (const u32* words = BinderWords(stage, image_desc.sharp_fetch.offsets[0], image_desc.is_r128 ? 4 : 8, 2, &identity_binding)) {
                 chosen_tsharp = image_desc.FromWords(words);
                 image_from_record = true;
+                {
+                    const u32* record_words = words;
+                    const auto& raw = chosen_tsharp;
+                    if (identity_binding != ~0u) {
+                        // C1 audit: does the engine's description of this image id stay the same?
+                        auto& audit = g_identity_audit;
+                        audit.image_bindings.fetch_add(1, std::memory_order_relaxed);
+                        if (const u64 id = binder_plan->bindings[identity_binding].id; id != 0) {
+                            audit.image_with_id.fetch_add(1, std::memory_order_relaxed);
+                            u64 hash = 0x9E3779B97F4A7C15ull;
+                            for (u32 w = 0; w < 8; ++w) {
+                                hash = (hash ^ record_words[w]) * 0xC2B2AE3D27D4EB4Full;
+                                hash ^= hash >> 29;
+                            }
+                            const u64 address = raw.Address();
+                            const auto [it, is_new] = identity_tables.images.try_emplace(id, IdentityTables::ImageEntry{hash, address});
+                            if (is_new) {
+                                audit.image_ids_seen.fetch_add(1, std::memory_order_relaxed);
+                            } else if (it->second.words_hash == hash) {
+                                audit.image_same.fetch_add(1, std::memory_order_relaxed);
+                            } else {
+                                (it->second.address != address ? audit.image_address_changed : audit.image_other_words_changed).fetch_add(1, std::memory_order_relaxed);
+                                it->second = {hash, address};
+                            }
+                        }
+                    }
+                }
                 if (binder_verify) {
                     const auto legacy = image_desc.GetSharp(stage);
                     if (std::memcmp(&legacy, &chosen_tsharp, sizeof(legacy)) != 0) {

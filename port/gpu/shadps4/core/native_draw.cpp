@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "video_core/renderer_vulkan/vk_indexed_data.h"
 #include <algorithm>
 #include <array>
@@ -8911,6 +8912,13 @@ void NativeListRead(nlohmann::json& out) {
     out["lazy_registers_materialized"] = lazy_materialized.load();
     out["lazy_verify_full_take_compared"] = lazy_verified.load();
     out["lazy_verify_differences"] = lazy_differences.load();
+    {
+        const auto& a = Vulkan::g_identity_audit;
+        out["identity_audit"] = {{"image_bindings_with_a_record", a.image_bindings.load()}, {"of_them_with_an_engine_id", a.image_with_id.load()}, {"ids_seen", a.image_ids_seen.load()},
+                                 {"same_description", a.image_same.load()}, {"address_changed", a.image_address_changed.load()}, {"other_words_changed", a.image_other_words_changed.load()},
+                                 {"compute_dispatches", a.dispatches.load()}, {"compute_programs_seen", a.programs_seen.load()}, {"compute_same_pipeline", a.pipeline_same.load()},
+                                 {"compute_pipeline_switched", a.pipeline_switched.load()}};
+    }
     {
         const auto& c = Vulkan::g_indexed_census;
         out["pipeline_stage_census"] = {{"stages", c.stages.load()}, {"mip_level_images", c.mip_run_images.load()}, {"atomic_images", c.atomic_images.load()}, {"shared_memory_buffers", c.shared_memory_buffers.load()}};

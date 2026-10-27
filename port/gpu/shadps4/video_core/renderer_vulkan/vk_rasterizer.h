@@ -22,6 +22,7 @@
 #include "core/native_draw.h"
 #include "core/native_uploads.h"
 #include "video_core/readback_stats.h"
+#include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "video_core/renderer_vulkan/vk_constant_ring.h"
 #include "video_core/renderer_vulkan/vk_host_import.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -576,6 +577,7 @@ private:
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     /// tlg C9: the draw's row of slot numbers (the indexed buffers of the stages, in the order of the shaders' resources)
     bool indexed_active{false};
+    IdentityTables identity_tables; ///< C1 audit (vk_identity_audit.h), raster thread
     /// Puts the slot of one descriptor into the draw's row.
     void NoteIndexedRow(u32 slot);
     /// The dwords of a stage's flat user data go into the row (as many as the shader reserved), zero padded.

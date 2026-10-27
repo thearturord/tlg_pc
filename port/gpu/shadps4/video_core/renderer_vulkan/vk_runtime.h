@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <map>
+
 #include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -87,7 +89,13 @@ public:
         u64 buffer_true_by_writer_reader[Sources][Sources][2]{}; ///< [the access that left the range][the access that asked][the asker writes]
         u64 image_calls{}, image_true{};
         u64 image_true_by_layouts[Layouts][Layouts][Sources]{}; ///< [layout before][layout asked][the source asking]
+        /// C5, compute half: the true buffer hazards between two compute dispatches, by (program address of the dispatch that left the range, program address of the one that asked)
+        std::map<std::pair<u64, u64>, u64> compute_pairs;
     };
+    /// The compute program whose dispatch is being bound (the hazard audit attributes its accesses to it).
+    void SetHazardProgram(u64 address) noexcept {
+        hazard_program = address;
+    }
     [[nodiscard]] bool HazardAuditOn() const noexcept {
         return hazard_audit_on;
     }
@@ -105,7 +113,9 @@ private:
         u64 start, end;
         u8 source;
         bool write;
+        u64 program;
     };
+    u64 hazard_program{0};
     struct BufferBarriers {
         const VideoCore::Buffer* handle;
         using AccessList = IntervalList<Interval>;
