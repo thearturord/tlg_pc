@@ -801,11 +801,7 @@ bool Scan7(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
         reason = "no holder";
         return false;
     }
-    const u32 n = R<u32>(system + 0xc0);
-    if (n == 0) {
-        no_work = true;
-        return false;
-    }
+    const u32 n = R<u32>(system + 0xc0); // zero elements: the engine still issues the dispatch, with zero groups
     const auto field = [&](u64 owner, u64 offset) -> u64 { return owner != 0 ? R<u64>(owner + offset) : 0; };
     p.v[0] = R<u64>(holder + 0x78);
     p.v[1] = R<u64>(holder + 0x60);
