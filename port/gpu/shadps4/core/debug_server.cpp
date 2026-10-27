@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -52,6 +53,7 @@ std::mutex registry_mutex;
 std::map<std::string, Entry> registry;
 std::unique_ptr<httplib::Server> server;
 std::jthread server_thread;
+std::jthread snapshot_thread;
 std::mutex lifecycle_mutex;
 std::mutex published_mutex;
 std::map<std::string, nlohmann::json> published;
@@ -757,12 +759,60 @@ void Start(u16 port) {
     }
     server_thread = std::jthread{[] { server->listen_after_bind(); }};
     LOG_INFO(Core, "debug server listening on 127.0.0.1:{}", port);
+    // The counters of a play session survive the game: every 20 s (TLG_COUNTER_SNAPSHOT=0 turns it off) the reports of /status, /zpassgen and /native are written to
+    // user/log/last_counters.json (written aside and renamed), so they can be read after the game is closed.
+    const char* snapshot_env = std::getenv("TLG_COUNTER_SNAPSHOT");
+    if (snapshot_env == nullptr || *snapshot_env != '0') {
+        snapshot_thread = std::jthread{[](std::stop_token stop) {
+            const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "last_counters.json";
+            auto temp = path;
+            temp += ".tmp";
+            const auto write_snapshot = [&] {
+                nlohmann::json out;
+                out["written_unix_s"] = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                for (const char* name : {"/status", "/zpassgen", "/native"}) {
+                    Handler handler;
+                    {
+                        std::scoped_lock lk{registry_mutex};
+                        const auto it = registry.find(name);
+                        if (it != registry.end()) {
+                            handler = it->second.handler;
+                        }
+                    }
+                    if (!handler) {
+                        continue;
+                    }
+                    try {
+                        out[name] = handler(Params{});
+                    } catch (const std::exception& e) {
+                        out[name] = nlohmann::json{{"error", e.what()}};
+                    }
+                }
+                {
+                    std::ofstream file{temp, std::ios::binary | std::ios::trunc};
+                    file << out.dump(1);
+                }
+                std::error_code ec;
+                std::filesystem::rename(temp, path, ec);
+            };
+            while (!stop.stop_requested()) {
+                for (int i = 0; i < 200 && !stop.stop_requested(); ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                write_snapshot();
+            }
+        }};
+    }
 }
 
 void Stop() {
     std::scoped_lock lk{lifecycle_mutex};
     if (!server) {
         return;
+    }
+    if (snapshot_thread.joinable()) {
+        snapshot_thread.request_stop();
+        snapshot_thread.join();
     }
     server->stop();
     if (server_thread.joinable()) {
