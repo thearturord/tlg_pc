@@ -108,6 +108,15 @@ private:
     bool live_;
 };
 
+/// One thing a straight line piece does (the step based sites build a list of them in the scan and `ApplySteps` does them in the engine's order: stack slot writes, the virtuals of
+/// the context, the dispatch).
+struct Step {
+    enum Kind : u8 { PutStack64, PutStack32, PutAbs64, PutAbs32, Update, SetCb, SetUav, SetSrv, SetShader, Dispatch } kind;
+    u64 a{}, b{}, c{}, d{}, e{};
+    // PutStack*: a = offset from rsp, b = value. PutAbs*: a = address, b = value. Update: a = constant buffer, b = source (the seventh argument slot at [rsp] is zeroed).
+    // SetCb / SetUav / SetSrv: a = first slot, b = count, c = offset from rsp of the array. SetShader: a = shader. Dispatch: a, b, c = groups, d = call site (ghidra), e = fenced.
+};
+
 /// One of several dispatches a site issues: its groups, the call site (the return address in ghidra terms) and the words of the context's tables at that dispatch.
 struct Expect {
     u32 x{}, y{1}, z{1};
@@ -123,6 +132,7 @@ struct Plan {
     bool async{true};
     std::vector<std::pair<u64, u64>> context_words; ///< (offset in the context, value): compared at the engine's dispatch
     std::vector<std::pair<int, u64>> registers;     ///< what the registers hold after the piece (set by the generator, compared by the verify)
+    std::vector<struct Step> steps;                 ///< step based sites: what the piece does, in order (see ApplySteps)
     std::vector<Expect> dispatches;                 ///< sites that issue several dispatches: each one in order (replaces groups / site_ghidra / context_words for the comparison)
     u64 v[24]{};                                    ///< values of the scan the apply needs
 };
@@ -1185,8 +1195,164 @@ void Apply10(const Plan& p, Writer& w) {
     set_srvs(0, 0);
 }
 
-std::array<Site, 11>& Sites() {
-    static std::array<Site, 11> sites{{
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// The step based sites: the scan lists the steps, `Finish` derives what the verify compares at every dispatch (the shader word of the context and the stack slots the engine's virtuals
+// copy into the tables), `ApplySteps` does them. `ContextKind`: 1 graphics context, 2 async context (told by the fenced dispatch entry of the virtual table).
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+int ContextKind(u64 context) {
+    if (!Plausible(context)) {
+        return 0;
+    }
+    const u64 vtable = R<u64>(context);
+    if (!Plausible(vtable) || !Plausible(R<u64>(vtable + 0xd0))) {
+        return 0;
+    }
+    const u64 fenced = R<u64>(vtable + 0x50);
+    return fenced == Global(0x0246f5f0) ? 2 : fenced == Global(0x02479810) ? 1 : 0;
+}
+bool Finish(Plan& p, int kind) {
+    if (kind == 0) {
+        return false;
+    }
+    p.async = kind == 2;
+    std::map<u64, u64> stack;
+    std::vector<std::pair<u64, u64>> uav, srv;
+    u64 shader = 0;
+    const auto slots = [&](const Step& s, std::vector<std::pair<u64, u64>>& out) {
+        out.clear();
+        for (u64 i = 0; i < s.b; ++i) {
+            const u64 offset = s.c + 8 * i;
+            const auto found = stack.find(offset);
+            out.emplace_back(offset, found != stack.end() ? found->second : R<u64>(p.rsp + offset));
+        }
+    };
+    for (const Step& s : p.steps) {
+        switch (s.kind) {
+        case Step::PutStack64: stack[s.a] = s.b; break;
+        case Step::SetUav: slots(s, uav); break;
+        case Step::SetSrv: slots(s, srv); break;
+        case Step::SetShader: shader = s.a; break;
+        case Step::Dispatch: {
+            Expect e;
+            e.x = static_cast<u32>(s.a);
+            e.y = static_cast<u32>(s.b);
+            e.z = static_cast<u32>(s.c);
+            e.site = s.d;
+            e.words = {{p.async ? 0x1d10 : 0x4670, shader}};
+            e.stack = uav;
+            e.stack.insert(e.stack.end(), srv.begin(), srv.end());
+            p.dispatches.push_back(std::move(e));
+            break;
+        }
+        default: break;
+        }
+    }
+    if (p.dispatches.empty()) {
+        return false;
+    }
+    p.site_ghidra = p.dispatches[0].site;
+    return true;
+}
+void ApplySteps(const Plan& p, Writer& w) {
+    const u64 context = p.context;
+    const u64 vtable = R<u64>(context);
+    for (const Step& s : p.steps) {
+        switch (s.kind) {
+        case Step::PutStack64: w.Put<u64>(p.rsp + s.a, s.b); break;
+        case Step::PutStack32: w.Put<u32>(p.rsp + s.a, static_cast<u32>(s.b)); break;
+        case Step::PutAbs64: w.Put<u64>(s.a, s.b); break;
+        case Step::PutAbs32: w.Put<u32>(s.a, static_cast<u32>(s.b)); break;
+        case Step::Update:
+            w.Put<u32>(p.rsp, 0); // the seventh argument slot
+            if (w.Live()) {
+                reinterpret_cast<Virtual>(R<u64>(vtable + 0xd0))(context, s.a, 0, 0, s.b, 0, 0);
+            }
+            break;
+        case Step::SetCb:
+            if (w.Live()) {
+                reinterpret_cast<Virtual>(R<u64>(vtable + 0x28))(context, s.a, s.b, p.rsp + s.c, 0, 0, 0);
+            }
+            break;
+        case Step::SetSrv:
+            if (w.Live()) {
+                reinterpret_cast<Virtual>(R<u64>(vtable + 0x40))(context, s.a, s.b, p.rsp + s.c, 0, 0, 0);
+            }
+            break;
+        case Step::SetUav:
+            if (w.Live()) {
+                reinterpret_cast<Virtual>(R<u64>(vtable + 0x48))(context, s.a, s.b, p.rsp + s.c, 0, 0, 0);
+            }
+            break;
+        case Step::SetShader:
+            if (w.Live()) {
+                reinterpret_cast<Virtual>(R<u64>(vtable + 0x38))(context, s.a, 0, 0, 0, 0, 0);
+            }
+            break;
+        case Step::Dispatch:
+            if (w.Live()) {
+                NativeDraw::IssueDispatch(context, s.a, s.b, s.c, s.e != 0, s.d, p.async);
+            }
+            break;
+        }
+    }
+}
+/// The common pass: one view, srv slots, a shader, a fixed dispatch, then the views cleared again (the engine's pattern around most of the screen sized passes).
+void AddPass(Plan& p, u64 uav_slot, u64 uav, u64 srv_slot, u32 srv_count, const u64* srvs, u64 shader, u64 x, u64 y, u64 z, u64 site, bool fenced, bool clear) {
+    p.steps.push_back({Step::PutStack64, uav_slot, uav});
+    p.steps.push_back({Step::SetUav, 0, 1, uav_slot});
+    for (u32 i = 0; i < srv_count; ++i) {
+        p.steps.push_back({Step::PutStack64, srv_slot + 8 * i, srvs[i]});
+    }
+    p.steps.push_back({Step::SetSrv, 0, srv_count, srv_slot});
+    p.steps.push_back({Step::SetShader, shader});
+    p.steps.push_back({Step::Dispatch, x, y, z, site, fenced ? 1u : 0u});
+    if (clear) {
+        p.steps.push_back({Step::PutStack64, uav_slot, 0});
+        p.steps.push_back({Step::SetUav, 0, 1, uav_slot});
+        for (u32 i = 0; i < srv_count; ++i) {
+            p.steps.push_back({Step::PutStack64, srv_slot + 8 * i, 0});
+        }
+        p.steps.push_back({Step::SetSrv, 0, srv_count, srv_slot});
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Site 11: a fixed pass of `RenderDev_RenderScene`, 0x01c6cefc .. 0x01c6cfc9: context r14, the view `[[[rsp + 0x80] + 0x48] + 0x10]`, the shader resource in r12, the shader
+// `[device + 0x1328]`, a fenced dispatch of (16, 16, 1) groups, then both cleared. Leaves r13 = rsp + 0x140 and r12 = rsp + 0x180.
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool Scan11(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    (void)no_work;
+    p.rsp = c->rsp;
+    p.context = c->r14;
+    const u64 owner = R<u64>(p.rsp + 0x80);
+    const u64 device = R<u64>(Global(0x0689eed8));
+    if (!Plausible(owner) || !Plausible(device)) {
+        reason = "an object is not set";
+        return false;
+    }
+    const u64 inner = R<u64>(owner + 0x48);
+    if (!Plausible(inner)) {
+        reason = "the view owner is not set";
+        return false;
+    }
+    const u64 uav = R<u64>(inner + 0x10);
+    const u64 shader = R<u64>(device + 0x1328);
+    const u64 srv = c->r12;
+    if (shader == 0) {
+        reason = "the shader is not set";
+        return false;
+    }
+    AddPass(p, 0x140, uav, 0x180, 1, &srv, shader, 16, 16, 1, 0x01c6cf88, true, true);
+    if (!Finish(p, ContextKind(p.context))) {
+        reason = "the context is not a known context";
+        return false;
+    }
+    p.registers = {{R13, p.rsp + 0x140}, {R12, p.rsp + 0x180}};
+    return true;
+}
+
+std::array<Site, 12>& Sites() {
+    static std::array<Site, 12> sites{{
         {"begin_recording_loop_1", 0x01c49e40, &Scan0, &Apply0, {}},
         {"begin_recording_loop_2", 0x01c4a9e3, &Scan1, &Apply1, {}},
         {"vertex_cluster_loop_1", 0x01d7e334, &Scan2, &Apply2, {}},
@@ -1198,6 +1364,7 @@ std::array<Site, 11>& Sites() {
         {"begin_recording_loop_3", 0x01c4b6ea, &Scan8, &Apply8, {}},
         {"begin_recording_loop_4", 0x01c4bea6, &Scan9, &Apply9, {}},
         {"render_scene_chain", 0x01c6d7ea, &Scan10, &Apply10, {}},
+        {"render_scene_pass_a", 0x01c6cfc9, &Scan11, &ApplySteps, {}},
     }};
     return sites;
 }
@@ -1507,6 +1674,12 @@ u64 FindHandler(const char* name) {
     }
     if (n == "site_bottom_10") {
         return reinterpret_cast<u64>(&Bottom<10>);
+    }
+    if (n == "site_top_11") {
+        return reinterpret_cast<u64>(&Top<11>);
+    }
+    if (n == "site_bottom_11") {
+        return reinterpret_cast<u64>(&Bottom<11>);
     }
     return 0;
 }
