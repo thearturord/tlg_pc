@@ -1476,8 +1476,203 @@ bool Scan13(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
     return true;
 }
 
-std::array<Site, 14>& Sites() {
-    static std::array<Site, 14> sites{{
+/// Writes a step list in the engine's words.
+struct StepList {
+    Plan& p;
+    void put(u64 offset, u64 value) { p.steps.push_back({Step::PutStack64, offset, value}); }
+    void put32(u64 offset, u64 value) { p.steps.push_back({Step::PutStack32, offset, value}); }
+    void cb(u64 first, u64 count, u64 offset) { p.steps.push_back({Step::SetCb, first, count, offset}); }
+    void srv(u64 count, u64 offset) { p.steps.push_back({Step::SetSrv, 0, count, offset}); }
+    void uav(u64 count, u64 offset) { p.steps.push_back({Step::SetUav, 0, count, offset}); }
+    void shader(u64 value) { p.steps.push_back({Step::SetShader, value}); }
+    void dispatch(u64 x, u64 y, u64 site) { p.steps.push_back({Step::Dispatch, x, y, 1, site, 1}); }
+};
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Site 14: two passes of `RenderDev_RenderScene` in a row, 0x01c6549f .. 0x01c65693 (context r13, the object r14, r15d and ebx the sizes): SetConstantBuffers (slot 2, `[r14 + 0x1450]`),
+// five shader resources and two views, shaders `[device + 0x1818]` and `0x1808`, the first dispatch of (`[rsp + 0x230]`, `[rsp + 0x220]`, 1) groups, the second of (((r15d + 1) / 2 +
+// 7) / 8, ((ebx + 1) / 2 + 7) / 8, 1), both cleared at the end. Leaves r15d, ebx the group counts.
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool Scan14(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    (void)no_work;
+    p.rsp = c->rsp;
+    p.context = c->r13;
+    const u64 object = c->r14;
+    const u64 device = R<u64>(Global(0x0689eed8));
+    const u64 owner = R<u64>(p.rsp + 0x240);
+    const u64 pointer_290 = R<u64>(p.rsp + 0x290);
+    const u64 inner = R<u64>(object + 0x1478);
+    if (!Plausible(object) || !Plausible(device) || !Plausible(owner) || !Plausible(pointer_290) || !Plausible(inner)) {
+        reason = "an object is not set";
+        return false;
+    }
+    const u64 shader1 = R<u64>(device + 0x1818), shader2 = R<u64>(device + 0x1808);
+    if (shader1 == 0 || shader2 == 0) {
+        reason = "a shader is not set";
+        return false;
+    }
+    StepList s{p};
+    s.put(0x820, R<u64>(object + 0x1450));
+    s.cb(2, 1, 0x820);
+    s.put(0x860, R<u64>(p.rsp + 0x380));
+    s.put(0x868, R<u64>(p.rsp + 0x340));
+    s.put(0x870, R<u64>(object + 0x1498));
+    s.put(0x878, R<u64>(object + 0x14a0));
+    s.put(0x880, 0);
+    s.srv(5, 0x860);
+    s.put(0x7c0, R<u64>(inner + 0x50));
+    s.put(0x7c8, R<u64>(owner));
+    s.uav(2, 0x7c0);
+    s.shader(shader1);
+    s.dispatch(R<u32>(p.rsp + 0x230), R<u32>(p.rsp + 0x220), 0x01c6559c);
+    s.put(0x7c8, 0);
+    s.put(0x880, R<u64>(pointer_290));
+    s.uav(2, 0x7c0);
+    s.srv(5, 0x860);
+    s.shader(shader2);
+    const u32 gx = (((static_cast<u32>(c->r15) + 1u) >> 1) + 7u) >> 3;
+    const u32 gy = (((static_cast<u32>(c->rbx) + 1u) >> 1) + 7u) >> 3;
+    s.dispatch(gx, gy, 0x01c65638);
+    for (u64 i = 0; i < 5; ++i) {
+        s.put(0x860 + 8 * i, 0);
+    }
+    s.srv(5, 0x860);
+    s.put(0x7c0, 0);
+    s.put(0x7c8, 0);
+    s.uav(2, 0x7c0);
+    if (!Finish(p, ContextKind(p.context))) {
+        reason = "the context is not a known context";
+        return false;
+    }
+    p.registers = {{R15, gx}, {RBX, gy}};
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Site 15: two passes between the targets `[r14 + 0x1460]` and `[r14 + 0x1468]` (context r13), 0x01c65997 .. 0x01c65b34: the first reads the first target and writes the second, the
+// second the other way round; two shader resources, one view, shaders `[device + 0x13e8]` and `0x13f8`, groups ((w + 7) / 8, (h + 7) / 8, 1) of the first target's size (`+ 0x2c`, `+ 0x30`).
+// Leaves r12 = rsp + 0x840, rbx and r15 the group counts.
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool Scan15(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    (void)no_work;
+    p.rsp = c->rsp;
+    p.context = c->r13;
+    const u64 object = c->r14;
+    const u64 device = R<u64>(Global(0x0689eed8));
+    if (!Plausible(object) || !Plausible(device)) {
+        reason = "an object is not set";
+        return false;
+    }
+    const u64 first = R<u64>(object + 0x1460), second = R<u64>(object + 0x1468);
+    if (!Plausible(first) || !Plausible(second)) {
+        reason = "a target is not set";
+        return false;
+    }
+    const u64 shader1 = R<u64>(device + 0x13e8), shader2 = R<u64>(device + 0x13f8);
+    if (shader1 == 0 || shader2 == 0) {
+        reason = "a shader is not set";
+        return false;
+    }
+    const u32 width = R<u32>(first + 0x2c), height = R<u32>(first + 0x30);
+    const u32 gx = (width + 7u) >> 3, gy = (height + 7u) >> 3;
+    StepList s{p};
+    s.put(0x840, 0);
+    s.put(0x230, first);
+    s.put(0x240, second);
+    s.put32(0x250, width);
+    s.uav(1, 0x840);
+    s.put(0x860, R<u64>(first + 0x48));
+    s.put(0x868, R<u64>(first + 0x48));
+    s.srv(2, 0x860);
+    s.put(0x840, R<u64>(second + 0x50));
+    s.uav(1, 0x840);
+    s.shader(shader1);
+    s.dispatch(gx, gy, 0x01c65a79);
+    s.put(0x840, 0);
+    s.uav(1, 0x840);
+    s.put(0x860, R<u64>(second + 0x48));
+    s.put(0x868, R<u64>(second + 0x48));
+    s.srv(2, 0x860);
+    s.put(0x840, R<u64>(first + 0x50));
+    s.uav(1, 0x840);
+    s.shader(shader2);
+    s.dispatch(gx, gy, 0x01c65b34);
+    if (!Finish(p, ContextKind(p.context))) {
+        reason = "the context is not a known context";
+        return false;
+    }
+    p.registers = {{R12, p.rsp + 0x840}, {RBX, gx}, {R15, gy}};
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Site 16: two passes of `RenderDev_RenderScene`, 0x01c67e70 .. 0x01c68036 (context r14, rbx the target set `[system + 0x50]`, r13 the object with `+ 0x50`, r15d / r12d the sizes):
+// SetConstantBuffers (slot 12), views from `[[rbx + 0x28] + 0x20 / 0x28] + 0x50`, four shader resources, shaders `[device + 0x1148]` and `0x1158`, dispatches of ((w + 7) / 8,
+// (h + 7) / 8, 1) groups. Leaves r13 the object's `+ 0x48`, r15 and r12 the group counts.
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool Scan16(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    (void)no_work;
+    p.rsp = c->rsp;
+    p.context = c->r14;
+    const u64 targets = c->rbx;
+    const u64 object = c->r13;
+    const u64 device = R<u64>(Global(0x0689eed8));
+    if (!Plausible(targets) || !Plausible(object) || !Plausible(device)) {
+        reason = "an object is not set";
+        return false;
+    }
+    const u64 inner = R<u64>(targets + 0x28);
+    const u64 view_owner_a = Plausible(inner) ? R<u64>(inner + 0x20) : 0;
+    const u64 view_owner_b = Plausible(inner) ? R<u64>(inner + 0x28) : 0;
+    const u64 sub = R<u64>(object + 0x50);
+    if (!Plausible(inner) || !Plausible(view_owner_a) || !Plausible(view_owner_b) || !Plausible(sub)) {
+        reason = "an object is not set";
+        return false;
+    }
+    const u64 new_r13 = R<u64>(sub + 0x48);
+    const u64 shader1 = R<u64>(device + 0x1148), shader2 = R<u64>(device + 0x1158);
+    if (shader1 == 0 || shader2 == 0) {
+        reason = "a shader is not set";
+        return false;
+    }
+    const u64 index = R<u32>(targets + 0x14);
+    const u64 tail_owner = R<u64>(targets + index * 8 + 0x18);
+    const u64 tail = Plausible(tail_owner) ? R<u64>(tail_owner + 0x48) : 0;
+    const u32 gx = (static_cast<u32>(c->r15) + 7u) >> 3;
+    const u32 gy = (static_cast<u32>(c->r12) + 7u) >> 3;
+    StepList s{p};
+    s.put(0x7c0, R<u64>(targets + 0x40));
+    s.cb(12, 1, 0x7c0);
+    s.put(0x840, R<u64>(view_owner_a + 0x50));
+    s.uav(1, 0x840);
+    s.put(0x860, 0);
+    s.put(0x868, new_r13);
+    s.put(0x870, 0);
+    s.put(0x878, tail);
+    s.srv(4, 0x860);
+    s.shader(shader1);
+    s.dispatch(gx, gy, 0x01c67f59);
+    s.put(0x840, 0);
+    s.uav(1, 0x840);
+    s.put(0x820, R<u64>(view_owner_b + 0x50));
+    s.uav(1, 0x820);
+    s.put(0x860, R<u64>(view_owner_a + 0x48));
+    s.put(0x868, new_r13);
+    s.put(0x870, R<u64>(p.rsp + 0x380));
+    s.put(0x878, tail);
+    s.srv(4, 0x860);
+    s.shader(shader2);
+    s.dispatch(gx, gy, 0x01c68036);
+    if (!Finish(p, ContextKind(p.context))) {
+        reason = "the context is not a known context";
+        return false;
+    }
+    p.registers = {{R13, new_r13}, {R15, gx}, {R12, gy}};
+    return true;
+}
+
+std::array<Site, 17>& Sites() {
+    static std::array<Site, 17> sites{{
         {"begin_recording_loop_1", 0x01c49e40, &Scan0, &Apply0, {}},
         {"begin_recording_loop_2", 0x01c4a9e3, &Scan1, &Apply1, {}},
         {"vertex_cluster_loop_1", 0x01d7e334, &Scan2, &Apply2, {}},
@@ -1492,6 +1687,9 @@ std::array<Site, 14>& Sites() {
         {"render_scene_pass_a", 0x01c6cfc9, &Scan11, &ApplySteps, {}},
         {"render_scene_pass_b", 0x01c6db15, &Scan12, &ApplySteps, {}},
         {"render_scene_pre_chain", 0x01c6d33e, &Scan13, &ApplySteps, {}},
+        {"render_scene_pass_d", 0x01c65693, &Scan14, &ApplySteps, {}},
+        {"render_scene_pass_e", 0x01c65b34, &Scan15, &ApplySteps, {}},
+        {"render_scene_pass_f", 0x01c68036, &Scan16, &ApplySteps, {}},
     }};
     return sites;
 }
@@ -1819,6 +2017,24 @@ u64 FindHandler(const char* name) {
     }
     if (n == "site_bottom_13") {
         return reinterpret_cast<u64>(&Bottom<13>);
+    }
+    if (n == "site_top_14") {
+        return reinterpret_cast<u64>(&Top<14>);
+    }
+    if (n == "site_bottom_14") {
+        return reinterpret_cast<u64>(&Bottom<14>);
+    }
+    if (n == "site_top_15") {
+        return reinterpret_cast<u64>(&Top<15>);
+    }
+    if (n == "site_bottom_15") {
+        return reinterpret_cast<u64>(&Bottom<15>);
+    }
+    if (n == "site_top_16") {
+        return reinterpret_cast<u64>(&Top<16>);
+    }
+    if (n == "site_bottom_16") {
+        return reinterpret_cast<u64>(&Bottom<16>);
     }
     return 0;
 }
