@@ -1218,6 +1218,8 @@ bool Finish(Plan& p, int kind) {
     std::map<u64, u64> stack;
     std::vector<std::pair<u64, u64>> uav, srv;
     u64 shader = 0;
+    bool shader_set = false;
+    std::map<u64, u64> direct; // writes straight into the context's memory (offset -> value)
     const auto slots = [&](const Step& s, std::vector<std::pair<u64, u64>>& out) {
         out.clear();
         for (u64 i = 0; i < s.b; ++i) {
@@ -1231,14 +1233,22 @@ bool Finish(Plan& p, int kind) {
         case Step::PutStack64: stack[s.a] = s.b; break;
         case Step::SetUav: slots(s, uav); break;
         case Step::SetSrv: slots(s, srv); break;
-        case Step::SetShader: shader = s.a; break;
+        case Step::SetShader: shader = s.a; shader_set = true; break;
+        case Step::PutAbs64:
+            if (s.a >= p.context && s.a < p.context + 0x10000) {
+                direct[s.a - p.context] = s.b;
+            }
+            break;
         case Step::Dispatch: {
             Expect e;
             e.x = static_cast<u32>(s.a);
             e.y = static_cast<u32>(s.b);
             e.z = static_cast<u32>(s.c);
             e.site = s.d;
-            e.words = {{p.async ? 0x1d10 : 0x4670, shader}};
+            if (shader_set) {
+                e.words = {{p.async ? 0x1d10 : 0x4670, shader}};
+            }
+            e.words.insert(e.words.end(), direct.begin(), direct.end());
             e.stack = uav;
             e.stack.insert(e.stack.end(), srv.begin(), srv.end());
             p.dispatches.push_back(std::move(e));
@@ -1482,10 +1492,12 @@ struct StepList {
     void put(u64 offset, u64 value) { p.steps.push_back({Step::PutStack64, offset, value}); }
     void put32(u64 offset, u64 value) { p.steps.push_back({Step::PutStack32, offset, value}); }
     void cb(u64 first, u64 count, u64 offset) { p.steps.push_back({Step::SetCb, first, count, offset}); }
-    void srv(u64 count, u64 offset) { p.steps.push_back({Step::SetSrv, 0, count, offset}); }
+    void srv(u64 count, u64 offset, u64 first = 0) { p.steps.push_back({Step::SetSrv, first, count, offset}); }
     void uav(u64 count, u64 offset) { p.steps.push_back({Step::SetUav, 0, count, offset}); }
     void shader(u64 value) { p.steps.push_back({Step::SetShader, value}); }
-    void dispatch(u64 x, u64 y, u64 site) { p.steps.push_back({Step::Dispatch, x, y, 1, site, 1}); }
+    void dispatch(u64 x, u64 y, u64 site, bool fenced = true) { p.steps.push_back({Step::Dispatch, x, y, 1, site, fenced ? 1u : 0u}); }
+    void abs(u64 address, u64 value) { p.steps.push_back({Step::PutAbs64, address, value}); }
+    void update(u64 buffer, u64 source) { p.steps.push_back({Step::Update, buffer, source}); }
 };
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1671,8 +1683,174 @@ bool Scan16(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
     return true;
 }
 
-std::array<Site, 17>& Sites() {
-    static std::array<Site, 17> sites{{
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Site 17: three passes of a system near `0x01c98ee3` (context r14, the object rbx, r15d the width of the second pass, `[rsp + 0x38]` its height): SetConstantBuffers (slot 0,
+// `[rbx + 0x150]`), three views, seven shader resources (`[rsp + 0x58 / 0x48 / 0x50]` and four words of the device), the shader `[device + 0x1298]`, a fenced dispatch of (1, 1, 1);
+// the shader `0x12a8` and a fenced dispatch of (r15d, `[rsp + 0x38]`, 1); three views again, eight shader resources, the shader `0x12b8` and a plain dispatch of (`[rbx + 0x58]`,
+// `[rsp + 0x38]`, 1). Resumes at 0x01c99120. Leaves r13 = `[rsp + 0x48]`, r12 = `[rsp + 0x50]`, r15 = `[rsp + 0x38]`.
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool Scan17(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    (void)no_work;
+    p.rsp = c->rsp;
+    p.context = c->r14;
+    const u64 object = c->rbx;
+    const u64 device = R<u64>(Global(0x0689eed8));
+    if (!Plausible(object) || !Plausible(device)) {
+        reason = "an object is not set";
+        return false;
+    }
+    const u64 shader1 = R<u64>(device + 0x1298), shader2 = R<u64>(device + 0x12a8), shader3 = R<u64>(device + 0x12b8);
+    if (shader1 == 0 || shader2 == 0 || shader3 == 0) {
+        reason = "a shader is not set";
+        return false;
+    }
+    const u64 a58 = R<u64>(p.rsp + 0x58), a48 = R<u64>(p.rsp + 0x48), a50 = R<u64>(p.rsp + 0x50), a38 = R<u64>(p.rsp + 0x38);
+    const u64 d4458 = R<u64>(device + 0x4458), d4448 = R<u64>(device + 0x4448), d4460 = R<u64>(device + 0x4460), d4468 = R<u64>(device + 0x4468);
+    StepList s{p};
+    s.put(0x198, R<u64>(object + 0x150));
+    s.cb(0, 1, 0x198);
+    s.put(0x180, R<u64>(object + 0x70));
+    s.put(0x188, R<u64>(object + 0x98));
+    s.put(0x190, R<u64>(object + 0x80));
+    s.uav(3, 0x180);
+    s.put(0x140, a58);
+    s.put(0x148, a48);
+    s.put(0x150, a50);
+    s.put(0x158, d4458);
+    s.put(0x160, d4448);
+    s.put(0x168, d4460);
+    s.put(0x170, d4468);
+    s.srv(7, 0x140);
+    s.shader(shader1);
+    s.dispatch(1, 1, 0x01c99004);
+    s.shader(shader2);
+    s.dispatch(static_cast<u32>(c->r15), static_cast<u32>(a38), 0x01c99038);
+    s.put(0x120, R<u64>(object + 0x20));
+    s.put(0x128, R<u64>(object + 0x48));
+    s.put(0x130, R<u64>(object + 0x50));
+    s.uav(3, 0x120);
+    s.put(0xe0, a58);
+    s.put(0xe8, a48);
+    s.put(0xf0, a50);
+    s.put(0xf8, d4458);
+    s.put(0x100, d4448);
+    s.put(0x108, d4460);
+    s.put(0x110, d4468);
+    s.put(0x118, R<u64>(object + 0x68));
+    s.srv(8, 0xe0);
+    s.shader(shader3);
+    s.dispatch(R<u32>(object + 0x58), static_cast<u32>(a38), 0x01c99120, false);
+    if (!Finish(p, ContextKind(p.context))) {
+        reason = "the context is not a known context";
+        return false;
+    }
+    p.registers = {{R13, a48}, {R12, a50}, {R15, a38}};
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Site 18: a pass of the system `[r13 + 0x4000 ..]` (context r15, the object r13), 0x01c44e56 .. 0x01c44f64: SetConstantBuffers (slot 11, `[r13 + 0x4170]`), six shader resources from
+// slot 100 (five words of the device and `[r13 + 0x4188]`), the shader `[device + 0x10b8]`, one view `[r13 + 0x4198]`, a fenced dispatch of (([r13 + 0x4000] + 63) / 64, 1, 1). Leaves r14 = rsp + 0x118.
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool Scan18(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    (void)no_work;
+    p.rsp = c->rsp;
+    p.context = c->r15;
+    const u64 object = c->r13;
+    const u64 device = R<u64>(Global(0x0689eed8));
+    if (!Plausible(object) || !Plausible(device)) {
+        reason = "an object is not set";
+        return false;
+    }
+    const u64 shader = R<u64>(device + 0x10b8);
+    const u32 count = R<u32>(object + 0x4000);
+    if (shader == 0) {
+        reason = "the shader is not set";
+        return false;
+    }
+    if (count == 0) {
+        no_work = true;
+        return false;
+    }
+    StepList s{p};
+    s.put(0xf8, R<u64>(object + 0x4170));
+    s.cb(11, 1, 0xf8);
+    s.put(0x120, R<u64>(device + 0x41b0));
+    s.put(0x128, R<u64>(device + 0x4188));
+    s.put(0x130, R<u64>(device + 0x4190));
+    s.put(0x138, R<u64>(device + 0x4198));
+    s.put(0x140, R<u64>(device + 0x41a0));
+    s.put(0x148, R<u64>(object + 0x4188));
+    s.srv(6, 0x120, 100);
+    s.shader(shader);
+    s.put(0x118, R<u64>(object + 0x4198));
+    s.uav(1, 0x118);
+    s.dispatch((count + 63u) >> 6, 1, 0x01c44f64);
+    if (!Finish(p, ContextKind(p.context))) {
+        reason = "the context is not a known context";
+        return false;
+    }
+    p.registers = {{R14, p.rsp + 0x118}};
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Site 19: a pass that writes straight into the graphics context `[device + 0x2d8]` (rbx) and dispatches with the plain function, 0x01cf1e8a .. 0x01cf1f41: the system r15, its job
+// `[r15 + 0x360]` (r14). The constant buffer slot 1 and the shader resources 1 .. 3, the views 0 and 1 and the shader are words of the context; the groups are
+// (`[[r15 + 0x248] + 0x48]` + 255) / 256. Afterwards the engine's words are zero again.
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool Scan19(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    (void)no_work;
+    p.rsp = c->rsp;
+    p.context = c->rbx;
+    const u64 system = c->r15;
+    const u64 job = c->r14;
+    const u64 device = R<u64>(Global(0x0689eed8));
+    if (!Plausible(system) || !Plausible(job) || !Plausible(device) || !Plausible(p.context)) {
+        reason = "an object is not set";
+        return false;
+    }
+    const u64 srv_a = R<u64>(job + 0x10), srv_b = R<u64>(job + 0x18), uav_a = R<u64>(job), uav_b = R<u64>(job + 8);
+    const u64 owner = R<u64>(system + 0x248);
+    if (!Plausible(srv_a) || !Plausible(srv_b) || !Plausible(uav_a) || !Plausible(uav_b) || !Plausible(owner)) {
+        reason = "the job is not set up";
+        return false;
+    }
+    const u64 shader = R<u64>(device + 0x1738);
+    if (shader == 0) {
+        reason = "the shader is not set";
+        return false;
+    }
+    const u32 groups = (R<u32>(owner + 0x48) + 0xffu) >> 8;
+    if (groups == 0) {
+        no_work = true;
+        return false;
+    }
+    const u64 ctx = p.context;
+    StepList s{p};
+    s.abs(ctx + 0x508, R<u64>(job + 0x30));
+    s.abs(ctx + 0x1988, R<u64>(srv_a + 0x28));
+    s.abs(ctx + 0x1990, R<u64>(srv_b + 0x28));
+    s.abs(ctx + 0x1998, R<u64>(device + 0x41b0));
+    s.abs(ctx + 0x2098, R<u64>(R<u64>(job) + 0x30));
+    s.abs(ctx + 0x20a0, R<u64>(uav_b + 0x30));
+    s.abs(ctx + 0x4670, shader);
+    s.dispatch(groups, 1, 0x01cf1f17, false);
+    s.abs(ctx + 0x508, 0);
+    s.abs(ctx + 0x1988, 0);
+    s.abs(ctx + 0x1990, 0);
+    s.abs(ctx + 0x1998, 0);
+    s.abs(ctx + 0x2098, 0);
+    s.abs(ctx + 0x20a0, 0);
+    if (!Finish(p, ContextKind(ctx))) {
+        reason = "the context is not a known context";
+        return false;
+    }
+    return true;
+}
+
+std::array<Site, 20>& Sites() {
+    static std::array<Site, 20> sites{{
         {"begin_recording_loop_1", 0x01c49e40, &Scan0, &Apply0, {}},
         {"begin_recording_loop_2", 0x01c4a9e3, &Scan1, &Apply1, {}},
         {"vertex_cluster_loop_1", 0x01d7e334, &Scan2, &Apply2, {}},
@@ -1690,6 +1868,9 @@ std::array<Site, 17>& Sites() {
         {"render_scene_pass_d", 0x01c65693, &Scan14, &ApplySteps, {}},
         {"render_scene_pass_e", 0x01c65b34, &Scan15, &ApplySteps, {}},
         {"render_scene_pass_f", 0x01c68036, &Scan16, &ApplySteps, {}},
+        {"system_passes_99", 0x01c99120, &Scan17, &ApplySteps, {}},
+        {"system_pass_44", 0x01c44f64, &Scan18, &ApplySteps, {}},
+        {"system_pass_cf", 0x01cf1f41, &Scan19, &ApplySteps, {}},
     }};
     return sites;
 }
@@ -1884,6 +2065,28 @@ u64 PS4_SYSV_ABI Bottom(MidContext* c) {
 
 } // namespace
 
+namespace {
+struct Census {
+    bool on{std::getenv("TLG_SITE_CENSUS") != nullptr && *std::getenv("TLG_SITE_CENSUS") == '1'};
+    std::mutex mutex;
+    std::map<u64, std::pair<u64, u64>> sites; ///< call site -> (issued by the engine's code, issued by a generator)
+};
+Census& GetCensus() {
+    static Census census;
+    return census;
+}
+} // namespace
+
+void CensusDispatch(u64 site_runtime, bool generated) {
+    Census& census = GetCensus();
+    if (!census.on) {
+        return;
+    }
+    std::scoped_lock lock{census.mutex};
+    auto& entry = census.sites[site_runtime];
+    ++(generated ? entry.second : entry.first);
+}
+
 void NoteDispatch(u64 context, u64 x, u64 y, u64 z, u64 site_runtime) {
     if (!pending.armed || context != pending.plan.context) {
         return;
@@ -2036,6 +2239,24 @@ u64 FindHandler(const char* name) {
     if (n == "site_bottom_16") {
         return reinterpret_cast<u64>(&Bottom<16>);
     }
+    if (n == "site_top_17") {
+        return reinterpret_cast<u64>(&Top<17>);
+    }
+    if (n == "site_bottom_17") {
+        return reinterpret_cast<u64>(&Bottom<17>);
+    }
+    if (n == "site_top_18") {
+        return reinterpret_cast<u64>(&Top<18>);
+    }
+    if (n == "site_bottom_18") {
+        return reinterpret_cast<u64>(&Bottom<18>);
+    }
+    if (n == "site_top_19") {
+        return reinterpret_cast<u64>(&Top<19>);
+    }
+    if (n == "site_bottom_19") {
+        return reinterpret_cast<u64>(&Bottom<19>);
+    }
     return 0;
 }
 
@@ -2064,6 +2285,18 @@ nlohmann::json Report() {
         list.push_back(std::move(e));
     }
     out["sites"] = std::move(list);
+    if (Census& census = GetCensus(); census.on) {
+        nlohmann::json rows = nlohmann::json::array();
+        std::scoped_lock lock{census.mutex};
+        for (const auto& [site, counts] : census.sites) {
+            nlohmann::json r;
+            r["call_site"] = fmt::format("{:#x}", site - NativeDraw::ImageBase() + 0x1000000);
+            r["engine"] = counts.first;
+            r["generated"] = counts.second;
+            rows.push_back(std::move(r));
+        }
+        out["dispatch_census"] = std::move(rows);
+    }
     return out;
 }
 

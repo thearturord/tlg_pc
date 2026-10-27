@@ -7640,6 +7640,7 @@ u64 PS4_SYSV_ABI MeasureExCsDepthCopy(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u
 }
 
 u64 PS4_SYSV_ABI TagAscDispatch(u64 jcc, u64 x, u64 y, u64 z, u64 a4, u64 a5, u64 ret) {
+    NativeSiteGen::CensusDispatch(ret, generator_issuing);
     NativeJobGen::NoteAsyncDispatch(jcc, x, y, z, ret); // B7: the verify run compares the engine's dispatch with the generator's prediction
     NativeSiteGen::NoteDispatch(jcc, x, y, z, ret);
     if (NativeZPassGen::VerifyActive()) {
@@ -7652,6 +7653,7 @@ u64 PS4_SYSV_ABI TagAscDispatchRecordOnly(u64 jcc, u64 x, u64 y, u64 z, u64 a4, 
 }
 
 u64 PS4_SYSV_ABI TagDispatch(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    NativeSiteGen::CensusDispatch(ret, generator_issuing);
     NativeSiteGen::NoteDispatch(ctx, a1, a2, a3, ret); // B7: a verify run compares the engine's dispatch with the site generator's prediction
     if (NativeZPassGen::VerifyActive()) {
         NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 3, ctx, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a3));
@@ -7662,6 +7664,7 @@ u64 PS4_SYSV_ABI TagDispatch(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u6
 /// command processor stall that only orders the dispatch against later commands. The raster thread runs everything in
 /// order, so with execution the wait and its label are not needed (game-visible fences are other packets).
 u64 PS4_SYSV_ABI TagDispatchFenced(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    NativeSiteGen::CensusDispatch(ret, generator_issuing);
     NativeSiteGen::NoteDispatch(ctx, a1, a2, a3, ret); // B7: a verify run compares the engine's dispatch with the site generator's prediction
     if (NativeZPassGen::VerifyActive()) {
         NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 3, ctx, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a3));
