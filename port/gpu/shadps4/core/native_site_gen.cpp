@@ -111,15 +111,16 @@ private:
 /// One thing a straight line piece does (the step based sites build a list of them in the scan and `ApplySteps` does them in the engine's order: stack slot writes, the virtuals of
 /// the context, the dispatch).
 struct Step {
-    enum Kind : u8 { PutStack64, PutStack32, PutAbs64, PutAbs32, PutAbs8, PutAbsZero, Update, SetCb, SetUav, SetSrv, SetShader, Dispatch } kind;
+    enum Kind : u8 { PutStack64, PutStack32, PutAbs64, PutAbs32, PutAbs8, PutAbsZero, Update, SetCb, SetUav, SetSrv, SetShader, Dispatch, DispatchIndirect } kind;
     u64 a{}, b{}, c{}, d{}, e{};
     // PutStack*: a = offset from rsp, b = value. PutAbs*: a = address, b = value. Update: a = constant buffer, b = source (the seventh argument slot at [rsp] is zeroed).
-    // SetCb / SetUav / SetSrv: a = first slot, b = count, c = offset from rsp of the array. SetShader: a = shader. Dispatch: a, b, c = groups, d = call site (ghidra), e = fenced.
+    // SetCb / SetUav / SetSrv: a = first slot, b = count, c = offset from rsp of the array (or d = the array's address). SetShader: a = shader. Dispatch: a, b, c = groups, d = call site (ghidra),
+    // e = fenced. DispatchIndirect: a = the arguments' buffer, b = the offset, d = call site (ghidra).
 };
 
 /// One of several dispatches a site issues: its groups, the call site (the return address in ghidra terms) and the words of the context's tables at that dispatch.
 struct Expect {
-    u32 x{}, y{1}, z{1};
+    u64 x{}, y{1}, z{1};
     u64 site{};
     std::vector<std::pair<u64, u64>> words; ///< (offset in the context, value)
     std::vector<std::pair<u64, u64>> stack; ///< (offset from the function's rsp, value): what the engine's virtuals copy into the context's tables
@@ -1236,11 +1237,12 @@ bool Finish(Plan& p, int kind) {
                 direct[s.a - p.context] = s.b;
             }
             break;
+        case Step::DispatchIndirect:
         case Step::Dispatch: {
             Expect e;
-            e.x = static_cast<u32>(s.a);
-            e.y = static_cast<u32>(s.b);
-            e.z = static_cast<u32>(s.c);
+            e.x = s.a;
+            e.y = s.b;
+            e.z = s.kind == Step::Dispatch ? s.c : 0;
             e.site = s.d;
             if (shader_set) {
                 e.words = {{p.async ? 0x1d10 : 0x4670, shader}};
@@ -1304,6 +1306,11 @@ void ApplySteps(const Plan& p, Writer& w) {
         case Step::Dispatch:
             if (w.Live()) {
                 NativeDraw::IssueDispatch(context, s.a, s.b, s.c, s.e != 0, s.d, p.async);
+            }
+            break;
+        case Step::DispatchIndirect:
+            if (w.Live()) {
+                NativeDraw::IssueDispatchIndirect(context, s.a, s.b, s.d);
             }
             break;
         }
@@ -1502,6 +1509,7 @@ struct StepList {
     void cbp(u64 first, u64 count, u64 pointer) { p.steps.push_back({Step::SetCb, first, count, 0, pointer}); }
     void srvp(u64 count, u64 pointer) { p.steps.push_back({Step::SetSrv, 0, count, 0, pointer}); }
     void uavp(u64 count, u64 pointer) { p.steps.push_back({Step::SetUav, 0, count, 0, pointer}); }
+    void indirect(u64 buffer, u64 offset, u64 site) { p.steps.push_back({Step::DispatchIndirect, buffer, offset, 0, site}); }
     void abs(u64 address, u64 value) { p.steps.push_back({Step::PutAbs64, address, value}); }
     void abs32(u64 address, u64 value) { p.steps.push_back({Step::PutAbs32, address, value}); }
     void abs8(u64 address, u64 value) { p.steps.push_back({Step::PutAbs8, address, value}); }
@@ -2214,8 +2222,64 @@ bool Scan27(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
     return true;
 }
 
-std::array<Site, 28>& Sites() {
-    static std::array<Site, 28> sites{{
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Site 28: two indirect dispatches of `FUN_01c62xxx` (0x01c62baf .. 0x01c62d5b, graphics context `[r13 + 0x2d8]`, the object r12 whose job buffer `[[r12 + 0x38] + 0x78]` holds the group
+// counts, ebx the index of the first shader): the engine writes the context's tables itself (view `[rsp + 0x220]`, fourteen shader resources from `[rsp + 0x320 ..]`, the bookkeeping words
+// at `+ 0x4484 ..`), sets the shader `[r13 + (ebx << 4) + 0x1008]` and calls the indirect dispatch with the offset 12; then the shader of the index `[rsp + 0x370]` and the offset 0.
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool Scan28(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    (void)no_work;
+    p.rsp = c->rsp;
+    const u64 object = c->r12;
+    const u64 device = c->r13;
+    if (!Plausible(object) || !Plausible(device)) {
+        reason = "an object is not set";
+        return false;
+    }
+    const u64 ctx = R<u64>(device + 0x2d8);
+    p.context = ctx;
+    const u64 job = R<u64>(object + 0x38);
+    if (!Plausible(ctx) || !Plausible(job)) {
+        reason = "the context or the job is not set";
+        return false;
+    }
+    const u64 buffer = R<u64>(job + 0x78);
+    const u64 shader1 = R<u64>(device + (u64{static_cast<u32>(c->rbx)} << 4) + 0x1008);
+    const u64 second_index = R<u64>(p.rsp + 0x370);
+    const u64 shader2 = R<u64>(device + (second_index << 4) + 0x1008);
+    if (!Plausible(buffer) || shader1 == 0 || shader2 == 0) {
+        reason = "the buffer or a shader is not set";
+        return false;
+    }
+    StepList s{p};
+    s.zero(ctx + 0x44a4, 32);
+    s.zero(ctx + 0x4484, 32);
+    s.abs32(ctx + 0x44c4, 0);
+    s.abs8(ctx + 0x44c8, 1);
+    s.abs(ctx + 0x44d0, 0);
+    s.abs8(ctx + 0x44d8, 1);
+    s.abs(ctx + 0x2098, R<u64>(p.rsp + 0x220));
+    static constexpr std::pair<u64, u64> words[] = {{0x1980, 0x320}, {0x1988, 0x2b0}, {0x1990, 0x2e0}, {0x1998, 0x2d0}, {0x19a0, 0x2c0}, {0x19b0, 0x2a0}, {0x19b8, 0x290},
+                                                     {0x19c0, 0x280}, {0x19c8, 0x240}, {0x19d0, 0x250}, {0x19d8, 0x260}, {0x19e0, 0x230}, {0x19f8, 0x270}};
+    for (const auto& [offset, slot] : words) {
+        s.abs(ctx + offset, R<u64>(p.rsp + slot));
+    }
+    s.abs(ctx + 0x19a8, 0);
+    s.zero(ctx + 0x19e8, 16);
+    s.abs(ctx + 0x4670, shader1);
+    s.indirect(buffer, 12, 0x01c62d1a);
+    s.put(0x370, object);
+    s.abs(ctx + 0x4670, shader2);
+    s.indirect(buffer, 0, 0x01c62d5b);
+    if (!Finish(p, ContextKind(ctx))) {
+        reason = "the context is not a known context";
+        return false;
+    }
+    return true;
+}
+
+std::array<Site, 29>& Sites() {
+    static std::array<Site, 29> sites{{
         {"begin_recording_loop_1", 0x01c49e40, &Scan0, &Apply0, {}},
         {"begin_recording_loop_2", 0x01c4a9e3, &Scan1, &Apply1, {}},
         {"vertex_cluster_loop_1", 0x01d7e334, &Scan2, &Apply2, {}},
@@ -2244,6 +2308,7 @@ std::array<Site, 28>& Sites() {
         {"emitter_system_loop_b", 0x01bcbc10, &Scan25, &ApplySteps, {}},
         {"emitter_system_loop_d", 0x01bcc200, &Scan26, &ApplySteps, {}},
         {"system_pass_ee", 0x01ee4dd5, &Scan27, &ApplySteps, {}},
+        {"indirect_pair_1c62", 0x01c62d5b, &Scan28, &ApplySteps, {}},
     }};
     return sites;
 }
@@ -2677,6 +2742,12 @@ u64 FindHandler(const char* name) {
     }
     if (n == "site_bottom_27") {
         return reinterpret_cast<u64>(&Bottom<27>);
+    }
+    if (n == "site_top_28") {
+        return reinterpret_cast<u64>(&Top<28>);
+    }
+    if (n == "site_bottom_28") {
+        return reinterpret_cast<u64>(&Bottom<28>);
     }
     return 0;
 }

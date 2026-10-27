@@ -6019,6 +6019,8 @@ u64 TagCompute(u64 ctx, u64 x, u64 y, u64 z, u64 ret, bool exec_capable) {
 /// read from the argument buffer when the dispatch runs); while the call site is not verified it is tagged like a direct
 /// dispatch and compared with the game's packets.
 u64 PS4_SYSV_ABI TagDispatchIndirect(u64 ctx, u64 buffer, u64 offset, u64 a3, u64 a4, u64 a5, u64 ret) {
+    NativeSiteGen::CensusDispatch(ret, generator_issuing);
+    NativeSiteGen::NoteDispatch(ctx, buffer, offset, 0, ret); // B7: the indirect dispatch's arguments are its buffer and offset
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || ctx == 0 || !valid(buffer) ||
@@ -9201,6 +9203,18 @@ void IssueDispatch(u64 ctx, u64 x, u64 y, u64 z, bool fenced, u64 site_ghidra, b
         return;
     }
     reinterpret_cast<GuestDraw6>(original)(ctx, x, y, z, 0, 0);
+}
+
+void IssueDispatchIndirect(u64 ctx, u64 buffer, u64 offset, u64 site_ghidra) {
+    static const u64 original = Core::GuestHooks::OriginalEntry("DispatchIndirect");
+    const u64 site = ImageBase() + (site_ghidra - 0x1000000);
+    generator_issuing = true;
+    const bool taken = TagDispatchIndirect(ctx, buffer, offset, 0, 0, 0, site) != 0;
+    generator_issuing = false;
+    if (taken || original == 0) {
+        return;
+    }
+    reinterpret_cast<GuestDraw6>(original)(ctx, buffer, offset, 0, 0, 0);
 }
 
 void IssueInlineAutoDraw(u64 ctx, u32 count, u64 site_ghidra) {
