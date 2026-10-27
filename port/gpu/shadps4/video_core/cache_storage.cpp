@@ -78,13 +78,22 @@ void MigrateLegacyCache(const std::filesystem::path& cache_path) {
 
 // tlg: shaders translated by an older recompiler are never reused: this game's folders of other
 // keys (and the unkeyed <serial>) are removed, in the port's own cache folder only.
+bool IndexedBuild() {
+    const char* e = std::getenv("TLG_INDEXED_DATA");
+    return e != nullptr && *e != 0 && *e != '0';
+}
+bool EndsWithIdx(const std::string& name) {
+    return name.size() > 4 && name.compare(name.size() - 4, 4, "-idx") == 0;
+}
+
 void PruneOtherRevisions(const std::filesystem::path& cache_path) {
     const std::string serial{Common::ElfInfo::Instance().GameSerial()};
     const auto name = cache_path.filename().string();
     std::error_code ec;
     for (const auto& entry : std::filesystem::directory_iterator(cache_path.parent_path(), ec)) {
         const auto other = entry.path().filename().string();
-        if (entry.is_directory(ec) && other != name &&
+        // tlg C9: the shaders of the indexed data path (TLG_INDEXED_DATA) live in <serial>-<key>-idx; each build prunes only the folders of its own kind
+        if (entry.is_directory(ec) && other != name && EndsWithIdx(other) == IndexedBuild() &&
             (other == serial || other.rfind(serial + "-", 0) == 0)) {
             LOG_INFO(Render, "Removing shader cache of another recompiler revision: {}", other);
             std::filesystem::remove_all(entry.path(), ec);
@@ -100,8 +109,10 @@ namespace Storage {
 std::filesystem::path GameCacheDir() {
     const std::string serial{Common::ElfInfo::Instance().GameSerial()};
 #ifdef TLG_SHADER_CACHE_KEY
+    const char* indexed = std::getenv("TLG_INDEXED_DATA");
+    const bool indexed_build = indexed != nullptr && *indexed != 0 && *indexed != '0';
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-           (serial + "-" + TLG_SHADER_CACHE_KEY);
+           (serial + "-" + TLG_SHADER_CACHE_KEY + (indexed_build ? "-idx" : ""));
 #else
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / serial;
 #endif

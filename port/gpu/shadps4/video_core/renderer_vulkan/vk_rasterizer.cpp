@@ -1491,6 +1491,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
     set_writes.clear();
     buffer_infos.clear();
     image_infos.clear();
+    indexed_active = pipeline->IsIndexed();
+    indexed_row_size = 0;
     Census((fixed != nullptr ? 0u : 32u) + CBindResources);
 
     bool uses_dma = false;
@@ -1521,6 +1523,22 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
 
     if (uses_dma) {
         buffer_cache.SynchronizeDmaBuffers();
+    }
+
+    if (indexed_active) {
+        // tlg C9: the plain bindings are the ones that got a write; the guest buffers are named by the draw's row, copied into the stream buffer the global set's table binding covers
+        set_writes.resize(set_write_index);
+        auto* indexed = IndexedData::Get();
+        if (indexed_row_size != 0) {
+            auto& table = buffer_cache.GetStreamBuffer();
+            indexed->SetTable(table.Handle(), table.SizeBytes());
+            const u64 offset = table.Copy(indexed_row.data(), indexed_row_size * sizeof(u32), sizeof(u32));
+            push_data.row_base = static_cast<u32>(offset / sizeof(u32));
+            indexed->stats.rows_entries.fetch_add(indexed_row_size, std::memory_order_relaxed);
+        }
+        indexed->stats.draws.fetch_add(1, std::memory_order_relaxed);
+        indexed->FlushWrites();
+        indexed->Maintain();
     }
 
     return true;
@@ -2349,6 +2367,31 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 
         if (census_base == 0 && DescCensusOn()) {
             DescriptorNoteBuffer(static_cast<u32>(stage.sw_stage), buffer_index, buffer_infos.back());
+        }
+        if (indexed_active && stage.indexed && Shader::Indexed::IsIndexedBufferType(desc.buffer_type)) {
+            auto* indexed = IndexedData::Get();
+            const auto& info = buffer_infos.back();
+            const u32 slot = indexed->BufferSlot(info.buffer, info.offset, info.range);
+            if (indexed_row_size < indexed_row.size()) {
+                indexed_row[indexed_row_size++] = slot;
+            } else {
+                LOG_ERROR(Render_Vulkan, "indexed data: the row of a draw is longer than {} entries", indexed_row.size());
+            }
+            const u32 every = indexed->VerifyEvery();
+            if (every != 0 && indexed->stats.draws.load(std::memory_order_relaxed) % every == 0) {
+                vk::Buffer buffer_of;
+                u64 offset_of, range_of;
+                indexed->stats.verified.fetch_add(1, std::memory_order_relaxed);
+                const bool known = indexed->BufferOf(slot, buffer_of, offset_of, range_of);
+                const bool same = info.buffer ? (known && buffer_of == info.buffer && offset_of == info.offset && range_of == info.range) : slot == 0;
+                if (!same) {
+                    indexed->stats.verify_differences.fetch_add(1, std::memory_order_relaxed);
+                    LOG_ERROR(Render_Vulkan, "indexed data: slot {} does not stand for the descriptor {:#x}+{:#x}/{:#x} of the legacy binder", slot,
+                              reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)), info.offset, info.range);
+                }
+            }
+            ++binding.buffer;
+            continue;
         }
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;

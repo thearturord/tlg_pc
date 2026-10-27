@@ -45,6 +45,7 @@ public:
     Id Def(const IR::Value& value);
 
     void DefineBufferProperties();
+    void DefineIndexedResources();
     void DefineAmdPerVertexAttribs();
     void DefineWorkgroupIndex();
 
@@ -351,6 +352,10 @@ public:
         BufferType buffer_type;
         std::array<Id, u32(PointerSize::NumClass)> offsets;
         std::array<BufferSpv, u32(PointerType::NumAlias)> aliases;
+        /// tlg C9: entry of the draw's row that names the buffer's descriptor (~0u: a plain binding), and per alias the descriptor array and the pointer type of its elements
+        u32 indexed_row{~0u};
+        std::array<Id, u32(PointerType::NumAlias)> indexed_array{};
+        std::array<Id, u32(PointerType::NumAlias)> indexed_struct_ptr{};
 
         template <class Self>
         auto& Alias(this Self& self, PointerType alias) {
@@ -364,6 +369,12 @@ public:
     };
 
     Bindings& binding;
+    Id indexed_table{};
+    std::map<u64, Id> indexed_arrays;
+    BufferSpv DefineIndexedBuffer(BufferDefinition& def, PointerType alias, bool is_written, bool is_coherent, u32 elem_shift, Id data_type);
+    [[nodiscard]] u32 LegacySet() const noexcept {
+        return info.indexed ? Indexed::LegacySet : 0u;
+    }
     boost::container::small_vector<Id, 16> buf_type_ids;
     boost::container::small_vector<BufferDefinition, 16> buffers;
     boost::container::small_vector<TextureDefinition, 8> images;

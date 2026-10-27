@@ -573,6 +573,10 @@ private:
 
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
+    /// tlg C9: the draw's row of slot numbers (the indexed buffers of the stages, in the order of the shaders' resources)
+    bool indexed_active{false};
+    std::array<u32, 128> indexed_row{};
+    u32 indexed_row_size{0};
 
     struct BoundBuffer {
         const VideoCore::Buffer* buffer;

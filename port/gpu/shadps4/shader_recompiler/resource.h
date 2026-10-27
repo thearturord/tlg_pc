@@ -84,6 +84,19 @@ enum class BufferType : u8 {
     ClipPlanes,
 };
 
+/// tlg C9 (the indexed data path): graphics shaders find the guest buffers of a draw through descriptor arrays of one global set (set 0) and a per draw row of slot numbers; what stays
+/// on the push descriptors (images and samplers while only buffers are indexed, the special buffers) sits in set 1. The classification is shared by the shader backend and the binder.
+namespace Indexed {
+constexpr u32 GlobalSet = 0;
+constexpr u32 LegacySet = 1;
+constexpr u32 TableBinding = 0;  ///< the row table: u32 slots of the draws
+constexpr u32 BufferBinding = 1; ///< the array of storage buffer descriptors
+constexpr u32 MaxBuffers = 1u << 16;
+[[nodiscard]] constexpr bool IsIndexedBufferType(BufferType type) {
+    return type == BufferType::Guest;
+}
+} // namespace Indexed
+
 struct BufferResource {
     SharpFetch<AmdGpu::Buffer> sharp_fetch{};
     IR::Type used_types{};
@@ -283,6 +296,8 @@ struct PushData {
     std::array<u8, NUM_BUFFERS> buf_offsets;
     u32 motion_param; ///< tlg: object motion parameter index (0: off)
     u32 scene_size; ///< reduced width | height << 16; zero means native pixel coordinates
+    u32 row_base;   ///< tlg C9: first entry of this draw's row in the indexed data table
+    static constexpr u32 RowBaseIndex = 7;
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());

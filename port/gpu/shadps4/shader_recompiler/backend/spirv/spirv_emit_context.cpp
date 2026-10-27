@@ -781,7 +781,7 @@ void EmitContext::DefineOutputs() {
 void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
     const Id struct_type{
-        Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2]), "AuxData")};
+        Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2], U32[1]), "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
     MemberName(struct_type, PushData::YOffsetIndex, "yoffset");
@@ -797,6 +797,8 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 0, spv::Decoration::Offset, 16U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 32U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 48U);
+    MemberName(struct_type, PushData::RowBaseIndex, "row_base");
+    MemberDecorate(struct_type, PushData::RowBaseIndex, spv::Decoration::Offset, 80U);
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);
@@ -822,7 +824,7 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
     const Id pointer_type = TypePointer(storage_class, data_type);
     const Id id{AddGlobalVariable(struct_pointer_type, storage_class)};
     Decorate(id, spv::Decoration::Binding, binding.unified);
-    Decorate(id, spv::Decoration::DescriptorSet, 0U);
+    Decorate(id, spv::Decoration::DescriptorSet, LegacySet());
     if (!is_written) {
         Decorate(id, spv::Decoration::NonWritable);
     } else if (is_coherent) {
@@ -876,27 +878,116 @@ void EmitContext::DefineBuffers() {
 
         // Define aliases depending on the shader usage.
         auto& spv_buffer = buffers.emplace_back(binding.buffer++, desc.buffer_type);
+        // tlg C9: a guest buffer of an indexed graphics shader is found through the draw's row of slots: its descriptor array replaces the plain binding
+        const bool through_table = info.indexed && Indexed::IsIndexedBufferType(desc.buffer_type);
+        if (through_table) {
+            spv_buffer.indexed_row = binding.indexed++;
+        }
+        const auto define = [&](PointerType alias, u32 shift, Id data_type) {
+            return through_table ? DefineIndexedBuffer(spv_buffer, alias, desc.is_written, is_coherent, shift, data_type)
+                                 : DefineBuffer(desc.is_written, is_coherent, shift, desc.buffer_type, data_type);
+        };
         if (True(desc.used_types & IR::Type::U64)) {
-            spv_buffer.Alias(PointerType::U64) =
-                DefineBuffer(desc.is_written, is_coherent, 3, desc.buffer_type, U64);
+            spv_buffer.Alias(PointerType::U64) = define(PointerType::U64, 3, U64);
         }
         if (True(desc.used_types & IR::Type::U32)) {
-            spv_buffer.Alias(PointerType::U32) =
-                DefineBuffer(desc.is_written, is_coherent, 2, desc.buffer_type, U32[1]);
+            spv_buffer.Alias(PointerType::U32) = define(PointerType::U32, 2, U32[1]);
         }
         if (True(desc.used_types & IR::Type::F32)) {
-            spv_buffer.Alias(PointerType::F32) =
-                DefineBuffer(desc.is_written, is_coherent, 2, desc.buffer_type, F32[1]);
+            spv_buffer.Alias(PointerType::F32) = define(PointerType::F32, 2, F32[1]);
         }
         if (True(desc.used_types & IR::Type::U16)) {
-            spv_buffer.Alias(PointerType::U16) =
-                DefineBuffer(desc.is_written, is_coherent, 1, desc.buffer_type, U16);
+            spv_buffer.Alias(PointerType::U16) = define(PointerType::U16, 1, U16);
         }
         if (True(desc.used_types & IR::Type::U8)) {
-            spv_buffer.Alias(PointerType::U8) =
-                DefineBuffer(desc.is_written, is_coherent, 0, desc.buffer_type, U8);
+            spv_buffer.Alias(PointerType::U8) = define(PointerType::U8, 0, U8);
         }
-        ++binding.unified;
+        if (!through_table) {
+            ++binding.unified;
+        }
+    }
+}
+
+/// tlg C9: the element array of a guest buffer's alias in the global descriptor array (one variable per element type, written and coherent flags); the pointer into it is made in the
+/// prologue (DefineIndexedResources) from the draw's row.
+EmitContext::BufferSpv EmitContext::DefineIndexedBuffer(BufferDefinition& def, PointerType alias, bool is_written, bool is_coherent, u32 elem_shift, Id data_type) {
+    const Id record_array_type{TypeRuntimeArray(data_type)};
+    const Id struct_type{TypeStruct(record_array_type)};
+    if (std::ranges::find(buf_type_ids, record_array_type.value, &Id::value) == buf_type_ids.end()) {
+        Decorate(record_array_type, spv::Decoration::ArrayStride, 1 << elem_shift);
+        Decorate(struct_type, spv::Decoration::Block);
+        MemberName(struct_type, 0, "data");
+        MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+        buf_type_ids.push_back(record_array_type);
+    }
+    constexpr auto storage_class = spv::StorageClass::StorageBuffer;
+    if (!indexed_table.value) {
+        AddExtension("SPV_EXT_descriptor_indexing");
+        AddCapability(spv::Capability::RuntimeDescriptorArray);
+        AddCapability(spv::Capability::ShaderNonUniform);
+        AddCapability(spv::Capability::StorageBufferArrayDynamicIndexing);
+        AddCapability(spv::Capability::StorageBufferArrayNonUniformIndexing);
+        const Id table_array{TypeRuntimeArray(U32[1])};
+        Decorate(table_array, spv::Decoration::ArrayStride, 4U);
+        const Id table_struct{TypeStruct(table_array)};
+        Decorate(table_struct, spv::Decoration::Block);
+        MemberName(table_struct, 0, "rows");
+        MemberDecorate(table_struct, 0, spv::Decoration::Offset, 0U);
+        MemberDecorate(table_struct, 0, spv::Decoration::NonWritable);
+        indexed_table = AddGlobalVariable(TypePointer(storage_class, table_struct), storage_class);
+        Decorate(indexed_table, spv::Decoration::Binding, Indexed::TableBinding);
+        Decorate(indexed_table, spv::Decoration::DescriptorSet, Indexed::GlobalSet);
+        Name(indexed_table, "indexed_rows");
+        interfaces.push_back(indexed_table);
+    }
+    const Id struct_pointer_type{TypePointer(storage_class, struct_type)};
+    const Id pointer_type = TypePointer(storage_class, data_type);
+    const u64 key = (u64{struct_type.value} << 2) | (is_written ? 1u : 0u) | (is_written && is_coherent ? 2u : 0u);
+    Id array_variable;
+    if (const auto it = indexed_arrays.find(key); it != indexed_arrays.end()) {
+        array_variable = it->second;
+    } else {
+        const Id array_type{TypeRuntimeArray(struct_type)};
+        array_variable = AddGlobalVariable(TypePointer(storage_class, array_type), storage_class);
+        Decorate(array_variable, spv::Decoration::Binding, Indexed::BufferBinding);
+        Decorate(array_variable, spv::Decoration::DescriptorSet, Indexed::GlobalSet);
+        if (!is_written) {
+            Decorate(array_variable, spv::Decoration::NonWritable);
+        } else if (is_coherent) {
+            Decorate(array_variable, spv::Decoration::Coherent);
+        }
+        Name(array_variable, fmt::format("{}_gbuf{}", hw_stage, indexed_arrays.size()));
+        interfaces.push_back(array_variable);
+        indexed_arrays.emplace(key, array_variable);
+    }
+    def.indexed_array[u32(alias)] = array_variable;
+    def.indexed_struct_ptr[u32(alias)] = struct_pointer_type;
+    return {Id{}, pointer_type};
+}
+
+/// tlg C9, at the start of the main function: the pointer of every indexed buffer's aliases, from the slot its entry of the draw's row holds.
+void EmitContext::DefineIndexedResources() {
+    if (!indexed_table.value) {
+        return;
+    }
+    const Id row_base{OpLoad(U32[1], OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]), push_data_block, ConstU32(PushData::RowBaseIndex)))};
+    const Id rows_pointer{TypePointer(spv::StorageClass::StorageBuffer, U32[1])};
+    for (auto& buffer : buffers) {
+        if (buffer.indexed_row == ~0u) {
+            continue;
+        }
+        const Id index{OpIAdd(U32[1], row_base, ConstU32(buffer.indexed_row))};
+        const Id slot{OpLoad(U32[1], OpAccessChain(rows_pointer, indexed_table, u32_zero_value, index))};
+        Decorate(slot, spv::Decoration::NonUniform);
+        Name(slot, fmt::format("buf{}_slot", buffer.binding));
+        for (u32 a = 0; a < u32(PointerType::NumAlias); ++a) {
+            if (buffer.indexed_array[a].value == 0) {
+                continue;
+            }
+            const Id pointer{OpAccessChain(buffer.indexed_struct_ptr[a], buffer.indexed_array[a], slot)};
+            Decorate(pointer, spv::Decoration::NonUniform);
+            buffer.aliases[a].id = pointer;
+        }
     }
 }
 
@@ -1021,7 +1112,7 @@ void EmitContext::DefineImagesAndSamplers() {
         const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding.unified);
         binding.unified += num_bindings;
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, LegacySet());
         Name(id, fmt::format("{}_{}{}", hw_stage, "img", images.size()));
         images.push_back({
             .data_types = &data_types,
@@ -1048,7 +1139,7 @@ void EmitContext::DefineImagesAndSamplers() {
     for (const auto& samp_desc : info.samplers) {
         const Id id{AddGlobalVariable(sampler_pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding.unified++);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, LegacySet());
         Name(id, fmt::format("{}_{}{}", hw_stage, "samp", samplers.size()));
         samplers.push_back(id);
         interfaces.push_back(id);

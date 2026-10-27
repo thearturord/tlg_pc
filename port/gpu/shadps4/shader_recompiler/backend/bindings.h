@@ -10,6 +10,7 @@ namespace Shader::Backend {
 struct Bindings {
     u32 unified{};
     u32 buffer{};
+    u32 indexed{}; ///< tlg C9: entries of the draw's row in the indexed data table used so far
 
     auto operator<=>(const Bindings&) const = default;
 };

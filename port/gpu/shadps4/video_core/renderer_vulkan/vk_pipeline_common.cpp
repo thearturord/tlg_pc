@@ -4,6 +4,7 @@
 #include <boost/container/static_vector.hpp>
 
 #include "shader_recompiler/resource.h"
+#include "video_core/renderer_vulkan/vk_indexed_data.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
@@ -28,13 +29,20 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
     cmdbuf.pushConstants(*pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
 
+    // tlg C9: the global set (descriptor arrays and the row table) is bound once per command buffer; the bindings that stay plain are set 1
+    u32 set_index = 0;
+    if (indexed) {
+        IndexedData::Get()->BindSet(cmdbuf, *pipeline_layout);
+        set_index = Shader::Indexed::LegacySet;
+    }
+
     // Bind descriptor set.
     if (set_writes.empty()) {
         return;
     }
 
     if (uses_push_descriptors) {
-        cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, 0, set_writes);
+        cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, set_index, set_writes);
         return;
     }
 
@@ -43,7 +51,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
         set_write.dstSet = desc_set;
     }
     instance.GetDevice().updateDescriptorSets(set_writes, {});
-    cmdbuf.bindDescriptorSets(bind_point, *pipeline_layout, 0, desc_set, {});
+    cmdbuf.bindDescriptorSets(bind_point, *pipeline_layout, set_index, desc_set, {});
 }
 
 std::string Pipeline::GetDebugString() const {

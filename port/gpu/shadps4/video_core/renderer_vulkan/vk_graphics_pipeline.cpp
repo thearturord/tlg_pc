@@ -10,6 +10,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_indexed_data.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -41,6 +42,8 @@ GraphicsPipeline::GraphicsPipeline(
 
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
+    // tlg C9: stages compiled with the indexed data path read their guest buffers through the global set (set 0); the other bindings are set 1
+    indexed = !preloading && IndexedData::Get() != nullptr && std::ranges::any_of(infos, [](const Shader::Info* info) { return info != nullptr && info->indexed; });
     BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
 
@@ -50,10 +53,15 @@ GraphicsPipeline::GraphicsPipeline(
         .size = sizeof(Shader::PushData),
     };
 
-    const vk::DescriptorSetLayout set_layout = *desc_layout;
+    std::array<vk::DescriptorSetLayout, 2> set_layouts{};
+    if (indexed) {
+        set_layouts = {IndexedData::Get()->Layout(), *desc_layout};
+    } else {
+        set_layouts[0] = *desc_layout;
+    }
     const vk::PipelineLayoutCreateInfo layout_info = {
-        .setLayoutCount = 1U,
-        .pSetLayouts = &set_layout,
+        .setLayoutCount = indexed ? 2U : 1U,
+        .pSetLayouts = set_layouts.data(),
         .pushConstantRangeCount = 1,
         .pPushConstantRanges = &push_constants,
     };
@@ -479,6 +487,9 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
         }
         const auto stage_bit = LogicalStageToStageBit[u32(stage->sw_stage)];
         for (const auto& buffer : stage->buffers) {
+            if (indexed && stage->indexed && Shader::Indexed::IsIndexedBufferType(buffer.buffer_type)) {
+                continue; // found through the global set
+            }
             const auto sharp =
                 preloading ? AmdGpu::Buffer{}
                            : buffer.GetSharp(*stage); // See for the comment in compute PL creation

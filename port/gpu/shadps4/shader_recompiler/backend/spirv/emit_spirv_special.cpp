@@ -15,6 +15,7 @@ void EmitPrologue(EmitContext& ctx) {
     if (ctx.info.loads.Get(IR::Attribute::WorkgroupIndex)) {
         ctx.DefineWorkgroupIndex();
     }
+    ctx.DefineIndexedResources();
     ctx.DefineBufferProperties();
 }
 

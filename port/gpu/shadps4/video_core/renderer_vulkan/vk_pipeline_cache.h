@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_fixed_state.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_indexed_data.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
@@ -209,6 +210,10 @@ public:
 
     void WarmUp();
     void Sync();
+    /// tlg C9: the indexed data path (null: off)
+    [[nodiscard]] IndexedData* GetIndexedData() const noexcept {
+        return indexed_data.get();
+    }
 
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
@@ -283,6 +288,7 @@ private:
     Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
     DescriptorHeap desc_heap;
+    std::unique_ptr<IndexedData> indexed_data; ///< tlg C9: null unless TLG_INDEXED_DATA=1 and the device can do it
     vk::UniquePipelineCache pipeline_cache;
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};

@@ -54,6 +54,8 @@ struct Profile {
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};
+    /// tlg C9: graphics shaders read their guest buffers through the global indexed table (descriptor arrays) instead of push descriptors
+    bool indexed_resources{};
 
     bool operator==(const Profile&) const = default;
 };

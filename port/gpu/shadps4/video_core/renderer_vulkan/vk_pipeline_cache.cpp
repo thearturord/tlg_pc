@@ -356,6 +356,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
+    if (IndexedData::RequestedByEnvironment()) {
+        if (instance.IsIndexedDataSupported()) {
+            indexed_data = std::make_unique<IndexedData>(instance, scheduler);
+            profile.indexed_resources = true;
+        } else {
+            LOG_ERROR(Render_Vulkan, "TLG_INDEXED_DATA is set but the device lacks descriptor indexing features: the legacy binder is used");
+        }
+    }
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
@@ -1024,6 +1032,8 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
+    // tlg C9: graphics shaders find their guest buffers through the indexed data table
+    info.indexed = profile.indexed_resources && info.hw_stage != HwStage::Compute;
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);

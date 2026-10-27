@@ -58,6 +58,8 @@ struct InfoPersistent {
     bool has_fetch_shader{};
     bool has_bitwise_xor{};
     bool uses_dma{};
+    /// tlg C9: compiled with the indexed data path (see Indexed in resource.h)
+    bool indexed{};
 
     InfoPersistent() = default;
     InfoPersistent(HwStage hw_stage_, SwStage sw_stage_, u64 pgm_hash_)
@@ -205,7 +207,14 @@ struct Info : InfoPersistent {
 
     void AddBindings(Backend::Bindings& bnd) const {
         bnd.buffer += buffers.size();
-        bnd.unified += buffers.size() + images.size() + samplers.size();
+        u32 indexed_buffers = 0;
+        if (indexed) {
+            for (const auto& buffer : buffers) {
+                indexed_buffers += Indexed::IsIndexedBufferType(buffer.buffer_type) ? 1u : 0u;
+            }
+        }
+        bnd.indexed += indexed_buffers;
+        bnd.unified += buffers.size() - indexed_buffers + images.size() + samplers.size();
     }
 
     void RefreshFlatBuf() {

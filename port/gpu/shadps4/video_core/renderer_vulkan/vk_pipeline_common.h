@@ -57,6 +57,11 @@ public:
         return is_compute;
     }
 
+    /// tlg C9: the guest buffers of this pipeline's draws are found through the global indexed set
+    bool IsIndexed() const noexcept {
+        return indexed;
+    }
+
     /// cp_split_mode: from now on the raster thread's copies of the stage Infos are used (the
     /// command processor thread keeps rewriting the shared ones). Done once, before first use.
     void AdoptStageInfos(const std::array<const Shader::Info*, Shader::MaxStageTypes>& infos) {
@@ -84,6 +89,7 @@ protected:
     vk::UniquePipeline pipeline;
     vk::UniquePipelineLayout pipeline_layout;
     vk::UniqueDescriptorSetLayout desc_layout;
+    bool indexed{false}; ///< tlg C9: set 0 is the global indexed set, the legacy bindings are set 1
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     bool stages_adopted{};
     bool uses_push_descriptors{};

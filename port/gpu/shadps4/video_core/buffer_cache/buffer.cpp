@@ -8,6 +8,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/renderer_vulkan/vk_indexed_data.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -101,6 +102,7 @@ UniqueBuffer::~UniqueBuffer() {
 }
 
 void UniqueBuffer::Destroy() {
+    Vulkan::IndexedData::NoteBufferDestroyed(buffer); // tlg C9: no slot of the indexed data path may still name it
     if (allocation) {
         vmaDestroyBuffer(allocator, buffer, allocation);
     } else if (buffer) {
