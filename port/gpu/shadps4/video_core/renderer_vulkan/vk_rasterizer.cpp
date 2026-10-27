@@ -525,6 +525,16 @@ static u32 NativeHandleMode() {
     return mode;
 }
 
+/// B9 (`TLG_DISPATCH_BINDER`): the descriptors of a dispatch come from its record's typed bindings. 0 off, 2 the record serves every descriptor it holds, 3 like 2 but every
+/// descriptor is compared with the guest's (the guest's wins on a difference: the audit of the record against stale table reads). Default 3 until the owner plays with 2.
+static u32 DispatchBinderMode() {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_DISPATCH_BINDER");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 3u;
+    }();
+    return mode;
+}
+
 static u32 NativeBinderMode() {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_NATIVE_BINDER");
@@ -1242,7 +1252,9 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
 
     static const bool dispatch_audit_on = std::getenv("TLG_DISPATCH_AUDIT") != nullptr;
     dispatch_audit_plan = (dispatch_audit_on && plan != nullptr && plan->bindings_complete) ? plan : nullptr;
+    binder_plan = DispatchBinderFor(plan);
     const bool dispatch_bound = BindResources(pipeline);
+    binder_plan = nullptr;
     dispatch_audit_plan = nullptr;
     if (!dispatch_bound) {
         return;
@@ -1282,7 +1294,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Dis
 
     static const bool dispatch_audit_on = std::getenv("TLG_DISPATCH_AUDIT") != nullptr;
     dispatch_audit_plan = (dispatch_audit_on && plan != nullptr && plan->bindings_complete) ? plan : nullptr;
+    binder_plan = DispatchBinderFor(plan);
     const bool dispatch_bound = BindResources(pipeline);
+    binder_plan = nullptr;
     dispatch_audit_plan = nullptr;
     if (!dispatch_bound) {
         return;
@@ -1450,6 +1464,27 @@ void Rasterizer::OnFence(Common::UniqueFunction<void>&& signal, VideoCore::Fence
 
 /// N3 native binder switch (`TLG_NATIVE_BINDER`): 0 off, 1 the depth passes (class 0), 2 every class with a complete binding list, 3 like 2 and every descriptor is compared with
 /// the legacy one (the legacy one wins on a difference).
+/// B9: a binder plan made of a dispatch's record (the existing binder machinery reads (stage 5, kind, flat offset) from it). Null: the dispatch binds from the guest's tables.
+const DrawPlan* Rasterizer::DispatchBinderFor(const DispatchPlan* plan) {
+    const u32 mode = DispatchBinderMode();
+    if (mode == 0 || plan == nullptr || !plan->bindings_complete || plan->binding_count == 0) {
+        return nullptr;
+    }
+    if (!dispatch_binder_plan) {
+        dispatch_binder_plan = std::make_unique<DrawPlan>();
+    }
+    DrawPlan& out = *dispatch_binder_plan;
+    out.native_seq = plan->native_seq;
+    out.binding_count = plan->binding_count;
+    out.bindings_complete = true;
+    out.any_flat_skipped = false;
+    out.has_handles = false;
+    out.has_geometry_handles = false;
+    std::memcpy(out.bindings.data(), plan->bindings.data(), sizeof(Core::NativeDraw::RecordBinding) * plan->binding_count);
+    binder_verify = mode == 3;
+    return &out;
+}
+
 const DrawPlan* Rasterizer::NativeBinderFor(const DrawPlan* plan, u32 draw_class) {
     const u32 mode = NativeBinderMode();
     binder_verify = mode == 3;
@@ -1507,9 +1542,18 @@ bool Rasterizer::StageFlatSkipped(const Shader::Info& stage) const {
 
 /// The descriptor words of the binder's plan for the resource at flat user data `offset` of `stage` (null: the record has no binding there).
 const u32* Rasterizer::BinderWords(const Shader::Info& stage, u32 offset, u32 dwords, u32 kind, u32* binding_index) const {
-    const u32 s = stage.sw_stage == Shader::SwStage::Vertex ? 0 : stage.sw_stage == Shader::SwStage::Fragment ? 1 : 2;
-    if (s > 1) {
+    const u32 s = stage.sw_stage == Shader::SwStage::Vertex ? 0 : stage.sw_stage == Shader::SwStage::Fragment ? 1 : stage.sw_stage == Shader::SwStage::Compute ? 5 : 2;
+    if (s == 2) {
         return nullptr;
+    }
+    if (s == 5 && DispatchBinderMode() == 2) {
+        static const u32 kinds = [] {
+            const char* e = std::getenv("TLG_DISPATCH_BINDER_KINDS"); // bit 0 buffers (kind 1), bit 1 images (kind 2), bit 2 samplers (kind 3); mode 3 compares all
+            return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 1u;
+        }();
+        if (kind == 0 || kind > 3 || ((kinds >> (kind - 1)) & 1) == 0) {
+            return nullptr;
+        }
     }
     return FindRecordWords(stage, binder_plan->bindings.data(), binder_plan->binding_count, s, kind, offset, dwords, binding_index);
 }
@@ -2243,7 +2287,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                             u32 l[4], r[4];
                             std::memcpy(l, &legacy, 16);
                             std::memcpy(r, &recorded, 16);
-                            LOG_ERROR(Render_Vulkan, "B9 dispatch buffer differs: program {:#x} offset {} guest {:08x} {:08x} {:08x} {:08x} record {:08x} {:08x} {:08x} {:08x}", stage.pgm_hash,
+                            LOG_ERROR(Render_Vulkan, "B9 dispatch buffer differs: caller {:#x} program {:#x} offset {} guest {:08x} {:08x} {:08x} {:08x} record {:08x} {:08x} {:08x} {:08x}", Core::NativeDraw::RecordCallerGhidra(dispatch_audit_plan->native_seq), stage.pgm_hash,
                                       desc.sharp_fetch.offsets[0], l[0], l[1], l[2], l[3], r[0], r[1], r[2], r[3]);
                         }
                     }

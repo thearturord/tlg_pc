@@ -4634,6 +4634,12 @@ void MaterializeRegs(ExecDraw& d) {
     lazy_materialized.fetch_add(1, std::memory_order_relaxed);
 }
 
+u64 RecordCallerGhidra(u64 seq) {
+    auto& slot = Slot(seq);
+    const u64 caller = slot.caller;
+    return slot.seq.load(std::memory_order_acquire) == seq && caller >= ImageBase() ? caller - ImageBase() + 0x1000000 : 0;
+}
+
 bool TakeDispatchBindings(u64 seq, RecordBinding* out, u32 max, u32& count) {
     count = 0;
     auto& slot = Slot(seq);
