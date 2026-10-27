@@ -108,6 +108,14 @@ private:
     bool live_;
 };
 
+/// One of several dispatches a site issues: its groups, the call site (the return address in ghidra terms) and the words of the context's tables at that dispatch.
+struct Expect {
+    u32 x{}, y{1}, z{1};
+    u64 site{};
+    std::vector<std::pair<u64, u64>> words; ///< (offset in the context, value)
+    std::vector<std::pair<u64, u64>> stack; ///< (offset from the function's rsp, value): what the engine's virtuals copy into the context's tables
+};
+
 /// What one execution of a site would do.
 struct Plan {
     u64 rsp{}, context{}, site_ghidra{};
@@ -115,6 +123,7 @@ struct Plan {
     bool async{true};
     std::vector<std::pair<u64, u64>> context_words; ///< (offset in the context, value): compared at the engine's dispatch
     std::vector<std::pair<int, u64>> registers;     ///< what the registers hold after the piece (set by the generator, compared by the verify)
+    std::vector<Expect> dispatches;                 ///< sites that issue several dispatches: each one in order (replaces groups / site_ghidra / context_words for the comparison)
     u64 v[24]{};                                    ///< values of the scan the apply needs
 };
 
@@ -1018,8 +1027,166 @@ void Apply9(const Plan& p, Writer& w) {
     }
 }
 
-std::array<Site, 10>& Sites() {
-    static std::array<Site, 10> sites{{
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Site 10: the chain of screen passes in `RenderDev_RenderScene` (ghidra 0x01c593d0), the loop over the levels `0x01c6d360 .. 0x01c6d7ea`, graphics context in r15 (the fenced dispatch
+// is its virtual 0x50), the holder `[rsp + 0xd8]`, the table of views `[rsp + 0x110]`, the level count in rdx (counted down), the offset r12 (0 on the first level, then minus 8 per
+// level). One level: four words into the holder (the level size and the level), UpdateSubresource of `[holder + 0x2d0]`, then (first level) one pass with the shader 0x12c8 or (other
+// levels) two passes with 0x1308 and 0x12c8, then the pass with 0x12d8 that both have; every pass is SetUnorderedAccessViews (one view from the table or zero), SetShaderResources
+// (two entries from the holder or zero), SetShader, and the fenced dispatch of (ceil(w / 8), ceil(h / 8), 1) groups, the views cleared after it. Resumes at 0x01c6d7ea.
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool Scan10(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    (void)no_work;
+    p.rsp = c->rsp;
+    p.context = c->r15;
+    const u64 holder = R<u64>(p.rsp + 0xd8);
+    const u64 table = R<u64>(p.rsp + 0x110);
+    const u64 update_source = R<u64>(p.rsp + 0xb0);
+    const u32 level_count = static_cast<u32>(c->rdx);
+    if (!Plausible(p.context) || !Plausible(holder) || !Plausible(table) || !Plausible(update_source) || level_count == 0) {
+        reason = "an object of the loop is not set";
+        return false;
+    }
+    const u64 vtable = R<u64>(p.context);
+    const u64 fenced_entry = Plausible(vtable) ? R<u64>(vtable + 0x50) : 0;
+    const bool async = fenced_entry == Global(0x0246f5f0);
+    if (!Plausible(vtable) || !Plausible(R<u64>(vtable + 0xd0)) || (!async && fenced_entry != Global(0x02479810))) {
+        reason = "the context is not a known context";
+        return false;
+    }
+    const u64 device = R<u64>(Global(0x0689eed8));
+    if (!Plausible(device)) {
+        reason = "the device is not set";
+        return false;
+    }
+    const s64 offset = static_cast<s64>(c->r12);
+    const u64 size = R<u64>(holder + 0x170);
+    const u32 shift = (level_count - 1) & 31;
+    const u32 w = static_cast<u32>(size) >> shift;
+    const u32 h = static_cast<u32>(size >> 32) >> shift;
+    const u32 gx = (w >> 3) + ((w & 7) != 0 ? 1 : 0);
+    const u32 gy = (h >> 3) + ((h & 7) != 0 ? 1 : 0);
+    p.v[0] = holder;
+    p.v[1] = table;
+    p.v[2] = update_source;
+    p.v[3] = R<u64>(holder + 0x2d0); // the constant buffer
+    p.v[4] = w;
+    p.v[5] = h;
+    p.v[6] = level_count;
+    p.v[7] = c->rdx;
+    p.v[8] = static_cast<u64>(offset);
+    p.v[9] = gx;
+    p.v[10] = gy;
+    p.v[11] = R<u64>(device + 0x1308);
+    p.v[12] = R<u64>(device + 0x12c8);
+    p.v[13] = R<u64>(device + 0x12d8);
+    p.v[14] = R<u64>(holder + 0x118);
+    p.v[15] = R<u64>(holder + 0x180);
+    p.v[16] = R<u64>(holder + 0x250);
+    p.v[17] = R<u64>(holder + 0x1e8);
+    // the views: first pass of the other levels, second pass (or the only pass of the first level), the last pass
+    p.v[18] = offset != 0 ? R<u64>(table + static_cast<u64>(offset)) : 0;
+    p.v[19] = R<u64>(table + static_cast<u64>(offset) - 0x68);
+    p.v[20] = R<u64>(table + static_cast<u64>(offset) - 0xd0);
+    if (p.v[11] == 0 || p.v[12] == 0 || p.v[13] == 0) {
+        reason = "a shader is not set";
+        return false;
+    }
+    const auto expect = [&](u64 site, u64 srv0, u64 srv1, u64 uav, u64 shader) {
+        Expect e;
+        e.x = gx;
+        e.y = gy;
+        e.site = site;
+        e.words = {{async ? 0x1d10 : 0x4670, shader}}; // the tables are written by the engine's virtuals: their input is compared (the stack slots)
+        e.stack = {{0x140, uav}, {0x180, srv0}, {0x188, srv1}};
+        p.dispatches.push_back(std::move(e));
+    };
+    if (offset != 0) {
+        expect(0x01c6d4b5, p.v[14], p.v[15], p.v[18], p.v[11]);
+        expect(0x01c6d59c, p.v[16], 0, p.v[19], p.v[12]);
+    } else {
+        expect(0x01c6d6b7, p.v[14], 0, p.v[19], p.v[12]);
+    }
+    expect(0x01c6d7a9, p.v[17], 0, p.v[20], p.v[13]);
+    p.site_ghidra = p.dispatches[0].site;
+    p.async = async;
+    p.v[21] = async ? 1 : 0;
+    p.registers = {{RBX, p.rsp + 0x180}, {R13, p.rsp + 0x140}, {R14, p.rsp + 0x180}, {R12, c->r12}};
+    return true;
+}
+void Apply10(const Plan& p, Writer& w) {
+    const u64 holder = p.v[0];
+    const u64 context = p.context;
+    const u64 vtable = R<u64>(context);
+    const u64 view_slot = p.rsp + 0x140;
+    const u64 srv_slot = p.rsp + 0x180;
+    const auto set_view = [&](u64 view) {
+        w.Put<u64>(view_slot, view);
+        if (w.Live()) {
+            reinterpret_cast<Virtual>(R<u64>(vtable + 0x48))(context, 0, 1, view_slot, 0, 0, 0);
+        }
+    };
+    const auto set_srvs = [&](u64 a, u64 b) {
+        w.Put<u64>(srv_slot, a);
+        w.Put<u64>(srv_slot + 8, b);
+        if (w.Live()) {
+            reinterpret_cast<Virtual>(R<u64>(vtable + 0x40))(context, 0, 2, srv_slot, 0, 0, 0);
+        }
+    };
+    const auto set_shader = [&](u64 shader) {
+        if (w.Live()) {
+            reinterpret_cast<Virtual>(R<u64>(vtable + 0x38))(context, shader, 0, 0, 0, 0, 0);
+        }
+    };
+    size_t dispatch_index = 0;
+    const auto dispatch = [&] {
+        const Expect& e = p.dispatches[dispatch_index++];
+        if (w.Live()) {
+            NativeDraw::IssueDispatch(context, e.x, e.y, e.z, true, e.site, p.v[21] != 0);
+        }
+    };
+    w.Put<u32>(holder + 0x2c0, static_cast<u32>(p.v[4]));
+    w.Put<u32>(holder + 0x2c4, static_cast<u32>(p.v[5]));
+    w.Put<u32>(holder + 0x2c8, static_cast<u32>(p.v[6]) - 1);
+    w.Put<u32>(holder + 0x2cc, static_cast<u32>(p.v[6]));
+    w.Put<u64>(p.rsp + 0xd0, p.v[7]);
+    w.Put<u32>(p.rsp, 0); // the seventh argument slot
+    if (w.Live()) {
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0xd0))(context, p.v[3], 0, 0, p.v[2], 0, 0); // UpdateSubresource
+    }
+    w.Put<u64>(p.rsp + 0xe0, p.v[8]);
+    w.Put<u32>(p.rsp + 0xc8, static_cast<u32>(p.v[9]));
+    w.Put<u32>(p.rsp + 0xc0, static_cast<u32>(p.v[10]));
+    if (static_cast<s64>(p.v[8]) != 0) {
+        set_view(p.v[18]);
+        set_srvs(p.v[14], p.v[15]);
+        set_shader(p.v[11]);
+        dispatch();
+        set_view(0);
+        set_srvs(0, 0);
+        set_view(p.v[19]);
+        set_srvs(p.v[16], 0);
+        set_shader(p.v[12]);
+        dispatch();
+        set_view(0);
+        set_srvs(0, 0);
+    } else {
+        set_view(p.v[19]);
+        set_srvs(p.v[14], 0);
+        set_shader(p.v[12]);
+        dispatch();
+        set_view(0);
+        set_srvs(0, 0);
+    }
+    set_view(p.v[20]);
+    set_srvs(p.v[17], 0);
+    set_shader(p.v[13]);
+    dispatch();
+    set_view(0);
+    set_srvs(0, 0);
+}
+
+std::array<Site, 11>& Sites() {
+    static std::array<Site, 11> sites{{
         {"begin_recording_loop_1", 0x01c49e40, &Scan0, &Apply0, {}},
         {"begin_recording_loop_2", 0x01c4a9e3, &Scan1, &Apply1, {}},
         {"vertex_cluster_loop_1", 0x01d7e334, &Scan2, &Apply2, {}},
@@ -1030,6 +1197,7 @@ std::array<Site, 10>& Sites() {
         {"vertex_cluster_pre", 0x01d7e1c0, &Scan7, &Apply7, {}},
         {"begin_recording_loop_3", 0x01c4b6ea, &Scan8, &Apply8, {}},
         {"begin_recording_loop_4", 0x01c4bea6, &Scan9, &Apply9, {}},
+        {"render_scene_chain", 0x01c6d7ea, &Scan10, &Apply10, {}},
     }};
     return sites;
 }
@@ -1084,7 +1252,7 @@ bool Scan(Site& site, MidContext* c, Plan& plan, const char*& reason, bool& no_w
 /// A verify execution: what the generator predicts, kept until the engine's code has run through the piece.
 struct Pending {
     bool armed{false}, dispatch_seen{false};
-    u32 site{0};
+    u32 site{0}, dispatch_count{0};
     MidContext saved{};
     Plan plan;
     std::vector<Patch> patches;
@@ -1121,6 +1289,7 @@ u64 PS4_SYSV_ABI Top(MidContext* c) {
         }
         pending.armed = true;
         pending.dispatch_seen = false;
+        pending.dispatch_count = 0;
         pending.site = N;
         pending.saved = *c;
         pending.plan = plan;
@@ -1161,6 +1330,8 @@ u64 PS4_SYSV_ABI Bottom(MidContext* c) {
     };
     if (!pending.dispatch_seen) {
         fail("dispatch missing", "the engine issued no dispatch through the piece");
+    } else if (!pending.plan.dispatches.empty() && pending.dispatch_count != pending.plan.dispatches.size()) {
+        fail("dispatch count", fmt::format("{} dispatches, expected {}", pending.dispatch_count, pending.plan.dispatches.size()));
     }
     for (const auto& note : pending.notes) {
         fail("dispatch", note);
@@ -1222,10 +1393,39 @@ u64 PS4_SYSV_ABI Bottom(MidContext* c) {
 } // namespace
 
 void NoteDispatch(u64 context, u64 x, u64 y, u64 z, u64 site_runtime) {
-    if (!pending.armed || pending.dispatch_seen || context != pending.plan.context) {
+    if (!pending.armed || context != pending.plan.context) {
         return;
     }
     const Plan& plan = pending.plan;
+    if (!plan.dispatches.empty()) {
+        const u32 index = pending.dispatch_count++;
+        pending.dispatch_seen = true;
+        if (index >= plan.dispatches.size()) {
+            pending.notes.push_back(fmt::format("dispatch {} is more than the {} expected", index, plan.dispatches.size()));
+            return;
+        }
+        const Expect& e = plan.dispatches[index];
+        if (x != e.x || y != e.y || z != e.z) {
+            pending.notes.push_back(fmt::format("dispatch {}: groups {} x {} x {}, expected {} x {} x {}", index, x, y, z, e.x, e.y, e.z));
+        }
+        if (site_runtime != Global(e.site)) {
+            pending.notes.push_back(fmt::format("dispatch {}: call site {:#x}, expected {:#x}", index, site_runtime, Global(e.site)));
+        }
+        for (const auto& [offset, value] : e.words) {
+            if (R<u64>(context + offset) != value) {
+                pending.notes.push_back(fmt::format("dispatch {}: context word {:#x}: {:#x}, expected {:#x}", index, offset, R<u64>(context + offset), value));
+            }
+        }
+        for (const auto& [offset, value] : e.stack) {
+            if (R<u64>(plan.rsp + offset) != value) {
+                pending.notes.push_back(fmt::format("dispatch {}: stack word {:#x}: {:#x}, expected {:#x}", index, offset, R<u64>(plan.rsp + offset), value));
+            }
+        }
+        return;
+    }
+    if (pending.dispatch_seen) {
+        return;
+    }
     pending.dispatch_seen = true;
     if (x != plan.groups || y != plan.groups_y || z != plan.groups_z) {
         pending.notes.push_back(fmt::format("groups {} x {} x {}, expected {} x {} x {}", x, y, z, plan.groups, plan.groups_y, plan.groups_z));
@@ -1301,6 +1501,12 @@ u64 FindHandler(const char* name) {
     }
     if (n == "site_bottom_9") {
         return reinterpret_cast<u64>(&Bottom<9>);
+    }
+    if (n == "site_top_10") {
+        return reinterpret_cast<u64>(&Top<10>);
+    }
+    if (n == "site_bottom_10") {
+        return reinterpret_cast<u64>(&Bottom<10>);
     }
     return 0;
 }
