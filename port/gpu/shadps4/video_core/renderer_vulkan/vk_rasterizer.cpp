@@ -530,7 +530,7 @@ static u32 NativeHandleMode() {
 static u32 DispatchBinderMode() {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_DISPATCH_BINDER");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 0u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 2u; // default 2 since 2026-10-28 (owner play: no glitch from it); 0 turns it off
     }();
     return mode;
 }
@@ -1582,7 +1582,7 @@ const u32* Rasterizer::BinderWords(const Shader::Info& stage, u32 offset, u32 dw
     if (s == 5 && DispatchBinderMode() == 2) {
         static const u32 kinds = [] {
             const char* e = std::getenv("TLG_DISPATCH_BINDER_KINDS"); // bit 0 buffers (kind 1), bit 1 images (kind 2), bit 2 samplers (kind 3); mode 3 compares all
-            return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 1u;
+            return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 7u;
         }();
         if (kind == 0 || kind > 3 || ((kinds >> (kind - 1)) & 1) == 0) {
             return nullptr;
