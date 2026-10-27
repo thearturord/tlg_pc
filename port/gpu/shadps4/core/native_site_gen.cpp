@@ -1222,8 +1222,9 @@ bool Finish(Plan& p, int kind) {
     std::map<u64, u64> direct; // writes straight into the context's memory (offset -> value)
     const auto slots = [&](const Step& s, std::vector<std::pair<u64, u64>>& out) {
         out.clear();
+        const u64 base = s.d != 0 ? s.d - p.rsp : s.c; // an array behind a pointer: its offset from rsp (wraps for an address outside the frame)
         for (u64 i = 0; i < s.b; ++i) {
-            const u64 offset = s.c + 8 * i;
+            const u64 offset = base + 8 * i;
             const auto found = stack.find(offset);
             out.emplace_back(offset, found != stack.end() ? found->second : R<u64>(p.rsp + offset));
         }
@@ -1286,17 +1287,17 @@ void ApplySteps(const Plan& p, Writer& w) {
             break;
         case Step::SetCb:
             if (w.Live()) {
-                reinterpret_cast<Virtual>(R<u64>(vtable + 0x28))(context, s.a, s.b, p.rsp + s.c, 0, 0, 0);
+                reinterpret_cast<Virtual>(R<u64>(vtable + 0x28))(context, s.a, s.b, s.d != 0 ? s.d : p.rsp + s.c, 0, 0, 0);
             }
             break;
         case Step::SetSrv:
             if (w.Live()) {
-                reinterpret_cast<Virtual>(R<u64>(vtable + 0x40))(context, s.a, s.b, p.rsp + s.c, 0, 0, 0);
+                reinterpret_cast<Virtual>(R<u64>(vtable + 0x40))(context, s.a, s.b, s.d != 0 ? s.d : p.rsp + s.c, 0, 0, 0);
             }
             break;
         case Step::SetUav:
             if (w.Live()) {
-                reinterpret_cast<Virtual>(R<u64>(vtable + 0x48))(context, s.a, s.b, p.rsp + s.c, 0, 0, 0);
+                reinterpret_cast<Virtual>(R<u64>(vtable + 0x48))(context, s.a, s.b, s.d != 0 ? s.d : p.rsp + s.c, 0, 0, 0);
             }
             break;
         case Step::SetShader:
@@ -1502,6 +1503,9 @@ struct StepList {
     void uav(u64 count, u64 offset) { p.steps.push_back({Step::SetUav, 0, count, offset}); }
     void shader(u64 value) { p.steps.push_back({Step::SetShader, value}); }
     void dispatch(u64 x, u64 y, u64 site, bool fenced = true) { p.steps.push_back({Step::Dispatch, x, y, 1, site, fenced ? 1u : 0u}); }
+    void cbp(u64 first, u64 count, u64 pointer) { p.steps.push_back({Step::SetCb, first, count, 0, pointer}); }
+    void srvp(u64 count, u64 pointer) { p.steps.push_back({Step::SetSrv, 0, count, 0, pointer}); }
+    void uavp(u64 count, u64 pointer) { p.steps.push_back({Step::SetUav, 0, count, 0, pointer}); }
     void abs(u64 address, u64 value) { p.steps.push_back({Step::PutAbs64, address, value}); }
     void abs32(u64 address, u64 value) { p.steps.push_back({Step::PutAbs32, address, value}); }
     void abs8(u64 address, u64 value) { p.steps.push_back({Step::PutAbs8, address, value}); }
@@ -2080,8 +2084,101 @@ bool Scan24(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
     return true;
 }
 
-std::array<Site, 25>& Sites() {
-    static std::array<Site, 25> sites{{
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Sites 25 and 26: the other two dispatch loops of the emitter system `FUN_01bcac40` (graphics context r14, the system `[rsp + 0x80]`, the tables behind the pointers `[rsp + 0x88]`
+// (constant buffer, slot 10), `[rsp + 0x90]` (two views), `[rsp + 0xa8]` (four shader resources)). Loop B (0x01bcbc29 .. 0x01bcbd38, node rbx, only for `[data + 0x58] != 0`, shader
+// 0x1c at `[device + 0x11c8]`, size `[data + 0x50]`) and loop D (0x01bcc075 .. 0x01bcc200, node rbx, data r12, shader 0x1a at `[device + 0x11a8]`, size `[data + 0x80]`, the stack slots
+// 0xb8 / 0xc0 / 0xc8 / 0xf0 / 0xf8 from the pair of targets), both plain dispatches of ((w + 7) / 8, (h + 7) / 8, 1).
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+u64 TargetWord(u64 data, u32 index, u64 offset) {
+    const u64 target = R<u64>(data + u64{index} * 8 + 0x1c8);
+    return target != 0 ? R<u64>(target + offset) : 0;
+}
+bool Scan25(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    const u64 node = c->rbx;
+    const u64 data = Plausible(node) ? R<u64>(node + 0x108) : 0;
+    if (!EmitterPreamble(c, p, node, data, reason, no_work)) {
+        return false;
+    }
+    if (R<u32>(data + 0x58) == 0) {
+        no_work = true;
+        return false;
+    }
+    const u64 system = R<u64>(p.rsp + 0x80);
+    const u64 device = R<u64>(Global(0x0689eed8));
+    const u64 pointer_a = R<u64>(p.rsp + 0x88), pointer_b = R<u64>(p.rsp + 0x90), pointer_c = R<u64>(p.rsp + 0xa8);
+    if (!Plausible(system) || !Plausible(device) || !Plausible(pointer_a) || !Plausible(pointer_b) || !Plausible(pointer_c)) {
+        reason = "the table pointers of the function are not set";
+        return false;
+    }
+    const u32 a = R<u32>(data + 0x24c), b = R<u32>(data + 0x250);
+    StepList s{p};
+    s.put(0xb8, R<u64>(data + 0x178));
+    s.put(0xf0, TargetWord(data, (a ^ 1u) + b * 2u, 0x50));
+    s.cbp(10, 1, pointer_a);
+    s.uavp(2, pointer_b);
+    s.srvp(4, pointer_c);
+    if (R<u32>(system + 0x78) != 0x1c) {
+        const u64 shader = R<u64>(device + 0x11c8);
+        if (shader == 0) {
+            reason = "the shader is not set";
+            return false;
+        }
+        s.abs32(system + 0x78, 0x1c);
+        s.shader(shader);
+    }
+    const u64 size = R<u64>(data + 0x50);
+    s.dispatch((static_cast<u32>(size) + 7u) >> 3, (static_cast<u32>(size >> 32) + 7u) >> 3, 0x01bcbd38, false);
+    if (!Finish(p, ContextKind(p.context))) {
+        reason = "the context is not a known context";
+        return false;
+    }
+    p.registers = {{R15, data}};
+    return true;
+}
+bool Scan26(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    const u64 node = c->rbx;
+    const u64 data = c->r12;
+    if (!EmitterPreamble(c, p, node, data, reason, no_work)) {
+        return false;
+    }
+    const u64 system = R<u64>(p.rsp + 0x80);
+    const u64 device = R<u64>(Global(0x0689eed8));
+    const u64 pointer_a = R<u64>(p.rsp + 0x88), pointer_b = R<u64>(p.rsp + 0x90), pointer_c = R<u64>(p.rsp + 0xa8);
+    if (!Plausible(system) || !Plausible(device) || !Plausible(pointer_a) || !Plausible(pointer_b) || !Plausible(pointer_c)) {
+        reason = "the table pointers of the function are not set";
+        return false;
+    }
+    const u32 a = R<u32>(data + 0x24c), b = R<u32>(data + 0x250);
+    StepList s{p};
+    s.put(0xb8, R<u64>(data + 0x1a8));
+    s.put(0xc0, TargetWord(data, b * 2u + a, 0x48));
+    s.put(0xc8, TargetWord(data, (a ^ 1u) + b * 2u, 0x48));
+    s.put(0xf0, TargetWord(data, ((b * 2u) ^ 2u) + a, 0x50));
+    s.put(0xf8, TargetWord(data, ((b * 2u) ^ 2u) + (a ^ 1u), 0x50));
+    s.cbp(10, 1, pointer_a);
+    s.uavp(2, pointer_b);
+    s.srvp(4, pointer_c);
+    if (R<u32>(system + 0x78) != 0x1a) {
+        const u64 shader = R<u64>(device + 0x11a8);
+        if (shader == 0) {
+            reason = "the shader is not set";
+            return false;
+        }
+        s.abs32(system + 0x78, 0x1a);
+        s.shader(shader);
+    }
+    const u64 size = R<u64>(data + 0x80);
+    s.dispatch((static_cast<u32>(size) + 7u) >> 3, (static_cast<u32>(size >> 32) + 7u) >> 3, 0x01bcc200, false);
+    if (!Finish(p, ContextKind(p.context))) {
+        reason = "the context is not a known context";
+        return false;
+    }
+    return true;
+}
+
+std::array<Site, 27>& Sites() {
+    static std::array<Site, 27> sites{{
         {"begin_recording_loop_1", 0x01c49e40, &Scan0, &Apply0, {}},
         {"begin_recording_loop_2", 0x01c4a9e3, &Scan1, &Apply1, {}},
         {"vertex_cluster_loop_1", 0x01d7e334, &Scan2, &Apply2, {}},
@@ -2107,6 +2204,8 @@ std::array<Site, 25>& Sites() {
         {"render_scene_dispatch_tail", 0x01c6e128, &Scan22, &ApplySteps, {}},
         {"scene_job_1c60", 0x01c6024f, &Scan23, &ApplySteps, {}},
         {"render_scene_pass_i", 0x01c63816, &Scan24, &ApplySteps, {}},
+        {"emitter_system_loop_b", 0x01bcbc10, &Scan25, &ApplySteps, {}},
+        {"emitter_system_loop_d", 0x01bcc200, &Scan26, &ApplySteps, {}},
     }};
     return sites;
 }
@@ -2522,6 +2621,18 @@ u64 FindHandler(const char* name) {
     }
     if (n == "site_bottom_24") {
         return reinterpret_cast<u64>(&Bottom<24>);
+    }
+    if (n == "site_top_25") {
+        return reinterpret_cast<u64>(&Top<25>);
+    }
+    if (n == "site_bottom_25") {
+        return reinterpret_cast<u64>(&Bottom<25>);
+    }
+    if (n == "site_top_26") {
+        return reinterpret_cast<u64>(&Top<26>);
+    }
+    if (n == "site_bottom_26") {
+        return reinterpret_cast<u64>(&Bottom<26>);
     }
     return 0;
 }
