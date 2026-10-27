@@ -6615,6 +6615,18 @@ u64 PS4_SYSV_ABI WetSim(u64 system, u64 ctx, u64 scene, u64 a3, u64 a4, u64 a5, 
     return 0;
 }
 
+/// B4: the GPU instancing loop `FUN_01ee5130(holder, scene)`: a generator behind `TLG_INST_GEN=1` (core/native_zpass_gen.cpp, B4).
+u64 PS4_SYSV_ABI InstanceLoop(u64 holder, u64 scene, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
+    (void)a2, (void)a3, (void)a4, (void)a5, (void)ret, (void)caller_rsp;
+    if (NativeZPassGen::InstEnabled() && IsHeapPointer(holder) && IsHeapPointer(scene)) {
+        static const u64 loop_entry = Core::GuestHooks::OriginalEntry("InstanceLoop");
+        if (NativeZPassGen::HandleInst(holder, scene, loop_entry)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void SkinWritesAnnounce(u64 ring, u64 scene);
 u64 PS4_SYSV_ABI SkinWrites(u64 ring, u64 scene, u64 flag, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
     (void)a3, (void)a4, (void)a5, (void)ret, (void)caller_rsp;
@@ -8245,6 +8257,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "light_writes") {
         return reinterpret_cast<u64>(&LightWrites);
+    }
+    if (name == "instance_loop") {
+        return reinterpret_cast<u64>(&InstanceLoop);
     }
     if (name == "wet_sim") {
         return reinterpret_cast<u64>(&WetSim);

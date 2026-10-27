@@ -93,11 +93,13 @@ enum class CallId : u32 {
     PassWet,
     ScanWet,
     WetUpdate,
+    PassInst,
+    ScanInst,
     Count
 };
 constexpr const char* CallNames[static_cast<u32>(CallId::Count)] = {"FUN_01c92f30 resource set", "FUN_01ee4e50 instance group bind", "FUN_01c710f0 forward prologue", "FUN_01c822c0 variant find", "FUN_01c59060 handle lookup (G-buffer prologue)",
                                                                       "special entry virtual +0x48", "FUN_01e45a60 handle free", "draw issue (hook, tag, engine draw)", "FUN_01c92b60 material block (plain stores)",
-                                                                      "shader pair (2 x SetShader)", "generated depth pass (whole)", "generated G-buffer pass (whole)", "generated forward pass (whole)", "scan, depth", "scan, G-buffer", "scan, forward", "generated decal pass (whole)", "scan, decal", "decal constant buffer update (UpdateSubresource)", "generated skinning loop (whole)", "scan, skinning", "skinning constant buffer update (UpdateSubresource)", "generated wet loop (whole)", "scan, wet", "wet constant buffer update (UpdateSubresource)"};
+                                                                      "shader pair (2 x SetShader)", "generated depth pass (whole)", "generated G-buffer pass (whole)", "generated forward pass (whole)", "scan, depth", "scan, G-buffer", "scan, forward", "generated decal pass (whole)", "scan, decal", "decal constant buffer update (UpdateSubresource)", "generated skinning loop (whole)", "scan, skinning", "skinning constant buffer update (UpdateSubresource)", "generated wet loop (whole)", "scan, wet", "wet constant buffer update (UpdateSubresource)", "generated instancing loop (whole)", "scan, instancing"};
 struct CallCensus {
     std::atomic<u64> calls{0}, ticks{0};
 };
@@ -287,6 +289,8 @@ struct Mark {
     // B5: which wet block this dispatch consumed and what it is made from (the verify run builds it again when it compares): 1 step (system + 0x1c8, the frame time), 2 intersect, 3 force
     u32 wet_kind{0};
     u64 wet_system{0}, wet_object{0}, wet_water{0}, wet_block{0}, wet_context_global{0};
+    // the call site (ghidra return address) the generator gives the dispatch; the verify run compares it with the loop's own (0: not set)
+    u64 site{0};
 };
 
 /// Where the generator writes: the live device context, or a private copy of it that logs every write (the verify run).
@@ -1173,6 +1177,22 @@ u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, cons
         u32 offset;
     };
     std::map<u32, DirectWord> direct_words;
+    // a word is one thing at a time: a later write of another kind replaces what an earlier one left in the other lists (the order of the writes decides)
+    const auto forget_words = [&](u32 offset, u32 bytes) {
+        for (auto* words : {&slot_words, &table_words, &batch_words}) {
+            for (auto it = words->begin(); it != words->end();) {
+                it = (it->first + 8 > offset && it->first < offset + bytes) ? words->erase(it) : std::next(it);
+            }
+        }
+        for (auto it = direct_words.begin(); it != direct_words.end();) {
+            it = (it->first + 8 > offset && it->first < offset + bytes) ? direct_words.erase(it) : std::next(it);
+        }
+    };
+    const auto forget_bytes = [&](u32 offset, u32 bytes) {
+        for (u32 i = 0; i < bytes; ++i) {
+            v.expect[offset + i] = -1;
+        }
+    };
     size_t at = from;
     while (at < to) {
         u32 offset, size;
@@ -1193,18 +1213,24 @@ u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, cons
         if (const auto bowner = v.shadow.batch_owner_map.find(entry_at); bowner != v.shadow.batch_owner_map.end() && bytes == 8 && (offset == 0x580 || offset == 0x58 || offset == 0x288 || offset == 0x308)) {
             u64 value = 0;
             std::memcpy(&value, expected, 8);
+            forget_words(offset, 8);
+            forget_bytes(offset, 8);
             batch_words[offset] = {value, bowner->second};
             continue;
         }
         if (const auto downer = v.shadow.direct_owner.find(entry_at); downer != v.shadow.direct_owner.end() && bytes == 8) {
             u64 value = 0;
             std::memcpy(&value, expected, 8);
+            forget_words(offset, 8);
+            forget_bytes(offset, 8);
             direct_words[offset] = {value, downer->second.first, downer->second.second};
             continue;
         }
         if (const auto towner = v.shadow.table_owner.find(entry_at); towner != v.shadow.table_owner.end() && bytes == 8) {
             u64 value = 0;
             std::memcpy(&value, expected, 8);
+            forget_words(offset, 8);
+            forget_bytes(offset, 8);
             table_words[offset] = {value, towner->second};
             continue;
         }
@@ -1212,10 +1238,13 @@ u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, cons
         if (bytes == 8 && owner != v.shadow.slot_owner.end() && (offset == 0x290 || offset == 0x310 || offset == 0x298 || offset == 0x318)) {
             u64 value = 0;
             std::memcpy(&value, expected, 8);
+            forget_words(offset, 8);
+            forget_bytes(offset, 8);
             slot_words[offset] = {value, owner->second};
             continue;
         }
         const u64 material_owner = owner != v.shadow.slot_owner.end() ? owner->second : 0;
+        forget_words(offset, bytes);
         for (u32 i = 0; i < bytes; ++i) {
             if (v.expect[offset + i] < 0) {
                 touched.push_back(offset + i);
@@ -1225,6 +1254,8 @@ u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, cons
         }
     }
     std::sort(touched.begin(), touched.end());
+    touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+    touched.erase(std::remove_if(touched.begin(), touched.end(), [&](u32 b) { return v.expect[b] < 0; }), touched.end());
     for (size_t i = 0; i < touched.size();) {
         size_t j = i;
         while (j + 1 < touched.size() && touched[j + 1] == touched[j] + 1) {
@@ -4295,6 +4326,452 @@ WStats& WS() {
     return stats;
 }
 
+// ------------------------------------------------------------------------------------------------------------------------------- B4: GPU instancing (cull and sort)
+// FUN_01ee5130(H = the instance holder, F = the scene): the systems of the scene's instance list (F + 0x29e10) feed the GPU instancing path. Per frame: the holder's constant block, the
+// per system ring updates (a memcpy of the CPU copy into the next mapped buffer of a ring of two and UpdateSubresource of it), the systems' uploads (FUN_01c458b0), then the dispatches:
+// loop 1 (per system, shader index system + 0xa0), loop 2 (system + 0xa4, with the views and the shader cleared after it and the resource copies the flags 0x20000000 / 0x2000000 ask for),
+// and, when the scene's pass mask F[0] is not zero, the scene constant block (F + 0 .. 0x5af copied to H + 0x10 and sent), loop 3 (one dispatch of 9 x count groups per system,
+// device + 0x1368), the nine-pass loop 4 (a counter block H + 0x5d0 per pass and system, device + 0x1008 + system + 0xac), a wait and loop 5 (device + 0x1378). The context virtuals are
+// table writes (graphics context: shader + 0x4670, constant buffers + 0x500, shader resources + 0x1980, unordered access views + 0x2098), UpdateSubresource and the dispatches
+// (return addresses 0x1ee8a76, 0x1ee8ec4, 0x1ee94fc, 0x1ee95c5, 0x1ee9a35). First uses (the holder's objects, a system's render object and buffers, the rebuild flag) are the engine's.
+// Decompiled and annotated in documents/tlg/native plan/stages/b4-instance.md.
+constexpr u64 InstBegin = 0x01ee5130, InstEnd = 0x01ee9ac8;
+constexpr u64 InstSite1 = 0x01ee8a76, InstSite2 = 0x01ee8ec4, InstSite3 = 0x01ee94fc, InstSite4 = 0x01ee95c5, InstSite5 = 0x01ee9a35;
+
+struct InstPlan {
+    bool scanned{false};
+    bool no_work{false};
+    std::vector<const char*> reasons;
+    u64 holder{0}, scene{0}, device{0}, ctx{0};
+    bool Ok() const { return scanned && reasons.empty(); }
+    void Decline(const char* r) {
+        for (const char* x : reasons) {
+            if (x == r) {
+                return;
+            }
+        }
+        reasons.push_back(r);
+    }
+};
+
+struct InstScanArgs {
+    InstPlan* plan;
+};
+
+constexpr u32 InstSystemsMax = 4096;
+std::array<std::atomic<u64>, 5> inst_dispatches{}; // by loop: 1, 2, 3, 4, 5
+
+void ScanInst(InstScanArgs& a) {
+    InstPlan& p = *a.plan;
+    const u64 H = p.holder, F = p.scene;
+    p.scanned = true;
+    if (R<u64>(F + 0x29e10) == 0) {
+        p.no_work = true;
+        return;
+    }
+    p.device = R<u64>(Global(GlobalDevice));
+    p.ctx = p.device != 0 ? R<u64>(p.device + 0x2d8) : 0;
+    if (p.device == 0 || p.ctx == 0) {
+        p.Decline("no device context");
+        return;
+    }
+    const u64 object = R<u64>(H);
+    const u64 block = R<u64>(H + 8);
+    if (object == 0 || block == 0 || R<u64>(object + 0x38) == 0 || R<u64>(block + 0x10) == 0 || R<u64>(block) == 0) {
+        p.Decline("the instance holder is not set up yet (the loop creates its objects at first use)");
+        return;
+    }
+    u32 guard = 0;
+    for (u64 node = R<u64>(F + 0x29e10); node != 0; node = R<u64>(node), ++guard) {
+        if (guard > InstSystemsMax) {
+            p.Decline("the system list is not plausible");
+            return;
+        }
+        const u64 sys = R<u64>(node + 8);
+        if (sys == 0) {
+            p.Decline("a system without its object");
+            return;
+        }
+        const u32 flags = R<u32>(sys + 0x40);
+        const u64 rd = R<u64>(sys + 0x38);
+        if (static_cast<s32>(flags) < 0 || rd == 0 || (flags & 0x40000000u) != 0) {
+            p.Decline("a system's render object is not ready (the loop creates or rebuilds it)");
+            return;
+        }
+        if (R<u64>(rd + 0x28) == 0) {
+            p.Decline("a system's render object is not ready (the loop creates or rebuilds it)");
+            return;
+        }
+        if ((flags & 0x20000000u) != 0 && R<u64>(rd + 0x2a0) == 0) {
+            p.Decline("a resource copy target is not created yet (the loop creates it at first use)");
+            return;
+        }
+        if ((flags & 0x2000000u) != 0 && R<u64>(rd + 0x2a8) == 0) {
+            p.Decline("a resource copy target is not created yet (the loop creates it at first use)");
+            return;
+        }
+        const s32 count = R<s32>(R<u64>(rd + 0x28) + 0x48);
+        if (count != 0 && (R<u8>(sys + 0x43) & 1) == 0 && (R<u32>(sys + 0xa0) != 0 || R<u32>(sys + 0xa4) != 0)) {
+            // loops 1 and 2: the shapes the engine asserts on are declined (no views, too many views)
+            const u32 srvs = R<u32>(rd + 0xa8), uavs = R<u32>(rd + 0xc0);
+            if (srvs == 0 || srvs >= 0x80 || uavs == 0 || uavs > 8) {
+                p.Decline("a system with a view count the engine asserts on");
+                return;
+            }
+        }
+        if (count != 0 && R<u32>(F) != 0) {
+            // loop 4: the views of the nine passes
+            const s32 n = R<s32>(rd + 0x38);
+            const u64 current = R<u64>(R<u64>(rd + 0xb8) + u64{R<u32>(rd + 0x20)} * 8);
+            if (n < 0 || n >= 0x7f || R<u32>(rd + 0x50) + 2 > 8 || current == 0) {
+                p.Decline("a system with a view count the engine asserts on");
+                return;
+            }
+        }
+    }
+}
+
+void GenerateInst(Target& t, const InstPlan& p) {
+    const u64 H = p.holder, F = p.scene, D = p.device, ctx = p.ctx;
+    const bool live = t.live;
+    using Virtual = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64);
+    const auto vcall = [&](u32 slot, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) { return reinterpret_cast<Virtual>(R<u64>(R<u64>(ctx) + slot))(ctx, a1, a2, a3, a4, a5, 0); };
+    constexpr u32 ShaderWord = 0x4670, CbTable = 0x500, SrvTable = 0x1980, UavTable = 0x2098;
+    struct Src {
+        u64 value;
+        u64 owner;
+        u32 offset;
+    };
+    // a table entry with the engine word it was read from, so the verify run can tell a word the engine's other threads replaced between the two reads
+    const auto put = [&](u32 address, const Src& src) {
+        t.direct_object = src.owner;
+        t.direct_offset = src.offset;
+        t.Put(address, &src.value, 8);
+        t.direct_object = 0;
+    };
+    const auto set_shader = [&](u64 shader) { t.Set<u64>(ShaderWord, shader); };
+    u32 inst_kind = 0;
+    // the verify run does not toggle the systems' current buffer (the loop does, before its dispatches): the generator keeps its own copy of the value it would have left
+    std::unordered_map<u64, u32> current_buffer;
+    const auto current_of = [&](u64 rd) -> u32 {
+        const auto it = current_buffer.find(rd);
+        return it != current_buffer.end() ? it->second : R<u32>(rd + 0x20);
+    };
+    const auto dispatch = [&](u32 x, u32 y, u32 z, u64 site) {
+        inst_dispatches[site == InstSite1 ? 0 : site == InstSite2 ? 1 : site == InstSite3 ? 2 : site == InstSite4 ? 3 : 4].fetch_add(1, std::memory_order_relaxed);
+        if (live) {
+            Timed(CallId::DrawIssue, [&] { NativeDraw::IssueDispatch(ctx, x, y, z, false, site, false); });
+        } else {
+            t.marks.push_back({t.arena.size(), 3u, x, y, z, t.Get<u64>(ShaderWord), 0});
+            t.marks.back().blocks = std::move(t.blocks);
+            t.blocks.clear();
+            t.marks.back().site = site;
+        }
+        ++t.draws;
+        (void)inst_kind;
+    };
+    const auto wait = [&] {
+        if (live) {
+            vcall(0x78, 0, 0, 0, 0, 0);
+        }
+    };
+    // UpdateSubresource of a staged block: live, the bytes are in the engine's memory and the virtual copies from there; the verify run keeps (address, bytes) for the comparison at the next
+    // dispatch (a block staged again at the same address replaces the pending one)
+    const auto stage = [&](u64 resource, u64 source, const u8* bytes, u32 size) {
+        if (!live) {
+            const u32 n = std::min<u32>(R<u32>(resource + 0x180), size);
+            for (auto& [address, block] : t.blocks) {
+                if (address == source) {
+                    block.assign(bytes, bytes + n);
+                    return;
+                }
+            }
+            t.blocks.push_back({source, std::vector<u8>(bytes, bytes + n)});
+        }
+    };
+    const auto update_live = [&](u64 resource, u64 source) { vcall(0xd0, resource, 0, 0, source, 0); };
+    const auto upload_flush = [&](u64 rd, u64 object) {
+        if (live) {
+            reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u64, u64)>(Global(0x01c458b0))(rd, ctx, object, 0);
+        }
+    };
+    const auto nodes = [&](auto&& fn) {
+        for (u64 node = R<u64>(F + 0x29e10); node != 0; node = R<u64>(node)) {
+            fn(node, R<u64>(node + 8));
+        }
+    };
+
+    // ---- the holder's constant block and the first two table words
+    const u64 holder_object = R<u64>(H);
+    const u64 holder_block = R<u64>(H + 8);
+    const u64 holder_rd = R<u64>(holder_object + 0x38);
+    upload_flush(holder_rd, holder_object);
+    {
+        const u64 destination = R<u64>(holder_block + 0x10);
+        const u64 source = R<u64>(holder_block);
+        const u32 size = R<u32>(holder_block + 8);
+        if (live) {
+            update_live(destination, source);
+        } else {
+            std::vector<u8> bytes(size);
+            std::memcpy(bytes.data(), reinterpret_cast<const void*>(source), size);
+            stage(destination, source, bytes.data(), size);
+        }
+        put(CbTable, {destination, holder_block, 0x10});
+        put(SrvTable, {R<u64>(holder_rd + 0x28), holder_rd, 0x28});
+    }
+    // ---- the systems' ring updates and uploads
+    nodes([&](u64, u64 sys) {
+        const u64 rd = R<u64>(sys + 0x38);
+        if (R<s32>(R<u64>(rd + 0x28) + 0x48) == 0) {
+            return;
+        }
+        const u32 flags = R<u32>(sys + 0x40);
+        if ((flags & 0x1000000u) == 0) {
+            if (live) {
+                W<u8>(rd + 0x20, static_cast<u8>(R<u8>(rd + 0x20) ^ 1));
+            } else {
+                current_buffer[rd] = R<u32>(rd + 0x20) ^ 1u;
+            }
+        }
+        const u64 rings[3] = {R<u64>(rd + 0xd0), R<u64>(rd + 0x98), R<u64>(rd + 0x60)};
+        for (u32 i = 0; i < 3; ++i) {
+            const u64 A = rings[i];
+            if (A == 0 || (i > 0 && A == rings[0])) {
+                continue;
+            }
+            const s32 index = R<s32>(A + 0x28);
+            const u64 destination = R<u64>(A + 0x18 + static_cast<u64>(static_cast<s64>(index)) * 8);
+            const u64 source = R<u64>(A + 8);
+            const s32 size = R<s32>(A + 0x10);
+            const u64 block = R<u64>(A);
+            if (live) {
+                std::memcpy(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(source), static_cast<size_t>(static_cast<s64>(size)));
+                W<u64>(block, destination);
+                update_live(R<u64>(block + 0x10), destination);
+                W<u8>(A + 0x28, static_cast<u8>(R<u8>(A + 0x28) ^ 1));
+            } else {
+                std::vector<u8> bytes(static_cast<size_t>(size));
+                std::memcpy(bytes.data(), reinterpret_cast<const void*>(source), bytes.size());
+                stage(R<u64>(block + 0x10), destination, bytes.data(), static_cast<u32>(size));
+            }
+        }
+        for (const u32 array : {0xa0u, 0x68u, 0x30u}) {
+            const u32 count = R<u32>(rd + array + 8);
+            for (u32 k = 0; k < count; ++k) {
+                const u64 entry = R<u64>(R<u64>(rd + array) + u64{k} * 8);
+                if (entry != 0) {
+                    upload_flush(R<u64>(entry + 0x38), entry);
+                }
+            }
+        }
+    });
+    // ---- loops 1 and 2: per system, its views, its shader, one dispatch
+    const auto fill_views = [&](u64 sys, u64 rd, u32 shader_index, bool clear_after, u64 site) {
+        const u64 ring0 = R<u64>(rd + 0xd0);
+        const u64 cb1 = ring0 != 0 ? R<u64>(R<u64>(ring0) + 0x10) : 0;
+        const u32 n = R<u32>(rd + 0xa8);
+        std::array<Src, 128> srv{};
+        for (u32 i = 0; i < n; ++i) {
+            const u64 entry = R<u64>(R<u64>(rd + 0xa0) + u64{i} * 8);
+            srv[i] = {entry != 0 ? R<u64>(R<u64>(entry + 0x38) + 0x28) : 0, entry != 0 ? R<u64>(entry + 0x38) : 0, 0x28};
+        }
+        const u32 m = R<u32>(rd + 0xc0);
+        std::array<Src, 8> uav{};
+        for (u32 i = 0; i < m && i < 8; ++i) {
+            const u32 index = i < 2 ? (current_of(rd) ^ i) : i;
+            const u64 entry = R<u64>(R<u64>(rd + 0xb8) + u64{index} * 8);
+            uav[i] = {entry != 0 ? R<u64>(entry + 0x30) : 0, entry, 0x30};
+        }
+        put(CbTable + 8, {cb1, ring0 != 0 ? R<u64>(ring0) : 0, 0x10});
+        for (u32 i = 0; i < m && i < 8; ++i) {
+            put(UavTable + i * 8, uav[i]);
+        }
+        for (u32 i = 0; i < n; ++i) {
+            put(SrvTable + 8 + i * 8, srv[i]);
+        }
+        set_shader(R<u64>(D + 0x1008 + u64{shader_index} * 0x10));
+        const s32 count = R<s32>(R<u64>(rd + 0x28) + 0x48);
+        dispatch((static_cast<u32>(count) + 0x3fu) >> 6, 1, 1, site);
+        if (clear_after) {
+            const u64 zero = 0;
+            put(CbTable + 8, {0, 0, 0});
+            for (u32 i = 0; i < n; ++i) {
+                put(SrvTable + 8 + i * 8, {0, 0, 0});
+            }
+            for (u32 i = 0; i < m && i < 8; ++i) {
+                put(UavTable + i * 8, {0, 0, 0});
+            }
+            (void)zero;
+            set_shader(0);
+        }
+    };
+    nodes([&](u64, u64 sys) {
+        const u64 rd = R<u64>(sys + 0x38);
+        if ((R<u8>(sys + 0x43) & 1) != 0 || R<s32>(R<u64>(rd + 0x28) + 0x48) == 0 || R<u32>(sys + 0xa0) == 0) {
+            return;
+        }
+        fill_views(sys, rd, R<u32>(sys + 0xa0), false, InstSite1);
+        if ((R<u8>(sys + 0x42) & 0x80) != 0 && live) {
+            W<u32>(sys + 0xa0, 0);
+        }
+    });
+    nodes([&](u64, u64 sys) {
+        const u64 rd = R<u64>(sys + 0x38);
+        if ((R<u8>(sys + 0x43) & 1) != 0 || R<s32>(R<u64>(rd + 0x28) + 0x48) == 0 || R<u32>(sys + 0xa4) == 0) {
+            return;
+        }
+        fill_views(sys, rd, R<u32>(sys + 0xa4), true, InstSite2);
+        u32 flags = R<u32>(sys + 0x40);
+        if ((flags & 0x20000000u) != 0) {
+            if (live) {
+                W<u32>(sys + 0x40, flags & ~0x20000000u);
+                vcall(0x88, R<u64>(rd + 0x2a0), R<u64>(rd + 0x2b0), 0, 0, 0);
+                W<u32>(rd + 0x2d0, 1);
+            }
+            flags &= ~0x20000000u;
+        }
+        if ((flags & 0x2000000u) != 0 && live) {
+            W<u32>(sys + 0x40, flags & ~0x2000000u);
+            vcall(0x88, R<u64>(rd + 0x2a8), R<u64>(rd + 0x2b8), 0, 0, 0);
+            W<u32>(rd + 0x2d0, 1);
+        }
+    });
+    // ---- the scene's pass mask: the scene block and loops 3 to 5
+    const u32 mask = R<u32>(F);
+    if (mask != 0) {
+        {
+            const u64 destination = R<u64>(H + 0x5c0);
+            if (live) {
+                std::memcpy(reinterpret_cast<void*>(H + 0x10), reinterpret_cast<const void*>(F), 0x5b0);
+                update_live(destination, H + 0x10);
+            } else {
+                stage(destination, H + 0x10, reinterpret_cast<const u8*>(F), 0x5b0);
+            }
+            put(CbTable + 0x20, {destination, H, 0x5c0});
+            put(CbTable + 0x28, {R<u64>(H + 0x5f0), H, 0x5f0});
+        }
+        nodes([&](u64, u64 sys) {
+            if (sys == 0) {
+                return;
+            }
+            const u64 rd = R<u64>(sys + 0x38);
+            if (rd == 0 || R<s32>(R<u64>(rd + 0x28) + 0x48) == 0) {
+                return;
+            }
+            set_shader(R<u64>(D + 0x1368));
+            put(UavTable, {R<u64>(rd + 0x118), rd, 0x118});
+            dispatch(9, R<u32>(rd + 0x298), 1, InstSite3);
+        });
+        wait();
+        for (u32 k = 0; k < 9; ++k) {
+            if (((mask >> (k & 0x1f)) & 1) == 0) {
+                continue;
+            }
+            nodes([&](u64, u64 sys) {
+                if (sys == 0) {
+                    return;
+                }
+                const u64 rd = R<u64>(sys + 0x38);
+                if (rd == 0) {
+                    return;
+                }
+                const s32 count = R<s32>(R<u64>(rd + 0x28) + 0x48);
+                if (count == 0) {
+                    return;
+                }
+                // the counter block: H + 0x5d4 = count - 1, H + 0x5d8 = the pass
+                const u64 destination = R<u64>(H + 0x5f0);
+                const u32 width = std::min<u32>(R<u32>(destination + 0x180), 0x20);
+                std::array<u8, 0x20> block{};
+                std::memcpy(block.data(), reinterpret_cast<const void*>(H + 0x5d0), 0x20);
+                const u32 counter = static_cast<u32>(count - 1);
+                std::memcpy(block.data() + 4, &counter, 4);
+                std::memcpy(block.data() + 8, &k, 4);
+                if (live) {
+                    W<u32>(H + 0x5d4, counter);
+                    W<u32>(H + 0x5d8, k);
+                    update_live(destination, H + 0x5d0);
+                } else {
+                    stage(destination, H + 0x5d0, block.data(), width);
+                }
+                // views: shader resource 0 is the object's current buffer, then its list; unordered access 0 / 1 / then its list
+                const u32 current = current_of(rd);
+                const u64 first = R<u64>(R<u64>(rd + 0xb8) + u64{current} * 8);
+                put(SrvTable, {R<u64>(first + 0x28), first, 0x28});
+                const s32 n = R<s32>(rd + 0x38);
+                for (s32 i = 0; i < n; ++i) {
+                    const u64 entry = R<u64>(R<u64>(rd + 0x30) + u64{static_cast<u32>(i)} * 8);
+                    put(SrvTable + 8 + static_cast<u32>(i) * 8, {entry != 0 ? R<u64>(R<u64>(entry + 0x38) + 0x28) : 0, entry != 0 ? R<u64>(entry + 0x38) : 0, 0x28});
+                }
+                put(UavTable, {R<u64>(rd + 0x118), rd, 0x118});
+                put(UavTable + 8, {R<u64>(rd + 0x168 + u64{k} * 8), rd, 0x168 + k * 8});
+                const u32 extra = R<u32>(rd + 0x50);
+                for (u32 i = 0; i < extra; ++i) {
+                    const u32 index = i < 2 ? (current ^ i) : i;
+                    const u64 entry = R<u64>(R<u64>(rd + 0x48) + u64{index} * 8);
+                    put(UavTable + (i + 2) * 8, {entry != 0 ? R<u64>(entry + 0x30) : 0, entry, 0x30});
+                }
+                if (const u64 ring = R<u64>(rd + 0x60); ring != 0) {
+                    put(CbTable + 0x30, {R<u64>(R<u64>(ring) + 0x10), R<u64>(ring), 0x10});
+                }
+                u32 shader_index = R<u32>(sys + 0xac);
+                if (shader_index == 0) {
+                    shader_index = 0x33;
+                }
+                set_shader(R<u64>(D + 0x1008 + u64{shader_index} * 0x10));
+                dispatch(1, 1, 1, InstSite4);
+            });
+        }
+        wait();
+        nodes([&](u64, u64 sys) {
+            if (sys == 0) {
+                return;
+            }
+            const u64 rd = R<u64>(sys + 0x38);
+            if (rd == 0 || R<s32>(R<u64>(rd + 0x28) + 0x48) == 0 || R<u32>(rd + 0x298) <= 1) {
+                return;
+            }
+            set_shader(R<u64>(D + 0x1378));
+            put(UavTable, {R<u64>(rd + 0x118), rd, 0x118});
+            dispatch(9, R<u32>(rd + 0x298) - 1, 1, InstSite5);
+        });
+        put(SrvTable, {0, 0, 0});
+        put(UavTable, {0, 0, 0});
+        put(UavTable + 8, {0, 0, 0});
+    }
+    put(CbTable, {0, 0, 0});
+    put(SrvTable, {0, 0, 0});
+}
+
+struct IConfig {
+    bool on{false};
+    u32 verify_every{32};
+};
+const IConfig& ICfg() {
+    static const IConfig config = [] {
+        IConfig c;
+        const char* e = std::getenv("TLG_INST_GEN");
+        c.on = e != nullptr && *e != 0 && *e != '0';
+        if (const char* n = std::getenv("TLG_INST_GEN_VERIFY"); n != nullptr && *n != 0) {
+            c.verify_every = static_cast<u32>(std::atoi(n));
+        }
+        return c;
+    }();
+    return config;
+}
+
+struct IStats {
+    ViewStats v;
+    u64 eligible{0};
+    u64 loops_without_work{0};
+};
+IStats& IS() {
+    static IStats stats;
+    return stats;
+}
+
+
 
 
 } // namespace
@@ -4330,6 +4807,10 @@ void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3) {
         ++v.mismatches;
         NoteMismatch(s, v.view, "context", fmt::format("draw {}: another device context", k));
         return;
+    }
+    if ((kind == 3 || kind == 4) && mark.site != 0 && mark.site != caller) {
+        ++v.mismatches;
+        NoteMismatch(s, v.view, "dispatch site", fmt::format("dispatch {}: the loop's call site {:#x}, the generator's {:#x}", k, caller, mark.site));
     }
     if (kind == 3 || kind == 4) {
         // B3: a dispatch: the compute shader of the context and the constant blocks the loop updated its buffers from
@@ -5175,7 +5656,11 @@ bool HandleWet(u64 system, u64 ctx, u64 scene, u64 original_loop) {
         run_loop();
         v.active.store(false);
         std::scoped_lock lock{s.mutex};
-        if (v.cursor < v.shadow.marks.size()) {
+        // the loop's own first test (system enabled, frame time at least 1e-5) can flip between the scan and the loop: then the loop did nothing and there is nothing to compare
+        const bool loop_ran = R<s32>(system + 0x68) != 0 && 1e-5f <= R<float>(plan.context_global + 0x19c);
+        if (!loop_ran) {
+            ++v.raced;
+        } else if (v.cursor < v.shadow.marks.size()) {
             ++v.mismatches;
             NoteMismatch(s, v.view, "missing draw", fmt::format("the generator has {} dispatches, the loop issued {}", v.shadow.marks.size(), v.cursor));
         } else {
@@ -5199,6 +5684,115 @@ bool HandleWet(u64 system, u64 ctx, u64 scene, u64 original_loop) {
         run_loop();
         std::scoped_lock lock{s.mutex};
         ++ws.v.loop_passes;
+    }
+    return true;
+}
+
+bool InstEnabled() {
+    return ICfg().on;
+}
+
+bool HandleInst(u64 holder, u64 scene, u64 original_loop) {
+    const IConfig& cfg = ICfg();
+    if (!cfg.on || original_loop == 0) {
+        return false;
+    }
+    using Loop = void(PS4_SYSV_ABI*)(u64, u64);
+    State& s = S();
+    IStats& is = IS();
+    InstPlan plan;
+    plan.holder = holder;
+    plan.scene = scene;
+    const auto run_loop = [&] { reinterpret_cast<Loop>(original_loop)(holder, scene); };
+    InstScanArgs scan_args{&plan};
+    {
+        std::scoped_lock lock{s.mutex};
+        if (is.v.disabled) {
+            plan.scanned = true;
+            plan.Decline("generator switched off by a verify difference");
+        } else if (!Timed(CallId::ScanInst, [&] { return NativeDraw::GuardedCall([](void* p) { ScanInst(*static_cast<InstScanArgs*>(p)); }, &scan_args); })) {
+            ++is.v.not_scanned;
+            plan.scanned = false;
+            plan.Decline("scan faulted");
+        }
+        if (plan.no_work) {
+            ++is.loops_without_work;
+        } else {
+            ++is.v.passes;
+            if (!plan.Ok()) {
+                for (const char* r : plan.reasons) {
+                    ++is.v.declines[r];
+                }
+            }
+        }
+    }
+    if (plan.no_work) {
+        run_loop();
+        return true;
+    }
+    bool verify_pass = false;
+    if (plan.Ok()) {
+        std::scoped_lock lock{s.mutex};
+        ++is.eligible;
+        verify_pass = cfg.verify_every != 0 && is.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().claimed.exchange(true);
+    }
+    if (plan.Ok() && !verify_pass) {
+        Target live;
+        live.live = true;
+        live.base = reinterpret_cast<u8*>(plan.ctx);
+        Timed(CallId::PassInst, [&] { GenerateInst(live, plan); });
+        std::scoped_lock lock{s.mutex};
+        ++is.v.generated;
+        is.v.generated_draws += live.draws;
+        return true;
+    }
+    Verify& v = V();
+    if (verify_pass) {
+        v.shadow = Target{};
+        v.shadow.live = false;
+        std::vector<u8> copy(CtxBytes);
+        std::memcpy(copy.data(), reinterpret_cast<const void*>(plan.ctx), CtxBytes);
+        v.shadow.base = copy.data();
+        GenerateInst(v.shadow, plan);
+        v.cursor = 0;
+        v.arena_pos = 0;
+        v.view = 204;
+        v.lo = InstBegin;
+        v.hi = InstEnd;
+        v.ctx = plan.ctx;
+        v.rd = plan.device;
+        v.compared_draws = 0;
+        v.mismatches = 0;
+        v.raced = 0;
+        v.thread = std::this_thread::get_id();
+        v.active.store(true);
+        run_loop();
+        v.active.store(false);
+        std::scoped_lock lock{s.mutex};
+        if (v.cursor < v.shadow.marks.size()) {
+            ++v.mismatches;
+            NoteMismatch(s, v.view, "missing draw", fmt::format("the generator has {} dispatches, the loop issued {}", v.shadow.marks.size(), v.cursor));
+        } else {
+            v.mismatches += CompareDelta(s, v, v.arena_pos, v.shadow.arena.size(), plan.ctx, "epilogue");
+        }
+        ++is.v.verify_passes;
+        is.v.verify_draws += v.compared_draws;
+        is.v.verify_raced += v.raced;
+        if (v.mismatches == 0) {
+            ++is.v.verify_clean;
+        } else {
+            ++is.v.verify_mismatched;
+            is.v.disabled = true;
+            LOG_ERROR(Render, "instance generator switched off, {} differences against the engine's loop", v.mismatches);
+        }
+        v.shadow = Target{};
+        v.lo = ZPassBegin;
+        v.hi = ZPassEnd;
+        v.claimed.store(false);
+    } else {
+        run_loop();
+        std::scoped_lock lock{s.mutex};
+        ++is.v.loop_passes;
     }
     return true;
 }
@@ -5359,6 +5953,28 @@ nlohmann::json Report() {
         }
         wt["declined_passes_by_reason"] = wdeclines;
         out["wet"] = wt;
+        const ViewStats& ij = IS().v;
+        nlohmann::json inst = {{"enabled", ICfg().on},
+                               {"passes", ij.passes},
+                               {"loops_without_work", IS().loops_without_work},
+                               {"generated_passes_without_the_loop", ij.generated},
+                               {"generated_dispatches", ij.generated_draws},
+                               {"passes_run_by_the_loop", ij.loop_passes},
+                               {"verify_passes", ij.verify_passes},
+                               {"verify_clean", ij.verify_clean},
+                               {"verify_with_differences", ij.verify_mismatched},
+                               {"verify_dispatches_compared", ij.verify_draws},
+                               {"verify_draws_compared", ij.verify_draws},
+                               {"verify_words_that_moved", ij.verify_raced},
+                               {"switched_off_by_verify", ij.disabled},
+                               {"scan_faults", ij.not_scanned},
+                               {"dispatches_by_loop", {{"loop1", inst_dispatches[0].load()}, {"loop2", inst_dispatches[1].load()}, {"loop3_counts", inst_dispatches[2].load()}, {"loop4_nine_passes", inst_dispatches[3].load()}, {"loop5", inst_dispatches[4].load()}}}};
+        nlohmann::json ideclines = nlohmann::json::object();
+        for (const auto& [reason, count] : ij.declines) {
+            ideclines[reason] = count;
+        }
+        inst["declined_passes_by_reason"] = ideclines;
+        out["instancing"] = inst;
     }
     if (CensusOn()) {
         LARGE_INTEGER frequency;

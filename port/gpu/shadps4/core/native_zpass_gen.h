@@ -40,6 +40,8 @@ bool HandleDecal(u64 render_device, u64 view, u64 a3, u64 a4, u64 desc, u32 flag
 bool HandleSkin(u64 system, u64 scene, u64 async_flag, u64 original_loop);
 [[nodiscard]] bool WetEnabled();
 bool HandleWet(u64 system, u64 ctx, u64 scene, u64 original_loop);
+[[nodiscard]] bool InstEnabled();
+bool HandleInst(u64 holder, u64 scene, u64 original_loop);
 
 nlohmann::json Report();
 
