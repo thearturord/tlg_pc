@@ -48,6 +48,18 @@
 // the CPU wrote while the emulator tracked them (any hooks file turns this on).
 namespace Core::GuestHooks {
 
+/// Mode "mid": a hook inside a function (at an instruction boundary where the next 5 or more bytes are plain instructions: no branch, call or relative operand). The handler
+/// `u64 PS4_SYSV_ABI handler(MidContext*)` sees every register of the interrupted code and may change them (not `rsp`: the stack contents can be changed through it). It returns 0
+/// to let the code go on (the displaced instructions run), or an address (a runtime address) where the code continues instead, with the registers as the handler left them: the
+/// way a generator replaces an inline loop. The 128 byte red zone below `rsp` is left alone. `u8 ymm[i][32]`: the 16 vector registers (the upper half of a ymm register is part of it).
+struct MidContext {
+    u8 ymm[16][32];
+    u64 rip;  ///< the address of the hook
+    u64 rsp;  ///< the stack pointer of the interrupted code (read only)
+    u64 r15, r14, r13, r12, r11, r10, r9, r8, rdi, rsi, rbp, rbx, rdx, rcx, rax;
+    u64 rflags;
+};
+
 /// Installs the hooks listed in the configuration file into the eboot loaded at `base`.
 /// Must run before the guest starts executing.
 void InstallForEboot(VAddr base, u64 image_size);

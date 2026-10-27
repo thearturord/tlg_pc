@@ -43,7 +43,7 @@ constexpr u64 RingEntrySize = 64;
 constexpr size_t MinDisplacedBytes = 5; // size of a near jump
 constexpr size_t MaxDisplacedBytes = 15;
 
-enum class Mode { Count, Args, Snap, Call };
+enum class Mode { Count, Args, Snap, Call, Mid };
 
 struct Deref {
     u32 reg{};  // index into rdi, rsi, rdx, rcx, r8, r9
@@ -274,6 +274,84 @@ void EmitCallStub(Xbyak::CodeGenerator& c, Hook& hook, const u8* original, size_
     c.jmp(resume, Xbyak::CodeGenerator::T_NEAR);
 }
 
+/// Mode Mid (see MidContext). The stub keeps the interrupted code's registers in a MidContext on its stack: 128 bytes of red zone are skipped, a slot for the continue address,
+/// flags and the fifteen registers, rip and rsp, the sixteen ymm registers; the handler is called with the stack aligned and a pointer to the context in rdi.
+void EmitMidStub(Xbyak::CodeGenerator& c, Hook& hook, const u8* original, size_t displaced, const u8* resume) {
+    constexpr int YmmBytes = 16 * 32;
+    constexpr int Fields = 16;       // rip, rsp
+    constexpr int RegsAndFlags = 128; // fifteen registers and the flags
+    constexpr int Slot = 8;
+    constexpr int RedZone = 128;
+    constexpr int ContinueSlotInContext = YmmBytes + Fields + RegsAndFlags; // the slot below the interrupted rsp's red zone, from the context
+    Xbyak::Label take;
+    const auto save = [&] {
+        c.lea(rsp, ptr[rsp - (RedZone + Slot)]);
+        c.pushfq();
+        c.push(rax);
+        c.push(rcx);
+        c.push(rdx);
+        c.push(rbx);
+        c.push(rbp);
+        c.push(rsi);
+        c.push(rdi);
+        c.push(r8);
+        c.push(r9);
+        c.push(r10);
+        c.push(r11);
+        c.push(r12);
+        c.push(r13);
+        c.push(r14);
+        c.push(r15);
+        c.sub(rsp, Fields + YmmBytes);
+        for (int i = 0; i < 16; ++i) {
+            c.vmovups(ptr[rsp + 32 * i], Xbyak::Ymm(i));
+        }
+        c.mov(rax, reinterpret_cast<u64>(hook.entry));
+        c.mov(ptr[rsp + YmmBytes], rax);
+        c.lea(rax, ptr[rsp + (YmmBytes + Fields + RegsAndFlags + Slot + RedZone)]);
+        c.mov(ptr[rsp + YmmBytes + 8], rax);
+    };
+    const auto restore = [&] {
+        for (int i = 0; i < 16; ++i) {
+            c.vmovups(Xbyak::Ymm(i), ptr[rsp + 32 * i]);
+        }
+        c.add(rsp, Fields + YmmBytes);
+        c.pop(r15);
+        c.pop(r14);
+        c.pop(r13);
+        c.pop(r12);
+        c.pop(r11);
+        c.pop(r10);
+        c.pop(r9);
+        c.pop(r8);
+        c.pop(rdi);
+        c.pop(rsi);
+        c.pop(rbp);
+        c.pop(rbx);
+        c.pop(rdx);
+        c.pop(rcx);
+        c.pop(rax);
+        c.popfq();
+    };
+    save();
+    c.mov(r12, rsp); // the context; r12 is callee saved
+    c.mov(rdi, rsp);
+    c.and_(rsp, -16);
+    c.mov(rax, hook.handler);
+    c.call(rax);
+    c.mov(rsp, r12);
+    c.test(rax, rax);
+    c.jnz(take, Xbyak::CodeGenerator::T_NEAR);
+    restore();
+    c.add(rsp, RedZone + Slot);
+    c.db(original, displaced);
+    c.jmp(resume, Xbyak::CodeGenerator::T_NEAR);
+    c.L(take);
+    c.mov(ptr[rsp + ContinueSlotInContext], rax);
+    restore();
+    c.ret(RedZone);
+}
+
 bool InstallHook(Hook& hook, u8* image_base, u64 image_size) {
     if (hook.offset + 16 > image_size) {
         LOG_ERROR(Core, "guest hook '{}': offset {:#x} is outside the image", hook.name, hook.offset);
@@ -303,6 +381,11 @@ bool InstallHook(Hook& hook, u8* image_base, u64 image_size) {
         stub = c.getCurr<const u8*>();
         if (hook.mode == Mode::Call) {
             EmitCallStub(c, hook, original, displaced, entry + displaced);
+            return true;
+        }
+        if (hook.mode == Mode::Mid) {
+            hook.entry = entry;
+            EmitMidStub(c, hook, original, displaced, entry + displaced);
             return true;
         }
         if (hook.mode != Mode::Count) {
@@ -336,6 +419,7 @@ bool InstallHook(Hook& hook, u8* image_base, u64 image_size) {
     hook.entry = entry;
     LOG_INFO(Core, "guest hook '{}' installed at {:#x} ({} bytes displaced, mode {})", hook.name,
              reinterpret_cast<u64>(entry), displaced, hook.mode == Mode::Call   ? "call"
+                 : hook.mode == Mode::Mid  ? "mid"
                  : hook.mode == Mode::Snap ? "snap"
                  : hook.mode == Mode::Args ? "args"
                                            : "count");
@@ -565,11 +649,12 @@ void InstallForEboot(VAddr base, u64 image_size) {
             {
                 const auto mode_name = item.value("mode", std::string("count"));
                 hook->mode = mode_name == "call"   ? Mode::Call
+                             : mode_name == "mid"  ? Mode::Mid
                              : mode_name == "snap" ? Mode::Snap
                              : mode_name == "args" ? Mode::Args
                                                    : Mode::Count;
             }
-            if (hook->mode == Mode::Call) {
+            if (hook->mode == Mode::Call || hook->mode == Mode::Mid) {
                 hook->handler = NativeDraw::FindHandler(item.value("handler", std::string()));
                 if (hook->handler == 0) {
                     LOG_ERROR(Core, "guest hook '{}': unknown handler '{}'", hook->name,

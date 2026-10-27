@@ -7979,6 +7979,67 @@ u64 PS4_SYSV_ABI GpuAlloc(u64 device, u64 size, u64 alignment, u64 type, u64 a4,
     return (1ull << 63) | result; // skip the guest function (it ran), return its result
 }
 
+/// B7 probe: a mid function hook (mode "mid") at `0x01c606f0` inside `RenderScene`, the first instruction of the body of the loop over the scene's small async jobs (list at [rdi],
+/// 24 byte entries addressed by r14d: object pointer, a state / count dword, ...). It changes nothing and returns 0; it only counts the visits per frame and keeps the first
+/// entries it sees, to check that the site is the loop body (about 116 visits per frame) before a generator replaces the loop.
+u64 PS4_SYSV_ABI MidProbeB7(Core::GuestHooks::MidContext* ctx) {
+    static std::atomic<u64> hits{0}, frame_hits{0}, last_frame{~0ull}, max_per_frame{0}, frames_seen{0};
+    static std::atomic<u32> min_index{~0u}, max_index{0};
+    static std::mutex samples_mutex;
+    static std::vector<nlohmann::json> samples;
+    const u64 frame = Core::DebugServer::PresentCount();
+    const u64 previous = last_frame.exchange(frame);
+    if (previous != frame) {
+        const u64 count = frame_hits.exchange(0);
+        if (previous != ~0ull) {
+            frames_seen.fetch_add(1, std::memory_order_relaxed);
+            u64 max = max_per_frame.load(std::memory_order_relaxed);
+            while (count > max && !max_per_frame.compare_exchange_weak(max, count)) {
+            }
+            nlohmann::json out;
+            out["visits_total"] = hits.load();
+            out["visits_in_the_last_frame"] = count;
+            out["most_visits_in_a_frame"] = max_per_frame.load();
+            out["frames_seen"] = frames_seen.load();
+            out["entry_index_range"] = {min_index.load(), max_index.load()};
+            {
+                std::scoped_lock lock{samples_mutex};
+                out["first_entries"] = samples;
+            }
+            Core::DebugServer::Publish("b7_probe", std::move(out));
+        }
+    }
+    ++frame_hits;
+    ++hits;
+    const u32 index = static_cast<u32>(ctx->r14);
+    u32 low = min_index.load(std::memory_order_relaxed);
+    while (index < low && !min_index.compare_exchange_weak(low, index)) {
+    }
+    u32 high = max_index.load(std::memory_order_relaxed);
+    while (index > high && !max_index.compare_exchange_weak(high, index)) {
+    }
+    if (hits.load(std::memory_order_relaxed) <= 24) {
+        nlohmann::json sample;
+        Guarded([&]() -> u64 {
+            const u64 list = Rd<u64>(ctx->rdi, 0);
+            const u64 entry = list + static_cast<u64>(static_cast<s64>(static_cast<s32>(index))) * 24;
+            sample["index"] = index;
+            sample["entry"] = fmt::format("{:#x}", entry);
+            sample["object"] = fmt::format("{:#x}", Rd<u64>(entry, 0));
+            sample["state_dword"] = Rd<u32>(entry, 8);
+            sample["dword_c"] = Rd<u32>(entry, 12);
+            sample["rsp"] = fmt::format("{:#x}", ctx->rsp);
+            sample["rbx"] = fmt::format("{:#x}", ctx->rbx);
+            sample["r13"] = fmt::format("{:#x}", ctx->r13);
+            sample["r15"] = fmt::format("{:#x}", ctx->r15);
+            return 0;
+        });
+        std::scoped_lock lock{samples_mutex};
+        samples.push_back(std::move(sample));
+    }
+    return 0;
+}
+
 void FlushSceneSlotAnnouncements() {
     const u64 frame = scene_slot_frame.load(std::memory_order_relaxed);
     if (frame != 0 && Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
@@ -8215,6 +8276,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "shader_cache_load_1") {
         return reinterpret_cast<u64>(&ShaderCacheLoad<1>);
+    }
+    if (name == "mid_probe_b7") {
+        return reinterpret_cast<u64>(&MidProbeB7);
     }
     if (name == "alloc_garlic_memory") {
         return reinterpret_cast<u64>(&GpuAlloc<0>);
