@@ -90,11 +90,14 @@ enum class CallId : u32 {
     PassSkin,
     ScanSkin,
     SkinUpdate,
+    PassWet,
+    ScanWet,
+    WetUpdate,
     Count
 };
 constexpr const char* CallNames[static_cast<u32>(CallId::Count)] = {"FUN_01c92f30 resource set", "FUN_01ee4e50 instance group bind", "FUN_01c710f0 forward prologue", "FUN_01c822c0 variant find", "FUN_01c59060 handle lookup (G-buffer prologue)",
                                                                       "special entry virtual +0x48", "FUN_01e45a60 handle free", "draw issue (hook, tag, engine draw)", "FUN_01c92b60 material block (plain stores)",
-                                                                      "shader pair (2 x SetShader)", "generated depth pass (whole)", "generated G-buffer pass (whole)", "generated forward pass (whole)", "scan, depth", "scan, G-buffer", "scan, forward", "generated decal pass (whole)", "scan, decal", "decal constant buffer update (UpdateSubresource)", "generated skinning loop (whole)", "scan, skinning", "skinning constant buffer update (UpdateSubresource)"};
+                                                                      "shader pair (2 x SetShader)", "generated depth pass (whole)", "generated G-buffer pass (whole)", "generated forward pass (whole)", "scan, depth", "scan, G-buffer", "scan, forward", "generated decal pass (whole)", "scan, decal", "decal constant buffer update (UpdateSubresource)", "generated skinning loop (whole)", "scan, skinning", "skinning constant buffer update (UpdateSubresource)", "generated wet loop (whole)", "scan, wet", "wet constant buffer update (UpdateSubresource)"};
 struct CallCensus {
     std::atomic<u64> calls{0}, ticks{0};
 };
@@ -277,6 +280,13 @@ struct Mark {
     std::vector<std::pair<u64, std::vector<u8>>> blocks;
     // B3: dword 3 of the block at flag_block is a flag computed from the float at flag_source, which the engine's main thread changes: the verify run re-reads it
     u64 flag_source{0}, flag_block{0};
+    // B5: the block of a wet force dispatch (system + 0x130): its colour lanes (bytes 0x40 .. 0x4f) come from system + 0x254 .. 0x258, which the game's thread writes
+    u64 color_block{0};
+    // B5: the block of a wet time step (system + 0x80): its second dword is the frame time (context global + 0x19c), which the main thread updates
+    u64 time_block{0}, time_source{0};
+    // B5: which wet block this dispatch consumed and what it is made from (the verify run builds it again when it compares): 1 step (system + 0x1c8, the frame time), 2 intersect, 3 force
+    u32 wet_kind{0};
+    u64 wet_system{0}, wet_object{0}, wet_water{0}, wet_block{0}, wet_context_global{0};
 };
 
 /// Where the generator writes: the live device context, or a private copy of it that logs every write (the verify run).
@@ -2707,8 +2717,10 @@ void GenerateDecal(Target& t, const DPlan& plan) {
     t.Set<u64>(0x68, 0);
     const u64 object_list = R<u64>(R<u64>(Global(GlobalContext)) + 0x38);
     HandleLookup(rd, R<u64>(object_list + 0x50)); // the loop calls it for its side effect (the render data of the default object)
+    u64 last_view_data = 0; // the render data the last view_of call read its view from (a word the engine's other threads can replace: tagged for the verify compare)
     const auto view_of = [&](u64 object) -> u64 {
         const u64 data = HandleLookup(rd, object);
+        last_view_data = data;
         return data != 0 ? R<u64>(data + 0x48) : 0;
     };
     const u64 desc_targets = R<u64>(desc + 0x448);
@@ -2798,18 +2810,22 @@ void GenerateDecal(Target& t, const DPlan& plan) {
             const u64 p = step.index;
             const u64 image_object = R<u64>(R<u64>(d + 0x1e8) + p * 8);
             const u64 view_0 = view_of(image_object);
+            const u64 data_0 = last_view_data;
             const u64 view_1 = view_of(R<u64>(R<u64>(d + 0x230) + p * 8));
+            const u64 data_1 = last_view_data;
             const u64 view_2 = view_of(R<u64>(R<u64>(d + 0x248) + p * 8));
+            const u64 data_2 = last_view_data;
             if (view_0 == 0) {
                 continue;
             }
-            u64 view_d = view_0;
+            u64 view_d = view_0, data_d = data_0;
             if (R<u32>(d + 0x2b8) >= 2) {
                 const u64 object = R<u64>(R<u64>(d + 0x200) + p * 8);
                 if (object == 0) {
                     continue;
                 }
                 view_d = view_of(object);
+                data_d = last_view_data;
             }
             const u64 data_e = HandleLookup(rd, R<u64>(R<u64>(d + 0x218) + p * 8));
             if (data_e == 0) {
@@ -2901,14 +2917,18 @@ void GenerateDecal(Target& t, const DPlan& plan) {
                 t.stages.push_back(shadow_stage);
                 t.stage_pending = static_cast<s32>(t.stages.size()) - 1;
             }
+            t.direct_offset = 0x48;
+            t.direct_object = data_0;
             t.Set<u64>(0xa38, view_0);
+            t.direct_object = data_d;
             t.Set<u64>(0xa40, view_d);
             t.direct_object = data_e;
-            t.direct_offset = 0x48;
             t.Set<u64>(0xa48, view_e);
-            t.direct_object = 0;
+            t.direct_object = data_1;
             t.Set<u64>(0xa50, view_1);
+            t.direct_object = data_2;
             t.Set<u64>(0xa58, view_2);
+            t.direct_object = 0;
             t.Set<u64>(0x58, 0);
             t.Set<u64>(0x60, 0x39);
             if (t.Get<u32>(0x4480) != 5) {
@@ -3626,6 +3646,648 @@ SStats& SS() {
     return stats;
 }
 
+// ------------------------------------------------------------------------------------------------------------------------------- B5: the wet simulation
+// FUN_0199bf00(wet system W, device context C, scene F), a virtual of the wet system called once per frame per context (graphics or async compute): the wetness of the characters and
+// objects in three phases (CS_WetElapse: the time step; CS_WetIntersect: every wet object's box against the system's boxes; CS_WetForce: the water modifier's force) and, when the
+// CPU asked for it (system + 0x1b8 bit 2), the readback of the result (CopyResource into a staging resource, Map, memcpy, Unmap). Like the skinning loop it talks to the context through
+// virtuals that are table writes (SetConstantBuffers + 0x28, SetShader + 0x38, SetShaderResources + 0x40, SetUnorderedAccessViews + 0x48), UpdateSubresource (+ 0xd0) of its own constant
+// blocks and the dispatches (+ 0x58, return addresses 0x199c529, 0x199d14b, 0x199d728); what is not a table write (a PM4 packet through + 0xb8, the wait + 0x78, CopyResource / Map /
+// Unmap + 0x88 / 0x90 / 0xc8) is called through the same virtuals in the live run. Its locks (the system's at + 0x70, the job lists' at + 0x1b4, a ticket at + 0x250) are taken only in the
+// live run. Decompiled and annotated in documents/tlg/native plan/stages/b5-wet.md.
+constexpr u64 WetBegin = 0x0199bf00, WetEnd = 0x0199dba5;
+constexpr u64 WetSiteElapse = 0x0199c529, WetSiteIntersect = 0x0199d14b, WetSiteForce = 0x0199d728;
+
+struct WetPlan {
+    bool scanned{false};
+    bool no_work{false};
+    bool async{false};
+    std::vector<const char*> reasons;
+    u64 system{0}, ctx{0}, scene{0}, device{0}, context_global{0};
+    bool Ok() const { return scanned && reasons.empty(); }
+    void Decline(const char* r) {
+        for (const char* x : reasons) {
+            if (x == r) {
+                return;
+            }
+        }
+        reasons.push_back(r);
+    }
+};
+
+struct WetScanArgs {
+    WetPlan* plan;
+};
+
+constexpr u32 WetSystemsMax = 64, WetJobsMax = 4096;
+
+void ScanWet(WetScanArgs& a) {
+    WetPlan& p = *a.plan;
+    const u64 Wsys = p.system;
+    p.scanned = true;
+    p.device = R<u64>(Global(GlobalDevice));
+    p.context_global = R<u64>(Global(GlobalContext));
+    if (R<s32>(Wsys + 0x68) == 0 || !(1e-5f <= R<float>(p.context_global + 0x19c))) {
+        p.no_work = true; // the function does nothing
+        return;
+    }
+    if (p.device == 0 || p.context_global == 0) {
+        p.Decline("no device");
+        return;
+    }
+    // the context the system is called with is one of the frame's contexts, not always the device's current one: its class (graphics or async compute) is its vtable
+    const u64 graphics = R<u64>(p.device + 0x2d8);
+    const u64 asc_holder = R<u64>(p.device + 0x2c8);
+    const u64 asc = asc_holder != 0 ? R<u64>(asc_holder + 0x30258) : 0;
+    const u64 vtable = R<u64>(p.ctx);
+    if (graphics != 0 && vtable == R<u64>(graphics)) {
+        p.async = false;
+    } else if (asc != 0 && vtable == R<u64>(asc)) {
+        p.async = true;
+    } else {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1) < 3) {
+            LOG_WARNING(Render, "wet: context {:#x} (vtable {:#x}), graphics {:#x} (vtable {:#x}), async {:#x}", p.ctx, vtable, graphics, graphics != 0 ? R<u64>(graphics) : 0, asc);
+        }
+        p.Decline("a device context the generator does not know");
+        return;
+    }
+    if (R<u64>(Wsys + 0x90) == 0) {
+        p.Decline("the wet system's constant buffer is not created");
+        return;
+    }
+    const u32 count = R<u32>(Wsys + 0x58);
+    const u64 systems = R<u64>(Wsys + 0x50);
+    if (count > WetSystemsMax || (count != 0 && systems == 0)) {
+        p.Decline("the system list is not plausible");
+        return;
+    }
+    const u64 def = R<u64>(R<u64>(p.context_global + 0x38) + 0x20);
+    const u64 water = R<u64>(p.scene + 0x31ed0);
+    const bool water_on = water != 0 && R<s32>(water + 0x48) != 0;
+    if (water_on && R<u64>(water + 0x38) == 0) {
+        p.Decline("render data not created yet (the wet loop creates it at first use)");
+    }
+    const auto has_rd = [&](u64 object) { return object != 0 && R<u64>(object + 0x38) != 0; };
+    for (u32 i = 0; i < count; ++i) {
+        const u64 s = R<u64>(systems + i * 8);
+        if (s == 0) {
+            p.Decline("the system list is not plausible");
+            return;
+        }
+        if (R<s32>(s + 0x30) == 0) {
+            continue;
+        }
+        if (R<u64>(s + 0x120) == 0 || R<u64>(s + 0x190) == 0) {
+            p.Decline("a system's constant buffer is not created");
+            return;
+        }
+        if (R<s32>(s + 0x1d4) == 0) {
+            continue;
+        }
+        const u32 jobs = R<u32>(s + 0x1a8);
+        const u64 list = R<u64>(s + 0x1a0);
+        if (jobs > WetJobsMax || (jobs != 0 && list == 0)) {
+            p.Decline("the job list is not plausible");
+            return;
+        }
+        const bool readback = (R<u32>(s + 0x1b8) & 4) != 0;
+        for (u32 j = 0; j < jobs; ++j) {
+            const u64 e = list + u64{j} * 0x20;
+            const u64 object = R<u64>(e);
+            if (object == 0) {
+                p.Decline("a job without its object");
+                return;
+            }
+            const u64 x = R<u64>(object + 0x48);
+            const u64 y = R<u64>(R<u64>(object + 0x60) + 0x60);
+            if (!has_rd(x) || !has_rd(y)) {
+                p.Decline("render data not created yet (the wet loop creates it at first use)");
+                return;
+            }
+            if (R<u32>(object + 0x68) > 0xd) {
+                const u64 c = R<u64>(R<u64>(object + 0x60) + 0x68);
+                if (c != def && c != 0) {
+                    if (!has_rd(c)) {
+                        p.Decline("render data not created yet (the wet loop creates it at first use)");
+                        return;
+                    }
+                    if (readback) {
+                        const u64 staging = R<u64>(e + 8);
+                        if (staging == 0 || R<u64>(e + 0x10) == 0) {
+                            p.Decline("the readback destination is not allocated yet (the wet loop allocates it at first use)");
+                            return;
+                        }
+                        if (!has_rd(staging)) {
+                            p.Decline("render data not created yet (the wet loop creates it at first use)");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The ticket the engine's FUN_0120d030 takes on a system (+ 0x250): the counter moves only while its high half is zero.
+void WetTicketAcquire(u64 address) {
+    auto* word = reinterpret_cast<std::atomic<u32>*>(address);
+    for (u32 spin = 0;; ++spin) {
+        u32 expected = word->load(std::memory_order_relaxed) & 0xffffu;
+        if (word->compare_exchange_strong(expected, (expected & 0xffffu) + 1u, std::memory_order_acq_rel)) {
+            return;
+        }
+        if (spin > 64) {
+            SwitchToThread();
+        }
+    }
+}
+
+/// A lock word the engine spins on (0 free, 1 taken): the wet system's (+ 0x70) and the job lists' (+ 0x1b4, FUN_0199dbd0).
+void WetLockAcquire(u64 address) {
+    auto* word = reinterpret_cast<std::atomic<s32>*>(address);
+    for (u32 spin = 0;; ++spin) {
+        s32 expected = 0;
+        if (word->compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+            return;
+        }
+        if (spin > 64) {
+            SwitchToThread();
+        }
+    }
+}
+
+void WetLockRelease(u64 address) {
+    auto* word = reinterpret_cast<std::atomic<s32>*>(address);
+    s32 expected = 1;
+    word->compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+}
+
+std::atomic<u64> wet_skipped_jobs{0};
+std::atomic<u64> s_raced_wet_color{0};
+
+/// The blocks of the wet loop as functions of the engine's objects, so the verify run can build them again when it compares (the objects are rewritten by the game's thread).
+void WetBuildStep(u64 s, u64 G, std::array<u8, 16>& block) {
+    block = {};
+    const u32 step = R<u32>(s + 0x1c8);
+    const u32 time = R<u32>(G + 0x19c);
+    std::memcpy(block.data(), &step, 4);
+    std::memcpy(block.data() + 4, &time, 4);
+}
+
+void WetBuildIntersect(u64 s, u64 P, u64 object, u64 B, std::array<u8, 0xc0>& block) {
+    block = {};
+    // the block at s + 0x60 .. 0x11f
+    const auto put32 = [&](u32 at, u32 v) { std::memcpy(block.data() + (at - 0x60), &v, 4); };
+    const auto putf = [&](u32 at, float v) { std::memcpy(block.data() + (at - 0x60), &v, 4); };
+    const auto put64 = [&](u32 at, u64 v) { std::memcpy(block.data() + (at - 0x60), &v, 8); };
+    const auto Pf = [&](u32 o) { return R<float>(P + o); };
+    const auto Bf = [&](u32 o) { return R<float>(B + o); };
+    const u64 c1c0 = R<u64>(s + 0x1c0);
+    put32(0x60, R<u32>(s + 0x1bc));
+    put32(0x64, static_cast<u32>(c1c0));
+    put32(0x68, static_cast<u32>(c1c0 >> 32));
+    put64(0x6c, 0);
+    put64(0x74, 0);
+    put32(0x7c, 0);
+    putf(0x80, 1.0f / R<float>(object + 0xa0));
+    putf(0x84, 1.0f / R<float>(object + 0xa4));
+    put32(0x88, R<u32>(object + 0x60));
+    put32(0x8c, R<u32>(object + 0x68));
+    // the four rows of the object's matrix and the system's two 4x4 factors, in the engine's operation order
+    float row[4][4];
+    for (u32 r = 0; r < 4; ++r) {
+        for (u32 c = 0; c < 4; ++c) {
+            row[r][c] = Bf(0xb0 + r * 0x10 + c * 4);
+        }
+    }
+    const float P70 = Pf(0x70), P74 = Pf(0x74), P78 = Pf(0x78), P7c = Pf(0x7c), P80 = Pf(0x80), P84 = Pf(0x84), P88 = Pf(0x88), P8c = Pf(0x8c), P90 = Pf(0x90), P94 = Pf(0x94),
+                P98 = Pf(0x98), P9c = Pf(0x9c), Pa0 = Pf(0xa0), Pa4 = Pf(0xa4), Pa8 = Pf(0xa8), Pac = Pf(0xac);
+    // the engine adds the four products as (row 1 + row 0) + (row 2 + row 3) (read off the disassembly: ymm lanes and scalar chains, not the decompiler's left to right sum)
+    const auto tree = [](float r1, float r0, float r2, float r3) { return (r1 + r0) + (r2 + r3); };
+    for (u32 c = 0; c < 4; ++c) {
+        putf(0x90 + c * 4, tree(row[1][c] * P74, row[0][c] * P70, row[2][c] * P78, row[3][c] * P7c));
+        putf(0xa0 + c * 4, tree(P84 * row[1][c], P80 * row[0][c], P88 * row[2][c], P8c * row[3][c]));
+    }
+    const float Pm[4][2] = {{P94, P90}, {P98, P9c}, {Pa4, Pa0}, {Pa8, Pac}};
+    for (u32 c = 0; c < 4; ++c) {
+        putf(0xb0 + c * 4, tree(P94 * row[1][c], P90 * row[0][c], P98 * row[2][c], P9c * row[3][c]));
+        putf(0xc0 + c * 4, tree(Pa4 * row[1][c], Pa0 * row[0][c], Pa8 * row[2][c], Pac * row[3][c]));
+    }
+    (void)Pm;
+    for (u32 k = 0; k < 4; ++k) {
+        put64(0xd0 + k * 8, R<u64>(B + 0x70 + k * 8));
+        put64(0xf0 + k * 8, R<u64>(B + 0x90 + k * 8));
+    }
+    put32(0x110, R<u32>(B + 0x150));
+    put32(0x114, R<u32>(B + 0x160));
+    put32(0x118, R<u32>(B + 0x158));
+    put32(0x11c, R<u32>(B + 0x168));
+}
+
+void WetBuildForce(u64 s, u64 P, u64 water, std::array<u8, 0x54>& block) {
+    block = {};
+    // the block at s + 0x130: the system's parameters, the water's value and the colour
+    for (u32 k = 0; k < 8; ++k) {
+        const u32 from = k < 4 ? 0x70 + k * 8 : 0x90 + (k - 4) * 8; // 0x70 0x78 0x80 0x88, then 0x90 0x98 0xa0 0xa8
+        const u64 v = R<u64>(P + from);
+        std::memcpy(block.data() + k * 8, &v, 8);
+    }
+    const u32 water_value = R<u32>(water + 0x48);
+    std::memcpy(block.data() + 0x50, &water_value, 4);
+    const float f = R<float>(s + 0x258) * std::bit_cast<float>(0x3b808081u);
+    const u32 packed = R<u32>(s + 0x254);
+    const std::array<u32, 4> channels{static_cast<u32>(R<u8>(s + 0x256)), static_cast<u32>(R<u8>(s + 0x255)), packed, packed >> 24};
+    const float scale[4] = {f, f, f, std::bit_cast<float>(0x3b808081u)};
+    for (u32 c = 0; c < 4; ++c) {
+        const float v = scale[c] * static_cast<float>(static_cast<s32>(channels[c] & 0xffu));
+        std::memcpy(block.data() + 0x40 + c * 4, &v, 4);
+    }
+}
+
+void GenerateWet(Target& t, const WetPlan& p) {
+    const u64 Wsys = p.system, F = p.scene, device = p.device, ctx = p.ctx, G = p.context_global;
+    const bool live = t.live;
+    using Virtual = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64);
+    const auto vcall = [&](u32 slot, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) { return reinterpret_cast<Virtual>(R<u64>(R<u64>(ctx) + slot))(ctx, a1, a2, a3, a4, a5, 0); };
+    const u32 set_shader_offset = p.async ? 0x1d10 : 0x4670, cb_table = p.async ? 0x21f8 : 0x500, srv_table = p.async ? 0x1d18 : 0x1980, uav_table = p.async ? 0x2118 : 0x2098;
+    const auto set_cb = [&](u32 start, u32 count, const u64* values) { t.Put(cb_table + start * 8, values, count * 8); };
+    const auto set_srv = [&](u32 start, u32 count, const u64* values) { t.Put(srv_table + start * 8, values, count * 8); };
+    const auto set_uav = [&](u32 start, u32 count, const u64* values) {
+        t.Put(uav_table + start * 8, values, count * 8);
+        if (p.async && live) {
+            for (u32 i = 0; i < count; ++i) {
+                if (values[i] != 0) {
+                    W<u32>(values[i] + 0x88, 0xffffffffu); // the async context resets the counter index of every view it is given (no counter array)
+                }
+            }
+        }
+    };
+    // table entries with the object word each was read from, so the verify run can tell a word the engine's other threads replaced between the two reads
+    struct Src {
+        u64 value;
+        u64 owner;
+        u32 offset;
+    };
+    const auto put_table = [&](u32 table, u32 start, std::initializer_list<Src> sources, bool uav) {
+        u32 i = 0;
+        for (const Src& src : sources) {
+            t.direct_object = src.owner;
+            t.direct_offset = src.offset;
+            t.Put(table + (start + i) * 8, &src.value, 8);
+            t.direct_object = 0;
+            if (uav && p.async && live && src.value != 0) {
+                W<u32>(src.value + 0x88, 0xffffffffu);
+            }
+            ++i;
+        }
+    };
+    const auto put_cb = [&](u32 start, std::initializer_list<Src> sources) { put_table(cb_table, start, sources, false); };
+    const auto put_srv = [&](u32 start, std::initializer_list<Src> sources) { put_table(srv_table, start, sources, false); };
+    const auto put_uav = [&](u32 start, std::initializer_list<Src> sources) { put_table(uav_table, start, sources, true); };
+    const auto set_shader = [&](u64 shader) { t.Set<u64>(set_shader_offset, shader); };
+    u32 wet_kind = 0;
+    u64 wet_system = 0, wet_object = 0, wet_water = 0, wet_block = 0;
+    const auto dispatch = [&](u32 x, u64 site) {
+        if (live) {
+            Timed(CallId::DrawIssue, [&] { NativeDraw::IssueDispatch(ctx, x, 1, 1, false, site, p.async); });
+        } else {
+            t.marks.push_back({t.arena.size(), p.async ? 4u : 3u, x, 1, 1, t.Get<u64>(set_shader_offset), 0});
+            t.marks.back().blocks = std::move(t.blocks);
+            t.blocks.clear();
+            Mark& mk = t.marks.back();
+            mk.wet_kind = wet_kind;
+            mk.wet_system = wet_system;
+            mk.wet_object = wet_object;
+            mk.wet_water = wet_water;
+            mk.wet_block = wet_block;
+            mk.wet_context_global = G;
+        }
+        ++t.draws;
+    };
+    const auto wait = [&] {
+        if (live) {
+            vcall(0x78, 0, 0, 0, 0, 0);
+        }
+    };
+    // UpdateSubresource of a staged block: the engine writes its fields into its own memory and the virtual copies the destination's byte width from there. The live run does the same;
+    // the verify run keeps the bytes for the comparison at the next dispatch (a block staged again at the same address replaces the pending one: no dispatch consumed it)
+    const auto update = [&](u64 resource, u64 source, const u8* bytes, u32 size) {
+        if (live) {
+            std::memcpy(reinterpret_cast<void*>(source), bytes, size);
+            Timed(CallId::WetUpdate, [&] { vcall(0xd0, resource, 0, 0, source, 0); });
+        } else {
+            const u32 n = std::min<u32>(R<u32>(resource + 0x180), size);
+            for (auto& [address, block] : t.blocks) {
+                if (address == source) {
+                    block.assign(bytes, bytes + n);
+                    return;
+                }
+            }
+            t.blocks.push_back({source, std::vector<u8>(bytes, bytes + n)});
+        }
+    };
+    const auto lock_list = [&](u64 s) {
+        if (live) {
+            WetLockAcquire(s + 0x1b4);
+        }
+    };
+    const auto unlock_list = [&](u64 s) {
+        if (live) {
+            WetLockRelease(s + 0x1b4);
+        }
+    };
+    const auto render_data = [&](u64 object) -> u64 {
+        const u64 rd = object != 0 ? R<u64>(object + 0x38) : 0;
+        if (rd == 0 && live) {
+            wet_skipped_jobs.fetch_add(1, std::memory_order_relaxed); // created between the scan and now: the engine would create it here
+        }
+        return rd;
+    };
+    const auto skip_gt = [](float a, float b) { return a > b; };
+    const auto skip_lt = [](float a, float b) { return !(a >= b); };
+
+    if (live) {
+        W<s32>(Wsys + 0x74, 2);
+    }
+    const float dt = R<float>(G + 0x19c);
+    const u64 ring = static_cast<u64>(static_cast<s64>(R<s32>(Wsys + 0x78)) ^ 1);
+    const u64 list_count_at = Wsys + 0xa8 + ring * 0x18;
+    // the objects with render data that is in use (the list the engine builds before it starts)
+    std::vector<u64> wet_objects;
+    if (const u32 n = R<u32>(list_count_at); n != 0) {
+        const u64 array = R<u64>(Wsys + 0xa0 + ring * 0x18);
+        for (u32 i = 0; i < n; ++i) {
+            const u64 object = R<u64>(array + u64{i} * 0x10);
+            const u64 rd = R<u64>(object + 0x38);
+            if (rd != 0 && R<s32>(rd + 0x30) != 0) {
+                wet_objects.push_back(object);
+            }
+        }
+    }
+    const u64 systems = R<u64>(Wsys + 0x50);
+    const u32 system_count = R<u32>(Wsys + 0x58);
+    const u64 constants = R<u64>(Wsys + 0x90);
+    put_cb(0, {{constants, Wsys, 0x90}});
+    if (live) {
+        WetLockAcquire(Wsys + 0x70);
+        vcall(0xb8, 0xd8, 0, 0, 0, 0);
+    }
+    set_shader(R<u64>(device + 0x1168));
+    // ---- phase 1: the time step
+    if (system_count != 0) {
+        bool any = false;
+        for (u32 i = 0; i < system_count; ++i) {
+            const u64 s = R<u64>(systems + u64{i} * 8);
+            if (R<s32>(s + 0x30) == 0) {
+                continue;
+            }
+            std::array<u8, 16> block{};
+            WetBuildStep(s, G, block);
+            update(constants, Wsys + 0x80, block.data(), 16);
+            wet_kind = 1;
+            wet_system = s;
+            wet_block = Wsys + 0x80;
+            any = true;
+            if (R<s32>(s + 0x1d4) != 0) {
+                lock_list(s);
+                const u32 jobs = R<u32>(s + 0x1a8);
+                const u64 list = R<u64>(s + 0x1a0);
+                for (u32 j = 0; j < jobs; ++j) {
+                    const u64 e = list + u64{j} * 0x20;
+                    const u64 object = R<u64>(e);
+                    const s32 amount = R<s32>(e + 0x18);
+                    const u64 rd_a = render_data(R<u64>(object + 0x48));
+                    const u64 rd_b = render_data(R<u64>(R<u64>(object + 0x60) + 0x60));
+                    if (rd_a == 0 || rd_b == 0) {
+                        continue;
+                    }
+                    put_cb(1, {{R<u64>(s + 0x120), s, 0x120}});
+                    put_srv(0, {{R<u64>(rd_a + 0x28), rd_a, 0x28}});
+                    put_uav(0, {{R<u64>(rd_b + 0x30), rd_b, 0x30}});
+                    dispatch((static_cast<u32>(amount) + 0xffu) >> 8, WetSiteElapse);
+                }
+                unlock_list(s);
+            }
+        }
+        if (any) {
+            wait();
+        }
+    }
+    (void)dt;
+    // ---- phase 2: the objects' boxes against the systems' boxes
+    if (R<u32>(list_count_at) != 0) {
+        set_shader(R<u64>(device + 0x1178));
+        if (system_count != 0) {
+            bool any = false;
+            for (u32 i = 0; i < system_count; ++i) {
+                const u64 s = R<u64>(systems + u64{i} * 8);
+                if (R<s32>(s + 0x30) == 0) {
+                    continue;
+                }
+                const u64 P = R<u64>(s + 0x28);
+                if (R<s32>(s + 0x1d4) != 0 && P != 0 && !wet_objects.empty()) {
+                    const u64 box = (static_cast<u64>(static_cast<s64>(R<s32>(s + 0x54)) ^ 1)) * 0x20;
+                    const u64 hi = s + 0x220 + box, lo = s + 0x210 + box;
+                    for (const u64 object : wet_objects) {
+                        const u64 B = R<u64>(R<u64>(object + 0x38) + 0x28);
+                        if (B == 0 || (R<u8>(B + 0x24) & 1) == 0) {
+                            continue;
+                        }
+                        if (skip_gt(R<float>(B + 0x170), R<float>(hi)) || skip_lt(R<float>(B + 0x180), R<float>(lo)) || skip_gt(R<float>(B + 0x174), R<float>(hi + 4)) ||
+                            skip_lt(R<float>(B + 0x184), R<float>(lo + 4)) || skip_gt(R<float>(B + 0x178), R<float>(hi + 8)) || skip_lt(R<float>(B + 0x188), R<float>(lo + 8))) {
+                            continue;
+                        }
+                        std::array<u8, 0xc0> block{};
+                        WetBuildIntersect(s, P, object, B, block);
+                        update(R<u64>(s + 0x120), s + 0x60, block.data(), 0xc0);
+                        wet_kind = 2;
+                        wet_system = s;
+                        wet_object = object;
+                        wet_block = s + 0x60;
+                        // the second shader resource: the object's wetness texture or the default one
+                        u64 handle;
+                        const u64 texture = R<u64>(object + 0x40);
+                        if (texture == 0 || static_cast<u32>(R<u64>(texture + 0x50)) == 0 || (R<u64>(texture + 0x50) >> 32) == 0 || R<s32>(texture + 0x30) == 0 || R<s32>(texture + 0x58) == 0) {
+                            handle = R<u64>(object + 0xf0);
+                        } else {
+                            handle = R<u64>(R<u64>(texture + 0x108) + 0x108);
+                        }
+                        if (handle == 0) {
+                            handle = R<u64>(R<u64>(G + 0x38) + 0x38);
+                        }
+                        const u64 looked = HandleLookup(device, handle);
+                        lock_list(s);
+                        const u32 jobs = R<u32>(s + 0x1a8);
+                        const u64 list = R<u64>(s + 0x1a0);
+                        for (u32 j = 0; j < jobs; ++j) {
+                            const u64 e = list + u64{j} * 0x20;
+                            const u64 job = R<u64>(e);
+                            const s32 amount = R<s32>(e + 0x18);
+                            const u64 rd_a = render_data(R<u64>(job + 0x48));
+                            const u64 rd_b = render_data(R<u64>(R<u64>(job + 0x60) + 0x60));
+                            if (rd_a == 0 || rd_b == 0 || looked == 0) {
+                                continue;
+                            }
+                            put_cb(1, {{R<u64>(s + 0x120), s, 0x120}});
+                            put_srv(0, {{R<u64>(rd_a + 0x28), rd_a, 0x28}, {R<u64>(looked + 0x48), looked, 0x48}});
+                            put_uav(0, {{R<u64>(rd_b + 0x30), rd_b, 0x30}});
+                            dispatch((static_cast<u32>(amount) + 0xffu) >> 8, WetSiteIntersect);
+                        }
+                        unlock_list(s);
+                    }
+                }
+                any = true;
+            }
+            if (any) {
+                wait();
+            }
+        }
+    }
+    // ---- phase 3: the water modifier's force, and the readback
+    const u64 water = R<u64>(F + 0x31ed0);
+    if (water != 0 && R<s32>(water + 0x48) != 0 && system_count != 0) {
+        const u64 def = R<u64>(R<u64>(G + 0x38) + 0x20);
+        bool any = false;
+        for (u32 i = 0; i < system_count; ++i) {
+            const u64 s = R<u64>(systems + u64{i} * 8);
+            if (R<s32>(s + 0x30) == 0) {
+                continue;
+            }
+            any = true;
+            const u64 P = R<u64>(s + 0x28);
+            if (R<s32>(s + 0x1d4) == 0 || P == 0) {
+                continue;
+            }
+            const u64 box = (static_cast<u64>(static_cast<s64>(R<s32>(s + 0x54)) ^ 1)) * 0x20;
+            const u64 hi = s + 0x220 + box, lo = s + 0x210 + box;
+            const bool inside = !(skip_gt(R<float>(F + 0x31eb0), R<float>(hi)) || skip_lt(R<float>(F + 0x31ec0), R<float>(lo)) || skip_gt(R<float>(F + 0x31eb4), R<float>(hi + 4)) ||
+                                  skip_lt(R<float>(F + 0x31ec4), R<float>(lo + 4)) || skip_gt(R<float>(F + 0x31eb8), R<float>(hi + 8)) || skip_lt(R<float>(F + 0x31ec8), R<float>(lo + 8)));
+            u32 flags = 0;
+            if (inside || ((flags = R<u32>(s + 0x1b8)) & 4) != 0) {
+                if (live) {
+                    WetTicketAcquire(s + 0x250);
+                }
+                lock_list(s);
+                const u32 jobs = R<u32>(s + 0x1a8);
+                const u64 list = R<u64>(s + 0x1a0);
+                for (u32 j = 0; j < jobs; ++j) {
+                    const u64 e = list + u64{j} * 0x20;
+                    const u64 object = R<u64>(e);
+                    u64 second = 0;
+                    if (R<u32>(object + 0x68) > 0xd) {
+                        const u64 c = R<u64>(R<u64>(object + 0x60) + 0x68);
+                        second = c != def ? c : 0;
+                    }
+                    set_shader(R<u64>(device + 0x1188 + (second != 0 ? 0x10 : 0)));
+                    const s32 amount = R<s32>(e + 0x18);
+                    std::array<u8, 0x54> block{};
+                    WetBuildForce(s, P, water, block);
+                    update(R<u64>(s + 0x190), s + 0x130, block.data(), 0x54);
+                    const u64 rd_a = render_data(R<u64>(object + 0x48));
+                    const u64 rd_w = render_data(water);
+                    const u64 rd_b = render_data(R<u64>(R<u64>(object + 0x60) + 0x60));
+                    const u64 rd_c = second != 0 ? render_data(second) : 0;
+                    if (rd_a == 0 || rd_w == 0 || rd_b == 0 || (second != 0 && rd_c == 0)) {
+                        continue;
+                    }
+                    put_cb(1, {{R<u64>(s + 0x190), s, 0x190}});
+                    put_uav(0, {{R<u64>(rd_b + 0x30), rd_b, 0x30}, {second != 0 ? R<u64>(rd_c + 0x30) : 0, second != 0 ? rd_c : 0, 0x30}});
+                    put_srv(0, {{R<u64>(rd_a + 0x28), rd_a, 0x28}, {R<u64>(rd_w + 0x28), rd_w, 0x28}});
+                    wet_kind = 3;
+                    wet_system = s;
+                    wet_water = water;
+                    wet_block = s + 0x130;
+                    dispatch((static_cast<u32>(amount) + 0xffu) >> 8, WetSiteForce);
+                }
+                if (live) {
+                    reinterpret_cast<std::atomic<s32>*>(s + 0x250)->fetch_sub(1, std::memory_order_acq_rel);
+                }
+                if ((R<u32>(s + 0x1b8) & 4) != 0) {
+                    wait();
+                }
+                unlock_list(s);
+                flags = R<u32>(s + 0x1b8);
+            }
+            if ((flags & 4) != 0) {
+                lock_list(s);
+                const u32 jobs = R<u32>(s + 0x1a8);
+                const u64 list = R<u64>(s + 0x1a0);
+                for (u32 j = 0; live && j < jobs; ++j) {
+                    const u64 e = list + u64{j} * 0x20;
+                    const u64 object = R<u64>(e);
+                    if (R<u32>(object + 0x68) <= 0xd) {
+                        continue;
+                    }
+                    const u64 c = R<u64>(R<u64>(object + 0x60) + 0x68);
+                    if (c == def || c == 0) {
+                        continue;
+                    }
+                    const u64 rd_c = render_data(c);
+                    const u64 staging = R<u64>(e + 8);
+                    const u64 destination = R<u64>(e + 0x10);
+                    const u32 dwords = R<u32>(e + 0x18);
+                    const u64 rd_s = staging != 0 ? render_data(staging) : 0;
+                    if (rd_c == 0 || rd_s == 0 || destination == 0) {
+                        continue;
+                    }
+                    vcall(0x88, R<u64>(rd_s + 0x20), R<u64>(rd_c + 0x20), 0, 0, 0);
+                    u64 mapped = 0;
+                    const u64 status = reinterpret_cast<Virtual>(R<u64>(R<u64>(ctx) + 0x90))(ctx, R<u64>(rd_s + 0x20), 0, 1, 0, reinterpret_cast<u64>(&mapped), 0);
+                    if (static_cast<s32>(status) >= 0) {
+                        std::memcpy(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(mapped), u64{dwords} << 2);
+                        vcall(0xc8, R<u64>(rd_s + 0x20), 0, 0, 0, 0);
+                    }
+                }
+                if (live) {
+                    W<u8>(s + 0x1b8, static_cast<u8>(R<u8>(s + 0x1b8) & 0xfbu));
+                }
+                unlock_list(s);
+            }
+        }
+        if (any) {
+            wait();
+            if (live) {
+                vcall(0xb8, 0, 0, 0, 0, 0);
+            }
+        }
+    }
+    // ---- the end: the lock, and the views are cleared
+    if (live) {
+        WetLockRelease(Wsys + 0x70);
+    }
+    const std::array<u64, 2> zeros{};
+    set_srv(0, 2, zeros.data());
+    set_uav(0, 2, zeros.data());
+}
+
+struct WConfig {
+    bool on{false};
+    u32 verify_every{32};
+};
+const WConfig& WCfg() {
+    static const WConfig config = [] {
+        WConfig c;
+        const char* e = std::getenv("TLG_WET_GEN");
+        c.on = e != nullptr && *e != 0 && *e != '0';
+        if (const char* n = std::getenv("TLG_WET_GEN_VERIFY"); n != nullptr && *n != 0) {
+            c.verify_every = static_cast<u32>(std::atoi(n));
+        }
+        return c;
+    }();
+    return config;
+}
+
+struct WStats {
+    ViewStats v;
+    u64 eligible{0};
+    u64 loops_without_work{0};
+};
+WStats& WS() {
+    static WStats stats;
+    return stats;
+}
+
+
 
 } // namespace
 
@@ -3670,6 +4332,39 @@ void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3) {
         }
         for (const auto& [address, generated] : mark.blocks) {
             std::vector<u8> bytes = generated;
+            if (mark.wet_kind != 0 && address == mark.wet_block) {
+                // the wet blocks are made from objects the game's thread rewrites: build the block again from them now; if the live block is what they give now, the loop and the generator
+                // read them at different times. The frame time (kind 1) is a global the main thread writes every frame: any plausible value is the loop's own read.
+                std::vector<u8> now;
+                const u64 sys = mark.wet_system;
+                if (mark.wet_kind == 1) {
+                    std::array<u8, 16> b16;
+                    WetBuildStep(sys, mark.wet_context_global, b16);
+                    now.assign(b16.begin(), b16.end());
+                } else if (mark.wet_kind == 2) {
+                    std::array<u8, 0xc0> b;
+                    WetBuildIntersect(sys, R<u64>(sys + 0x28), mark.wet_object, R<u64>(R<u64>(mark.wet_object + 0x38) + 0x28), b);
+                    now.assign(b.begin(), b.end());
+                } else {
+                    std::array<u8, 0x54> b;
+                    WetBuildForce(sys, R<u64>(sys + 0x28), mark.wet_water, b);
+                    now.assign(b.begin(), b.end());
+                }
+                const u32 n = static_cast<u32>(std::min(now.size(), bytes.size()));
+                if (std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), n) != 0 && std::memcmp(reinterpret_cast<const void*>(address), now.data(), n) == 0) {
+                    std::memcpy(bytes.data(), now.data(), n);
+                    ++v.raced;
+                    ++s_raced_wet_color;
+                } else if (mark.wet_kind == 1 && bytes.size() >= 8) {
+                    float live_time;
+                    std::memcpy(&live_time, reinterpret_cast<const void*>(address + 4), 4);
+                    if (std::isfinite(live_time) && live_time > 0.0f && live_time < 1.0f) {
+                        std::memcpy(bytes.data() + 4, &live_time, 4);
+                        ++v.raced;
+                        ++s_raced_wet_color;
+                    }
+                }
+            }
             if (mark.flag_source != 0 && address == mark.flag_block && bytes.size() >= 0x10) {
                 // the flag in dword 3 comes from a float the main thread updates: if the live value is what the float gives now, the loop and the generator read it at different times
                 u32 live_flag = 0, generated_flag = 0;
@@ -3691,7 +4386,14 @@ void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3) {
                 std::memcpy(&a, reinterpret_cast<const void*>(address + at), 4);
                 std::memcpy(&b, bytes.data() + at, 4);
                 ++v.mismatches;
-                NoteMismatch(s, v.view, "skinning constants", fmt::format("dispatch {}: dword {:#x} of the block at {:#x}: the loop {:#x}, the generator {:#x}", k, at, address, a, b));
+                std::string extra;
+                if (mark.color_block != 0 && address == mark.color_block) {
+                    const u64 sys = address - 0x130;
+                    extra = fmt::format(" (system {:#x}: +0x254 {:#x}, +0x258 {:#x}, +0x1b8 {:#x}; live lanes {:#x} {:#x} {:#x} {:#x}; generated lanes {:#x} {:#x} {:#x} {:#x})", sys, R<u32>(sys + 0x254), R<u32>(sys + 0x258), R<u32>(sys + 0x1b8),
+                                        R<u32>(address + 0x40), R<u32>(address + 0x44), R<u32>(address + 0x48), R<u32>(address + 0x4c), R<u32>(reinterpret_cast<u64>(bytes.data()) + 0x40),
+                                        R<u32>(reinterpret_cast<u64>(bytes.data()) + 0x44), R<u32>(reinterpret_cast<u64>(bytes.data()) + 0x48), R<u32>(reinterpret_cast<u64>(bytes.data()) + 0x4c));
+                }
+                NoteMismatch(s, v.view, "skinning constants", fmt::format("dispatch {}: dword {:#x} of the block at {:#x}: the loop {:#x}, the generator {:#x}{}", k, at, address, a, b, extra));
             }
         }
     }
@@ -4383,6 +5085,116 @@ bool HandleSkin(u64 system, u64 scene, u64 async_flag, u64 original_loop) {
     return true;
 }
 
+bool WetEnabled() {
+    return WCfg().on;
+}
+
+bool HandleWet(u64 system, u64 ctx, u64 scene, u64 original_loop) {
+    const WConfig& cfg = WCfg();
+    if (!cfg.on || original_loop == 0) {
+        return false;
+    }
+    using Loop = void(PS4_SYSV_ABI*)(u64, u64, u64);
+    State& s = S();
+    WStats& ws = WS();
+    WetPlan plan;
+    plan.system = system;
+    plan.ctx = ctx;
+    plan.scene = scene;
+    const auto run_loop = [&] { reinterpret_cast<Loop>(original_loop)(system, ctx, scene); };
+    WetScanArgs scan_args{&plan};
+    {
+        std::scoped_lock lock{s.mutex};
+        if (ws.v.disabled) {
+            plan.scanned = true;
+            plan.Decline("generator switched off by a verify difference");
+        } else if (!Timed(CallId::ScanWet, [&] { return NativeDraw::GuardedCall([](void* p) { ScanWet(*static_cast<WetScanArgs*>(p)); }, &scan_args); })) {
+            ++ws.v.not_scanned;
+            plan.scanned = false;
+            plan.Decline("scan faulted");
+        }
+        if (plan.no_work) {
+            ++ws.loops_without_work;
+        } else {
+            ++ws.v.passes;
+            if (!plan.Ok()) {
+                for (const char* r : plan.reasons) {
+                    ++ws.v.declines[r];
+                }
+            }
+        }
+    }
+    if (plan.no_work) {
+        run_loop();
+        return true;
+    }
+    bool verify_pass = false;
+    if (plan.Ok()) {
+        std::scoped_lock lock{s.mutex};
+        ++ws.eligible;
+        verify_pass = cfg.verify_every != 0 && ws.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().claimed.exchange(true);
+    }
+    if (plan.Ok() && !verify_pass) {
+        Target live;
+        live.live = true;
+        live.base = reinterpret_cast<u8*>(plan.ctx);
+        Timed(CallId::PassWet, [&] { GenerateWet(live, plan); });
+        std::scoped_lock lock{s.mutex};
+        ++ws.v.generated;
+        ws.v.generated_draws += live.draws;
+        return true;
+    }
+    Verify& v = V();
+    if (verify_pass) {
+        v.shadow = Target{};
+        v.shadow.live = false;
+        std::vector<u8> copy(CtxBytes);
+        std::memcpy(copy.data(), reinterpret_cast<const void*>(plan.ctx), CtxBytes);
+        v.shadow.base = copy.data();
+        GenerateWet(v.shadow, plan);
+        v.cursor = 0;
+        v.arena_pos = 0;
+        v.view = 203;
+        v.lo = WetBegin;
+        v.hi = WetEnd;
+        v.ctx = plan.ctx;
+        v.rd = plan.device;
+        v.compared_draws = 0;
+        v.mismatches = 0;
+        v.raced = 0;
+        v.thread = std::this_thread::get_id();
+        v.active.store(true);
+        run_loop();
+        v.active.store(false);
+        std::scoped_lock lock{s.mutex};
+        if (v.cursor < v.shadow.marks.size()) {
+            ++v.mismatches;
+            NoteMismatch(s, v.view, "missing draw", fmt::format("the generator has {} dispatches, the loop issued {}", v.shadow.marks.size(), v.cursor));
+        } else {
+            v.mismatches += CompareDelta(s, v, v.arena_pos, v.shadow.arena.size(), plan.ctx, "epilogue");
+        }
+        ++ws.v.verify_passes;
+        ws.v.verify_draws += v.compared_draws;
+        ws.v.verify_raced += v.raced;
+        if (v.mismatches == 0) {
+            ++ws.v.verify_clean;
+        } else {
+            ++ws.v.verify_mismatched;
+            ws.v.disabled = true;
+            LOG_ERROR(Render, "wet generator switched off, {} differences against the engine's loop", v.mismatches);
+        }
+        v.shadow = Target{};
+        v.lo = ZPassBegin;
+        v.hi = ZPassEnd;
+        v.claimed.store(false);
+    } else {
+        run_loop();
+        std::scoped_lock lock{s.mutex};
+        ++ws.v.loop_passes;
+    }
+    return true;
+}
+
 nlohmann::json Report() {
     auto& s = S();
     std::scoped_lock lock{s.mutex};
@@ -4516,6 +5328,28 @@ nlohmann::json Report() {
         }
         sk["declined_passes_by_reason"] = sdeclines;
         out["skinning"] = sk;
+        const ViewStats& wj = WS().v;
+        nlohmann::json wt = {{"enabled", WCfg().on},
+                             {"passes", wj.passes},
+                             {"loops_without_work", WS().loops_without_work},
+                             {"generated_passes_without_the_loop", wj.generated},
+                             {"generated_dispatches", wj.generated_draws},
+                             {"passes_run_by_the_loop", wj.loop_passes},
+                             {"verify_passes", wj.verify_passes},
+                             {"verify_clean", wj.verify_clean},
+                             {"verify_with_differences", wj.verify_mismatched},
+                             {"verify_dispatches_compared", wj.verify_draws},
+                             {"verify_draws_compared", wj.verify_draws},
+                             {"verify_words_that_moved", wj.verify_raced},
+                             {"jobs_skipped_for_render_data_created_late", wet_skipped_jobs.load()},
+                             {"switched_off_by_verify", wj.disabled},
+                             {"scan_faults", wj.not_scanned}};
+        nlohmann::json wdeclines = nlohmann::json::object();
+        for (const auto& [reason, count] : wj.declines) {
+            wdeclines[reason] = count;
+        }
+        wt["declined_passes_by_reason"] = wdeclines;
+        out["wet"] = wt;
     }
     if (CensusOn()) {
         LARGE_INTEGER frequency;

@@ -38,6 +38,8 @@ bool HandleDecal(u64 render_device, u64 view, u64 a3, u64 a4, u64 desc, u32 flag
 /// B3, the skinning loop (`FUN_01c93730(system, scene, async)`): `TLG_SKIN_GEN=1`, verify one pass in `TLG_SKIN_GEN_VERIFY` (default 32). Same contract.
 [[nodiscard]] bool SkinEnabled();
 bool HandleSkin(u64 system, u64 scene, u64 async_flag, u64 original_loop);
+[[nodiscard]] bool WetEnabled();
+bool HandleWet(u64 system, u64 ctx, u64 scene, u64 original_loop);
 
 nlohmann::json Report();
 

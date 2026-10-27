@@ -6603,6 +6603,18 @@ using GuestMap7 = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64);
 /// and a matrix count at +0x50, 64 bytes each) with memcpy into the memory of one of four buffers of a ring (the buffer object at ring + 4 * index, index = the counter at
 /// ring + 0x40 after its increment; the memory pointer at buffer + 0x30), without any Map. The writes are announced here, before the function runs: the range is the
 /// buffer memory from the start for the sum of the counts (jobs the function skips make the range larger than what it writes, never smaller).
+/// B5: the wet simulation `FUN_0199bf00(wet system, device context, scene)`, a virtual of the wet system: a generator behind `TLG_WET_GEN=1` (core/native_zpass_gen.cpp, B5).
+u64 PS4_SYSV_ABI WetSim(u64 system, u64 ctx, u64 scene, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
+    (void)a3, (void)a4, (void)a5, (void)ret, (void)caller_rsp;
+    if (NativeZPassGen::WetEnabled() && IsHeapPointer(system) && IsHeapPointer(ctx) && IsHeapPointer(scene)) {
+        static const u64 loop_entry = Core::GuestHooks::OriginalEntry("WetSim");
+        if (NativeZPassGen::HandleWet(system, ctx, scene, loop_entry)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void SkinWritesAnnounce(u64 ring, u64 scene);
 u64 PS4_SYSV_ABI SkinWrites(u64 ring, u64 scene, u64 flag, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
     (void)a3, (void)a4, (void)a5, (void)ret, (void)caller_rsp;
@@ -8233,6 +8245,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "light_writes") {
         return reinterpret_cast<u64>(&LightWrites);
+    }
+    if (name == "wet_sim") {
+        return reinterpret_cast<u64>(&WetSim);
     }
     if (name == "skin_writes") {
         return reinterpret_cast<u64>(&SkinWrites);
