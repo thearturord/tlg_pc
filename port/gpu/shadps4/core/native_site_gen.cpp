@@ -611,13 +611,167 @@ void Apply4(const Plan& p, Writer& w) {
     }
 }
 
-std::array<Site, 5>& Sites() {
-    static std::array<Site, 5> sites{{
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Sites 5 and 6: two more dispatch loops of the emitter system `FUN_01bcac40`, over the same list of emitters (`node + 0x38`), the emitter data `[node + 0x108]`, the graphics context in
+// r14. Site 5 (0x01bcbdb8 .. 0x01bcbeff, node r12, data r13, the shader was set before the loop, resumes at 0x01bcbf02 where the engine counts the emitter's frames down): the loop
+// only runs for `[data + 0x258] > 0`. Site 6 (0x01bcba34 .. 0x01bcbb5b, node rbx, data r15, system r13 with the cached shader index at `+ 0x78`, shader 0x1b from `[device + 0x11b8]`,
+// resumes at 0x01bcbb60, the loop's next emitter). Both fill the same stack slots (`[rsp + 0xb8]`, `[rsp + 0xc0]`, `[rsp + 0xc8]`, `[rsp + 0xf0]`), write the tables with
+// SetConstantBuffers (slot 10), SetUnorderedAccessViews (two entries) and SetShaderResources (four entries), and dispatch ((w + 7) / 8, (h + 7) / 8, 1) groups of the size `[data]`
+// (site 6: `[data + 0x30]`).
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+bool EmitterPreamble(MidContext* c, Plan& p, u64 node, u64 data, const char*& reason, bool& no_work) {
+    p.rsp = c->rsp;
+    p.context = c->r14;
+    if (!Plausible(node) || !Plausible(p.context)) {
+        reason = "an object of the loop is not set";
+        return false;
+    }
+    if (!Plausible(data)) {
+        no_work = true;
+        return false;
+    }
+    const float threshold = R<float>(Global(0x024f108c));
+    if (threshold > R<float>(data + 0x290)) {
+        no_work = true; // the loop skips an emitter that is not alive
+        return false;
+    }
+    if (!Plausible(R<u64>(p.context)) || !Plausible(R<u64>(R<u64>(p.context) + 0x58))) {
+        reason = "the context has no virtual table";
+        return false;
+    }
+    return true;
+}
+bool Scan5(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    const u64 node = c->r12;
+    const u64 data = Plausible(node) ? R<u64>(node + 0x108) : 0;
+    if (!EmitterPreamble(c, p, node, data, reason, no_work)) {
+        return false;
+    }
+    if (static_cast<s32>(R<u32>(data + 0x258)) <= 0) {
+        no_work = true;
+        return false;
+    }
+    const auto field = [&](u64 owner, u64 offset) -> u64 { return Plausible(owner) ? R<u64>(owner + offset) : 0; };
+    const u32 pair = R<u32>(data + 0x250) * 2 + R<u32>(data + 0x24c);
+    p.v[0] = R<u64>(data + 0x190);                              // [rsp + 0xb8]
+    p.v[1] = field(R<u64>(data + 0x1c8 + u64{pair} * 8), 0x48); // [rsp + 0xc0]
+    const u64 second = field(R<u64>(data + 0x220), 0x48);
+    p.v[2] = second != 0 ? second : p.v[1];                      // [rsp + 0xc8]
+    const u32 other = (R<u32>(data + 0x24c) ^ 1u) + R<u32>(data + 0x250) * 2;
+    p.v[3] = field(R<u64>(data + 0x1c8 + u64{other} * 8), 0x50); // [rsp + 0xf0]
+    p.v[4] = R<u64>(p.rsp + 0xd0);
+    p.v[5] = R<u64>(p.rsp + 0xd8);
+    p.v[6] = R<u64>(p.rsp + 0xf8);
+    p.v[7] = data;
+    const u64 size = R<u64>(data);
+    p.groups = (static_cast<u32>(size) + 7u) >> 3;
+    p.groups_y = (static_cast<u32>(size >> 32) + 7u) >> 3;
+    p.site_ghidra = 0x01bcbf02;
+    p.async = false;
+    p.context_words.emplace_back(0x500 + 10 * 8, p.v[0]);
+    p.context_words.emplace_back(0x1980, p.v[1]);
+    p.context_words.emplace_back(0x1980 + 8, p.v[2]);
+    p.context_words.emplace_back(0x1980 + 16, p.v[4]);
+    p.context_words.emplace_back(0x1980 + 24, p.v[5]);
+    p.context_words.emplace_back(0x2098, p.v[3]);
+    p.context_words.emplace_back(0x2098 + 8, p.v[6]);
+    p.registers = {{R13, data}, {RBX, 0}};
+    return true;
+}
+void ApplyEmitterTables(const Plan& p, Writer& w) {
+    w.Put<u64>(p.rsp + 0xb8, p.v[0]);
+    w.Put<u64>(p.rsp + 0xc0, p.v[1]);
+    w.Put<u64>(p.rsp + 0xf0, p.v[3]);
+}
+void Apply5(const Plan& p, Writer& w) {
+    ApplyEmitterTables(p, w);
+    w.Put<u64>(p.rsp + 0xc8, p.v[2]);
+    if (w.Live()) {
+        const u64 vtable = R<u64>(p.context);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x28))(p.context, 10, 1, R<u64>(p.rsp + 0x88), 0, 0, 0);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x48))(p.context, 0, 2, R<u64>(p.rsp + 0x90), 0, 0, 0);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x40))(p.context, 0, 4, R<u64>(p.rsp + 0xa8), 0, 0, 0);
+        NativeDraw::IssueDispatch(p.context, p.groups, p.groups_y, 1, false, p.site_ghidra, false);
+    }
+}
+
+bool Scan6(MidContext* c, Plan& p, const char*& reason, bool& no_work) {
+    const u64 node = c->rbx;
+    const u64 data = Plausible(node) ? R<u64>(node + 0x108) : 0;
+    if (!EmitterPreamble(c, p, node, data, reason, no_work)) {
+        return false;
+    }
+    if (R<u32>(data + 0x38) == 0) {
+        no_work = true;
+        return false;
+    }
+    const u64 system = c->r13;
+    if (!Plausible(system)) {
+        reason = "the system is not set";
+        return false;
+    }
+    const auto field = [&](u64 owner, u64 offset) -> u64 { return Plausible(owner) ? R<u64>(owner + offset) : 0; };
+    p.v[0] = R<u64>(data + 0x160);                              // [rsp + 0xb8]
+    p.v[1] = field(R<u64>(data + 0x148), 0x28);                 // [rsp + 0xc0]
+    const u32 other = (R<u32>(data + 0x24c) ^ 1u) + R<u32>(data + 0x250) * 2;
+    p.v[3] = field(R<u64>(data + 0x1c8 + u64{other} * 8), 0x50); // [rsp + 0xf0]
+    p.v[2] = R<u64>(p.rsp + 0xc8);
+    p.v[4] = R<u64>(p.rsp + 0xd0);
+    p.v[5] = R<u64>(p.rsp + 0xd8);
+    p.v[6] = R<u64>(p.rsp + 0xf8);
+    p.v[7] = data;
+    p.v[8] = system;
+    p.v[9] = R<u32>(system + 0x78); // the cached shader index
+    const u64 device = R<u64>(Global(0x0689eed8));
+    p.v[10] = Plausible(device) ? R<u64>(device + 0x11b8) : 0;
+    if (p.v[10] == 0) {
+        reason = "the shader table is not set";
+        return false;
+    }
+    const u64 size = R<u64>(data + 0x30);
+    p.groups = (static_cast<u32>(size) + 7u) >> 3;
+    p.groups_y = (static_cast<u32>(size >> 32) + 7u) >> 3;
+    p.site_ghidra = 0x01bcbb5e;
+    p.async = false;
+    p.context_words.emplace_back(0x500 + 10 * 8, p.v[0]);
+    p.context_words.emplace_back(0x1980, p.v[1]);
+    p.context_words.emplace_back(0x1980 + 8, p.v[2]);
+    p.context_words.emplace_back(0x1980 + 16, p.v[4]);
+    p.context_words.emplace_back(0x1980 + 24, p.v[5]);
+    p.context_words.emplace_back(0x2098, p.v[3]);
+    p.context_words.emplace_back(0x2098 + 8, p.v[6]);
+    p.context_words.emplace_back(0x4670, p.v[10]);
+    p.registers = {{R15, data}};
+    return true;
+}
+void Apply6(const Plan& p, Writer& w) {
+    ApplyEmitterTables(p, w);
+    if (w.Live()) {
+        const u64 vtable = R<u64>(p.context);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x28))(p.context, 10, 1, p.rsp + 0xb8, 0, 0, 0);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x48))(p.context, 0, 2, p.rsp + 0xf0, 0, 0, 0);
+        reinterpret_cast<Virtual>(R<u64>(vtable + 0x40))(p.context, 0, 4, p.rsp + 0xc0, 0, 0, 0);
+    }
+    if (static_cast<u32>(p.v[9]) != 0x1b) {
+        w.Put<u32>(p.v[8] + 0x78, 0x1b);
+        if (w.Live()) {
+            reinterpret_cast<Virtual>(R<u64>(R<u64>(p.context) + 0x38))(p.context, p.v[10], 0, 0, 0, 0, 0); // SetShader
+        }
+    }
+    if (w.Live()) {
+        NativeDraw::IssueDispatch(p.context, p.groups, p.groups_y, 1, false, p.site_ghidra, false);
+    }
+}
+
+std::array<Site, 7>& Sites() {
+    static std::array<Site, 7> sites{{
         {"begin_recording_loop_1", 0x01c49e40, &Scan0, &Apply0, {}},
         {"begin_recording_loop_2", 0x01c4a9e3, &Scan1, &Apply1, {}},
         {"vertex_cluster_loop_1", 0x01d7e334, &Scan2, &Apply2, {}},
         {"vertex_cluster_loop_2", 0x01d7e5b0, &Scan3, &Apply3, {}},
         {"emitter_system_loop_e", 0x01bcc400, &Scan4, &Apply4, {}},
+        {"emitter_system_loop_c", 0x01bcbf02, &Scan5, &Apply5, {}},
+        {"emitter_system_loop_a", 0x01bcbb60, &Scan6, &Apply6, {}},
     }};
     return sites;
 }
@@ -859,6 +1013,18 @@ u64 FindHandler(const char* name) {
     }
     if (n == "site_bottom_4") {
         return reinterpret_cast<u64>(&Bottom<4>);
+    }
+    if (n == "site_top_5") {
+        return reinterpret_cast<u64>(&Top<5>);
+    }
+    if (n == "site_bottom_5") {
+        return reinterpret_cast<u64>(&Bottom<5>);
+    }
+    if (n == "site_top_6") {
+        return reinterpret_cast<u64>(&Top<6>);
+    }
+    if (n == "site_bottom_6") {
+        return reinterpret_cast<u64>(&Bottom<6>);
     }
     return 0;
 }
