@@ -3751,6 +3751,11 @@ void ScanWet(WetScanArgs& a) {
             return;
         }
         const bool readback = (R<u32>(s + 0x1b8) & 4) != 0;
+        if (readback) {
+            // the CPU readback (CopyResource, Map, memcpy, Unmap) is written in GenerateWet but no scene of the regression set asks for it, so it has never been verified: the engine keeps it
+            p.Decline("a CPU readback is pending (the engine's loop does it until the generator's is verified)");
+            return;
+        }
         for (u32 j = 0; j < jobs; ++j) {
             const u64 e = list + u64{j} * 0x20;
             const u64 object = R<u64>(e);
@@ -3823,6 +3828,7 @@ void WetLockRelease(u64 address) {
 }
 
 std::atomic<u64> wet_skipped_jobs{0};
+std::array<std::atomic<u64>, 4> wet_dispatches{}; // by phase: elapse, intersect, force; and the readbacks done
 std::atomic<u64> s_raced_wet_color{0};
 
 /// The blocks of the wet loop as functions of the engine's objects, so the verify run can build them again when it compares (the objects are rewritten by the game's thread).
@@ -3948,6 +3954,7 @@ void GenerateWet(Target& t, const WetPlan& p) {
     u32 wet_kind = 0;
     u64 wet_system = 0, wet_object = 0, wet_water = 0, wet_block = 0;
     const auto dispatch = [&](u32 x, u64 site) {
+        wet_dispatches[site == WetSiteElapse ? 0 : site == WetSiteIntersect ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
         if (live) {
             Timed(CallId::DrawIssue, [&] { NativeDraw::IssueDispatch(ctx, x, 1, 1, false, site, p.async); });
         } else {
@@ -4230,6 +4237,7 @@ void GenerateWet(Target& t, const WetPlan& p) {
                     if (rd_c == 0 || rd_s == 0 || destination == 0) {
                         continue;
                     }
+                    wet_dispatches[3].fetch_add(1, std::memory_order_relaxed);
                     vcall(0x88, R<u64>(rd_s + 0x20), R<u64>(rd_c + 0x20), 0, 0, 0);
                     u64 mapped = 0;
                     const u64 status = reinterpret_cast<Virtual>(R<u64>(R<u64>(ctx) + 0x90))(ctx, R<u64>(rd_s + 0x20), 0, 1, 0, reinterpret_cast<u64>(&mapped), 0);
@@ -5342,6 +5350,7 @@ nlohmann::json Report() {
                              {"verify_draws_compared", wj.verify_draws},
                              {"verify_words_that_moved", wj.verify_raced},
                              {"jobs_skipped_for_render_data_created_late", wet_skipped_jobs.load()},
+                             {"dispatches_by_phase", {{"elapse", wet_dispatches[0].load()}, {"intersect", wet_dispatches[1].load()}, {"force", wet_dispatches[2].load()}, {"readbacks_done_live", wet_dispatches[3].load()}}},
                              {"switched_off_by_verify", wj.disabled},
                              {"scan_faults", wj.not_scanned}};
         nlohmann::json wdeclines = nlohmann::json::object();
