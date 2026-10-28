@@ -763,7 +763,7 @@ void Start(u16 port) {
     }
     server_thread = std::jthread{[] { server->listen_after_bind(); }};
     LOG_INFO(Core, "debug server listening on 127.0.0.1:{}", port);
-    // The counters of a play session survive the game: every 20 s (TLG_COUNTER_SNAPSHOT=0 turns it off) the reports of /status, /zpassgen, /native and /registry are written to
+    // The counters of a play session survive the game: every 20 s (TLG_COUNTER_SNAPSHOT=0 turns it off) the reports of /status, /zpassgen, /native, /registry and /stats are written to
     // user/log/last_counters.json (written aside and renamed), so they can be read after the game is closed.
     const char* snapshot_env = std::getenv("TLG_COUNTER_SNAPSHOT");
     if (snapshot_env == nullptr || *snapshot_env != '0') {
@@ -778,7 +778,7 @@ void Start(u16 port) {
                     out["rare_events"] = rare_counts;
                 }
                 out["written_unix_s"] = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-                for (const char* name : {"/status", "/zpassgen", "/native", "/registry"}) {
+                for (const char* name : {"/status", "/zpassgen", "/native", "/registry", "/stats"}) {
                     Handler handler;
                     {
                         std::scoped_lock lk{registry_mutex};
