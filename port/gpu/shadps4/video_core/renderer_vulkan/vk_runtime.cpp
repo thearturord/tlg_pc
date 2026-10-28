@@ -109,8 +109,12 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     }
     // C8 (2026-10-28): the planner always decides; the tracker runs next to it and is only compared
     live_plan_on = true;
-    live_plan_exact = true;
     live_plan_decides = true;
+    // P1 (2026-10-28): the tracker and the exact list next to the planner are a comparison only (0 differences over the owner's plays): off by default
+    if (const char* e = std::getenv("TLG_BARRIER_TRACKER"); (e != nullptr && *e == '1') || hazard_audit_on) {
+        tracker_on = true;
+    }
+    live_plan_exact = tracker_on;
 }
 
 namespace {
@@ -280,8 +284,15 @@ void Runtime::PlanImageBarriers(VideoCore::Image* image, VideoCore::Image::Barri
 
 u64 Runtime::LivePlanSpace(const VideoCore::Buffer* handle, u64 offset, u64& begin) {
     const u64 base = handle->CpuAddr();
-    auto& seen = live_seen[reinterpret_cast<u64>(handle)];
     const u64 size = handle->SizeBytes();
+    if (handle == plan_last_handle && base == plan_last_base && size == plan_last_size) {
+        begin = base != 0 ? base + offset : offset;
+        return base != 0 ? 0 : reinterpret_cast<u64>(handle);
+    }
+    plan_last_handle = handle;
+    plan_last_base = base;
+    plan_last_size = size;
+    auto& seen = live_seen[reinterpret_cast<u64>(handle)];
     if (seen.base != base || seen.size != size) {
         // the buffer cache moved or re-created the buffer: both guest ranges count as read and written by an unknown access (the tracker keeps lists in the buffer's own offset space)
         if (seen.size != 0) {
@@ -1089,6 +1100,15 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
+    if (!tracker_on) {
+        // P1: the planner alone
+        u64 begin = 0;
+        auto& space = live_plan.buffers[LivePlanSpace(handle, offset, begin)];
+        const bool planned = space.write.Overlaps(begin, begin + size) || (check_read_access && space.read.Overlaps(begin, begin + size));
+        ++live_stats.queries;
+        live_stats.answered_true += planned ? 1 : 0;
+        return planned;
+    }
     MakeCurrent(handle);
     bool has_access = resource->write_ranges.Overlaps(offset, offset + size);
     const bool plan_logged_has_write = has_access;
@@ -1164,7 +1184,9 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
 
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
-    MakeCurrent(handle);
+    if (tracker_on) {
+        MakeCurrent(handle);
+    }
 
     const Interval range = {
         .start = offset,
@@ -1211,10 +1233,10 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         }
         list.Add(new_range);
     };
-    if (src_access & WRITE_MASK) {
+    if (tracker_on && (src_access & WRITE_MASK)) {
         add_range(resource->write_ranges, range);
     }
-    if (src_access & READ_MASK) {
+    if (tracker_on && (src_access & READ_MASK)) {
         add_range(resource->read_ranges, range);
     }
     if (hazard_audit_on) {

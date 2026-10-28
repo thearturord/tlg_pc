@@ -172,6 +172,10 @@ private:
     Planner planner, planner_by_address;
     void ReplayPlan();
     bool live_plan_on{}, live_plan_exact{}, live_plan_decides{};
+    /// P1: the old buffer tracker runs next to the planner only as a comparison (`TLG_BARRIER_TRACKER=1`, or the hazard audit); off, the planner alone answers
+    bool tracker_on{};
+    const VideoCore::Buffer* plan_last_handle{}; ///< LivePlanSpace: the buffer of the last call and the range it had (no map lookup when it is the same)
+    u64 plan_last_base{}, plan_last_size{};
     Planner live_exact; ///< TLG_BARRIER_PLANNER=2: the same lists without the collapse, the oracle for a miss
     Planner live_plan; ///< L4: updated by every access, consulted by every query, cleared by every effective flush
     struct SeenBuffer {
