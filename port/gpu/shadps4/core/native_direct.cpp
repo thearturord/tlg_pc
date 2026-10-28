@@ -228,10 +228,9 @@ void AddSpan(Buffer& buffer, const u32* begin, u32 dwords, u32 depth, bool marke
 
 } // namespace
 
-// LEGACY(packet-path): with the walk off (the default) a command buffer runs from its entries only.
+// C8 (2026-10-28): there is no packet path any more; a command buffer always runs from its entries.
 bool PacketPathOff() {
-    // Without the game's hooks no draw is a record: the packets are all there is.
-    return VideoCore::ReadbackPolicy::Get().packet_path.load(std::memory_order_relaxed) == 0 && GuestHooks::IsActive();
+    return true;
 }
 
 bool ExecuteEnabled() {
