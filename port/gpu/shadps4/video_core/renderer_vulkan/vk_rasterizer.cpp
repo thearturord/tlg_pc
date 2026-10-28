@@ -1533,8 +1533,13 @@ const DrawPlan* Rasterizer::DispatchBinderFor(const DispatchPlan* plan) {
     out.native_seq = plan->native_seq;
     out.binding_count = plan->binding_count;
     out.bindings_complete = true;
-    out.any_flat_skipped = LegacyDescriptorsOff();
-    out.stages[static_cast<u32>(Shader::SwStage::Compute)].flat_skipped = LegacyDescriptorsOff();
+    // a missing entry becomes null only when the record serves every kind; with fewer kinds (TLG_DISPATCH_BINDER_KINDS) the kinds it does not serve are read from the guest as before
+    static const bool serves_all_kinds = [] {
+        const char* e = std::getenv("TLG_DISPATCH_BINDER_KINDS");
+        return e == nullptr || *e == 0 || std::atoi(e) == 7;
+    }();
+    out.any_flat_skipped = LegacyDescriptorsOff() && serves_all_kinds;
+    out.stages[static_cast<u32>(Shader::SwStage::Compute)].flat_skipped = LegacyDescriptorsOff() && serves_all_kinds;
     out.has_handles = false;
     out.has_geometry_handles = false;
     std::memcpy(out.bindings.data(), plan->bindings.data(), sizeof(Core::NativeDraw::RecordBinding) * plan->binding_count);
