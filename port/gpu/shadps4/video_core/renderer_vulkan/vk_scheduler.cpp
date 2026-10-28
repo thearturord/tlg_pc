@@ -102,6 +102,10 @@ void SchedulerCore::BeginRendering(const RenderState& new_state) {
     const auto recorder = CommandBuffer();
     recorder.beginRendering(rendering_info);
     recorder.record([this](vk::CommandBuffer) { replay_rendering = true; });
+    if (const auto* list = recorder.List()) {
+        segment_begin_commands = list->Size();
+        segment_begin_draws = list->Draws();
+    }
     if (CaptureStamps()) {
         pass_draws = 0;
         RecordStamp(GpuStampPassBegin, 0);
@@ -115,6 +119,16 @@ void SchedulerCore::EndRendering() {
     is_rendering = false;
     if (stream_id == 0) {
         Core::NativePass::PassEnd(__builtin_return_address(0));
+    }
+    if (const auto* list = CommandBuffer().List(); list != nullptr && stream_id == 0 && list->Size() >= segment_begin_commands) {
+        const u32 kind = render_state.num_color_attachments == 0 ? 0 : render_state.num_color_attachments >= 4 ? 2 : 1;
+        const u64 commands = list->Size() - segment_begin_commands;
+        g_segment_census.segments[kind].fetch_add(1, std::memory_order_relaxed);
+        g_segment_census.commands[kind].fetch_add(commands, std::memory_order_relaxed);
+        g_segment_census.draws[kind].fetch_add(list->Draws() - segment_begin_draws, std::memory_order_relaxed);
+        u64 seen = g_segment_census.max_commands[kind].load(std::memory_order_relaxed);
+        while (commands > seen && !g_segment_census.max_commands[kind].compare_exchange_weak(seen, commands, std::memory_order_relaxed)) {
+        }
     }
     CommandBuffer().record([this](vk::CommandBuffer cmdbuf) {
         cmdbuf.endRendering();

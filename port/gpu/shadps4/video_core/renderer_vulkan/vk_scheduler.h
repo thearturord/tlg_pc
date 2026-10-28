@@ -363,6 +363,13 @@ struct SchedulerLocks {
     static inline thread_local bool submit_lock_held = false;
 };
 
+/// C6 census of the rendering instances recorded into the command lists (graphics stream): per kind (0 depth only, 1 colour, 2 four or more colour targets = G-buffer) the number of
+/// instances, the commands and the draws recorded between begin and end, and the largest instance. Counts only.
+struct SegmentCensus {
+    std::atomic<u64> segments[3]{}, commands[3]{}, draws[3]{}, max_commands[3]{};
+};
+inline SegmentCensus g_segment_census;
+
 /// One command stream: ticks (timeline semaphore), command lists, encoder thread, priority operation thread, one VkQueue.
 /// Scheduler (below) owns the graphics stream and, with TLG_ASC_QUEUE=1, a second one for the asynchronous compute queue 1.
 class SchedulerCore : public SchedulerLocks {
@@ -606,6 +613,7 @@ private:
     std::once_flag gpu_timeline_once;
     std::vector<GpuStamp> list_stamps; ///< the raster thread's: stamps of the command list being recorded
     u64 pass_draws = 0;
+    u64 segment_begin_commands{}, segment_begin_draws{};
     GpuTimeline* Timeline();
     bool CaptureStamps() const noexcept;
     void RecordStamp(u8 kind, u64 detail);

@@ -2004,6 +2004,15 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                                             {"since_start", {{"answered_without_a_synchronization", resident_total[0]}, {"synchronized", resident_total[1]}, {"verify_runs", resident_total[2]}, {"stale_answers_found_by_verify", resident_total[3]}, {"registered_buffers", resident_total[5]}}},
                                             {"note", "C1 / C3, counts per ~5 s interval; since_start is cumulative"}});
             }
+            {
+                const auto& s = Vulkan::g_segment_census;
+                nlohmann::json kinds = nlohmann::json::object();
+                const char* names[3] = {"depth_only", "colour", "g_buffer_4_or_more_targets"};
+                for (u32 k = 0; k < 3; ++k) {
+                    kinds[names[k]] = {{"rendering_instances", s.segments[k].load()}, {"commands", s.commands[k].load()}, {"draws", s.draws[k].load()}, {"largest_instance_commands", s.max_commands[k].load()}};
+                }
+                Core::DebugServer::Publish("segment_census", {{"by_kind_since_start", std::move(kinds)}, {"note", "C6 census: commands and draws recorded between a begin and an end of rendering, graphics stream, counts only"}});
+            }
             if (rasterizer->HazardAuditOn()) {
                 const auto h = rasterizer->TakeHazardAudit();
                 static constexpr const char* sources[] = {"z_shadow_draws", "g_buffer_draws", "forward_draws", "compute", "indirect_draws", "untagged_draws", "buffer_copies", "fills_and_inline_data", "image_copies_and_uploads", "unknown_merged_ranges"};

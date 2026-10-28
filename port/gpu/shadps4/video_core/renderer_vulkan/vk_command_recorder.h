@@ -35,6 +35,14 @@ public:
         return head == nullptr;
     }
 
+    /// C6 census: draws recorded so far (never reset; the scheduler takes differences).
+    void NoteDraw() noexcept {
+        ++draws;
+    }
+    [[nodiscard]] u64 Draws() const noexcept {
+        return draws;
+    }
+
     /// Number of commands recorded since the last replay.
     [[nodiscard]] u64 Size() const noexcept {
         return num_commands;
@@ -146,6 +154,7 @@ private:
     Command* head{};
     Command* tail{};
     u64 num_commands{};
+    u64 draws{};
 };
 
 /// What the scheduler hands out instead of a raw command buffer. In direct mode every call goes
@@ -405,32 +414,51 @@ public:
         list->Record([=](vk::CommandBuffer c) { c.beginRendering(*copy); });
     }
 
+    [[nodiscard]] CommandList* List() const noexcept {
+        return list;
+    }
+
     void endRendering() const {
         Do([](vk::CommandBuffer c) { c.endRendering(); });
     }
 
     void draw(u32 vertices, u32 instances, u32 first_vertex, u32 first_instance) const {
+        if (list) {
+            list->NoteDraw();
+        }
         Do([=](vk::CommandBuffer c) { c.draw(vertices, instances, first_vertex, first_instance); });
     }
 
     void drawIndexed(u32 indices, u32 instances, u32 first_index, s32 vertex_offset,
                      u32 first_instance) const {
+        if (list) {
+            list->NoteDraw();
+        }
         Do([=](vk::CommandBuffer c) {
             c.drawIndexed(indices, instances, first_index, vertex_offset, first_instance);
         });
     }
 
     void drawIndirect(vk::Buffer buffer, vk::DeviceSize offset, u32 count, u32 stride) const {
+        if (list) {
+            list->NoteDraw();
+        }
         Do([=](vk::CommandBuffer c) { c.drawIndirect(buffer, offset, count, stride); });
     }
 
     void drawIndexedIndirect(vk::Buffer buffer, vk::DeviceSize offset, u32 count,
                              u32 stride) const {
+        if (list) {
+            list->NoteDraw();
+        }
         Do([=](vk::CommandBuffer c) { c.drawIndexedIndirect(buffer, offset, count, stride); });
     }
 
     void drawIndirectCount(vk::Buffer buffer, vk::DeviceSize offset, vk::Buffer count_buffer,
                            vk::DeviceSize count_offset, u32 max_count, u32 stride) const {
+        if (list) {
+            list->NoteDraw();
+        }
         Do([=](vk::CommandBuffer c) {
             c.drawIndirectCount(buffer, offset, count_buffer, count_offset, max_count, stride);
         });
@@ -438,6 +466,9 @@ public:
 
     void drawIndexedIndirectCount(vk::Buffer buffer, vk::DeviceSize offset, vk::Buffer count_buffer,
                                   vk::DeviceSize count_offset, u32 max_count, u32 stride) const {
+        if (list) {
+            list->NoteDraw();
+        }
         Do([=](vk::CommandBuffer c) {
             c.drawIndexedIndirectCount(buffer, offset, count_buffer, count_offset, max_count,
                                        stride);
