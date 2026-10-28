@@ -2092,8 +2092,8 @@ bool Rasterizer::HazardAuditOn() const noexcept {
 
 void Rasterizer::HarvestAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) {
     static const bool on = [] {
-        const char* e = std::getenv("TLG_HARVEST_AHEAD"); // off until verified (O1, left for later on 2026-10-28)
-        return e != nullptr && *e == '1';
+        const char* e = std::getenv("TLG_HARVEST_AHEAD"); // P2: on by default (verified 2026-10-28: 0 misses, 0 stale answers); 0 turns it off
+        return e == nullptr || *e != '0';
     }();
     if (!on || !Core::WriteWatch::Enabled() || (draw_plan == nullptr && dispatch_plan == nullptr)) {
         return;

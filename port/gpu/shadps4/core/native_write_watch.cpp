@@ -310,7 +310,7 @@ void BackgroundLoop() {
     }();
     const u64 window_us = [] {
         const char* e = std::getenv("TLG_WRITE_WATCH_WINDOW_US");
-        return e != nullptr ? std::strtoull(e, nullptr, 10) : 1000ull;
+        return e != nullptr ? std::strtoull(e, nullptr, 10) : 0ull;
     }();
     std::vector<uintptr_t> pages;
     for (;;) {
@@ -453,7 +453,7 @@ void Harvest(VAddr address, u64 size, Replay replay, IsCpuDirty dirty, IsCpuDirt
         // a write is seen at most this long after it happened even inside one epoch (the fault saw it at once)
         static const u64 window_ns = [] {
             const char* e = std::getenv("TLG_WRITE_WATCH_WINDOW_US");
-            return (e != nullptr ? std::strtoull(e, nullptr, 10) : 1000ull) * 1000ull;
+            return (e != nullptr ? std::strtoull(e, nullptr, 10) : 0ull) * 1000ull; // P2: off by default (2026-10-28), only submissions and passed waits
         }();
         static std::atomic<u64> last_bump{0};
         const u64 t = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
