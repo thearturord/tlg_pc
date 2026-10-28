@@ -30,7 +30,7 @@ std::atomic<bool> enabled{[] {
     const char* res = std::getenv("TLG_RESIDENT_BUFFERS");
     // the announcements are also what the native uploads and the snapshots are made of
     return (e != nullptr && *e != 0 && *e != '0') || (u != nullptr && *u != 0 && *u != '0') || (s != nullptr && *s != 0 && *s != '0') ||
-           (r != nullptr && *r != 0 && *r != '0') || (res != nullptr && *res != 0 && *res != '0');
+           (r != nullptr && *r != 0 && *r != '0') || res == nullptr || *res != '0'; // resident buffers are on by default (L1), so are their announcements
 }()};
 
 namespace {

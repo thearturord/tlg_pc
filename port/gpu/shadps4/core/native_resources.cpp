@@ -725,8 +725,8 @@ u64 ImmutableEpoch() {
 
 bool ResidentBuffersEnabled() {
     static const bool on = [] {
-        const char* e = std::getenv("TLG_RESIDENT_BUFFERS");
-        return e != nullptr && *e != 0 && *e != '0';
+        const char* e = std::getenv("TLG_RESIDENT_BUFFERS"); // default on since 2026-10-28 (L1); =0 turns it off
+        return e == nullptr || *e == 0 || *e != '0';
     }();
     return on;
 }
