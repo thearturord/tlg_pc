@@ -155,7 +155,103 @@ u32 Runtime::HazardSource() const {
     return draw_class <= 4 ? draw_class : 5;
 }
 
+void Runtime::ReplayPlan() {
+    constexpr size_t MaxIntervals = 64;
+    const auto add_range = [&](Planner::List& list, const Interval& range) {
+        if (!planner.bounded) {
+            list.Add(range);
+            return;
+        }
+        if (list.Contains(range.start, range.end)) {
+            return;
+        }
+        if (list.Size() >= MaxIntervals) {
+            u64 lo = range.start, hi = range.end;
+            for (const auto& interval : list) {
+                lo = std::min(lo, interval.start);
+                hi = std::max(hi, interval.end);
+            }
+            list.Clear();
+            list.Add({.start = lo, .end = hi});
+            return;
+        }
+        list.Add(range);
+    };
+    for (const PlanEvent& e : plan_log) {
+        ++hazard.plan_events;
+        switch (e.kind) {
+        case PlanEvent::Query: {
+            auto& state = planner.buffers[e.handle];
+            bool answer = state.write.Overlaps(e.offset, e.offset + e.size);
+            if (e.check_read && !answer) {
+                answer = state.read.Overlaps(e.offset, e.offset + e.size);
+            }
+            ++hazard.plan_queries;
+            hazard.plan_query_mismatches += answer != e.answer ? 1 : 0;
+            {
+                // the same plan keyed by guest address (one list for all guest memory) instead of by buffer: what the command processor thread could plan before any buffer exists
+                auto& space = planner_by_address.buffers[e.address != 0 ? 0 : e.handle];
+                const u64 begin = e.address != 0 ? e.address : e.offset;
+                bool by_address = space.write.Overlaps(begin, begin + e.size);
+                if (e.check_read && !by_address) {
+                    by_address = space.read.Overlaps(begin, begin + e.size);
+                }
+                hazard.addr_true_tracker_false += by_address && !e.answer ? 1 : 0;
+                hazard.addr_false_tracker_true += !by_address && e.answer ? 1 : 0;
+                if (!by_address && e.answer) {
+                    static u32 logged = 0;
+                    if (logged++ < 24) {
+                        LOG_ERROR(Render_Vulkan, "C5 planner by address missed a barrier: handle {:#x} offset {:#x} size {:#x} address {:#x} check_read {}", e.handle, e.offset, e.size, e.address, e.check_read);
+                    }
+                }
+            }
+            break;
+        }
+        case PlanEvent::Access: {
+            auto& state = planner.buffers[e.handle];
+            const Interval range{.start = e.offset, .end = e.offset + e.size};
+            if (e.write) {
+                add_range(state.write, range);
+            }
+            if (e.read) {
+                add_range(state.read, range);
+            }
+            planner.memory_pending |= e.staged;
+            {
+                auto& space = planner_by_address.buffers[e.address != 0 ? 0 : e.handle];
+                const u64 begin = e.address != 0 ? e.address : e.offset;
+                const Interval range2{.start = begin, .end = begin + e.size};
+                if (e.write) {
+                    add_range(space.write, range2);
+                }
+                if (e.read) {
+                    add_range(space.read, range2);
+                }
+                planner_by_address.memory_pending |= e.staged;
+            }
+            break;
+        }
+        case PlanEvent::Flush: {
+            const bool effective = planner.memory_pending || e.image_pending;
+            ++hazard.plan_flushes;
+            hazard.plan_flush_mismatches += effective != e.answer ? 1 : 0;
+            if (effective) {
+                planner.buffers.clear();
+                planner.memory_pending = false;
+                planner_by_address.buffers.clear();
+                planner_by_address.memory_pending = false;
+            }
+            break;
+        }
+        }
+    }
+    plan_log.clear();
+}
+
 void Runtime::EndAuditUnit() {
+    if (hazard_audit_on) {
+        ReplayPlan();
+    }
     if (!hazard_audit_on || unit_bits.empty()) {
         return;
     }
@@ -815,12 +911,15 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
                                bool check_read_access) {
     MakeCurrent(handle);
     bool has_access = resource->write_ranges.Overlaps(offset, offset + size);
+    const bool plan_logged_has_write = has_access;
+    (void)plan_logged_has_write;
     bool by_read = false;
     if (check_read_access && !has_access) {
         has_access |= resource->read_ranges.Overlaps(offset, offset + size);
         by_read = has_access;
     }
     if (hazard_audit_on) {
+        plan_log.push_back({PlanEvent::Query, check_read_access, false, false, false, false, has_access, reinterpret_cast<u64>(handle), offset, size, handle->CpuAddr() != 0 ? handle->CpuAddr() + offset : 0});
         ++hazard.buffer_queries;
         {
             auto& ask = hazard.ask_keys[{HazardSource(), hazard_program, reinterpret_cast<u64>(handle)}];
@@ -920,6 +1019,10 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         }
     }
 
+    if (hazard_audit_on) {
+        plan_log.push_back({PlanEvent::Access, false, (src_access & WRITE_MASK) != vk::AccessFlags2{}, (src_access & READ_MASK) != vk::AccessFlags2{}, src_stage != vk::PipelineStageFlags2{}, false, false,
+                            reinterpret_cast<u64>(handle), offset, size, handle->CpuAddr() != 0 ? handle->CpuAddr() + offset : 0});
+    }
     memory_barrier.srcStageMask |= src_stage;
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
 }
@@ -936,6 +1039,9 @@ void Runtime::FlushBarriers() {
         dep_info.imageMemoryBarrierCount = static_cast<u32>(image_barriers.size());
     }
 
+    if (hazard_audit_on) {
+        plan_log.push_back({PlanEvent::Flush, false, false, false, false, !image_barriers.empty(), dep_info.memoryBarrierCount != 0 || dep_info.imageMemoryBarrierCount != 0, 0, 0, 0, 0});
+    }
     if (!dep_info.memoryBarrierCount && !dep_info.imageMemoryBarrierCount) {
         return;
     }

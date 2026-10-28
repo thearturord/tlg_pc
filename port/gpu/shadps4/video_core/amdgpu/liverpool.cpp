@@ -2071,6 +2071,10 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                         never_true_keys += counts.first >= 1000 && counts.second == 0 ? 1 : 0;
                     }
                     static u64 units = 0, lr = 0, li = 0, lbd = 0, lb = 0, sr = 0, si = 0, sbd = 0, sb = 0;
+                    static u64 pq = 0, pqm = 0, pf = 0, pfm = 0, pe = 0, atf = 0, aft = 0;
+                    pq += h.plan_queries; pqm += h.plan_query_mismatches; pf += h.plan_flushes; pfm += h.plan_flush_mismatches; pe += h.plan_events; atf += h.addr_true_tracker_false; aft += h.addr_false_tracker_true;
+                    out["recipe_planner"] = {{"events_replayed", pe}, {"queries", pq}, {"query_answers_differing_from_the_tracker", pqm}, {"flushes", pf}, {"flush_effects_differing", pfm},
+                                           {"by_guest_address_barrier_the_tracker_did_not_ask_for", atf}, {"by_guest_address_missed_barrier", aft}};
                     units += h.units; lr += h.loose_repeated; li += h.loose_identical; lbd += h.loose_bits_differing; lb += h.loose_bits;
                     sr += h.strict_repeated; si += h.strict_identical; sbd += h.strict_bits_differing; sb += h.strict_bits;
                     out["recipe_units"] = {{"submissions", units}, {"loose_shape_seen_before", lr}, {"loose_bit_identical", li}, {"loose_bits_differing", lbd}, {"loose_bits_compared", lb},

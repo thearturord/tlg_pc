@@ -95,6 +95,7 @@ public:
         std::map<std::tuple<u32, u64, u64>, std::pair<u64, u64>> ask_keys; ///< key: (source, program, the buffer asked about)
         /// C5 frame recipe test, per submission ("unit"): the sequence of the tracker's answers as a bit vector, compared with the last unit that had the same shape (the sequence of
         /// askers, loose = (source, program), strict = also the buffer): units seen, units whose shape was seen before, of those the bit identical ones, the differing bits, the bits compared
+        u64 plan_queries{}, plan_query_mismatches{}, plan_flushes{}, plan_flush_mismatches{}, plan_events{}, addr_true_tracker_false{}, addr_false_tracker_true{};
         u64 units{}, loose_repeated{}, loose_identical{}, loose_bits_differing{}, loose_bits{}, strict_repeated{}, strict_identical{}, strict_bits_differing{}, strict_bits{};
     };
     /// The compute program whose dispatch is being bound (the hazard audit attributes its accesses to it).
@@ -134,6 +135,26 @@ private:
     u64 unit_loose{0xcbf29ce484222325ull}, unit_strict{0xcbf29ce484222325ull};
     std::unordered_map<u64, std::vector<u8>> unit_loose_seen, unit_strict_seen;
     void EndAuditUnit();
+    /// C5 planner (audit only): the buffer tracker as a pure state machine over a log of events (query, access, flush). The log is the "frame recipe as data"; replaying it through the
+    /// planner must give the live tracker's answer to every query and the live flush's effect: 0 mismatches means the barrier plan is a deterministic function of the access list.
+    struct PlanEvent {
+        enum Kind : u8 { Query, Access, Flush } kind;
+        bool check_read{}, write{}, read{}, staged{}, image_pending{}, answer{}; ///< query: check_read, answer; access: write, read, staged (src stage non zero); flush: image_pending, answer = effective
+        u64 handle{}, offset{}, size{};
+        u64 address{}; ///< the guest address of the range (the buffer's CPU address + offset), 0 for a buffer that is not guest memory
+    };
+    struct Planner {
+        using List = IntervalList<Interval>;
+        struct State {
+            List read, write;
+        };
+        std::unordered_map<u64, State> buffers;
+        bool memory_pending{false};
+        bool bounded{true};
+    };
+    std::vector<PlanEvent> plan_log;
+    Planner planner, planner_by_address;
+    void ReplayPlan();
     u32 hazard_override{~0u}; ///< set inside the runtime's own copies, fills and image transfers
     HazardAudit hazard{};
     u32 HazardSource() const;
