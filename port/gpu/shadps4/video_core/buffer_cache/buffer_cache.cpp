@@ -630,6 +630,12 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                 }
                 return {arena, arena->Offset(device_addr)};
             }
+            if (StreamWhilePassOpen(device_addr, size)) {
+                // O1 / C6 step 1: a small read-only range of a buffer that needs a synchronization while a render pass is open goes through the stream buffer
+                // (no copy command, so the pass is not cut); the buffer stays unsynchronized and the next use outside a pass synchronizes it
+                Core::NativeResources::NoteBufferRequest(device_addr, size, false, Core::NativeResources::BufferPath::StreamCopy, size);
+                return StreamCopy(device_addr, size);
+            }
             const u32 generation = immutable->generation.load(std::memory_order_acquire);
             const u32 whole = static_cast<u32>(immutable->end - immutable->begin);
             const auto* arena = GetArena(immutable->begin >> block_shift, (immutable->end - 1) >> block_shift);
@@ -649,7 +655,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         }
     }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+    if (!is_written && size <= STREAM_THRESHOLD && (!IsRegionGpuModified(device_addr, size) || (!is_texel_buffer && StreamWhilePassOpen(device_addr, size)))) {
         // Stream copies are at most STREAM_THRESHOLD bytes, so the size fits in the low 16 bits.
         const u64 reuse_key = (device_addr << 16) | size;
         auto& reuse = stream_reuse_sets[Vulkan::Scheduler::SideSelected() ? 1 : 0];
@@ -741,6 +747,22 @@ u32 BufferCache::WaitForExplicitDownloads(VAddr device_addr, u64 size, u32 timeo
         return 0;
     }
     return explicit_landed.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return !overlaps(); }) ? 1 : 2;
+}
+
+bool BufferCache::StreamWhilePassOpen(VAddr device_addr, u32 size) {
+    // a page the GPU wrote somewhere is no reason to cut the pass: only bytes the GPU wrote (the precise ranges) must come from the arena
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_STREAM_IN_PASS");
+        return e == nullptr || *e != '0';
+    }();
+    return on && size <= STREAM_THRESHOLD && scheduler.IsRendering() && !IsRangeGpuWritten(device_addr, size);
+}
+
+std::pair<const Buffer*, u64> BufferCache::StreamCopy(VAddr device_addr, u32 size) {
+    const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
+    memory->CopySparseMemory(device_addr, data, size);
+    stream_buffer.Commit();
+    return {&stream_buffer, offset};
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForDownload(VAddr device_addr, u32 size) {

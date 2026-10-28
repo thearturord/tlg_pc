@@ -105,6 +105,11 @@ public:
     /// write fault would have; called before any use of the range's CPU state
     void HarvestWriteWatch(VAddr device_addr, u64 size, bool image = false);
 
+    /// O1 / C6 step 1 (`TLG_STREAM_IN_PASS=0` turns it off): a small read-only request while a render pass is open, whose bytes the GPU did not write, is served
+    /// from the stream buffer, so an upload does not cut the pass
+    [[nodiscard]] bool StreamWhilePassOpen(VAddr device_addr, u32 size);
+    std::pair<const Buffer*, u64> StreamCopy(VAddr device_addr, u32 size);
+
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
 
