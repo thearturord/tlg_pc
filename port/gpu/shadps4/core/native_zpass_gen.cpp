@@ -267,6 +267,9 @@ State& S() {
 
 // ------------------------------------------------------------------------------------------------------------------------------- the target of the generator
 
+/// B4: the instancing scene block (the holder's `+ 0x10`, 0x5b0 bytes copied from the scene) of the pass being verified, and its source: the verify run re-reads the scene when a word differs
+thread_local u64 g_inst_scene_block{0}, g_inst_scene_source{0};
+
 struct Mark {
     size_t arena_end;
     u32 kind;
@@ -4650,6 +4653,8 @@ void GenerateInst(Target& t, const InstPlan& p) {
     if (mask != 0) {
         {
             const u64 destination = R<u64>(H + 0x5c0);
+            g_inst_scene_block = H + 0x10;
+            g_inst_scene_source = F;
             if (live) {
                 std::memcpy(reinterpret_cast<void*>(H + 0x10), reinterpret_cast<const void*>(F), 0x5b0);
                 update_live(destination, H + 0x10);
@@ -4872,6 +4877,20 @@ void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3) {
                     std::memcpy(bytes.data() + 0xc, &live_flag, 4);
                     ++v.raced;
                     ++s.raced_words[fmt::format("view {} skinning flag word {:#x}", v.view, 0xc)];
+                }
+            }
+            if (g_inst_scene_block != 0 && address == g_inst_scene_block && bytes.size() == 0x5b0) {
+                // the scene block is a copy of the scene, which the game's main thread keeps updating (times, fades): where the scene's word is no longer the one the generator copied the engine's loop
+                // copied a later value, which is a race and no difference
+                for (u32 w = 0; w < 0x5b0; w += 4) {
+                    u32 live_word = 0, generated_word = 0;
+                    std::memcpy(&live_word, reinterpret_cast<const void*>(address + w), 4);
+                    std::memcpy(&generated_word, bytes.data() + w, 4);
+                    if (live_word != generated_word && R<u32>(g_inst_scene_source + w) != generated_word) {
+                        std::memcpy(bytes.data() + w, &live_word, 4);
+                        ++v.raced;
+                        ++s.raced_words[fmt::format("view {} instancing scene block word {:#x}", v.view, w)];
+                    }
                 }
             }
             if (std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) != 0) {
