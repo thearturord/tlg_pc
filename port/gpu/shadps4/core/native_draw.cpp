@@ -2201,7 +2201,7 @@ const Vulkan::FixedState* Build(u64 ctx, const DeviceAddresses& dev, u32& stale)
         ds = Rd<u64>(dev.device, 0x30288);
     }
     if (blend == 0 || raster == 0 || ds == 0 || dev.topology_table == 0) {
-        return nullptr;
+        { Live().fixed_null[0].fetch_add(1, std::memory_order_relaxed); return nullptr; }
     }
     if (Rd<u8>(ctx, 0x46d8) == 0) {
         stale = Vulkan::StaleSurface | Vulkan::StaleClip;
@@ -2247,7 +2247,7 @@ const Vulkan::FixedState* Build(u64 ctx, const DeviceAddresses& dev, u32& stale)
         }
     }
     if (states.size() >= 16384) {
-        return nullptr;
+        { Live().fixed_null[1].fetch_add(1, std::memory_order_relaxed); return nullptr; }
     }
 
     Vulkan::FixedState s = Vulkan::DefaultFixedState();
@@ -2269,7 +2269,7 @@ const Vulkan::FixedState* Build(u64 ctx, const DeviceAddresses& dev, u32& stale)
             if (!Pick(BlendFactors, Rd<u32>(rt, 4), out.src_color) || !Pick(BlendFactors, Rd<u32>(rt, 8), out.dst_color) ||
                 !Pick(BlendOps, Rd<u32>(rt, 12), out.color_op) || !Pick(BlendFactors, Rd<u32>(rt, 16), out.src_alpha) ||
                 !Pick(BlendFactors, Rd<u32>(rt, 20), out.dst_alpha) || !Pick(BlendOps, Rd<u32>(rt, 24), out.alpha_op)) {
-                return nullptr;
+                { Live().fixed_null[2].fetch_add(1, std::memory_order_relaxed); return nullptr; }
             }
         }
         s.target_write_mask[i] = target7 && i == 7 ? 0xf : static_cast<u8>(Rd<u8>(rt, 0x1c) & 0xf);
@@ -2296,7 +2296,7 @@ const Vulkan::FixedState* Build(u64 ctx, const DeviceAddresses& dev, u32& stale)
         const u32 prim_code = topology < 10 ? (Rd<u32>(dev.topology_table, topology * 4) & 0x3f) : 9u;
         const auto prim = static_cast<AmdGpu::PrimitiveType>(prim_code);
         if (prim == AmdGpu::PrimitiveType::None) {
-            return nullptr;
+            { Live().fixed_null[3].fetch_add(1, std::memory_order_relaxed); return nullptr; }
         }
         Vulkan::SetFixedStateTopology(s, prim, cull_mode);
         s.clip_disabled = prim == AmdGpu::PrimitiveType::RectList;
@@ -2316,22 +2316,23 @@ const Vulkan::FixedState* Build(u64 ctx, const DeviceAddresses& dev, u32& stale)
             s.depth_write = false;
             const u32 index = Rd<u32>(d, 8);
             if (dev.depth_stencil_table == 0) {
-                return nullptr;
+                { Live().fixed_null[4].fetch_add(1, std::memory_order_relaxed); return nullptr; }
             }
             s.depth_compare = Vulkan::LiverpoolToVK::CompareOp(
                 static_cast<AmdGpu::CompareFunc>(Rd<u32>(dev.depth_stencil_table, index * 4) & 7));
-        } else if (!Pick(CompareOps, Rd<u32>(d, 8), s.depth_compare, 1)) {
-            return nullptr;
+        } else if (!Pick(CompareOps, Rd<u32>(d, 8), s.depth_compare, s.depth_test ? 1u : 0u)) {
+            // a zeroed description (depth test off, function 0) reads as "never", which the disabled test ignores
+            { Live().fixed_null[5].fetch_add(1, std::memory_order_relaxed); return nullptr; }
         }
         const u32 stencil = Rd<u32>(d, 12);
         s.stencil_test = (stencil & 1) != 0;
         auto& front = s.stencil_front_ops;
         auto& back = s.stencil_back_ops;
         if (!Pick(StencilOps, Rd<u32>(d, 16), front.fail_op) || !Pick(StencilOps, Rd<u32>(d, 20), front.depth_fail_op) ||
-            !Pick(StencilOps, Rd<u32>(d, 24), front.pass_op) || !Pick(CompareOps, Rd<u32>(d, 28), front.compare_op, 1) ||
+            !Pick(StencilOps, Rd<u32>(d, 24), front.pass_op) || !Pick(CompareOps, Rd<u32>(d, 28), front.compare_op, s.stencil_test ? 1u : 0u) ||
             !Pick(StencilOps, Rd<u32>(d, 32), back.fail_op) || !Pick(StencilOps, Rd<u32>(d, 36), back.depth_fail_op) ||
-            !Pick(StencilOps, Rd<u32>(d, 40), back.pass_op) || !Pick(CompareOps, Rd<u32>(d, 44), back.compare_op, 1)) {
-            return nullptr;
+            !Pick(StencilOps, Rd<u32>(d, 40), back.pass_op) || !Pick(CompareOps, Rd<u32>(d, 44), back.compare_op, s.stencil_test ? 1u : 0u)) {
+            { Live().fixed_null[6].fetch_add(1, std::memory_order_relaxed); return nullptr; }
         }
         s.stencil_reference = {stencil_ref, stencil_ref};
         const u32 write_mask = (dsv_flags & 2) != 0 ? 0u : ((stencil >> 16) & 0xff);

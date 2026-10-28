@@ -59,6 +59,8 @@ struct LiveCounters {
     std::atomic<u64> stage_key_hits{}, stage_key_misses{}, stage_key_uncached{}, stage_key_audits{}, stage_key_violations{};
     /// cp_exec_inputs: draws planned from the record alone, draws that could not be (no cached inputs or pipeline yet), draws planned both ways and compared, and the ones that differed
     std::atomic<u64> exec_typed{}, exec_fallback{}, exec_audits{}, exec_violations{};
+    std::array<std::atomic<u64>, 12> fixed_null{}; ///< why Fixed::Build gave no fixed state (by exit point)
+    std::array<std::atomic<u64>, 3> plan_null{};   ///< why PlanExecDraw gave no plan: 0 stale surface / clip, 1 inputs not learned yet, 2 pipeline plan failed
     /// why a draw was not planned from its record: 0 the switches are not all on, 1 the record has no key (not typed, no fixed state), 2 the command processor is not split,
     /// 3 a fixed-state verify draw, 4 no cached render target inputs or pipeline for its keys yet, 5 a fast clear eliminate that could not be planned
     std::array<std::atomic<u64>, 8> exec_reason{};

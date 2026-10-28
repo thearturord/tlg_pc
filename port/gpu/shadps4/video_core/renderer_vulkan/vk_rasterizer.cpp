@@ -672,6 +672,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u32
     }
     const auto cached = exec_inputs.find(inputs_key);
     if (native_stale != 0 || cached == exec_inputs.end()) {
+        Core::NativeDraw::Live().plan_null[native_stale != 0 ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
     std::unique_ptr<DrawPlan> plan;
@@ -707,6 +708,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u32
         Core::NativeRegistry::NoteBinderReason(draw_class, 2, draw.bindings_overflow ? 10 : 1); // the whole draw keeps the flat user data: its binding list is not complete
     }
     if (!pipeline_cache.PlanGraphicsTyped(exec_key, plan->fixed, vertex_user_data, pixel_user_data, *plan, skip_flat ? &draw : nullptr, draw_class)) {
+        Core::NativeDraw::Live().plan_null[2].fetch_add(1, std::memory_order_relaxed);
         RecyclePlan(std::move(plan));
         return nullptr;
     }

@@ -194,7 +194,9 @@ nlohmann::json Native(const Params&) {
     j["exec_inputs"] = {{"typed", live.exec_typed.load()}, {"fallback", live.exec_fallback.load()}, {"audits", live.exec_audits.load()}, {"violations", live.exec_violations.load()},
                         {"fast_clear", live.exec_fast_clear.load()}, {"inline", live.exec_inline.load()}, {"inline_seen", live.exec_inline_seen.load()},
                         {"reasons", {live.exec_reason[0].load(), live.exec_reason[1].load(), live.exec_reason[2].load(), live.exec_reason[3].load(),
-                                     live.exec_reason[4].load(), live.exec_reason[5].load(), live.exec_reason[6].load(), live.exec_reason[7].load()}}};
+                                     live.exec_reason[4].load(), live.exec_reason[5].load(), live.exec_reason[6].load(), live.exec_reason[7].load()}},
+                        {"fixed_null_by_exit", [&live] { nlohmann::json a = nlohmann::json::array(); for (const auto& c : live.fixed_null) { a.push_back(c.load()); } return a; }()},
+                        {"plan_null_stale_inputs_pipeline", {live.plan_null[0].load(), live.plan_null[1].load(), live.plan_null[2].load()}}};
     j["exec_state"] = {{"planned", live.state_planned.load()}, {"audits", live.state_audits.load()}, {"violations", live.state_violations.load()},
                        {"group_violations", live.state_group_violations.load()}};
     j["fetch_rebuild"] = {{"tried", live.fetch_rebuild_tried.load()}, {"rebuilt", live.fetch_rebuilt.load()}, {"refused", live.fetch_rebuild_refused.load()}, {"executed", live.fetch_rebuild_exec.load()}};

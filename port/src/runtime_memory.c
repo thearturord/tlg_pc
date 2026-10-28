@@ -156,7 +156,8 @@ static HANDLE section;
 static void win_fail(const char *what, uintptr_t address, uint64_t size);
 static int ww_enabled(void) {
     static int on=-1;
-    if (on<0) { const char *e=getenv("TLG_WRITE_WATCH"); on=e && *e=='1'; }
+    /* default on since the owner's play of 2026-10-28; TLG_WRITE_WATCH=0 maps the GPU memory as views of the section again */
+    if (on<0) { const char *e=getenv("TLG_WRITE_WATCH"); on=!e || *e!='0'; }
     return on;
 }
 static unsigned char *phys_used; /* one byte per 64 KiB of the section: its content may be non-zero */
