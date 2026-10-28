@@ -5,6 +5,7 @@
 
 #include "core/stream_probe.h"
 #include "core/frame_timeline.h"
+#include "core/native_write_watch.h"
 #include "core/native_registry.h"
 #include "core/resource_audit.h"
 #include "common/arch.h"
@@ -2012,6 +2013,9 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                     kinds[names[k]] = {{"rendering_instances", s.segments[k].load()}, {"commands", s.commands[k].load()}, {"draws", s.draws[k].load()}, {"largest_instance_commands", s.max_commands[k].load()}};
                 }
                 Core::DebugServer::Publish("segment_census", {{"by_kind_since_start", std::move(kinds)}, {"note", "C6 census: commands and draws recorded between a begin and an end of rendering, graphics stream, counts only"}});
+            }
+            if (Core::WriteWatch::Enabled()) {
+                Core::DebugServer::Publish("write_watch", Core::WriteWatch::Report());
             }
             if (rasterizer->LivePlannerOn()) {
                 const auto p = rasterizer->ReadLivePlanStats();
@@ -4375,6 +4379,7 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 }
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bool partial) {
+    Core::WriteWatch::BumpEpoch(); // the CPU's data for this submission is written by now (L3 write watch)
     auto& queue = mapped_queues[GfxQueueId];
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
@@ -4404,6 +4409,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bo
 
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
+    Core::WriteWatch::BumpEpoch(); // the CPU's data for this submission is written by now (L3 write watch)
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;

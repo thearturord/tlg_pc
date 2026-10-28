@@ -32,6 +32,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "core/native_write_watch.h"
 
 #include <vk_mem_alloc.h>
 
@@ -144,6 +145,28 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
         ReadMemory(device_addr, size, true, assume_locks);
     });
+}
+
+void BufferCache::HarvestWriteWatch(VAddr device_addr, u64 size) {
+    if (!Core::WriteWatch::Enabled()) {
+        return;
+    }
+    // what the write fault did for these pages (Rasterizer::InvalidateMemory, buffer side; readbacks are off whenever the
+    // protection is lifted, so the invalidation is the CPU mark); a page an image watches is still protected and faulted already
+    Core::WriteWatch::Harvest(
+        device_addr, size,
+        [](void* context, VAddr page, u64 bytes) {
+            auto* self = static_cast<BufferCache*>(context);
+            Core::NativeResources::NoteCpuWrite(page, bytes);
+            self->memory_tracker->MarkRegionAsCpuModified(page, bytes);
+        },
+        [](void* context, VAddr page, u64 bytes) {
+            return static_cast<BufferCache*>(context)->memory_tracker->IsRegionCpuModified(page, bytes);
+        },
+        [](void* context, VAddr page, u64 bytes) {
+            return static_cast<BufferCache*>(context)->memory_tracker->IsRegionGpuModified(page, bytes);
+        },
+        this);
 }
 
 static u64 SteadyNowNs() {
@@ -545,6 +568,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                                                         bool is_written, bool is_texel_buffer,
                                                         Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint) {
     Core::ResourceAudit::Note(Core::ResourceAudit::BufferUse, device_addr, size, is_written);
+    HarvestWriteWatch(device_addr, size);
     if (static const bool census = [] { const char* e = std::getenv("TLG_LIFT_CENSUS"); return e != nullptr && *e == '1'; }(); census && Core::NativeRegistry::enabled.load(std::memory_order_relaxed)) {
         Core::NativeRegistry::NoteRequestBuffer(device_addr, size, is_written);
     }
@@ -740,6 +764,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
 }
 
 bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
+    HarvestWriteWatch(addr, size);
     return memory_tracker->IsRegionCpuModified(addr, size);
 }
 
@@ -914,11 +939,16 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
+    HarvestWriteWatch(device_addr, size);
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
     const auto add_copy = [&](u64 addr, u64 copy_size) {
         copies.emplace_back(total_size_bytes, addr, copy_size);
         total_size_bytes += copy_size;
+        if (Core::WriteWatch::VerifyOn()) {
+            // write watch verify: the page's CPU mark is cleared before its new upload hash exists; no hash meanwhile
+            Core::WriteWatch::NoteGpuSideWrite(addr, copy_size);
+        }
     };
     const auto& ring = UntrackedRing::Get();
     if (ring.Active() && !is_written) {
@@ -965,6 +995,11 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         if (Core::NativeAudit::Enabled()) {
             for (const auto& copy : copies) {
                 Core::NativeAudit::NoteUpload(copy.dstOffset + arena->cpu_addr, staging.mapped + (copy.srcOffset - staging.offset), copy.size);
+            }
+        }
+        if (Core::WriteWatch::VerifyOn()) {
+            for (const auto& copy : copies) {
+                Core::WriteWatch::NoteUpload(copy.dstOffset + arena->cpu_addr, staging.mapped + (copy.srcOffset - staging.offset), copy.size);
             }
         }
         runtime.CopyBuffer(staging.buffer, arena, copies);

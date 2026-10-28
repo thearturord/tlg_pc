@@ -20,6 +20,7 @@
 #include "core/memory.h"
 #include "core/native_draw.h"
 #include "core/native_updates.h"
+#include "core/native_write_watch.h"
 #include "core/signals.h"
 #include "video_core/page_manager.h"
 #include "video_core/untracked_ring.h"
@@ -55,10 +56,14 @@ struct PageManager::Impl {
     struct PageState {
         u8 num_write_watchers;
         u8 num_read_watchers;
+        u8 num_image_watchers; ///< the texture cache's share of num_write_watchers
+        u8 write_watched;      ///< the runtime records CPU writes to this page (Core::WriteWatch): the buffer cache needs no protection
 
         Core::MemoryPermission WritePerm() const noexcept {
-            return num_write_watchers == 0 ? Core::MemoryPermission::Write
-                                           : Core::MemoryPermission::None;
+            if (num_write_watchers == 0 || (write_watched && num_image_watchers == 0)) {
+                return Core::MemoryPermission::Write;
+            }
+            return Core::MemoryPermission::None;
         }
 
         Core::MemoryPermission ReadPerm() const noexcept {
@@ -113,6 +118,14 @@ struct PageManager::Impl {
     virtual void OnMap(VAddr address, size_t size) {
         // No-op
         EnsurePages(address, address + size);
+        if (Core::WriteWatch::LiftProtection() && Core::WriteWatch::Watched(address, size)) {
+            for (u64 page = address >> PM_PAGE_BITS, end = (address + size) >> PM_PAGE_BITS; page < end; ++page) {
+                if (PageState* state = cached_pages.find(page)) {
+                    state->write_watched = 1;
+                }
+            }
+            LOG_INFO(Render, "write watch: the buffer cache does not protect {:#x}+{:#x}", address, size);
+        }
     }
 
     virtual void OnUnmap(VAddr address, size_t size) {
@@ -169,7 +182,8 @@ struct PageManager::Impl {
                 perms = old_perms;
             }
 
-            // Apply the change to the page state
+            // Apply the change to the page state (the texture cache's watchers: counted apart too)
+            state->num_image_watchers += std::to_underlying(write_op);
             const auto new_perms = state->Update(write_op);
             if (new_perms != perms) [[unlikely]] {
                 // If the protection changed add pending (un)protect action

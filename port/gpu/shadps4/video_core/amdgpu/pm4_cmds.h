@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstring>
 #include "common/assert.h"
 #include "common/bit_field.h"
@@ -11,6 +12,10 @@
 #include "core/libraries/gnmdriver/gnmdriver.h"
 #include "core/libraries/kernel/time.h"
 #include "video_core/amdgpu/pm4_opcodes.h"
+
+namespace Core::WriteWatch {
+extern std::atomic<u32> epoch; ///< core/native_write_watch.h
+}
 
 namespace AmdGpu {
 
@@ -699,7 +704,15 @@ struct PM4CmdWaitRegMem {
     }
 
     bool Test(std::span<const u32> regs) const {
-        return TestValue(mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()]);
+        if (mem_space.Value() == MemSpace::Memory) {
+            const bool passed = TestValue(*Address());
+            if (passed) {
+                // a label the CPU may have written after its data: data written before it matters from here (L3 write watch)
+                Core::WriteWatch::epoch.fetch_add(1, std::memory_order_acq_rel);
+            }
+            return passed;
+        }
+        return TestValue(regs[Reg()]);
     }
 
     bool TestValue(u32 value) const {

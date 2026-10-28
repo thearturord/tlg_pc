@@ -1,6 +1,7 @@
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
 #include "core/debug_server.h"
+#include "core/native_write_watch.h"
 #include "core/guest_hooks.h"
 #include "core/frame_timeline.h"
 #include "core/guest_heap.h"
@@ -160,6 +161,12 @@ void MemoryManager::CopySparseMemory(VAddr source, u8* dest, u64 size) {
 }
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     TlgWriteLog::Note(reinterpret_cast<uintptr_t>(address), data, size, TlgWriteLog::Backing);
+    if (Core::WriteWatch::VerifyOn()) {
+        // verify mode: the write and the end of its pages' upload hashes are one step for the verify
+        return Core::WriteWatch::GpuSideWrite(reinterpret_cast<uintptr_t>(address), size, [&] {
+            return runtime_memory_write_backing(reinterpret_cast<uintptr_t>(address), data, size) != 0;
+        });
+    }
     return runtime_memory_write_backing(reinterpret_cast<uintptr_t>(address), data, size) != 0;
 }
 void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms) {
