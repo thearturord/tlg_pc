@@ -9071,6 +9071,11 @@ void NativeListRead(nlohmann::json& out) {
         const auto& a = Vulkan::g_identity_audit;
         out["identity_audit"] = {{"image_bindings_with_a_record", a.image_bindings.load()}, {"of_them_with_an_engine_id", a.image_with_id.load()}, {"ids_seen", a.image_ids_seen.load()},
                                  {"same_description", a.image_same.load()}, {"address_changed", a.image_address_changed.load()}, {"other_words_changed", a.image_other_words_changed.load()},
+                                 {"image_dword_changed_for_the_same_id", {a.image_word_changed[0].load(), a.image_word_changed[1].load(), a.image_word_changed[2].load(), a.image_word_changed[3].load(), a.image_word_changed[4].load(), a.image_word_changed[5].load(), a.image_word_changed[6].load(), a.image_word_changed[7].load()}},
+                                 {"texture_lookup_miss_cold_slot", a.texture_miss_cold.load()}, {"texture_lookup_miss_other_key_in_slot", a.texture_miss_other_key.load()}, {"texture_lookup_miss_native_reuse_off", a.texture_miss_native_reuse_off.load()},
+                                 {"texture_hit_same_generation_verified", a.texture_gen_verified.load()}, {"texture_hit_same_generation_image_differs", a.texture_gen_diff_image.load()}, {"texture_hit_same_generation_range_differs", a.texture_gen_diff_range.load()},
+                                 {"texture_id_served_after_generation_moved", a.texture_id_served.load()}, {"texture_id_refused", a.texture_id_refused.load()}, {"texture_id_verified", a.texture_id_verified.load()},
+                                 {"texture_id_verify_image_differs", a.texture_id_diff_image.load()}, {"texture_id_verify_range_differs", a.texture_id_diff_range.load()},
                                  {"compute_dispatches", a.dispatches.load()}, {"compute_programs_seen", a.programs_seen.load()}, {"compute_same_pipeline", a.pipeline_same.load()},
                                  {"compute_pipeline_switched", a.pipeline_switched.load()},
                                  {"dispatch_with_record", a.dispatch_with_record.load()},

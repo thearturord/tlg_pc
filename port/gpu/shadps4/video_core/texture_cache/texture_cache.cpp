@@ -199,6 +199,48 @@ void TextureCache::RecordImageDownloads(ReadbackBatch& batch, u32 fence_kind) {
     download_images.clear();
 }
 
+void TextureCache::NoteImageEvent(const ImageInfo& info) noexcept {
+    const u64 generation = image_generation.fetch_add(1, std::memory_order_release) + 1;
+    ImageEvent& event = image_events[generation % ImageEventRing];
+    event.generation.store(0, std::memory_order_release);
+    event.address.store(info.guest_address, std::memory_order_relaxed);
+    event.size.store(info.guest_size, std::memory_order_relaxed);
+    event.generation.store(generation, std::memory_order_release);
+}
+
+bool TextureCache::ImageUnchangedSince(ImageId image_id, u64 uid, u64 since, VAddr address, u64 size) const noexcept {
+    if (uid == 0 || !image_id || !slot_images.IsAllocated(image_id)) {
+        return false;
+    }
+    const Image& image = slot_images[image_id];
+    if (image.image_uid != uid || False(image.flags & ImageFlagBits::Registered)) {
+        return false;
+    }
+    const u64 now = image_generation.load(std::memory_order_acquire);
+    if (now < since || now - since > ImageEventRing) {
+        return false;
+    }
+    const u64 begin = address & ~u64{4095};
+    const u64 end = (address + std::max<u64>(size, 1) + 4095) & ~u64{4095};
+    for (u64 generation = since + 1; generation <= now; ++generation) {
+        const ImageEvent& event = image_events[generation % ImageEventRing];
+        if (event.generation.load(std::memory_order_acquire) != generation) {
+            return false; // not written yet, or overwritten
+        }
+        const u64 event_address = event.address.load(std::memory_order_relaxed);
+        const u64 event_size = event.size.load(std::memory_order_relaxed);
+        if (event.generation.load(std::memory_order_acquire) != generation) {
+            return false;
+        }
+        const u64 event_begin = event_address & ~u64{4095};
+        const u64 event_end = (event_address + std::max<u64>(event_size, 1) + 4095) & ~u64{4095};
+        if (event_begin < end && begin < event_end) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void TextureCache::TouchFoundImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     image.tick_accessed_last = gc_tick;
@@ -963,7 +1005,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
-    image_generation.fetch_add(1, std::memory_order_release);
+    NoteImageEvent(image.info);
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image_lru_cache.Insert(image, gc_tick);
     const auto& info = image.info;
@@ -982,7 +1024,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
-    image_generation.fetch_add(1, std::memory_order_release);
+    NoteImageEvent(image.info);
     image_lru_cache.Free(image);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {

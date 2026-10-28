@@ -523,10 +523,11 @@ private:
         bool valid{};
         u64 generation{};
         VideoCore::ImageId image_id{};
+        u64 image_uid{}; ///< L1(b): the unique id of that image (the slot index is reused), so the answer can be proven again after the generation moved
         std::array<u64, 6> key{};
         VideoCore::TextureCache::ImageDesc desc;
     };
-    std::array<CachedTextureLookup, 512> texture_lookup_cache{};
+    std::array<CachedTextureLookup, 8192> texture_lookup_cache{}; ///< L1(b): 8192 entries (was 512: 37k collision misses in 90 s)
     const bool rt_reuse_enabled;
     bool RtReuseOn() const {
         const s32 override_mode = VideoCore::ReadbackPolicy::Get().rt_reuse_override.load(std::memory_order_relaxed);

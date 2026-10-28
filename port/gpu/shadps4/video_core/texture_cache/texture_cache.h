@@ -147,6 +147,15 @@ public:
     /// Does what FindImage does for an image found again: marks it as recently used.
     void TouchFoundImage(ImageId image_id);
 
+    /// L1(b): the unique id of the image in the slot (0 for none): a slot index is reused, the uid never is.
+    [[nodiscard]] u64 ImageUid(ImageId image_id) const noexcept {
+        return image_id && slot_images.IsAllocated(image_id) ? slot_images[image_id].image_uid : 0;
+    }
+
+    /// L1(b): is the answer FindImage gave for a range at image generation `since` still the answer? True when the image (slot and uid) is still registered and no image was registered or
+    /// unregistered since then that touches a page of [address, address + size) (FindImage looks at the images of that region only); false also when the event ring cannot tell.
+    [[nodiscard]] bool ImageUnchangedSince(ImageId image_id, u64 uid, u64 since, VAddr address, u64 size) const noexcept;
+
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
@@ -474,6 +483,15 @@ private:
     /// Bumped whenever an image is registered or unregistered: a lookup result stays valid while
     /// it is unchanged (rt_lookup_reuse_enabled).
     std::atomic<u64> image_generation{};
+    /// L1(b): the range of every registration and unregistration, by generation (the event of generation g is at g % ring size): what ImageUnchangedSince reads
+    struct ImageEvent {
+        std::atomic<u64> generation{};
+        std::atomic<u64> address{};
+        std::atomic<u64> size{};
+    };
+    static constexpr u64 ImageEventRing = 4096;
+    std::array<ImageEvent, ImageEventRing> image_events{};
+    void NoteImageEvent(const ImageInfo& info) noexcept;
     absl::flat_hash_map<VAddr, MetaDataInfo> surface_metas;
 };
 

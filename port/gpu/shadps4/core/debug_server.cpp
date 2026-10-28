@@ -778,7 +778,7 @@ void Start(u16 port) {
                     out["rare_events"] = rare_counts;
                 }
                 out["written_unix_s"] = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-                for (const char* name : {"/status", "/zpassgen", "/native", "/registry", "/stats"}) {
+                for (const char* name : {"/status", "/zpassgen", "/native", "/registry", "/stats", "/resources"}) {
                     Handler handler;
                     {
                         std::scoped_lock lk{registry_mutex};

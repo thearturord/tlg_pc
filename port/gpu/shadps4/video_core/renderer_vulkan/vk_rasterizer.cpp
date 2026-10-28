@@ -545,6 +545,23 @@ static bool LegacyDescriptorsOff() {
     return off;
 }
 
+/// L1(b) (`TLG_TEXTURE_IDS`, default on; 0 turns it off): a cached image lookup is kept across generation changes when the texture cache proves that nothing touched its range.
+/// `TLG_TEXTURE_IDS_VERIFY=N` (default 64, 0 none, 1 every use): every Nth such answer is compared with FindImage.
+static bool TextureIdsOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_TEXTURE_IDS");
+        return e == nullptr || *e != '0';
+    }();
+    return on;
+}
+static u32 TextureIdsVerifyEvery() {
+    static const u32 every = [] {
+        const char* e = std::getenv("TLG_TEXTURE_IDS_VERIFY");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 64u;
+    }();
+    return every;
+}
+
 /// L2 census: the record's binding list of the dispatch being bound, and a dump of it when a descriptor of a dispatch differs from the guest's (once per call site, program, kind, offset; at most 60 dumps)
 struct DispatchDumpContext {
     const Core::NativeDraw::RecordBinding* list{};
@@ -1591,7 +1608,17 @@ const DrawPlan* Rasterizer::DispatchBinderFor(const DispatchPlan* plan) {
     out.stages[static_cast<u32>(Shader::SwStage::Compute)].flat_skipped = LegacyDescriptorsOff() && serves_all_kinds;
     out.has_handles = false;
     out.has_geometry_handles = false;
+    out.geometry_handle_count = 0;
     std::memcpy(out.bindings.data(), plan->bindings.data(), sizeof(Core::NativeDraw::RecordBinding) * plan->binding_count);
+    // L1(c): the engine buffer each kind 1 binding names, by the engine's id (the same handles the graphics plans carry, N3c); ObtainBuffer checks that the request lies inside it
+    if (NativeHandleMode() != 0 && Core::NativeResources::ImmutableResidencyEnabled()) {
+        out.handle_epoch = Core::NativeResources::ImmutableEpoch();
+        for (u32 i = 0; i < out.binding_count; ++i) {
+            const auto& b = out.bindings[i];
+            out.handles[i] = b.kind == 1 && b.id != 0 ? Core::NativeResources::FindImmutableById(b.id) : nullptr;
+            out.has_handles |= out.handles[i] != nullptr;
+        }
+    }
     binder_verify = mode == 3;
     g_dump_context = {out.bindings.data(), out.binding_count, plan->native_seq};
     return &out;
@@ -2964,9 +2991,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
         AmdGpu::Image chosen_tsharp;
         bool image_from_record = false;
+        u64 image_engine_id = 0; // L1(b): the engine's id of the view object the record's binding names
         if (binder_plan != nullptr && image_desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad) {
             u32 identity_binding = ~0u;
             if (const u32* words = BinderWords(stage, image_desc.sharp_fetch.offsets[0], image_desc.is_r128 ? 4 : 8, 2, &identity_binding)) {
+                if (identity_binding != ~0u) {
+                    image_engine_id = binder_plan->bindings[identity_binding].id;
+                }
                 chosen_tsharp = image_desc.FromWords(words);
                 image_from_record = true;
                 if (stage.sw_stage == Shader::SwStage::Compute && DispatchBinderMode() == 2) {
@@ -2988,14 +3019,21 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                 hash ^= hash >> 29;
                             }
                             const u64 address = raw.Address();
-                            const auto [it, is_new] = identity_tables.images.try_emplace(id, IdentityTables::ImageEntry{hash, address});
+                            IdentityTables::ImageEntry fresh{hash, address};
+                            std::memcpy(fresh.words, record_words, sizeof(fresh.words));
+                            const auto [it, is_new] = identity_tables.images.try_emplace(id, fresh);
                             if (is_new) {
                                 audit.image_ids_seen.fetch_add(1, std::memory_order_relaxed);
                             } else if (it->second.words_hash == hash) {
                                 audit.image_same.fetch_add(1, std::memory_order_relaxed);
                             } else {
                                 (it->second.address != address ? audit.image_address_changed : audit.image_other_words_changed).fetch_add(1, std::memory_order_relaxed);
-                                it->second = {hash, address};
+                                for (u32 w = 0; w < 8; ++w) {
+                                    if (it->second.words[w] != record_words[w]) {
+                                        audit.image_word_changed[w].fetch_add(1, std::memory_order_relaxed);
+                                    }
+                                }
+                                it->second = fresh;
                             }
                         }
                     }
@@ -3075,40 +3113,84 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                      u64(image_desc.is_r128) << 32 | u64(image_desc.constant_mip_index) << 40 |
                      u64(static_cast<u8>(image_desc.mip_fallback_mode)) << 48 |
                      u64(static_cast<u8>(image_desc.post_op)) << 56;
-            key[5] = u64(i);
+            key[5] = u64(i) | (image_from_record ? image_engine_id << 16 : 0);
             u64 hash = 0;
             for (const u64 word : key) {
                 hash = (hash ^ word) * 0x9E3779B97F4A7C15ull;
                 hash ^= hash >> 29;
             }
-            auto& cached = texture_lookup_cache[hash & 511];
+            auto& cached = texture_lookup_cache[hash & 8191];
             const bool native_reuse =
                 VideoCore::ReadbackPolicy::Get().native_draw_mode.load(std::memory_order_relaxed) >=
                 2;
-            if (native_reuse && cached.valid && cached.key == key &&
-                cached.generation == texture_cache.ImageGeneration()) {
+            // the mip fallback of the shader's view (applied to a fresh description before FindImage)
+            const auto finish_desc = [&](VideoCore::TextureCache::ImageDesc& d) {
+                if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
+                    ASSERT(num_bindings == 1);
+                    d.view_info.range.base.level += image_desc.constant_mip_index;
+                    d.view_info.range.extent.levels = 1;
+                } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+                    d.view_info.range.base.level += i;
+                    d.view_info.range.extent.levels = 1;
+                }
+            };
+            const u64 generation_now = texture_cache.ImageGeneration();
+            // L1(b): the same description and engine object as an earlier lookup, and the generation moved: the answer is still the answer when its image is registered and no registration or
+            // unregistration touched the range since (the texture cache's event ring says so exactly); the image is found by what it is, not by "nothing changed anywhere"
+            const bool same_generation = native_reuse && cached.valid && cached.key == key && cached.generation == generation_now;
+            const bool by_id = native_reuse && !same_generation && cached.valid && cached.key == key && TextureIdsOn() &&
+                               texture_cache.ImageUnchangedSince(cached.image_id, cached.image_uid, cached.generation, cached.desc.info.guest_address, cached.desc.info.guest_size);
+            if (native_reuse && cached.valid && cached.key == key && !same_generation && !by_id && TextureIdsOn()) {
+                g_identity_audit.texture_id_refused.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (same_generation || by_id) {
                 Census(census_base + CImageLookupHit);
                 std::construct_at(&desc, cached.desc);
                 image_id = cached.image_id;
                 texture_cache.TouchFoundImage(image_id);
-            } else {
-                std::construct_at(&desc, tsharp, image_desc);
-
-                if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
-                    ASSERT(num_bindings == 1);
-                    desc.view_info.range.base.level += image_desc.constant_mip_index;
-                    desc.view_info.range.extent.levels = 1;
-                } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
-                    desc.view_info.range.base.level += i;
-                    desc.view_info.range.extent.levels = 1;
+                if (by_id) {
+                    cached.generation = generation_now;
+                    g_identity_audit.texture_id_served.fetch_add(1, std::memory_order_relaxed);
                 }
+                // verify (every Nth hit): what FindImage says now. The legacy lookup by address and T# only runs here and on a miss.
+                const u32 every = TextureIdsVerifyEvery();
+                static thread_local u64 verify_counter = 0;
+                if (every != 0 && ++verify_counter % every == 0) {
+                    VideoCore::TextureCache::ImageDesc check(tsharp, image_desc);
+                    finish_desc(check);
+                    const VideoCore::ImageId found = texture_cache.FindImage(check);
+                    (by_id ? g_identity_audit.texture_id_verified : g_identity_audit.texture_gen_verified).fetch_add(1, std::memory_order_relaxed);
+                    const bool image_differs = found != image_id;
+                    const bool range_differs = check.view_info.range.base.level != desc.view_info.range.base.level || check.view_info.range.base.layer != desc.view_info.range.base.layer;
+                    if (image_differs || range_differs) {
+                        (by_id ? (image_differs ? g_identity_audit.texture_id_diff_image : g_identity_audit.texture_id_diff_range)
+                               : (image_differs ? g_identity_audit.texture_gen_diff_image : g_identity_audit.texture_gen_diff_range))
+                            .fetch_add(1, std::memory_order_relaxed);
+                        static std::atomic<u32> logged{0};
+                        if (logged.fetch_add(1) < 12) {
+                            LOG_ERROR(Render_Vulkan, "L1 texture lookup differs ({}): engine id {} address {:#x} size {:#x} served image {} (uid {}) found {} ({}), range level {} layer {} against {} {}", by_id ? "by id" : "same generation",
+                                      image_engine_id, desc.info.guest_address, desc.info.guest_size, image_id.index, cached.image_uid, found.index, image_differs ? "other image" : "same image", desc.view_info.range.base.level,
+                                      desc.view_info.range.base.layer, check.view_info.range.base.level, check.view_info.range.base.layer);
+                        }
+                        image_id = found;
+                        std::construct_at(&desc, check);
+                        cached.image_id = found;
+                        cached.image_uid = texture_cache.ImageUid(found);
+                        cached.desc = check;
+                    }
+                }
+            } else {
+                (!native_reuse ? g_identity_audit.texture_miss_native_reuse_off : !cached.valid ? g_identity_audit.texture_miss_cold : g_identity_audit.texture_miss_other_key).fetch_add(1, std::memory_order_relaxed);
+                std::construct_at(&desc, tsharp, image_desc);
+                finish_desc(desc);
 
                 Census(census_base + CImageFind);
                 image_id = texture_cache.FindImage(desc);
                 if (native_reuse) {
                     cached.valid = true;
-                    cached.generation = texture_cache.ImageGeneration();
+                    cached.generation = generation_now;
                     cached.image_id = image_id;
+                    cached.image_uid = texture_cache.ImageUid(image_id);
                     cached.key = key;
                     cached.desc = desc;
                 }
