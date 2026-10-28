@@ -190,6 +190,7 @@ struct DrawPlan {
     u64 ring_end{}; ///< T1: the constant ring position after this plan's copies
     u64 native_seq{}; ///< the record the plan was made from (0: planned from the registers); diagnostics
     u32 ww_epoch{};   ///< O1: the write watch epoch the command processor read before it harvested the plan's ranges (0: not harvested ahead)
+    u32 ww_base_epoch{}; ///< P3: the base epoch read before the plan's images' shared pages were harvested (0: not harvested ahead)
     /// NativeDraw v2: the descriptors of the record in the user data of its stages; the native binder reads them by (stage, flat offset)
     std::array<Core::NativeDraw::RecordBinding, Core::NativeDraw::MaxRecordBindings> bindings{};
     u32 binding_count{};
@@ -216,6 +217,7 @@ struct DispatchPlan {
     u64 ring_end{}; ///< T1: the constant ring position after this plan's copies
     u64 native_seq{}; ///< B2: the record this dispatch was planned from (the registry audit names its resources by it)
     u32 ww_epoch{};   ///< O1: see DrawPlan::ww_epoch
+    u32 ww_base_epoch{}; ///< P3: see DrawPlan::ww_base_epoch
     /// B9: the typed bindings of that record (the descriptors in the dispatch's user data, with the engine ids); complete when none was dropped
     std::array<Core::NativeDraw::RecordBinding, Core::NativeDraw::MaxRecordBindings> bindings{};
     u32 binding_count{};

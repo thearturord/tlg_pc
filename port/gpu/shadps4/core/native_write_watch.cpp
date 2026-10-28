@@ -34,11 +34,46 @@ std::atomic<u32> base_epoch{1};
 
 namespace {
 thread_local u32 t_known_epoch = 0;
-std::atomic<u64> known_skips{0};
+thread_local u32 t_known_base = 0;
+std::atomic<u64> known_skips{0}, known_image_skips{0};
+/// P3: image sizes by address (direct mapped; a slot holds the address >> 8 in its high 38 bits and the size in 256 byte units in the low 26)
+constexpr u32 ImageSlots = 1u << 16;
+std::atomic<u64> image_sizes[ImageSlots]{};
+u32 ImageSlot(VAddr begin) noexcept {
+    return static_cast<u32>(((begin >> 8) * 0x9E3779B97F4A7C15ull) >> 48) & (ImageSlots - 1);
+}
+thread_local bool t_raster = false; ///< the thread executes planned operations (it set a known epoch once)
+/// P3 census: kernel calls by who asked (0 other threads, 1 raster image, 2 raster with a plan epoch, 3 raster without one) and their time
+std::atomic<u64> class_calls[4]{}, class_ns[4]{};
+/// P3: the per request counters are kept per thread and added to the shared ones every 4096 requests (the command processor and the raster thread
+/// both harvest: one shared counter line between them cost more than the check itself)
+struct LocalCounts {
+    u64 calls{}, skipped{}, known{}, known_image{};
+};
+thread_local LocalCounts t_counts;
 } // namespace
 
-void SetKnownEpoch(u32 known) noexcept {
+void SetKnownEpoch(u32 known, u32 known_base) noexcept {
     t_known_epoch = known;
+    t_known_base = known_base;
+    t_raster = true;
+}
+
+void NoteImageRange(VAddr begin, u64 size) noexcept {
+    const u64 units = (size + 255) >> 8;
+    if ((begin & 255) != 0 || (begin >> 8) >= (u64{1} << 38) || units >= (u64{1} << 26)) {
+        return;
+    }
+    const u64 packed = ((begin >> 8) << 26) | units;
+    auto& slot = image_sizes[ImageSlot(begin)];
+    if (slot.load(std::memory_order_relaxed) != packed) {
+        slot.store(packed, std::memory_order_relaxed);
+    }
+}
+
+u64 ImageSize(VAddr begin) noexcept {
+    const u64 packed = image_sizes[ImageSlot(begin)].load(std::memory_order_relaxed);
+    return (packed >> 26) == (begin >> 8) && (begin & 255) == 0 ? (packed & ((u64{1} << 26) - 1)) << 8 : 0;
 }
 
 namespace {
@@ -422,8 +457,14 @@ void Harvest(VAddr address, u64 size, Replay replay, IsCpuDirty dirty, IsCpuDirt
         return;
     }
     State& s = Get();
-    s.calls.fetch_add(1, std::memory_order_relaxed);
-    if (const u32 known = t_known_epoch; known != 0 && !image && runtime_memory_ww_pending() == 0) {
+    if (++t_counts.calls == 4096) {
+        s.calls.fetch_add(t_counts.calls, std::memory_order_relaxed);
+        s.skipped.fetch_add(t_counts.skipped, std::memory_order_relaxed);
+        known_skips.fetch_add(t_counts.known, std::memory_order_relaxed);
+        known_image_skips.fetch_add(t_counts.known_image, std::memory_order_relaxed);
+        t_counts = {};
+    }
+    if (const u32 known = image ? t_known_base : t_known_epoch; known != 0 && runtime_memory_ww_pending() == 0) {
         // harvested ahead by the command processor when it planned this operation
         bool current = true;
         const VAddr end = address + size;
@@ -433,15 +474,15 @@ void Harvest(VAddr address, u64 size, Replay replay, IsCpuDirty dirty, IsCpuDirt
             const VAddr a = std::max(address, r.start);
             const VAddr b = std::min(end, r.start + r.size);
             for (u64 c = a < b ? (a - r.start) >> ChunkBits : 1, c1 = a < b ? (b - 1 - r.start) >> ChunkBits : 0; c <= c1; ++c) {
-                if (static_cast<s32>(r.harvested[c].load(std::memory_order_acquire) - known) < 0) {
+                if (static_cast<s32>((image ? r.harvested_base[c] : r.harvested[c]).load(std::memory_order_acquire) - known) < 0) {
                     current = false;
                     break;
                 }
             }
         }
         if (current && VerifyInterval() == 0) {
-            known_skips.fetch_add(1, std::memory_order_relaxed);
-            s.skipped.fetch_add(1, std::memory_order_relaxed);
+            ++(image ? t_counts.known_image : t_counts.known);
+            ++t_counts.skipped;
             return;
         }
     }
@@ -488,7 +529,7 @@ void Harvest(VAddr address, u64 size, Replay replay, IsCpuDirty dirty, IsCpuDirt
             }
         }
         if (!stale && s.refreshed_at.load(std::memory_order_relaxed) == now_base) {
-            s.skipped.fetch_add(1, std::memory_order_relaxed);
+            ++t_counts.skipped;
             if (VerifyInterval() == 0) {
                 return;
             }
@@ -588,8 +629,11 @@ void Harvest(VAddr address, u64 size, Replay replay, IsCpuDirty dirty, IsCpuDirt
     if (!any) {
         s.skipped.fetch_add(1, std::memory_order_relaxed);
     } else {
-        s.ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()),
-                       std::memory_order_relaxed);
+        const u64 spent = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+        s.ns.fetch_add(spent, std::memory_order_relaxed);
+        const u32 cls = !t_raster ? 0u : image ? 1u : t_known_epoch != 0 ? 2u : 3u;
+        class_calls[cls].fetch_add(1, std::memory_order_relaxed);
+        class_ns[cls].fetch_add(spent, std::memory_order_relaxed);
     }
 }
 
@@ -619,6 +663,15 @@ nlohmann::json Report() {
             {"epoch_bumps_by_the_time_window", s.window_bumps.load(std::memory_order_relaxed)},
             {"harvest_requests", s.calls.load(std::memory_order_relaxed)},
             {"requests_harvested_ahead_by_the_command_processor", known_skips.load(std::memory_order_relaxed)},
+            {"image_requests_harvested_ahead_by_the_command_processor", known_image_skips.load(std::memory_order_relaxed)},
+            {"harvests_by_caller", [] {
+                 nlohmann::json j;
+                 static constexpr const char* names[4] = {"other_threads", "raster_images", "raster_planned_but_stale", "raster_unplanned"};
+                 for (u32 i = 0; i < 4; ++i) {
+                     j[names[i]] = {{"calls", class_calls[i].load(std::memory_order_relaxed)}, {"ms", class_ns[i].load(std::memory_order_relaxed) / 1'000'000}};
+                 }
+                 return j;
+             }()},
             {"requests_with_nothing_to_harvest", s.skipped.load(std::memory_order_relaxed)},
             {"chunks_harvested", s.chunks.load(std::memory_order_relaxed)},
             {"runtime_calls", s.runtime_calls.load(std::memory_order_relaxed)},

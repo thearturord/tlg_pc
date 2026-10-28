@@ -970,6 +970,7 @@ void TextureCache::RefreshImage(Image& image) {
     const auto harvest_shared_pages = [&] {
         const VAddr begin = image.info.guest_address;
         const VAddr end = begin + image.info.guest_size;
+        Core::WriteWatch::NoteImageRange(begin, image.info.guest_size); // P3: the command processor harvests these pages ahead next time
         if ((begin & 4095) != 0 || image.info.guest_size < 4096) {
             buffer_cache.HarvestWriteWatch(begin & ~VAddr{4095}, 4096, true);
         }

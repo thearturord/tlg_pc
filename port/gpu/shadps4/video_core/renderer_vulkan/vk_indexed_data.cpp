@@ -484,9 +484,7 @@ void IndexedData::ForgetHandle(u32 first_table, u32 last_table, u64 handle) {
     std::scoped_lock lock{mutex};
     for (u32 index = first_table; index <= last_table; ++index) {
         auto& map = tables[index].map;
-        for (auto it = map.begin(); it != map.end();) {
-            it = it->first.a == handle ? map.erase(it) : std::next(it);
-        }
+        absl::erase_if(map, [handle](const auto& entry) { return entry.first.a == handle; });
         // a run that names the view is not found again (its slots stay until the GPU is done with it)
         auto& t = tables[index];
         for (u32 id = 0; id < t.runs.size(); ++id) {

@@ -13,6 +13,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <absl/container/flat_hash_map.h>
+
 #include "common/types.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -132,7 +134,7 @@ private:
         u32 binding{};
         vk::DescriptorType type{};
         u32 capacity{};
-        std::unordered_map<Key, u32, KeyHash> map;
+        absl::flat_hash_map<Key, u32, KeyHash> map; ///< P3: flat (about 230 k new buffer slots a second, the key holds the offset)
         std::vector<SlotInfo> slots;
         std::vector<u32> free;
         std::deque<std::pair<u32, u64>> uses; // (slot, tick of the use), oldest first

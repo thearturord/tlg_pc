@@ -1452,7 +1452,8 @@ DispatchStat& DispatchStatFor(u64 caller, u64 program, bool indirect, bool asc) 
 void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw_plan,
                                const Vulkan::DispatchPlan* dispatch_plan) {
     // O1: the ranges the command processor harvested for this operation need no harvest here
-    Core::WriteWatch::SetKnownEpoch(draw_plan != nullptr ? draw_plan->ww_epoch : dispatch_plan != nullptr ? dispatch_plan->ww_epoch : 0u);
+    Core::WriteWatch::SetKnownEpoch(draw_plan != nullptr ? draw_plan->ww_epoch : dispatch_plan != nullptr ? dispatch_plan->ww_epoch : 0u,
+                                    draw_plan != nullptr ? draw_plan->ww_base_epoch : dispatch_plan != nullptr ? dispatch_plan->ww_base_epoch : 0u);
     struct KnownEpochScope {
         ~KnownEpochScope() {
             Core::WriteWatch::SetKnownEpoch(0);

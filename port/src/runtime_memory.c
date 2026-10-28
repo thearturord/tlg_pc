@@ -141,7 +141,7 @@ static int host_prot(int prot) {
  * section. Mapping a range carves it out as a single placeholder first: views overlapping
  * it are unmapped, placeholders coalesced and split, and the parts of views outside the
  * range mapped again with the page protections they had (GPU page tracking included). */
-typedef struct { uintptr_t start, end; uint64_t phys; int mapped, ww; } HostRegion;
+typedef struct { uintptr_t start, end; uint64_t phys; int mapped, ww; unsigned char *ro; } HostRegion; /* ro: watched region, per page 1 when not read/write (P3) */
 typedef struct { uintptr_t start, end; DWORD protect; } ProtRun;
 static HostRegion *regions; static size_t region_count, region_capacity;
 static HANDLE section;
@@ -205,6 +205,8 @@ static int ww_map(HostRegion *r, DWORD protect) {
     ResetWriteWatch((void *)r->start,size);
     DWORD old;
     if (protect!=PAGE_READWRITE && !VirtualProtect((void *)r->start,size,protect,&old)) win_fail("VirtualProtect",r->start,size);
+    r->ro=calloc(size/4096+1,1);
+    if (r->ro && protect!=PAGE_READWRITE) memset(r->ro,1,size/4096+1);
     InterlockedAdd64(&ww_stat_bytes,(LONG64)size);
     printf("Runtime: write watched mapping %p, size=%" PRIu64 "\n",(void *)r->start,size);
     return 1;
@@ -221,6 +223,7 @@ static void ww_release(HostRegion *r) {
     InterlockedAdd64(&ww_stat_bytes,-(LONG64)size);
     InterlockedIncrement64(&ww_stat_releases);
     r->ww=0; r->mapped=0;
+    free(r->ro); r->ro=NULL;
 }
 static DWORD win_prot(int prot) {
     if (prot & PROT_EXEC) return (prot & PROT_WRITE) ? PAGE_EXECUTE_READWRITE : (prot & PROT_READ) ? PAGE_EXECUTE_READ : PAGE_EXECUTE;
@@ -257,9 +260,9 @@ void runtime_memory_reserve(void) {
     /* The system-reserved window sits below USER_MIN; without its own placeholder, a hinted map
      * there (TLG's tessellation ring) stopped the game with "guest range outside the reservation". */
     if (VirtualAlloc2(NULL,(void *)SYSTEM_RESERVED_MIN,SYSTEM_RESERVED_MAX-SYSTEM_RESERVED_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
-        region_insert(region_count,(HostRegion){SYSTEM_RESERVED_MIN,SYSTEM_RESERVED_MAX,0,0,0});
+        region_insert(region_count,(HostRegion){SYSTEM_RESERVED_MIN,SYSTEM_RESERVED_MAX,0,0,0,NULL});
     else fprintf(stderr,"Runtime: system-reserved window %p unavailable (error %lu); hinted maps there move to the user range\n",(void *)SYSTEM_RESERVED_MIN,GetLastError());
-    region_insert(region_count,(HostRegion){USER_MIN,USER_MAX,0,0,0});
+    region_insert(region_count,(HostRegion){USER_MIN,USER_MAX,0,0,0,NULL});
 }
 static int system_window_reserved(void) { return region_count && regions[0].start==SYSTEM_RESERVED_MIN; }
 static void view_map(const HostRegion *r, DWORD protect) {
@@ -303,12 +306,12 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
     if (last-first>1 && !VirtualFree((void *)lo,hi-lo,MEM_RELEASE|MEM_COALESCE_PLACEHOLDERS))
         win_fail("coalescing placeholders",lo,hi-lo);
     region_erase(first,last-first);
-    region_insert(first,(HostRegion){lo,hi,0,0,0});
+    region_insert(first,(HostRegion){lo,hi,0,0,0,NULL});
     size_t at=first;
     if (lo<a) {
         if (!VirtualFree((void *)lo,a-lo,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)) win_fail("splitting a placeholder",lo,a-lo);
         regions[at].end=a;
-        region_insert(at+1,(HostRegion){a,hi,0,0,0});
+        region_insert(at+1,(HostRegion){a,hi,0,0,0,NULL});
         if (keep_left) {
             regions[at].phys=left.phys; regions[at].mapped=1;
             view_map(&regions[at],PAGE_READWRITE);
@@ -318,7 +321,7 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
     if (b<hi) {
         if (!VirtualFree((void *)a,b-a,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)) win_fail("splitting a placeholder",a,b-a);
         regions[at].end=b;
-        region_insert(at+1,(HostRegion){b,hi,0,0,0});
+        region_insert(at+1,(HostRegion){b,hi,0,0,0,NULL});
         if (keep_right) {
             regions[at+1].phys=right.phys+(b-right.start); regions[at+1].mapped=1;
             view_map(&regions[at+1],PAGE_READWRITE);
@@ -349,7 +352,7 @@ static HostRegion *ww_region(uintptr_t a) {
 /* A write of the GPU side into a watched region: snapshot the pages, hand the CPU's writes so far to the pending list, write
  * (lifting a protection for the moment), drop the write watch bits the write set, and compare the pages with snapshot plus
  * write: a page that differs was written by the CPU in the meantime and goes to the pending list too. */
-static void ww_write(uintptr_t at, const unsigned char *data, uint64_t n) {
+static void ww_write(HostRegion *r, uintptr_t at, const unsigned char *data, uint64_t n) {
     uintptr_t p0=at&~(uintptr_t)4095, p1=(at+n+4095)&~(uintptr_t)4095;
     size_t len=p1-p0;
     static __thread unsigned char *snap; static __thread size_t snap_capacity;
@@ -358,7 +361,10 @@ static void ww_write(uintptr_t at, const unsigned char *data, uint64_t n) {
     if (snap) memcpy(snap,(const void *)p0,len);
     ww_collect(p0,p1);
     ProtRun *runs=NULL; size_t nruns=0, capacity=0;
-    nruns=save_protections(p0,p1,&runs,0,&capacity);
+    /* P3: the region's page map says whether a page is protected; all read/write needs no query (VirtualQuery of a watched allocation walks its pages) */
+    int all_rw=r && r->ro && p0>=r->start && p1<=r->end;
+    for (uintptr_t pg=p0; all_rw && pg<p1; pg+=4096) all_rw=!r->ro[(pg-r->start)>>12];
+    if (!all_rw) nruns=save_protections(p0,p1,&runs,0,&capacity);
     DWORD old;
     for (size_t i=0;i<nruns;++i) if (runs[i].protect!=PAGE_READWRITE) VirtualProtect((void *)runs[i].start,runs[i].end-runs[i].start,PAGE_READWRITE,&old);
     memcpy((void *)at,data,n);
@@ -390,6 +396,7 @@ static int host_protect(uintptr_t address, uint64_t size, int prot) {
         if (!regions[i].mapped) continue;
         uintptr_t a=regions[i].start>address ? regions[i].start : address, b=regions[i].end<end ? regions[i].end : end;
         if (!VirtualProtect((void *)a,b-a,protect,&old)) return -1;
+        if (regions[i].ww && regions[i].ro) memset(regions[i].ro+((a-regions[i].start)>>12),protect!=PAGE_READWRITE,((b-1-regions[i].start)>>12)-((a-regions[i].start)>>12)+1);
     }
     return 0;
 }
@@ -925,7 +932,8 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
         if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED) { ok=0; break; }
         uint64_t n=(vmas[i].end<end ? vmas[i].end : end)-at;
 #ifdef _WIN32
-        if (ww_region(at)) { ww_write(at,(const unsigned char *)data+(at-address),n); at+=n; continue; }
+        HostRegion *watched=ww_region(at);
+        if (watched) { ww_write(watched,at,(const unsigned char *)data+(at-address),n); at+=n; continue; }
         phys_mark(vmas[i].phys+(at-vmas[i].start),n);
 #endif
         memcpy(backing_base+vmas[i].phys+(at-vmas[i].start),(const unsigned char *)data+(at-address),n);
