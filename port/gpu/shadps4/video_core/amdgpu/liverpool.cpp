@@ -2013,6 +2013,13 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                 }
                 Core::DebugServer::Publish("segment_census", {{"by_kind_since_start", std::move(kinds)}, {"note", "C6 census: commands and draws recorded between a begin and an end of rendering, graphics stream, counts only"}});
             }
+            if (rasterizer->LivePlannerOn()) {
+                const auto p = rasterizer->ReadLivePlanStats();
+                Core::DebugServer::Publish("barrier_planner",
+                                           {{"queries_answered_by_the_planner", p.queries}, {"answered_true", p.answered_true}, {"misses_barrier_the_tracker_had_and_the_planner_lacked", p.planner_missed},
+                                            {"extra_barriers_the_tracker_did_not_need", p.planner_extra}, {"tracker_true_only_from_its_own_range_collapse_(mode_2)", p.tracker_collapse_only}, {"flushes", p.flushes}, {"flush_decisions_differing", p.flush_differences},
+                                            {"buffer_rebases_seen", p.rebases}, {"note", "L4 TLG_BARRIER_PLANNER=1, cumulative since start; the planner decides, the tracker corrects a miss"}});
+            }
             if (rasterizer->HazardAuditOn()) {
                 const auto h = rasterizer->TakeHazardAudit();
                 static constexpr const char* sources[] = {"z_shadow_draws", "g_buffer_draws", "forward_draws", "compute", "indirect_draws", "untagged_draws", "buffer_copies", "fills_and_inline_data", "image_copies_and_uploads", "unknown_merged_ranges"};

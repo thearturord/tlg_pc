@@ -107,6 +107,19 @@ public:
     }
     HazardAudit TakeHazardAudit();
 
+    /// L4: `TLG_BARRIER_PLANNER=1` makes the planner (a state machine over the access list keyed by guest address, see `Planner`) answer the buffer hazard queries; the tracker still runs
+    /// next to it and corrects it (a barrier the planner lacks and the tracker has is counted as a miss and the barrier is made). 0 misses over a long run is the exit of L4.
+    struct LivePlanStats {
+        u64 queries{}, answered_true{}, planner_missed{}, planner_extra{}, tracker_collapse_only{}, flushes{}, flush_differences{}, rebases{};
+    };
+    [[nodiscard]] bool LivePlannerOn() const noexcept {
+        return live_plan_on;
+    }
+    /// cumulative since start (read from another thread: counters only, a torn read is harmless)
+    [[nodiscard]] LivePlanStats ReadLivePlanStats() const {
+        return live_stats;
+    }
+
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);
 
@@ -155,6 +168,16 @@ private:
     std::vector<PlanEvent> plan_log;
     Planner planner, planner_by_address;
     void ReplayPlan();
+    bool live_plan_on{}, live_plan_exact{}, live_plan_decides{};
+    Planner live_exact; ///< TLG_BARRIER_PLANNER=2: the same lists without the collapse, the oracle for a miss
+    Planner live_plan; ///< L4: updated by every access, consulted by every query, cleared by every effective flush
+    struct SeenBuffer {
+        u64 base{}, size{};
+    };
+    std::unordered_map<u64, SeenBuffer> live_seen; ///< buffer object -> the guest range it covered when last seen (a change is a rebase)
+    LivePlanStats live_stats{};
+    /// the list a range lives in (0 = all guest memory, else the buffer's own offset space) and its start there
+    u64 LivePlanSpace(const VideoCore::Buffer* handle, u64 offset, u64& begin);
     u32 hazard_override{~0u}; ///< set inside the runtime's own copies, fills and image transfers
     HazardAudit hazard{};
     u32 HazardSource() const;

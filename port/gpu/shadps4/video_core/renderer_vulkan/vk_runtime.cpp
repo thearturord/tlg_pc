@@ -107,6 +107,11 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     if (const char* e = std::getenv("TLG_HAZARD_AUDIT"); e != nullptr && *e != 0 && *e != '0') {
         hazard_audit_on = true;
     }
+    if (const char* e = std::getenv("TLG_BARRIER_PLANNER"); e != nullptr && *e != 0 && *e != '0') {
+        live_plan_on = true;
+        live_plan_exact = e[0] == '2' || e[0] == '3';
+        live_plan_decides = e[0] == '3';
+    }
 }
 
 namespace {
@@ -153,6 +158,52 @@ u32 Runtime::HazardSource() const {
     }
     const u32 draw_class = Core::NativeRegistry::CurrentDrawClass();
     return draw_class <= 4 ? draw_class : 5;
+}
+
+namespace {
+/// the planner's list rule: the same as the tracker's bounded lists (above 64 intervals one covering range replaces them, which can only add a barrier)
+template <typename List>
+void LivePlanAdd(List& list, u64 start, u64 end) {
+    constexpr size_t MaxIntervals = 64;
+    if (list.Contains(start, end)) {
+        return;
+    }
+    if (list.Size() >= MaxIntervals) {
+        u64 lo = start, hi = end;
+        for (const auto& interval : list) {
+            lo = std::min(lo, interval.start);
+            hi = std::max(hi, interval.end);
+        }
+        list.Clear();
+        list.Add({.start = lo, .end = hi});
+        return;
+    }
+    list.Add({.start = start, .end = end});
+}
+} // namespace
+
+u64 Runtime::LivePlanSpace(const VideoCore::Buffer* handle, u64 offset, u64& begin) {
+    const u64 base = handle->CpuAddr();
+    auto& seen = live_seen[reinterpret_cast<u64>(handle)];
+    const u64 size = handle->SizeBytes();
+    if (seen.base != base || seen.size != size) {
+        // the buffer cache moved or re-created the buffer: both guest ranges count as read and written by an unknown access (the tracker keeps lists in the buffer's own offset space)
+        if (seen.size != 0) {
+            ++live_stats.rebases;
+            auto& space = live_plan.buffers[0];
+            if (seen.base != 0) {
+                LivePlanAdd(space.write, seen.base, seen.base + seen.size);
+                LivePlanAdd(space.read, seen.base, seen.base + seen.size);
+            }
+            if (base != 0) {
+                LivePlanAdd(space.write, base, base + size);
+                LivePlanAdd(space.read, base, base + size);
+            }
+        }
+        seen = {base, size};
+    }
+    begin = base != 0 ? base + offset : offset;
+    return base != 0 ? 0 : reinterpret_cast<u64>(handle);
 }
 
 void Runtime::ReplayPlan() {
@@ -947,6 +998,38 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
             }
         }
     }
+    if (live_plan_on) {
+        u64 begin = 0;
+        auto& space = live_plan.buffers[LivePlanSpace(handle, offset, begin)];
+        bool planned = space.write.Overlaps(begin, begin + size);
+        if (check_read_access && !planned) {
+            planned = space.read.Overlaps(begin, begin + size);
+        }
+        ++live_stats.queries;
+        live_stats.answered_true += planned ? 1 : 0;
+        live_stats.planner_extra += planned && !has_access ? 1 : 0;
+        if (!planned && has_access) {
+            // TLG_BARRIER_PLANNER=2 keeps an exact list (no collapse above 64 intervals) next to the planner: if it also says "no hazard" the tracker's answer came from its own
+            // collapse (a covering range over the gaps of one big buffer), not from an access the planner lacks
+            bool exact_true = true;
+            if (live_plan_exact) {
+                auto& exact = live_exact.buffers[LivePlanSpace(handle, offset, begin)];
+                exact_true = exact.write.Overlaps(begin, begin + size) || (check_read_access && exact.read.Overlaps(begin, begin + size));
+            }
+            if (exact_true) {
+                ++live_stats.planner_missed;
+                static u32 logged = 0;
+                if (logged++ < 24) {
+                    LOG_ERROR(Render_Vulkan, "L4 planner missed a barrier: handle {:#x} offset {:#x} size {:#x} base {:#x} check_read {}", reinterpret_cast<u64>(handle), offset, size,
+                              u64{handle->CpuAddr()}, check_read_access);
+                }
+            } else {
+                ++live_stats.tracker_collapse_only;
+            }
+        }
+        // mode 1 and 2: the tracker corrects a miss (union); mode 3: the planner alone decides, the tracker is only compared (a miss is counted and logged, no barrier is made for it)
+        has_access = live_plan_decides ? planned : has_access || planned;
+    }
     return has_access;
 }
 
@@ -1023,6 +1106,26 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         plan_log.push_back({PlanEvent::Access, false, (src_access & WRITE_MASK) != vk::AccessFlags2{}, (src_access & READ_MASK) != vk::AccessFlags2{}, src_stage != vk::PipelineStageFlags2{}, false, false,
                             reinterpret_cast<u64>(handle), offset, size, handle->CpuAddr() != 0 ? handle->CpuAddr() + offset : 0});
     }
+    if (live_plan_on) {
+        u64 begin = 0;
+        auto& space = live_plan.buffers[LivePlanSpace(handle, offset, begin)];
+        if (src_access & WRITE_MASK) {
+            LivePlanAdd(space.write, begin, begin + size);
+        }
+        if (src_access & READ_MASK) {
+            LivePlanAdd(space.read, begin, begin + size);
+        }
+        live_plan.memory_pending |= src_stage != vk::PipelineStageFlags2{};
+        if (live_plan_exact) {
+            auto& exact = live_exact.buffers[LivePlanSpace(handle, offset, begin)];
+            if (src_access & WRITE_MASK) {
+                exact.write.Add({.start = begin, .end = begin + size});
+            }
+            if (src_access & READ_MASK) {
+                exact.read.Add({.start = begin, .end = begin + size});
+            }
+        }
+    }
     memory_barrier.srcStageMask |= src_stage;
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
 }
@@ -1041,6 +1144,17 @@ void Runtime::FlushBarriers() {
 
     if (hazard_audit_on) {
         plan_log.push_back({PlanEvent::Flush, false, false, false, false, !image_barriers.empty(), dep_info.memoryBarrierCount != 0 || dep_info.imageMemoryBarrierCount != 0, 0, 0, 0, 0});
+    }
+    if (live_plan_on) {
+        const bool actual = dep_info.memoryBarrierCount != 0 || dep_info.imageMemoryBarrierCount != 0;
+        const bool planned = live_plan.memory_pending || !image_barriers.empty();
+        ++live_stats.flushes;
+        live_stats.flush_differences += planned != actual ? 1 : 0;
+        if (actual) {
+            live_plan.buffers.clear();
+            live_plan.memory_pending = false;
+            live_exact.buffers.clear();
+        }
     }
     if (!dep_info.memoryBarrierCount && !dep_info.imageMemoryBarrierCount) {
         return;

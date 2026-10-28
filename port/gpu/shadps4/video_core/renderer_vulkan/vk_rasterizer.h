@@ -140,6 +140,12 @@ public:
     std::array<u64, 16> TakeDescriptorCensus() noexcept;
     [[nodiscard]] bool HazardAuditOn() const noexcept;
     Runtime::HazardAudit TakeHazardAudit();
+    [[nodiscard]] bool LivePlannerOn() const noexcept {
+        return runtime.LivePlannerOn();
+    }
+    [[nodiscard]] Runtime::LivePlanStats ReadLivePlanStats() const {
+        return runtime.ReadLivePlanStats();
+    }
     [[nodiscard]] bool InPlaceOn() const noexcept {
         return inplace_on;
     }
