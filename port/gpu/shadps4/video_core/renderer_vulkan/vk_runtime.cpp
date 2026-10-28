@@ -107,14 +107,10 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     if (const char* e = std::getenv("TLG_HAZARD_AUDIT"); e != nullptr && *e != 0 && *e != '0') {
         hazard_audit_on = true;
     }
-    // default 3 (the planner decides) since the owner's play of 2026-10-28; TLG_BARRIER_PLANNER=0 gives the decision back to the tracker
-    const char* planner = std::getenv("TLG_BARRIER_PLANNER");
-    const char mode = planner != nullptr && *planner != 0 ? planner[0] : '3';
-    if (mode != '0') {
-        live_plan_on = true;
-        live_plan_exact = mode == '2' || mode == '3';
-        live_plan_decides = mode == '3';
-    }
+    // C8 (2026-10-28): the planner always decides; the tracker runs next to it and is only compared
+    live_plan_on = true;
+    live_plan_exact = true;
+    live_plan_decides = true;
 }
 
 namespace {

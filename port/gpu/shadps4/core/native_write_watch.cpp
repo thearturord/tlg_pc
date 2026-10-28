@@ -131,8 +131,7 @@ bool LiftProtection() noexcept {
             LOG_ERROR(Render, "write watch: readbacks are on, the page protection stays (a write fault must download first)");
             return false;
         }
-        const char* e = std::getenv("TLG_WRITE_WATCH_LIFT");
-        return e == nullptr || *e != '0';
+        return true;
     }();
     return lift;
 }
@@ -385,8 +384,7 @@ void StartBackground() {
 
 bool LiftImages() noexcept {
     static const bool lift = [] {
-        const char* e = std::getenv("TLG_WRITE_WATCH_IMAGES");
-        return LiftProtection() && (e == nullptr || *e != '0');
+        return LiftProtection();
     }();
     return lift;
 }
