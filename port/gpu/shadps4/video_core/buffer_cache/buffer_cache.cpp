@@ -655,7 +655,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         }
     }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= STREAM_THRESHOLD && (!IsRegionGpuModified(device_addr, size) || (!is_texel_buffer && StreamWhilePassOpen(device_addr, size)))) {
+    if (!is_written && ((size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) || (!is_texel_buffer && StreamWhilePassOpen(device_addr, size)))) {
         // Stream copies are at most STREAM_THRESHOLD bytes, so the size fits in the low 16 bits.
         const u64 reuse_key = (device_addr << 16) | size;
         auto& reuse = stream_reuse_sets[Vulkan::Scheduler::SideSelected() ? 1 : 0];
@@ -755,7 +755,11 @@ bool BufferCache::StreamWhilePassOpen(VAddr device_addr, u32 size) {
         const char* e = std::getenv("TLG_STREAM_IN_PASS");
         return e == nullptr || *e != '0';
     }();
-    return on && size <= STREAM_THRESHOLD && scheduler.IsRendering() && !IsRangeGpuWritten(device_addr, size);
+    static const u32 max_bytes = [] {
+        const char* e = std::getenv("TLG_STREAM_IN_PASS_MAX"); // bytes, default 16 KiB (the stream threshold)
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::strtoul(e, nullptr, 10)) : static_cast<u32>(STREAM_THRESHOLD);
+    }();
+    return on && size <= max_bytes && scheduler.IsRendering() && !IsRangeGpuWritten(device_addr, size);
 }
 
 std::pair<const Buffer*, u64> BufferCache::StreamCopy(VAddr device_addr, u32 size) {
