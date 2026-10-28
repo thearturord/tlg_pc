@@ -91,6 +91,8 @@ public:
         u64 image_true_by_layouts[Layouts][Layouts][Sources]{}; ///< [layout before][layout asked][the source asking]
         /// C5, compute half: the true buffer hazards between two compute dispatches, by (program address of the dispatch that left the range, program address of the one that asked)
         std::map<std::pair<u64, u64>, u64> compute_pairs;
+        /// C5 recipe holdout: per asking access (source, compute program address or 0) the buffer queries and how many of them were true
+        std::map<std::tuple<u32, u64, u64>, std::pair<u64, u64>> ask_keys; ///< key: (source, program, the buffer asked about)
     };
     /// The compute program whose dispatch is being bound (the hazard audit attributes its accesses to it).
     void SetHazardProgram(u64 address) noexcept {

@@ -2049,6 +2049,30 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                     out["compute_barrier_pairs_top"] = std::move(compute);
                     out["compute_barrier_pairs_distinct"] = h.compute_pairs.size();
                 }
+                {
+                    // C5 recipe, holdout test: an asking access (source, program) whose queries all answered "no hazard" over at least 1,000 earlier queries is predicted to need no barrier; the
+                    // interval's queries of such keys are counted, and the ones that were true anyway (a barrier the recipe would have missed) are the misses
+                    static std::map<std::tuple<u32, u64, u64>, std::pair<u64, u64>> seen;
+                    static u64 predicted_queries = 0, predicted_misses = 0, other_queries = 0, other_true = 0;
+                    for (const auto& [key, counts] : h.ask_keys) {
+                        auto& cumulative = seen[key];
+                        if (cumulative.first >= 1000 && cumulative.second == 0) {
+                            predicted_queries += counts.first;
+                            predicted_misses += counts.second;
+                        } else {
+                            other_queries += counts.first;
+                            other_true += counts.second;
+                        }
+                        cumulative.first += counts.first;
+                        cumulative.second += counts.second;
+                    }
+                    u64 never_true_keys = 0;
+                    for (const auto& [key, counts] : seen) {
+                        never_true_keys += counts.first >= 1000 && counts.second == 0 ? 1 : 0;
+                    }
+                    out["recipe_holdout"] = {{"asking_keys", seen.size()}, {"keys_never_true_over_1000_queries", never_true_keys}, {"queries_of_those_keys_since_start", predicted_queries},
+                                             {"of_them_true_anyway_(missed_barriers)", predicted_misses}, {"queries_of_the_other_keys", other_queries}, {"true_in_the_other_keys", other_true}};
+                }
                 out["note"] = "C5 hazard audit, counts per ~5 s interval (read only)";
                 Core::DebugServer::Publish("hazard_audit", std::move(out));
             }

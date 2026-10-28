@@ -796,6 +796,11 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
     }
     if (hazard_audit_on) {
         ++hazard.buffer_queries;
+        {
+            auto& ask = hazard.ask_keys[{HazardSource(), hazard_program, reinterpret_cast<u64>(handle)}];
+            ++ask.first;
+            ask.second += has_access ? 1 : 0;
+        }
         if (has_access) {
             ++hazard.buffer_true;
             u32 writer = HazardAudit::Sources - 1; // unknown unless a record is found
