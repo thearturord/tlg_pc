@@ -111,6 +111,7 @@ public:
     /// next to it and corrects it (a barrier the planner lacks and the tracker has is counted as a miss and the barrier is made). 0 misses over a long run is the exit of L4.
     struct LivePlanStats {
         u64 queries{}, answered_true{}, planner_missed{}, planner_extra{}, tracker_collapse_only{}, flushes{}, flush_differences{}, rebases{};
+        u64 image_transits{}, image_barriers{}, image_differences{}, images_planned{};
     };
     [[nodiscard]] bool LivePlannerOn() const noexcept {
         return live_plan_on;
@@ -119,6 +120,8 @@ public:
     [[nodiscard]] LivePlanStats ReadLivePlanStats() const {
         return live_stats;
     }
+    /// The layout an image is in for a descriptor or an attachment: the image planner's when it decides (mode 3), else the image's own state
+    [[nodiscard]] vk::ImageLayout CurrentLayout(const VideoCore::Image& image) const;
 
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);
@@ -178,6 +181,18 @@ private:
     LivePlanStats live_stats{};
     /// the list a range lives in (0 = all guest memory, else the buffer's own offset space) and its start there
     u64 LivePlanSpace(const VideoCore::Buffer* handle, u64 offset, u64& begin);
+    /// L4, images: the layout / access / stage of every image the planner has seen, per backing (sample count) and per subresource once a
+    /// partial transition split it, keyed by the image's unique id; the same state machine as Image::GetBarriers, kept apart from the image
+    struct ImagePlan {
+        VideoCore::Image::State state;
+        std::vector<VideoCore::Image::State> subresources;
+    };
+    std::unordered_map<u64, ImagePlan> image_plan;
+    static u64 ImagePlanKey(const VideoCore::Image& image, u32 num_samples) {
+        return (image.image_uid << 6) | (num_samples & 63);
+    }
+    void PlanImageBarriers(VideoCore::Image* image, VideoCore::Image::Barriers& out, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                           vk::PipelineStageFlags2 dst_stage, std::optional<VideoCore::SubresourceRange> subres_range);
     u32 hazard_override{~0u}; ///< set inside the runtime's own copies, fills and image transfers
     HazardAudit hazard{};
     u32 HazardSource() const;

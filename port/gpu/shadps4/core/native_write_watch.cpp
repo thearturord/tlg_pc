@@ -30,6 +30,7 @@ void runtime_memory_ww_stats(uint64_t out[4]);
 namespace Core::WriteWatch {
 
 std::atomic<u32> epoch{1};
+std::atomic<u32> base_epoch{1};
 
 namespace {
 constexpr u64 ChunkBits = 16;
@@ -50,6 +51,7 @@ struct Region {
     VAddr start{};
     u64 size{};
     std::unique_ptr<std::atomic<u32>[]> harvested; ///< per 64 KiB chunk: the epoch read before its last harvest (0: never)
+    std::unique_ptr<std::atomic<u32>[]> harvested_base; ///< per 64 KiB chunk: the base epoch read before its last harvest (0: never)
     std::unique_ptr<std::atomic<u32>[]> requested; ///< per block: the epoch of its last request (the background harvest keeps those fresh)
 };
 
@@ -100,8 +102,10 @@ void RefreshRegions(State& s) {
         r.size = sizes[i];
         const u64 chunks = (r.size + (u64{1} << ChunkBits) - 1) >> ChunkBits;
         r.harvested = std::make_unique<std::atomic<u32>[]>(chunks);
+        r.harvested_base = std::make_unique<std::atomic<u32>[]>(chunks);
         for (u64 c = 0; c < chunks; ++c) {
             r.harvested[c].store(0, std::memory_order_relaxed);
+            r.harvested_base[c].store(0, std::memory_order_relaxed);
         }
         const u64 blocks = chunks / BlockChunks() + 1;
         r.requested = std::make_unique<std::atomic<u32>[]>(blocks);
@@ -307,6 +311,7 @@ void BackgroundLoop() {
             epoch.fetch_add(1, std::memory_order_acq_rel);
             s.window_bumps.fetch_add(1, std::memory_order_relaxed);
         }
+        const u32 now_base = base_epoch.load(std::memory_order_acquire);
         const u32 now = epoch.load(std::memory_order_acquire);
         const auto started = std::chrono::steady_clock::now();
         const u32 count = s.region_count.load(std::memory_order_acquire);
@@ -350,6 +355,7 @@ void BackgroundLoop() {
                         }
                         for (u64 ch = c; ch <= run_end; ++ch) {
                             r.harvested[ch].store(now, std::memory_order_release);
+                            r.harvested_base[ch].store(now_base, std::memory_order_release);
                         }
                         s.background_calls.fetch_add(1, std::memory_order_relaxed);
                         s.background_pages_marked.fetch_add(n, std::memory_order_relaxed);
@@ -377,7 +383,34 @@ void StartBackground() {
 }
 } // namespace
 
-void Harvest(VAddr address, u64 size, Replay replay, IsCpuDirty dirty, IsCpuDirty gpu, void* context) {
+bool LiftImages() noexcept {
+    static const bool lift = [] {
+        const char* e = std::getenv("TLG_WRITE_WATCH_IMAGES");
+        return LiftProtection() && (e == nullptr || *e != '0');
+    }();
+    return lift;
+}
+
+namespace {
+std::atomic<u64> image_checks{0}, image_misses{0}, image_samples{0};
+} // namespace
+
+bool SampleImageCheck() noexcept {
+    return VerifyOn() && image_samples.fetch_add(1, std::memory_order_relaxed) % VerifyInterval() == 0;
+}
+
+void NoteImageCheck(bool changed_without_a_record, VAddr address, u64 size) {
+    image_checks.fetch_add(1, std::memory_order_relaxed);
+    if (changed_without_a_record) {
+        image_misses.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1) < 24) {
+            LOG_ERROR(Render, "write watch image MISS: image {:#x}+{:#x} changed since its upload and is not marked dirty", address, size);
+        }
+    }
+}
+
+void Harvest(VAddr address, u64 size, Replay replay, IsCpuDirty dirty, IsCpuDirty gpu, void* context, bool image) {
     if (!CheckEnabled() || size == 0) {
         return;
     }
@@ -396,17 +429,20 @@ void Harvest(VAddr address, u64 size, Replay replay, IsCpuDirty dirty, IsCpuDirt
         static std::atomic<u64> last_bump{0};
         const u64 t = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
         u64 last = last_bump.load(std::memory_order_relaxed);
-        if (!BackgroundOn() && window_ns != 0 && t - last > window_ns && last_bump.compare_exchange_strong(last, t, std::memory_order_relaxed)) {
+        if (!image && !BackgroundOn() && window_ns != 0 && t - last > window_ns && last_bump.compare_exchange_strong(last, t, std::memory_order_relaxed)) {
             epoch.fetch_add(1, std::memory_order_acq_rel);
             s.window_bumps.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    const u32 now_base = base_epoch.load(std::memory_order_acquire);
     const u32 now = epoch.load(std::memory_order_acquire);
     const bool pending = runtime_memory_ww_pending() != 0;
     const VAddr end = address + size;
-    // a chunk harvested at this epoch or later (its pages replayed before the epoch was stored) needs nothing
-    const auto current = [now](const std::atomic<u32>& harvested) {
-        return static_cast<s32>(harvested.load(std::memory_order_acquire) - now) >= 0;
+    // a chunk harvested at this epoch or later (its pages replayed before the epoch was stored) needs nothing; an image looks at the
+    // base epoch only
+    const auto current_at = [image, now, now_base](const Region& r, u64 c) {
+        return image ? static_cast<s32>(r.harvested_base[c].load(std::memory_order_acquire) - now_base) >= 0
+                     : static_cast<s32>(r.harvested[c].load(std::memory_order_acquire) - now) >= 0;
     };
     if (!every && !pending) {
         bool stale = false;
@@ -416,13 +452,13 @@ void Harvest(VAddr address, u64 size, Replay replay, IsCpuDirty dirty, IsCpuDirt
             const VAddr a = std::max(address, r.start);
             const VAddr b = std::min(end, r.start + r.size);
             for (u64 c = a < b ? (a - r.start) >> ChunkBits : 1, c1 = a < b ? (b - 1 - r.start) >> ChunkBits : 0; c <= c1; ++c) {
-                if (!current(r.harvested[c])) {
+                if (!current_at(r, c)) {
                     stale = true;
                     break;
                 }
             }
         }
-        if (!stale && s.refreshed_at.load(std::memory_order_relaxed) == now) {
+        if (!stale && s.refreshed_at.load(std::memory_order_relaxed) == now_base) {
             s.skipped.fetch_add(1, std::memory_order_relaxed);
             if (VerifyInterval() == 0) {
                 return;
@@ -434,10 +470,10 @@ void Harvest(VAddr address, u64 size, Replay replay, IsCpuDirty dirty, IsCpuDirt
     s.context = context;
     StartBackground();
     const auto started = std::chrono::steady_clock::now();
-    if (s.refreshed_at.load(std::memory_order_relaxed) != now) {
+    if (s.refreshed_at.load(std::memory_order_relaxed) != now_base) {
         // mappings change before the submissions that use them
         RefreshRegions(s);
-        s.refreshed_at.store(now, std::memory_order_relaxed);
+        s.refreshed_at.store(now_base, std::memory_order_relaxed);
     }
     // consecutive pages are marked as one range
     const auto replay_pages = [&](size_t n) {
@@ -470,12 +506,12 @@ void Harvest(VAddr address, u64 size, Replay replay, IsCpuDirty dirty, IsCpuDirt
         // runs of chunks not harvested at this epoch, one runtime call per run
         u64 c = c0;
         while (c <= c1) {
-            if (!every && current(r.harvested[c])) {
+            if (!every && current_at(r, c)) {
                 ++c;
                 continue;
             }
             u64 run_end = c;
-            while (run_end + 1 <= c1 && (every || !current(r.harvested[run_end + 1]))) {
+            while (run_end + 1 <= c1 && (every || !current_at(r, run_end + 1))) {
                 ++run_end;
             }
             const VAddr ra = r.start + (c << ChunkBits);
@@ -494,6 +530,7 @@ void Harvest(VAddr address, u64 size, Replay replay, IsCpuDirty dirty, IsCpuDirt
             s.replayed.fetch_add(n, std::memory_order_relaxed);
             for (u64 k = c; k <= run_end; ++k) {
                 r.harvested[k].store(now, std::memory_order_release);
+                r.harvested_base[k].store(now_base, std::memory_order_release);
             }
             s.chunks.fetch_add(run_end - c + 1, std::memory_order_relaxed);
             any = true;
@@ -566,6 +603,9 @@ nlohmann::json Report() {
             {"gpu_side_writes_pages", runtime[1]},
             {"gpu_side_writes_raced_by_the_cpu", runtime[2]},
             {"regions_released", runtime[3]},
+            {"images_unprotected", LiftImages()},
+            {"image_verify", {{"images_checked", image_checks.load(std::memory_order_relaxed)},
+                              {"MISSES_changed_without_being_marked", image_misses.load(std::memory_order_relaxed)}}},
             {"verify", {{"interval", VerifyInterval()},
                         {"pages_checked", Verify().pages_checked.load(std::memory_order_relaxed)},
                         {"MISSES_changed_without_a_record", Verify().misses.load(std::memory_order_relaxed)},

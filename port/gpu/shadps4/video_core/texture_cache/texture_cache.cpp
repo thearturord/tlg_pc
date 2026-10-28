@@ -14,6 +14,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "core/native_resources.h"
+#include "core/native_write_watch.h"
 #include "core/resource_audit.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/readback_batch.h"
@@ -291,6 +292,63 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Image begins and ends on this page so it can not receive any more invalidations.
             // We will check it's hash later to see if it really was modified.
             MarkAsMaybeDirty(image_id, image);
+        }
+    }
+}
+
+namespace {
+constexpr VAddr WwPage = 4096;
+/// the image's bytes on the page holding `at`
+std::pair<VAddr, VAddr> ImageBytesOnPage(const Image& image, VAddr at) {
+    const VAddr page = at & ~(WwPage - 1);
+    return {std::max(page, image.info.guest_address), std::min(page + WwPage, image.info.guest_address + image.info.guest_size)};
+}
+u64 HashBytes(std::pair<VAddr, VAddr> range) {
+    return range.first < range.second ? (XXH3_64bits(std::bit_cast<const u8*>(range.first), range.second - range.first) | 1) : 0;
+}
+} // namespace
+
+void TextureCache::NoteRefreshedForWriteWatch(Image& image) {
+    if (!Core::WriteWatch::LiftImages()) {
+        return;
+    }
+    const VAddr begin = image.info.guest_address;
+    const VAddr end = begin + image.info.guest_size;
+    image.ww_head_hash = (begin & (WwPage - 1)) != 0 || end - begin < WwPage ? HashBytes(ImageBytesOnPage(image, begin)) : 0;
+    image.ww_tail_hash = (end & (WwPage - 1)) != 0 ? HashBytes(ImageBytesOnPage(image, end - 1)) : 0;
+}
+
+void TextureCache::InvalidatePagesWritten(VAddr addr, size_t size) {
+    SmallVector<ImageId, 8> image_ids;
+    ForEachImageInRegion(addr, size, [&](ImageId image_id, Image&) { image_ids.push_back(image_id); });
+    for (const auto image_id : image_ids) {
+        Image& image = slot_images[image_id];
+        std::scoped_lock lk{image.mutex};
+        const VAddr begin = image.info.guest_address;
+        const VAddr end = begin + image.info.guest_size;
+        if (!image.Overlaps(addr, size) || True(image.flags & ImageFlagBits::CpuDirty)) {
+            continue;
+        }
+        // a written page that lies wholly inside the image: the write was the image's
+        const VAddr first_full = (begin + WwPage - 1) & ~(WwPage - 1);
+        const VAddr last_full_end = end & ~(WwPage - 1);
+        const VAddr a = std::max(addr, first_full);
+        const VAddr b = std::min<VAddr>(addr + size, last_full_end);
+        bool dirty = a < b;
+        if (!dirty) {
+            // only the image's partial first or last page was written: its own bytes there decide
+            const VAddr head_page = begin & ~(WwPage - 1);
+            const VAddr tail_page = (end - 1) & ~(WwPage - 1);
+            if (head_page >= addr && head_page < addr + size && image.ww_head_hash != 0) {
+                dirty |= HashBytes(ImageBytesOnPage(image, begin)) != image.ww_head_hash;
+            }
+            if (tail_page >= addr && tail_page < addr + size && image.ww_tail_hash != 0) {
+                dirty |= HashBytes(ImageBytesOnPage(image, end - 1)) != image.ww_tail_hash;
+            }
+        }
+        if (dirty) {
+            image.flags |= ImageFlagBits::CpuDirty;
+            UntrackImage(image_id);
         }
     }
 }
@@ -907,6 +965,33 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
 }
 
 void TextureCache::RefreshImage(Image& image) {
+    // L3 write watch: an image's first and last page, when it shares them with other data, are not protected; their CPU writes are learned
+    // here, before the dirty flags are read (the pages the image covers whole stay protected and fault as before)
+    const auto harvest_shared_pages = [&] {
+        const VAddr begin = image.info.guest_address;
+        const VAddr end = begin + image.info.guest_size;
+        if ((begin & 4095) != 0 || image.info.guest_size < 4096) {
+            buffer_cache.HarvestWriteWatch(begin & ~VAddr{4095}, 4096, true);
+        }
+        if ((end & 4095) != 0 && ((end - 1) & ~VAddr{4095}) != (begin & ~VAddr{4095})) {
+            buffer_cache.HarvestWriteWatch((end - 1) & ~VAddr{4095}, 4096, true);
+        }
+    };
+    harvest_shared_pages();
+    if (False(image.flags & ImageFlagBits::Dirty) && image.ww_hash != 0 && False(image.flags & ImageFlagBits::GpuModified) &&
+        Core::WriteWatch::SampleImageCheck()) {
+        // verify: an image that is not dirty must still hold the bytes of its last refresh
+        bool changed = (XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size) | 1) != image.ww_hash;
+        if (changed) {
+            // a write after the harvest above has its record by now: harvest again; still not dirty is a miss
+            harvest_shared_pages();
+            changed = False(image.flags & ImageFlagBits::Dirty);
+        }
+        Core::WriteWatch::NoteImageCheck(changed, image.info.guest_address, image.info.guest_size);
+        if (changed) {
+            image.flags |= ImageFlagBits::CpuDirty;
+        }
+    }
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
@@ -980,6 +1065,10 @@ void TextureCache::RefreshImage(Image& image) {
     runtime.UploadImage(&image, buffer, image_copies);
     Core::NativeResources::NoteImageUpload(image.info.guest_address, image.info.guest_size,
                                            BufferCache::last_image_source_gpu);
+    NoteRefreshedForWriteWatch(image);
+    image.ww_hash = Core::WriteWatch::VerifyOn() && !BufferCache::last_image_source_gpu
+                        ? XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size) | 1
+                        : 0;
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,

@@ -116,6 +116,12 @@ public:
     /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
 
+    /// L3 write watch: the CPU wrote the whole pages [addr, addr + size) (which bytes is not known). An image with a full page inside
+    /// the range is CPU dirty; an image that only shares its first or last page with the range is dirty when its own bytes on that page
+    /// changed since its last refresh (hashes taken by NoteRefreshedForWriteWatch), as the fault (which knew the bytes) decided.
+    void InvalidatePagesWritten(VAddr addr, size_t size);
+    static void NoteRefreshedForWriteWatch(Image& image);
+
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size, const char* by = "");
 

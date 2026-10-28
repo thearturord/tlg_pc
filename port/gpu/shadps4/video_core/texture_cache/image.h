@@ -153,6 +153,8 @@ public:
     SmallVector<BackingImage, 2> backing_images;
     BackingImage* backing{};
     u64 image_uid{};
+    u64 ww_hash{}; ///< write watch image verify: hash of the guest bytes at the last refresh (0: none)
+    u64 ww_head_hash{}, ww_tail_hash{}; ///< write watch: hash of the image's bytes on its first / last page at the last refresh (0: none)
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};

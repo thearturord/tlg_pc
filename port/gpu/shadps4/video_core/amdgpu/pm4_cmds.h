@@ -15,6 +15,7 @@
 
 namespace Core::WriteWatch {
 extern std::atomic<u32> epoch; ///< core/native_write_watch.h
+extern std::atomic<u32> base_epoch;
 }
 
 namespace AmdGpu {
@@ -708,6 +709,7 @@ struct PM4CmdWaitRegMem {
             const bool passed = TestValue(*Address());
             if (passed) {
                 // a label the CPU may have written after its data: data written before it matters from here (L3 write watch)
+                Core::WriteWatch::base_epoch.fetch_add(1, std::memory_order_acq_rel);
                 Core::WriteWatch::epoch.fetch_add(1, std::memory_order_acq_rel);
             }
             return passed;

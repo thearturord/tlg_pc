@@ -182,6 +182,103 @@ void LivePlanAdd(List& list, u64 start, u64 end) {
 }
 } // namespace
 
+vk::ImageLayout Runtime::CurrentLayout(const VideoCore::Image& image) const {
+    if (live_plan_decides && image.backing) {
+        if (const auto it = image_plan.find(ImagePlanKey(image, image.backing->num_samples)); it != image_plan.end()) {
+            return it->second.state.layout;
+        }
+    }
+    return image.backing ? image.backing->state.layout : vk::ImageLayout::eUndefined;
+}
+
+void Runtime::PlanImageBarriers(VideoCore::Image* image, VideoCore::Image::Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                                vk::PipelineStageFlags2 dst_stage, std::optional<VideoCore::SubresourceRange> subres_range) {
+    if (!image->backing) {
+        return;
+    }
+    const auto [it, created] = image_plan.try_emplace(ImagePlanKey(*image, image->backing->num_samples));
+    live_stats.images_planned += created ? 1 : 0;
+    auto& last_state = it->second.state;
+    auto& subresource_states = it->second.subresources;
+    const auto& info = image->info;
+    constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eMemoryWrite;
+    const bool needs_partial_transition =
+        subres_range && (subres_range->base != VideoCore::SubresourceBase{} || subres_range->extent != info.resources);
+    const bool partially_transited = !subresource_states.empty();
+    if (needs_partial_transition || partially_transited) {
+        if (!partially_transited) {
+            subresource_states.resize(info.resources.levels * info.resources.layers);
+            std::fill(subresource_states.begin(), subresource_states.end(), last_state);
+        }
+        const u32 start_mip = needs_partial_transition ? subres_range->base.level : 0u;
+        const u32 end_mip = needs_partial_transition ? subres_range->base.level + subres_range->extent.levels : info.resources.levels;
+        const u32 start_layer = needs_partial_transition ? subres_range->base.layer : 0u;
+        const u32 end_layer = needs_partial_transition ? subres_range->base.layer + subres_range->extent.layers : info.resources.layers;
+        for (u32 mip = start_mip; mip < end_mip; ++mip) {
+            for (u32 layer = start_layer; layer < end_layer; ++layer) {
+                const auto subres_idx = mip * info.resources.layers + layer;
+                if (subres_idx >= subresource_states.size()) {
+                    continue;
+                }
+                auto& state = subresource_states[subres_idx];
+                const bool is_write = static_cast<bool>(state.access_mask & write_flags);
+                if (state.layout != dst_layout || state.access_mask != dst_mask || is_write) {
+                    barriers.emplace_back(vk::ImageMemoryBarrier2{
+                        .srcStageMask = state.pl_stage,
+                        .srcAccessMask = state.access_mask,
+                        .dstStageMask = dst_stage,
+                        .dstAccessMask = dst_mask,
+                        .oldLayout = state.layout,
+                        .newLayout = dst_layout,
+                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .image = image->GetImage(),
+                        .subresourceRange{
+                            .aspectMask = image->aspect_mask,
+                            .baseMipLevel = mip,
+                            .levelCount = 1,
+                            .baseArrayLayer = layer,
+                            .layerCount = 1,
+                        },
+                    });
+                    state.layout = dst_layout;
+                    state.access_mask = dst_mask;
+                    state.pl_stage = dst_stage;
+                }
+            }
+        }
+        if (!needs_partial_transition) {
+            subresource_states.clear();
+        }
+    } else {
+        const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
+        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
+            return;
+        }
+        barriers.emplace_back(vk::ImageMemoryBarrier2{
+            .srcStageMask = last_state.pl_stage,
+            .srcAccessMask = last_state.access_mask,
+            .dstStageMask = dst_stage,
+            .dstAccessMask = dst_mask,
+            .oldLayout = last_state.layout,
+            .newLayout = dst_layout,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image->GetImage(),
+            .subresourceRange{
+                .aspectMask = image->aspect_mask,
+                .baseMipLevel = 0,
+                .levelCount = VK_REMAINING_MIP_LEVELS,
+                .baseArrayLayer = 0,
+                .layerCount = VK_REMAINING_ARRAY_LAYERS,
+            },
+        });
+    }
+    last_state.layout = dst_layout;
+    last_state.access_mask = dst_mask;
+    last_state.pl_stage = dst_stage;
+}
+
 u64 Runtime::LivePlanSpace(const VideoCore::Buffer* handle, u64 offset, u64& begin) {
     const u64 base = handle->CpuAddr();
     auto& seen = live_seen[reinterpret_cast<u64>(handle)];
@@ -398,6 +495,35 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
     const u32 layout_before = hazard_audit_on && image->backing ? HazardLayoutIndex(image->backing->state.layout) : 0;
     image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
+    if (live_plan_on) {
+        // L4, images: the planner's barriers next to the image's own; mode 3 takes the planner's
+        VideoCore::Image::Barriers planned;
+        PlanImageBarriers(image, planned, dst_layout, dst_access, dst_stage, subres_range);
+        ++live_stats.image_transits;
+        live_stats.image_barriers += planned.size();
+        bool same = planned.size() == image_barriers.size() - prev_num_barriers;
+        for (size_t i = 0; same && i < planned.size(); ++i) {
+            const auto& a = planned[i];
+            const auto& b = image_barriers[prev_num_barriers + i];
+            same = a.srcStageMask == b.srcStageMask && a.srcAccessMask == b.srcAccessMask && a.dstStageMask == b.dstStageMask &&
+                   a.dstAccessMask == b.dstAccessMask && a.oldLayout == b.oldLayout && a.newLayout == b.newLayout && a.image == b.image &&
+                   a.subresourceRange == b.subresourceRange;
+        }
+        if (!same) {
+            ++live_stats.image_differences;
+            static u32 logged = 0;
+            if (logged++ < 24) {
+                LOG_ERROR(Render_Vulkan, "L4 image planner differs: image {:#x} uid {} samples {}: planner {} barriers, image state {}", image->info.guest_address,
+                          image->image_uid, image->backing ? image->backing->num_samples : 0u, planned.size(), image_barriers.size() - prev_num_barriers);
+            }
+        }
+        if (live_plan_decides) {
+            image_barriers.resize(prev_num_barriers);
+            for (const auto& barrier : planned) {
+                image_barriers.push_back(barrier);
+            }
+        }
+    }
     const bool result = image_barriers.size() != prev_num_barriers;
     if (hazard_audit_on) {
         ++hazard.image_calls;
@@ -953,6 +1079,10 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         new_backing->state.layout = dst_layout;
         new_backing->state.access_mask = dst_access;
         new_backing->state.pl_stage = dst_stage;
+        if (live_plan_on) {
+            // the image planner learns the new backing's state the same way (no transition of its own made it)
+            image_plan[ImagePlanKey(*image, new_backing->num_samples)] = {{dst_stage, dst_access, dst_layout}, {}};
+        }
     }
 
     backing = new_backing;

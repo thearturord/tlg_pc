@@ -147,7 +147,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
     });
 }
 
-void BufferCache::HarvestWriteWatch(VAddr device_addr, u64 size) {
+void BufferCache::HarvestWriteWatch(VAddr device_addr, u64 size, bool image) {
     if (!Core::WriteWatch::Enabled()) {
         return;
     }
@@ -159,6 +159,10 @@ void BufferCache::HarvestWriteWatch(VAddr device_addr, u64 size) {
             auto* self = static_cast<BufferCache*>(context);
             Core::NativeResources::NoteCpuWrite(page, bytes);
             self->memory_tracker->MarkRegionAsCpuModified(page, bytes);
+            if (Core::WriteWatch::LiftImages()) {
+                // the texture side of the fault (Rasterizer::InvalidateMemory): images on these pages are no longer protected
+                self->texture_cache.InvalidatePagesWritten(page, bytes);
+            }
         },
         [](void* context, VAddr page, u64 bytes) {
             return static_cast<BufferCache*>(context)->memory_tracker->IsRegionCpuModified(page, bytes);
@@ -166,7 +170,7 @@ void BufferCache::HarvestWriteWatch(VAddr device_addr, u64 size) {
         [](void* context, VAddr page, u64 bytes) {
             return static_cast<BufferCache*>(context)->memory_tracker->IsRegionGpuModified(page, bytes);
         },
-        this);
+        this, image);
 }
 
 static u64 SteadyNowNs() {

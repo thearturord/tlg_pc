@@ -103,7 +103,7 @@ public:
 
     /// L3 write watch: the pages of the range the CPU wrote since they were last asked (Core::WriteWatch) are marked CPU modified, as a
     /// write fault would have; called before any use of the range's CPU state
-    void HarvestWriteWatch(VAddr device_addr, u64 size);
+    void HarvestWriteWatch(VAddr device_addr, u64 size, bool image = false);
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);

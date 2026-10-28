@@ -25,10 +25,19 @@ namespace Core::WriteWatch {
 [[nodiscard]] bool Enabled() noexcept;
 /// Enabled and the readbacks mode allows it (a write fault with readbacks on must download first, which a write watch cannot)
 [[nodiscard]] bool LiftProtection() noexcept;
+/// LiftProtection and the texture cache's pages too (`TLG_WRITE_WATCH_IMAGES=0` keeps them protected): a harvest then invalidates the
+/// images of the written pages as the fault did, and the texture cache harvests an image's range before it refreshes the image
+[[nodiscard]] bool LiftImages() noexcept;
+/// image verify (with `TLG_WRITE_WATCH_VERIFY=N`): true for one refresh in N; the result of the check is reported with NoteImageCheck
+[[nodiscard]] bool SampleImageCheck() noexcept;
+void NoteImageCheck(bool changed_without_a_record, VAddr address, u64 size);
 
 extern std::atomic<u32> epoch;
+/// the epoch without the time window: guest submissions and passed memory waits only (the images' rule, see Harvest)
+extern std::atomic<u32> base_epoch;
 /// a guest submission (graphics or compute) or a passed wait on memory
 inline void BumpEpoch() noexcept {
+    base_epoch.fetch_add(1, std::memory_order_acq_rel);
     epoch.fetch_add(1, std::memory_order_acq_rel);
 }
 
@@ -39,7 +48,10 @@ using IsCpuDirty = bool (*)(void* context, VAddr page, u64 size);
 /// Verify mode (`TLG_WRITE_WATCH_VERIFY=N`, one request in N): every page of the range that is not CPU modified after the harvest is
 /// hashed and compared with the hash of its last upload (`NoteUpload`); a page that changed without a write watch record is a miss
 /// (counted, logged, marked).
-void Harvest(VAddr address, u64 size, Replay replay, IsCpuDirty dirty, IsCpuDirty gpu, void* context);
+/// `image`: the range of an image the texture cache refreshes. Images follow the base epoch only (a guest submission or a passed wait
+/// makes their chunks stale, the time window does not): an image range is large (render targets are tens of MiB) and scanning it at every
+/// window costs more than the window gives; the rule that data written before a submission or a label is seen still holds.
+void Harvest(VAddr address, u64 size, Replay replay, IsCpuDirty dirty, IsCpuDirty gpu, void* context, bool image = false);
 
 /// verify mode: what an upload sent to the GPU, per 4 KiB page (page aligned data)
 void NoteUpload(VAddr address, const u8* data, u64 size);
