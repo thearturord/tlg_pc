@@ -2434,6 +2434,22 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 for (u32 s = 0; s < 8 && words == nullptr; ++s) {
                     words = FindRecordWords(stage, dispatch_audit_plan->bindings.data(), dispatch_audit_plan->binding_count, s, 1, desc.sharp_fetch.offsets[0], 4, &audit_index);
                 }
+                if (words == nullptr && Core::NativeDraw::RecordCallerGhidra(dispatch_audit_plan->native_seq) != 0x01c6456d) { // that pass binds from the guest's tables anyway
+                    // the record builder leaves out a slot with no bound object: is the guest's descriptor there a null buffer too?
+                    const auto legacy = desc.GetSharp(stage);
+                    audit.dispatch_buffer_missing.fetch_add(1, std::memory_order_relaxed);
+                    if (legacy.base_address == 0 || legacy.GetSize() == 0) {
+                        audit.dispatch_buffer_missing_null.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        static std::atomic<u32> logged{0};
+                        if (logged.fetch_add(1) < 12) {
+                            u32 l[4];
+                            std::memcpy(l, &legacy, 16);
+                            LOG_ERROR(Render_Vulkan, "L2 missing entry, guest descriptor is not null: caller {:#x} program {:#x} offset {} guest {:08x} {:08x} {:08x} {:08x}", Core::NativeDraw::RecordCallerGhidra(dispatch_audit_plan->native_seq),
+                                      stage.pgm_hash, desc.sharp_fetch.offsets[0], l[0], l[1], l[2], l[3]);
+                        }
+                    }
+                }
                 if (words != nullptr) {
                     audit.dispatch_buffer_record.fetch_add(1, std::memory_order_relaxed);
                     const auto legacy = desc.GetSharp(stage);

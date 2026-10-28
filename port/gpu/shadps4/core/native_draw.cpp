@@ -9078,6 +9078,8 @@ void NativeListRead(nlohmann::json& out) {
                                  {"dispatch_binding_entries", a.dispatch_binding_entries.load()},
                                  {"dispatch_buffer_loads", a.dispatch_buffer_loads.load()},
                                  {"dispatch_buffer_served_by_record", a.dispatch_buffer_record.load()},
+                                 {"dispatch_buffer_missing", a.dispatch_buffer_missing.load()},
+                                 {"dispatch_buffer_missing_guest_null", a.dispatch_buffer_missing_null.load()},
                                  {"dispatch_buffer_equal", a.dispatch_buffer_equal.load()},
                                  {"dispatch_buffer_different", a.dispatch_buffer_different.load()},
                                  {"dispatch_diff_base_size_other_hasid_bothvalid_recordonly_trustbroken_ambiguous", {a.dispatch_diff[0].load(), a.dispatch_diff[1].load(), a.dispatch_diff[2].load(), a.dispatch_diff[3].load(), a.dispatch_diff[4].load(), a.dispatch_diff[5].load(), a.dispatch_diff[6].load(), a.dispatch_diff[7].load()}},

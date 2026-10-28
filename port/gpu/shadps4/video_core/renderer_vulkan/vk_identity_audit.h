@@ -21,6 +21,8 @@ struct IdentityAudit {
     std::atomic<u64> dispatch_with_record{0}, dispatch_bindings_complete{0}, dispatch_binding_entries{0};
     // B9 compare (TLG_DISPATCH_AUDIT=1): buffer loads of dispatches, served by the record, equal to the guest's descriptor, different
     std::atomic<u64> dispatch_buffer_loads{0}, dispatch_buffer_record{0}, dispatch_buffer_equal{0}, dispatch_buffer_different{0};
+    // L2: buffer loads the record has no entry for, and of those the ones where the guest's descriptor is a null buffer too (base or size 0)
+    std::atomic<u64> dispatch_buffer_missing{0}, dispatch_buffer_missing_null{0};
     // B9: classes of the differing buffer descriptors: 0 base differs, 1 size differs, 2 other words differ, 3 the id has an immutable buffer, 4 the record's range is inside it, 5 the guest's range is inside it, 6 neither, 7 the record's buffer is not alive
     std::array<std::atomic<u64>, 8> dispatch_diff{};
     // B9: of the differing ones: 0 the record's base is the previous dispatch's guest base (the record lags one update), 1 the guest's base is the previous record's base, 2 neither
