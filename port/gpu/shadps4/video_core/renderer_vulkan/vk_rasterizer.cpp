@@ -545,10 +545,37 @@ static bool LegacyDescriptorsOff() {
     return off;
 }
 
+/// L2 census: the record's binding list of the dispatch being bound, and a dump of it when a descriptor of a dispatch differs from the guest's (once per call site, program, kind, offset; at most 60 dumps)
+struct DispatchDumpContext {
+    const Core::NativeDraw::RecordBinding* list{};
+    u32 count{};
+    u64 seq{};
+};
+static thread_local DispatchDumpContext g_dump_context;
+static void DumpDispatchRecord(const Shader::Info& stage, u32 kind, u32 offset, const char* why) {
+    static std::mutex mutex;
+    static std::set<std::tuple<u64, u64, u32, u32>> seen;
+    static u32 dumps = 0;
+    const u64 caller = Core::NativeDraw::RecordCallerGhidra(g_dump_context.seq);
+    std::scoped_lock lock{mutex};
+    if (dumps >= 60 || !seen.insert({caller, u64{stage.pgm_hash}, kind, offset}).second) {
+        return;
+    }
+    ++dumps;
+    u32 root = 0, src = 0;
+    const bool table = stage.srt_info.TableSource(offset, root, src);
+    LOG_ERROR(Render_Vulkan, "L2 dump ({}): caller {:#x} program {:#x} kind {} flat offset {} table {} root sgpr {} src {} entries {}", why, caller, u64{stage.pgm_hash}, kind, offset, table, root, src, g_dump_context.count);
+    for (u32 i = 0; i < g_dump_context.count && i < 64; ++i) {
+        const auto& b = g_dump_context.list[i];
+        LOG_ERROR(Render_Vulkan, "L2 entry {}: stage {} kind {} slot {} offset {:#x} dwords {} table_sgpr {} entry_dwords {} id {:#x} words {:08x} {:08x} {:08x} {:08x}", i, b.stage, b.kind, b.slot, b.offset, b.dwords, b.table_sgpr,
+                  b.entry_dwords, b.id, b.words[0], b.words[1], b.words[2], b.words[3]);
+    }
+}
+
 /// B9 trust by experience (mode 2): a descriptor of a dispatch's record is served from the record only after it equalled the guest's 64 times in a row for the same (call site, program,
 /// flat offset, kind); every 64th use after that is compared again and one difference ends the trust for good. `chosen` holds the record's descriptor; false: use the guest's.
 template <class T, class F>
-static bool DispatchTrustCheck(u64 key, T& chosen, F&& guest) {
+static bool DispatchTrustCheck(u64 key, T& chosen, F&& guest, const Shader::Info* dump_stage = nullptr, u32 dump_kind = 0, u32 dump_offset = 0) {
     if (LegacyDescriptorsOff()) {
         return true;
     }
@@ -574,6 +601,9 @@ static bool DispatchTrustCheck(u64 key, T& chosen, F&& guest) {
                 LOG_ERROR(Render_Vulkan, "B9 trust broken: caller {:#x} key kind {} program {:#x} offset {} after {} equal uses, guest {:08x} {:08x} {:08x} {:08x} record {:08x} {:08x} {:08x} {:08x}",
                           (key >> 40) & 0xfffffffu, key >> 60, (key >> 8) & 0xffffffffu, key & 0xff, t.equal, l[0], l[1], l[2], l[3], r[0], r[1], r[2], r[3]);
             }
+        }
+        if (!t.bad && dump_stage != nullptr) {
+            DumpDispatchRecord(*dump_stage, dump_kind, dump_offset, "trust broken");
         }
         t.bad = true;
         g_identity_audit.dispatch_diff[6].fetch_add(1, std::memory_order_relaxed);
@@ -1563,6 +1593,7 @@ const DrawPlan* Rasterizer::DispatchBinderFor(const DispatchPlan* plan) {
     out.has_geometry_handles = false;
     std::memcpy(out.bindings.data(), plan->bindings.data(), sizeof(Core::NativeDraw::RecordBinding) * plan->binding_count);
     binder_verify = mode == 3;
+    g_dump_context = {out.bindings.data(), out.binding_count, plan->native_seq};
     return &out;
 }
 
@@ -1643,7 +1674,7 @@ const u32* Rasterizer::BinderWords(const Shader::Info& stage, u32 offset, u32 dw
         // entry gives other words the record does not say which one the shader reads, and the guest's tables serve it
         u32 second = 0;
         const u32* other = first + 1 < binder_plan->binding_count
-                               ? FindRecordWords(stage, binder_plan->bindings.data() + first + 1, binder_plan->binding_count - first - 1, s, kind, offset, dwords, &second)
+                               ? FindRecordWords(stage, binder_plan->bindings.data() + first + 1, binder_plan->binding_count - first - 1, s, kind, offset, dwords, &second, false)
                                : nullptr;
         if (other != nullptr && std::memcmp(words, other, dwords * sizeof(u32)) != 0) {
             g_identity_audit.dispatch_diff[7].fetch_add(1, std::memory_order_relaxed); // counted as "ambiguous"
@@ -2357,7 +2388,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (const u32* words = BinderWords(stage, desc.sharp_fetch.offsets[0], 4, 1, &record_binding)) {
                     chosen_sharp = desc.FromWords(words, stage);
                     from_record = true;
-                    if (stage.sw_stage == Shader::SwStage::Compute && DispatchBinderMode() == 2) {
+                    if (stage.sw_stage == Shader::SwStage::Compute && DispatchBinderMode() == 2 && !LegacyDescriptorsOff()) {
                         // trust by experience: a (call site, program, flat offset) is served from the record only after 64 uses in a row where it equalled the guest's descriptor;
                         // every 64th use after that is compared again and one difference ends the trust for good (the guest's descriptor serves it from then on)
                         struct Trust {
@@ -2373,6 +2404,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                             if (std::memcmp(&legacy, &chosen_sharp, sizeof(legacy)) == 0) {
                                 t.equal = std::min<u32>(t.equal + 1, 64);
                             } else {
+                                if (!t.bad) {
+                                    DumpDispatchRecord(stage, 1, desc.sharp_fetch.offsets[0], "buffer trust broken");
+                                }
                                 t.bad = true;
                                 g_identity_audit.dispatch_diff[6].fetch_add(1, std::memory_order_relaxed);
                             }
@@ -2446,6 +2480,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 Core::NativeRegistry::NoteBinder(0);
             } else if (StageFlatSkipped(stage) && desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::MultiLoad) {
                 Core::NativeRegistry::NoteBinder(6); // must not happen: the plan skipped the flat user data for a stage the record covers
+                if (stage.sw_stage == Shader::SwStage::Compute) {
+                    DumpDispatchRecord(stage, 1, desc.sharp_fetch.offsets[0], "no record entry: buffer");
+                }
                 chosen_sharp = AmdGpu::Buffer::Null();
             } else {
                 chosen_sharp = desc.GetSharp(stage);
@@ -2918,7 +2955,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 image_from_record = true;
                 if (stage.sw_stage == Shader::SwStage::Compute && DispatchBinderMode() == 2) {
                     image_from_record = DispatchTrustCheck((Core::NativeDraw::RecordCallerGhidra(binder_plan->native_seq) << 40) ^ (u64{stage.pgm_hash} << 8) ^ image_desc.sharp_fetch.offsets[0] ^ (2ull << 60),
-                                                           chosen_tsharp, [&] { return image_desc.GetSharp(stage); });
+                                                           chosen_tsharp, [&] { return image_desc.GetSharp(stage); }, &stage, 2, image_desc.sharp_fetch.offsets[0]);
                 }
                 {
                     const u32* record_words = words;
@@ -2960,6 +2997,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             Core::NativeRegistry::NoteBinder(1);
         } else if (StageFlatSkipped(stage)) {
             Core::NativeRegistry::NoteBinder(6); // must not happen
+            if (stage.sw_stage == Shader::SwStage::Compute) {
+                DumpDispatchRecord(stage, 2, image_desc.sharp_fetch.offsets[0], "no record entry: image");
+            }
             chosen_tsharp = AmdGpu::Image::Null(image_desc.is_depth);
         } else {
             chosen_tsharp = image_desc.GetSharp(stage);
@@ -3228,7 +3268,7 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
             Core::NativeRegistry::NoteBinder(7);
             if (stage.sw_stage == Shader::SwStage::Compute && DispatchBinderMode() == 2) {
                 DispatchTrustCheck((Core::NativeDraw::RecordCallerGhidra(binder_plan->native_seq) << 40) ^ (u64{stage.pgm_hash} << 8) ^ sampler.sharp_fetch.offsets[0] ^ (3ull << 60), ssharp,
-                                   [&] { return sampler.GetSharp(stage); });
+                                   [&] { return sampler.GetSharp(stage); }, &stage, 3, sampler.sharp_fetch.offsets[0]);
             }
             if (binder_verify) {
                 const auto legacy = sampler.GetSharp(stage);
@@ -3239,6 +3279,9 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
             }
         } else if (StageFlatSkipped(stage)) {
             Core::NativeRegistry::NoteBinder(6); // must not happen
+            if (stage.sw_stage == Shader::SwStage::Compute) {
+                DumpDispatchRecord(stage, 3, sampler.sharp_fetch.offsets[0], "no record entry: sampler");
+            }
             ssharp = AmdGpu::Sampler{};
         } else {
             ssharp = sampler.GetSharp(stage);

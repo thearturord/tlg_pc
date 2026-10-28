@@ -1278,6 +1278,8 @@ void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* word
 }
 
 /// Adds the descriptor just built to the draw's binding list (`offset` 0xffff: an entry of a table behind a pointer).
+/// RecordBinding::entry_dwords value of the async context's entries: their `offset` is the engine's tagged offset (bit 15: a user data register, else a dword index into the staging table; bit 14 a flag)
+constexpr u32 TaggedOffsets = 0xfe;
 void NoteBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* words, u32 dwords, u32 table_sgpr = 0xff, u32 entry_dwords = 0) {
     if (last_descriptor_object.object != 0 && (offset != 0xffff || table_sgpr != 0xff)) {
         AddRecordBinding(stage, kind, slot, offset, words, dwords, table_sgpr, entry_dwords);
@@ -3291,7 +3293,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
             read_descriptor(sampler + 0x64, 4);
             NoteDescriptor(5, 3, descriptor.data());
             SetLastDescriptorObject(sampler, true);
-            NoteBinding(5, 3, index, Rd<u16>(offs, 0x142 + index * 2), descriptor.data(), 4);
+            NoteBinding(5, 3, index, Rd<u16>(offs, 0x142 + index * 2), descriptor.data(), 4, Rd<u8>(offs, 7), TaggedOffsets);
             place(Rd<u16>(offs, 0x142 + index * 2), descriptor.data(), 4);
         }
     }
@@ -3305,7 +3307,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
             read_descriptor(buffer + 0x60, 4);
             NoteDescriptor(5, 1, descriptor.data());
             SetLastDescriptorObject(buffer);
-            NoteBinding(5, 1, index, Rd<u16>(offs, 0x162 + index * 2), descriptor.data(), 4);
+            NoteBinding(5, 1, index, Rd<u16>(offs, 0x162 + index * 2), descriptor.data(), 4, Rd<u8>(offs, 7), TaggedOffsets);
             place(Rd<u16>(offs, 0x162 + index * 2), descriptor.data(), 4);
         }
     }
@@ -3324,13 +3326,13 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
                 descriptor[3] = (Rd<u32>(view, 0x84) & 0xc7ffffffu) | 0x18000000u;
                 NoteDescriptor(5, 1, descriptor.data());
                 SetLastDescriptorObject(view);
-                NoteBinding(5, 1, index, Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 4);
+                NoteBinding(5, 1, index, Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 4, Rd<u8>(offs, 7), TaggedOffsets);
                 place(Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 4);
             } else {
                 read_descriptor(view + 0x58, 8);
                 NoteDescriptor(5, 2, descriptor.data());
                 SetLastDescriptorObject(view);
-                NoteBinding(5, 2, index, Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 8);
+                NoteBinding(5, 2, index, Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 8, Rd<u8>(offs, 7), TaggedOffsets);
                 place(Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 8);
             }
         }
@@ -3347,7 +3349,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
                 read_descriptor(view + 0x74, 4);
                 NoteDescriptor(5, 1, descriptor.data());
                 SetLastDescriptorObject(view);
-                NoteBinding(5, 1, index, Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 4);
+                NoteBinding(5, 1, index, Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 4, Rd<u8>(offs, 7), TaggedOffsets);
                 place(Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 4);
                 if ((Rd<u8>(view, 0x50) & 2) != 0) {
                     if (const u32 init = Rd<u32>(jcc, 0x2158 + index * 4); init != 0xffffffffu) {
@@ -3365,7 +3367,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
                 read_descriptor(view + 0x54, 8);
                 NoteDescriptor(5, 2, descriptor.data());
                 SetLastDescriptorObject(view);
-                NoteBinding(5, 2, index, Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 8);
+                NoteBinding(5, 2, index, Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 8, Rd<u8>(offs, 7), TaggedOffsets);
                 place(Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 8);
             }
         }

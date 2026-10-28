@@ -111,13 +111,24 @@ constexpr u32 GeometryIndex = 0xFFFFFFFEu;  ///< and of the index range
 
 /// N6.1: the descriptor words the record holds for the shader load at flat user data `offset` of `stage_s` (0 vertex, 1 pixel): a descriptor put into the user data directly
 /// (`offset` inside the binding), or an entry of a descriptor table behind a user data register, found through the walker's table map of the shader. Null: not in the record.
-inline const u32* FindRecordWords(const Shader::Info& info, const Core::NativeDraw::RecordBinding* list, u32 count, u32 stage_s, u32 kind, u32 offset, u32 dwords, u32* index_out = nullptr) {
+inline const u32* FindRecordWords(const Shader::Info& info, const Core::NativeDraw::RecordBinding* list, u32 count, u32 stage_s, u32 kind, u32 offset, u32 dwords, u32* index_out = nullptr, bool use_hints = true) {
     u32 root = 0, src = 0;
     const bool table = info.srt_info.TableSource(offset, root, src);
     const auto match = [&](u32 i) -> const u32* {
         const auto& b = list[i];
         if (b.stage != stage_s || b.kind != kind) {
             return nullptr;
+        }
+        if (b.entry_dwords == 0xfe && b.offset != 0xffff) {
+            // an async context entry: a tagged engine offset. Only an entry in a user data register (bit 15) answers a direct load of that register; a dword index into the staging table
+            // (no bit 15) is the same number in another namespace and must not answer a register load (L2: the constant buffer at table index 8 was taken for the shader resource in register 8)
+            if ((b.offset & 0x8000) == 0) {
+                // a dword index into the staging table: answers a table load through the register that points to the table (table_sgpr) at that dword
+                const u32 index = b.offset & 0x3fff;
+                return table && b.table_sgpr == root && src >= index && src + dwords <= index + b.dwords ? b.words + (src - index) : nullptr;
+            }
+            const u32 reg = b.offset & 0x3fff;
+            return !table && offset >= reg && offset + dwords <= reg + b.dwords ? b.words + (offset - reg) : nullptr;
         }
         if (b.offset != 0xffff) {
             return offset >= b.offset && offset + dwords <= u32{b.offset} + b.dwords ? b.words + (offset - b.offset) : nullptr;
@@ -131,7 +142,7 @@ inline const u32* FindRecordWords(const Shader::Info& info, const Core::NativeDr
     // The same shader asks for the same load in every draw and the record builder lists its descriptors in the same order: the index that served the last such lookup is tried first.
     static thread_local std::array<u16, 1024> hints{};
     u16& hint = hints[(((reinterpret_cast<u64>(&info) >> 4) * 0x9E3779B1u) ^ (offset * 131u) ^ (kind * 7u) ^ (stage_s * 3u)) & 1023];
-    if (hint < count) {
+    if (use_hints && hint < count) {
         if (const u32* words = match(hint)) {
             if (index_out != nullptr) {
                 *index_out = hint;
@@ -141,7 +152,9 @@ inline const u32* FindRecordWords(const Shader::Info& info, const Core::NativeDr
     }
     for (u32 i = 0; i < count; ++i) {
         if (const u32* words = match(i)) {
-            hint = static_cast<u16>(i);
+            if (use_hints) {
+                hint = static_cast<u16>(i);
+            }
             if (index_out != nullptr) {
                 *index_out = i;
             }
