@@ -320,15 +320,6 @@ private:
     void MirrorObject(const void* object, size_t size);
     void MirrorSetDefaults();
 
-    /// Registers of executed native draws stay in the register file (and the raster mirror) between draws; only the
-    /// registers that differ from the previous draw are written. `truth` keeps what the command packets wrote for
-    /// every register that currently holds a record's value, so the packet path (and a fast clear eliminate) gets
-    /// its own state back before it runs (front thread only).
-    struct NativeOverlay {
-        std::vector<u64> bits; ///< register indices that hold a record's value
-        std::vector<u32> list;
-    };
-    NativeOverlay overlay;
     /// The registers of a record come in groups (targets, the two stage programs, their user data, the interpolants, the draw arguments, the rest). A group
     /// whose values are the ones the last record applied, and that nothing has written since, is not applied again (front thread only).
     static constexpr u32 NumRegisterGroups = 8;
@@ -356,7 +347,6 @@ private:
     void InvalidateExecGroup(u32 index);
     std::array<u64, NumRegisterGroups> group_applied_hash{};
     std::array<bool, NumRegisterGroups> group_applied_valid{};
-    void OverlaySetWord(u32 index, u32* word, u32 value);
     void InvalidateRegisterGroup(u32 index);
     void InvalidateRegisterGroups();
     bool native_exec_scope{}; ///< the draw being dispatched is an executed record
@@ -373,10 +363,6 @@ private:
     u32 native_audit_kind{};
     u64 native_exec_key{}; ///< pipeline key of the draw being dispatched, from the record (0: look the pipeline up from the registers)
     const Vulkan::FixedState* native_fixed{}; ///< fixed-function state of the draw being dispatched, from the engine's objects (null: from the registers)
-    void OverlaySet(u32 index, u32 value);
-    void OverlayRestore();
-    void OverlayForget(u32 dword_offset, u32 count);
-    void OverlayForgetAll();
     /// Wakes the raster thread (it runs SendCommand callbacks) when the split is active.
     void WakeRaster();
 
