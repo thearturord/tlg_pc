@@ -562,6 +562,9 @@ private:
     Core::NativeResources::ImmutableBuffer* GeometryHandle(VAddr address, u64 size) const;
     /// N3b: the binder's plan has no flat user data for this stage
     bool StageFlatSkipped(const Shader::Info& stage) const;
+    u32 FlatReadExtra(const Shader::Info& stage) const;
+    u32 draw_class_now{15}; ///< census: the draw class of the draw being bound
+    bool draw_has_plan{}; ///< census: the draw being bound came with a plan from the record
     u64 dispatch_caller{}; ///< diagnostics: the game call that made the dispatch being bound
     u8 clip_plane_mask{}; ///< user clip planes of the draw being bound
     std::vector<std::unique_ptr<DispatchPlan>> dispatch_plan_pool;

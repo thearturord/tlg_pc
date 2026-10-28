@@ -123,9 +123,10 @@ inline const u32* FindRecordWords(const Shader::Info& info, const Core::NativeDr
             // an async context entry: a tagged engine offset. Only an entry in a user data register (bit 15) answers a direct load of that register; a dword index into the staging table
             // (no bit 15) is the same number in another namespace and must not answer a register load (L2: the constant buffer at table index 8 was taken for the shader resource in register 8)
             if ((b.offset & 0x8000) == 0) {
-                // a dword index into the staging table: answers a table load through the register that points to the table (table_sgpr) at that dword
+                // a dword index into the staging table: answers a table load through the register that points to the table (table_sgpr, which starts at table_base in the staging table)
                 const u32 index = b.offset & 0x3fff;
-                return table && b.table_sgpr == root && src >= index && src + dwords <= index + b.dwords ? b.words + (src - index) : nullptr;
+                const u32 absolute = src + b.table_base;
+                return table && b.table_sgpr == root && absolute >= index && absolute + dwords <= index + b.dwords ? b.words + (absolute - index) : nullptr;
             }
             const u32 reg = b.offset & 0x3fff;
             return !table && offset >= reg && offset + dwords <= reg + b.dwords ? b.words + (offset - reg) : nullptr;

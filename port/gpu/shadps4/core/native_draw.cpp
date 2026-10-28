@@ -1253,7 +1253,7 @@ void AddGeometryId(NativeRecord& record, u64 object) {
     }
     record.geometry_ids[record.geometry_id_count++] = id;
 }
-void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* words, u32 dwords, u32 table_sgpr = 0xff, u32 entry_dwords = 0) {
+void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* words, u32 dwords, u32 table_sgpr = 0xff, u32 entry_dwords = 0, u32 table_base = 0) {
     if (binding_record == nullptr || (stage > 1 && stage != 5)) { // B2: the compute stage (5) names its resources too
         return;
     }
@@ -1271,6 +1271,7 @@ void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* word
     binding.dwords = static_cast<u16>(std::min<u32>(dwords, 8));
     binding.table_sgpr = static_cast<u8>(table_sgpr);
     binding.entry_dwords = static_cast<u8>(entry_dwords);
+    binding.table_base = static_cast<u16>(table_base);
     binding.id = last_descriptor_object.id;
     for (u32 i = 0; i < binding.dwords; ++i) {
         binding.words[i] = words[i];
@@ -1280,9 +1281,9 @@ void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* word
 /// Adds the descriptor just built to the draw's binding list (`offset` 0xffff: an entry of a table behind a pointer).
 /// RecordBinding::entry_dwords value of the async context's entries: their `offset` is the engine's tagged offset (bit 15: a user data register, else a dword index into the staging table; bit 14 a flag)
 constexpr u32 TaggedOffsets = 0xfe;
-void NoteBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* words, u32 dwords, u32 table_sgpr = 0xff, u32 entry_dwords = 0) {
+void NoteBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* words, u32 dwords, u32 table_sgpr = 0xff, u32 entry_dwords = 0, u32 table_base = 0) {
     if (last_descriptor_object.object != 0 && (offset != 0xffff || table_sgpr != 0xff)) {
-        AddRecordBinding(stage, kind, slot, offset, words, dwords, table_sgpr, entry_dwords);
+        AddRecordBinding(stage, kind, slot, offset, words, dwords, table_sgpr, entry_dwords, table_base);
     }
     if (v2_collect == nullptr || last_descriptor_object.object == 0) {
         return;
@@ -3277,6 +3278,32 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
             ok = false; asc_fail = __LINE__;
         }
     };
+    // the engine hands the shader up to four pointers into the staging table (user data registers `offs[8 + k]`, at dword offsets `offs[0x16 / 0x1a / 0x1c / 0x1e]`) and, in some layouts, one
+    // for the whole table (`offs[7]`): a table index entry is reached through the pointer whose table starts at the largest offset not above it
+    const auto table_for = [&](u32 tag, u32& table_base) -> u32 {
+        table_base = 0;
+        if (tag == 0xffff || (tag & 0x8000) != 0) {
+            return Rd<u8>(offs, 7);
+        }
+        static constexpr std::array<u32, 4> starts{0x16, 0x1a, 0x1c, 0x1e};
+        const u32 index = tag & 0x3fff;
+        u32 best = 0xff;
+        bool found = false;
+        for (u32 k = 0; k < 4; ++k) {
+            const u32 sgpr = Rd<u8>(offs, 8 + k);
+            const u32 start = Rd<u16>(offs, starts[k]);
+            if (sgpr != 0xff && start <= index && (!found || start >= table_base)) {
+                best = sgpr;
+                table_base = start;
+                found = true;
+            }
+        }
+        if (!found) {
+            table_base = 0;
+            return Rd<u8>(offs, 7);
+        }
+        return best;
+    };
     std::array<u32, 8> descriptor;
     const auto read_descriptor = [&](u64 address, u32 dwords) {
         for (u32 k = 0; k < dwords; ++k) {
@@ -3293,7 +3320,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
             read_descriptor(sampler + 0x64, 4);
             NoteDescriptor(5, 3, descriptor.data());
             SetLastDescriptorObject(sampler, true);
-            NoteBinding(5, 3, index, Rd<u16>(offs, 0x142 + index * 2), descriptor.data(), 4, Rd<u8>(offs, 7), TaggedOffsets);
+            { u32 table_base = 0; const u32 table_sgpr = table_for(Rd<u16>(offs, 0x142 + index * 2), table_base); NoteBinding(5, 3, index, Rd<u16>(offs, 0x142 + index * 2), descriptor.data(), 4, table_sgpr, TaggedOffsets, table_base); }
             place(Rd<u16>(offs, 0x142 + index * 2), descriptor.data(), 4);
         }
     }
@@ -3307,7 +3334,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
             read_descriptor(buffer + 0x60, 4);
             NoteDescriptor(5, 1, descriptor.data());
             SetLastDescriptorObject(buffer);
-            NoteBinding(5, 1, index, Rd<u16>(offs, 0x162 + index * 2), descriptor.data(), 4, Rd<u8>(offs, 7), TaggedOffsets);
+            { u32 table_base = 0; const u32 table_sgpr = table_for(Rd<u16>(offs, 0x162 + index * 2), table_base); NoteBinding(5, 1, index, Rd<u16>(offs, 0x162 + index * 2), descriptor.data(), 4, table_sgpr, TaggedOffsets, table_base); }
             place(Rd<u16>(offs, 0x162 + index * 2), descriptor.data(), 4);
         }
     }
@@ -3326,13 +3353,13 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
                 descriptor[3] = (Rd<u32>(view, 0x84) & 0xc7ffffffu) | 0x18000000u;
                 NoteDescriptor(5, 1, descriptor.data());
                 SetLastDescriptorObject(view);
-                NoteBinding(5, 1, index, Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 4, Rd<u8>(offs, 7), TaggedOffsets);
+                { u32 table_base = 0; const u32 table_sgpr = table_for(Rd<u16>(offs, 0x22 + index * 2), table_base); NoteBinding(5, 1, index, Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 4, table_sgpr, TaggedOffsets, table_base); }
                 place(Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 4);
             } else {
                 read_descriptor(view + 0x58, 8);
                 NoteDescriptor(5, 2, descriptor.data());
                 SetLastDescriptorObject(view);
-                NoteBinding(5, 2, index, Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 8, Rd<u8>(offs, 7), TaggedOffsets);
+                { u32 table_base = 0; const u32 table_sgpr = table_for(Rd<u16>(offs, 0x22 + index * 2), table_base); NoteBinding(5, 2, index, Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 8, table_sgpr, TaggedOffsets, table_base); }
                 place(Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 8);
             }
         }
@@ -3349,7 +3376,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
                 read_descriptor(view + 0x74, 4);
                 NoteDescriptor(5, 1, descriptor.data());
                 SetLastDescriptorObject(view);
-                NoteBinding(5, 1, index, Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 4, Rd<u8>(offs, 7), TaggedOffsets);
+                { u32 table_base = 0; const u32 table_sgpr = table_for(Rd<u16>(offs, 0x122 + index * 2), table_base); NoteBinding(5, 1, index, Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 4, table_sgpr, TaggedOffsets, table_base); }
                 place(Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 4);
                 if ((Rd<u8>(view, 0x50) & 2) != 0) {
                     if (const u32 init = Rd<u32>(jcc, 0x2158 + index * 4); init != 0xffffffffu) {
@@ -3367,7 +3394,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
                 read_descriptor(view + 0x54, 8);
                 NoteDescriptor(5, 2, descriptor.data());
                 SetLastDescriptorObject(view);
-                NoteBinding(5, 2, index, Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 8, Rd<u8>(offs, 7), TaggedOffsets);
+                { u32 table_base = 0; const u32 table_sgpr = table_for(Rd<u16>(offs, 0x122 + index * 2), table_base); NoteBinding(5, 2, index, Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 8, table_sgpr, TaggedOffsets, table_base); }
                 place(Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 8);
             }
         }
@@ -9076,7 +9103,7 @@ void NativeListRead(nlohmann::json& out) {
                                  {"texture_hit_same_generation_verified", a.texture_gen_verified.load()}, {"texture_hit_same_generation_image_differs", a.texture_gen_diff_image.load()}, {"texture_hit_same_generation_range_differs", a.texture_gen_diff_range.load()},
                                  {"texture_id_served_after_generation_moved", a.texture_id_served.load()}, {"texture_id_refused", a.texture_id_refused.load()}, {"texture_id_verified", a.texture_id_verified.load()},
                                  {"texture_id_verify_image_differs", a.texture_id_diff_image.load()}, {"texture_id_verify_range_differs", a.texture_id_diff_range.load()},
-                                 {"compute_dispatches", a.dispatches.load()}, {"compute_programs_seen", a.programs_seen.load()}, {"compute_same_pipeline", a.pipeline_same.load()},
+                                 {"compute_dispatches", a.dispatches.load()}, {"flat_reads_top", [] { nlohmann::json out = nlohmann::json::array(); std::scoped_lock lock{Vulkan::g_flat_reads.mutex}; std::vector<std::pair<u64, std::string>> rows; for (const auto& [k, n] : Vulkan::g_flat_reads.counts) { rows.emplace_back(n, fmt::format("kind {} stage {} summary {} plan {} caller {:#x} program {:#x} extra {:#x}", std::get<0>(k), std::get<1>(k), std::get<2>(k), std::get<3>(k), std::get<4>(k), std::get<5>(k), std::get<6>(k))); } std::sort(rows.rbegin(), rows.rend()); for (size_t i = 0; i < rows.size() && i < 90; ++i) { out.push_back({{"count", rows[i].first}, {"what", rows[i].second}}); } return out; }()}, {"compute_programs_seen", a.programs_seen.load()}, {"compute_same_pipeline", a.pipeline_same.load()},
                                  {"compute_pipeline_switched", a.pipeline_switched.load()},
                                  {"dispatch_with_record", a.dispatch_with_record.load()},
                                  {"dispatch_bindings_complete", a.dispatch_bindings_complete.load()},

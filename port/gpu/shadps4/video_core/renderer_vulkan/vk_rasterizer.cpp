@@ -547,6 +547,20 @@ static bool LegacyDescriptorsOff() {
 
 /// L1(b) (`TLG_TEXTURE_IDS`, default on; 0 turns it off): a cached image lookup is kept across generation changes when the texture cache proves that nothing touched its range.
 /// `TLG_TEXTURE_IDS_VERIFY=N` (default 64, 0 none, 1 every use): every Nth such answer is compared with FindImage.
+u32 Rasterizer::FlatReadExtra(const Shader::Info& stage) const {
+    // bit 0 the stage's flat user data was skipped, 1 the plan's list is complete, 2 verify mode, 3 a plan exists, 8.. the plan's binding count, 24.. the op class
+    return (StageFlatSkipped(stage) ? 1u : 0u) | (binder_plan != nullptr && binder_plan->bindings_complete ? 2u : 0u) | (binder_verify ? 4u : 0u) | (binder_plan != nullptr ? 8u : 0u) |
+           (binder_plan != nullptr ? std::min<u32>(binder_plan->binding_count, 255u) << 8 : 0u) | (draw_class_now << 24) | (draw_has_plan ? 16u : 0u);
+}
+
+static bool DispatchPassHIncluded() {
+    static const bool included = [] {
+        const char* e = std::getenv("TLG_DISPATCH_BINDER_PASS_H"); // the pass at 0x1c6456d is served from its record since the table base fix (L1); =0 excludes it again
+        return e == nullptr || *e != '0';
+    }();
+    return included;
+}
+
 static bool TextureIdsOn() {
     static const bool on = [] {
         const char* e = std::getenv("TLG_TEXTURE_IDS");
@@ -1126,8 +1140,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
 
     PrepareRenderState(pipeline, fixed);
     binder_plan = NativeBinderFor(plan, tag.valid ? (tag.meta & 0xff) : 15u);
+    draw_has_plan = plan != nullptr;
+    draw_class_now = tag.valid ? (tag.meta & 0xff) : 15u;
     const bool bound = BindResources(pipeline, &fixed);
     binder_plan = nullptr;
+    draw_has_plan = false;
     if (!bound) {
         return;
     }
@@ -1565,12 +1582,16 @@ void Rasterizer::OnFence(Common::UniqueFunction<void>&& signal, VideoCore::Fence
 const DrawPlan* Rasterizer::DispatchBinderFor(const DispatchPlan* plan) {
     const u32 mode = DispatchBinderMode();
     if (mode == 0 || plan == nullptr || !plan->bindings_complete || plan->binding_count == 0) {
+        if (plan != nullptr) {
+            NoteFlatRead(9, mode == 0 ? 1 : !plan->bindings_complete ? 2 : 3, 0, 0, Core::NativeDraw::RecordCallerGhidra(plan->native_seq), 0, plan->binding_count); // a dispatch with no usable record: why and where from
+        } else {
+            NoteFlatRead(9, 4, 0, 0, 0, 0, 0);
+        }
         return nullptr;
     }
     // the pass at 0x01c6456d (RenderScene pass h): all of the buffer descriptors of the record that differ from the guest's come from it (an unrelated buffer at flat offset 96);
     // until its record is understood the guest's tables serve it (TLG_DISPATCH_BINDER=2 with it included hung the GPU)
-    static const bool include_pass_h = std::getenv("TLG_DISPATCH_BINDER_PASS_H") != nullptr;
-    if (!include_pass_h && Core::NativeDraw::RecordCallerGhidra(plan->native_seq) == 0x01c6456d) {
+    if (!DispatchPassHIncluded() && Core::NativeDraw::RecordCallerGhidra(plan->native_seq) == 0x01c6456d) {
         return nullptr;
     }
     // TLG_DISPATCH_RECORD_EXCLUDE=0x1c6456d,0x1c94f44: call sites (ghidra) whose dispatches always bind from the guest's tables (bisecting a wrong picture in the legacy off experiment)
@@ -2461,7 +2482,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 for (u32 s = 0; s < 8 && words == nullptr; ++s) {
                     words = FindRecordWords(stage, dispatch_audit_plan->bindings.data(), dispatch_audit_plan->binding_count, s, 1, desc.sharp_fetch.offsets[0], 4, &audit_index);
                 }
-                if (words == nullptr && Core::NativeDraw::RecordCallerGhidra(dispatch_audit_plan->native_seq) != 0x01c6456d) { // that pass binds from the guest's tables anyway
+                if (words == nullptr && (DispatchPassHIncluded() || Core::NativeDraw::RecordCallerGhidra(dispatch_audit_plan->native_seq) != 0x01c6456d)) { // that pass binds from the guest's tables anyway
                     // the record builder leaves out a slot with no bound object: is the guest's descriptor there a null buffer too?
                     const auto legacy = desc.GetSharp(stage);
                     audit.dispatch_buffer_missing.fetch_add(1, std::memory_order_relaxed);
@@ -2529,6 +2550,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 chosen_sharp = AmdGpu::Buffer::Null();
             } else {
                 chosen_sharp = desc.GetSharp(stage);
+                NoteFlatRead(1, static_cast<u32>(stage.sw_stage), static_cast<u32>(desc.sharp_fetch.summary), binder_plan != nullptr, binder_plan != nullptr ? Core::NativeDraw::RecordCallerGhidra(binder_plan->native_seq) : 0, stage.pgm_hash, FlatReadExtra(stage));
                 if (binder_plan != nullptr) {
                     Core::NativeRegistry::NoteBinder(2);
                 }
@@ -3057,6 +3079,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             chosen_tsharp = AmdGpu::Image::Null(image_desc.is_depth);
         } else {
             chosen_tsharp = image_desc.GetSharp(stage);
+            NoteFlatRead(2, static_cast<u32>(stage.sw_stage), static_cast<u32>(image_desc.sharp_fetch.summary), binder_plan != nullptr, binder_plan != nullptr ? Core::NativeDraw::RecordCallerGhidra(binder_plan->native_seq) : 0, stage.pgm_hash, FlatReadExtra(stage));
             if (binder_plan != nullptr) {
                 Core::NativeRegistry::NoteBinder(3);
             }
@@ -3360,9 +3383,27 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     for (const auto& sampler : stage.samplers) {
         AmdGpu::Sampler ssharp;
-        const u32* record_words = binder_plan != nullptr && sampler.FromWordsPossible() ? BinderWords(stage, sampler.sharp_fetch.offsets[0], 4, 3) : nullptr;
+        const u32* record_words = nullptr;
+        u32 aniso_dw3 = 0; // L1: dword 3 of the T# the sampler is used with, from the record's image entry (the aniso post operation reads it)
+        if (binder_plan != nullptr && sampler.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Sampler>::Summary::SingleLoad) {
+            record_words = BinderWords(stage, sampler.sharp_fetch.offsets[0], 4, 3);
+            if (record_words != nullptr && sampler.post_op == Shader::SharpFetchPostOp::DisableAnisoIfSingleLod) {
+                const u32 off = sampler.post_op_tsharp_dw3_off;
+                const u32* tsharp = off >= 3 && off != Shader::UNKNOWN_LOCATION ? BinderWords(stage, off - 3, 8, 2) : nullptr;
+                if (tsharp == nullptr && off >= 3 && off != Shader::UNKNOWN_LOCATION) {
+                    tsharp = BinderWords(stage, off - 3, 4, 2);
+                }
+                if (tsharp != nullptr) {
+                    aniso_dw3 = tsharp[3];
+                } else {
+                    record_words = nullptr;
+                }
+            }
+        }
         if (record_words != nullptr) {
-            ssharp = sampler.FromWords(record_words);
+            AmdGpu::Sampler raw{};
+            std::memcpy(&raw, record_words, sizeof(raw));
+            ssharp = sampler.PostOp(raw, aniso_dw3);
             Core::NativeRegistry::NoteBinder(7);
             if (stage.sw_stage == Shader::SwStage::Compute && DispatchBinderMode() == 2) {
                 DispatchTrustCheck((Core::NativeDraw::RecordCallerGhidra(binder_plan->native_seq) << 40) ^ (u64{stage.pgm_hash} << 8) ^ sampler.sharp_fetch.offsets[0] ^ (3ull << 60), ssharp,
@@ -3383,6 +3424,7 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
             ssharp = AmdGpu::Sampler{};
         } else {
             ssharp = sampler.GetSharp(stage);
+            NoteFlatRead(3, static_cast<u32>(stage.sw_stage), static_cast<u32>(sampler.sharp_fetch.summary), binder_plan != nullptr, binder_plan != nullptr ? Core::NativeDraw::RecordCallerGhidra(binder_plan->native_seq) : 0, stage.pgm_hash, FlatReadExtra(stage));
         }
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
                                 current_bc_base->Address() == 0)) {

@@ -5,7 +5,12 @@
 
 #pragma once
 
+#include <array>
+#include <cstdlib>
 #include <atomic>
+#include <map>
+#include <mutex>
+#include <tuple>
 #include <unordered_map>
 
 #include "common/types.h"
@@ -36,6 +41,28 @@ struct IdentityAudit {
     std::array<std::atomic<u64>, 3> dispatch_lag{};
 };
 inline IdentityAudit g_identity_audit;
+
+/// L1: which resources are still read from the guest's tables (the flat user data) and why, per (kind 1 buffer 2 image 3 sampler, stage, how the shader loads it, has a record plan, call site, program).
+/// `TLG_FLAT_CENSUS=1`; counted under a mutex, a census run only.
+struct FlatReadCensus {
+    std::mutex mutex;
+    std::map<std::tuple<u32, u32, u32, u32, u64, u64, u32>, u64> counts;
+};
+inline FlatReadCensus g_flat_reads;
+inline bool FlatCensusOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_FLAT_CENSUS");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+inline void NoteFlatRead(u32 kind, u32 stage, u32 summary, u32 has_plan, u64 caller, u64 program, u32 extra) {
+    if (!FlatCensusOn()) {
+        return;
+    }
+    std::scoped_lock lock{g_flat_reads.mutex};
+    ++g_flat_reads.counts[{kind, stage, summary, has_plan, caller, program, extra}];
+}
 
 /// Raster thread only.
 class IdentityTables {

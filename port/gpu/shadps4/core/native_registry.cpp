@@ -1057,12 +1057,12 @@ nlohmann::json Report() {
     {
         constexpr const char* class_names[5] = {"z_prepass_shadow", "g_buffer", "forward", "compute_other", "indirect_draws"};
         constexpr const char* stage_names[3] = {"vertex_stage", "pixel_stage", "whole_draw"};
-        constexpr const char* reason_names[11] = {"covered", "record_list_not_complete", "shader_has_flat_constant_buffer", "shader_has_fmasks", "buffer_not_a_single_load",
-                                                  "buffer_load_not_in_the_record", "image_not_a_single_load", "image_load_not_in_the_record", "sampler_not_from_words", "sampler_not_in_the_record", "binding_list_overflow"};
+        constexpr const char* reason_names[12] = {"covered", "record_list_not_complete", "shader_has_flat_constant_buffer", "shader_has_fmasks", "buffer_not_a_single_load",
+                                                  "buffer_load_not_in_the_record", "image_not_a_single_load", "image_load_not_in_the_record", "sampler_not_from_words", "sampler_not_in_the_record", "binding_list_overflow", "sampler_aniso_tsharp_not_in_the_record"};
         auto& kept = j["kept_flat_user_data_by_class_and_reason"] = nlohmann::json::object();
         for (u32 c = 0; c < 5; ++c) {
             for (u32 s = 0; s < 3; ++s) {
-                for (u32 r = 1; r < 11; ++r) {
+                for (u32 r = 1; r < 12; ++r) {
                     if (const u64 n = binder_reasons[c][s][r].load()) {
                         kept[class_names[c]][stage_names[s]][reason_names[r]] = n;
                     }

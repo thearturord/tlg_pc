@@ -599,11 +599,18 @@ u32 StageCoverage(const Shader::Info& info, u32 record_stage, const Core::Native
         }
     }
     for (const auto& desc : info.samplers) {
-        if (!desc.FromWordsPossible()) {
+        if (desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Sampler>::Summary::SingleLoad) {
             return 8;
         }
         if (!covered(3, desc.sharp_fetch.offsets[0], 4)) {
             return 9;
+        }
+        if (desc.post_op == Shader::SharpFetchPostOp::DisableAnisoIfSingleLod) {
+            // L1: the post operation reads dword 3 of the T# the sampler is used with: the record's image entry gives it (a T# of 8 dwords, or a 4 dword one)
+            const u32 off = desc.post_op_tsharp_dw3_off;
+            if (off < 3 || off == Shader::UNKNOWN_LOCATION || (!covered(2, off - 3, 8) && !covered(2, off - 3, 4))) {
+                return 11;
+            }
         }
     }
     return 0;
