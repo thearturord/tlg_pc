@@ -333,15 +333,24 @@ private:
         std::array<vk::ShaderModule, MaxShaderStages> modules{};
         std::array<u32, MaxShaderStages> stage_hw{};
         std::array<VAddr, MaxShaderStages> pgm_base{};
-        Shader::Gcn::FetchShaderData* fetch_shader{};
+        /// the fetch shader as (program, variant): a pointer into the variant list would move when a variant is added
+        Program* fetch_program{};
+        size_t fetch_perm{};
         u32 stage_enable{};
         u64 epoch{};
     };
+    /// the fetch shader of an entry, resolved at use
+    [[nodiscard]] static Shader::Gcn::FetchShaderData* FetchOf(const ExecEntry& entry) {
+        return entry.fetch_program != nullptr ? &entry.fetch_program->modules[entry.fetch_perm].spec.fetch_shader_data : nullptr;
+    }
     tsl::robin_map<u64, ExecEntry> exec_pipelines;
     std::array<u32, MaxShaderStages> stage_hw{};
     std::array<VAddr, MaxShaderStages> stage_base{};
     u64 lookup_exec_key{};
-    u64 exec_epoch{1}; ///< bumped when a shader variant is added or replaced: the entries hold pointers into the variant lists
+    u64 exec_epoch{1}; ///< bumped when a shader is replaced (debug); adding a variant no longer invalidates the entries (2026-10-28: they hold
+                       ///< the fetch shader as program and variant index, every other pointer is stable)
+    Program* fetch_program{}; ///< the program and variant of `fetch_shader` (set together with it)
+    size_t fetch_perm{};
     u32 exec_tick{};
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};

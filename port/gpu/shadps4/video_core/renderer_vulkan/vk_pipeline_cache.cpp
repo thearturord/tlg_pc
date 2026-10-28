@@ -394,7 +394,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         if (exec_entry && !exec_audit) {
             infos = exec_entry->infos;
             modules = exec_entry->modules;
-            fetch_shader = exec_entry->fetch_shader;
+            fetch_shader = FetchOf(*exec_entry);
             bool resolved_all = true;
             for (u32 s = 0; s < MaxShaderStages && resolved_all; ++s) {
                 if (!infos[s]) {
@@ -470,7 +470,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         entry.modules = modules;
         entry.stage_hw = stage_hw;
         entry.pgm_base = stage_base;
-        entry.fetch_shader = fetch_shader;
+        entry.fetch_program = fetch_shader != nullptr ? fetch_program : nullptr;
+        entry.fetch_perm = fetch_perm;
         entry.stage_enable = lookup_regs->stage_enable.raw;
         entry.epoch = exec_epoch;
     }
@@ -658,7 +659,7 @@ bool PipelineCache::PlanGraphicsTyped(u64 exec_key, const FixedState& fixed, std
     }
     infos = entry.infos;
     modules = entry.modules;
-    fetch_shader = entry.fetch_shader;
+    fetch_shader = FetchOf(entry);
     std::array<bool, MaxShaderStages> skip_flat{};
     plan.any_flat_skipped = false;
     for (u32 s = 0; s < MaxShaderStages; ++s) {
@@ -904,6 +905,7 @@ bool PipelineCache::RefreshGraphicsStages() {
     const auto& regs = *lookup_regs;
     auto& key = graphics_key;
     fetch_shader = nullptr;
+    fetch_program = nullptr;
 
     Shader::Backend::Bindings binding{};
     const auto bind_stage = [&](HwStage stage_in, SwStage stage_out) -> bool {
@@ -1087,10 +1089,11 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         const auto perm_hash = HashCombine(params.hash, 0);
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
-        ++exec_epoch;
         program->AddPermut(module, std::move(spec));
         if (auto& fetch = program->modules[0].spec.fetch_shader_data; !fetch.Empty()) {
             fetch_shader = &fetch;
+            fetch_program = program.get();
+            fetch_perm = 0;
         }
         program->last_perm = 0;
         return std::make_tuple(&program->info, module, perm_hash);
@@ -1126,6 +1129,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         const auto& found = program->modules[fast_perm];
         if (auto& fetch = program->modules[fast_perm].spec.fetch_shader_data; !fetch.Empty()) {
             fetch_shader = &fetch;
+            fetch_program = program.get();
+            fetch_perm = fast_perm;
         }
         return std::make_tuple(&info, found.module, HashCombine(params.hash, fast_perm));
     }
@@ -1181,7 +1186,6 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         module = CompileModule(new_info, compile_info, params.code, perm_idx, binding);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
-        ++exec_epoch;
         program->AddPermut(module, std::move(spec));
     } else {
         info.AddBindings(binding);
@@ -1191,6 +1195,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     }
     if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
         fetch_shader = &fetch;
+        fetch_program = program.get();
+        fetch_perm = perm_idx;
     }
     program->last_perm = perm_idx;
     return std::make_tuple(&program->info, module, perm_hash);
