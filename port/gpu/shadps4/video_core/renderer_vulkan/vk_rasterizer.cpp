@@ -1526,6 +1526,25 @@ const DrawPlan* Rasterizer::DispatchBinderFor(const DispatchPlan* plan) {
     if (!include_pass_h && Core::NativeDraw::RecordCallerGhidra(plan->native_seq) == 0x01c6456d) {
         return nullptr;
     }
+    // TLG_DISPATCH_RECORD_EXCLUDE=0x1c6456d,0x1c94f44: call sites (ghidra) whose dispatches always bind from the guest's tables (bisecting a wrong picture in the legacy off experiment)
+    static const std::vector<u64> excluded = [] {
+        std::vector<u64> list;
+        if (const char* e = std::getenv("TLG_DISPATCH_RECORD_EXCLUDE")) {
+            for (const char* at = e; *at != 0;) {
+                char* end = nullptr;
+                const u64 value = std::strtoull(at, &end, 16);
+                if (end == at) {
+                    break;
+                }
+                list.push_back(value);
+                at = *end == ',' ? end + 1 : end;
+            }
+        }
+        return list;
+    }();
+    if (!excluded.empty() && std::find(excluded.begin(), excluded.end(), Core::NativeDraw::RecordCallerGhidra(plan->native_seq)) != excluded.end()) {
+        return nullptr;
+    }
     if (!dispatch_binder_plan) {
         dispatch_binder_plan = std::make_unique<DrawPlan>();
     }
