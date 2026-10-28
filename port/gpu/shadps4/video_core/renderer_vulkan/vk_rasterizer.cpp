@@ -535,12 +535,12 @@ static u32 DispatchBinderMode() {
     return mode;
 }
 
-/// Legacy descriptors switch (`TLG_LEGACY_DESCRIPTORS=0`, default on): a dispatch whose record holds its bindings is served from the record only, without the trust history, and an entry the
+/// Legacy descriptors switch (`TLG_LEGACY_DESCRIPTORS=1` turns the legacy path back on; default off since L2 was play tested on 2026-10-28): a dispatch whose record holds its bindings is served from the record only, without the trust history, and an entry the
 /// record lacks becomes a null descriptor instead of a read of the guest's tables. An experiment: what still needs the guest's descriptors shows as missing or black passes.
 static bool LegacyDescriptorsOff() {
     static const bool off = [] {
         const char* e = std::getenv("TLG_LEGACY_DESCRIPTORS");
-        return e != nullptr && *e == '0';
+        return e == nullptr || *e != '1';
     }();
     return off;
 }
