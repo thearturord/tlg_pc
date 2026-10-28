@@ -37,7 +37,6 @@ void InitFromSettings() {
     s.stage_key = EmulatorSettings.GetCpStageKey();
     s.exec_inputs = EmulatorSettings.GetCpExecInputs();
     s.stream_probe = EmulatorSettings.GetCpStreamProbe();
-    s.legacy_registers = EmulatorSettings.GetNativeLegacyRegisters();
     s.raster_delay_ns = EmulatorSettings.GetRasterDelayNs();
     s.raster_core = EmulatorSettings.GetCpRasterCore();
     s.native_draw_mode = EmulatorSettings.GetNativeDrawMode();
@@ -88,8 +87,6 @@ bool Set(std::string_view name, s64 value) {
         s.exec_inputs = static_cast<u32>(value);
     } else if (name == "stream_probe") {
         s.stream_probe = static_cast<u32>(value);
-    } else if (name == "legacy_registers") {
-        s.legacy_registers = static_cast<u32>(value);
     } else if (name == "raster_delay_ns") {
         s.raster_delay_ns = static_cast<u32>(value);
     } else if (name == "raster_core") {
@@ -129,8 +126,6 @@ bool Set(std::string_view name, s64 value) {
         }
     } else if (name == "packet_path") {
         s.packet_path = static_cast<s32>(value);
-    } else if (name == "cs_zero_base") {
-        s.cs_zero_base = static_cast<s32>(value);
     } else if (name == "cs_audit") {
         s.cs_audit = static_cast<s32>(value);
     } else if (name == "map_native") {
@@ -170,7 +165,6 @@ nlohmann::json Dump() {
             {"stage_key", s.stage_key.load()},
             {"exec_inputs", s.exec_inputs.load()},
             {"stream_probe", s.stream_probe.load()},
-            {"legacy_registers", s.legacy_registers.load()},
             {"raster_delay_ns", s.raster_delay_ns.load()},
             {"stream_submit", s.stream_submit.load()},
             {"stream_hooks", s.stream_hooks.load()},
@@ -184,7 +178,6 @@ nlohmann::json Dump() {
             {"rt_reuse", s.rt_reuse_override.load()},
             {"stage_reuse", s.stage_reuse_override.load()},
             {"packet_path", s.packet_path.load()},
-            {"cs_zero_base", s.cs_zero_base.load()},
             {"cs_audit", s.cs_audit.load()},
             {"map_native", s.map_native.load()},
             {"register_packets", s.register_packets.load()},

@@ -498,130 +498,6 @@ void Liverpool::InvalidateRegisterGroups() {
     group_sig_valid.fill(false);
 }
 
-/// LEGACY(register-image): applies the register values of a record to the shared draw state. The values come in groups; one that equals what the last record applied for the group, with nothing
-/// written to the group's registers since (every other write invalidates), is already in the state and is skipped.
-void Liverpool::ApplyRecordRegisters(const Core::NativeDraw::ExecRegister* record, u32 count, bool skip_fixed) {
-    const auto& table = RegisterGroupTable();
-    std::array<u64, NumRegisterGroups> hash;
-    hash.fill(0xcbf29ce484222325ull);
-    for (u32 i = 0; i < count; ++i) {
-        const u32 index = record[i].index;
-        if (skip_fixed && IsFixedStateRegister(index)) {
-            continue;
-        }
-        const u32 group = index < Regs::NumRegs ? table[index] : GroupOther;
-        u64& h = hash[group];
-        h = (h ^ index) * 0x100000001b3ull;
-        h = (h ^ record[i].value) * 0x100000001b3ull;
-    }
-    std::array<bool, NumRegisterGroups> skip;
-    for (u32 g = 0; g < NumRegisterGroups; ++g) {
-        skip[g] = group_applied_valid[g] && group_applied_hash[g] == hash[g];
-    }
-    const bool audit = VideoCore::ReadbackPolicy::Get().cs_audit.load(std::memory_order_relaxed) != 0;
-    for (u32 i = 0; i < count; ++i) {
-        const u32 index = record[i].index;
-        if (skip_fixed && IsFixedStateRegister(index)) {
-            continue;
-        }
-        const u32 group = index < Regs::NumRegs ? table[index] : GroupOther;
-        if (skip[group]) {
-            if (audit) {
-                // the state must hold the value the group skip says it holds
-                const u32* const word = front_state.Word(index);
-                auto& live = Core::NativeDraw::Live();
-                live.overlay_group_checked.fetch_add(1, std::memory_order_relaxed);
-                if (word != nullptr && *word != record[i].value) {
-                    live.overlay_group_violations.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-            continue;
-        }
-        OverlaySet(index, record[i].value);
-    }
-    for (u32 g = 0; g < NumRegisterGroups; ++g) {
-        if (!skip[g]) {
-            group_applied_hash[g] = hash[g];
-            group_applied_valid[g] = true;
-        }
-    }
-}
-
-/// LEGACY(register-image): applies the registers of a record by group to the shared draw state (the record stores them that way). A group whose identity (the engine objects its values come from) is the one
-/// applied last, with nothing written to the group's registers since, is already in the state and is skipped without looking at the values; every 32nd such skip is
-/// checked against the record (a violation is counted and the group applied). Groups without identity, and the registers behind the grouped part, are always applied.
-void Liverpool::ApplyRecordGroups(const Core::NativeDraw::ExecDraw& draw, bool skip_fixed) {
-    auto& live = Core::NativeDraw::Live();
-    const auto apply = [&](u32 begin, u32 end) {
-        for (u32 i = begin; i < end; ++i) {
-            if (skip_fixed && IsFixedStateRegister(draw.regs[i].index)) {
-                continue;
-            }
-            OverlaySet(draw.regs[i].index, draw.regs[i].value);
-        }
-    };
-    for (u32 g = 0; g < NumRegisterGroups; ++g) {
-        const u32 begin = draw.group_begin[g];
-        const u32 end = draw.group_begin[g + 1];
-        if (begin == end) {
-            continue;
-        }
-        const u64 sig = draw.group_sig[g];
-        if (sig != 0 && group_sig_valid[g] && group_applied_sig[g] == sig && (skip_fixed || group_sig_full[g])) {
-            live.group_sig_skipped.fetch_add(1, std::memory_order_relaxed);
-            if ((++group_sig_tick & 31) != 0) {
-                continue;
-            }
-            live.group_sig_audited.fetch_add(1, std::memory_order_relaxed);
-            bool violation = false;
-            for (u32 i = begin; i < end && !violation; ++i) {
-                const u32 index = draw.regs[i].index;
-                if (skip_fixed && IsFixedStateRegister(index)) {
-                    continue;
-                }
-                const u32* const word = front_state.Word(index);
-                violation = word != nullptr && *word != draw.regs[i].value;
-            }
-            if (!violation) {
-                continue;
-            }
-            live.group_sig_violations.fetch_add(1, std::memory_order_relaxed);
-            live.group_sig_violations_by_group[g].fetch_add(1, std::memory_order_relaxed);
-        }
-        live.group_sig_applied.fetch_add(1, std::memory_order_relaxed);
-        apply(begin, end);
-        group_sig_valid[g] = sig != 0;
-        group_applied_sig[g] = sig;
-        group_sig_full[g] = !skip_fixed;
-    }
-    apply(draw.grouped, draw.count);
-    if (draw.typed) {
-        using namespace Core::NativeDraw;
-        static const bool user_data_mapped = [this] {
-            bool mapped = true;
-            for (u32 i = 0; i < 16; ++i) {
-                mapped &= front_state.Word(VsUserDataRegister + i) == &front_state.vs_program.user_data[i];
-                mapped &= front_state.Word(PsUserDataRegister + i) == &front_state.ps_program.user_data[i];
-            }
-            if (!mapped) {
-                LOG_ERROR(Render, "native draw: the user data registers are not the user data members of the draw state");
-            }
-            return mapped;
-        }();
-        if (!user_data_mapped) {
-            live.group_sig_violations.fetch_add(1, std::memory_order_relaxed);
-        }
-        for (u32 mask = draw.vs_user_data_mask; mask != 0; mask &= mask - 1) {
-            const u32 i = static_cast<u32>(std::countr_zero(mask));
-            OverlaySetWord(VsUserDataRegister + i, &front_state.vs_program.user_data[i], draw.vs_user_data[i]);
-        }
-        for (u32 mask = draw.ps_user_data_mask; mask != 0; mask &= mask - 1) {
-            const u32 i = static_cast<u32>(std::countr_zero(mask));
-            OverlaySetWord(PsUserDataRegister + i, &front_state.ps_program.user_data[i], draw.ps_user_data[i]);
-        }
-    }
-}
-
 void Liverpool::InvalidateExecGroup(u32 index) {
     if (index < Regs::NumRegs) {
         exec_group_sig_valid[RegisterGroupTable()[index]] = false;
@@ -673,7 +549,7 @@ void Liverpool::ExecForget(u32 dword_offset, u32 count) {
     }
 }
 
-/// Applies a record to the private register block: the same grouping and identity skipping as the shared image's `ApplyRecordGroups`, without the overlay.
+/// Applies a record to the private register block, by register group (a group whose identity equals the last one applied is skipped).
 void Liverpool::ExecApplyRecord(const Core::NativeDraw::ExecDraw& draw, bool skip_fixed, u32 index_count) {
     auto& live = Core::NativeDraw::Live();
     const auto set = [&](u32 index, u32 value) {
@@ -1020,7 +896,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         if (native_exec_plan) {
             op.draw_plan.reset(std::exchange(native_exec_plan, nullptr));
         } else {
-            // LEGACY(register-image): the plan made from the shared register image (only when the legacy switch is on)
+            // LEGACY(packet-path): a draw without a plan of its record (a draw of the game's own packets) is planned from the packets' register state
             const auto make_plan = [&] {
                 return rasterizer->PlanDraw(front_state, params, native_fixed, native_fixed_stale, native_fixed_verify, native_exec_key, native_inputs_key);
             };
@@ -1040,19 +916,6 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
                 }
             }
             rasterizer->RecyclePlan(std::move(typed));
-        }
-        if (native_state_plan) {
-            std::unique_ptr<Vulkan::DrawPlan> candidate{std::exchange(native_state_plan, nullptr)};
-            auto& live = Core::NativeDraw::Live();
-            live.state_audits.fetch_add(1, std::memory_order_relaxed);
-            if (op.draw_plan) {
-                const std::string diff = Vulkan::Rasterizer::DiffExecPlans(*candidate, *op.draw_plan, native_audit_vertex_mask, native_audit_pixel_mask, native_audit_kind);
-                if (!diff.empty() && live.state_violations.fetch_add(1, std::memory_order_relaxed) < 40) {
-                    LOG_INFO(Render, "native draw planned from the private register block differs from the shared image plan in: {} (caller {:#x}, native fixed state {}, verify draw {}, kind {})", diff,
-                             Core::NativeAudit::PlanCaller(), native_fixed != nullptr, native_fixed_verify, native_audit_kind);
-                }
-            }
-            rasterizer->RecyclePlan(std::move(candidate));
         }
         if (op.draw_plan) {
             op.draw_plan->cb_extent = last_cb_extent;
@@ -1285,7 +1148,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         return;
     }
     SeedExecState();
-    const bool legacy_registers = VideoCore::ReadbackPolicy::Get().legacy_registers.load(std::memory_order_relaxed) != 0 || !split_active; // LEGACY(register-image)
+    // C8 (2026-10-28): the shared register image is no longer written by records; a record plans from the private register block only
     if (draw.kind == 10) {
         // memory copy: destination, source and the number of bytes travel in the record
         native_tag_pending.valid = false;
@@ -1347,23 +1210,6 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         }
         auto clear_inputs = Vulkan::MakeDrawInputs(exec_state);
         Core::NativeDraw::Live().state_planned.fetch_add(1, std::memory_order_relaxed);
-        if (legacy_registers) {
-            // LEGACY(register-image): the same through the shared image's overlay; the depth part of the inputs must agree
-            for (u32 i = 0; i < draw.count; ++i) {
-                OverlaySet(draw.regs[i].index, draw.regs[i].value);
-            }
-            if (!split_active) {
-                direct_state = front_state;
-            }
-            const std::string diff = Vulkan::DiffDrawInputs(clear_inputs, Vulkan::MakeDrawInputs(front_state));
-            auto& live = Core::NativeDraw::Live();
-            live.state_audits.fetch_add(1, std::memory_order_relaxed);
-            if (diff.find("depth") != std::string::npos || diff.find("stencil") != std::string::npos) {
-                if (live.state_violations.fetch_add(1, std::memory_order_relaxed) < 40) {
-                    LOG_INFO(Render, "depth clear inputs from the private register block differ from the shared image in: {}", diff);
-                }
-            }
-        }
         RasterRun(
             [this, extent = draw.db_extent, inputs = std::move(clear_inputs)] {
                 CbDbExtent db_extent;
@@ -1371,9 +1217,6 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
                 rasterizer->ClearDepthStencilTarget(inputs, db_extent);
             },
             false, false);
-        if (legacy_registers) {
-            OverlayRestore(); // LEGACY(register-image)
-        }
         ExecRestore();
         // what the SDK's clear leaves behind: all colour targets writable again, no clear bits in the depth render control
         regs.reg_array[Regs::ContextRegWordOffset + 0x8e] = 0xf;
@@ -1396,37 +1239,14 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     }
     if (draw.kind == 3 || draw.kind == 11) {
         // dispatch (kind 11: indirect, the group counts are read from the argument buffer): the record holds dwords of the compute program (user data, dimensions); applied for this dispatch only
-        // The dispatch runs on the program the record describes alone (a zeroed program with the record's dwords); `cs_zero_base` 0 applies the record to the
-        // queue's state instead, as before.
-        ComputeProgram& program = GetCsRegs();
-        const bool zero_base = split_active && VideoCore::ReadbackPolicy::Get().cs_zero_base.load(std::memory_order_relaxed) != 0;
-        ComputeProgram saved_program;
-        if (!zero_base) {
-            saved_program = program; // LEGACY(register-image): the record applied to the queue's compute state
-        }
+        // The dispatch runs on the program the record describes alone (a zeroed program with the record's dwords; C8: the queue's state is not touched)
         ComputeProgram alone{};
         auto* alone_dwords = reinterpret_cast<u32*>(&alone);
-        auto* dwords = reinterpret_cast<u32*>(&program);
         for (u32 i = 0; i < draw.count; ++i) {
             const u32 dword = draw.regs[i].index - Core::NativeDraw::ComputeRegisterBase;
             if (dword < sizeof(ComputeProgram) / sizeof(u32)) {
                 alone_dwords[dword] = draw.regs[i].value;
-                if (!zero_base) {
-                    dwords[dword] = draw.regs[i].value;
-                }
             }
-        }
-        if (!zero_base && VideoCore::ReadbackPolicy::Get().cs_audit.load(std::memory_order_relaxed) != 0) {
-            auto& live = Core::NativeDraw::Live();
-            live.cs_audit_dispatches.fetch_add(1, std::memory_order_relaxed);
-            bool differs = false;
-            for (u32 i = 0; i < sizeof(ComputeProgram) / sizeof(u32) && i < live.cs_audit_dword.size(); ++i) {
-                if (dwords[i] != alone_dwords[i]) {
-                    live.cs_audit_dword[i].fetch_add(1, std::memory_order_relaxed);
-                    differs = true;
-                }
-            }
-            live.cs_audit_differing.fetch_add(differs ? 1 : 0, std::memory_order_relaxed);
         }
         RasterCall dispatch{};
         dispatch.tag = native_tag_pending;
@@ -1451,14 +1271,9 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         } else {
             dispatch.marker = "gfx:{}:NativeDispatch";
         }
-        if (zero_base) {
-            dispatch.cs_override = &alone;
-        }
-        if (((zero_base ? alone : program).dispatch_initiator & 1) != 0) {
+        dispatch.cs_override = &alone;
+        if ((alone.dispatch_initiator & 1) != 0) {
             RasterDispatch(dispatch);
-        }
-        if (!zero_base) {
-            program = saved_program; // LEGACY(register-image)
         }
         return;
     }
@@ -1517,7 +1332,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         };
         const auto take = [&](std::unique_ptr<Vulkan::DrawPlan> plan) {
             // a fast clear has no other source for a comparison when the shared register image is not used
-            if ((++exec_plan_tick & 31) == 0 && (legacy_registers || !draw.cb_extents_only)) {
+            if ((++exec_plan_tick & 31) == 0 && !draw.cb_extents_only) {
                 native_audit_plan = plan.release();
                 native_audit_kind = draw.kind;
                 native_audit_vertex_mask = draw.vs_user_data_mask;
@@ -1538,7 +1353,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         }
         if (draw.cb_extents_only) {
             // a fast clear eliminate: the operation and its render target come from the record
-            if ((exec_on || !legacy_registers) && split_active && draw.kind == 4) {
+            if (split_active && draw.kind == 4) {
                 take(rasterizer->PlanExecOperation(draw));
             } else if (exec_on) {
                 left(5);
@@ -1606,18 +1421,6 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         if (!draw.cb_extents_only) {
             ExecApplyRecord(draw, !native_fixed_verify, index_count); // a fast clear eliminate's registers are for that operation only (its plan comes from the record)
         }
-        if (legacy_registers) {
-            // LEGACY(register-image): the shared image gets the record too (overlay), the game's own packets build on it
-            if (draw.grouped != 0 && VideoCore::ReadbackPolicy::Get().group_sig.load(std::memory_order_relaxed) != 0) {
-                ApplyRecordGroups(draw, !native_fixed_verify);
-            } else {
-                ApplyRecordRegisters(draw.regs.data(), draw.count, !native_fixed_verify);
-            }
-            OverlaySet(static_cast<u32>(&regs.draw_initiator - regs.reg_array.data()), 0);
-            if (index_count != ~0u) {
-                OverlaySet(static_cast<u32>(&regs.num_indices - regs.reg_array.data()), index_count);
-            }
-        }
     }
     RasterCall call{};
     if (draw.kind == 2) {
@@ -1665,21 +1468,11 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             candidate = ReplanAfterDrain(std::move(candidate), 2, make_candidate);
         }
         Core::NativeDraw::Live().state_planned.fetch_add(1, std::memory_order_relaxed);
-        if (legacy_registers) {
-            native_state_plan = candidate.release();
-            native_audit_kind = draw.kind;
-            native_audit_vertex_mask = draw.vs_user_data_mask;
-            native_audit_pixel_mask = draw.ps_user_data_mask;
-        } else {
-            native_exec_plan = candidate.release();
-        }
+        native_exec_plan = candidate.release();
     }
     RasterDispatch(call);
     if (native_exec_plan) {
         rasterizer->RecyclePlan(std::unique_ptr<Vulkan::DrawPlan>{std::exchange(native_exec_plan, nullptr)});
-    }
-    if (native_state_plan) {
-        rasterizer->RecyclePlan(std::unique_ptr<Vulkan::DrawPlan>{std::exchange(native_state_plan, nullptr)});
     }
     if (native_audit_plan) {
         rasterizer->RecyclePlan(std::unique_ptr<Vulkan::DrawPlan>{std::exchange(native_audit_plan, nullptr)});
@@ -1691,7 +1484,6 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     if (draw.cb_extents_only) {
         // the fast clear eliminate registers (color control in eliminate mode) must not reach the next draw
         last_cb_extent = saved_cb_extent;
-        OverlayRestore(); // LEGACY(register-image)
         ExecRestore();
     }
 }

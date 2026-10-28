@@ -354,11 +354,8 @@ private:
     void ExecApplyRecord(const Core::NativeDraw::ExecDraw& draw, bool skip_fixed, u32 index_count);
     void ExecSetWord(u32 index, u32* word, u32 value);
     void InvalidateExecGroup(u32 index);
-    Vulkan::DrawPlan* native_state_plan{}; ///< the draw planned from the private block, to compare with the plan made from the shared image (legacy switch on)
     std::array<u64, NumRegisterGroups> group_applied_hash{};
     std::array<bool, NumRegisterGroups> group_applied_valid{};
-    void ApplyRecordRegisters(const Core::NativeDraw::ExecRegister* regs, u32 count, bool skip_fixed);
-    void ApplyRecordGroups(const Core::NativeDraw::ExecDraw& draw, bool skip_fixed);
     void OverlaySetWord(u32 index, u32* word, u32 value);
     void InvalidateRegisterGroup(u32 index);
     void InvalidateRegisterGroups();

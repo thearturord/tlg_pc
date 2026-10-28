@@ -61,7 +61,7 @@ struct State {
     std::atomic<u32> stream_hooks{64};
     /// cp_delay_ns / raster_delay_ns (diagnostics): a spin per draw on the command processor / the raster thread.
     std::atomic<u32> cp_delay_ns{0};
-    /// cp_group_sig: native records are applied by register group identity (see Liverpool::ApplyRecordGroups).
+    /// cp_group_sig: native records are applied by register group identity (see Liverpool::ExecApplyRecord).
     std::atomic<u32> group_sig{0};
     /// cp_stage_key: the pipeline lookup of native draws goes by the record's key (see PipelineCache::GetGraphicsPipeline).
     std::atomic<u32> stage_key{0};
@@ -69,8 +69,6 @@ struct State {
     std::atomic<u32> exec_inputs{0};
     /// cp_stream_probe: the streaming study's probe runs on every draw hook (development part).
     std::atomic<u32> stream_probe{0};
-    /// native_legacy_registers: executed records are also applied to the shared register image (LEGACY(register-image)).
-    std::atomic<u32> legacy_registers{0};
     std::atomic<u32> raster_delay_ns{0};
     /// cp_raster_core: logical processor of the raster thread, -1 = not pinned. Applied live.
     std::atomic<s32> raster_core{-1};
@@ -88,7 +86,6 @@ struct State {
     /// Diagnostics: draw call sites (Ghidra addresses of the return address) that are not executed natively; /set?exclude_caller=<address> adds one, 0 clears the list
     std::array<std::atomic<u32>, 32> exclude_callers{};
     std::atomic<s32> packet_path{0};              ///< 0: the packet walk is off: a command buffer runs from its entries only, the packets that are not entries are not executed (logged as errors)
-    std::atomic<s32> cs_zero_base{1};             ///< record dispatches run on the record alone on a zeroed compute program (0 = LEGACY(register-image): the record applied to the queue's state)
     std::atomic<s32> cs_audit{0};                 ///< audit: a record dispatch's compute program against the record alone on a zeroed program (counters in /native)
     std::atomic<s32> map_native{0};               ///< the texture map helper's upload dispatch as a record: 0 off, 1 verify (tag + game packets), 2 execute
     std::atomic<s32> register_packets{1};         ///< SET_SH_REG, DISPATCH_DIRECT and WRITE_DATA of the graphics queue are entries of a direct buffer (0: they make it mixed)
