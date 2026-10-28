@@ -1340,20 +1340,65 @@ u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, cons
         ++differences;
         NoteMismatch(s, v.view, fmt::format("context word {:#x}", offset), fmt::format("{}: the loop left {:#x}, the generator writes {:#x} (the batch gives {:#x} now)", where, live, word.expected, recompute.value));
     }
+    // A8: the views of a decal's object are a ring of a few slots that the engine's writer thread advances: between the shadow read (A), the loop read (B) and the compare (A again) the object can
+    // go A, B, A. The values each such field was seen with (as the shadow expected it and as the object holds it when compared) are remembered; a loop value among them is that race
+    static thread_local std::map<u64, std::array<u64, 4>> ring_history;
+    const auto remember = [&](u64 key, u64 value) {
+        auto& h = ring_history[key];
+        for (u64 seen : h) {
+            if (seen == value) {
+                return;
+            }
+        }
+        std::rotate(h.begin(), h.begin() + 1, h.end());
+        h[3] = value;
+    };
+    const auto remembered = [&](u64 key, u64 value) {
+        const auto it = ring_history.find(key);
+        return it != ring_history.end() && std::find(it->second.begin(), it->second.end(), value) != it->second.end();
+    };
     for (const auto& [offset, word] : direct_words) {
         const u64 live = R<u64>(live_ctx + offset);
+        remember(word.object + word.offset, word.expected);
         if (live == word.expected) {
             continue;
         }
         // a view the engine's other threads replace in the object between the shadow read and the loop read
         const u64 now = R<u64>(word.object + word.offset);
-        if (live == now) {
+        remember(word.object + word.offset, now);
+        if (live == now || (live != 0 && remembered(word.object + word.offset, live))) {
             ++v.raced;
             ++s.raced_words[fmt::format("view {} {} word {:#x}", v.view, "object", offset)];
             continue;
         }
+        // the loop can leave a copy of the view (its reader takes a snapshot while the writer thread updates the object): the same descriptor at another address
+        std::string contents;
+        bool same_contents = false;
+        if (live > 0x100000000ull && word.expected > 0x100000000ull) {
+            struct Pair {
+                u64 a, b;
+                bool same;
+                std::string text;
+            } pair{live, word.expected, false, {}};
+            NativeDraw::GuardedCall(
+                [](void* q) {
+                    auto* x = static_cast<Pair*>(q);
+                    x->same = std::memcmp(reinterpret_cast<const void*>(x->a), reinterpret_cast<const void*>(x->b), 0x40) == 0;
+                    for (u32 i = 0; i < 8; ++i) {
+                        x->text += fmt::format(" {:x}/{:x}", R<u64>(x->a + i * 8), R<u64>(x->b + i * 8));
+                    }
+                },
+                &pair);
+            same_contents = pair.same;
+            contents = pair.text;
+        }
+        if (same_contents) {
+            ++v.raced;
+            ++s.raced_words[fmt::format("view {} {} word {:#x} (copy)", v.view, "object", offset)];
+            continue;
+        }
         ++differences;
-        NoteMismatch(s, v.view, fmt::format("context word {:#x}", offset), fmt::format("{}: the loop left {:#x}, the generator writes {:#x} (the object holds {:#x} now)", where, live, word.expected, now));
+        NoteMismatch(s, v.view, fmt::format("context word {:#x}", offset), fmt::format("{}: the loop left {:#x}, the generator writes {:#x} (the object holds {:#x} now; loop/generator qwords{})", where, live, word.expected, now, contents));
     }
     for (const auto& [offset, word] : table_words) {
         const u64 live = R<u64>(live_ctx + offset);
