@@ -154,6 +154,10 @@ void NoteBinderReason(u32 draw_class, u32 record_stage, u32 reason);
 bool AuditBuffer(u64 address, u64 size, bool written, bool shader_constant = false);
 /// C4 (update audit): is [address, address + size) inside a buffer the registry knows? 0 none, 1 inside, 2 partly, 3 the registry is off (`TLG_REGISTRY=1` turns it on).
 u32 BufferContaining(u64 address, u64 size);
+/// L3 census: a CPU write fault at `address` (TLG_LIFT_CENSUS=1 with TLG_REGISTRY=1)
+void NoteFaultBuffer(u64 address);
+/// L3 census: a buffer request (TLG_LIFT_CENSUS=1 with TLG_REGISTRY=1)
+void NoteRequestBuffer(u64 address, u64 size, bool written);
 void AuditImage(u64 address);
 
 void Start();

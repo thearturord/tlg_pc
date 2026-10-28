@@ -25,6 +25,7 @@
 #endif
 #include "common/logging/log.h"
 #include "core/native_draw.h"
+#include "core/native_registry.h"
 #include "core/native_resources.h"
 #include "video_core/readback_policy.h"
 
@@ -601,10 +602,39 @@ void NoteImageUpload(VAddr address, u64 size, bool from_gpu_memory) {
     }
 }
 
+/// L3 census: what the page of a CPU write fault holds, as far as the registry knows: 0 no registered buffer, 1 only buffers of at most 4 KB that are not immutable, 2 only non immutable
+/// buffers of at most the resident cap (some above 4 KB), 3 an immutable buffer, 4 a non immutable buffer above the cap. The pages of class 1 (and 2) are the ones that can leave page
+/// tracking when every read of them uploads the requested range.
+std::array<std::atomic<u64>, 5> lift_census_faults{};
+std::array<std::atomic<u64>, 8> lift_census_by_usage_size{};
+
 void NoteCpuWrite(VAddr address, u64 size) {
+    if (static const bool census = [] { const char* e = std::getenv("TLG_LIFT_CENSUS"); return e != nullptr && *e == '1'; }(); census && Core::NativeRegistry::enabled.load(std::memory_order_relaxed)) {
+        Core::NativeRegistry::NoteFaultBuffer(address);
+    }
     {
         std::shared_lock lock{immutable_mutex};
         if (!immutables.empty()) {
+            if (ResidentBuffersEnabled()) {
+                const VAddr page_begin = address & ~VAddr{4095};
+                const VAddr page_end = (address + size + 4095) & ~VAddr{4095};
+                auto at = immutables.upper_bound(page_begin);
+                if (at != immutables.begin()) {
+                    --at;
+                }
+                bool any = false, immutable = false, big = false, over_cap = false;
+                for (; at != immutables.end() && at->first < page_end; ++at) {
+                    const ImmutableBuffer& b = *at->second;
+                    if (!(b.end > page_begin && b.begin < page_end)) {
+                        continue;
+                    }
+                    any = true;
+                    immutable |= b.usage == 1;
+                    big |= b.end - b.begin > 4096;
+                    over_cap |= b.end - b.begin > ResidentCap();
+                }
+                lift_census_faults[!any ? 0 : immutable ? 3 : over_cap ? 4 : big ? 2 : 1].fetch_add(1, std::memory_order_relaxed);
+            }
             // the page protection is per 4 KiB page: the first write to a page faults, the others do not until the page is protected again, so a resident (mutable) buffer
             // on that page may have been written without a fault of its own; immutable buffers keep the exact range
             const VAddr page_begin = address & ~VAddr{4095};
@@ -1073,6 +1103,9 @@ nlohmann::json Report() {
                                       {"geometry_handles_stale_epoch_changed", immutable_handle_counters[6].load()},
                                       {"geometry_handles_differing_from_the_address_lookup", immutable_handle_counters[7].load()},
                                       {"geometry_handles_aliasing_another_buffer_that_holds_the_range", immutable_handle_counters[8].load()}};
+        out["lift_census_cpu_write_faults_by_what_the_page_holds"] = {{"no_registered_buffer", lift_census_faults[0].load()}, {"only_small_non_immutable_buffers_up_to_4k", lift_census_faults[1].load()},
+                                                                      {"only_non_immutable_buffers_up_to_the_cap", lift_census_faults[2].load()}, {"an_immutable_buffer", lift_census_faults[3].load()},
+                                                                      {"a_non_immutable_buffer_above_the_cap", lift_census_faults[4].load()}};
     }
     return out;
 }

@@ -695,6 +695,112 @@ void SetDrawClass(u32 draw_class_) {
     draw_class = draw_class_ & 15;
 }
 
+namespace {
+/// L3 census (`TLG_LIFT_CENSUS=1`, needs `TLG_REGISTRY=1`): CPU write faults by the registry buffer that contains the faulting page start: [D3D usage 0 default, 1 immutable, 2 dynamic, 3 staging, 4 none][log2 of the size]
+std::array<std::array<std::atomic<u64>, 28>, 5> fault_buffers{};
+std::mutex fault_id_mutex;
+std::unordered_map<u64, u64> fault_by_id;
+struct RequestCensus {
+    u64 requests{}, bytes{}, largest{}, written{};
+};
+std::unordered_map<u64, RequestCensus> requests_by_id;
+} // namespace
+void NoteRequestBuffer(u64 address, u64 size, bool written) {
+    u64 found_id = 0;
+    {
+        std::shared_lock lock{registry_mutex};
+        auto it = buffer_intervals.upper_bound(address);
+        if (it != buffer_intervals.begin()) {
+            --it;
+            const auto e = by_id.find(it->second);
+            if (e != by_id.end() && address >= e->second.address && address < e->second.address + e->second.size) {
+                found_id = e->first;
+            }
+        }
+    }
+    if (found_id != 0) {
+        std::scoped_lock lock{fault_id_mutex};
+        auto& c = requests_by_id[found_id];
+        ++c.requests;
+        c.bytes += size;
+        c.largest = std::max(c.largest, size);
+        c.written += written ? 1 : 0;
+    }
+}
+void NoteFaultBuffer(u64 address) {
+    u32 usage = 4, bucket = 0;
+    u64 found_id = 0;
+    {
+        std::shared_lock lock{registry_mutex};
+        auto it = buffer_intervals.upper_bound(address);
+        if (it != buffer_intervals.begin()) {
+            --it;
+            const auto e = by_id.find(it->second);
+            if (e != by_id.end() && address >= e->second.address && address < e->second.address + e->second.size) {
+                usage = std::min<u32>(e->second.usage, 3);
+                bucket = std::min<u32>(static_cast<u32>(std::bit_width(e->second.size)), 27);
+                found_id = e->first;
+            }
+        }
+    }
+    fault_buffers[usage][bucket].fetch_add(1, std::memory_order_relaxed);
+    if (found_id != 0) {
+        std::scoped_lock lock{fault_id_mutex};
+        ++fault_by_id[found_id];
+    }
+}
+nlohmann::json FaultBufferReport() {
+    nlohmann::json out = nlohmann::json::object();
+    constexpr const char* names[5] = {"default", "immutable", "dynamic", "staging", "no_registered_buffer"};
+    for (u32 u = 0; u < 5; ++u) {
+        for (u32 b = 0; b < 28; ++b) {
+            if (const u64 n = fault_buffers[u][b].load()) {
+                out[names[u]][fmt::format("size_below_{}", b == 0 ? 1ull : 1ull << b)] = n;
+            }
+        }
+    }
+    {
+        std::vector<std::pair<u64, u64>> rows;
+        {
+            std::scoped_lock lock{fault_id_mutex};
+            for (const auto& [id, n] : fault_by_id) {
+                rows.emplace_back(n, id);
+            }
+        }
+        std::sort(rows.rbegin(), rows.rend());
+        auto& top = out["top_buffers_by_faults"] = nlohmann::json::array();
+        {
+            std::vector<std::pair<u64, u64>> by_requests;
+            {
+                std::scoped_lock lock{fault_id_mutex};
+                for (const auto& [id, c] : requests_by_id) {
+                    by_requests.emplace_back(c.bytes, id);
+                }
+            }
+            std::sort(by_requests.rbegin(), by_requests.rend());
+            auto& req = out["top_buffers_by_requested_bytes"] = nlohmann::json::array();
+            std::shared_lock registry_lock{registry_mutex};
+            std::scoped_lock lock{fault_id_mutex};
+            for (size_t i = 0; i < by_requests.size() && i < 16; ++i) {
+                const auto e = by_id.find(by_requests[i].second);
+                const auto& c = requests_by_id[by_requests[i].second];
+                if (e != by_id.end()) {
+                    req.push_back({{"id", e->first}, {"address", fmt::format("{:#x}", e->second.address)}, {"size", e->second.size}, {"usage", e->second.usage}, {"requests", c.requests}, {"requested_bytes", c.bytes}, {"largest_request", c.largest}, {"written_requests", c.written}});
+                }
+            }
+        }
+        std::shared_lock lock{registry_mutex};
+        for (size_t i = 0; i < rows.size() && i < 16; ++i) {
+            const auto e = by_id.find(rows[i].second);
+            if (e == by_id.end()) {
+                continue;
+            }
+            top.push_back({{"faults", rows[i].first}, {"id", rows[i].second}, {"address", fmt::format("{:#x}", e->second.address)}, {"size", e->second.size}, {"usage", e->second.usage}, {"alive", e->second.alive}});
+        }
+    }
+    return out;
+}
+
 u32 BufferContaining(u64 address, u64 size) {
     if (!enabled.load(std::memory_order_relaxed)) {
         return 3;
@@ -1059,6 +1165,7 @@ nlohmann::json Report() {
         constexpr const char* stage_names[3] = {"vertex_stage", "pixel_stage", "whole_draw"};
         constexpr const char* reason_names[12] = {"covered", "record_list_not_complete", "shader_has_flat_constant_buffer", "shader_has_fmasks", "buffer_not_a_single_load",
                                                   "buffer_load_not_in_the_record", "image_not_a_single_load", "image_load_not_in_the_record", "sampler_not_from_words", "sampler_not_in_the_record", "binding_list_overflow", "sampler_aniso_tsharp_not_in_the_record"};
+        j["cpu_write_faults_by_registry_buffer_usage_and_size"] = FaultBufferReport();
         auto& kept = j["kept_flat_user_data_by_class_and_reason"] = nlohmann::json::object();
         for (u32 c = 0; c < 5; ++c) {
             for (u32 s = 0; s < 3; ++s) {

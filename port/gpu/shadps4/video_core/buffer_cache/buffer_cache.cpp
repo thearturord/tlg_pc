@@ -15,6 +15,7 @@
 #include "core/memory.h"
 #include "core/native_audit.h"
 #include "core/native_readbacks.h"
+#include "core/native_registry.h"
 #include "core/native_resources.h"
 #include "core/resource_audit.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -544,6 +545,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                                                         bool is_written, bool is_texel_buffer,
                                                         Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint) {
     Core::ResourceAudit::Note(Core::ResourceAudit::BufferUse, device_addr, size, is_written);
+    if (static const bool census = [] { const char* e = std::getenv("TLG_LIFT_CENSUS"); return e != nullptr && *e == '1'; }(); census && Core::NativeRegistry::enabled.load(std::memory_order_relaxed)) {
+        Core::NativeRegistry::NoteRequestBuffer(device_addr, size, is_written);
+    }
     // An immutable engine buffer (see NativeResources::ImmutableBuffer): after one synchronization of the whole buffer it is
     // read straight from the arena.
     if (!is_written && !is_texel_buffer && Core::NativeResources::ImmutableResidencyEnabled()) {

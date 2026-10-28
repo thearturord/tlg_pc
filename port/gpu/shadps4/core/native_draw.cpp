@@ -8026,6 +8026,77 @@ u64 PS4_SYSV_ABI SceneSlotWrites(u64 frame, u64 a1, u64 a2, u64 a3, u64 a4, u64 
     return 0;
 }
 
+/// L3: `FUN_01e07330(frame data, kind, flag, a4, object, matrix source, a7)` is the second writer of the scene slot ring: for `kind != 0x14` it takes the next slot (count at `[frame data + 0x31ea4]`)
+/// and stores 0x8c bytes of matrix products straight into the slot's buffer memory, with no Map. Announced here, before the function runs, with the same one slot lookahead as the hook of
+/// `FUN_01e05330` (before this hook it was only announced one frame late, by the next call of that function or by the frame start flush).
+u64 PS4_SYSV_ABI SceneSlotWritesMatrices(u64 frame, u64 kind, u64 a1, u64 a2, u64 a3, u64 a4, u64 ret) {
+    (void)a1, (void)a2, (void)a3, (void)a4, (void)ret;
+    static std::atomic<u64> calls{0}, slot_calls{0};
+    const u64 n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((kind & 0xffffffffull) != 0x14) {
+        slot_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    if ((n & 255) == 1) {
+        Core::DebugServer::Publish("scene_slot_matrix_writer", {{"calls", n}, {"calls_that_take_a_slot", slot_calls.load()}, {"note", "FUN_01e07330, announced before it runs (L3)"}});
+    }
+    if ((kind & 0xffffffffull) != 0x14 && Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && IsHeapPointer(frame)) {
+        scene_slot_frame.store(frame, std::memory_order_relaxed);
+        Guarded([&]() -> u64 {
+            AnnounceSceneSlotRange(frame, std::min<u32>(Rd<u32>(frame, 0x31ea4) + 1, 8192), true);
+            return 0;
+        });
+    }
+    return 0;
+}
+
+/// L3: `FUN_02480f90(context, resource, subresource, box, data)` is JsDeviceContext::UpdateSubresource. A buffer is rewritten through the frame ring (class R); a texture (`[resource + 0x124]`
+/// not 1) is tiled and copied into its own memory (`[resource + 0x30]`, `[resource + 0x38]` bytes) with no Map and no other announcement. The whole texture memory is announced (writer 6)
+/// and the calls are counted (`/stats` key `texture_updates`: calls, bytes, the call sites by return address, the sizes).
+u64 PS4_SYSV_ABI TextureUpdateSubresource(u64 context, u64 resource, u64 subresource, u64 box, u64 data, u64 a5, u64 ret) {
+    (void)context, (void)box, (void)data, (void)a5;
+    static std::atomic<u64> calls{0}, bytes{0}, announced{0};
+    static std::mutex mutex;
+    static std::map<u64, u64> sites;       // return address (ghidra) -> calls
+    static std::map<u32, u64> by_size_log; // log2 of the texture memory size -> calls
+    if (!IsHeapPointer(resource)) {
+        return 0;
+    }
+    Guarded([&]() -> u64 {
+        if (Rd<u32>(resource, 0x124) == 1) {
+            return 0; // a buffer: through the frame ring
+        }
+        const u64 memory = Rd<u64>(resource, 0x30);
+        const u64 size = Rd<u64>(resource, 0x38);
+        const u64 n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        bytes.fetch_add(size, std::memory_order_relaxed);
+        if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && memory != 0 && size != 0 && size < (1ull << 32)) {
+            Core::NativeUpdates::NoteWriterRange(6, memory, size);
+            announced.fetch_add(1, std::memory_order_relaxed);
+        }
+        {
+            std::scoped_lock lock{mutex};
+            ++sites[ret >= ImageBase() ? ret - ImageBase() + 0x1000000 : ret];
+            ++by_size_log[static_cast<u32>(std::bit_width(size))];
+        }
+        if ((n & 63) == 1) {
+            nlohmann::json out;
+            out["calls"] = n;
+            out["texture_bytes_covered"] = bytes.load();
+            out["announced"] = announced.load();
+            std::scoped_lock lock{mutex};
+            for (const auto& [site, count] : sites) {
+                out["by_call_site_ghidra"][fmt::format("{:#x}", site)] = count;
+            }
+            for (const auto& [log, count] : by_size_log) {
+                out["by_size_below"][fmt::format("{}", 1ull << log)] = count;
+            }
+            Core::DebugServer::Publish("texture_updates", std::move(out));
+        }
+        return 0;
+    });
+    return 0;
+}
+
 /// C4: the engine's GPU memory allocators (`FUN_02475f90` AllocateGarlicMemory(device, size, alignment, type), `FUN_02476730` AllocateOnionMemory(device, size, alignment), JsDevice.cpp):
 /// whatever the engine allocates is initialized by the CPU right after (shader code and headers at shader creation, resource contents): the range is announced as written at the
 /// allocation (writer 5, creation) so the writes that follow are not unannounced. Runs the original; does nothing more unless the update audit or the uploads are on.
@@ -8387,6 +8458,12 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "scene_slot_writes") {
         return reinterpret_cast<u64>(&SceneSlotWrites);
+    }
+    if (name == "scene_slot_writes_matrices") {
+        return reinterpret_cast<u64>(&SceneSlotWritesMatrices);
+    }
+    if (name == "texture_update_subresource") {
+        return reinterpret_cast<u64>(&TextureUpdateSubresource);
     }
     if (name == "zpass_enter") {
         return reinterpret_cast<u64>(&ZPassEnter);
