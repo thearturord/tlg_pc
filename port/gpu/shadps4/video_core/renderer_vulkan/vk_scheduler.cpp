@@ -14,6 +14,7 @@
 #include "video_core/thread_usage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_indexed_data.h"
 
 namespace Vulkan {
 
@@ -446,6 +447,13 @@ void SchedulerCore::EncoderThread(std::stop_token stoken) {
 }
 
 void SchedulerCore::SubmitExecution(SubmitInfo& info) {
+    // P4: the global descriptor set's new slots are written before the commands that name them are submitted, and finished slots are released
+    if (IndexedData::FlushPerSubmit()) {
+        if (auto* indexed = IndexedData::Get()) {
+            indexed->FlushWrites();
+            indexed->Maintain();
+        }
+    }
     // Recorded commands go into the command buffer before anything written directly at the end.
     Core::NativePass::SetEndCause(Core::NativePass::EndCause::Submit);
     EndRendering();

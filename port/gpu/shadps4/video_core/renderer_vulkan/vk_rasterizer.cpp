@@ -1703,8 +1703,12 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
             indexed->stats.rows_entries.fetch_add(indexed_row_size, std::memory_order_relaxed);
         }
         indexed->stats.draws.fetch_add(1, std::memory_order_relaxed);
-        indexed->FlushWrites();
-        indexed->Maintain();
+        // P4: the descriptor writes of new slots and the release of finished ones run once per submission (Scheduler::SubmitExecution), not per draw:
+        // the set is update-after-bind, a slot only has to be written before the command buffer that names it is submitted
+        if (!IndexedData::FlushPerSubmit()) {
+            indexed->FlushWrites();
+            indexed->Maintain();
+        }
     }
 
     return true;

@@ -41,6 +41,14 @@ public:
     /// `TLG_INDEXED_DATA=1` (development switch, off by default).
     [[nodiscard]] static bool RequestedByEnvironment();
     /// The live object, or null (switch off or the device lacks a feature).
+    /// P4 (`TLG_INDEXED_FLUSH_PER_DRAW=1` goes back to a flush per draw): the pending writes and the release of slots run once per submission
+    [[nodiscard]] static bool FlushPerSubmit() noexcept {
+        static const bool on = [] {
+            const char* e = std::getenv("TLG_INDEXED_FLUSH_PER_DRAW");
+            return e == nullptr || *e != '1';
+        }();
+        return on;
+    }
     [[nodiscard]] static IndexedData* Get() noexcept {
         return live.load(std::memory_order_acquire);
     }
