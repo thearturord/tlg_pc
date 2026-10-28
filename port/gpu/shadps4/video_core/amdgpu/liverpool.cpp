@@ -838,6 +838,8 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
                                  sp.done.load(std::memory_order_acquire), call.tag.valid ? call.tag.seq : (op.draw_plan ? op.draw_plan->native_seq : 0),
                                  call.indexed, call.index_offset);
     }
+    // O1: the write watch of the operation's buffers is harvested here, on the command processor thread, not on the raster thread
+    rasterizer->HarvestAhead(op.draw_plan.get(), op.dispatch_plan.get());
     RasterPush(std::move(op), false);
 }
 
@@ -1449,6 +1451,13 @@ DispatchStat& DispatchStatFor(u64 caller, u64 program, bool indirect, bool asc) 
 
 void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw_plan,
                                const Vulkan::DispatchPlan* dispatch_plan) {
+    // O1: the ranges the command processor harvested for this operation need no harvest here
+    Core::WriteWatch::SetKnownEpoch(draw_plan != nullptr ? draw_plan->ww_epoch : dispatch_plan != nullptr ? dispatch_plan->ww_epoch : 0u);
+    struct KnownEpochScope {
+        ~KnownEpochScope() {
+            Core::WriteWatch::SetKnownEpoch(0);
+        }
+    } known_epoch_scope;
     const auto run = [&](auto&& body) {
         if (c.no_marker) {
             body();

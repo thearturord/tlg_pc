@@ -41,6 +41,11 @@ inline void BumpEpoch() noexcept {
     epoch.fetch_add(1, std::memory_order_acq_rel);
 }
 
+/// O1: the command processor harvests the ranges of a draw or dispatch when it plans it and stores the epoch it read before (the plan's `ww_epoch`). The raster
+/// thread sets that epoch while it executes the operation: a request whose chunks were all harvested at that epoch or later needs nothing more (the rule of the
+/// epoch holds: the harvest ran after the submission the operation belongs to), so the raster thread makes no kernel call for them.
+void SetKnownEpoch(u32 known) noexcept;
+
 using Replay = void (*)(void* context, VAddr page, u64 size);
 using IsCpuDirty = bool (*)(void* context, VAddr page, u64 size);
 /// The pages of [address, address + size) the CPU wrote since their last harvest, and the pending ones the runtime found, each given

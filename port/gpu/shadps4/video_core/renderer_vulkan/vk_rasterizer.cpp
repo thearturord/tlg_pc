@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "core/guest_hooks.h"
 #include "core/native_draw.h"
+#include "core/native_write_watch.h"
 #include "core/native_audit.h"
 #include "core/native_readbacks.h"
 #include "core/native_resources.h"
@@ -2087,6 +2088,51 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 
 bool Rasterizer::HazardAuditOn() const noexcept {
     return runtime.HazardAuditOn();
+}
+
+void Rasterizer::HarvestAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_HARVEST_AHEAD"); // off until verified (O1, left for later on 2026-10-28)
+        return e != nullptr && *e == '1';
+    }();
+    if (!on || !Core::WriteWatch::Enabled() || (draw_plan == nullptr && dispatch_plan == nullptr)) {
+        return;
+    }
+    const u32 epoch = Core::WriteWatch::epoch.load(std::memory_order_acquire);
+    const auto buffers = [&](const auto& bindings, u32 count) {
+        for (u32 i = 0; i < count; ++i) {
+            const auto& b = bindings[i];
+            if (b.kind != 1) {
+                continue;
+            }
+            AmdGpu::Buffer v{};
+            std::memcpy(&v, b.words, sizeof(v));
+            const u64 bytes = v.GetSize();
+            if (v.base_address != 0 && bytes != 0 && bytes < (u64{1} << 28)) {
+                buffer_cache.HarvestWriteWatch(v.base_address, bytes);
+            }
+        }
+    };
+    if (draw_plan != nullptr) {
+        buffers(draw_plan->bindings, draw_plan->binding_count);
+        if (draw_plan->handle_epoch == Core::NativeResources::ImmutableEpoch()) {
+            for (u32 i = 0; i < draw_plan->binding_count; ++i) {
+                if (const auto* h = draw_plan->handles[i]) {
+                    buffer_cache.HarvestWriteWatch(h->begin, h->end - h->begin);
+                }
+            }
+            for (u32 i = 0; i < draw_plan->geometry_handle_count; ++i) {
+                if (const auto* h = draw_plan->geometry_handles[i]) {
+                    buffer_cache.HarvestWriteWatch(h->begin, h->end - h->begin);
+                }
+            }
+        }
+        draw_plan->ww_epoch = epoch;
+    }
+    if (dispatch_plan != nullptr) {
+        buffers(dispatch_plan->bindings, dispatch_plan->binding_count);
+        dispatch_plan->ww_epoch = epoch;
+    }
 }
 
 Runtime::HazardAudit Rasterizer::TakeHazardAudit() {

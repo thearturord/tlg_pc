@@ -140,6 +140,9 @@ public:
     std::array<u64, 16> TakeDescriptorCensus() noexcept;
     [[nodiscard]] bool HazardAuditOn() const noexcept;
     Runtime::HazardAudit TakeHazardAudit();
+    /// O1 (command processor thread): harvests the write watch for the buffers a planned draw or dispatch names (its record's buffer descriptors, the engine
+    /// buffers they belong to, the geometry buffers) and stores the epoch in the plan, so the raster thread need not
+    void HarvestAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan);
     [[nodiscard]] bool LivePlannerOn() const noexcept {
         return runtime.LivePlannerOn();
     }

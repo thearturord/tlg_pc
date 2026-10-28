@@ -33,6 +33,15 @@ std::atomic<u32> epoch{1};
 std::atomic<u32> base_epoch{1};
 
 namespace {
+thread_local u32 t_known_epoch = 0;
+std::atomic<u64> known_skips{0};
+} // namespace
+
+void SetKnownEpoch(u32 known) noexcept {
+    t_known_epoch = known;
+}
+
+namespace {
 constexpr u64 ChunkBits = 16;
 constexpr u64 PageSize = 4096;
 
@@ -414,6 +423,28 @@ void Harvest(VAddr address, u64 size, Replay replay, IsCpuDirty dirty, IsCpuDirt
     }
     State& s = Get();
     s.calls.fetch_add(1, std::memory_order_relaxed);
+    if (const u32 known = t_known_epoch; known != 0 && !image && runtime_memory_ww_pending() == 0) {
+        // harvested ahead by the command processor when it planned this operation
+        bool current = true;
+        const VAddr end = address + size;
+        const u32 count = s.region_count.load(std::memory_order_acquire);
+        for (u32 i = 0; i < count && current; ++i) {
+            const Region& r = s.regions[i];
+            const VAddr a = std::max(address, r.start);
+            const VAddr b = std::min(end, r.start + r.size);
+            for (u64 c = a < b ? (a - r.start) >> ChunkBits : 1, c1 = a < b ? (b - 1 - r.start) >> ChunkBits : 0; c <= c1; ++c) {
+                if (static_cast<s32>(r.harvested[c].load(std::memory_order_acquire) - known) < 0) {
+                    current = false;
+                    break;
+                }
+            }
+        }
+        if (current && VerifyInterval() == 0) {
+            known_skips.fetch_add(1, std::memory_order_relaxed);
+            s.skipped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
     static const bool every = [] {
         const char* e = std::getenv("TLG_WRITE_WATCH_EPOCH");
         return e != nullptr && *e == '0';
@@ -587,6 +618,7 @@ nlohmann::json Report() {
             {"epoch", epoch.load(std::memory_order_relaxed)},
             {"epoch_bumps_by_the_time_window", s.window_bumps.load(std::memory_order_relaxed)},
             {"harvest_requests", s.calls.load(std::memory_order_relaxed)},
+            {"requests_harvested_ahead_by_the_command_processor", known_skips.load(std::memory_order_relaxed)},
             {"requests_with_nothing_to_harvest", s.skipped.load(std::memory_order_relaxed)},
             {"chunks_harvested", s.chunks.load(std::memory_order_relaxed)},
             {"runtime_calls", s.runtime_calls.load(std::memory_order_relaxed)},
