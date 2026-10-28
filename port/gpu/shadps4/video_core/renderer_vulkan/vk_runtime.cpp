@@ -155,11 +155,37 @@ u32 Runtime::HazardSource() const {
     return draw_class <= 4 ? draw_class : 5;
 }
 
+void Runtime::EndAuditUnit() {
+    if (!hazard_audit_on || unit_bits.empty()) {
+        return;
+    }
+    ++hazard.units;
+    const auto compare = [&](std::unordered_map<u64, std::vector<u8>>& seen, u64 shape, u64& repeated, u64& identical, u64& bits_differing, u64& bits) {
+        auto [it, is_new] = seen.try_emplace(shape);
+        if (!is_new) {
+            ++repeated;
+            bits += unit_bits.size();
+            u64 differing = 0;
+            for (size_t i = 0; i < unit_bits.size() && i < it->second.size(); ++i) {
+                differing += unit_bits[i] != it->second[i] ? 1 : 0;
+            }
+            bits_differing += differing;
+            identical += differing == 0 ? 1 : 0;
+        }
+        it->second = unit_bits;
+    };
+    compare(unit_loose_seen, unit_loose, hazard.loose_repeated, hazard.loose_identical, hazard.loose_bits_differing, hazard.loose_bits);
+    compare(unit_strict_seen, unit_strict, hazard.strict_repeated, hazard.strict_identical, hazard.strict_bits_differing, hazard.strict_bits);
+    unit_bits.clear();
+    unit_loose = unit_strict = 0xcbf29ce484222325ull;
+}
+
 Runtime::HazardAudit Runtime::TakeHazardAudit() {
     return std::exchange(hazard, HazardAudit{});
 }
 
 void Runtime::TickFrame() {
+    EndAuditUnit();
     staging_pool.TickFrame();
 }
 
@@ -800,6 +826,10 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
             auto& ask = hazard.ask_keys[{HazardSource(), hazard_program, reinterpret_cast<u64>(handle)}];
             ++ask.first;
             ask.second += has_access ? 1 : 0;
+            unit_bits.push_back(has_access ? 1 : 0);
+            const u64 loose = (u64{HazardSource()} << 56) ^ hazard_program;
+            unit_loose = (unit_loose ^ loose) * 0x100000001b3ull;
+            unit_strict = (unit_strict ^ loose ^ (reinterpret_cast<u64>(handle) * 0x9E3779B97F4A7C15ull)) * 0x100000001b3ull;
         }
         if (has_access) {
             ++hazard.buffer_true;

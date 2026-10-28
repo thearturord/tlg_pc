@@ -93,6 +93,9 @@ public:
         std::map<std::pair<u64, u64>, u64> compute_pairs;
         /// C5 recipe holdout: per asking access (source, compute program address or 0) the buffer queries and how many of them were true
         std::map<std::tuple<u32, u64, u64>, std::pair<u64, u64>> ask_keys; ///< key: (source, program, the buffer asked about)
+        /// C5 frame recipe test, per submission ("unit"): the sequence of the tracker's answers as a bit vector, compared with the last unit that had the same shape (the sequence of
+        /// askers, loose = (source, program), strict = also the buffer): units seen, units whose shape was seen before, of those the bit identical ones, the differing bits, the bits compared
+        u64 units{}, loose_repeated{}, loose_identical{}, loose_bits_differing{}, loose_bits{}, strict_repeated{}, strict_identical{}, strict_bits_differing{}, strict_bits{};
     };
     /// The compute program whose dispatch is being bound (the hazard audit attributes its accesses to it).
     void SetHazardProgram(u64 address) noexcept {
@@ -127,6 +130,10 @@ private:
     };
     BufferBarriers* resource{};
     bool hazard_audit_on{};
+    std::vector<u8> unit_bits;
+    u64 unit_loose{0xcbf29ce484222325ull}, unit_strict{0xcbf29ce484222325ull};
+    std::unordered_map<u64, std::vector<u8>> unit_loose_seen, unit_strict_seen;
+    void EndAuditUnit();
     u32 hazard_override{~0u}; ///< set inside the runtime's own copies, fills and image transfers
     HazardAudit hazard{};
     u32 HazardSource() const;
