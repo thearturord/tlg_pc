@@ -535,10 +535,23 @@ static u32 DispatchBinderMode() {
     return mode;
 }
 
+/// Legacy descriptors switch (`TLG_LEGACY_DESCRIPTORS=0`, default on): a dispatch whose record holds its bindings is served from the record only, without the trust history, and an entry the
+/// record lacks becomes a null descriptor instead of a read of the guest's tables. An experiment: what still needs the guest's descriptors shows as missing or black passes.
+static bool LegacyDescriptorsOff() {
+    static const bool off = [] {
+        const char* e = std::getenv("TLG_LEGACY_DESCRIPTORS");
+        return e != nullptr && *e == '0';
+    }();
+    return off;
+}
+
 /// B9 trust by experience (mode 2): a descriptor of a dispatch's record is served from the record only after it equalled the guest's 64 times in a row for the same (call site, program,
 /// flat offset, kind); every 64th use after that is compared again and one difference ends the trust for good. `chosen` holds the record's descriptor; false: use the guest's.
 template <class T, class F>
 static bool DispatchTrustCheck(u64 key, T& chosen, F&& guest) {
+    if (LegacyDescriptorsOff()) {
+        return true;
+    }
     struct Trust {
         u32 equal{}, uses{};
         bool bad{};
@@ -1520,7 +1533,8 @@ const DrawPlan* Rasterizer::DispatchBinderFor(const DispatchPlan* plan) {
     out.native_seq = plan->native_seq;
     out.binding_count = plan->binding_count;
     out.bindings_complete = true;
-    out.any_flat_skipped = false;
+    out.any_flat_skipped = LegacyDescriptorsOff();
+    out.stages[static_cast<u32>(Shader::SwStage::Compute)].flat_skipped = LegacyDescriptorsOff();
     out.has_handles = false;
     out.has_geometry_handles = false;
     std::memcpy(out.bindings.data(), plan->bindings.data(), sizeof(Core::NativeDraw::RecordBinding) * plan->binding_count);
