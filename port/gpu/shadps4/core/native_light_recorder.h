@@ -27,7 +27,7 @@ struct Entry {
     u64 uid{};      ///< image: the cache image's unique id (never reused), 0 for a buffer
     u64 hash{};     ///< buffer: hash of the first 256 bytes in guest memory now; image: the T# words hash
     u32 slot{};     ///< image: the cache image slot
-    u32 words[64]{}; ///< buffer: the first 64 dwords of the guest memory now (the cascade matrices of the lighting passes are among them)
+    u32 words[176]{}; ///< buffer: the first 176 dwords of the guest memory now (the whole 688 byte per frame constant buffer; the cascade matrices of the lighting passes are among them)
 };
 
 /// Per frame signature (raster thread): every draw and dispatch adds itself (`kind`: 0 dispatch, 1 to 5 draw of class z / shadow, g buffer, forward, other, indirect, 6 untagged draw; `key`: the

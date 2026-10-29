@@ -3078,7 +3078,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     for (u64 b = 0; b < bytes; b += 4) {
                         u32 word = 0;
                         std::memcpy(&word, reinterpret_cast<const void*>(vsharp.base_address + b), std::min<u64>(4, bytes - b));
-                        if (b < 256) {
+                        if (b < 704) {
                             note.words[b / 4] = word;
                         }
                         h = (h ^ word) * 0x100000001b3ull;

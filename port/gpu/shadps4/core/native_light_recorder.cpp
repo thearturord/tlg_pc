@@ -29,7 +29,7 @@ std::mutex mutex;
 std::deque<Record> ring;
 thread_local Record current;
 thread_local bool recording = false;
-constexpr size_t RingSize = 800;
+constexpr size_t RingSize = 400;
 struct FrameSig {
     u64 present{~0ull};
     u32 counts[8]{};
