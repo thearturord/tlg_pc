@@ -46,6 +46,10 @@ void Watch(u64 address, u64 bytes);
 /// shadow maps are rendered with); their first 64 dwords are kept per frame, so the dump can tell whether the lighting reads the cascades of the same frame.
 void ShadowBuffer(u64 present, u64 address, u64 size);
 
+/// An indirect dispatch takes its group counts from guest memory (the deferred sun pass CS_Deferred is one): whether the buffer cache holds the arguments as changed by the CPU (the
+/// request uploads guest memory over them), as written by the GPU, and both. Per frame counts go into the census (raster thread).
+void IndirectArgs(u64 present, bool cpu_modified, bool gpu_modified, bool gpu_written);
+
 /// A lighting dispatch is being bound (raster thread).
 void Begin(u64 present, u64 caller, u64 program);
 void Note(const Entry& entry);

@@ -44,6 +44,7 @@ struct FrameSig {
     };
     ShadowView views[6]{};
     u32 view_count{};
+    u32 indirect{}, indirect_cpu_modified{}, indirect_gpu_modified{}, indirect_gpu_written{}, indirect_conflict{};
 };
 struct ShadowSeen {
     u64 size{};
@@ -122,6 +123,18 @@ void Watch(u64 address, u64 bytes) {
     if (watched_count < 8) {
         watched[watched_count++] = {address, bytes};
     }
+}
+
+void IndirectArgs(u64 present, bool cpu_modified, bool gpu_modified, bool gpu_written) {
+    FrameSig& f = frame_ring[present % FrameRing];
+    if (f.present != present) {
+        return; // FrameOp opens the frame first
+    }
+    ++f.indirect;
+    f.indirect_cpu_modified += cpu_modified ? 1 : 0;
+    f.indirect_gpu_modified += gpu_modified ? 1 : 0;
+    f.indirect_gpu_written += gpu_written ? 1 : 0;
+    f.indirect_conflict += cpu_modified && (gpu_modified || gpu_written) ? 1 : 0;
 }
 
 bool Recording() {
@@ -280,6 +293,8 @@ void WriteDump(const std::string& tag, u64 detail) {
                 text += fmt::format("frame {} dispatches {} draws z/shadow {} gbuffer {} forward {} other {} indirect {} untagged {} signature {:016x}\n", f.present, f.counts[0], f.counts[1], f.counts[2], f.counts[3], f.counts[4],
                                     f.counts[5], f.counts[6], f.signature);
                 text += fmt::format("imggen {} {} {}\n", f.present, f.image_generation_first, f.image_generation_last);
+                text += fmt::format("indirect {} dispatches {} args_cpu_modified {} args_gpu_modified {} args_gpu_written {} cpu_over_gpu {}\n", f.present, f.indirect, f.indirect_cpu_modified, f.indirect_gpu_modified,
+                                    f.indirect_gpu_written, f.indirect_conflict);
                 std::string watch;
                 for (u32 i = 0; i < watched_count; ++i) {
                     watch += fmt::format(" [{:#x} mean {:.6g} nonzero {}]", watched[i].address, f.watch_mean[i], f.watch_nonzero[i]);

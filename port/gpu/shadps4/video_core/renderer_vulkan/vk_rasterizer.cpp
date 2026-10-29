@@ -1568,6 +1568,31 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Dis
         return;
     }
 
+    if (Core::LightRecorder::On()) {
+        // dark frame: the indirect arguments (the deferred sun pass takes its tile count from them) as the buffer cache sees them before this request
+        const u64 present = Core::DebugServer::PresentCount();
+        Core::LightRecorder::FrameOp(present, 0, 0x1d1d1d1d, texture_cache.ImageGeneration());
+        Core::LightRecorder::IndirectArgs(present, buffer_cache.IsRegionCpuModified(address + offset, size), buffer_cache.IsRegionGpuModified(address + offset, size),
+                                          buffer_cache.IsRangeGpuWritten(address + offset, size));
+    }
+    {
+        static const bool full_barrier = [] {
+            const char* e = std::getenv("TLG_LIGHT_FULL_BARRIER");
+            return e != nullptr && *e == '1';
+        }();
+        if (full_barrier) {
+            // TLG_LIGHT_FULL_BARRIER: every indirect dispatch too (the deferred sun pass is one): the writes of its arguments and inputs are visible to it
+            runtime.FlushBarriers();
+            scheduler.EndRendering();
+            const vk::MemoryBarrier2 barrier = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            };
+            scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
+        }
+    }
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
     bound_buffers.emplace_back(buffer, base, size, vk::AccessFlagBits2::eIndirectCommandRead);
