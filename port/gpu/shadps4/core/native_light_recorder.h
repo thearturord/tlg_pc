@@ -27,7 +27,7 @@ struct Entry {
     u64 uid{};      ///< image: the cache image's unique id (never reused), 0 for a buffer
     u64 hash{};     ///< buffer: hash of the first 256 bytes in guest memory now; image: the T# words hash
     u32 slot{};     ///< image: the cache image slot
-    u32 words[4]{}; ///< buffer: the first four dwords of the guest memory now
+    u32 words[64]{}; ///< buffer: the first 64 dwords of the guest memory now (the cascade matrices of the lighting passes are among them)
 };
 
 /// Per frame signature (raster thread): every draw and dispatch adds itself (`kind`: 0 dispatch, 1 to 5 draw of class z / shadow, g buffer, forward, other, indirect, 6 untagged draw; `key`: the
@@ -38,6 +38,13 @@ void FrameOp(u64 present, u32 kind, u64 key, u64 image_generation);
 /// (the auto exposure takes its luminance from it). Up to 8 blocks are watched; at every present change the float contents of each (mean, non zero count) are sampled into the frame census,
 /// so a frame whose exposure input was zero, stale or wrong shows as an outlier in the dump. Raster thread.
 void Watch(u64 address, u64 bytes);
+
+/// A recorded (lighting) dispatch is being bound on this thread: only then is a buffer's content worth reading.
+[[nodiscard]] bool Recording();
+
+/// A buffer of at most 1 KB bound by a z / shadow draw (raster thread): the buffers many draws of the frame share are the passes' view constants (the cascade matrices the
+/// shadow maps are rendered with); their first 64 dwords are kept per frame, so the dump can tell whether the lighting reads the cascades of the same frame.
+void ShadowBuffer(u64 present, u64 address, u64 size);
 
 /// A lighting dispatch is being bound (raster thread).
 void Begin(u64 present, u64 caller, u64 program);

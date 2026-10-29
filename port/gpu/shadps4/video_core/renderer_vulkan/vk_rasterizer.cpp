@@ -1240,6 +1240,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     resolved_draw = nullptr;
     binder_plan = nullptr;
     draw_has_plan = false;
+    draw_class_now = 15;
     if (!bound) {
         return;
     }
@@ -2996,7 +2997,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2, cp_no_object);
-                if (Core::LightRecorder::On()) {
+                if (Core::LightRecorder::On() && !Core::LightRecorder::Recording() && draw_class_now == 0 && size <= 1024 && !desc.is_written) {
+                    Core::LightRecorder::ShadowBuffer(Core::DebugServer::PresentCount(), vsharp.base_address, size); // a z / shadow draw's view constants candidate
+                }
+                if (Core::LightRecorder::On() && Core::LightRecorder::Recording()) {
                     Core::LightRecorder::Entry note{};
                     note.kind = 1;
                     note.via = immutable_hint != nullptr ? 1 : 0;
@@ -3010,7 +3014,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     for (u64 b = 0; b < bytes; b += 4) {
                         u32 word = 0;
                         std::memcpy(&word, reinterpret_cast<const void*>(vsharp.base_address + b), std::min<u64>(4, bytes - b));
-                        if (b < 16) {
+                        if (b < 256) {
                             note.words[b / 4] = word;
                         }
                         h = (h ^ word) * 0x100000001b3ull;
@@ -3651,7 +3655,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 native_entry->image_uid = texture_cache.ImageUid(image_id);
                 native_entry->desc = desc;
             }
-            if (Core::LightRecorder::On()) {
+            if (Core::LightRecorder::On() && Core::LightRecorder::Recording()) {
                 Core::LightRecorder::Entry note{};
                 note.kind = 2;
                 note.via = native_hit ? 3 : same_generation ? 1 : by_id ? 2 : 0;

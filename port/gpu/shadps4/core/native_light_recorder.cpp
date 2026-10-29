@@ -4,7 +4,9 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <deque>
+#include <unordered_map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -35,7 +37,21 @@ struct FrameSig {
     u64 image_generation_first{}, image_generation_last{}; ///< the texture cache's image generation at the first and the last operation of the frame (an image registered or unregistered moves it)
     float watch_mean[8]{};
     u32 watch_nonzero[8]{};
+    struct ShadowView {
+        u64 address{}, size{};
+        u32 draws{};
+        u32 words[64]{};
+    };
+    ShadowView views[6]{};
+    u32 view_count{};
 };
+struct ShadowSeen {
+    u64 size{};
+    u32 draws{};
+    u32 words[64]{};
+};
+std::unordered_map<u64, ShadowSeen> shadow_seen; ///< raster thread: the z / shadow draws' small buffers of the frame being recorded
+u64 shadow_present = ~0ull;
 struct Watched {
     u64 address{};
     u64 bytes{};
@@ -106,6 +122,57 @@ void Watch(u64 address, u64 bytes) {
     if (watched_count < 8) {
         watched[watched_count++] = {address, bytes};
     }
+}
+
+bool Recording() {
+    return recording;
+}
+
+void CloseShadowFrame(u64 present);
+
+void ShadowBuffer(u64 present, u64 address, u64 size) {
+    if (present != shadow_present) {
+        CloseShadowFrame(present);
+    }
+    auto [it, is_new] = shadow_seen.try_emplace(address);
+    ++it->second.draws;
+    if (is_new) {
+        it->second.size = size;
+        const u64 bytes = std::min<u64>(size, 256);
+        if (Core::Memory::Instance()->IsValidMapping(address, bytes)) {
+            std::memcpy(it->second.words, reinterpret_cast<const void*>(address), bytes);
+        }
+    }
+}
+
+/// The frame `shadow_present` is complete: its most shared z / shadow buffers go into the frame census.
+void CloseShadowFrame(u64 present) {
+    if (shadow_present != ~0ull && !shadow_seen.empty()) {
+        std::vector<std::pair<u32, u64>> order;
+        for (const auto& [address, seen] : shadow_seen) {
+            if (seen.draws >= 4) {
+                order.emplace_back(seen.draws, address);
+            }
+        }
+        std::sort(order.rbegin(), order.rend());
+        FrameSig& f = frame_ring[shadow_present % FrameRing];
+        if (f.present == shadow_present) {
+            f.view_count = 0;
+            for (const auto& [draws, address] : order) {
+                if (f.view_count >= 6) {
+                    break;
+                }
+                auto& v = f.views[f.view_count++];
+                const ShadowSeen& seen = shadow_seen[address];
+                v.address = address;
+                v.size = seen.size;
+                v.draws = draws;
+                std::memcpy(v.words, seen.words, sizeof(v.words));
+            }
+        }
+    }
+    shadow_seen.clear();
+    shadow_present = present;
 }
 
 void FrameOp(u64 present, u32 kind, u64 key, u64 image_generation) {
@@ -220,6 +287,14 @@ void WriteDump(const std::string& tag, u64 detail) {
                 if (!watch.empty()) {
                     text += fmt::format("watch {}{}\n", f.present, watch);
                 }
+                for (u32 i = 0; i < f.view_count; ++i) {
+                    const auto& v = f.views[i];
+                    text += fmt::format("shadowview {} {:#x} size {} draws {} data", f.present, v.address, v.size, v.draws);
+                    for (const u32 w : v.words) {
+                        text += fmt::format(" {:08x}", w);
+                    }
+                    text += "\n";
+                }
             }
         }
         if (event_describer != nullptr) {
@@ -241,6 +316,11 @@ void WriteDump(const std::string& tag, u64 detail) {
                 if (e.kind == 1) {
                     text += fmt::format("  buffer id {} addr {:#x} size {} {}{} hash {:016x} words {:08x} {:08x} {:08x} {:08x}\n", e.id, e.address, e.size, e.written ? "written " : "", e.via == 1 ? "resident-no-sync" : "normal",
                                         e.hash, e.words[0], e.words[1], e.words[2], e.words[3]);
+                    text += "    data";
+                    for (const u32 w : e.words) {
+                        text += fmt::format(" {:08x}", w);
+                    }
+                    text += "\n";
                 } else {
                     text += fmt::format("  image  id {} addr {:#x} slot {} uid {} via {} tsharp hash {:016x}\n", e.id, e.address, e.slot, e.uid, e.via == 0 ? "FindImage" : e.via == 1 ? "same-generation" : e.via == 2 ? "kept-across-generation" : "B3-engine-id-table", e.hash);
                 }
