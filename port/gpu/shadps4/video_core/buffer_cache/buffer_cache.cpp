@@ -165,6 +165,7 @@ thread_local VAddr t_audit_begin = 0, t_audit_end = 0; ///< B2 audit: the range 
 } // namespace
 
 void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
+    BindMemoErase(address, size);
     if (newer) {
         // B2: the engine wrote these bytes after anything the GPU wrote there before (applied in order on the raster thread)
         SupersedeGpuWritten(address, size);
@@ -303,6 +304,7 @@ void BufferCache::NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool 
         // the GPU's bytes of a buffer that is gone are nobody's: the next owner's uploads are not kept back for them
         {
             std::unique_lock lock{gpu_ranges_mutex};
+            BindMemoBump(); // GPU written bytes change hands: memo answers are checked again
             gpu_modified_ranges.Subtract(address, bytes);
         }
         InvalidateStreamReuse(address, bytes);
@@ -365,6 +367,7 @@ void BufferCache::HarvestWriteWatch(VAddr device_addr, u64 size, bool image) {
                 }
             }
             Core::NativeResources::NoteCpuWrite(page, bytes);
+            self->BindMemoBump();
             self->memory_tracker->MarkRegionAsCpuModified(page, bytes);
             if (Core::WriteWatch::LiftImages()) {
                 // the texture side of the fault (Rasterizer::InvalidateMemory): images on these pages are no longer protected
@@ -472,6 +475,7 @@ void BufferCache::FinishFaultReadback(VAddr device_addr, u64 size, bool is_write
         memory_tracker->UnmarkRegionAsGpuModified(window_start, window_size, false);
     }
     if (is_write) {
+        BindMemoBump();
         memory_tracker->MarkRegionAsCpuModified(device_addr, size);
     }
 }
@@ -582,6 +586,7 @@ u64 BufferCache::CollectDownloadCopies(const Buffer* arena, VAddr device_addr, u
         };
         std::unique_lock lock{gpu_ranges_mutex};
         gpu_modified_ranges.ForEachInRange(address, range_size, add_download);
+        BindMemoBump(); // GPU written bytes change hands: memo answers are checked again
         gpu_modified_ranges.Subtract(address, range_size);
         range_epoch.fetch_add(1, std::memory_order_acq_rel);
     });
@@ -787,9 +792,76 @@ u64 BufferCache::PreSynchronize(VAddr device_addr, u64 size) {
     return last_upload_bytes;
 }
 
-std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
-                                                        bool is_written, bool is_texel_buffer,
+static bool BindMemoOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_BIND_MEMO");
+        return e == nullptr || *e != '0';
+    }();
+    return on;
+}
+
+std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                         Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
+    if (is_written) {
+        BindMemoErase(device_addr, size); // the GPU writes it: answers over this memory are stale
+    }
+    if (is_written || is_texel_buffer || size > BindMemoMax || !BindMemoOn()) {
+        return ObtainBufferUncached(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
+    }
+    auto& memo = bind_memos[Vulkan::Scheduler::SideSelected() ? 1 : 0];
+    const u64 tick = scheduler.CurrentTick();
+    if (memo.tick != tick) {
+        // a new command buffer: the game may have changed anything since
+        memo.tick = tick;
+        memo.entries.clear();
+    }
+    const u64 epoch = bind_memo_epoch.load(std::memory_order_acquire);
+    const u64 ranges = range_epoch.load(std::memory_order_acquire);
+    const u64 arenas = ArenaEpoch();
+    if (const auto it = memo.entries.find(device_addr); it != memo.entries.end()) {
+        for (const auto& e : it->second) {
+            if (e.size == size && e.epoch == epoch && e.range_epoch == ranges && e.arena_epoch == arenas &&
+                (e.buffer != &stream_buffer || e.wraps == stream_buffer.WrapCount())) {
+                bind_memo_counts[0].fetch_add(1, std::memory_order_relaxed);
+                return {e.buffer, e.offset};
+            }
+        }
+    }
+    bind_memo_counts[1].fetch_add(1, std::memory_order_relaxed);
+    const auto result = ObtainBufferUncached(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
+    if (memo.tick == tick) {
+        auto& list = memo.entries[device_addr];
+        list.erase(std::remove_if(list.begin(), list.end(), [&](const BindMemoEntry& e) { return e.size == size; }), list.end());
+        // the epochs as they were before the request: anything the request itself changed makes the next one ask again
+        list.push_back({size, result.first, result.second, ranges, arenas, result.first == &stream_buffer ? stream_buffer.WrapCount() : 0, epoch});
+    }
+    return result;
+}
+
+void BufferCache::BindMemoErase(VAddr address, u64 size) {
+    for (auto& memo : bind_memos) {
+        if (memo.entries.empty()) {
+            continue;
+        }
+        auto it = memo.entries.lower_bound(address >= BindMemoMax ? address - BindMemoMax : 0);
+        while (it != memo.entries.end() && it->first < address + size) {
+            it->second.erase(std::remove_if(it->second.begin(), it->second.end(), [&](const BindMemoEntry& e) { return it->first + e.size > address; }), it->second.end());
+            if (it->second.empty()) {
+                it = memo.entries.erase(it);
+                bind_memo_counts[2].fetch_add(1, std::memory_order_relaxed);
+            } else {
+                ++it;
+            }
+        }
+    }
+}
+
+nlohmann::json BufferCache::BindMemoReport() const {
+    return {{"on", BindMemoOn()}, {"hits", bind_memo_counts[0].load()}, {"misses", bind_memo_counts[1].load()}, {"addresses_erased_by_writes", bind_memo_counts[2].load()}};
+}
+
+std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
+                                                                Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
     Core::ResourceAudit::Note(Core::ResourceAudit::BufferUse, device_addr, size, is_written);
     HarvestWriteWatch(device_addr, size);
     if (static const bool census = [] { const char* e = std::getenv("TLG_LIFT_CENSUS"); return e != nullptr && *e == '1'; }(); census && Core::NativeRegistry::enabled.load(std::memory_order_relaxed)) {
@@ -1595,6 +1667,7 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 
 void BufferCache::SupersedeGpuWritten(VAddr addr, size_t size) {
     std::unique_lock lock{gpu_ranges_mutex};
+    BindMemoBump(); // GPU written bytes change hands: memo answers are checked again
     gpu_modified_ranges.Subtract(addr, size);
 }
 

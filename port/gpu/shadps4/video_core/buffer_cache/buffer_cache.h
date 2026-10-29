@@ -123,6 +123,14 @@ public:
                                                              bool is_texel_buffer = false,
                                                              Core::NativeResources::ImmutableBuffer* immutable_hint = nullptr,
                                                              bool verify_hint = false, bool known_no_object = false);
+    /// Binding memo (raster thread): a read-only request of at most BindMemoMax bytes asked again in the same command buffer, with nothing written to its memory
+    /// since and nothing moved, gets the same answer without the lookups and synchronization (TLG_BIND_MEMO, default on; =0 off)
+    static constexpr u64 BindMemoMax = 65536;
+    void BindMemoErase(VAddr address, u64 size);
+    void BindMemoBump() noexcept {
+        bind_memo_epoch.fetch_add(1, std::memory_order_acq_rel);
+    }
+    [[nodiscard]] nlohmann::json BindMemoReport() const;
 
     /// The arena range of a copy destination that is downloaded in stream order (an explicit readback): the CPU's pending writes are
     /// uploaded, the range is not marked GPU modified.
@@ -199,6 +207,7 @@ public:
     /// A guest memory write by the command processor (WriteData, occlusion results, DMA...).
     /// Drops reusable stream copies it overlaps.
     void NoteCpGuestWrite(VAddr device_addr, u64 size) {
+        BindMemoBump(); // the command processor's writes (any thread): every memo answer is checked again
         if (StreamReuseOn()) {
             InvalidateStreamReuse(device_addr, size);
         }
@@ -319,6 +328,21 @@ private:
         std::unique_ptr<Buffer> buffer;
     };
     std::map<VAddr, PlacedBuffer> placed;
+    struct BindMemoEntry {
+        u32 size;
+        const Buffer* buffer;
+        u64 offset;
+        u64 range_epoch, arena_epoch, wraps, epoch;
+    };
+    struct BindMemo {
+        u64 tick{~u64{0}};
+        std::map<VAddr, boost::container::small_vector<BindMemoEntry, 2>> entries;
+    };
+    std::array<BindMemo, 2> bind_memos; ///< by stream (graphics, side)
+    std::atomic<u64> bind_memo_epoch{0}; ///< bumped by writes the raster thread does not see by range (faults, the command processor)
+    std::array<std::atomic<u64>, 4> bind_memo_counts{}; ///< hits, misses, entries erased by writes, memo cleared
+    std::pair<const Buffer*, u64> ObtainBufferUncached(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
+                                                       Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object);
     // zero copy (TLG_ZERO_COPY=1, zero-copy-dynamic-buffers.md): counters, the verify's pending checks
     std::array<std::atomic<u64>, 10> zero_copy_counts{};
     std::atomic<bool> zero_copy_unavailable{false};
