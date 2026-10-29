@@ -36,6 +36,8 @@ public:
     u32 depth{}; ///< ProcessGraphics frames running over this buffer (the top one and the indirect buffers it calls)
     std::vector<Entry> entries;
     std::vector<u32> pool; ///< the dwords of Packet entries longer than `Entry::words` (the entry's `seq` is the offset)
+    /// B2: the engine's announced updates made before this submission (applied on the raster thread before its work), and the previous submission's again
+    std::vector<std::pair<u64, u64>> announced_first, announced_again;
 
     /// The dwords of a Packet entry.
     const u32* PacketWords(const Entry& entry) const {

@@ -267,8 +267,10 @@ void MarkAnnounced(u64 address, u64 size) {
 namespace {
 std::mutex pending_mutex;
 std::vector<std::pair<u64, u64>> pending_ranges, applied_last;
-void (*apply_fn)(void*, u64, u64) = nullptr;
+void (*apply_fn)(void*, u64, u64, bool) = nullptr;
 void* apply_context = nullptr;
+void (*queue_fn)(void*, Batch&&) = nullptr;
+void* queue_context = nullptr;
 std::atomic<u64> b2_applied_ranges{0}, b2_applied_bytes{0}, b2_reapplied_ranges{0}, b2_misses{0}, b2_miss_pages{0}, b2_skipped_pages{0};
 std::mutex miss_mutex;
 std::unordered_map<std::string, u64> misses_by_owner;
@@ -283,33 +285,56 @@ u32 B2NativeMode() noexcept {
     return mode;
 }
 
-void SetApply(void (*fn)(void*, u64, u64), void* context) {
+void SetApply(void (*fn)(void*, u64, u64, bool), void* context) {
     apply_context = context;
     apply_fn = fn;
 }
 
-void ApplyPending() {
-    if (B2NativeMode() == 0 || apply_fn == nullptr) {
+void SetQueue(void (*fn)(void*, Batch&&), void* context) {
+    queue_context = context;
+    queue_fn = fn;
+}
+
+Batch TakeBatch() {
+    Batch batch;
+    if (B2NativeMode() == 0) {
+        return batch;
+    }
+    std::scoped_lock lock{pending_mutex};
+    batch.first.swap(pending_ranges);
+    batch.again = applied_last;
+    applied_last = batch.first;
+    return batch;
+}
+
+void ApplyBatch(const Batch& batch) {
+    if (apply_fn == nullptr) {
         return;
     }
-    std::vector<std::pair<u64, u64>> now;
-    std::vector<std::pair<u64, u64>> again;
-    {
-        std::scoped_lock lock{pending_mutex};
-        now.swap(pending_ranges);
-        again.swap(applied_last);
+    for (const auto& [address, size] : batch.again) {
+        apply_fn(apply_context, address, size, false);
     }
-    for (const auto& [address, size] : again) {
-        apply_fn(apply_context, address, size);
-    }
-    for (const auto& [address, size] : now) {
-        apply_fn(apply_context, address, size);
+    for (const auto& [address, size] : batch.first) {
+        apply_fn(apply_context, address, size, true);
         b2_applied_bytes.fetch_add(size, std::memory_order_relaxed);
     }
-    b2_applied_ranges.fetch_add(now.size(), std::memory_order_relaxed);
-    b2_reapplied_ranges.fetch_add(again.size(), std::memory_order_relaxed);
-    std::scoped_lock lock{pending_mutex};
-    applied_last = std::move(now);
+    b2_applied_ranges.fetch_add(batch.first.size(), std::memory_order_relaxed);
+    b2_reapplied_ranges.fetch_add(batch.again.size(), std::memory_order_relaxed);
+}
+
+void ApplyPending() {
+    if (B2NativeMode() == 0) {
+        return;
+    }
+    Batch batch = TakeBatch();
+    if (batch.Empty()) {
+        return;
+    }
+    if (queue_fn != nullptr) {
+        queue_fn(queue_context, std::move(batch));
+    } else {
+        ApplyBatch(batch);
+    }
 }
 
 bool ConsumeMark(u64 page) {

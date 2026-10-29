@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <utility>
+#include <vector>
 #include <atomic>
 #include <nlohmann/json_fwd.hpp>
 #include "common/types.h"
@@ -53,9 +55,23 @@ u32 WhoWrote(u64 address, u64 size);
 /// Announcements are queued and applied when the command processor reaches the game's next submission or passed memory wait (the point the write watch harvests
 /// from), and once more one submission later, so an announcer that fires before its write is covered too.
 [[nodiscard]] u32 B2NativeMode() noexcept;
-/// The buffer cache's marking of a range the CPU changed (what a harvest's replay does)
-void SetApply(void (*fn)(void* context, u64 address, u64 size), void* context);
-/// Command processor: applies the queued announcements (called where the write watch's epoch moves)
+/// The buffer cache's marking of a range the CPU changed (what a harvest's replay does); `newer` (first application): the CPU's bytes are newer than anything the
+/// GPU wrote there before (the GPU written marks of the range are dropped); false for the second application one submission later
+void SetApply(void (*fn)(void* context, u64 address, u64 size, bool newer), void* context);
+/// The announcements of one submission: applied once (`first`) and the previous submission's again (`again`)
+struct Batch {
+    std::vector<std::pair<u64, u64>> first, again;
+    [[nodiscard]] bool Empty() const noexcept {
+        return first.empty() && again.empty();
+    }
+};
+/// Takes the announcements made since the last batch (B2 cutover; empty when off)
+[[nodiscard]] Batch TakeBatch();
+/// Applies a batch (raster thread: in order with the GPU work)
+void ApplyBatch(const Batch& batch);
+/// Where the command processor queues a batch in order (the raster thread); set by the command processor
+void SetQueue(void (*fn)(void* context, Batch&& batch), void* context);
+/// A passed memory wait (command processor): the announcements made so far are queued to the raster thread
 void ApplyPending();
 /// A harvested page: true when an announcement covered it since its last harvest (the mark is consumed)
 [[nodiscard]] bool ConsumeMark(u64 page);

@@ -267,6 +267,8 @@ private:
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid, std::shared_ptr<Core::NativeDirect::Buffer> direct = {});
     Task ProcessDirectAsc(std::shared_ptr<Core::NativeDirect::Buffer> direct, u32 vqid);
+    /// B2: queues the announced updates a submission carries to the raster thread (before its work)
+    void QueueAnnounced(Core::NativeDirect::Buffer& direct);
     Task DirectWaitAsc(const PM4CmdWaitRegMem& wait, u32 vqid);
     void StartAscTag(const u32* tag, const void* address, u32 vqid);
     void SignalComputeRelease(const PM4CmdReleaseMem& release, u32 vqid, u32 pipe_id);

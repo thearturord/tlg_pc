@@ -958,6 +958,7 @@ Liverpool::Task Liverpool::DirectWaitAsc(const PM4CmdWaitRegMem& wait_packet, u3
 Liverpool::Task Liverpool::ProcessDirectAsc(std::shared_ptr<Core::NativeDirect::Buffer> direct, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
     auto& queue = asc_queues[{vqid}];
+    QueueAnnounced(*direct);
     Core::EntryDump::Span entry_dump{vqid + 1, reinterpret_cast<const u32*>(direct->begin), direct->dwords};
     using Core::NativeDirect::EntryKind;
     for (const auto& entry : direct->entries) {
@@ -1714,6 +1715,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                                                               {"image_census", Core::NativeResources::ImageCensus()},
                                                               {"device", Core::NativeDevice::Report()},
                                                               {"b5_copies", {{"on_the_gpu", rasterizer->b5_copies_on_gpu.exchange(0)}, {"as_a_cpu_copy_in_ps4_memory", rasterizer->b5_copies_on_cpu.exchange(0)}}},
+                                                              {"uploads_that_kept_gpu_written_bytes", rasterizer->UploadsKeptForGpu()},
                                                               {"b6_copy_results", {{"downloaded_b6_off", rasterizer->b6_downloads[0].exchange(0)}, {"left_on_the_gpu", rasterizer->b6_downloads[1].exchange(0)},
                                                                                     {"downloaded_cpu_read_resource", rasterizer->b6_downloads[2].exchange(0)}, {"downloaded_no_engine_owner", rasterizer->b6_downloads[3].exchange(0)},
                                                                                     {"downloaded_explicit_readback", rasterizer->b6_downloads[4].exchange(0)}}},
@@ -2050,7 +2052,23 @@ Liverpool::Liverpool()
     : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
       fence_wait_shortcut{EmulatorSettings.GetReadbackFenceWaitShortcut()} {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
+    // B2: announcements of a passed memory wait go to the raster thread in order with the work around it
+    Core::NativeUpdates::SetQueue(
+        [](void* context, Core::NativeUpdates::Batch&& batch) {
+            static_cast<Liverpool*>(context)->RasterRun([b = std::move(batch)] { Core::NativeUpdates::ApplyBatch(b); });
+        },
+        this);
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
+}
+
+void Liverpool::QueueAnnounced(Core::NativeDirect::Buffer& direct) {
+    if (direct.announced_first.empty() && direct.announced_again.empty()) {
+        return;
+    }
+    Core::NativeUpdates::Batch batch;
+    batch.first = std::move(direct.announced_first);
+    batch.again = std::move(direct.announced_again);
+    RasterRun([b = std::move(batch)] { Core::NativeUpdates::ApplyBatch(b); });
 }
 
 Liverpool::~Liverpool() {
@@ -2938,6 +2956,7 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
         ce_task = ProcessCeUpdate(ccb);
         RESUME_GFX(ce_task);
     }
+    QueueAnnounced(*direct);
     Core::EntryDump::Span entry_dump{0, reinterpret_cast<const u32*>(direct->begin), direct->dwords};
     using Core::NativeDirect::EntryKind;
     u64 last_yield_ns = Core::FrameTimeline::Now();
@@ -3070,7 +3089,8 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 }
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bool partial) {
-    Core::WriteWatch::BumpEpoch(); // the CPU's data for this submission is written by now (L3 write watch)
+    Core::WriteWatch::BumpEpoch(false); // the CPU's data for this submission is written by now (L3 write watch)
+    auto announced = Core::NativeUpdates::TakeBatch(); // B2: applied on the raster thread before this submission's work
     auto& queue = mapped_queues[GfxQueueId];
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
@@ -3081,6 +3101,14 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bo
     auto direct = Core::NativeDirect::Build(0, dcb.data(), static_cast<u32>(dcb.size()), !ccb.empty(), guest_markers_enabled);
     Core::StreamProbe::NoteBuild(Core::FrameTimeline::Now() - build_start, direct && direct->pure, static_cast<u32>(dcb.size()));
     const bool run_direct = direct && (direct->pure || Core::NativeDirect::PacketPathOff()) && Core::NativeDirect::ExecuteEnabled();
+    if (!announced.Empty()) {
+        if (direct) {
+            direct->announced_first = std::move(announced.first);
+            direct->announced_again = std::move(announced.again);
+        } else {
+            RasterRun([batch = std::move(announced)] { Core::NativeUpdates::ApplyBatch(batch); });
+        }
+    }
     auto task = run_direct ? ProcessDirect(direct, ccb) : ProcessGraphics(dcb, ccb, std::move(direct));
     Core::NativeDraw::Live().direct_executed.fetch_add(run_direct ? 1 : 0, std::memory_order_relaxed);
     if (partial) {
@@ -3100,11 +3128,20 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bo
 
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
-    Core::WriteWatch::BumpEpoch(); // the CPU's data for this submission is written by now (L3 write watch)
+    Core::WriteWatch::BumpEpoch(false); // the CPU's data for this submission is written by now (L3 write watch)
+    auto announced = Core::NativeUpdates::TakeBatch();
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;
     auto direct = Core::NativeDirect::Build(gnm_vqid, acb.data(), static_cast<u32>(acb.size()), false, guest_markers_enabled);
+    if (!announced.Empty()) {
+        if (direct) {
+            direct->announced_first = std::move(announced.first);
+            direct->announced_again = std::move(announced.again);
+        } else {
+            RasterRun([batch = std::move(announced)] { Core::NativeUpdates::ApplyBatch(batch); });
+        }
+    }
     const bool run_direct = direct && (direct->pure || Core::NativeDirect::PacketPathOff()) && Core::NativeDirect::ExecuteEnabled();
     const auto& task = run_direct ? ProcessDirectAsc(direct, vqid) : ProcessCompute(acb, vqid, std::move(direct));
     Core::NativeDraw::Live().direct_executed_asc.fetch_add(run_direct ? 1 : 0, std::memory_order_relaxed);

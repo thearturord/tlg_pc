@@ -144,7 +144,7 @@ public:
     }
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
     /// What a CPU write of [address, address + size) means for the caches (the harvest's replay; B2: an applied announcement)
-    void ApplyCpuWrite(VAddr address, u64 size);
+    void ApplyCpuWrite(VAddr address, u64 size, bool newer = false);
     /// R1: changes when an arena is replaced
     [[nodiscard]] u64 ArenaEpoch() const noexcept {
         return arena_epoch.load(std::memory_order_acquire);
@@ -293,6 +293,9 @@ private:
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
     RangeSet gpu_modified_ranges;
+public:
+    std::atomic<u64> upload_bytes_kept_for_gpu{0}; ///< B5 / B6: uploads that left GPU written bytes out
+private:
 
     struct ExplicitDownload {
         VAddr addr;

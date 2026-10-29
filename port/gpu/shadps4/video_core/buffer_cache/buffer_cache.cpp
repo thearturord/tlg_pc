@@ -131,7 +131,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     Core::NativeReadbacks::SetLandingGate(
         [this](VAddr address, u64 size, u32 timeout_ms) { return WaitForExplicitDownloads(address, size, timeout_ms); });
     // B2 cutover: an applied announcement is a CPU write for the caches
-    Core::NativeUpdates::SetApply([](void* context, u64 address, u64 size) { static_cast<BufferCache*>(context)->ApplyCpuWrite(address, size); }, this);
+    Core::NativeUpdates::SetApply([](void* context, u64 address, u64 size, bool newer) { static_cast<BufferCache*>(context)->ApplyCpuWrite(address, size, newer); }, this);
 }
 
 BufferCache::~BufferCache() {
@@ -154,7 +154,11 @@ namespace {
 thread_local VAddr t_audit_begin = 0, t_audit_end = 0; ///< B2 audit: the range of the current harvest request
 } // namespace
 
-void BufferCache::ApplyCpuWrite(VAddr address, u64 size) {
+void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
+    if (newer) {
+        // B2: the engine wrote these bytes after anything the GPU wrote there before (applied in order on the raster thread)
+        SupersedeGpuWritten(address, size);
+    }
     Core::NativeResources::NoteCpuWrite(address, size);
     memory_tracker->MarkRegionAsCpuModified(address, size);
     if (Core::WriteWatch::LiftImages()) {
@@ -1089,12 +1093,33 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     HarvestWriteWatch(device_addr, size);
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
-    const auto add_copy = [&](u64 addr, u64 copy_size) {
+    const auto add_piece = [&](u64 addr, u64 copy_size) {
         copies.emplace_back(total_size_bytes, addr, copy_size);
         total_size_bytes += copy_size;
         if (Core::WriteWatch::VerifyOn()) {
             // write watch verify: the page's CPU mark is cleared before its new upload hash exists; no hash meanwhile
             Core::WriteWatch::NoteGpuSideWrite(addr, copy_size);
+        }
+    };
+    // B5 / B6: bytes the GPU wrote (and nothing the CPU wrote since) are the GPU's: a page upload of PS4 memory leaves them out
+    static const bool keep_gpu_bytes = Core::NativeUpdates::B2NativeMode() != 0;
+    const auto add_copy = [&](u64 addr, u64 copy_size) {
+        if (!keep_gpu_bytes) {
+            add_piece(addr, copy_size);
+            return;
+        }
+        std::shared_lock lock{gpu_ranges_mutex};
+        if (!gpu_modified_ranges.Intersects(addr, copy_size)) {
+            lock.unlock();
+            add_piece(addr, copy_size);
+            return;
+        }
+        upload_bytes_kept_for_gpu.fetch_add(1, std::memory_order_relaxed);
+        boost::container::small_vector<std::pair<u64, u64>, 8> pieces;
+        gpu_modified_ranges.ForEachNotInRange(addr, copy_size, [&](u64 a, u64 n) { pieces.emplace_back(a, n); });
+        lock.unlock();
+        for (const auto& [a, n] : pieces) {
+            add_piece(a, n);
         }
     };
     const auto& ring = UntrackedRing::Get();
