@@ -1190,6 +1190,9 @@ void SaveToastBox(SaveClock::time_point now) {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const char* text = toast_kind == 2 ? TL("Save loaded", "Save carregado")
                        : toast_kind == 3 ? TL("Save deleted", "Save excluído")
+                       : toast_kind == 4 ? TL("Screenshot saved", "Captura de tela salva")
+                       : toast_kind == 5 ? TL("Recording 5 seconds...", "Gravando 5 segundos...")
+                       : toast_kind == 6 ? TL("Video saved", "Vídeo salvo")
                                          : TL("Game saved", "Jogo salvo");
     const float in = std::chrono::duration<float>(now - toast_since).count();
     const float out = std::chrono::duration<float>(toast_until - now).count();
@@ -1771,6 +1774,13 @@ void SaveProgress(int kind, int active, int percent, const char* text) {
 void SaveToast(int kind) {
     std::scoped_lock lock{imgui_mutex};
     const auto now = SaveClock::now();
+    if (kind >= 4) {
+        // tlg capture (F12 / Shift+F12): its own toast, shown at once
+        toast_kind = kind;
+        toast_since = now;
+        toast_until = now + std::chrono::milliseconds(kind == 5 ? 5000 : 2600);
+        return;
+    }
     // A dialog's "saved" and the save's own unmount come together: one toast.
     if (now < toast_until + std::chrono::seconds(3)) {
         toast_until = std::max(toast_until, now + std::chrono::milliseconds(2600));

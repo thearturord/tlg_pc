@@ -12,6 +12,7 @@
 #include "common/logging/log.h"
 #include "core/frame_timeline.h"
 #include "sdl_window.h"
+#include "tlg_capture.h"
 #include "tlg_overlay.h"
 #include "tlg_graphics.h"
 #include "tlg_settings.h"
@@ -366,6 +367,15 @@ bool WindowSDL::PollEvents() {
         if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F9 && !event.key.repeat) {
             if (!Core::FrameTimeline::StopCapture()) {
                 Core::FrameTimeline::StartCapture(10, "f9_" + std::to_string(static_cast<long long>(std::time(nullptr))));
+            }
+            continue;
+        }
+        // tlg: F12 saves a screenshot, Shift+F12 records 5 seconds of video (user/screenshots, tlg_capture.h)
+        if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F12 && !event.key.repeat) {
+            if (event.key.mod & SDL_KMOD_SHIFT) {
+                TlgCapture::RequestVideo(5.0);
+            } else {
+                TlgCapture::RequestScreenshot();
             }
             continue;
         }

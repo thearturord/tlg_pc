@@ -73,7 +73,7 @@ void CloseSaveDialog();
 /// "Saving..." panel: active 1 on (percent < 0: no bar; text null keeps the last), 0 off,
 /// 2 on for a moment (dialogs the port answers at once).
 void SaveProgress(int kind, int active, int percent, const char* text);
-/// "Game saved" in the bottom-right corner.
+/// "Game saved" in the bottom-right corner (kind 2 loaded, 3 deleted; 4 screenshot saved, 5 recording, 6 video saved).
 void SaveToast(int kind);
 
 } // namespace TlgOverlay
