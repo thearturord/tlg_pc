@@ -568,6 +568,14 @@ bool B9PlaceOn() noexcept {
     return on;
 }
 
+bool B9AliasesOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_B9_ALIASES");
+        return e == nullptr || *e != '0'; // default on (B9.4 step 4: 3 of 3 headless runs clean, 0 requests left on the arena over engine buffers)
+    }();
+    return on;
+}
+
 u32 B9VerifyEvery() noexcept {
     static const u32 n = [] {
         const char* e = std::getenv("TLG_B9_VERIFY");
@@ -592,7 +600,9 @@ nlohmann::json B9Report() {
                            {"moved_back_to_the_arena", c(B9Demoted)}, {"of_those_by_a_request_over_the_edge", c(B9DemotedByRequest)}, {"freed_at_deletion", c(B9PlacedFreed)},
                            {"READBACKS_OVER_PLACED_MEMORY", c(B9ReadbackOverPlaced)}, {"blocks_of_several_buffers", c(B9Groups)},
                            {"buffers_in_those_blocks", c(B9GroupMembers)}, {"placed_buffers_taken_into_a_block", c(B9GroupReused)}, {"new_buffers_joining_a_block", c(B9Adopted)},
-                           {"members_deleted_out_of_a_block", c(B9MemberLeft)}, {"requests_on_the_arena_over_engine_buffers", c(B9ArenaOverBuffers)}}},
+                           {"members_deleted_out_of_a_block", c(B9MemberLeft)}, {"requests_on_the_arena_over_engine_buffers", c(B9ArenaOverBuffers)},
+                           {"aliases", {{"on", B9AliasesOn()}, {"blocks_with_overlapping_members", c(B9BlockAliased)}, {"blocks_with_textures", c(B9BlockWithTextures)},
+                                        {"textures_created_inside_a_block", c(B9TextureInBlockKept)}, {"buffers_created_over_a_member", c(B9AdoptedOverMember)}}}}},
             {"page_tracker", {{"off_for_engine_buffers", B9TrackerOff()}, {"marks_skipped", c(B9TrackerMarksSkipped)}, {"uploads_without_it", c(B9TrackerUploadsSkipped)},
                               {"other_cpu_changes_given_to_buffers", c(B9OtherChanges)}}},
             {"queries", {{"mode", B9QueryMode()},

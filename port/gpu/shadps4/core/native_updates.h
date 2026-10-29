@@ -171,6 +171,9 @@ void NoteB8Unannounced(u64 address, u64 size, bool by_fault) noexcept;
 /// use; every request inside it is served from that buffer instead of the arena. A new resource over its memory, or a request that runs over its edge, moves it back
 /// into the arena; the engine's deletion frees it.
 [[nodiscard]] bool B9PlaceOn() noexcept;
+/// B9.4 step 4 (`TLG_B9_ALIASES`, default on, =0 off): a block may hold engine buffers that overlap each other and textures (one Vulkan buffer is one memory range, as the arena
+/// was); a buffer created over a block's members joins it, a texture created inside a block leaves it in place
+[[nodiscard]] bool B9AliasesOn() noexcept;
 enum B9Count : u32 {
     B9AnnouncedOnBuffer,   ///< announcements inside one engine buffer
     B9AnnouncedClipped,    ///< announcements that meet several buffers or reach past one (each buffer takes its part)
@@ -215,6 +218,10 @@ enum B9Count : u32 {
     B9Adopted,             ///< a new engine buffer inside a placed block that overlaps no live member: it joins the block
     B9MemberLeft,          ///< an engine buffer deleted out of a block that still has members
     B9ArenaOverBuffers,    ///< requests served by the arena although engine buffers meet them (aliased memory, textures in the block, too big)
+    B9BlockAliased,        ///< B9.4 step 4: blocks placed with members that overlap each other
+    B9BlockWithTextures,   ///< ... with textures inside
+    B9TextureInBlockKept,  ///< a texture created inside a block (the block stays)
+    B9AdoptedOverMember,   ///< a buffer created over a block's live member joins the block
     B9BuffersDeleted,      ///< B9.2: engine buffer deletions carried out
     B9DeletedPending,      ///< ... with announced bytes never uploaded (dropped)
     B9DeletedGpuWritten,   ///< ... whose memory held GPU written bytes

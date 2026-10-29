@@ -1302,8 +1302,17 @@ void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, boo
             }
         }
     }
+    if (texture && under.size() == 1 && Core::NativeUpdates::B9AliasesOn()) {
+        // a texture inside one block: the block stays (the texture's image reads memory, or the block for bytes the GPU wrote)
+        const auto& entry = placed.at(under[0]);
+        if (address >= entry.begin && address + bytes <= entry.end) {
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9TextureInBlockKept);
+            return;
+        }
+    }
     if (!texture && under.size() == 1) {
         // a new buffer inside one placed block that overlaps no live member of it (a gap, or a deleted member's memory): it joins the block
+        // (TLG_B9_ALIASES=1: also over live members)
         auto& entry = placed.at(under[0]);
         if (address >= entry.begin && address + bytes <= entry.end) {
             static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
@@ -1313,7 +1322,10 @@ void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, boo
             Core::NativeDevice::BuffersIn(address, bytes, parts);
             (void)Core::NativeDevice::TexturesIn(address, bytes, textures);
             const bool alone = textures.empty() && std::ranges::all_of(parts, [&](const auto& part) { return part.id == id; });
-            if (alone) {
+            if (!alone && Core::NativeUpdates::B9AliasesOn()) {
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9AdoptedOverMember);
+            }
+            if (alone || Core::NativeUpdates::B9AliasesOn()) {
                 entry.ids.push_back(id);
                 entry.users.push_back(id);
                 Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9Adopted);
@@ -1374,9 +1386,13 @@ const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanni
         any_buffer = !parts.empty();
         // the members must not overlap each other, no texture may lie in the block, none may have been moved back by a request before
         std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.object_begin < b.object_begin; });
+        // (B9.4 step 4, TLG_B9_ALIASES=1: overlapping members and textures are allowed: one Vulkan buffer is one memory range, as the arena was)
+        const bool aliases = Core::NativeUpdates::B9AliasesOn();
         VAddr last_end = 0;
+        bool overlapping = false;
         for (const auto& part : parts) {
-            if (part.object_begin < last_end || part.object_end > hi || part.object_begin < lo || place_refused.contains(part.id)) {
+            overlapping |= part.object_begin < last_end;
+            if ((part.object_begin < last_end && !aliases) || part.object_end > hi || part.object_begin < lo || place_refused.contains(part.id)) {
                 refused = true;
             }
             last_end = std::max(last_end, part.object_end);
@@ -1384,6 +1400,10 @@ const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanni
         }
         textures.clear();
         (void)Core::NativeDevice::TexturesIn(lo, hi - lo, textures);
+        const bool with_textures = !textures.empty();
+        if (aliases) {
+            textures.clear();
+        }
         const bool too_big = hi - lo > (u64{256} << 20);
         static const bool groups = [] {
             // TLG_B9_GROUPS=0 turns blocks off (B9.4 step 3: on after the freed-buffer resolutions were fixed, 5 of 5 headless runs clean)
@@ -1400,6 +1420,12 @@ const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanni
                 }
             }
             Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedServed);
+            if (overlapping) {
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9BlockAliased);
+            }
+            if (with_textures) {
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9BlockWithTextures);
+            }
             return Place(std::move(ids), lo, hi);
         }
         if (any_buffer) {
