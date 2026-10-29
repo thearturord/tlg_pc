@@ -3718,6 +3718,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 native_entry->image_uid = texture_cache.ImageUid(image_id);
                 native_entry->desc = desc;
             }
+            if (Core::LightRecorder::On() && image_desc.is_written) {
+                Core::LightRecorder::ImageWritten(Core::DebugServer::PresentCount(), desc.info.guest_address, desc.info.guest_size, texture_cache.ImageUid(image_id), 3);
+            }
             if (Core::LightRecorder::On() && Core::LightRecorder::Recording()) {
                 Core::LightRecorder::Entry note{};
                 note.kind = 2;
@@ -4078,6 +4081,9 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         runtime.SetBackingSamples(image, key.color_samples[cb]);
         Core::NativeDevice::CheckTarget(false, image->info.guest_address, image->info.size.width, image->info.size.height); // B4 census
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
+        if (Core::LightRecorder::On()) {
+            Core::LightRecorder::ImageWritten(Core::DebugServer::PresentCount(), image->info.guest_address, image->info.guest_size, texture_cache.ImageUid(image_id), 1);
+        }
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
 
@@ -4129,6 +4135,9 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
         auto& image = texture_cache.GetImage(image_id);
+        if (Core::LightRecorder::On()) {
+            Core::LightRecorder::ImageWritten(Core::DebugServer::PresentCount(), image.info.guest_address, image.info.guest_size, texture_cache.ImageUid(image_id), 2);
+        }
         Core::NativeDevice::CheckTarget(true, image.info.guest_address, image.info.size.width, image.info.size.height); // B4 census
 
         const auto slice = image_view.info.range.base.layer;

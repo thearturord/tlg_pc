@@ -50,6 +50,10 @@ void ShadowBuffer(u64 present, u64 address, u64 size);
 /// request uploads guest memory over them), as written by the GPU, and both. Per frame counts go into the census (raster thread).
 void IndirectArgs(u64 present, bool cpu_modified, bool gpu_modified, bool gpu_written);
 
+/// An image the GPU writes in this frame (raster thread): a colour target (kind 1), a depth target (2) or a storage image of a dispatch or draw (3), with the cache image's unique id.
+/// Kept per frame, so the dump can check that the image a lighting pass samples is the image the pass that produces it wrote in the same frame (the sun shadow mask, for one).
+void ImageWritten(u64 present, u64 address, u64 size, u64 uid, u32 kind);
+
 /// A lighting dispatch is being bound (raster thread).
 void Begin(u64 present, u64 caller, u64 program);
 void Note(const Entry& entry);

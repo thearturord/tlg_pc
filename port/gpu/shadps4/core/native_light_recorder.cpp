@@ -45,6 +45,12 @@ struct FrameSig {
     ShadowView views[6]{};
     u32 view_count{};
     u32 indirect{}, indirect_cpu_modified{}, indirect_gpu_modified{}, indirect_gpu_written{}, indirect_conflict{};
+    struct Written {
+        u64 address{}, size{}, uid{};
+        u32 kind{}, count{};
+    };
+    Written written[64]{};
+    u32 written_count{};
 };
 struct ShadowSeen {
     u64 size{};
@@ -135,6 +141,23 @@ void IndirectArgs(u64 present, bool cpu_modified, bool gpu_modified, bool gpu_wr
     f.indirect_gpu_modified += gpu_modified ? 1 : 0;
     f.indirect_gpu_written += gpu_written ? 1 : 0;
     f.indirect_conflict += cpu_modified && (gpu_modified || gpu_written) ? 1 : 0;
+}
+
+void ImageWritten(u64 present, u64 address, u64 size, u64 uid, u32 kind) {
+    FrameSig& f = frame_ring[present % FrameRing];
+    if (f.present != present) {
+        return; // FrameOp opens the frame first
+    }
+    for (u32 i = 0; i < f.written_count; ++i) {
+        auto& w = f.written[i];
+        if (w.address == address && w.uid == uid && w.kind == kind) {
+            ++w.count;
+            return;
+        }
+    }
+    if (f.written_count < 64) {
+        f.written[f.written_count++] = {address, size, uid, kind, 1};
+    }
 }
 
 bool Recording() {
@@ -301,6 +324,10 @@ void WriteDump(const std::string& tag, u64 detail) {
                 }
                 if (!watch.empty()) {
                     text += fmt::format("watch {}{}\n", f.present, watch);
+                }
+                for (u32 i = 0; i < f.written_count; ++i) {
+                    const auto& w = f.written[i];
+                    text += fmt::format("written {} {:#x} size {:#x} uid {} kind {} count {}\n", f.present, w.address, w.size, w.uid, w.kind, w.count);
                 }
                 for (u32 i = 0; i < f.view_count; ++i) {
                     const auto& v = f.views[i];
