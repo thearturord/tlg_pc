@@ -482,7 +482,9 @@ nlohmann::json B8Report() {
                           {"used_after_delete_new_owner", c(B8UsedAfterDeleteReused)}, {"USED_AFTER_DELETE_NO_OWNER", c(B8UsedAfterDeleteNoOwner)},
                           {"view_ids_dropped", c(B8ViewIdsDropped)}}},
             {"find", {{"mode", B8FindMode()}, {"by_engine_id", c(B8FindById)}, {"AUDIT_OTHER_IMAGE_BY_ADDRESS", c(B8FindByIdOther)},
-                      {"no_image_yet", c(B8FindNoImageYet)}, {"no_engine_owner", c(B8FindNoOwner)}, {"images_owned", c(B8FindOwned)}}},
+                      {"no_image_yet", c(B8FindNoImageYet)}, {"no_engine_owner", c(B8FindNoOwner)}, {"images_owned", c(B8FindOwned)},
+                      {"by_remembered_answer", c(B8FindByAnswer)}, {"AUDIT_OTHER_ANSWER_BY_ADDRESS", c(B8FindAnswerOther)}, {"answer_stale", c(B8FindAnswerStale)},
+                      {"page_table_lookups_no_overlap", c(B8FirstNoOverlap)}, {"page_table_lookups_with_overlap", c(B8FirstOverlap)}}},
             {"note", "B8.1, cumulative: images refreshed by the engine's announcements instead of write faults"}};
 }
 

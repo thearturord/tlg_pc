@@ -119,6 +119,11 @@ enum B8Count : u32 {
     B8FindNoImageYet,           ///< ... the texture has no matching image yet (page table lookup, then owned)
     B8FindNoOwner,              ///< ... no engine texture starts at the memory (page table lookup)
     B8FindOwned,                ///< images given to an engine texture
+    B8FindByAnswer,             ///< B8.4: lookups answered by the engine texture's remembered answer (a view of another format or size, a mip or layer of a bigger image)
+    B8FindAnswerOther,          ///< ... audit: the lookup by address gave another image, mip or layer
+    B8FindAnswerStale,          ///< ... an image was registered or removed in the range since: the page table lookup runs again
+    B8FirstNoOverlap,           ///< B8.4 census: a page table lookup for an engine texture that met no image in its memory
+    B8FirstOverlap,             ///< ... that met images (overlap resolution ran)
     B8Counts,
 };
 void NoteB8(B8Count what) noexcept;

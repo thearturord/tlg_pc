@@ -388,6 +388,7 @@ void TextureCache::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
 void TextureCache::NoteEngineTextureDelete(u64 id, VAddr address, u64 bytes, bool free) {
     Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8TexturesDeleted);
     engine_images.erase(id);
+    engine_answers.erase(id);
     SmallVector<ImageId, 4> image_ids;
     ForEachImageInRegion(address, bytes, [&](ImageId image_id, Image& image) {
         if (image.info.guest_address != address) {
@@ -812,6 +813,48 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             return by_id;
         }
     }
+    // B8.4: an engine texture's other answers, by the request (everything overlap resolution looks at)
+    u64 answer_key = 0;
+    const EngineAnswer* answer = nullptr;
+    if (owner_id != 0 && !by_id) {
+        u32 props_bits;
+        std::memcpy(&props_bits, &info.props, sizeof(props_bits));
+        const u64 words[] = {u64(info.guest_size), u64(info.size.width) | u64(info.size.height) << 32, u64(info.size.depth) | u64(info.pitch) << 32,
+                             u64(info.pixel_format) | u64(info.type) << 32, u64(info.resources.levels) | u64(info.resources.layers) << 32,
+                             u64(info.tile_mode) | u64(info.num_samples) << 32, u64(info.num_bits) | u64(props_bits) << 32,
+                             u64(desc.type) | u64(exact_fmt) << 8 | u64(info.alt_tile) << 16 | u64(info.bank_swizzle) << 24, info.meta_info.htile_addr};
+        answer_key = 0x9E3779B97F4A7C15ull;
+        for (const u64 w : words) {
+            answer_key = (answer_key ^ w) * 0x100000001B3ull;
+            answer_key ^= answer_key >> 31;
+        }
+        if (const auto it = engine_answers.find(owner_id); it != engine_answers.end()) {
+            for (const auto& a : it->second) {
+                if (a.key == answer_key) {
+                    answer = &a;
+                }
+            }
+        }
+        if (answer != nullptr && !ImageUnchangedSince(answer->image_id, answer->uid, answer->generation, info.guest_address, info.guest_size)) {
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8FindAnswerStale);
+            answer = nullptr;
+        }
+        if (answer != nullptr) {
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8FindByAnswer);
+            if (b8_find == 2) {
+                Image& image = slot_images[answer->image_id];
+                image.tick_accessed_last = gc_tick;
+                TouchImage(image);
+                if (answer->mip > 0) {
+                    desc.view_info.range.base.level = answer->mip;
+                }
+                if (answer->slice > 0) {
+                    desc.view_info.range.base.layer = answer->slice;
+                }
+                return answer->image_id;
+            }
+        }
+    }
     // B8.3: the image the lookup by address returns becomes the engine texture's when it lies at its memory
     const auto own = [&](ImageId found) {
         if (owner_id == 0) {
@@ -840,6 +883,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     SmallVector<ImageId, 8> image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+    if (owner_id != 0) {
+        Core::NativeUpdates::NoteB8(image_ids.empty() ? Core::NativeUpdates::B8FirstNoOverlap : Core::NativeUpdates::B8FirstOverlap);
+    }
 
     ImageId image_id{};
 
@@ -917,6 +963,34 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
     if (view_mip <= 0 && view_slice <= 0) {
         own(image_id);
+    }
+    if (answer_key != 0) {
+        const Image& found = slot_images[image_id];
+        const bool exact = found.info.guest_address == info.guest_address && found.info.guest_size == info.guest_size && found.info.size == info.size &&
+                           found.info.pixel_format == info.pixel_format && found.info.type == info.type && !(found.info.resources < info.resources);
+        if (answer != nullptr && (answer->image_id != image_id || answer->uid != found.image_uid || answer->mip != view_mip || answer->slice != view_slice)) {
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8FindAnswerOther);
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+                LOG_WARNING(Render_Vulkan, "B8.4 audit: engine texture {} at {:#x}: answer image {} mip {} slice {}, by address image {} mip {} slice {}", owner_id,
+                            info.guest_address, answer->image_id.index, answer->mip, answer->slice, image_id.index, view_mip, view_slice);
+            }
+        }
+        if (!exact) {
+            // remembered: the next lookup of this request is answered by the engine texture's id
+            auto& list = engine_answers[owner_id];
+            EngineAnswer fresh{answer_key, image_id, found.image_uid, ImageGeneration(), view_mip, view_slice};
+            bool replaced = false;
+            for (auto& a : list) {
+                if (a.key == answer_key) {
+                    a = fresh;
+                    replaced = true;
+                }
+            }
+            if (!replaced) {
+                list.push_back(fresh);
+            }
+        }
     }
     return image_id;
 }

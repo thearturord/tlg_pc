@@ -472,6 +472,16 @@ private:
     Common::SlotVector<Image> slot_images;
     /// B8.3: the images of each engine texture (by its id; slot and uid, a stale entry is skipped), raster thread
     std::unordered_map<u64, SmallVector<std::pair<ImageId, u64>, 2>> engine_images;
+    /// B8.4: the other answers of each engine texture's lookups (a view of another format or size, a mip or layer of a bigger image), by the request; valid while no
+    /// image was registered or removed in the range since (the event ring)
+    struct EngineAnswer {
+        u64 key{};
+        ImageId image_id{};
+        u64 uid{};
+        u64 generation{};
+        s32 mip{-1}, slice{-1};
+    };
+    std::unordered_map<u64, SmallVector<EngineAnswer, 2>> engine_answers;
     Common::SlotVector<ImageView> slot_image_views;
     Common::SlotVector<Sampler> slot_samplers;
     BlitHelper blit_helper;
