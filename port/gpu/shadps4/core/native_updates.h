@@ -98,7 +98,9 @@ void NoteEngineDelete(u64 id, u64 address, u64 bytes, u32 what);
 void SetDelete(void (*fn)(void* context, u64 id, u64 address, u64 bytes, u32 what), void* context);
 /// B8.4: the engine created a texture (its memory gets a new owner); queued with the next submission's batch like a deletion
 void NoteEngineCreate(u64 id, u64 address, u64 bytes);
-void SetCreate(void (*fn)(void* context, u64 id, u64 address, u64 bytes), void* context);
+void SetCreate(void (*fn)(void* context, u64 id, u64 address, u64 bytes, bool texture), void* context);
+/// B9.4: the engine created a buffer (a placed buffer under its memory moves back into the arena)
+void NoteEngineBufferCreate(u64 id, u64 address, u64 bytes);
 /// B8.1 verify: true for every Nth check (0: verify off)
 [[nodiscard]] bool B8VerifySample() noexcept;
 [[nodiscard]] bool B8VerifyOn() noexcept;
@@ -165,6 +167,10 @@ void NoteB8Unannounced(u64 address, u64 size, bool by_fault) noexcept;
 /// B9.3 step 2 (`TLG_B9_TRACKER=0`, with B9.1 and B9.3 native): the page tracker is not kept for engine buffers any more (announced bytes and CPU changes found
 /// otherwise mark the buffers; uploads inside one engine buffer neither ask nor clear the tracker); other memory keeps it
 [[nodiscard]] bool B9TrackerOff() noexcept;
+/// B9.4 (`TLG_B9_PLACE=1`, with B9.1 to B9.3 native): an engine buffer that shares its memory with no other live resource gets a Vulkan buffer of its own at its first
+/// use; every request inside it is served from that buffer instead of the arena. A new resource over its memory, or a request that runs over its edge, moves it back
+/// into the arena; the engine's deletion frees it.
+[[nodiscard]] bool B9PlaceOn() noexcept;
 enum B9Count : u32 {
     B9AnnouncedOnBuffer,   ///< announcements inside one engine buffer
     B9AnnouncedClipped,    ///< announcements that meet several buffers or reach past one (each buffer takes its part)
@@ -193,6 +199,16 @@ enum B9Count : u32 {
     B9TrackerMarksSkipped, ///< B9.3 step 2: CPU changes inside engine buffers not marked in the page tracker
     B9TrackerUploadsSkipped, ///< ... uploads inside one engine buffer that did not ask the tracker
     B9OtherChanges,        ///< ... CPU changes found otherwise (faults, decoders) given to the buffers
+    B9Placed,              ///< B9.4: engine buffers given a Vulkan buffer of their own
+    B9PlacedBytes,
+    B9PlaceRefusedAlias,   ///< ... refused: another live buffer or texture shares the memory
+    B9PlaceRefusedSize,    ///< ... refused: size unknown (0) or above the limit
+    B9PlacedServed,        ///< requests served from an engine buffer's own Vulkan buffer
+    B9PlacedGpuCopied,     ///< placements that copied GPU written bytes over from the arena
+    B9Demoted,             ///< buffers moved back into the arena (a new resource over the memory, a request over the edge)
+    B9DemotedByRequest,    ///< ... of those, by a request over the edge
+    B9PlacedFreed,         ///< buffers freed at the engine's deletion
+    B9ReadbackOverPlaced,  ///< a fault readback over a placed buffer's memory (it reads the arena: must stay 0)
     B9BuffersDeleted,      ///< B9.2: engine buffer deletions carried out
     B9DeletedPending,      ///< ... with announced bytes never uploaded (dropped)
     B9DeletedGpuWritten,   ///< ... whose memory held GPU written bytes

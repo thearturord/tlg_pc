@@ -269,7 +269,7 @@ std::mutex pending_mutex;
 std::vector<std::pair<u64, u64>> pending_ranges, applied_last;
 std::vector<std::array<u64, 4>> pending_deleted;
 void (*delete_fn)(void*, u64, u64, u64, u32) = nullptr;
-void (*create_fn)(void*, u64, u64, u64) = nullptr;
+void (*create_fn)(void*, u64, u64, u64, bool) = nullptr;
 void* create_context = nullptr;
 void* delete_context = nullptr;
 void (*apply_fn)(void*, u64, u64, bool) = nullptr;
@@ -318,13 +318,21 @@ void SetDelete(void (*fn)(void*, u64, u64, u64, u32), void* context) {
     delete_fn = fn;
 }
 
-void SetCreate(void (*fn)(void*, u64, u64, u64), void* context) {
+void SetCreate(void (*fn)(void*, u64, u64, u64, bool), void* context) {
     create_context = context;
     create_fn = fn;
 }
 
+void NoteEngineBufferCreate(u64 id, u64 address, u64 bytes) {
+    if (!B9PlaceOn() || B2NativeMode() == 0) {
+        return;
+    }
+    std::scoped_lock lock{pending_mutex};
+    pending_deleted.push_back({id, address, bytes, 5u});
+}
+
 void NoteEngineCreate(u64 id, u64 address, u64 bytes) {
-    if (B8FindMode() == 0 || B2NativeMode() == 0) {
+    if ((B8FindMode() == 0 && !B9PlaceOn()) || B2NativeMode() == 0) {
         return;
     }
     std::scoped_lock lock{pending_mutex};
@@ -343,9 +351,9 @@ void ApplyBatch(const Batch& batch) {
     if (delete_fn != nullptr) {
         // deletions first: the work of this submission comes after them in the game's order, and no announcement of it touches a deleted object
         for (const auto& d : batch.deleted) {
-            if (d[3] == 2) {
+            if (d[3] == 2 || d[3] == 5) {
                 if (create_fn != nullptr) {
-                    create_fn(create_context, d[0], d[1], d[2]);
+                    create_fn(create_context, d[0], d[1], d[2], d[3] == 2);
                 }
             } else {
                 delete_fn(delete_context, d[0], d[1], d[2], static_cast<u32>(d[3]));
@@ -552,6 +560,14 @@ bool B9TrackerOff() noexcept {
     return off;
 }
 
+bool B9PlaceOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_B9_PLACE");
+        return e != nullptr && *e == '1' && B9TrackerOff() && B9LifetimeMode() == 2;
+    }();
+    return on;
+}
+
 u32 B9VerifyEvery() noexcept {
     static const u32 n = [] {
         const char* e = std::getenv("TLG_B9_VERIFY");
@@ -571,6 +587,10 @@ nlohmann::json B9Report() {
             {"uploads", {{"inside_one_buffer", c(B9SyncByObject)}, {"other_ranges", c(B9SyncNoObject)}}},
             {"TRACKER_ONLY_RANGES", c(B9TrackerOnlyRanges)}, {"tracker_ranges_announced_outside_the_request", c(B9TrackerElsewhere)}, {"tracker_only_bytes", c(B9TrackerOnlyBytes)}, {"announced_only_ranges", c(B9ObjectOnlyRanges)},
             {"bytes_by_page_tracker", c(B9BytesByTracker)}, {"bytes_by_announcements", c(B9BytesByObject)},
+            {"placement", {{"on", B9PlaceOn()}, {"placed", c(B9Placed)}, {"placed_bytes", c(B9PlacedBytes)}, {"refused_alias", c(B9PlaceRefusedAlias)},
+                           {"refused_size", c(B9PlaceRefusedSize)}, {"requests_served", c(B9PlacedServed)}, {"placements_with_gpu_bytes", c(B9PlacedGpuCopied)},
+                           {"moved_back_to_the_arena", c(B9Demoted)}, {"of_those_by_a_request_over_the_edge", c(B9DemotedByRequest)}, {"freed_at_deletion", c(B9PlacedFreed)},
+                           {"READBACKS_OVER_PLACED_MEMORY", c(B9ReadbackOverPlaced)}}},
             {"page_tracker", {{"off_for_engine_buffers", B9TrackerOff()}, {"marks_skipped", c(B9TrackerMarksSkipped)}, {"uploads_without_it", c(B9TrackerUploadsSkipped)},
                               {"other_cpu_changes_given_to_buffers", c(B9OtherChanges)}}},
             {"queries", {{"mode", B9QueryMode()},

@@ -241,6 +241,19 @@ void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, st
 
 void BufferCache::NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool native) {
     Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9BuffersDeleted);
+    if (Core::NativeUpdates::B9PlaceOn()) {
+        bool mine = false;
+        {
+            std::scoped_lock lock{placed_mutex};
+            const auto it = placed.find(address);
+            mine = it != placed.end() && it->second.id == id;
+        }
+        if (mine) {
+            DropPlaced(address); // B9.4: its contents are gone with it (the engine's memory may hold a new resource next)
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedFreed);
+        }
+        place_refused.erase(id);
+    }
     {
         std::scoped_lock lock{object_dirty_mutex};
         if (const auto it = object_dirty.find(id); it != object_dirty.end()) {
@@ -378,6 +391,12 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
+        if (Core::NativeUpdates::B9PlaceOn()) {
+            std::scoped_lock lock{placed_mutex};
+            if (PlacedMeets(device_addr, size)) {
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9ReadbackOverPlaced);
+            }
+        }
 
         const auto [window_start, window_end] = ReadbackWindow(arena, device_addr, size);
         const u64 window_size = window_end - window_start;
@@ -460,6 +479,12 @@ void BufferCache::ReadMemoryForGuest(VAddr device_addr, u64 size, bool is_write)
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
+        if (Core::NativeUpdates::B9PlaceOn()) {
+            std::scoped_lock lock{placed_mutex};
+            if (PlacedMeets(device_addr, size)) {
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9ReadbackOverPlaced);
+            }
+        }
         const auto [win_start, win_end] = ReadbackWindow(arena, device_addr, size);
         window_start = win_start;
         window_size = win_end - win_start;
@@ -735,10 +760,10 @@ u64 BufferCache::PreSynchronize(VAddr device_addr, u64 size) {
     if (size == 0) {
         return 0;
     }
-    const u64 first_block = device_addr >> block_shift;
-    const u64 last_block = (device_addr + size - 1) >> block_shift;
-    const auto* arena = GetArena(first_block, last_block);
-    EnsureResident(arena, first_block, last_block);
+    const auto* arena = BufferFor(device_addr, size, false); // B9.4: a range over placed buffers' edges is left to their own requests
+    if (arena == nullptr) {
+        return 0;
+    }
     last_upload_bytes = 0;
     Core::NativeUploads::SetPreSyncActive(true);
     SynchronizeMemory(arena, device_addr, static_cast<u32>(size), false, false);
@@ -810,7 +835,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             // saw nothing), so the generation alone is not enough; the tracker's dirty bit is the safety net of the engine's own knowledge
             if (immutable->synced.load(std::memory_order_acquire) && !Core::NativeResources::ImmutableCheck(*immutable) &&
                 (immutable->usage == 1 || !IsRegionCpuModified(device_addr, size))) {
-                const auto* arena = GetArena(device_addr >> block_shift, (device_addr + size - 1) >> block_shift);
+                const auto* arena = BufferFor(device_addr, size); // B9.4: the object's own Vulkan buffer when it is placed
                 if (immutable->gpu_arena_epoch.load(std::memory_order_relaxed) != ArenaEpoch() && immutable->begin >= arena->cpu_addr &&
                     immutable->end <= arena->cpu_addr + arena->size_bytes) {
                     // R1: the arenas moved since the synchronization; the object is resident in this one now
@@ -849,8 +874,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             }
             const u32 generation = immutable->generation.load(std::memory_order_acquire);
             const u32 whole = static_cast<u32>(immutable->end - immutable->begin);
-            const auto* arena = GetArena(immutable->begin >> block_shift, (immutable->end - 1) >> block_shift);
-            EnsureResident(arena, immutable->begin >> block_shift, (immutable->end - 1) >> block_shift);
+            const auto* arena = BufferFor(immutable->begin, immutable->end - immutable->begin);
             last_upload_bytes = 0;
             const bool immutable_pass_open = Core::NativeUploads::OnDemandAudit() && scheduler.IsRendering();
             SynchronizeMemory(arena, immutable->begin, whole, false, false);
@@ -922,10 +946,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         }
 
     }
-    const u64 first_block = device_addr >> block_shift;
-    const u64 last_block = (device_addr + size - 1) >> block_shift;
-    const auto* arena = GetArena(first_block, last_block);
-    EnsureResident(arena, first_block, last_block);
+    const auto* arena = BufferFor(device_addr, size, true, is_written); // B9.4: a placed engine buffer's own Vulkan buffer, or the arena
     last_upload_bytes = 0;
     const bool pass_open_before = Core::NativeUploads::OnDemandAudit() && scheduler.IsRendering(); // the upload itself ends the pass
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
@@ -1013,10 +1034,7 @@ std::pair<const Buffer*, u64> BufferCache::StreamCopy(VAddr device_addr, u32 siz
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForDownload(VAddr device_addr, u32 size) {
-    const u64 first_block = device_addr >> block_shift;
-    const u64 last_block = (device_addr + size - 1) >> block_shift;
-    const auto* arena = GetArena(first_block, last_block);
-    EnsureResident(arena, first_block, last_block);
+    const auto* arena = BufferFor(device_addr, size);
     last_upload_bytes = 0;
     SynchronizeMemory(arena, device_addr, size, false, false);
     Core::NativeResources::NoteBufferRequest(device_addr, size, false, Core::NativeResources::BufferPath::Arena, last_upload_bytes);
@@ -1034,6 +1052,231 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
     staging.Flush();
     return {staging.buffer, staging.offset};
+}
+
+BufferCache::PlacedBuffer* BufferCache::PlacedAt(VAddr address, u64 size, bool written) {
+    auto it = placed.upper_bound(address);
+    if (it == placed.begin()) {
+        return nullptr;
+    }
+    --it;
+    return address >= it->second.begin && address + size <= it->second.end + (written ? 0 : PlacedSlack) && address < it->second.end ? &it->second : nullptr;
+}
+
+bool BufferCache::PlacedMeets(VAddr address, u64 size) const {
+    auto it = placed.upper_bound(address + size - 1);
+    while (it != placed.begin()) {
+        --it;
+        if (it->second.end > address) {
+            return true;
+        }
+        if (it->second.end <= address && it->first < address) {
+            // placed buffers do not overlap each other: the nearest one below that ends before the range is the last candidate
+            return false;
+        }
+    }
+    return false;
+}
+
+const Buffer* BufferCache::Place(u64 id, VAddr begin, VAddr end) {
+    const VAddr base = begin & ~VAddr{255};
+    auto buffer = std::make_unique<Buffer>(instance, base, end - base + PlacedSlack, MemoryType::DeviceLocal, fmt::format("engine buffer {} {:#x}+{:#x}", id, begin, end - begin));
+    Buffer* dst = buffer.get();
+    // its contents: the CPU's bytes from memory, the bytes the GPU wrote (and nothing newer since) from the arena
+    boost::container::small_vector<std::pair<u64, u64>, 8> gpu_pieces, cpu_pieces;
+    {
+        std::shared_lock lock{gpu_ranges_mutex};
+        gpu_modified_ranges.ForEachInRange(begin, end - begin, [&](u64 a, u64 e) { gpu_pieces.emplace_back(a, e - a); });
+        gpu_modified_ranges.ForEachNotInRange(begin, end - begin, [&](u64 a, u64 n) { cpu_pieces.emplace_back(a, n); });
+    }
+    scheduler.EndRendering();
+    if (!gpu_pieces.empty()) {
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedGpuCopied);
+        const u64 first_block = begin >> block_shift, last_block = (end - 1) >> block_shift;
+        const auto* arena = GetArena(first_block, last_block);
+        EnsureResident(arena, first_block, last_block);
+        boost::container::small_vector<vk::BufferCopy, 8> copies;
+        for (const auto& [a, n] : gpu_pieces) {
+            copies.push_back({arena->Offset(a), dst->Offset(a), n});
+        }
+        runtime.CopyBuffer(arena, dst, copies);
+    }
+    u64 total = 0;
+    for (const auto& [a, n] : cpu_pieces) {
+        total += n;
+    }
+    if (total != 0) {
+        const auto staging = staging_pool.Request(total, MemoryType::HostUncached);
+        boost::container::small_vector<vk::BufferCopy, 8> copies;
+        u64 at = 0;
+        for (const auto& [a, n] : cpu_pieces) {
+            memory->CopySparseMemory(a, staging.mapped + at, n);
+            copies.push_back({staging.offset + at, dst->Offset(a), n});
+            at += n;
+        }
+        staging.Flush();
+        runtime.CopyBuffer(staging.buffer, dst, copies);
+    }
+    {
+        // the buffer holds memory as it is now: its announced bytes are uploaded
+        std::scoped_lock lock{object_dirty_mutex};
+        if (const auto it = object_dirty.find(id); it != object_dirty.end()) {
+            it->second.Subtract(begin, end - begin);
+        }
+        b9_unattributed.Subtract(begin, end - begin);
+        all_object_dirty.Subtract(begin, end - begin);
+    }
+    {
+        std::scoped_lock lock{placed_mutex};
+        placed.emplace(begin, PlacedBuffer{id, begin, end, std::move(buffer)});
+    }
+    ForgetShadows(begin, end);
+    Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9Placed);
+    Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedBytes, end - begin);
+    range_epoch.fetch_add(1, std::memory_order_acq_rel); // the upload memo's answers (this command buffer only) that name the arena for this memory are stale
+    if (auto* object = Core::NativeResources::FindImmutableById(id)) {
+        // the resident object's binding resolution (R2) names its own buffer from now on; the other objects' resolutions stay valid
+        object->gpu_arena.store(dst, std::memory_order_relaxed);
+        object->gpu_arena_base.store(dst->cpu_addr, std::memory_order_relaxed);
+        object->gpu_arena_epoch.store(ArenaEpoch(), std::memory_order_release);
+    }
+    return dst;
+}
+
+void BufferCache::ForgetShadows(VAddr begin, VAddr end) {
+    // B9.1 verify: the CPU copies of the pages are rebuilt (a placement or a move fills a Vulkan buffer outside the uploads the copies follow)
+    if (b9_shadow.empty()) {
+        return;
+    }
+    for (VAddr page = begin & ~VAddr{4095}; page < end; page += 4096) {
+        b9_shadow.erase(page);
+    }
+}
+
+void BufferCache::DropPlaced(VAddr begin) {
+    std::unique_ptr<Buffer> buffer;
+    u64 id = 0;
+    {
+        std::scoped_lock lock{placed_mutex};
+        const auto it = placed.find(begin);
+        if (it == placed.end()) {
+            return;
+        }
+        id = it->second.id;
+        buffer = std::move(it->second.buffer);
+        placed.erase(it);
+    }
+    range_epoch.fetch_add(1, std::memory_order_acq_rel);
+    if (auto* object = Core::NativeResources::FindImmutableById(id)) {
+        object->gpu_arena_epoch.store(~u64{0}, std::memory_order_release); // its binding resolution is made again (it names the arena next)
+    }
+    // freed once the GPU is done with the work recorded so far (its descriptor slots are dropped by the buffer's destructor)
+    scheduler.DeferOperation([b = std::move(buffer)]() mutable { b.reset(); });
+}
+
+void BufferCache::Demote(VAddr begin, bool by_request) {
+    PlacedBuffer* entry = nullptr;
+    {
+        std::scoped_lock lock{placed_mutex};
+        const auto it = placed.find(begin);
+        if (it == placed.end()) {
+            return;
+        }
+        entry = &it->second;
+    }
+    // the arena takes the buffer's contents (CPU bytes announced since and not uploaded stay announced: the next upload puts them into the arena)
+    scheduler.EndRendering();
+    const u64 first_block = entry->begin >> block_shift, last_block = (entry->end - 1) >> block_shift;
+    const auto* arena = GetArena(first_block, last_block);
+    EnsureResident(arena, first_block, last_block);
+    const vk::BufferCopy copy{entry->buffer->Offset(entry->begin), arena->Offset(entry->begin), entry->end - entry->begin};
+    runtime.CopyBuffer(entry->buffer.get(), arena, std::span<const vk::BufferCopy>{&copy, 1});
+    ForgetShadows(entry->begin, entry->end);
+    Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9Demoted);
+    if (by_request) {
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9DemotedByRequest);
+        place_refused.insert(entry->id);
+    }
+    DropPlaced(begin);
+}
+
+void BufferCache::NoteEngineResourceCreate(VAddr address, u64 bytes) {
+    if (!Core::NativeUpdates::B9PlaceOn() || bytes == 0) {
+        return;
+    }
+    boost::container::small_vector<VAddr, 4> under;
+    {
+        std::scoped_lock lock{placed_mutex};
+        // placed buffers do not overlap each other: only the one that starts below the address can reach into the range from below
+        auto it = placed.upper_bound(address);
+        if (it != placed.begin()) {
+            --it;
+        }
+        for (; it != placed.end() && it->first < address + bytes; ++it) {
+            if (it->second.end > address) {
+                under.push_back(it->first);
+            }
+        }
+    }
+    for (const VAddr begin : under) {
+        Demote(begin, false);
+    }
+}
+
+const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanning, bool written) {
+    if (Core::NativeUpdates::B9PlaceOn()) {
+        if (const PlacedBuffer* entry = PlacedAt(address, size, written)) {
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedServed);
+            return entry->buffer.get();
+        }
+        if (PlacedMeets(address, size)) {
+            if (!demote_spanning) {
+                return nullptr;
+            }
+            boost::container::small_vector<VAddr, 4> met;
+            for (auto it = placed.begin(); it != placed.end(); ++it) {
+                if (it->second.begin < address + size && address < it->second.end) {
+                    met.push_back(it->first);
+                    static std::atomic<u32> logged{0};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                        LOG_WARNING(Render_Vulkan, "B9.4: request {:#x}+{:#x} runs over the edge of placed engine buffer {} {:#x}+{:#x} ({}; at the request: {})", address, size,
+                                    it->second.id, it->second.begin, it->second.end - it->second.begin, Core::NativeDevice::OwnerName(it->second.begin),
+                                    Core::NativeDevice::OwnerName(address));
+                    }
+                }
+            }
+            for (const VAddr begin : met) {
+                Demote(begin, true);
+            }
+        } else {
+            Core::NativeDevice::Object object;
+            if (Core::NativeDevice::ResourceAt(address, object) && object.kind == Core::NativeDevice::Kind::Buffer && object.alive &&
+                address + size <= object.address + std::max<u64>(object.bytes, 1)) {
+                const VAddr begin = object.address, end = object.address + object.bytes;
+                if (object.bytes == 0 || object.bytes > (u64{256} << 20)) {
+                    Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlaceRefusedSize);
+                } else if (place_refused.contains(object.id)) {
+                    // moved back by a request over its edge: it stays in the arena
+                } else {
+                    static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
+                    static thread_local std::vector<u64> textures;
+                    parts.clear();
+                    textures.clear();
+                    Core::NativeDevice::BuffersIn(begin, end - begin, parts);
+                    (void)Core::NativeDevice::TexturesIn(begin, end - begin, textures);
+                    if (parts.size() == 1 && parts[0].id == object.id && textures.empty()) {
+                        Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedServed);
+                        return Place(object.id, begin, end);
+                    }
+                    Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlaceRefusedAlias);
+                }
+            }
+        }
+    }
+    const u64 first_block = address >> block_shift, last_block = (address + size - 1) >> block_shift;
+    const auto* arena = GetArena(first_block, last_block);
+    EnsureResident(arena, first_block, last_block);
+    return arena;
 }
 
 u64 BufferCache::BufferHolding(VAddr addr, size_t size) const {
@@ -1189,6 +1432,9 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    if (arena->mem_type != MemoryType::Sparse) {
+        return; // B9.4: a placed engine buffer is resident as a whole
+    }
     for (const auto& [lo, hi] : resident_range_cache) {
         if (first_block >= lo && last_block < hi) {
             return;
@@ -1284,6 +1530,15 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
     const auto add_piece = [&](u64 addr, u64 copy_size) {
+        if (arena->mem_type != MemoryType::Sparse) {
+            // B9.4: a placed engine buffer takes only what lies inside it (a page range of the tracker, or a read past its end into the slack, can reach beyond)
+            const u64 lo = std::max<u64>(addr, arena->cpu_addr), hi = std::min<u64>(addr + copy_size, arena->cpu_addr + arena->size_bytes);
+            if (lo >= hi) {
+                return;
+            }
+            addr = lo;
+            copy_size = hi - lo;
+        }
         copies.emplace_back(total_size_bytes, addr, copy_size);
         total_size_bytes += copy_size;
         if (Core::WriteWatch::VerifyOn()) {

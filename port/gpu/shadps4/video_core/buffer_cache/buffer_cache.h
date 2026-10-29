@@ -150,6 +150,8 @@ public:
     void NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool native);
     /// B9.3: the engine buffer that holds all of [addr, addr + size) (0: none)
     [[nodiscard]] u64 BufferHolding(VAddr addr, size_t size) const;
+    /// B9.4: a new engine resource at [address, address + bytes): placed buffers under it move back into the arena
+    void NoteEngineResourceCreate(VAddr address, u64 bytes);
     /// B9.1: [address, address + size) changed on the CPU: each engine buffer it meets keeps its part, the rest waits for the first buffer upload over it. Returns the
     /// parts no buffer holds (B9.3 step 2: what the page tracker still marks)
     void MarkBuffersChanged(VAddr address, u64 size, bool announced, std::vector<std::pair<VAddr, VAddr>>* gaps);
@@ -306,6 +308,24 @@ private:
     RangeSet all_object_dirty; ///< B9.1 audit: the same bytes of all buffers by address
     std::unordered_map<u64, std::unique_ptr<std::array<u8, 4096>>> b9_shadow; ///< B9.1 verify: what the GPU copy of a sampled page holds (raster thread)
     RangeSet b9_owed; ///< B9.1 verify: differences found, waiting for an announcement
+    /// B9.4: the Vulkan buffer of [address, address + size): a placed engine buffer's own when the range is inside one (placing it at its first use), else the arena
+    /// (resident). `demote_spanning`: a range over a placed buffer's edge moves that buffer back into the arena first; false: such a range gets nullptr
+    const Buffer* BufferFor(VAddr address, u64 size, bool demote_spanning = true, bool written = false);
+    static constexpr u64 PlacedSlack = 64; ///< B9.4: a read may run this far past a placed buffer's end (vertex fetch rounding); the bytes there are not memory's
+    struct PlacedBuffer {
+        u64 id{};
+        VAddr begin{}, end{}; ///< the engine buffer's memory (the Vulkan buffer starts at begin aligned down to 256: the same offset alignment as the arena)
+        std::unique_ptr<Buffer> buffer;
+    };
+    std::map<VAddr, PlacedBuffer> placed;
+    std::unordered_set<u64> place_refused; ///< B9.4: engine buffers a request over their edge moved back into the arena (they stay there until deleted) ///< B9.4: by begin (raster thread; placed_mutex for the readers on other threads)
+    mutable std::mutex placed_mutex;
+    PlacedBuffer* PlacedAt(VAddr address, u64 size, bool written = true);
+    bool PlacedMeets(VAddr address, u64 size) const;
+    const Buffer* Place(u64 id, VAddr begin, VAddr end);
+    void Demote(VAddr begin, bool by_request);
+    void DropPlaced(VAddr begin);
+    void ForgetShadows(VAddr begin, VAddr end);
     std::atomic<u64> b9_epoch{0}; ///< B9.3 step 2: bumped when an engine buffer gets changed bytes (the upload memo's answers are stale)
     RangeSet b9_unattributed; ///< B9.1: announced bytes no engine buffer held when they were announced (a buffer's creation data comes before the buffer is known)
     std::mutex object_dirty_mutex;

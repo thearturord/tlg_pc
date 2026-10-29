@@ -100,6 +100,8 @@ void Insert(const Object& object) {
     std::unique_lock lock{table_mutex};
     if (!by_id.contains(object.id) && object.kind >= Kind::Texture1D && object.kind <= Kind::Texture3D && object.address != 0 && object.bytes != 0) {
         Core::NativeUpdates::NoteEngineCreate(object.id, object.address, object.bytes); // B8.4: the memory's older images are unlisted, in order with the GPU work
+    } else if (!by_id.contains(object.id) && object.kind == Kind::Buffer && object.address != 0) {
+        Core::NativeUpdates::NoteEngineBufferCreate(object.id, object.address, std::max<u64>(object.bytes, 1)); // B9.4
     }
     if (const auto it = by_id.find(object.id); it != by_id.end()) {
         if (it->second.alive) {
