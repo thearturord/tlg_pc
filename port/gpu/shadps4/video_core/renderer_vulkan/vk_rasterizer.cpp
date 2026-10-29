@@ -1736,8 +1736,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
     }
 
     if (uses_dma) {
+        b9_dma_binds.fetch_add(1, std::memory_order_relaxed); // B9.4 census: a shader reads memory by a raw PS4 address (needs the address mirror)
         buffer_cache.SynchronizeDmaBuffers();
     }
+    b9_all_binds.fetch_add(1, std::memory_order_relaxed);
 
     if (indexed_active) {
         // tlg C9: the plain bindings are the ones that got a write; the guest buffers are named by the draw's row, copied into the stream buffer the global set's table binding covers

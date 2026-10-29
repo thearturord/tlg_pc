@@ -572,7 +572,8 @@ private:
     std::unordered_map<u64, std::vector<u64>> native_image_keys; ///< B8.2: the native_images keys of each view id (dropped at the engine's deletion)
 public:
     std::array<std::atomic<u64>, 5> b6_downloads{}; ///< B6: copy results downloaded into PS4 memory / left on the GPU (no CPU reader)
-    std::atomic<u64> b5_copies_on_gpu{0}, b5_copies_on_cpu{0}; ///< B5: guest copies run on the GPU / as a CPU copy in PS4 memory
+    std::atomic<u64> b5_copies_on_gpu{0}, b5_copies_on_cpu{0};
+    std::atomic<u64> b9_dma_binds{0}, b9_all_binds{0}; ///< B9.4 census: draws / dispatches whose shaders read memory by a raw address, of all ///< B5: guest copies run on the GPU / as a CPU copy in PS4 memory
     std::array<std::atomic<u64>, 5> b3_stats{}; ///< B3 image bindings: 0 by id, 1 first sight, 2 the object's image changed; verify 3 same image, 4 other image
 private:
     const bool rt_reuse_enabled;
