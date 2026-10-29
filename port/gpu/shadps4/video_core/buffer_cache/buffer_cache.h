@@ -293,6 +293,13 @@ private:
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
     RangeSet gpu_modified_ranges;
+    /// B9.1: the bytes of each engine buffer (by its id) the engine announced since their last upload
+    std::unordered_map<u64, RangeSet> object_dirty;
+    RangeSet all_object_dirty; ///< B9.1 audit: the same bytes of all buffers by address
+    std::unordered_map<u64, std::unique_ptr<std::array<u8, 4096>>> b9_shadow; ///< B9.1 verify: what the GPU copy of a sampled page holds (raster thread)
+    RangeSet b9_owed; ///< B9.1 verify: differences found, waiting for an announcement
+    RangeSet b9_unattributed; ///< B9.1: announced bytes no engine buffer held when they were announced (a buffer's creation data comes before the buffer is known)
+    std::mutex object_dirty_mutex;
 public:
     std::atomic<u64> upload_bytes_kept_for_gpu{0}; ///< B5 / B6: uploads that left GPU written bytes out
 private:

@@ -59,6 +59,13 @@ void NoteDelete(u64 object);
 [[nodiscard]] bool ResourceAt(VAddr address, Object& out);
 /// B8.4: the live textures whose memory meets [address, address + size) (ids appended to `out`); true when together they cover the whole range
 [[nodiscard]] bool TexturesIn(VAddr address, u64 size, std::vector<u64>& out);
+/// B9.1: the live buffers whose memory meets [address, address + size), each with the part of the range inside it (appended to `out`)
+struct BufferPart {
+    u64 id;
+    VAddr begin, end;
+    u32 usage, cpu_access;
+};
+void BuffersIn(VAddr address, u64 size, std::vector<BufferPart>& out);
 /// A short name of what owns `address` (for audits): "buffer usage U bind B", "texture_2d usage U bind B", "none"
 [[nodiscard]] std::string OwnerName(VAddr address);
 

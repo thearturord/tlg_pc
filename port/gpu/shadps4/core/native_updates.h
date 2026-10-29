@@ -149,6 +149,32 @@ void NoteB8(B8Count what) noexcept;
 void NoteB8Unannounced(u64 address, u64 size, bool by_fault) noexcept;
 [[nodiscard]] nlohmann::json B8Report();
 
+/// B9.1 (`TLG_B9_BUFFERS`): 0 off, 1 audit (each engine buffer keeps the bytes the engine announced since their last upload; an upload compares them with the page
+/// tracker's ranges), 2 native (an engine buffer's upload copies its announced bytes; the page tracker only keeps its marks for the other paths)
+[[nodiscard]] u32 B9BufferMode() noexcept;
+/// B9.1 verify (`TLG_B9_VERIFY=N`, native mode): every Nth page keeps a CPU copy of what the GPU copy holds; after a native upload the request's bytes on the page must
+/// equal memory (a byte the engine wrote and did not announce shows up here)
+[[nodiscard]] u32 B9VerifyEvery() noexcept;
+enum B9Count : u32 {
+    B9AnnouncedOnBuffer,   ///< announcements inside one engine buffer
+    B9AnnouncedClipped,    ///< announcements that meet several buffers or reach past one (each buffer takes its part)
+    B9AnnouncedNoBuffer,   ///< announcements not starting in an engine buffer (textures, unowned memory)
+    B9SyncByObject,        ///< uploads of a range inside one engine buffer
+    B9SyncNoObject,        ///< uploads of other ranges (page tracker)
+    B9TrackerOnlyRanges,   ///< a page tracker range with no announced byte anywhere in it (native mode would not upload it: must stay 0)
+    B9TrackerOnlyBytes,
+    B9TrackerElsewhere,    ///< a page tracker range whose announced bytes lie outside the request (another buffer on the page, or later in this one: uploaded with that request)
+    B9ObjectOnlyRanges,    ///< announced bytes no page tracker range covered
+    B9BytesByTracker,      ///< bytes the page tracker would upload
+    B9BytesByObject,       ///< bytes the announcements upload
+    B9VerifyChecked,       ///< verify: request pages compared
+    B9VerifyMiss,          ///< ... differing from memory after the upload (fixed by a page upload)
+    B9VerifyLate,          ///< ... of those, announced afterwards (the game wrote ahead of the raster thread: the page tracker had the same timing)
+    B9Counts,
+};
+void NoteB9(B9Count what, u64 n = 1) noexcept;
+[[nodiscard]] nlohmann::json B9Report();
+
 nlohmann::json Report();
 
 } // namespace Core::NativeUpdates

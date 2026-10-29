@@ -285,6 +285,29 @@ bool TexturesIn(VAddr address, u64 size, std::vector<u64>& out) {
     return covered >= end;
 }
 
+void BuffersIn(VAddr address, u64 size, std::vector<BufferPart>& out) {
+    if (size == 0) {
+        return;
+    }
+    const VAddr end = address + size;
+    std::shared_lock lock{table_mutex};
+    auto it = resource_by_address.lower_bound(end);
+    u32 below = 0; // entries that start before the range: a few are looked at (a buffer that starts earlier and reaches in)
+    while (it != resource_by_address.begin() && below < 16) {
+        --it;
+        if (it->first < address) {
+            ++below;
+        }
+        const auto entry = by_id.find(it->second);
+        if (entry == by_id.end() || !entry->second.alive || entry->second.kind != Kind::Buffer || entry->second.address != it->first ||
+            it->first + std::max<u64>(entry->second.bytes, 1) <= address) {
+            continue;
+        }
+        out.push_back({entry->second.id, std::max(it->first, address), std::min<VAddr>(it->first + std::max<u64>(entry->second.bytes, 1), end), entry->second.usage,
+                       entry->second.cpu_access});
+    }
+}
+
 bool B6NativeOn() noexcept {
     static const bool on = [] {
         const char* e = std::getenv("TLG_B6_NATIVE");

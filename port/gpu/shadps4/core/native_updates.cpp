@@ -516,6 +516,42 @@ nlohmann::json B8Report() {
             {"note", "B8.1, cumulative: images refreshed by the engine's announcements instead of write faults"}};
 }
 
+namespace {
+std::array<std::atomic<u64>, B9Counts> b9_counts{};
+} // namespace
+
+u32 B9BufferMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_B9_BUFFERS");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 0u;
+    }();
+    return mode;
+}
+
+u32 B9VerifyEvery() noexcept {
+    static const u32 n = [] {
+        const char* e = std::getenv("TLG_B9_VERIFY");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 0u;
+    }();
+    return B9BufferMode() == 2 ? n : 0u;
+}
+
+void NoteB9(B9Count what, u64 n) noexcept {
+    b9_counts[what].fetch_add(n, std::memory_order_relaxed);
+}
+
+nlohmann::json B9Report() {
+    const auto c = [](B9Count what) { return b9_counts[what].load(std::memory_order_relaxed); };
+    return {{"mode", B9BufferMode()},
+            {"announcements", {{"inside_one_buffer", c(B9AnnouncedOnBuffer)}, {"running_over_several_buffers", c(B9AnnouncedClipped)}, {"not_in_a_buffer", c(B9AnnouncedNoBuffer)}}},
+            {"uploads", {{"inside_one_buffer", c(B9SyncByObject)}, {"other_ranges", c(B9SyncNoObject)}}},
+            {"TRACKER_ONLY_RANGES", c(B9TrackerOnlyRanges)}, {"tracker_ranges_announced_outside_the_request", c(B9TrackerElsewhere)}, {"tracker_only_bytes", c(B9TrackerOnlyBytes)}, {"announced_only_ranges", c(B9ObjectOnlyRanges)},
+            {"bytes_by_page_tracker", c(B9BytesByTracker)}, {"bytes_by_announcements", c(B9BytesByObject)},
+            {"verify", {{"every_nth_page", B9VerifyEvery()}, {"pages_checked", c(B9VerifyChecked)}, {"differing", c(B9VerifyMiss)},
+                        {"of_those_announced_later", c(B9VerifyLate)}, {"MISSES_never_announced", c(B9VerifyMiss) - std::min(c(B9VerifyMiss), c(B9VerifyLate))}}},
+            {"note", "B9.1, cumulative: engine buffers uploaded by their announced bytes instead of the page tracker's pages"}};
+}
+
 nlohmann::json HarvestAuditReport() {
     nlohmann::json j;
     j["enabled"] = HarvestAuditOn();

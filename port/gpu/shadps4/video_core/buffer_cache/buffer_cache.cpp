@@ -14,6 +14,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "core/native_audit.h"
+#include "core/native_device.h"
 #include "core/native_readbacks.h"
 #include "core/native_registry.h"
 #include "core/native_updates.h"
@@ -164,6 +165,29 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
     }
     Core::NativeResources::NoteCpuWrite(address, size);
     memory_tracker->MarkRegionAsCpuModified(address, size);
+    if (Core::NativeUpdates::B9BufferMode() != 0) {
+        // B9.1: each engine buffer the bytes belong to keeps its part until its next upload (an announcement can run over several buffers)
+        std::scoped_lock lock{object_dirty_mutex};
+        all_object_dirty.Add(address, size); // audit: every announced byte, by address
+        if (b9_owed.Intersects(address, size)) {
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9VerifyLate);
+            b9_owed.Subtract(address, size);
+        }
+        static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
+        parts.clear();
+        Core::NativeDevice::BuffersIn(address, size, parts);
+        Core::NativeUpdates::NoteB9(parts.empty() ? Core::NativeUpdates::B9AnnouncedNoBuffer
+                                    : parts.size() == 1 && parts[0].begin == address && parts[0].end == address + size ? Core::NativeUpdates::B9AnnouncedOnBuffer
+                                                                                                                      : Core::NativeUpdates::B9AnnouncedClipped);
+        for (const auto& part : parts) {
+            object_dirty[part.id].Add(part.begin, part.end - part.begin);
+        }
+        // the bytes no buffer holds now: the first upload of a buffer over them takes them
+        b9_unattributed.Add(address, size);
+        for (const auto& part : parts) {
+            b9_unattributed.Subtract(part.begin, part.end - part.begin);
+        }
+    }
     const u32 b8 = Core::NativeUpdates::B8ImageMode();
     if (b8 != 0) {
         texture_cache.NoteAnnouncedWrite(address, size, newer);
@@ -1137,13 +1161,89 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             add_piece(a, n);
         }
     };
+    // B9.1: an upload inside one engine buffer: its announced bytes against the page tracker's ranges
+    const u32 b9 = Core::NativeUpdates::B9BufferMode();
+    u64 b9_object = 0;
+    bool b9_cpu_read = false; // a buffer the CPU reads (staging, CPU read access): its memory also takes downloads, which the verify's copy does not see
+    boost::container::small_vector<std::pair<u64, u64>, 8> b9_pieces;
+    if (b9 != 0) {
+        Core::NativeDevice::Object object;
+        if (Core::NativeDevice::ResourceAt(device_addr, object) && object.kind == Core::NativeDevice::Kind::Buffer &&
+            device_addr + size <= object.address + std::max<u64>(object.bytes, 1)) {
+            b9_object = object.id;
+            b9_cpu_read = object.usage == 3 || (object.cpu_access & 0x20000) != 0;
+            std::scoped_lock lock{object_dirty_mutex};
+            if (const auto it = object_dirty.find(b9_object); it != object_dirty.end()) {
+                it->second.ForEachInRange(device_addr, size, [&](u64 a, u64 e) { b9_pieces.emplace_back(a, e - a); }); // (start, end) pairs
+                it->second.Subtract(device_addr, size);
+            }
+            b9_unattributed.ForEachInRange(device_addr, size, [&](u64 a, u64 e) { b9_pieces.emplace_back(a, e - a); });
+            b9_unattributed.Subtract(device_addr, size);
+            for (const auto& [a, n] : b9_pieces) {
+                all_object_dirty.Subtract(a, n);
+            }
+        }
+        Core::NativeUpdates::NoteB9(b9_object != 0 ? Core::NativeUpdates::B9SyncByObject : Core::NativeUpdates::B9SyncNoObject);
+    }
+    const auto b9_forget = [&](u64 addr, u64 n) {
+        // audit: bytes an upload of no engine buffer took (texture memory, unowned memory) leave the announced set
+        if (b9 != 0 && b9_object == 0) {
+            std::scoped_lock lock{object_dirty_mutex};
+            all_object_dirty.Subtract(addr, n);
+            b9_unattributed.Subtract(addr, n);
+        }
+    };
+    const bool b9_native = b9 == 2 && b9_object != 0;
+    boost::container::small_vector<bool, 8> b9_piece_seen(b9_pieces.size(), false);
+    // a page tracker range (the copies of the tracker): compared with the announced bytes; native mode leaves the copy to the announcements
+    const auto tracker_copy = [&](u64 addr, u64 copy_size) {
+        if (b9_object != 0) {
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9BytesByTracker, copy_size);
+            bool any = false;
+            for (size_t i = 0; i < b9_pieces.size(); ++i) {
+                const auto& [a, n] = b9_pieces[i];
+                if (a < addr + copy_size && addr < a + n) {
+                    any = true;
+                    b9_piece_seen[i] = true;
+                }
+            }
+            if (!any) {
+                bool elsewhere;
+                {
+                    std::scoped_lock lock{object_dirty_mutex};
+                    elsewhere = all_object_dirty.Intersects(addr, copy_size);
+                }
+                if (elsewhere) {
+                    Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9TrackerElsewhere);
+                    any = true;
+                }
+            }
+            if (!any) {
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9TrackerOnlyRanges);
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9TrackerOnlyBytes, copy_size);
+                static std::atomic<u32> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    LOG_WARNING(Render_Vulkan, "B9.1: page tracker range {:#x}+{:#x} of engine buffer {} ({}) has no announced byte (request {:#x}+{:#x}{})", addr,
+                                copy_size, b9_object, Core::NativeDevice::OwnerName(addr), device_addr, size, is_written ? ", written" : "");
+                }
+            }
+            if (b9_native) {
+                return;
+            }
+        }
+        b9_forget(addr, copy_size);
+        add_copy(addr, copy_size);
+    };
     const auto& ring = UntrackedRing::Get();
+    VAddr ring_lo = 0, ring_hi = 0; // the part the untracked ring uploads whole (native mode adds no announced piece there)
     if (ring.Active() && !is_written) {
         const auto [lo, hi] = ring.Clip(device_addr, size);
         if (lo < hi && !memory_tracker->IsRegionGpuModified(lo, hi - lo)) {
+            ring_lo = lo;
+            ring_hi = hi;
             // Untracked upload ring: nobody told us what the CPU wrote, so the requested part is uploaded.
             if (device_addr < lo) {
-                memory_tracker->ForEachUploadRange(device_addr, lo - device_addr, is_written, add_copy);
+                memory_tracker->ForEachUploadRange(device_addr, lo - device_addr, is_written, tracker_copy);
             }
             // Read again in the same command buffer: the data cannot have changed since the first upload.
             auto& done = ring_uploads[(lo >> 6) & 255];
@@ -1156,13 +1256,107 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 Core::NativeUploads::NoteRingSkipped(hi - lo);
             }
             if (hi < device_addr + size) {
-                memory_tracker->ForEachUploadRange(hi, device_addr + size - hi, is_written, add_copy);
+                memory_tracker->ForEachUploadRange(hi, device_addr + size - hi, is_written, tracker_copy);
             }
         } else {
-            memory_tracker->ForEachUploadRange(device_addr, size, is_written, add_copy);
+            memory_tracker->ForEachUploadRange(device_addr, size, is_written, tracker_copy);
         }
     } else {
-        memory_tracker->ForEachUploadRange(device_addr, size, is_written, add_copy);
+        memory_tracker->ForEachUploadRange(device_addr, size, is_written, tracker_copy);
+    }
+    if (b9_object != 0) {
+        for (size_t i = 0; i < b9_pieces.size(); ++i) {
+            auto [a, n] = b9_pieces[i];
+            if (!b9_piece_seen[i]) {
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9ObjectOnlyRanges);
+            }
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9BytesByObject, n);
+            if (!b9_native) {
+                continue;
+            }
+            // native: the announced bytes are the upload (outside the part the untracked ring uploads whole)
+            const u64 end = a + n;
+            if (ring_lo < ring_hi && a < ring_hi && ring_lo < end) {
+                if (a < ring_lo) {
+                    add_copy(a, ring_lo - a);
+                }
+                if (ring_hi < end) {
+                    add_copy(ring_hi, end - ring_hi);
+                }
+                continue;
+            }
+            add_copy(a, n);
+        }
+    }
+    if (b9_native && !b9_cpu_read && Core::NativeUpdates::B9VerifyEvery() != 0) {
+        // B9.1 verify: the sampled pages of the request; their CPU copy takes what this upload copies, then the request's bytes must equal memory
+        const u32 every = Core::NativeUpdates::B9VerifyEvery();
+        const auto sampled = [&](u64 page) { return (page >> 12) % every == 0; };
+        // guest bytes are read as the upload reads them (memory that is not mapped for the CPU reads as zeros)
+        std::array<u8, 4096> now{};
+        const size_t num_copies = copies.size();
+        for (size_t i = 0; i < num_copies; ++i) {
+            const u64 a = copies[i].dstOffset, e = a + copies[i].size;
+            for (u64 page = a & ~u64{4095}; page < e; page += 4096) {
+                if (!sampled(page)) {
+                    continue;
+                }
+                if (const auto it = b9_shadow.find(page); it != b9_shadow.end()) {
+                    const u64 lo = std::max(a, page), hi = std::min(e, page + 4096);
+                    memory->CopySparseMemory(lo, it->second->data() + (lo - page), hi - lo);
+                }
+            }
+        }
+        const u64 req_end = device_addr + size;
+        for (u64 page = device_addr & ~u64{4095}; page < req_end; page += 4096) {
+            if (!sampled(page)) {
+                continue;
+            }
+            const u64 lo = std::max<u64>(device_addr, page), hi = std::min<u64>(req_end, page + 4096);
+            bool gpu_written;
+            {
+                std::shared_lock lock{gpu_ranges_mutex};
+                gpu_written = gpu_modified_ranges.Intersects(lo, hi - lo);
+            }
+            auto it = b9_shadow.find(page);
+            if (gpu_written) {
+                if (it != b9_shadow.end()) {
+                    b9_shadow.erase(it);
+                }
+                continue;
+            }
+            if (it == b9_shadow.end()) {
+                if (b9_shadow.size() >= 8192) {
+                    continue;
+                }
+                // a new sampled page: the request's bytes are uploaded so the GPU copy and the CPU copy agree from here on
+                auto copy = std::make_unique<std::array<u8, 4096>>();
+                memory->CopySparseMemory(lo, copy->data() + (lo - page), hi - lo);
+                b9_shadow.emplace(page, std::move(copy));
+                add_piece(lo, hi - lo);
+                continue;
+            }
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9VerifyChecked);
+            memory->CopySparseMemory(lo, now.data() + (lo - page), hi - lo);
+            if (std::memcmp(it->second->data() + (lo - page), now.data() + (lo - page), hi - lo) != 0) {
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9VerifyMiss);
+                {
+                    std::scoped_lock lock{object_dirty_mutex};
+                    b9_owed.Add(lo, hi - lo);
+                }
+                static std::atomic<u32> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    u64 first = lo;
+                    while (first < hi && it->second->at(first - page) == now[first - page]) {
+                        ++first;
+                    }
+                    LOG_WARNING(Render_Vulkan, "B9.1 verify: engine buffer {} request {:#x}+{:#x}: byte {:#x} differs from memory after the upload ({})", b9_object, device_addr,
+                                size, first, Core::NativeDevice::OwnerName(first));
+                }
+                std::memcpy(it->second->data() + (lo - page), now.data() + (lo - page), hi - lo);
+                add_piece(lo, hi - lo);
+            }
+        }
     }
     last_upload_bytes += total_size_bytes;
     Core::NativeUploads::NoteUploaded(total_size_bytes);
