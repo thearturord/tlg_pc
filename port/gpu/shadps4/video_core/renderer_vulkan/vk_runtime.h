@@ -116,6 +116,7 @@ public:
     /// next to it and corrects it (a barrier the planner lacks and the tracker has is counted as a miss and the barrier is made). 0 misses over a long run is the exit of L4.
     struct LivePlanStats {
         u64 queries{}, answered_true{}, planner_missed{}, planner_extra{}, tracker_collapse_only{}, flushes{}, flush_differences{}, rebases{};
+        u64 barriers_recorded{}, barriers_memory_only{}, barriers_ending_a_pass{}, barriers_from_compute_writes{}; ///< GPU track: pipeline barriers actually recorded
         u64 image_transits{}, image_barriers{}, image_differences{}, images_planned{};
     };
     [[nodiscard]] bool LivePlannerOn() const noexcept {

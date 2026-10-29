@@ -1317,6 +1317,10 @@ void Runtime::FlushBarriers() {
         return;
     }
 
+    ++live_stats.barriers_recorded;
+    live_stats.barriers_memory_only += dep_info.imageMemoryBarrierCount == 0 ? 1 : 0;
+    live_stats.barriers_ending_a_pass += scheduler.IsRendering() ? 1 : 0;
+    live_stats.barriers_from_compute_writes += (memory_barrier.srcStageMask & vk::PipelineStageFlagBits2::eComputeShader) ? 1 : 0;
     Core::NativePass::SetEndCause(Core::NativePass::EndCause::Barrier);
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();

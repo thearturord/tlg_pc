@@ -1750,6 +1750,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                                            {{"queries_answered_by_the_planner", p.queries}, {"answered_true", p.answered_true}, {"misses_barrier_the_tracker_had_and_the_planner_lacked", p.planner_missed},
                                             {"extra_barriers_the_tracker_did_not_need", p.planner_extra}, {"tracker_true_only_from_its_own_range_collapse_(mode_2)", p.tracker_collapse_only}, {"flushes", p.flushes}, {"flush_decisions_differing", p.flush_differences},
                                             {"buffer_rebases_seen", p.rebases},
+                                            {"pipeline_barriers", {{"recorded", p.barriers_recorded}, {"memory_only", p.barriers_memory_only}, {"ending_a_render_pass", p.barriers_ending_a_pass}, {"after_compute_writes", p.barriers_from_compute_writes}}},
                                             {"images", {{"transitions", p.image_transits}, {"barriers", p.image_barriers}, {"DIFFERENCES_from_the_image_state", p.image_differences}, {"images_planned", p.images_planned}}},
                                             {"note", "L4 TLG_BARRIER_PLANNER=1, cumulative since start; the planner decides, the tracker corrects a miss"}});
             }
