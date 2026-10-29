@@ -1773,6 +1773,8 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                                             {"buffer_rebases_seen", p.rebases},
                                             {"pipeline_barriers", {{"recorded", p.barriers_recorded}, {"memory_only", p.barriers_memory_only}, {"ending_a_render_pass", p.barriers_ending_a_pass}, {"after_compute_writes", p.barriers_from_compute_writes}}},
                                             {"images", {{"transitions", p.image_transits}, {"barriers", p.image_barriers}, {"DIFFERENCES_from_the_image_state", p.image_differences}, {"images_planned", p.images_planned}}},
+                                            {"b10_by_object", {{"mode", rasterizer->B10Mode()}, {"queries", p.object_queries}, {"in_a_placed_buffers_own_space", p.object_space_queries},
+                                                               {"same_answer", p.object_same}, {"OBJECT_NO_ADDRESS_YES", p.object_no_address_yes}, {"object_yes_address_no", p.object_yes_address_no}}},
                                             {"note", "L4 TLG_BARRIER_PLANNER=1, cumulative since start; the planner decides, the tracker corrects a miss"}});
             }
             if (rasterizer->HazardAuditOn()) {

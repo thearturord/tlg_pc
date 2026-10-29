@@ -122,7 +122,12 @@ public:
         u64 queries{}, answered_true{}, planner_missed{}, planner_extra{}, tracker_collapse_only{}, flushes{}, flush_differences{}, rebases{};
         u64 barriers_recorded{}, barriers_memory_only{}, barriers_ending_a_pass{}, barriers_from_compute_writes{}; ///< GPU track: pipeline barriers actually recorded
         u64 image_transits{}, image_barriers{}, image_differences{}, images_planned{};
+        /// B10: buffer hazards by object (a placed engine buffer in its own offset space, the arena by guest address)
+        u64 object_queries{}, object_same{}, object_no_address_yes{}, object_yes_address_no{}, object_space_queries{};
     };
+    [[nodiscard]] u32 B10Mode() const noexcept {
+        return b10_mode;
+    }
     [[nodiscard]] bool LivePlannerOn() const noexcept {
         return live_plan_on;
     }
@@ -189,6 +194,10 @@ private:
     u64 plan_last_base{}, plan_last_size{};
     Planner live_exact; ///< TLG_BARRIER_PLANNER=2: the same lists without the collapse, the oracle for a miss
     Planner live_plan; ///< L4: updated by every access, consulted by every query, cleared by every effective flush
+    /// B10 (`TLG_B10_OBJECTS`): 0 off, 1 audit (the object planner runs next to the address planner, which answers), 2 native (the object planner answers alone)
+    u32 b10_mode{};
+    Planner live_object; ///< B10: the same state machine keyed by object: a placed engine buffer (its own Vulkan buffer) in its own offset space
+    u64 LiveObjectSpace(const VideoCore::Buffer* handle, u64 offset, u64& begin);
     struct SeenBuffer {
         u64 base{}, size{};
     };

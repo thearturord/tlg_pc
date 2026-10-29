@@ -164,6 +164,9 @@ public:
     [[nodiscard]] bool LivePlannerOn() const noexcept {
         return runtime.LivePlannerOn();
     }
+    [[nodiscard]] u32 B10Mode() const noexcept {
+        return runtime.B10Mode();
+    }
     [[nodiscard]] Runtime::LivePlanStats ReadLivePlanStats() const {
         return runtime.ReadLivePlanStats();
     }

@@ -110,6 +110,11 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     // C8 (2026-10-28): the planner always decides; the tracker runs next to it and is only compared
     live_plan_on = true;
     live_plan_decides = true;
+    // B10: buffer hazards by object, default on (=1 audit next to the address planner, =0 by address only)
+    b10_mode = 2;
+    if (const char* e = std::getenv("TLG_B10_OBJECTS"); e != nullptr && *e != 0) {
+        b10_mode = static_cast<u32>(std::clamp(std::atoi(e), 0, 2));
+    }
     // P1 (2026-10-28): the tracker and the exact list next to the planner are a comparison only (0 differences over the owner's plays): off by default
     if (const char* e = std::getenv("TLG_BARRIER_TRACKER"); (e != nullptr && *e == '1') || hazard_audit_on) {
         tracker_on = true;
@@ -280,6 +285,16 @@ void Runtime::PlanImageBarriers(VideoCore::Image* image, VideoCore::Image::Barri
     last_state.layout = dst_layout;
     last_state.access_mask = dst_mask;
     last_state.pl_stage = dst_stage;
+}
+
+u64 Runtime::LiveObjectSpace(const VideoCore::Buffer* handle, u64 offset, u64& begin) {
+    if (handle->mem_type != VideoCore::MemoryType::Sparse && handle->CpuAddr() != 0) {
+        // B10: a placed engine buffer (or block) is its own Vulkan buffer: its hazards are its own, in its own offset space
+        ++live_stats.object_space_queries;
+        begin = offset;
+        return reinterpret_cast<u64>(handle);
+    }
+    return LivePlanSpace(handle, offset, begin);
 }
 
 u64 Runtime::LivePlanSpace(const VideoCore::Buffer* handle, u64 offset, u64& begin) {
@@ -1105,10 +1120,24 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
     if (!tracker_on) {
-        // P1: the planner alone
+        // P1: the planner alone (B10: the planner by object answers in mode 2, is compared in mode 1)
         u64 begin = 0;
-        auto& space = live_plan.buffers[LivePlanSpace(handle, offset, begin)];
-        const bool planned = space.write.Overlaps(begin, begin + size) || (check_read_access && space.read.Overlaps(begin, begin + size));
+        bool by_address = false, by_object = false;
+        if (b10_mode != 2) {
+            auto& space = live_plan.buffers[LivePlanSpace(handle, offset, begin)];
+            by_address = space.write.Overlaps(begin, begin + size) || (check_read_access && space.read.Overlaps(begin, begin + size));
+        }
+        if (b10_mode != 0) {
+            auto& space = live_object.buffers[LiveObjectSpace(handle, offset, begin)];
+            by_object = space.write.Overlaps(begin, begin + size) || (check_read_access && space.read.Overlaps(begin, begin + size));
+            ++live_stats.object_queries;
+            if (b10_mode == 1) {
+                live_stats.object_same += by_object == by_address ? 1 : 0;
+                live_stats.object_no_address_yes += !by_object && by_address ? 1 : 0;
+                live_stats.object_yes_address_no += by_object && !by_address ? 1 : 0;
+            }
+        }
+        const bool planned = b10_mode == 2 ? by_object : by_address;
         ++live_stats.queries;
         live_stats.answered_true += planned ? 1 : 0;
         return planned;
@@ -1261,15 +1290,33 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         plan_log.push_back({PlanEvent::Access, false, (src_access & WRITE_MASK) != vk::AccessFlags2{}, (src_access & READ_MASK) != vk::AccessFlags2{}, src_stage != vk::PipelineStageFlags2{}, false, false,
                             reinterpret_cast<u64>(handle), offset, size, handle->CpuAddr() != 0 ? handle->CpuAddr() + offset : 0});
     }
+    if (live_plan_on && b10_mode != 0) {
+        u64 begin = 0;
+        auto& space = live_object.buffers[LiveObjectSpace(handle, offset, begin)];
+        if (src_access & WRITE_MASK) {
+            LivePlanAdd(space.write, begin, begin + size);
+        }
+        if (src_access & READ_MASK) {
+            LivePlanAdd(space.read, begin, begin + size);
+        }
+        live_object.memory_pending |= src_stage != vk::PipelineStageFlags2{};
+    }
     if (live_plan_on) {
         u64 begin = 0;
-        auto& space = live_plan.buffers[LivePlanSpace(handle, offset, begin)];
+        auto& space = live_plan.buffers[b10_mode == 2 ? 0 : LivePlanSpace(handle, offset, begin)];
+        if (b10_mode == 2) {
+            // B10 native: the address planner is not kept (only its write count, which R2 asks)
+            if (src_access & WRITE_MASK) {
+                ++live_plan_writes;
+            }
+        } else {
         if (src_access & WRITE_MASK) {
             LivePlanAdd(space.write, begin, begin + size);
             ++live_plan_writes;
         }
         if (src_access & READ_MASK) {
             LivePlanAdd(space.read, begin, begin + size);
+        }
         }
         live_plan.memory_pending |= src_stage != vk::PipelineStageFlags2{};
         if (live_plan_exact) {
@@ -1311,6 +1358,8 @@ void Runtime::FlushBarriers() {
             live_plan_writes = 0;
             live_plan.memory_pending = false;
             live_exact.buffers.clear();
+            live_object.buffers.clear();
+            live_object.memory_pending = false;
         }
     }
     if (!dep_info.memoryBarrierCount && !dep_info.imageMemoryBarrierCount) {
