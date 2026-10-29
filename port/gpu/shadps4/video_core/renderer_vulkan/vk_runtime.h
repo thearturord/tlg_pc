@@ -77,6 +77,10 @@ public:
 
     bool IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                           bool check_read_access = false);
+    /// R2: false when the planner holds no write since the last barrier (a read then needs no barrier, whatever it reads)
+    [[nodiscard]] bool PlanHasWrites() const noexcept {
+        return live_plan_writes != 0;
+    }
 
     void FlushBarriers();
 
@@ -174,6 +178,7 @@ private:
     bool live_plan_on{}, live_plan_exact{}, live_plan_decides{};
     /// P1: the old buffer tracker runs next to the planner only as a comparison (`TLG_BARRIER_TRACKER=1`, or the hazard audit); off, the planner alone answers
     bool tracker_on{};
+    u64 live_plan_writes{}; ///< R2: write ranges added to the live plan since its last clear
     const VideoCore::Buffer* plan_last_handle{}; ///< LivePlanSpace: the buffer of the last call and the range it had (no map lookup when it is the same)
     u64 plan_last_base{}, plan_last_size{};
     Planner live_exact; ///< TLG_BARRIER_PLANNER=2: the same lists without the collapse, the oracle for a miss

@@ -143,6 +143,25 @@ public:
         return STREAM_THRESHOLD;
     }
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
+    /// R1: changes when an arena is replaced
+    [[nodiscard]] u64 ArenaEpoch() const noexcept {
+        return arena_epoch.load(std::memory_order_acquire);
+    }
+    /// R1b: the object's own copy in the stream ring for [device_addr, device_addr + size) when it is current (no copy is made); null when not
+    [[nodiscard]] const Buffer* ObjectCopy(const Core::NativeResources::ImmutableBuffer& object, VAddr device_addr, u64& offset) const noexcept {
+        if (object.copy_offset == ~u64{0} || object.copy_generation != object.generation.load(std::memory_order_acquire) ||
+            object.copy_gpu_writes != object.gpu_writes.load(std::memory_order_acquire) || object.copy_wraps != stream_buffer.WrapCount()) {
+            return nullptr;
+        }
+        offset = object.copy_offset + (device_addr - object.begin);
+        return &stream_buffer;
+    }
+    /// R1b switch (`TLG_OBJECT_COPIES=0` turns it off)
+    static bool ObjectCopiesOn();
+    /// R1b verify (`TLG_OBJECT_COPY_VERIFY=N`, one answer from a copy in N): the copy must still equal the object's guest memory; counted in
+    /// `object_copy_checks` / `object_copy_stale` (/stats resident_buffers)
+    void VerifyObjectCopy(const Core::NativeResources::ImmutableBuffer& object);
+    std::atomic<u64> object_copy_checks{0}, object_copy_stale{0};
     /// N5e: byte precise. True when a shader or a GPU copy wrote bytes of [addr, addr + size) that were not downloaded since (the set `gpu_modified_ranges`), as against
     /// `IsRegionGpuModified`, which answers per 4 KB page and keeps the answer for as long as the page lives.
     [[nodiscard]] bool IsRangeGpuWritten(VAddr addr, size_t size);
@@ -297,6 +316,7 @@ private:
     static constexpr u32 ObtainMemoSlots = 8192;
     std::unique_ptr<ObtainMemo[]> obtain_memo;
     std::atomic<u64> range_epoch{0}; ///< bumped when the GPU modified ranges shrink or the arenas move
+    std::atomic<u64> arena_epoch{0}; ///< R1: bumped when an arena is replaced (a binding resolved against the old one is stale)
     /// Guards gpu_modified_ranges.
     mutable std::shared_mutex gpu_ranges_mutex;
 

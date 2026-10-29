@@ -814,6 +814,26 @@ void NoteAnnouncedWrite(VAddr address, u64 size) {
     }
 }
 
+void NoteGpuWritten(VAddr address, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    std::shared_lock lock{immutable_mutex};
+    if (immutables.empty()) {
+        return;
+    }
+    auto it = immutables.upper_bound(address);
+    if (it != immutables.begin()) {
+        --it;
+    }
+    for (; it != immutables.end() && it->first < address + size; ++it) {
+        ImmutableBuffer& buffer = *it->second;
+        if (buffer.end > address && buffer.begin < address + size) {
+            buffer.gpu_writes.fetch_add(1, std::memory_order_acq_rel);
+        }
+    }
+}
+
 void NoteHandle(u32 what) {
     immutable_handle_counters[what & 15].fetch_add(1, std::memory_order_relaxed);
 }

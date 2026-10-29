@@ -52,6 +52,18 @@ struct ImmutableBuffer {
     std::atomic<u32> generation{0}; ///< bumped by every CPU write to the range
     std::atomic<u64> hash{0};       ///< hash of the guest memory at the first check after the synchronization (0: not taken yet)
     std::atomic<u32> requests{0};
+    /// R1 (native back end): where the object is resident on the GPU since its last synchronization, written by the raster thread before `synced` (release):
+    /// the buffer cache's arena (a `VideoCore::Buffer`), its guest base address and the arena epoch it was found at
+    std::atomic<const void*> gpu_arena{nullptr};
+    std::atomic<u64> gpu_arena_base{0};
+    std::atomic<u64> gpu_arena_epoch{~u64{0}};
+    std::atomic<u32> gpu_writes{0}; ///< R1b: bumped when a GPU write (a written storage buffer, a copy or fill) covers bytes of the object
+    /// R1b (raster thread only): the object's own copy in the stream ring, made once per generation for a default / dynamic buffer: valid while the generation,
+    /// `gpu_writes` and the ring's wrap count are the ones it was made at
+    u64 copy_offset{~u64{0}};
+    u64 copy_wraps{};
+    u32 copy_generation{};
+    u32 copy_gpu_writes{};
     u8 usage{1}; ///< 1 immutable (the engine writes it once); 0 default and 2 dynamic only with `TLG_RESIDENT_BUFFERS` (C1, see below)
 };
 
@@ -65,6 +77,8 @@ u32 ResidentCap();
 u32 ResidentVerifyInterval();
 /// An engine writer announced a write of [address, address + size): the resident buffers on those pages are not synchronized any more.
 void NoteAnnouncedWrite(VAddr address, u64 size);
+/// R1b: the GPU writes [address, address + size) (byte exact): the copies of the engine buffers it touches are stale.
+void NoteGpuWritten(VAddr address, u64 size);
 /// Counters (0 answered without a synchronization, 1 synchronized (first use or after a write), 2 verify run, 3 verify run that found something to upload (stale answer),
 /// 4 request left to the normal path because the GPU modified the range, 5 buffer registered, 6 written by an announcement, 7 dropped by a CPU write fault).
 void NoteResident(u32 what);

@@ -596,6 +596,31 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         } else {
             immutable = Core::NativeResources::FindImmutable(device_addr, size);
         }
+        if (immutable != nullptr && immutable->usage != 1 && ObjectCopiesOn()) {
+            // R1b (native back end): a default or dynamic engine buffer has its own copy in the stream ring, made once per generation from its exact bytes
+            // (no page of a neighbour is uploaded with it, so a page the GPU wrote elsewhere does not matter); bytes of the object the GPU wrote keep it in the arena
+            u64 offset = 0;
+            if (const Buffer* copy = ObjectCopy(*immutable, device_addr, offset)) {
+                VerifyObjectCopy(*immutable);
+                Core::NativeResources::NoteResident(0);
+                return {copy, offset};
+            }
+            const u32 whole = static_cast<u32>(immutable->end - immutable->begin);
+            if (!IsRangeGpuWritten(immutable->begin, whole)) {
+                const u32 generation = immutable->generation.load(std::memory_order_acquire);
+                const u32 gpu_writes = immutable->gpu_writes.load(std::memory_order_acquire);
+                const auto [data, at] = stream_buffer.Map(whole, instance.UniformMinAlignment());
+                memory->CopySparseMemory(immutable->begin, data, whole);
+                stream_buffer.Commit();
+                immutable->copy_offset = at;
+                immutable->copy_wraps = stream_buffer.WrapCount();
+                immutable->copy_generation = generation;
+                immutable->copy_gpu_writes = gpu_writes;
+                Core::NativeResources::NoteResident(1);
+                Core::NativeResources::NoteBufferRequest(device_addr, size, false, Core::NativeResources::BufferPath::StreamCopy, whole);
+                return {&stream_buffer, at + (device_addr - immutable->begin)};
+            }
+        }
         if (immutable != nullptr && immutable->usage != 1 && IsRegionGpuModified(device_addr, size)) {
             // a resident (mutable usage) buffer the GPU modified: the normal path decides
             Core::NativeResources::NoteResident(4);
@@ -607,6 +632,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             if (immutable->synced.load(std::memory_order_acquire) && !Core::NativeResources::ImmutableCheck(*immutable) &&
                 (immutable->usage == 1 || !memory_tracker->IsRegionCpuModified(device_addr, size))) {
                 const auto* arena = GetArena(device_addr >> block_shift, (device_addr + size - 1) >> block_shift);
+                if (immutable->gpu_arena_epoch.load(std::memory_order_relaxed) != ArenaEpoch() && immutable->begin >= arena->cpu_addr &&
+                    immutable->end <= arena->cpu_addr + arena->size_bytes) {
+                    // R1: the arenas moved since the synchronization; the object is resident in this one now
+                    immutable->gpu_arena.store(arena, std::memory_order_relaxed);
+                    immutable->gpu_arena_base.store(arena->cpu_addr, std::memory_order_relaxed);
+                    immutable->gpu_arena_epoch.store(ArenaEpoch(), std::memory_order_release);
+                }
                 Core::NativeResources::NoteImmutableHit();
                 if (immutable->usage != 1) {
                     Core::NativeResources::NoteResident(0);
@@ -646,6 +678,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             if (last_upload_bytes != 0 && Core::NativeUploads::OnDemandAudit()) {
                 Core::NativeUploads::NoteOnDemand(immutable_pass_open, whole, last_upload_bytes, immutable->begin, true);
             }
+            // R1: the object keeps where it is resident (read by the command processor's binding resolution once `synced` is set)
+            immutable->gpu_arena.store(arena, std::memory_order_relaxed);
+            immutable->gpu_arena_base.store(arena->cpu_addr, std::memory_order_relaxed);
+            immutable->gpu_arena_epoch.store(ArenaEpoch(), std::memory_order_relaxed);
             Core::NativeResources::ImmutableSynced(*immutable, generation);
             Core::NativeResources::NoteImmutableSync();
             if (immutable->usage != 1) {
@@ -722,6 +758,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (is_written) {
         std::unique_lock lock{gpu_ranges_mutex};
         gpu_modified_ranges.Add(device_addr, size);
+        Core::NativeResources::NoteGpuWritten(device_addr, size); // R1b: copies of engine buffers with these bytes are stale
         if (Core::NativeAudit::Enabled()) {
             Core::NativeAudit::NoteGpuWrite(device_addr, size);
         }
@@ -747,6 +784,33 @@ u32 BufferCache::WaitForExplicitDownloads(VAddr device_addr, u64 size, u32 timeo
         return 0;
     }
     return explicit_landed.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return !overlaps(); }) ? 1 : 2;
+}
+
+bool BufferCache::ObjectCopiesOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_OBJECT_COPIES");
+        return e == nullptr || *e != '0';
+    }();
+    return on;
+}
+
+void BufferCache::VerifyObjectCopy(const Core::NativeResources::ImmutableBuffer& object) {
+    static const u32 every = [] {
+        const char* e = std::getenv("TLG_OBJECT_COPY_VERIFY");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 0u;
+    }();
+    static u64 counter = 0;
+    if (every == 0 || ++counter % every != 0) {
+        return;
+    }
+    object_copy_checks.fetch_add(1, std::memory_order_relaxed);
+    const u64 whole = object.end - object.begin;
+    if (std::memcmp(stream_buffer.mapped_data.data() + object.copy_offset, reinterpret_cast<const void*>(object.begin), whole) != 0) {
+        if (object_copy_stale.fetch_add(1, std::memory_order_relaxed) < 12) {
+            LOG_ERROR(Render, "R1b: the copy of engine buffer {:#x}+{:#x} (usage {}) differs from guest memory at generation {}", object.begin, whole, object.usage,
+                      object.copy_generation);
+        }
+    }
 }
 
 bool BufferCache::StreamWhilePassOpen(VAddr device_addr, u32 size) {
@@ -874,6 +938,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
         address_space[base_page + page] = new_arena;
     }
     range_epoch.fetch_add(1, std::memory_order_acq_rel); // answers that name the old arenas are stale
+    arena_epoch.fetch_add(1, std::memory_order_acq_rel);
     return new_arena;
 }
 

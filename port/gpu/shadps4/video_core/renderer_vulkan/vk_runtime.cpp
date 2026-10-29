@@ -298,6 +298,7 @@ u64 Runtime::LivePlanSpace(const VideoCore::Buffer* handle, u64 offset, u64& beg
         if (seen.size != 0) {
             ++live_stats.rebases;
             auto& space = live_plan.buffers[0];
+            ++live_plan_writes;
             if (seen.base != 0) {
                 LivePlanAdd(space.write, seen.base, seen.base + seen.size);
                 LivePlanAdd(space.read, seen.base, seen.base + seen.size);
@@ -1262,6 +1263,7 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         auto& space = live_plan.buffers[LivePlanSpace(handle, offset, begin)];
         if (src_access & WRITE_MASK) {
             LivePlanAdd(space.write, begin, begin + size);
+            ++live_plan_writes;
         }
         if (src_access & READ_MASK) {
             LivePlanAdd(space.read, begin, begin + size);
@@ -1303,6 +1305,7 @@ void Runtime::FlushBarriers() {
         live_stats.flush_differences += planned != actual ? 1 : 0;
         if (actual) {
             live_plan.buffers.clear();
+            live_plan_writes = 0;
             live_plan.memory_pending = false;
             live_exact.buffers.clear();
         }

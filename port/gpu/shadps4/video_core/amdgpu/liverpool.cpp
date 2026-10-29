@@ -840,6 +840,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
     }
     // O1: the write watch of the operation's buffers is harvested here, on the command processor thread, not on the raster thread
     rasterizer->HarvestAhead(op.draw_plan.get(), op.dispatch_plan.get());
+    rasterizer->ResolveAhead(op.draw_plan.get(), op.dispatch_plan.get()); // R2: after the harvest, so the generations include what it found
     RasterPush(std::move(op), false);
 }
 
@@ -1688,7 +1689,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                                                                "buffers_by_address_written", "address_read_le256", "address_read_le4k", "address_read_le64k", "address_read_bigger",
                                                                "buffer_barrier_queries", "buffer_barrier_true", "images", "images_null", "images_from_texture_set_memo",
                                                                "images_from_lookup_cache", "images_find_image", "images_storage", "image_transits", "image_transits_true",
-                                                               "bind_resources_calls", "buffers_in_place"};
+                                                               "bind_resources_calls", "buffers_in_place", "buffers_resolved_ahead"};
                 for (u32 side = 0; side < 2; ++side) {
                     nlohmann::json part = nlohmann::json::object();
                     for (u32 k = 0; k < std::size(shader_names); ++k) {
@@ -1700,6 +1701,14 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                                    {"index_ring", c[27]}, {"index_by_engine_handle", c[28]}, {"index_by_address", c[29]}};
                 out["note"] = "C0 census, counts per ~5 s interval (read only)";
                 Core::DebugServer::Publish("consumer_census", std::move(out));
+                const auto r = rasterizer->TakeResolveStats();
+                Core::DebugServer::Publish("native_backend", {{"buffers_resolved_by_the_command_processor", r[0]}, {"bound_from_the_resolution", r[1]},
+                                                              {"resolution_stale_at_bind", r[2]},
+                                                              {"object_copy_verify", {{"checked", rasterizer->ObjectCopyVerify().first}, {"DIFFERENT", rasterizer->ObjectCopyVerify().second}}},
+                                                              {"stale_why", {{"epoch", r[12]}, {"gone", r[13]}, {"not_synchronized", r[14]}, {"generation_moved", r[15]}, {"arena", r[16]}, {"tracker_dirty", r[17]}}},
+                                                              {"not_resolved", {{"no_record_entry", r[3]}, {"null_or_huge", r[4]}, {"no_engine_object", r[5]}, {"not_immutable", r[6]},
+                                                                                {"outside_the_object", r[7]}, {"not_synchronized", r[8]}, {"no_arena_yet", r[9]}, {"arena_moved", r[10]}, {"clamped", r[11]}}},
+                                                              {"note", "R2, counts per ~5 s interval"}});
             }
             if (const char* e = std::getenv("TLG_DESC_CENSUS"); e != nullptr && *e != 0 && *e != '0') {
                 const auto d = rasterizer->TakeDescriptorCensus();

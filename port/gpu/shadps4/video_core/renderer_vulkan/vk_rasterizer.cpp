@@ -131,7 +131,7 @@ namespace {
 enum CensusKind : u32 {
     CBufferTotal = 0, CBufferRing, CBufferSpecial, CBufferNull, CBufferHandle, CBufferAddrRead, CBufferAddrWritten, CBufferAddrReadLe256, CBufferAddrReadLe4k,
     CBufferAddrReadLe64k, CBufferAddrReadBig, CBufferBarrierQuery, CBufferBarrierTrue, CImageTotal, CImageNull, CImageSetHit, CImageLookupHit, CImageFind,
-    CImageStorage, CImageTransit, CImageTransitTrue, CBindResources, CBufferInPlace,
+    CImageStorage, CImageTransit, CImageTransitTrue, CBindResources, CBufferInPlace, CBufferResolved,
     CGeometryVertexRing = 24, CGeometryVertexHandle, CGeometryVertexAddress, CGeometryIndexRing, CGeometryIndexHandle, CGeometryIndexAddress,
 };
 bool DescCensusOn() {
@@ -818,6 +818,7 @@ void ResetStage(StagePlan& stage) {
     stage.flat.clear();
     stage.flat_skipped = false;
     stage.pgm_base = 0;
+    stage.resolved.clear();
 }
 } // namespace
 
@@ -1084,7 +1085,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     binder_plan = NativeBinderFor(plan, tag.valid ? (tag.meta & 0xff) : 15u);
     draw_has_plan = plan != nullptr;
     draw_class_now = tag.valid ? (tag.meta & 0xff) : 15u;
+    resolved_draw = binder_plan == plan ? plan : nullptr;
     const bool bound = BindResources(pipeline, &fixed);
+    resolved_draw = nullptr;
     binder_plan = nullptr;
     draw_has_plan = false;
     if (!bound) {
@@ -1176,7 +1179,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     PrepareRenderState(pipeline, fixed);
     binder_plan = NativeBinderFor(plan, 4);
+    resolved_draw = binder_plan == plan ? plan : nullptr;
     const bool bound = BindResources(pipeline, &fixed);
+    resolved_draw = nullptr;
     binder_plan = nullptr;
     if (!bound) {
         return;
@@ -1309,7 +1314,9 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     static const bool dispatch_audit_on = std::getenv("TLG_DISPATCH_AUDIT") != nullptr;
     dispatch_audit_plan = (dispatch_audit_on && plan != nullptr && plan->bindings_complete) ? plan : nullptr;
     binder_plan = DispatchBinderFor(plan);
+    resolved_dispatch = binder_plan != nullptr ? plan : nullptr;
     const bool dispatch_bound = BindResources(pipeline);
+    resolved_dispatch = nullptr;
     binder_plan = nullptr;
     dispatch_audit_plan = nullptr;
     if (!dispatch_bound) {
@@ -1351,7 +1358,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Dis
     static const bool dispatch_audit_on = std::getenv("TLG_DISPATCH_AUDIT") != nullptr;
     dispatch_audit_plan = (dispatch_audit_on && plan != nullptr && plan->bindings_complete) ? plan : nullptr;
     binder_plan = DispatchBinderFor(plan);
+    resolved_dispatch = binder_plan != nullptr ? plan : nullptr;
     const bool dispatch_bound = BindResources(pipeline);
+    resolved_dispatch = nullptr;
     binder_plan = nullptr;
     dispatch_audit_plan = nullptr;
     if (!dispatch_bound) {
@@ -2161,6 +2170,103 @@ void Rasterizer::HarvestAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) 
     }
 }
 
+void Rasterizer::ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_RESOLVE_AHEAD");
+        return e == nullptr || *e != '0';
+    }();
+    if (!on || !Core::NativeResources::ImmutableResidencyEnabled() || NativeBinderMode() == 3 || inplace_on) {
+        return;
+    }
+    // R2b: the engine's default and dynamic buffers too (resident buffers): the arena holds their contents while their generation is the synchronized one
+    static const bool mutable_on = [] {
+        const char* e = std::getenv("TLG_RESOLVE_MUTABLE");
+        return e == nullptr || *e != '0';
+    }();
+    const auto resolve = [&](StagePlan& out, const Shader::Info& info, u32 s, const Core::NativeDraw::RecordBinding* list, u32 count,
+                             Core::NativeResources::ImmutableBuffer* const* handles) {
+        out.resolved.clear();
+        out.resolved_epoch = Core::NativeResources::ImmutableEpoch();
+        if (count == 0) {
+            return;
+        }
+        out.resolved.resize(info.buffers.size());
+        for (u32 i = 0; i < info.buffers.size(); ++i) {
+            const auto& desc = info.buffers[i];
+            if (desc.IsSpecial() || desc.is_written || desc.is_formatted || desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase ||
+                desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
+                continue;
+            }
+            // the same entry the raster thread's lookup takes: the first match, and none when a later entry answers the same load with other words
+            u32 first = 0, second = 0;
+            const u32* words = FindRecordWords(info, list, count, s, 1, desc.sharp_fetch.offsets[0], 4, &first, false);
+            const auto reject = [&](u32 why) { resolve_stats.rejected[why].fetch_add(1, std::memory_order_relaxed); };
+            if (words == nullptr) {
+                reject(0);
+                continue;
+            }
+            if (first + 1 < count) {
+                const u32* other = FindRecordWords(info, list + first + 1, count - first - 1, s, 1, desc.sharp_fetch.offsets[0], 4, &second, false);
+                if (other != nullptr && std::memcmp(words, other, 16) != 0) {
+                    reject(0);
+                    continue;
+                }
+            }
+            const AmdGpu::Buffer v = desc.FromWords(words, info);
+            const u64 bytes = v.GetSize();
+            if (v.base_address == 0 || bytes == 0 || bytes >= (u64{1} << 28)) {
+                reject(1);
+                continue;
+            }
+            // the object of the engine id; in the handles' compare mode (2) the lookup by address wins, as it does in ObtainBuffer
+            auto* object = NativeHandleMode() == 2 || (handles == nullptr && list[first].id == 0) ? Core::NativeResources::FindImmutable(v.base_address, static_cast<u32>(bytes))
+                           : handles != nullptr                                               ? handles[first]
+                                                                                              : Core::NativeResources::FindImmutableById(list[first].id);
+            if (object == nullptr || (object->usage != 1 && !mutable_on) || v.base_address < object->begin || v.base_address + bytes > object->end) {
+                reject(object == nullptr ? 2 : object->usage != 1 && !mutable_on ? 3 : 4);
+                continue;
+            }
+            const u32 generation = object->generation.load(std::memory_order_acquire);
+            if (!object->alive.load(std::memory_order_acquire)) {
+                reject(5);
+                continue;
+            }
+            const u64 size = memory->ClampRangeSize(v.base_address, bytes);
+            if (size != bytes) {
+                reject(8);
+                continue;
+            }
+            // not synchronized yet is fine: the raster thread binds it only once it is (at this generation)
+            out.resolved[i] = {object, v.base_address, static_cast<u32>(size), generation};
+            resolve_stats.planned.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+    if (draw_plan != nullptr && draw_plan->pipeline != nullptr && (draw_plan->any_flat_skipped || (draw_plan->bindings_complete && draw_plan->binding_count != 0))) {
+        const bool handles_ok = draw_plan->has_handles && draw_plan->handle_epoch == Core::NativeResources::ImmutableEpoch();
+        for (const auto* info : draw_plan->pipeline->GetStages()) {
+            if (info == nullptr || (info->sw_stage != Shader::SwStage::Vertex && info->sw_stage != Shader::SwStage::Fragment)) {
+                continue;
+            }
+            resolve(draw_plan->stages[static_cast<u32>(info->sw_stage)], *info, info->sw_stage == Shader::SwStage::Vertex ? 0u : 1u, draw_plan->bindings.data(),
+                    draw_plan->binding_count, handles_ok ? draw_plan->handles.data() : nullptr);
+        }
+    }
+    if (dispatch_plan != nullptr && dispatch_plan->pipeline != nullptr && dispatch_plan->bindings_complete && dispatch_plan->binding_count != 0 && DispatchBinderMode() != 0) {
+        resolve(dispatch_plan->stage, dispatch_plan->pipeline->GetStage(Shader::SwStage::Compute), 5u, dispatch_plan->bindings.data(), dispatch_plan->binding_count, nullptr);
+    }
+}
+
+std::array<u64, 18> Rasterizer::TakeResolveStats() {
+    std::array<u64, 18> out{resolve_stats.planned.exchange(0), resolve_stats.hits.exchange(0), resolve_stats.stale.exchange(0)};
+    for (u32 i = 0; i < 9; ++i) {
+        out[3 + i] = resolve_stats.rejected[i].exchange(0);
+    }
+    for (u32 i = 0; i < 6; ++i) {
+        out[12 + i] = resolve_stats.stale_why[i].exchange(0);
+    }
+    return out;
+}
+
 Runtime::HazardAudit Rasterizer::TakeHazardAudit() {
     return runtime.TakeHazardAudit();
 }
@@ -2407,6 +2513,57 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 } else {
                     Core::NativeRegistry::AuditBinding(static_cast<u32>(stage.sw_stage), false, 0xffff, nullptr, 0);
                 }
+            }
+            if (const StagePlan* rs = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
+                                      : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
+                                                                                                                  : nullptr;
+                rs != nullptr && buffer_index < rs->resolved.size() && rs->resolved[buffer_index].object != nullptr) {
+                // R2: resolved by the command processor from the record's engine object; bound when its stamps hold
+                const ResolvedBuffer& r = rs->resolved[buffer_index];
+                if (rs->resolved_epoch == Core::NativeResources::ImmutableEpoch()) {
+                    buffer_cache.HarvestWriteWatch(r.address, r.size); // a CPU write since the command processor looked bumps the generation
+                    const auto* object = r.object;
+                    u64 copy_offset = 0;
+                    if (const auto* copy = object->usage != 1 && object->alive.load(std::memory_order_acquire) && object->generation.load(std::memory_order_acquire) == r.generation
+                                               ? buffer_cache.ObjectCopy(*object, r.address, copy_offset)
+                                               : nullptr) {
+                        // R1b: the object's own copy of this generation in the stream ring
+                        buffer_cache.VerifyObjectCopy(*object);
+                        const u64 offset_aligned = Common::AlignDown(copy_offset, alignment);
+                        const u64 adjust = copy_offset - offset_aligned;
+                        push_data.AddOffset(binding.buffer, adjust);
+                        buffer_infos.emplace_back(copy->Handle(), offset_aligned, r.size + adjust);
+                        Census(census_base + CBufferResolved);
+                        resolve_stats.hits.fetch_add(1, std::memory_order_relaxed);
+                        goto buffer_bound;
+                    }
+                    const bool ready = object->alive.load(std::memory_order_acquire) && object->synced.load(std::memory_order_acquire); // the arena fields are stored before `synced`
+                    const auto* arena = ready ? static_cast<const VideoCore::Buffer*>(object->gpu_arena.load(std::memory_order_relaxed)) : nullptr;
+                    if (ready && object->generation.load(std::memory_order_acquire) == r.generation && arena != nullptr &&
+                        object->gpu_arena_epoch.load(std::memory_order_acquire) == buffer_cache.ArenaEpoch() &&
+                        (object->usage == 1 || !buffer_cache.IsRegionCpuModified(r.address, r.size))) { // as ObtainBuffer: the tracker's dirty bit is the safety net of a resident buffer
+                        const u64 offset = r.address - object->gpu_arena_base.load(std::memory_order_relaxed);
+                        const u64 offset_aligned = Common::AlignDown(offset, alignment);
+                        const u64 adjust = offset - offset_aligned;
+                        push_data.AddOffset(binding.buffer, adjust);
+                        buffer_infos.emplace_back(arena->Handle(), offset_aligned, r.size + adjust);
+                        bound_buffers.emplace_back(arena, offset, r.size, src_access);
+                        if (runtime.PlanHasWrites() && runtime.IsBufferAccessed(arena, offset, r.size, false)) {
+                            needs_barrier = true;
+                        }
+                        Census(census_base + CBufferResolved);
+                        resolve_stats.hits.fetch_add(1, std::memory_order_relaxed);
+                        goto buffer_bound;
+                    }
+                    // why: 0 epoch, 1 gone, 2 not synchronized, 3 generation moved, 4 arena, 5 tracker dirty
+                    const u32 why = !object->alive.load(std::memory_order_relaxed) ? 1 : !object->synced.load(std::memory_order_relaxed) ? 2
+                                    : object->generation.load(std::memory_order_relaxed) != r.generation                       ? 3
+                                    : arena == nullptr || object->gpu_arena_epoch.load(std::memory_order_relaxed) != buffer_cache.ArenaEpoch() ? 4 : 5;
+                    resolve_stats.stale_why[why].fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    resolve_stats.stale_why[0].fetch_add(1, std::memory_order_relaxed);
+                }
+                resolve_stats.stale.fetch_add(1, std::memory_order_relaxed);
             }
             AmdGpu::Buffer chosen_sharp;
             bool from_record = false;
@@ -2681,6 +2838,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
         }
 
+    buffer_bound:
         if (census_base == 0 && DescCensusOn()) {
             DescriptorNoteBuffer(static_cast<u32>(stage.sw_stage), buffer_index, buffer_infos.back());
         }

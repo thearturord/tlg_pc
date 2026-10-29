@@ -165,8 +165,20 @@ inline const u32* FindRecordWords(const Shader::Info& info, const Core::NativeDr
     return nullptr;
 }
 
+/// R2 (native back end): a shader buffer binding the command processor resolved from the record's engine object: the raster thread binds it from the object's
+/// arena when the object is synchronized at the stamped generation (no buffer cache request, no record lookup). The stamp is taken when the command processor
+/// plans the operation, after the game wrote the frame's data: an object the raster thread synchronizes at its first use in the frame serves the later uses.
+struct ResolvedBuffer {
+    Core::NativeResources::ImmutableBuffer* object{}; ///< null: not resolved (the raster thread takes the full path)
+    VAddr address{};
+    u32 size{};
+    u32 generation{};
+};
+
 struct StagePlan {
     boost::container::small_vector<RingBinding, 8> ring; ///< T1: filled by the command processor thread, read by the raster thread
+    boost::container::small_vector<ResolvedBuffer, 8> resolved; ///< R2: by the stage's buffer index (empty: none resolved)
+    u64 resolved_epoch{}; ///< R2: the immutable epoch the objects were looked up at
     Shader::Info* info{};
     boost::container::small_vector<PreparedImage, 8> images;
     bool images_prepared{};

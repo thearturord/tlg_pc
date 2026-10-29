@@ -143,6 +143,19 @@ public:
     /// O1 (command processor thread): harvests the write watch for the buffers a planned draw or dispatch names (its record's buffer descriptors, the engine
     /// buffers they belong to, the geometry buffers) and stores the epoch in the plan, so the raster thread need not
     void HarvestAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan);
+    /// R2 (command processor thread): resolves the shader buffer bindings of a planned draw or dispatch whose record names a resident immutable engine buffer
+    /// (`TLG_RESOLVE_AHEAD=0` turns it off); the raster thread binds them after a stamp check
+    void ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan);
+    struct ResolveStats {
+        std::atomic<u64> planned{}, hits{}, stale{};
+        std::array<std::atomic<u64>, 6> stale_why{};
+        std::array<std::atomic<u64>, 9> rejected{}; ///< 0 no record entry, 1 null or huge V#, 2 no engine object, 3 not immutable, 4 outside the object, 5 not synchronized, 6 no arena yet, 7 arena moved, 8 clamped
+    };
+    std::array<u64, 18> TakeResolveStats();
+    /// R1b verify counters (cumulative): copies checked, copies that differed from guest memory
+    [[nodiscard]] std::pair<u64, u64> ObjectCopyVerify() const noexcept {
+        return {buffer_cache.object_copy_checks.load(std::memory_order_relaxed), buffer_cache.object_copy_stale.load(std::memory_order_relaxed)};
+    }
     [[nodiscard]] bool LivePlannerOn() const noexcept {
         return runtime.LivePlannerOn();
     }
@@ -563,6 +576,9 @@ private:
     const DrawPlan* DispatchBinderFor(const DispatchPlan* plan);
     const DispatchPlan* dispatch_audit_plan{}; ///< B9: the plan of the dispatch being bound; its record's descriptors are compared with the guest's (TLG_DISPATCH_AUDIT=1)
     const DrawPlan* binder_plan{};   ///< N3: the plan whose record binds the resources of the draw being recorded (null: from the flat user data)
+    const DrawPlan* resolved_draw{};         ///< R2: the draw being bound, when its plan carries resolved bindings
+    const DispatchPlan* resolved_dispatch{}; ///< R2: the dispatch being bound
+    ResolveStats resolve_stats;
     bool binder_verify{};
     const DrawPlan* NativeBinderFor(const DrawPlan* plan, u32 draw_class);
     /// kind: 1 buffer, 2 image, 3 sampler descriptor
