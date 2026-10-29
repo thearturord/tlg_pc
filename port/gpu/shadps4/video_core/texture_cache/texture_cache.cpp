@@ -423,7 +423,14 @@ void TextureCache::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
     if (b8_find != 0) {
         static thread_local std::vector<u64> ids;
         ids.clear();
-        if (Core::NativeDevice::TexturesIn(addr, size, ids)) {
+        const bool covered_by_textures = Core::NativeDevice::TexturesIn(addr, size, ids);
+        if (!engine_pending_clears.empty()) {
+            // B11 step 6: a CPU write to a texture whose clear waits for its first image comes after the clear: the clear is gone
+            for (const u64 id : ids) {
+                engine_pending_clears.erase(id);
+            }
+        }
+        if (covered_by_textures) {
             Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8RouteAnnounce);
             EngineImagesIn(ids, addr, size, image_ids);
             routed = b8_find == 2;
@@ -499,6 +506,7 @@ void TextureCache::NoteEngineTextureDelete(u64 id, VAddr address, u64 bytes, boo
     }
     engine_images.erase(id);
     engine_answers.erase(id);
+    engine_pending_clears.erase(id);
     if (bytes == 0) {
         return;
     }
@@ -996,6 +1004,30 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             list.emplace_back(found, image.image_uid);
             slot_images[found].b8_listed_by = owner_id;
             Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8FindOwned);
+            if (const auto pending = engine_pending_clears.find(owner_id); pending != engine_pending_clears.end()) {
+                // B11 step 6: the texture's clear that came before its first image
+                Image& target = slot_images[found];
+                const EngineClear clear = pending->second;
+                engine_pending_clears.erase(pending);
+                if (target.info.props.is_depth == clear.depth && target.info.resources.levels == 1) {
+                    const SubresourceRange range{.base = {0, 0}, .extent = {1, static_cast<u16>(target.info.resources.layers)}};
+                    if (clear.fast) {
+                        target.pending_fast_clear = EngineColorValue(target.info.pixel_format, clear.value);
+                    } else {
+                        if (clear.depth) {
+                            runtime.ClearDepthStencilImage(&target, range, (clear.flags & 1) != 0, clear.value[0], (clear.flags & 2) != 0, clear.stencil);
+                            target.usage.depth_target = true;
+                        } else {
+                            runtime.ClearImage(&target, range, EngineColorValue(target.info.pixel_format, clear.value));
+                        }
+                        target.flags &= ~(ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty);
+                        target.flags |= ImageFlagBits::GpuModified;
+                    }
+                    Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeClearAtFirstImage);
+                } else {
+                    Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeClearFirstImageMismatch);
+                }
+            }
         }
         return true;
     };
@@ -1886,6 +1918,21 @@ void TextureCache::DeleteImage(ImageId image_id) {
         slot_images.Erase(image_id);
         images_freed.fetch_add(1, std::memory_order_relaxed);
     });
+}
+
+vk::ClearValue TextureCache::EngineColorValue(vk::Format format, const float (&value)[4]) {
+    vk::ClearValue out{};
+    const std::string name = vk::to_string(format);
+    if (name.find("Uint") != std::string::npos || name.find("Sint") != std::string::npos) {
+        for (u32 i = 0; i < 4; ++i) {
+            out.color.int32[i] = static_cast<s32>(value[i]);
+        }
+    } else {
+        for (u32 i = 0; i < 4; ++i) {
+            out.color.float32[i] = value[i];
+        }
+    }
+    return out;
 }
 
 } // namespace VideoCore

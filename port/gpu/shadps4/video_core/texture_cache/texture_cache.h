@@ -129,6 +129,17 @@ public:
     void NoteEngineTextureCreate(VAddr address, u64 bytes);
     /// B8.4: the images listed for the engine textures `ids` (their own and their remembered answers) that meet [address, address + size), each once
     void EngineImagesIn(const std::vector<u64>& ids, VAddr address, u64 size, SmallVector<ImageId, 8>& out) const;
+    /// B11 step 6: an engine clear of a texture that has no image yet (whole texture: one mip, all layers); applied to its first image when the lookup lists it
+    struct EngineClear {
+        bool depth{}, fast{};
+        u32 flags{}, stencil{};
+        float value[4]{};
+    };
+    void SetEnginePendingClear(u64 id, const EngineClear& clear) {
+        engine_pending_clears[id] = clear;
+    }
+    /// B11: the clear value of an engine color clear for `format` (integer formats take the values as integers)
+    static vk::ClearValue EngineColorValue(vk::Format format, const float (&value)[4]);
     /// B11: the type EngineImagesOf fills
     static SmallVector<ImageId, 4> EngineImagesOfType();
     /// B11: the engine texture's own images (its list, registered)
@@ -488,6 +499,7 @@ private:
     Common::SlotVector<Image> slot_images;
     /// B8.3: the images of each engine texture (by its id; slot and uid, a stale entry is skipped), raster thread
     std::unordered_map<u64, SmallVector<std::pair<ImageId, u64>, 2>> engine_images;
+    std::unordered_map<u64, EngineClear> engine_pending_clears; ///< B11 step 6, by engine texture id
     /// B8.4: the other answers of each engine texture's lookups (a view of another format or size, a mip or layer of a bigger image), by the request; valid while no
     /// image was registered or removed in the range since (the event ring)
     struct EngineAnswer {

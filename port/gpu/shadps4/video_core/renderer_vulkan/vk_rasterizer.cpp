@@ -602,11 +602,12 @@ bool Rasterizer::NativeClear(const Core::NativeDevice::ClearRecord& record) {
     // A color fast clear (the target has a meta surface) writes only the CMASK on the console: the color memory changes when a fast clear eliminate runs, and a texture
     // read before that sees the old pixels; the game's image depends on it (owner play 2026-10-29: Trico's feathers over the view when it ran as a full clear).
     // It keeps its path (the eliminate clears); TLG_B11_FAST=1 runs it as a Vulkan clear anyway (study).
-    static const bool fast_native = [] {
-        const char* e = std::getenv("TLG_B11_FAST");
-        return e != nullptr && *e == '1';
-    }();
-    if (record.kind == 0 && record.path == 1 && !fast_native) {
+    // Step 5 (TLG_B11_FAST, default 2): the fast clear is kept on the engine texture's images as a pending clear (Image::pending_fast_clear), applied where the
+    // console's CMASK would take effect: the next render pass on the image, or the fast clear eliminate. 0 keeps the old path (the meta fill recognized as a
+    // clear of the CMASK), 1 clears at once (study: wrong, see above).
+    const u32 fast_mode = B11FastMode();
+    const bool fast_clear = record.kind == 0 && record.path == 1;
+    if (fast_clear && fast_mode == 0) {
         Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeFastClearKept);
         return false;
     }
@@ -644,7 +645,29 @@ bool Rasterizer::NativeClear(const Core::NativeDevice::ClearRecord& record) {
         targets.emplace_back(image_id, range);
     }
     if (targets.empty()) {
-        Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeNoImage);
+        // B11 step 6: a clear of the whole texture before its first image is kept on the texture and applied when the image is made
+        const bool whole = resource.mips == 1 && record.first_layer == 0 && record.layer_count == std::max<u32>(resource.layers, 1);
+        if (!ids.empty() || !whole || fast_mode == 3) {
+            Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeNoImage);
+            return false;
+        }
+        VideoCore::TextureCache::EngineClear clear{.depth = record.kind == 1, .fast = fast_clear && fast_mode == 2, .flags = record.flags, .stencil = record.stencil};
+        std::memcpy(clear.value, record.value, sizeof(clear.value));
+        if (fast_clear && fast_mode == 1) {
+            clear.fast = false;
+        }
+        texture_cache.SetEnginePendingClear(record.resource_id, clear);
+        Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeClearBeforeImage);
+        Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeDone);
+        ++recorded_work;
+        return true;
+    }
+    if (fast_clear && fast_mode >= 2 && std::ranges::any_of(targets, [&](const auto& t) {
+            const auto& image = texture_cache.GetImage(t.first);
+            return image.info.resources.levels != 1 || t.second.base.layer != 0 || t.second.extent.layers != image.info.resources.layers;
+        })) {
+        // a pending clear is kept per image: a fast clear of a part of an image keeps the old path
+        Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeFastClearKept);
         return false;
     }
     if (record.mip != 0 || record.first_layer != 0 || resource.mips > 1 || resource.layers > 1) {
@@ -654,16 +677,11 @@ bool Rasterizer::NativeClear(const Core::NativeDevice::ClearRecord& record) {
         auto& image = texture_cache.GetImage(image_id);
         const bool whole = image.info.resources.levels == 1 && range.base.layer == 0 && range.extent.layers == image.info.resources.layers;
         if (record.kind == 0) {
-            vk::ClearValue value{};
-            const std::string format = vk::to_string(image.info.pixel_format);
-            if (format.find("Uint") != std::string::npos || format.find("Sint") != std::string::npos) {
-                for (u32 i = 0; i < 4; ++i) {
-                    value.color.int32[i] = static_cast<s32>(record.value[i]);
-                }
-            } else {
-                for (u32 i = 0; i < 4; ++i) {
-                    value.color.float32[i] = record.value[i];
-                }
+            const vk::ClearValue value = VideoCore::TextureCache::EngineColorValue(image.info.pixel_format, record.value);
+            if (fast_clear && fast_mode >= 2) {
+                image.pending_fast_clear = value;
+                Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeFastClearPending);
+                continue;
             }
             runtime.ClearImage(&image, range, value);
         } else {
@@ -677,9 +695,42 @@ bool Rasterizer::NativeClear(const Core::NativeDevice::ClearRecord& record) {
         image.flags |= VideoCore::ImageFlagBits::GpuModified;
         Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeImages);
     }
+    if (fast_clear && fast_mode == 3) {
+        return false; // audit: the old path runs too and is compared where the pending clear is used
+    }
     Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeDone);
     ++recorded_work;
     return true;
+}
+
+u32 Rasterizer::B11FastMode() {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_B11_FAST");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 2u;
+    }();
+    return mode;
+}
+
+void Rasterizer::AuditFastClear(bool old_clear, const vk::ClearValue& old_value, const std::optional<vk::ClearValue>& pending, VAddr address) {
+    using namespace Core::NativeDevice;
+    if (old_clear == pending.has_value()) {
+        NoteClearNative(old_clear ? FastAuditBothClear : FastAuditNeither);
+        if (old_clear && std::memcmp(old_value.color.uint32.data(), pending->color.uint32.data(), 16) != 0) {
+            NoteClearNative(FastAuditValueDiffers);
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(Render_Vulkan, "B11 fast clear audit at {:#x}: old value {:#x} {:#x} {:#x} {:#x}, engine {:#x} {:#x} {:#x} {:#x}", address, old_value.color.uint32[0],
+                            old_value.color.uint32[1], old_value.color.uint32[2], old_value.color.uint32[3], pending->color.uint32[0], pending->color.uint32[1],
+                            pending->color.uint32[2], pending->color.uint32[3]);
+            }
+        }
+        return;
+    }
+    NoteClearNative(old_clear ? FastAuditOldOnly : FastAuditPendingOnly);
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_WARNING(Render_Vulkan, "B11 fast clear audit at {:#x}: old path {}, pending engine clear {}", address, old_clear, pending.has_value());
+    }
 }
 
 void Rasterizer::EngineObjectDeleted(u64 id, VAddr address, u64 bytes, u32 what) {
@@ -1161,6 +1212,23 @@ void Rasterizer::EliminateFastClear(const DrawInputs& inputs, const AmdGpu::CbDb
     VideoCore::TextureCache::ImageDesc desc(col_buf, cb0);
     const auto image_id = texture_cache.FindImage(desc);
     const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
+    if (B11FastMode() == 3 && !engine_clear_on) {
+        auto& image = texture_cache.GetImage(image_id);
+        AuditFastClear(texture_cache.IsMetaCleared(col_buf.CmaskAddress(), col_buf.view.slice_start), LiverpoolToVK::ColorBufferClearValue(col_buf), image.pending_fast_clear,
+                       col_buf.Address());
+        image.pending_fast_clear.reset();
+    }
+    if (auto& image = texture_cache.GetImage(image_id); image.pending_fast_clear && !engine_clear_on) {
+        // B11 step 5: the engine fast clear pending on the image is written now (the eliminate is where the console writes it into the memory)
+        const vk::ClearValue value = *image.pending_fast_clear;
+        image.pending_fast_clear.reset();
+        for (u32 slice = col_buf.view.slice_start; slice <= col_buf.view.slice_max; ++slice) {
+            texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
+        }
+        Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeFastClearAtEliminate);
+        runtime.ClearImage(&image, desc.view_info.range, value);
+        return;
+    }
     if (!texture_cache.IsMetaCleared(col_buf.CmaskAddress(), col_buf.view.slice_start)) {
         Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseFastClearEliminateNothing, engine_clear_on);
         return;
@@ -4132,8 +4200,20 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         const auto mip = image_view.info.range.base.level;
 
         const auto& col_buf = regs.color_buffers[cb];
-        const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
+        bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
         texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
+        // B11 step 5: an engine fast clear pending on the image is the render pass's clear (its value is the engine's)
+        std::optional<vk::ClearValue> engine_clear_value;
+        if (B11FastMode() == 3) {
+            AuditFastClear(is_clear, LiverpoolToVK::ColorBufferClearValue(col_buf), image->pending_fast_clear, col_buf.Address());
+            image->pending_fast_clear.reset();
+        }
+        if (image->pending_fast_clear) {
+            engine_clear_value = image->pending_fast_clear;
+            image->pending_fast_clear.reset();
+            is_clear = true;
+            Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeFastClearAtRenderPass);
+        }
 
         if (image->binding.is_bound) {
             ASSERT_MSG(!image->binding.force_general,
@@ -4161,7 +4241,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
 
         const auto clear_value =
-            is_clear ? LiverpoolToVK::ColorBufferClearValue(col_buf) : vk::ClearValue{};
+            engine_clear_value ? *engine_clear_value : is_clear ? LiverpoolToVK::ColorBufferClearValue(col_buf) : vk::ClearValue{};
         auto& attachment = state.color_attachments[cb];
         attachment.image_view = *image_view.image_view;
         attachment.image_layout = runtime.CurrentLayout(*image);

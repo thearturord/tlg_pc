@@ -158,6 +158,9 @@ public:
     u64 ring_hash{}; ///< dark frame fix: an image inside the frame ring, hash of its guest bytes when last checked or uploaded (0: none)
     u64 b8_hash{};  ///< B8.1 verify: hash of the guest bytes at the last CPU refresh (0: none)
     u64 b8_listed_by{}; ///< B8.4 diagnosis: the engine texture whose list took the image last (bit 63: as an answer)
+    /// B11 step 5: an engine color fast clear not applied yet (the console wrote only the CMASK): applied as the render pass's clear when the image is next a
+    /// render target, or by the fast clear eliminate; until then the memory (and a texture read of it) keeps the old pixels
+    std::optional<vk::ClearValue> pending_fast_clear;
     u8 b8_marks{};  ///< B8.1: what dirtied the image since its last refresh (1 a write fault, 2 an announcement), 4 a change found without one, still owed
     u64 lru_id{};
     u64 tick_accessed_last{};

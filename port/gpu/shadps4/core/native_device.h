@@ -122,7 +122,7 @@ void NoteClearEntered(const ClearRecord& clear, const u32 (&entries)[4]);
 /// B11 step 3 (`TLG_B11_CLEARS=1`): the engine's clear runs as a Vulkan clear of the target's images at its place in the stream; the work inside its packets
 /// (the meta fill, the fast clear eliminate, the depth target clear, its draws and dispatches) is skipped
 [[nodiscard]] bool B11ClearsOn() noexcept;
-enum ClearNative : u32 { NativeDone, NativeImages, NativeNotEligible, NativeNoImage, NativeSkippedWork, NativeFastClearKept, NativeSubresource, ClearNatives };
+enum ClearNative : u32 { NativeDone, NativeImages, NativeNotEligible, NativeNoImage, NativeSkippedWork, NativeFastClearKept, NativeSubresource, NativeFastClearPending, NativeFastClearAtRenderPass, NativeFastClearAtEliminate, FastAuditBothClear, FastAuditNeither, FastAuditOldOnly, FastAuditPendingOnly, FastAuditValueDiffers, NativeClearBeforeImage, NativeClearAtFirstImage, NativeClearFirstImageMismatch, ClearNatives };
 void NoteClearNative(ClearNative what, u64 n = 1);
 
 } // namespace Core::NativeDevice
