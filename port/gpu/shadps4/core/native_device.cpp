@@ -69,20 +69,20 @@ bool ReadResourceObject(u64 object, Object& out) {
     switch (kind) {
     case 1: // ByteWidth, Usage, BindFlags, CPUAccessFlags, MiscFlags, StructureByteStride
         out.kind = Kind::Buffer;
-        out.width = d(0), out.usage = d(1), out.bind = d(2), out.misc = d(4);
+        out.width = d(0), out.usage = d(1), out.bind = d(2), out.cpu_access = d(3), out.misc = d(4);
         out.bytes = out.width;
         break;
     case 2: // Width, MipLevels, ArraySize, Format, Usage, BindFlags
         out.kind = Kind::Texture1D;
-        out.width = d(0), out.height = 1, out.depth = 1, out.mips = d(1), out.layers = d(2), out.format = d(3), out.usage = d(4), out.bind = d(5);
+        out.width = d(0), out.height = 1, out.depth = 1, out.mips = d(1), out.layers = d(2), out.format = d(3), out.usage = d(4), out.bind = d(5), out.cpu_access = d(6);
         break;
     case 3: // Width, Height, MipLevels, ArraySize, Format, SampleCount, SampleQuality, Usage, BindFlags
         out.kind = Kind::Texture2D;
-        out.width = d(0), out.height = d(1), out.depth = 1, out.mips = d(2), out.layers = d(3), out.format = d(4), out.usage = d(7), out.bind = d(8);
+        out.width = d(0), out.height = d(1), out.depth = 1, out.mips = d(2), out.layers = d(3), out.format = d(4), out.usage = d(7), out.bind = d(8), out.cpu_access = d(9);
         break;
     case 4: // Width, Height, Depth, MipLevels, Format, Usage, BindFlags
         out.kind = Kind::Texture3D;
-        out.width = d(0), out.height = d(1), out.depth = d(2), out.mips = d(3), out.layers = 1, out.format = d(4), out.usage = d(5), out.bind = d(6);
+        out.width = d(0), out.height = d(1), out.depth = d(2), out.mips = d(3), out.layers = 1, out.format = d(4), out.usage = d(5), out.bind = d(6), out.cpu_access = d(7);
         break;
     default:
         return false;
@@ -222,6 +222,26 @@ bool ResourceAt(VAddr address, Object& out) {
     return false;
 }
 
+bool B6NativeOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_B6_NATIVE");
+        return e != nullptr && *e == '1';
+    }();
+    return on;
+}
+
+u32 CpuReadReason(VAddr address, u64 size) {
+    Object o;
+    if (!ResourceAt(address, o) || address + size > o.address + std::max<u64>(o.bytes, 1)) {
+        return 2; // not (wholly) an engine resource: kept
+    }
+    return o.usage == 3 || (o.cpu_access & 0x20000) != 0 ? 1u : 0u;
+}
+
+bool CpuReads(VAddr address, u64 size) {
+    return CpuReadReason(address, size) != 0;
+}
+
 std::string OwnerName(VAddr address) {
     Object o;
     if (!ResourceAt(address, o)) {
@@ -280,6 +300,27 @@ void CheckBuffer(u64 id, VAddr address, u64 size) {
     }
 }
 
+namespace {
+/// [color, depth][0 engine texture with the same size, 1 engine texture of another size (a mip / slice / part), 2 inside an engine texture, 3 an engine buffer, 4 none]
+std::array<std::array<std::atomic<u64>, 5>, 2> target_checks{};
+std::atomic<u32> targets_logged{0};
+} // namespace
+
+void CheckTarget(bool depth, VAddr address, u32 width, u32 height) {
+    if (!Enabled()) {
+        return;
+    }
+    Object o;
+    u32 result = 4;
+    if (ResourceAt(address, o)) {
+        result = o.kind == Kind::Buffer ? 3u : o.address != address ? 2u : (o.width == width && o.height == height) ? 0u : 1u;
+    }
+    target_checks[depth ? 1 : 0][result].fetch_add(1, std::memory_order_relaxed);
+    if (result >= 3 && targets_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_WARNING(Core, "B4 census: {} target {:#x} {}x{} has no engine texture ({})", depth ? "depth" : "color", address, width, height, OwnerName(address));
+    }
+}
+
 nlohmann::json Report() {
     nlohmann::json out;
     out["enabled"] = Enabled();
@@ -298,6 +339,12 @@ nlohmann::json Report() {
     out["buffer_bindings"] = {{"inside_the_object", buffer_checks[0].load()}, {"OUTSIDE_THE_OBJECT", buffer_checks[1].load()}, {"id_not_in_the_table", buffer_checks[2].load()},
                               {"outside_in_the_frame_allocator_by_usage", {outside_by[0][0].load(), outside_by[0][1].load(), outside_by[0][2].load(), outside_by[0][3].load()}},
                               {"outside_elsewhere_by_usage", {outside_by[1][0].load(), outside_by[1][1].load(), outside_by[1][2].load(), outside_by[1][3].load()}}};
+    static constexpr const char* target_names[5] = {"engine_texture_same_size", "engine_texture_other_size", "inside_an_engine_texture", "ENGINE_BUFFER", "NONE"};
+    for (u32 d = 0; d < 2; ++d) {
+        for (u32 r = 0; r < 5; ++r) {
+            out[d ? "depth_targets" : "color_targets"][target_names[r]] = target_checks[d][r].load();
+        }
+    }
     out["note"] = "B1 native device table (cumulative); bindings: the texture cache's / buffer cache's answer against the engine object the record names";
     return out;
 }

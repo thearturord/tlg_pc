@@ -34,6 +34,7 @@ struct Object {
     Kind kind{};
     bool alive{};
     u32 usage{}, bind{}, misc{}, format{};
+    u32 cpu_access{}; ///< D3D11 CPUAccessFlags (0x10000 write, 0x20000 read)
     u32 width{}, height{}, depth{}, mips{}, layers{};
     VAddr address{};  ///< resources: the memory (+0x30); views: the memory of their resource
     u64 bytes{};      ///< resources: the size of the memory (+0x38 for textures, ByteWidth for buffers)
@@ -62,6 +63,15 @@ void NoteDelete(u64 object);
 void CheckImage(u64 id, VAddr address, u32 width, u32 height);
 /// ... and a buffer range for a binding whose record names `id`
 void CheckBuffer(u64 id, VAddr address, u64 size);
+/// B6: does the CPU read [address, address + size)? True for memory of a resource the engine created for CPU reads (staging usage or CPU read access) and for memory
+/// no engine resource owns (unknown: kept safe); false for every other engine resource (the GPU's own data)
+[[nodiscard]] bool CpuReads(VAddr address, u64 size);
+/// the same with the reason: 0 an engine resource the CPU does not read, 1 one it reads (staging / CPU read access), 2 no engine resource owns the range
+[[nodiscard]] u32 CpuReadReason(VAddr address, u64 size);
+/// B6 switch (`TLG_B6_NATIVE=1`): results go back into PS4 memory only where the CPU reads them
+[[nodiscard]] bool B6NativeOn() noexcept;
+/// B4 census: a color (`depth` false) or depth target the draw renders into, at `address` of `width` x `height`
+void CheckTarget(bool depth, VAddr address, u32 width, u32 height);
 
 [[nodiscard]] nlohmann::json Report();
 

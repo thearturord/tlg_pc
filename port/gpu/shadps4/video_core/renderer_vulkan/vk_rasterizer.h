@@ -552,6 +552,23 @@ private:
         VideoCore::TextureCache::ImageDesc desc;
     };
     std::array<CachedTextureLookup, 8192> texture_lookup_cache{}; ///< L1(b): 8192 entries (was 512: 37k collision misses in 90 s)
+    /// B3: the image of each engine object (by id and use), raster thread
+    struct NativeImage {
+        bool valid{};
+        u64 id{};
+        u64 flags{};
+        u32 index{};
+        std::array<u8, 32> tsharp{};
+        VideoCore::ImageId image_id{};
+        u64 image_uid{};
+        VideoCore::TextureCache::ImageDesc desc;
+    };
+    std::unordered_map<u64, NativeImage> native_images;
+public:
+    std::array<std::atomic<u64>, 5> b6_downloads{}; ///< B6: copy results downloaded into PS4 memory / left on the GPU (no CPU reader)
+    std::atomic<u64> b5_copies_on_gpu{0}, b5_copies_on_cpu{0}; ///< B5: guest copies run on the GPU / as a CPU copy in PS4 memory
+    std::array<std::atomic<u64>, 5> b3_stats{}; ///< B3 image bindings: 0 by id, 1 first sight, 2 the object's image changed; verify 3 same image, 4 other image
+private:
     const bool rt_reuse_enabled;
     bool RtReuseOn() const {
         const s32 override_mode = VideoCore::ReadbackPolicy::Get().rt_reuse_override.load(std::memory_order_relaxed);

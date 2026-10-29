@@ -553,6 +553,15 @@ u32 Rasterizer::FlatReadExtra(const Shader::Info& stage) const {
            (binder_plan != nullptr ? std::min<u32>(binder_plan->binding_count, 255u) << 8 : 0u) | (draw_class_now << 24) | (draw_has_plan ? 16u : 0u);
 }
 
+/// B3 (`TLG_B3_IMAGES=0` turns it off): image bindings by the engine object's id
+static bool B3ImagesOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_B3_IMAGES");
+        return e == nullptr || *e != '0';
+    }();
+    return on;
+}
+
 static bool TextureIdsOn() {
     static const bool on = [] {
         const char* e = std::getenv("TLG_TEXTURE_IDS");
@@ -3374,7 +3383,34 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             if (native_reuse && cached.valid && cached.key == key && !same_generation && !by_id && TextureIdsOn()) {
                 g_identity_audit.texture_id_refused.fetch_add(1, std::memory_order_relaxed);
             }
-            if (same_generation || by_id) {
+            // B3: the image of an engine object is found by the object's id (and the binding's use), not by its address; the T# the record holds for the object is the
+            // guard that the object still describes the same image
+            NativeImage* native_entry = nullptr;
+            bool native_hit = false;
+            if (B3ImagesOn() && image_from_record && image_engine_id != 0) {
+                native_entry = &native_images[(image_engine_id << 8) ^ (key[4] * 0x9E3779B97F4A7C15ull) ^ i];
+                native_hit = native_entry->valid && native_entry->id == image_engine_id && native_entry->flags == key[4] && native_entry->index == i &&
+                             std::memcmp(native_entry->tsharp.data(), &tsharp, sizeof(AmdGpu::Image)) == 0 && texture_cache.ImageUid(native_entry->image_id) == native_entry->image_uid &&
+                             True(texture_cache.GetImage(native_entry->image_id).flags & VideoCore::ImageFlagBits::Registered);
+                b3_stats[native_hit ? 0 : native_entry->valid ? 2 : 1].fetch_add(1, std::memory_order_relaxed);
+            }
+            if (native_hit) {
+                std::construct_at(&desc, native_entry->desc);
+                image_id = native_entry->image_id;
+                texture_cache.TouchFoundImage(image_id);
+                static const u32 b3_verify = [] {
+                    const char* e = std::getenv("TLG_B3_VERIFY");
+                    return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 0u;
+                }();
+                static thread_local u64 b3_counter = 0;
+                if (b3_verify != 0 && ++b3_counter % b3_verify == 0) {
+                    // verify: the lookup by address finds the same image
+                    VideoCore::TextureCache::ImageDesc check(tsharp, image_desc);
+                    finish_desc(check);
+                    const VideoCore::ImageId found = texture_cache.FindImage(check);
+                    b3_stats[found == image_id ? 3 : 4].fetch_add(1, std::memory_order_relaxed);
+                }
+            } else if (same_generation || by_id) {
                 Census(census_base + CImageLookupHit);
                 std::construct_at(&desc, cached.desc);
                 image_id = cached.image_id;
@@ -3425,6 +3461,16 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     cached.key = key;
                     cached.desc = desc;
                 }
+            }
+            if (native_entry != nullptr && !native_hit && image_id) {
+                native_entry->valid = true;
+                native_entry->id = image_engine_id;
+                native_entry->flags = key[4];
+                native_entry->index = i;
+                std::memcpy(native_entry->tsharp.data(), &tsharp, sizeof(AmdGpu::Image));
+                native_entry->image_id = image_id;
+                native_entry->image_uid = texture_cache.ImageUid(image_id);
+                native_entry->desc = desc;
             }
             if (set_record) {
                 set_found[num_images - 1] = image_id;
@@ -3760,6 +3806,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         }
         texture_cache.UpdateImage(image_id);
         runtime.SetBackingSamples(image, key.color_samples[cb]);
+        Core::NativeDevice::CheckTarget(false, image->info.guest_address, image->info.size.width, image->info.size.height); // B4 census
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
@@ -3812,6 +3859,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
         auto& image = texture_cache.GetImage(image_id);
+        Core::NativeDevice::CheckTarget(true, image.info.guest_address, image.info.size.width, image.info.size.height); // B4 census
 
         const auto slice = image_view.info.range.base.layer;
         const bool is_depth_clear =
@@ -4583,7 +4631,14 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     if (!dst_gds && !src_gds && Core::NativeResources::ImageCopyEnabled() && TryCopyImages(dst, src, num_bytes)) {
         return;
     }
-    if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
+    // B5 (`TLG_B5_GPU_COPIES=1`): every copy runs on the GPU between the two ranges; the CPU copy inside PS4 memory below was the emulation of the console's DMA
+    static const bool b5_gpu_copies = [] {
+        const char* e = std::getenv("TLG_B5_GPU_COPIES");
+        return e != nullptr && *e == '1';
+    }();
+    if (b5_gpu_copies) {
+        b5_copies_on_gpu.fetch_add(1, std::memory_order_relaxed);
+    } else if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory. The destination is
@@ -4594,6 +4649,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             InvalidateMemory(dst, num_bytes, false);
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             buffer_cache.NoteCpGuestWrite(dst, num_bytes);
+            b5_copies_on_cpu.fetch_add(1, std::memory_order_relaxed);
             return;
         }
     }
@@ -4627,7 +4683,14 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     };
     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
     if (!dst_gds && VideoCore::ReadbackPolicy::Get().dma_async.load(std::memory_order_relaxed)) {
-        buffer_cache.RecordDmaDownload(dst_buffer, dst, num_bytes, explicit_readback);
+        // B6: only where the CPU reads the result (an explicit readback, a resource the engine made for CPU reads, or memory no engine resource owns)
+        const u32 reason = explicit_readback ? 3u : Core::NativeDevice::CpuReadReason(dst, num_bytes);
+        if (!Core::NativeDevice::B6NativeOn() || reason != 0) {
+            buffer_cache.RecordDmaDownload(dst_buffer, dst, num_bytes, explicit_readback);
+            b6_downloads[reason == 0 ? 0 : reason + 1].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            b6_downloads[1].fetch_add(1, std::memory_order_relaxed);
+        }
     }
     ++recorded_work;
 }
