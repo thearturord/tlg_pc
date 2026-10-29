@@ -134,6 +134,10 @@ enum B8Count : u32 {
     B8Adopted,                  ///< B8.4: an older image a page table lookup gave out for the first time (native mode: refreshed from memory, its announcements may have been missed)
     B8AdoptedGpu,               ///< ... the GPU wrote it: kept
     B8CreatedTextures,          ///< B8.4: engine texture creations carried out
+    B8FirstByEngine,            ///< B8.4 step 3: a first lookup whose candidate images came from the engine textures covering the memory
+    B8FirstFallback,            ///< ... the memory is not covered by engine textures (page table)
+    B8FirstMissedListed,        ///< ... audit: a candidate the page table finds, a lookup gave out, and the engine textures' lists lack (must stay 0)
+    B8FirstStaleLeft,           ///< ... audit: an older image no lookup gave out since (native mode leaves it out: the new image does not reuse a stale one)
     B8CreatedUnlisted,          ///< ... older images in the new texture's memory, unlisted (refreshed when a lookup gives them out again)
     B8RouteCopy,                ///< B8.4: copies whose image was found through the engine texture at the address
     B8RouteCopyFallback,        ///< ... no engine texture starts at the address (page table)

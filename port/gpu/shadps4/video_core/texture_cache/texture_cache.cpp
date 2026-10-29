@@ -980,8 +980,52 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     };
 
     SmallVector<ImageId, 8> image_ids;
-    ForEachImageInRegion(info.guest_address, info.guest_size,
-                         [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+    // B8.4 step 3: the candidates of an engine texture's first lookup are the images the engine textures covering its memory hold (their lists), not the page table's
+    bool candidates_by_engine = false;
+    SmallVector<ImageId, 8> engine_candidates;
+    bool covered = false;
+    if (b8_find != 0 && owner_id != 0) {
+        static thread_local std::vector<u64> ids;
+        ids.clear();
+        covered = Core::NativeDevice::TexturesIn(info.guest_address, info.guest_size, ids);
+        if (covered) {
+            EngineImagesIn(ids, info.guest_address, info.guest_size, engine_candidates);
+            // the page table's order (by the first page of the image in the range, then age), which overlap resolution depends on
+            const u64 first_page = info.guest_address >> Traits::PAGE_BITS;
+            std::sort(engine_candidates.begin(), engine_candidates.end(), [&](ImageId a, ImageId b) {
+                const Image& ia = slot_images[a];
+                const Image& ib = slot_images[b];
+                const u64 pa = std::max(first_page, ia.info.guest_address >> Traits::PAGE_BITS);
+                const u64 pb = std::max(first_page, ib.info.guest_address >> Traits::PAGE_BITS);
+                return pa != pb ? pa < pb : ia.image_uid < ib.image_uid;
+            });
+            candidates_by_engine = b8_find == 2;
+        }
+        Core::NativeUpdates::NoteB8(covered ? Core::NativeUpdates::B8FirstByEngine : Core::NativeUpdates::B8FirstFallback);
+    }
+    if (candidates_by_engine) {
+        image_ids = engine_candidates;
+    } else {
+        ForEachImageInRegion(info.guest_address, info.guest_size,
+                             [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+        if (covered) {
+            // audit: the page table's candidates against the engine textures'
+            for (const ImageId image_id : image_ids) {
+                if (std::ranges::find(engine_candidates, image_id) != engine_candidates.end()) {
+                    continue;
+                }
+                const Image& image = slot_images[image_id];
+                const bool listed = (image.b8_marks & B8Listed) != 0;
+                Core::NativeUpdates::NoteB8(listed ? Core::NativeUpdates::B8FirstMissedListed : Core::NativeUpdates::B8FirstStaleLeft);
+                static std::atomic<u32> logged{0};
+                if (listed && logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+                    LOG_WARNING(Render_Vulkan, "B8.4 step 3 audit: engine texture {} at {:#x}+{:#x}: candidate {:#x}+{:#x} ({}x{} uid {}) is in no covering texture's list (listed by {:#x})",
+                                owner_id, info.guest_address, info.guest_size, image.info.guest_address, image.info.guest_size, image.info.size.width,
+                                image.info.size.height, image.image_uid, image.b8_listed_by);
+                }
+            }
+        }
+    }
     if (owner_id != 0) {
         Core::NativeUpdates::NoteB8(image_ids.empty() ? Core::NativeUpdates::B8FirstNoOverlap : Core::NativeUpdates::B8FirstOverlap);
     }

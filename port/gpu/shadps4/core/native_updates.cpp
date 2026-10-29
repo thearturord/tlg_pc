@@ -509,7 +509,9 @@ nlohmann::json B8Report() {
             {"route", {{"announcements_by_engine_textures", c(B8RouteAnnounce)}, {"announcements_page_table", c(B8RouteAnnounceFallback)},
                        {"audit_images_missed_not_looked_up", c(B8RouteMissed)}, {"AUDIT_IMAGES_MISSED_LISTED", c(B8RouteMissedListed)},
                        {"images_adopted", c(B8Adopted)}, {"images_adopted_gpu_written", c(B8AdoptedGpu)},
-                       {"textures_created", c(B8CreatedTextures)}, {"older_images_unlisted_at_creation", c(B8CreatedUnlisted)}, {"copies_by_engine_texture", c(B8RouteCopy)}, {"copies_page_table", c(B8RouteCopyFallback)},
+                       {"textures_created", c(B8CreatedTextures)}, {"older_images_unlisted_at_creation", c(B8CreatedUnlisted)},
+                       {"first_lookups_by_engine_textures", c(B8FirstByEngine)}, {"first_lookups_page_table", c(B8FirstFallback)},
+                       {"AUDIT_FIRST_CANDIDATE_MISSED", c(B8FirstMissedListed)}, {"audit_first_stale_left_out", c(B8FirstStaleLeft)}, {"copies_by_engine_texture", c(B8RouteCopy)}, {"copies_page_table", c(B8RouteCopyFallback)},
                        {"AUDIT_COPY_OTHER", c(B8RouteCopyOther)}}},
             {"note", "B8.1, cumulative: images refreshed by the engine's announcements instead of write faults"}};
 }
