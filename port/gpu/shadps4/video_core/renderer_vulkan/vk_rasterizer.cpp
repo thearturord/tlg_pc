@@ -14,6 +14,7 @@
 #include "core/guest_hooks.h"
 #include "core/native_draw.h"
 #include "core/native_light_recorder.h"
+#include "video_core/untracked_ring.h"
 #include "core/native_write_watch.h"
 #include "core/native_audit.h"
 #include "core/native_readbacks.h"
@@ -3748,6 +3749,25 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             auto* image = &texture_cache.GetImage(image_id);
             if (image_from_record && i == 0) {
                 Core::NativeDevice::CheckImage(image_engine_id, image->info.guest_address, image->info.size.width, image->info.size.height); // B1 shadow check
+            }
+            {
+                // Dark / bright frame check (2026-10-29): a sampled texture served by a cache image of another address or size than the texture asked for (an overlap resolved
+                // into a view of a bigger image). Inside the frame ring this is how a new small dynamic texture (the R32F 4x4 / 16x16 the CPU writes every frame) can be read
+                // from an old image after the ring wrapped. Counted always, logged for the frame ring and the first other cases.
+                const bool other_image = image->info.guest_address != desc.info.guest_address || image->info.size.width != desc.info.size.width ||
+                                         image->info.size.height != desc.info.size.height;
+                if (other_image && !image_desc.is_written) {
+                    const auto& ring = VideoCore::UntrackedRing::Get();
+                    const bool in_ring = ring.Active() && desc.info.guest_address >= ring.Start() && desc.info.guest_address < ring.End();
+                    static std::atomic<u64> served_other{0}, served_other_ring{0};
+                    const u64 n = (in_ring ? served_other_ring : served_other).fetch_add(1, std::memory_order_relaxed) + 1;
+                    if ((in_ring && (n <= 40 || (n & (n - 1)) == 0)) || (!in_ring && n <= 10)) {
+                        LOG_WARNING(Render_Vulkan, "texture served by another image ({} {}): asked {:#x} {}x{} format {}, got image {:#x} {}x{} format {} view level {} layer {}, present {}, program {:#x}, caller {:#x}",
+                                    in_ring ? "frame ring" : "other", n, desc.info.guest_address, desc.info.size.width, desc.info.size.height, static_cast<u32>(desc.info.pixel_format), image->info.guest_address,
+                                    image->info.size.width, image->info.size.height, static_cast<u32>(image->info.pixel_format), desc.view_info.range.base.level, desc.view_info.range.base.layer,
+                                    Core::DebugServer::PresentCount(), stage.pgm_hash, binder_plan != nullptr ? Core::NativeDraw::RecordCallerGhidra(binder_plan->native_seq) : 0);
+                    }
+                }
             }
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
