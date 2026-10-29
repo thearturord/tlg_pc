@@ -44,6 +44,12 @@ bool SupersedeEnabled();
 /// in milliseconds (bits 16 and up); ~0 when no announcement covers it (the window ring keeps the last 4096).
 u32 WhoWrote(u64 address, u64 size);
 
+/// B2 gate (`TLG_B2_AUDIT=1`): every page the write watch finds written is checked against the pages an announcement covered since the page's last harvest.
+/// The pages of an announcement are marked (a direct mapped table of 1 M pages); a harvested page with no mark is a CPU write no engine update explains.
+[[nodiscard]] bool HarvestAuditOn() noexcept;
+void NoteHarvested(u64 address, u64 bytes, bool in_upload_ring);
+[[nodiscard]] nlohmann::json HarvestAuditReport();
+
 nlohmann::json Report();
 
 } // namespace Core::NativeUpdates

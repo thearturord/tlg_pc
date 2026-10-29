@@ -16,6 +16,7 @@
 #include "core/native_audit.h"
 #include "core/native_readbacks.h"
 #include "core/native_registry.h"
+#include "core/native_updates.h"
 #include "core/native_resources.h"
 #include "core/resource_audit.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -147,16 +148,30 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
     });
 }
 
+namespace {
+thread_local VAddr t_audit_begin = 0, t_audit_end = 0; ///< B2 audit: the range of the current harvest request
+} // namespace
+
 void BufferCache::HarvestWriteWatch(VAddr device_addr, u64 size, bool image) {
     if (!Core::WriteWatch::Enabled()) {
         return;
     }
+    t_audit_begin = device_addr;
+    t_audit_end = device_addr + size;
     // what the write fault did for these pages (Rasterizer::InvalidateMemory, buffer side; readbacks are off whenever the
     // protection is lifted, so the invalidation is the CPU mark); a page an image watches is still protected and faulted already
     Core::WriteWatch::Harvest(
         device_addr, size,
         [](void* context, VAddr page, u64 bytes) {
             auto* self = static_cast<BufferCache*>(context);
+            if (Core::NativeUpdates::HarvestAuditOn()) {
+                // only the part the GPU asked for (the harvest covers whole blocks)
+                const VAddr a = std::max<VAddr>(page, t_audit_begin), b = std::min<VAddr>(page + bytes, t_audit_end);
+                if (a < b) {
+                    const auto [lo, hi] = UntrackedRing::Get().Clip(a, b - a);
+                    Core::NativeUpdates::NoteHarvested(a, b - a, lo < hi);
+                }
+            }
             Core::NativeResources::NoteCpuWrite(page, bytes);
             self->memory_tracker->MarkRegionAsCpuModified(page, bytes);
             if (Core::WriteWatch::LiftImages()) {

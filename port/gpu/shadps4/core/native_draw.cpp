@@ -8066,7 +8066,15 @@ u64 PS4_SYSV_ABI TextureUpdateSubresource(u64 context, u64 resource, u64 subreso
     }
     Guarded([&]() -> u64 {
         if (Rd<u32>(resource, 0x124) == 1) {
-            return 0; // a buffer: through the frame ring
+            // a buffer: a constant buffer gets a new version in the frame ring; other default buffers (shader resource / unordered access) are written in their
+            // own memory (B2 audit, 2026-10-29): that memory is announced (writer 5, like the initial data of a buffer)
+            const u64 memory = Rd<u64>(resource, 0x30);
+            const u32 width = Rd<u32>(resource, 0x180);
+            const u32 bind = Rd<u32>(resource, 0x188);
+            if ((bind & 0x4) == 0 && Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && memory != 0 && width != 0 && width < (1u << 30)) {
+                Core::NativeUpdates::NoteWriterRange(5, memory, width);
+            }
+            return 0;
         }
         const u64 memory = Rd<u64>(resource, 0x30);
         const u64 size = Rd<u64>(resource, 0x38);

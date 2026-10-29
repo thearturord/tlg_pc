@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <string>
 
 #include <nlohmann/json.hpp>
 
@@ -52,6 +53,10 @@ void NoteDelete(u64 object);
 
 /// The live object of an id, copied (false: unknown or deleted)
 [[nodiscard]] bool Lookup(u64 id, Object& out);
+/// The live resource (buffer or texture) whose memory holds `address`, copied (false: none)
+[[nodiscard]] bool ResourceAt(VAddr address, Object& out);
+/// A short name of what owns `address` (for audits): "buffer usage U bind B", "texture_2d usage U bind B", "none"
+[[nodiscard]] std::string OwnerName(VAddr address);
 
 /// B1 shadow check: the texture cache bound an image at `address` of `width` x `height` for a binding whose record names engine object `id`
 void CheckImage(u64 id, VAddr address, u32 width, u32 height);

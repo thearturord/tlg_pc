@@ -5,6 +5,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <map>
+#include <memory>
+#include <string>
+#include <unordered_map>
 #include <mutex>
 #include <thread>
 #include <tuple>
@@ -18,6 +21,7 @@
 #include "core/native_registry.h"
 #include "core/native_resources.h"
 #include "core/native_uploads.h"
+#include "core/native_device.h"
 #include "core/native_updates.h"
 
 namespace Core::NativeUpdates {
@@ -240,9 +244,88 @@ void NoteWriterRange(u32 writer, u64 address, u64 size) {
     NoteWriterRangeOf(writer, address, size, ThreadKey());
 }
 
+namespace {
+constexpr u64 MarkSlots = u64{1} << 20;
+std::unique_ptr<std::atomic<u64>[]> page_marks;
+std::once_flag page_marks_once;
+std::array<std::atomic<u64>, 2> harvested_ring{}, harvested_other{}; // [announced, unannounced]
+std::array<std::atomic<u64>, 64> unannounced_by_class{};
+std::mutex owner_mutex;
+std::unordered_map<std::string, u64> unannounced_by_owner;
+std::atomic<u32> unannounced_logged{0};
+std::atomic<u64>* MarkOf(u64 page) {
+    std::call_once(page_marks_once, [] { page_marks = std::make_unique<std::atomic<u64>[]>(MarkSlots); });
+    return &page_marks[((page >> 12) * 0x9E3779B97F4A7C15ull >> 40) & (MarkSlots - 1)];
+}
+void MarkAnnounced(u64 address, u64 size) {
+    for (u64 page = address & ~u64{4095}; page < address + size; page += 4096) {
+        MarkOf(page)->store(page | 1, std::memory_order_relaxed);
+    }
+}
+} // namespace
+
+bool HarvestAuditOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_B2_AUDIT");
+        return e != nullptr && *e == '1';
+    }();
+    return on;
+}
+
+void NoteHarvested(u64 address, u64 bytes, bool in_upload_ring) {
+    for (u64 page = address & ~u64{4095}; page < address + bytes; page += 4096) {
+        const bool announced = MarkOf(page)->exchange(0, std::memory_order_relaxed) == (page | 1);
+        (in_upload_ring ? harvested_ring : harvested_other)[announced ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+        if (!announced && !in_upload_ring) {
+            const std::string owner = NativeDevice::OwnerName(page);
+            {
+                std::scoped_lock lock{owner_mutex};
+                ++unannounced_by_owner[owner];
+            }
+            static std::atomic<u32> none_logged{0};
+            if (owner == "none" ? none_logged.fetch_add(1, std::memory_order_relaxed) < 24 : unannounced_logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(Core, "B2 audit: page {:#x} written with no announcement ({}; {}; usage class {})", page, owner, NativeResources::DescribeAddress(page),
+                            NativeResources::UsageClassNameOf(NativeResources::UsageClassOf(page)));
+            }
+        }
+    }
+}
+
+nlohmann::json HarvestAuditReport() {
+    nlohmann::json j;
+    j["enabled"] = HarvestAuditOn();
+    j["upload_ring_pages"] = {{"announced", harvested_ring[0].load()}, {"UNANNOUNCED", harvested_ring[1].load()}};
+    j["other_pages"] = {{"announced", harvested_other[0].load()}, {"UNANNOUNCED", harvested_other[1].load()}};
+    nlohmann::json by_class = nlohmann::json::object();
+    for (u32 c = 0; c < 64; ++c) {
+        if (const u64 n = unannounced_by_class[c].load()) {
+            by_class[NativeResources::UsageClassNameOf(c)] = n;
+        }
+    }
+    j["unannounced_other_pages_by_memory_class"] = std::move(by_class);
+    {
+        std::scoped_lock lock{owner_mutex};
+        std::vector<std::pair<u64, std::string>> rows;
+        for (const auto& [name, n] : unannounced_by_owner) {
+            rows.emplace_back(n, name);
+        }
+        std::sort(rows.rbegin(), rows.rend());
+        nlohmann::json owners = nlohmann::json::object();
+        for (size_t i = 0; i < rows.size() && i < 24; ++i) {
+            owners[rows[i].second] = rows[i].first;
+        }
+        j["unannounced_other_pages_by_owner"] = std::move(owners);
+    }
+    j["note"] = "B2 gate: pages the write watch found written, against the engine's announced updates since their last harvest (cumulative)";
+    return j;
+}
+
 void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread) {
     if (address == 0 || size == 0) {
         return;
+    }
+    if (HarvestAuditOn()) {
+        MarkAnnounced(address, size);
     }
     NativeResources::NoteAnnouncedWrite(address, size); // C1: resident buffers on those pages are not synchronized any more
     if (AuditFaults()) {

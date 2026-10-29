@@ -4,7 +4,9 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 
 #include "common/logging/log.h"
@@ -28,6 +30,7 @@ T Rd(u64 base, u64 offset) {
 std::shared_mutex table_mutex;
 std::unordered_map<u64, Object> by_id;
 std::unordered_map<u64, u64> id_by_object;
+std::map<VAddr, u64> resource_by_address; ///< live resources by their memory (address -> id)
 
 std::atomic<u64> resources_noted{0}, views_noted{0}, deletes_noted{0}, deletes_unknown{0}, bad_reads{0};
 std::array<std::atomic<u64>, 9> live_by_kind{};
@@ -101,6 +104,9 @@ void Insert(const Object& object) {
     }
     by_id[object.id] = object;
     id_by_object[object.object] = object.id;
+    if (object.kind >= Kind::Buffer && object.kind <= Kind::Texture3D && object.address != 0) {
+        resource_by_address[object.address] = object.id;
+    }
     live_by_kind[static_cast<u32>(object.kind)].fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -197,6 +203,31 @@ void NoteDelete(u64 object) {
         live_by_kind[static_cast<u32>(entry->second.kind)].fetch_sub(1, std::memory_order_relaxed);
     }
     id_by_object.erase(it);
+}
+
+bool ResourceAt(VAddr address, Object& out) {
+    std::shared_lock lock{table_mutex};
+    auto it = resource_by_address.upper_bound(address);
+    while (it != resource_by_address.begin()) {
+        --it;
+        const auto entry = by_id.find(it->second);
+        if (entry != by_id.end() && entry->second.alive && address < entry->second.address + std::max<u64>(entry->second.bytes, 1)) {
+            out = entry->second;
+            return true;
+        }
+        if (entry != by_id.end() && entry->second.alive) {
+            return false; // the nearest live resource below ends before the address
+        }
+    }
+    return false;
+}
+
+std::string OwnerName(VAddr address) {
+    Object o;
+    if (!ResourceAt(address, o)) {
+        return "none";
+    }
+    return fmt::format("{} usage {} bind {:#x}", KindName(o.kind), o.usage, o.bind);
 }
 
 bool Lookup(u64 id, Object& out) {
