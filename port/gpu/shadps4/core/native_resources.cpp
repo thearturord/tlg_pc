@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <xxhash.h>
 #include <memory>
@@ -319,8 +320,15 @@ void AddImmutable(const Resource& resource) {
     immutable_epoch.fetch_add(1, std::memory_order_release);
 }
 
+std::map<u64, std::pair<u64, u64>> texture_ranges; ///< B1 census: engine textures by address (end, id)
+
 void AddResource(const Resource& resource) {
     std::lock_guard lock{resource_mutex};
+    if (resource.kind >= 2) {
+        u64 size = 0;
+        SafeRead64(resource.object + 0x38, &size);
+        texture_ranges[resource.address] = {resource.address + (size ? size : 1), resource.id};
+    }
     resources_by_address[resource.address] = resource;
     address_by_object[resource.object] = resource.address;
 }
@@ -669,6 +677,94 @@ void NoteCpuWrite(VAddr address, u64 size) {
         c->cpu_writes.fetch_add(1, std::memory_order_relaxed);
         c->cpu_write_bytes.fetch_add(size, std::memory_order_relaxed);
     }
+}
+
+namespace {
+std::array<std::array<std::atomic<u64>, 6>, 3> image_census{}; // [plain / render target / depth][category]
+std::atomic<u64> image_census_unknown_registry{0};
+std::atomic<u64> texture_census_no_memory{0};
+} // namespace
+
+void NoteImageCensus(VAddr address, u32 width, u32 height, bool render_target, bool depth) {
+    u32 category = 3;
+    {
+        // the textures created since the last call are read now (their fields are set once the initialization returned)
+        std::vector<u64> textures;
+        {
+            std::lock_guard lock{resource_mutex};
+            textures.swap(pending_textures);
+        }
+        static std::vector<u64> later; // objects whose memory was not assigned yet when first read
+        textures.insert(textures.end(), later.begin(), later.end());
+        later.clear();
+        for (const u64 object : textures) {
+            Resource resource;
+            if (ReadResource(object, resource)) {
+                AddResource(resource);
+            } else {
+                u64 id = 0;
+                if (SafeRead64(object + 0x10, &id) && id != 0 && later.size() < 65536) {
+                    static std::unordered_set<u64> logged;
+                    if (logged.size() < 10 && logged.insert(object).second) {
+                        u64 tag = 0, mem = 0, size = 0, kind = 0, d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0;
+                        SafeRead64(object + 0x18, &tag), SafeRead64(object + 0x30, &mem), SafeRead64(object + 0x38, &size), SafeRead64(object + 0x120, &kind);
+                        SafeRead64(object + 0x180, &d0), SafeRead64(object + 0x188, &d1), SafeRead64(object + 0x190, &d2), SafeRead64(object + 0x198, &d3), SafeRead64(object + 0x1a0, &d4);
+                        LOG_WARNING(Core, "B1 census: texture object {:#x} id {} tag {:#x} mem {:#x} size {:#x} kind {:#x} desc {:016x} {:016x} {:016x} {:016x} {:016x}", object, id, tag & 0xffffffff, mem, size,
+                                    kind, d0, d1, d2, d3, d4);
+                    }
+                    later.push_back(object);
+                    texture_census_no_memory.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+    {
+        std::lock_guard lock{resource_mutex};
+        if (const auto it = resources_by_address.find(address); it != resources_by_address.end()) {
+            const Resource& r = it->second;
+            if (r.kind == 1) {
+                category = 2;
+            } else {
+                category = r.width == width && (r.kind == 2 || r.height == height) ? 0 : 1;
+            }
+        } else if (auto t = texture_ranges.upper_bound(address); t != texture_ranges.begin() && std::prev(t)->second.first > address) {
+            category = 4; // inside an engine texture (a mip, a slice, an aliased part)
+        } else {
+            u64 ring_base = 0, ring_size = 0;
+            if (FrameRing(&ring_base, &ring_size) && address >= ring_base && address < ring_base + ring_size) {
+                category = 5; // the frame allocator
+            }
+        }
+    }
+    image_census[depth ? 2 : render_target ? 1 : 0][category].fetch_add(1, std::memory_order_relaxed);
+    if (category == 3) {
+        static std::mutex samples_mutex;
+        static std::unordered_map<u64, u64> seen;
+        std::lock_guard lock{samples_mutex};
+        if (++seen[address] == 1 && seen.size() <= 24) {
+            LOG_WARNING(Core, "B1 census: image {}x{} at {:#x} has no engine resource: {}", width, height, address, DescribeAddress(address));
+        }
+        if (seen.size() == 24 || (seen.size() % 1000) == 0) {
+            static u64 logged_size = 0;
+            if (seen.size() != logged_size) {
+                logged_size = seen.size();
+                LOG_WARNING(Core, "B1 census: {} distinct addresses without an engine resource so far", seen.size());
+            }
+        }
+    }
+}
+
+nlohmann::json ImageCensus() {
+    nlohmann::json out;
+    out["texture_reads_without_memory_yet"] = texture_census_no_memory.load(std::memory_order_relaxed);
+    static constexpr const char* rows[3] = {"textures", "render_targets", "depth"};
+    static constexpr const char* cols[6] = {"engine_texture_same_size", "engine_texture_other_size", "engine_buffer", "no_engine_resource", "inside_an_engine_texture", "frame_allocator"};
+    for (u32 r = 0; r < 3; ++r) {
+        for (u32 c = 0; c < 6; ++c) {
+            out[rows[r]][cols[c]] = image_census[r][c].load(std::memory_order_relaxed);
+        }
+    }
+    return out;
 }
 
 void NoteImageCopy(bool done, u32 reason) {

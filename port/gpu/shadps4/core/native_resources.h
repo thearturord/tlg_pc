@@ -36,6 +36,10 @@ void NoteBufferDestroyed(u64 object);
 void NoteBufferRequest(VAddr address, u32 size, bool written, BufferPath path, u64 uploaded);
 /// An image was (re)uploaded from guest memory.
 void NoteImageUpload(VAddr address, u64 size, bool from_gpu_memory);
+/// B1 census: an image the texture cache registers, against the engine resource at its address (0 engine texture with the same size, 1 engine texture of
+/// another size, 2 engine buffer, 3 no engine resource at that address); `render_target` / `depth`: how the cache made it
+void NoteImageCensus(VAddr address, u32 width, u32 height, bool render_target, bool depth);
+[[nodiscard]] nlohmann::json ImageCensus();
 /// The CPU wrote tracked memory.
 void NoteCpuWrite(VAddr address, u64 size);
 

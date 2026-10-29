@@ -37,6 +37,7 @@
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/gnmdriver/gnmdriver.h"
 #include "core/frame_timeline.h"
+#include "core/native_device.h"
 #include "core/native_draw.h"
 #include "core/native_job_gen.h"
 #include "core/native_site_gen.h"
@@ -7809,6 +7810,7 @@ u64 PS4_SYSV_ABI ResourceBufferCreated(u64 device, u64 description, u64 initial,
     if (out != 0) {
         const u64 created = Guarded([&] { return Rd<u64>(out, 0); });
         NativeResources::NoteBufferObject(created);
+        Guarded([&]() -> u64 { NativeDevice::NoteResource(created); return 0; }); // B1
         NativeRegistry::NoteBufferCreated(created);
         if (NativeUpdates::enabled.load(std::memory_order_relaxed)) {
             // N5b: a buffer created with initial data: the engine copied the data into the new memory before returning (announced after the write).
@@ -8504,6 +8506,21 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "resource_buffer_destroyed") {
         return reinterpret_cast<u64>(&ResourceBufferDestroyed);
+    }
+    if (name == "native_view_srv") {
+        return reinterpret_cast<u64>(&NativeDevice::ViewCreatedSrv);
+    }
+    if (name == "native_view_uav") {
+        return reinterpret_cast<u64>(&NativeDevice::ViewCreatedUav);
+    }
+    if (name == "native_view_rtv") {
+        return reinterpret_cast<u64>(&NativeDevice::ViewCreatedRtv);
+    }
+    if (name == "native_view_dsv") {
+        return reinterpret_cast<u64>(&NativeDevice::ViewCreatedDsv);
+    }
+    if (name == "native_delay_delete") {
+        return reinterpret_cast<u64>(&NativeDevice::DelayDelete);
     }
     if (name == "draw_probe_indexed") {
         return reinterpret_cast<u64>(&ProbeIndexed);

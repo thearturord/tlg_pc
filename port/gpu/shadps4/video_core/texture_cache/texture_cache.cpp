@@ -1096,6 +1096,8 @@ void TextureCache::RegisterImage(ImageId image_id) {
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
     NoteImageEvent(image.info);
+    Core::NativeResources::NoteImageCensus(image.info.guest_address, image.info.size.width, image.info.size.height, (image.usage_flags & vk::ImageUsageFlagBits::eColorAttachment) ? true : false,
+                                           image.info.props.is_depth != 0); // B1 census
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image_lru_cache.Insert(image, gc_tick);
     const auto& info = image.info;

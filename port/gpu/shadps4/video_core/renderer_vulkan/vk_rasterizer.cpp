@@ -16,6 +16,7 @@
 #include "core/native_write_watch.h"
 #include "core/native_audit.h"
 #include "core/native_readbacks.h"
+#include "core/native_device.h"
 #include "core/native_resources.h"
 #include "core/native_pass.h"
 #include "core/native_updates.h"
@@ -2827,6 +2828,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (Core::NativeUploads::OnDemandAudit()) {
                     Core::NativeUploads::SetWriter(Core::NativeUpdates::WhoWrote(vsharp.base_address, size));
                 }
+                if (record_binding != ~0u && binder_plan != nullptr) {
+                    Core::NativeDevice::CheckBuffer(binder_plan->bindings[record_binding].id, vsharp.base_address, size); // B1 shadow check
+                }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2, cp_no_object);
                 if (Core::NativeRegistry::AuditBuffer(vsharp.base_address, size, desc.is_written, desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase)) {
@@ -3426,6 +3430,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 set_found[num_images - 1] = image_id;
             }
             auto* image = &texture_cache.GetImage(image_id);
+            if (image_from_record && i == 0) {
+                Core::NativeDevice::CheckImage(image_engine_id, image->info.guest_address, image->info.size.width, image->info.size.height); // B1 shadow check
+            }
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
                 // Redirect the access to the actual depth-stencil buffer.
