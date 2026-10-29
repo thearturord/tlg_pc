@@ -162,6 +162,9 @@ void NoteB8Unannounced(u64 address, u64 size, bool by_fault) noexcept;
 /// B9.3 (`TLG_B9_QUERIES`): 0 off, 1 audit (for a range inside one engine buffer, "did the CPU change it" and "did the GPU write it" are answered by the buffer's state
 /// and compared with the page tracker), 2 native (the buffer's state answers: its announced bytes, the GPU written bytes)
 [[nodiscard]] u32 B9QueryMode() noexcept;
+/// B9.3 step 2 (`TLG_B9_TRACKER=0`, with B9.1 and B9.3 native): the page tracker is not kept for engine buffers any more (announced bytes and CPU changes found
+/// otherwise mark the buffers; uploads inside one engine buffer neither ask nor clear the tracker); other memory keeps it
+[[nodiscard]] bool B9TrackerOff() noexcept;
 enum B9Count : u32 {
     B9AnnouncedOnBuffer,   ///< announcements inside one engine buffer
     B9AnnouncedClipped,    ///< announcements that meet several buffers or reach past one (each buffer takes its part)
@@ -187,6 +190,9 @@ enum B9Count : u32 {
     B9GpuTrackerPage,      ///< ... tracker yes, bytes no: GPU written bytes elsewhere on the page (page granularity)
     B9GpuTrackerOnly,      ///< ... tracker yes, no GPU written byte on the pages (the tracker keeps a page's mark after the bytes were superseded or downloaded)
     B9GpuBytesOnly,        ///< ... bytes yes, tracker no (native answers yes: the arena's bytes are kept, the safe way round)
+    B9TrackerMarksSkipped, ///< B9.3 step 2: CPU changes inside engine buffers not marked in the page tracker
+    B9TrackerUploadsSkipped, ///< ... uploads inside one engine buffer that did not ask the tracker
+    B9OtherChanges,        ///< ... CPU changes found otherwise (faults, decoders) given to the buffers
     B9BuffersDeleted,      ///< B9.2: engine buffer deletions carried out
     B9DeletedPending,      ///< ... with announced bytes never uploaded (dropped)
     B9DeletedGpuWritten,   ///< ... whose memory held GPU written bytes

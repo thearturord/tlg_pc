@@ -544,6 +544,14 @@ u32 B9QueryMode() noexcept {
     return mode;
 }
 
+bool B9TrackerOff() noexcept {
+    static const bool off = [] {
+        const char* e = std::getenv("TLG_B9_TRACKER");
+        return e != nullptr && *e == '0' && B9BufferMode() == 2 && B9QueryMode() == 2;
+    }();
+    return off;
+}
+
 u32 B9VerifyEvery() noexcept {
     static const u32 n = [] {
         const char* e = std::getenv("TLG_B9_VERIFY");
@@ -563,6 +571,8 @@ nlohmann::json B9Report() {
             {"uploads", {{"inside_one_buffer", c(B9SyncByObject)}, {"other_ranges", c(B9SyncNoObject)}}},
             {"TRACKER_ONLY_RANGES", c(B9TrackerOnlyRanges)}, {"tracker_ranges_announced_outside_the_request", c(B9TrackerElsewhere)}, {"tracker_only_bytes", c(B9TrackerOnlyBytes)}, {"announced_only_ranges", c(B9ObjectOnlyRanges)},
             {"bytes_by_page_tracker", c(B9BytesByTracker)}, {"bytes_by_announcements", c(B9BytesByObject)},
+            {"page_tracker", {{"off_for_engine_buffers", B9TrackerOff()}, {"marks_skipped", c(B9TrackerMarksSkipped)}, {"uploads_without_it", c(B9TrackerUploadsSkipped)},
+                              {"other_cpu_changes_given_to_buffers", c(B9OtherChanges)}}},
             {"queries", {{"mode", B9QueryMode()},
                          {"cpu_changed", {{"asked", c(B9CpuQueries)}, {"same_answer", c(B9CpuAgree)}, {"tracker_yes_neighbor_bytes", c(B9CpuTrackerNeighbor)},
                                           {"TRACKER_YES_NO_ANNOUNCED_BYTE", c(B9CpuTrackerOnly)}, {"buffer_yes_tracker_no", c(B9CpuObjectOnly)}}},
