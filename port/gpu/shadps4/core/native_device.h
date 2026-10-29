@@ -100,5 +100,26 @@ u64 PS4_SYSV_ABI DelayDelete(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
 u64 PS4_SYSV_ABI ClearRtvEnter(Core::GuestHooks::MidContext* c);
 u64 PS4_SYSV_ABI ClearDsvEnter(Core::GuestHooks::MidContext* c);
 [[nodiscard]] nlohmann::json ClearReport();
+/// B11 step 2: an engine clear and the packets it wrote ([begin, end) in its command buffer)
+struct ClearRecord {
+    u64 begin{}, end{};
+    u32 kind{};  ///< 0 color, 1 depth / stencil
+    u32 path{};  ///< color: 1 the target has a meta surface; depth: 1 the target has an HTILE surface
+    u32 flags{}, stencil{};
+    u64 view_id{}, resource_id{}, address{};
+    float value[4]{}; ///< color, or depth in [0]
+};
+/// The clears recorded in [begin, end) (a submitted command buffer), in order; taken out of the pending list
+void TakeClears(u64 begin, u64 end, std::vector<ClearRecord>& out);
+/// What the back end did inside / outside an engine clear's packets (raster thread)
+enum ClearUse : u32 { UseMetaClearDispatch, UseFastClearEliminate, UseFastClearEliminateNothing, UseDepthClearTarget, UseRenderPassClear, UseDraw, UseDispatch, ClearUses };
+void NoteClearUse(ClearUse use, bool inside);
+/// The command processor met a clear's packets: entries inside by kind (0 tag, 1 sync, 2 packet, 3 other)
+void NoteClearEntered(const ClearRecord& clear, const u32 (&entries)[4]);
+/// B11 step 3 (`TLG_B11_CLEARS=1`): the engine's clear runs as a Vulkan clear of the target's images at its place in the stream; the work inside its packets
+/// (the meta fill, the fast clear eliminate, the depth target clear, its draws and dispatches) is skipped
+[[nodiscard]] bool B11ClearsOn() noexcept;
+enum ClearNative : u32 { NativeDone, NativeImages, NativeNotEligible, NativeNoImage, NativeSkippedWork, ClearNatives };
+void NoteClearNative(ClearNative what, u64 n = 1);
 
 } // namespace Core::NativeDevice

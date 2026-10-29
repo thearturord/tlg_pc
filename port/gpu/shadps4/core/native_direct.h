@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "core/native_device.h"
+
 #include <array>
 #include <memory>
 #include <vector>
@@ -39,6 +41,7 @@ public:
     /// B2: the engine's announced updates made before this submission (applied on the raster thread before its work), and the previous submission's again
     std::vector<std::pair<u64, u64>> announced_first, announced_again;
     std::vector<std::array<u64, 4>> announced_deleted; ///< B8.2: engine textures and views deleted before this submission
+    std::vector<Core::NativeDevice::ClearRecord> clears; ///< B11: the engine's clears written into this command buffer, in order
 
     /// The dwords of a Packet entry.
     const u32* PacketWords(const Entry& entry) const {

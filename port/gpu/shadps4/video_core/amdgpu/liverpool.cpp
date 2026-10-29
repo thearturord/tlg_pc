@@ -2967,10 +2967,33 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
     Core::EntryDump::Span entry_dump{0, reinterpret_cast<const u32*>(direct->begin), direct->dwords};
     using Core::NativeDirect::EntryKind;
     u64 last_yield_ns = Core::FrameTimeline::Now();
+    // B11: the engine clears of this command buffer: the entries inside each clear's packets are marked on the raster thread
+    size_t clear_at = 0;
+    bool in_clear = false;
+    u32 clear_entries[4]{};
+    const auto leave_clear = [&] {
+        if (in_clear) {
+            Core::NativeDevice::NoteClearEntered(direct->clears[clear_at], clear_entries);
+            RasterRun([this] { rasterizer->SetEngineClear(nullptr); });
+            in_clear = false;
+        }
+    };
     for (const auto& entry : direct->entries) {
         ProcessCommands();
         if (ShouldYieldToOtherQueue(last_yield_ns)) {
             YIELD_GFX();
+        }
+        while (clear_at < direct->clears.size() && entry.address >= direct->clears[clear_at].end) {
+            leave_clear();
+            ++clear_at;
+        }
+        if (clear_at < direct->clears.size() && entry.address >= direct->clears[clear_at].begin && !in_clear) {
+            in_clear = true;
+            std::fill(std::begin(clear_entries), std::end(clear_entries), 0u);
+            RasterRun([this, record = direct->clears[clear_at]] { rasterizer->SetEngineClear(&record); });
+        }
+        if (in_clear) {
+            ++clear_entries[entry.kind == EntryKind::Tag ? 0 : entry.kind == EntryKind::Sync ? 1 : entry.kind == EntryKind::Packet ? 2 : 3];
         }
         entry_dump.Packet(entry.words.data(), entry.address, entry.dwords != 0);
         switch (entry.kind) {
@@ -3030,6 +3053,7 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
         }
         }
     }
+    leave_clear();
     if (ce_task.handle) {
         while (!ce_task.handle.done()) {
             RESUME_GFX(ce_task);
@@ -3106,6 +3130,10 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bo
 
     const u64 build_start = Core::FrameTimeline::Now();
     auto direct = Core::NativeDirect::Build(0, dcb.data(), static_cast<u32>(dcb.size()), !ccb.empty(), guest_markers_enabled);
+    if (direct) {
+        // B11: the engine's clears written into this command buffer travel with it
+        Core::NativeDevice::TakeClears(direct->begin, direct->begin + u64{direct->dwords} * 4, direct->clears);
+    }
     Core::StreamProbe::NoteBuild(Core::FrameTimeline::Now() - build_start, direct && direct->pure, static_cast<u32>(dcb.size()));
     const bool run_direct = direct && (direct->pure || Core::NativeDirect::PacketPathOff()) && Core::NativeDirect::ExecuteEnabled();
     if (!announced.Empty()) {

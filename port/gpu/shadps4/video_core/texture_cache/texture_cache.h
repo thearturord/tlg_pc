@@ -129,6 +129,18 @@ public:
     void NoteEngineTextureCreate(VAddr address, u64 bytes);
     /// B8.4: the images listed for the engine textures `ids` (their own and their remembered answers) that meet [address, address + size), each once
     void EngineImagesIn(const std::vector<u64>& ids, VAddr address, u64 size, SmallVector<ImageId, 8>& out) const;
+    /// B11: the type EngineImagesOf fills
+    static SmallVector<ImageId, 4> EngineImagesOfType();
+    /// B11: the engine texture's own images (its list, registered)
+    void EngineImagesOf(u64 id, SmallVector<ImageId, 4>& out) const {
+        if (const auto it = engine_images.find(id); it != engine_images.end()) {
+            for (const auto& [image_id, uid] : it->second) {
+                if (slot_images.IsAllocated(image_id) && slot_images[image_id].image_uid == uid && True(slot_images[image_id].flags & ImageFlagBits::Registered)) {
+                    out.push_back(image_id);
+                }
+            }
+        }
+    }
     static void NoteRefreshedForWriteWatch(Image& image);
 
     /// Marks an image as dirty if it exists at the provided address.

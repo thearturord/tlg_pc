@@ -19,6 +19,7 @@
 #include "video_core/page_manager.h"
 #include <span>
 #include <string>
+#include "core/native_device.h"
 #include "core/native_draw.h"
 #include "core/native_uploads.h"
 #include "video_core/readback_stats.h"
@@ -266,6 +267,21 @@ public:
     /// N5h: see BufferCache::SupersedeGpuWritten.
     /// B8.2: the engine deleted a texture or view (raster thread, in order with the GPU work)
     void EngineObjectDeleted(u64 id, VAddr address, u64 bytes, u32 what);
+    /// B11: the engine clear whose packets the raster thread is running now (null: none); the record is copied
+    void SetEngineClear(const Core::NativeDevice::ClearRecord* record);
+    /// B11 step 3: the clear as a Vulkan clear of the target's own images; false when it cannot (the old path runs)
+    bool NativeClear(const Core::NativeDevice::ClearRecord& record);
+    /// B11 step 3: true when the work at hand belongs to an engine clear that ran natively (it is skipped)
+    bool SkipForEngineClear() {
+        if (engine_clear_on && engine_clear_skip) {
+            Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeSkippedWork);
+            return true;
+        }
+        return false;
+    }
+    bool engine_clear_on{};
+    bool engine_clear_skip{};
+    Core::NativeDevice::ClearRecord engine_clear{};
     void SupersedeGpuWritten(VAddr addr, u64 size) {
         buffer_cache.SupersedeGpuWritten(addr, size);
     }

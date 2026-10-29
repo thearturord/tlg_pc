@@ -429,6 +429,12 @@ std::mutex clear_mutex;
 std::map<u32, u64> clear_opcodes; ///< (kind * 2 + path) << 8 | opcode -> packets
 std::map<u32, u64> clear_shapes;  ///< (kind * 2 + path) << 16 | packets in the clear -> clears
 std::atomic<u32> clear_logged{0};
+std::map<u64, ClearRecord> pending_clears; ///< by begin (clear_mutex)
+thread_local ClearRecord clear_record[8];
+enum ClearMatch : u32 { MatchRecorded, MatchAttached, MatchDropped, MatchEntered, MatchEntriesTag, MatchEntriesSync, MatchEntriesPacket, MatchEntriesOther, MatchCounts };
+std::array<std::atomic<u64>, MatchCounts> clear_match{};
+std::array<std::array<std::atomic<u64>, 2>, ClearUses> clear_uses{};
+std::array<std::atomic<u64>, ClearNatives> clear_native{};
 
 u64 PS4_SYSV_ABI ClearExit() {
     const ClearFrame f = clear_stack[--clear_depth];
@@ -461,6 +467,18 @@ u64 PS4_SYSV_ABI ClearExit() {
     clear_counts[ClearPackets].fetch_add(packets, std::memory_order_relaxed);
     clear_counts[ClearDwords].fetch_add((end - f.cursor) / 4, std::memory_order_relaxed);
     ++clear_shapes[group << 16 | std::min<u32>(packets, 0xffff)];
+    if (end > f.cursor) {
+        // B11 step 2: the clear waits for the submission of its command buffer
+        ClearRecord record = clear_record[clear_depth];
+        record.begin = f.cursor;
+        record.end = end;
+        pending_clears[f.cursor] = record;
+        clear_match[MatchRecorded].fetch_add(1, std::memory_order_relaxed);
+        if (pending_clears.size() > 4096) {
+            pending_clears.erase(pending_clears.begin()); // never submitted (or its memory reused): dropped
+            clear_match[MatchDropped].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     return f.ret;
 }
 
@@ -483,6 +501,18 @@ u64 PS4_SYSV_ABI ClearRtvEnter(Core::GuestHooks::MidContext* c) {
     f.path = resource != 0 && Rd<u64>(resource, 0x58) != 0 ? 1 : 0;
     clear_counts[ClearColor].fetch_add(1, std::memory_order_relaxed);
     clear_counts[ClearColorFill].fetch_add(f.path == 0 ? 1 : 0, std::memory_order_relaxed);
+    {
+        ClearRecord& r = clear_record[clear_depth - 1];
+        r = {};
+        r.kind = 0;
+        r.path = f.path;
+        r.view_id = Rd<u64>(c->rsi, 0x10);
+        r.resource_id = resource != 0 ? Rd<u64>(resource, 0x10) : 0;
+        r.address = resource != 0 ? Rd<u64>(resource, 0x30) : 0;
+        if (c->rdx != 0) {
+            std::memcpy(r.value, reinterpret_cast<const void*>(c->rdx), sizeof(r.value));
+        }
+    }
     if (clear_logged.fetch_add(1, std::memory_order_relaxed) < 16 && c->rdx != 0) {
         LOG_WARNING(Core, "B11: ClearRenderTargetView rtv id {} resource id {} memory {:#x} surface {:#x} color {} {} {} {}", Rd<u64>(c->rsi, 0x10),
                     resource != 0 ? Rd<u64>(resource, 0x10) : 0, resource != 0 ? Rd<u64>(resource, 0x30) : 0, resource != 0 ? Rd<u64>(resource, 0x58) : 0,
@@ -507,6 +537,18 @@ u64 PS4_SYSV_ABI ClearDsvEnter(Core::GuestHooks::MidContext* c) {
     f.path = resource != 0 && Rd<u64>(resource, 0x48) != 0 ? 1 : 0;
     const u32 flags = static_cast<u32>(c->rdx);
     clear_counts[ClearDepth].fetch_add(1, std::memory_order_relaxed);
+    {
+        ClearRecord& r = clear_record[clear_depth - 1];
+        r = {};
+        r.kind = 1;
+        r.path = f.path;
+        r.flags = flags;
+        r.stencil = static_cast<u32>(c->rcx & 0xff);
+        r.view_id = Rd<u64>(c->rsi, 0x10);
+        r.resource_id = resource != 0 ? Rd<u64>(resource, 0x10) : 0;
+        r.address = resource != 0 ? Rd<u64>(resource, 0x30) : 0;
+        std::memcpy(&r.value[0], c->ymm[0], sizeof(float));
+    }
     clear_counts[ClearDepthNoSurface].fetch_add(f.path == 0 ? 1 : 0, std::memory_order_relaxed);
     if (flags >= 1 && flags <= 3) {
         clear_counts[ClearDepthFlags1 + flags - 1].fetch_add(1, std::memory_order_relaxed);
@@ -522,6 +564,40 @@ u64 PS4_SYSV_ABI ClearDsvEnter(Core::GuestHooks::MidContext* c) {
     f.ret = *ret_slot;
     *ret_slot = stub;
     return 0;
+}
+
+void TakeClears(u64 begin, u64 end, std::vector<ClearRecord>& out) {
+    std::scoped_lock lock{clear_mutex};
+    for (auto it = pending_clears.lower_bound(begin); it != pending_clears.end() && it->first < end;) {
+        out.push_back(it->second);
+        it = pending_clears.erase(it);
+        clear_match[MatchAttached].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+bool B11ClearsOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_B11_CLEARS");
+        return e != nullptr && *e == '1';
+    }();
+    return on;
+}
+
+void NoteClearNative(ClearNative what, u64 n) {
+    clear_native[what].fetch_add(n, std::memory_order_relaxed);
+}
+
+void NoteClearUse(ClearUse use, bool inside) {
+    clear_uses[use][inside ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteClearEntered(const ClearRecord& clear, const u32 (&entries)[4]) {
+    (void)clear;
+    clear_match[MatchEntered].fetch_add(1, std::memory_order_relaxed);
+    clear_match[MatchEntriesTag].fetch_add(entries[0], std::memory_order_relaxed);
+    clear_match[MatchEntriesSync].fetch_add(entries[1], std::memory_order_relaxed);
+    clear_match[MatchEntriesPacket].fetch_add(entries[2], std::memory_order_relaxed);
+    clear_match[MatchEntriesOther].fetch_add(entries[3], std::memory_order_relaxed);
 }
 
 nlohmann::json ClearReport() {
@@ -541,7 +617,22 @@ nlohmann::json ClearReport() {
     return {{"color_clears", c(ClearColor)}, {"of_those_fills", c(ClearColorFill)}, {"depth_clears", c(ClearDepth)}, {"of_those_without_surface", c(ClearDepthNoSurface)},
             {"depth_flags", {c(ClearDepthFlags1), c(ClearDepthFlags2), c(ClearDepthFlags3)}}, {"unreadable_new_chunk", c(ClearUnreadable)},
             {"packets", c(ClearPackets)}, {"dwords", c(ClearDwords)}, {"packets_by_opcode", opcodes}, {"clears_by_packet_count", shapes},
-            {"note", "B11 census, cumulative: the packets each engine clear writes into its command buffer"}};
+            {"matching", {{"recorded", clear_match[MatchRecorded].load()}, {"attached_to_their_submission", clear_match[MatchAttached].load()},
+                          {"dropped_never_submitted", clear_match[MatchDropped].load()}, {"met_by_the_command_processor", clear_match[MatchEntered].load()},
+                          {"entries_inside", {{"tags", clear_match[MatchEntriesTag].load()}, {"syncs", clear_match[MatchEntriesSync].load()},
+                                              {"packets", clear_match[MatchEntriesPacket].load()}, {"other", clear_match[MatchEntriesOther].load()}}}}},
+            {"native", {{"on", B11ClearsOn()}, {"clears_done_as_vulkan_clears", clear_native[NativeDone].load()}, {"images_cleared", clear_native[NativeImages].load()},
+                        {"not_eligible_mips_or_layers", clear_native[NativeNotEligible].load()}, {"no_image_yet_old_path", clear_native[NativeNoImage].load()},
+                        {"work_skipped_inside", clear_native[NativeSkippedWork].load()}}},
+            {"back_end_inside_vs_outside_a_clear", {
+                {"meta_clear_dispatch", {clear_uses[UseMetaClearDispatch][1].load(), clear_uses[UseMetaClearDispatch][0].load()}},
+                {"fast_clear_eliminate_clearing", {clear_uses[UseFastClearEliminate][1].load(), clear_uses[UseFastClearEliminate][0].load()}},
+                {"fast_clear_eliminate_nothing", {clear_uses[UseFastClearEliminateNothing][1].load(), clear_uses[UseFastClearEliminateNothing][0].load()}},
+                {"depth_clear_target", {clear_uses[UseDepthClearTarget][1].load(), clear_uses[UseDepthClearTarget][0].load()}},
+                {"render_pass_clear", {clear_uses[UseRenderPassClear][1].load(), clear_uses[UseRenderPassClear][0].load()}},
+                {"draws", {clear_uses[UseDraw][1].load(), clear_uses[UseDraw][0].load()}},
+                {"dispatches", {clear_uses[UseDispatch][1].load(), clear_uses[UseDispatch][0].load()}}}},
+            {"note", "B11 census, cumulative: the packets each engine clear writes into its command buffer; inside / outside pairs: [inside an engine clear's packets, outside]"}};
 }
 
 nlohmann::json Report() {

@@ -574,6 +574,67 @@ static bool B3ImagesOn() {
     return on;
 }
 
+void Rasterizer::SetEngineClear(const Core::NativeDevice::ClearRecord* record) {
+    engine_clear_on = record != nullptr;
+    engine_clear_skip = false;
+    if (record == nullptr) {
+        return;
+    }
+    engine_clear = *record;
+    if (Core::NativeDevice::B11ClearsOn()) {
+        engine_clear_skip = NativeClear(engine_clear);
+    }
+}
+
+bool Rasterizer::NativeClear(const Core::NativeDevice::ClearRecord& record) {
+    Core::NativeDevice::Object resource;
+    if (!Core::NativeDevice::Lookup(record.resource_id, resource) || resource.mips > 1 || resource.layers > 1 || resource.depth > 1) {
+        // a view of one mip or layer would need the view's range: the old path
+        Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeNotEligible);
+        return false;
+    }
+    decltype(std::declval<VideoCore::TextureCache&>().EngineImagesOfType()) ids;
+    texture_cache.EngineImagesOf(record.resource_id, ids);
+    if (ids.empty()) {
+        Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeNoImage);
+        return false;
+    }
+    for (const auto image_id : ids) {
+        auto& image = texture_cache.GetImage(image_id);
+        const VideoCore::SubresourceRange range{.base = {0, 0}, .extent = {image.info.resources.levels, image.info.resources.layers}};
+        if (record.kind == 0) {
+            if (image.info.props.is_depth) {
+                continue;
+            }
+            vk::ClearValue value{};
+            const std::string format = vk::to_string(image.info.pixel_format);
+            if (format.find("Uint") != std::string::npos || format.find("Sint") != std::string::npos) {
+                for (u32 i = 0; i < 4; ++i) {
+                    value.color.int32[i] = static_cast<s32>(record.value[i]);
+                }
+            } else {
+                for (u32 i = 0; i < 4; ++i) {
+                    value.color.float32[i] = record.value[i];
+                }
+            }
+            runtime.ClearImage(&image, range, value);
+        } else {
+            if (!image.info.props.is_depth) {
+                continue;
+            }
+            runtime.ClearDepthStencilImage(&image, range, (record.flags & 1) != 0, record.value[0], (record.flags & 2) != 0, record.stencil);
+            image.usage.depth_target = true;
+        }
+        // the image is what the clear made it: nothing older from memory is uploaded over it
+        image.flags &= ~(VideoCore::ImageFlagBits::CpuDirty | VideoCore::ImageFlagBits::MaybeCpuDirty);
+        image.flags |= VideoCore::ImageFlagBits::GpuModified;
+        Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeImages);
+    }
+    Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeDone);
+    ++recorded_work;
+    return true;
+}
+
 void Rasterizer::EngineObjectDeleted(u64 id, VAddr address, u64 bytes, u32 what) {
     if (const auto it = native_image_keys.find(id); it != native_image_keys.end()) {
         // B3: the deleted view's entries leave the table (the id is never used again)
@@ -1054,8 +1115,13 @@ void Rasterizer::EliminateFastClear(const DrawInputs& inputs, const AmdGpu::CbDb
     const auto image_id = texture_cache.FindImage(desc);
     const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
     if (!texture_cache.IsMetaCleared(col_buf.CmaskAddress(), col_buf.view.slice_start)) {
+        Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseFastClearEliminateNothing, engine_clear_on);
         return;
     }
+    if (SkipForEngineClear()) {
+        return;
+    }
+    Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseFastClearEliminate, engine_clear_on);
     for (u32 slice = col_buf.view.slice_start; slice <= col_buf.view.slice_max; ++slice) {
         texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
     }
@@ -1074,6 +1140,10 @@ void Rasterizer::ClearDepthStencilTarget(const DrawInputs& inputs, const AmdGpu:
 }
 
 void Rasterizer::ClearDepthTarget(const DrawInputs& regs, const AmdGpu::CbDbExtent& db_extent) {
+    Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseDepthClearTarget, engine_clear_on);
+    if (SkipForEngineClear()) {
+        return;
+    }
     const auto htile_address = regs.depth_htile_data_base.GetAddress();
     VideoCore::TextureCache::ImageDesc desc(regs.depth_buffer, regs.depth_view, regs.depth_control, htile_address,
                                             db_extent);
@@ -1090,6 +1160,10 @@ void Rasterizer::ClearDepthTarget(const DrawInputs& regs, const AmdGpu::CbDbExte
 }
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
+    Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseDraw, engine_clear_on);
+    if (SkipForEngineClear()) {
+        return;
+    }
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -1198,6 +1272,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset, const DrawPlan* plan) {
+    if (SkipForEngineClear()) { // B11: the work of an engine clear that ran natively
+        return;
+    }
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -1315,6 +1392,10 @@ void Rasterizer::SetExplicitImageReadback(bool on) {
 }
 
 void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
+    Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseDispatch, engine_clear_on);
+    if (SkipForEngineClear()) {
+        return;
+    }
     RENDERER_TRACE;
     Core::NativeRegistry::SetDrawClass(3);
     Core::NativeRegistry::SetCurrentDraw(plan != nullptr ? plan->native_seq : 0, plan != nullptr && plan->native_seq != 0);
@@ -1392,6 +1473,9 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const DispatchPlan* plan) {
+    if (SkipForEngineClear()) { // B11: the work of an engine clear that ran natively
+        return;
+    }
     RENDERER_TRACE;
     Core::NativeRegistry::SetDrawClass(3);
     Core::NativeRegistry::SetCurrentDraw(plan != nullptr ? plan->native_seq : 0, plan != nullptr && plan->native_seq != 0);
@@ -2027,6 +2111,7 @@ bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
         for (const auto& desc : info.buffers) {
             const VAddr address = desc.GetSharp(info).base_address;
             if (!desc.IsSpecial() && desc.is_written && texture_cache.ClearMeta(address)) {
+                Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseMetaClearDispatch, engine_clear_on); // B11 census
                 // Assume all slices were updates
                 LOG_TRACE(Render_Vulkan, "Metadata update skipped");
                 return true;
@@ -3811,6 +3896,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         bool clears = state.depth_stencil_attachment.depth_clear || state.depth_stencil_attachment.stencil_clear;
         for (u32 i = 0; i < state.num_color_attachments; ++i) {
             clears |= state.color_attachments[i].is_clear != 0;
+        }
+        if (clears) {
+            Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseRenderPassClear, engine_clear_on);
         }
         if (!clears) {
             begin_memo = {true, MakeBeginSignature(pipeline), state};
