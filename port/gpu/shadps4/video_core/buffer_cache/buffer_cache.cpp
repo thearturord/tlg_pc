@@ -854,6 +854,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                 if (immutable->gpu_arena_epoch.load(std::memory_order_relaxed) != ArenaEpoch() && immutable->begin >= arena->cpu_addr &&
                     immutable->end <= arena->cpu_addr + arena->size_bytes) {
                     // R1: the arenas moved since the synchronization; the object is resident in this one now
+                    NoteResolutionUser(arena, immutable->id);
                     immutable->gpu_arena.store(arena, std::memory_order_relaxed);
                     immutable->gpu_arena_base.store(arena->cpu_addr, std::memory_order_relaxed);
                     immutable->gpu_arena_epoch.store(ArenaEpoch(), std::memory_order_release);
@@ -897,6 +898,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                 Core::NativeUploads::NoteOnDemand(immutable_pass_open, whole, last_upload_bytes, immutable->begin, true);
             }
             // R1: the object keeps where it is resident (read by the command processor's binding resolution once `synced` is set)
+            NoteResolutionUser(arena, immutable->id);
             immutable->gpu_arena.store(arena, std::memory_order_relaxed);
             immutable->gpu_arena_base.store(arena->cpu_addr, std::memory_order_relaxed);
             immutable->gpu_arena_epoch.store(ArenaEpoch(), std::memory_order_relaxed);
@@ -1179,7 +1181,7 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
     }
     {
         std::scoped_lock lock{placed_mutex};
-        placed.emplace(begin, PlacedBuffer{ids, begin, end, std::move(buffer)});
+        placed.emplace(begin, PlacedBuffer{ids, {}, begin, end, std::move(buffer)});
     }
     ForgetShadows(begin, end);
     Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9Placed);
@@ -1190,6 +1192,7 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
     }
     range_epoch.fetch_add(1, std::memory_order_acq_rel); // the upload memo's answers (this command buffer only) that name the arena for this memory are stale
     for (const u64 id : ids) {
+        NoteResolutionUser(dst, id);
         if (auto* object = Core::NativeResources::FindImmutableById(id)) {
             // the resident object's binding resolution (R2) names the block's buffer from now on; the other objects' resolutions stay valid
             object->gpu_arena.store(dst, std::memory_order_relaxed);
@@ -1198,6 +1201,25 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
         }
     }
     return dst;
+}
+
+void BufferCache::NoteResolutionUser(const Buffer* buffer, u64 id) {
+    if (buffer->mem_type == MemoryType::Sparse || id == 0) {
+        return;
+    }
+    std::scoped_lock lock{placed_mutex};
+    for (auto it = placed.upper_bound(buffer->cpu_addr + 255); it != placed.begin();) {
+        --it;
+        if (it->second.buffer.get() == buffer) {
+            if (std::ranges::find(it->second.users, id) == it->second.users.end()) {
+                it->second.users.push_back(id);
+            }
+            return;
+        }
+        if (it->first < buffer->cpu_addr) {
+            return;
+        }
+    }
 }
 
 void BufferCache::ForgetShadows(VAddr begin, VAddr end) {
@@ -1220,6 +1242,7 @@ void BufferCache::DropPlaced(VAddr begin) {
             return;
         }
         ids = std::move(it->second.ids);
+        ids.insert(ids.end(), it->second.users.begin(), it->second.users.end()); // every resolution that names it, members or not
         buffer = std::move(it->second.buffer);
         placed.erase(it);
     }
@@ -1292,6 +1315,7 @@ void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, boo
             const bool alone = textures.empty() && std::ranges::all_of(parts, [&](const auto& part) { return part.id == id; });
             if (alone) {
                 entry.ids.push_back(id);
+                entry.users.push_back(id);
                 Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9Adopted);
                 {
                     // the block holds older bytes there (a deleted member's, a gap's): the new buffer's first upload takes all of its memory, as a placement would
@@ -1362,9 +1386,9 @@ const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanni
         (void)Core::NativeDevice::TexturesIn(lo, hi - lo, textures);
         const bool too_big = hi - lo > (u64{256} << 20);
         static const bool groups = [] {
-            // opt-in for now: with groups the default scene ended in a lost device in 3 of 4 headless runs (cause open, see the plan's B9.4 step 2)
+            // TLG_B9_GROUPS=0 turns blocks off (B9.4 step 3: on after the freed-buffer resolutions were fixed, 5 of 5 headless runs clean)
             const char* e = std::getenv("TLG_B9_GROUPS");
-            return e != nullptr && *e == '1';
+            return e == nullptr || *e != '0';
         }();
         // without groups (TLG_B9_GROUPS=0): only a request inside one engine buffer places it (B9.4 step 1)
         const bool single = ids.size() == 1 && lo == parts.front().object_begin && hi == parts.front().object_end && !PlacedMeets(lo, hi - lo);

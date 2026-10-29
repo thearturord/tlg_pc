@@ -314,6 +314,7 @@ private:
     static constexpr u64 PlacedSlack = 64; ///< B9.4: a read may run this far past a placed buffer's end (vertex fetch rounding); the bytes there are not memory's
     struct PlacedBuffer {
         std::vector<u64> ids; ///< the engine buffers it holds (one, or a block the engine laid out next to each other and binds as one range)
+        std::vector<u64> users; ///< the resident objects (engine ids) whose binding resolution names this buffer: all are reset when it is freed
         VAddr begin{}, end{}; ///< the memory it holds (the Vulkan buffer starts at begin aligned down to 256: the same offset alignment as the arena)
         std::unique_ptr<Buffer> buffer;
     };
@@ -326,6 +327,8 @@ private:
     void Demote(VAddr begin, bool by_request);
     void DropPlaced(VAddr begin);
     void ForgetShadows(VAddr begin, VAddr end);
+    /// B9.4: a resident object's binding resolution names `buffer` from now on (a placed buffer remembers it, so freeing the buffer resets it)
+    void NoteResolutionUser(const Buffer* buffer, u64 id);
     std::atomic<u64> b9_epoch{0}; ///< B9.3 step 2: bumped when an engine buffer gets changed bytes (the upload memo's answers are stale)
     RangeSet b9_unattributed; ///< B9.1: announced bytes no engine buffer held when they were announced (a buffer's creation data comes before the buffer is known)
     std::mutex object_dirty_mutex;
