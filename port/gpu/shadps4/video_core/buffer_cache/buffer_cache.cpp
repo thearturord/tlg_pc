@@ -875,7 +875,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                             immutable->synced.store(false, std::memory_order_release);
                             static std::atomic<u32> logged{0};
                             if (logged.fetch_add(1) < 12) {
-                                LOG_ERROR(Render, "resident buffer {:#x}+{} (engine buffer {:#x}..{:#x}, usage {}) was stale: {} bytes had to be uploaded", device_addr, size, immutable->begin, immutable->end, immutable->usage, last_upload_bytes);
+                                // who announced the last write that covers it (needs TLG_UPDATE_AUDIT=1; ~0: no announcement window covers it), the engine id and the bytes now in guest memory
+                                const u32 who = Core::NativeUpdates::WhoWrote(device_addr, size);
+                                u32 words[16] = {};
+                                std::memcpy(words, reinterpret_cast<const void*>(device_addr), std::min<u32>(size, 64));
+                                LOG_ERROR(Render, "resident buffer {:#x}+{} (engine buffer {:#x}..{:#x}, usage {}, engine id {}) was stale: {} bytes had to be uploaded; last announcer {} (0 Map 1 skin 2 light 3 stream copy 4 recording / scene slots 5 creation 6 texture 7 instance group, bit 8 render thread, age ms {}); words {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                                          device_addr, size, immutable->begin, immutable->end, immutable->usage, immutable->id, last_upload_bytes, who == ~0u ? 99u : (who & 0xff), who == ~0u ? 0u : (who >> 8) & 1, who == ~0u ? 0u : who >> 16,
+                                          words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
                             }
                         }
                     }

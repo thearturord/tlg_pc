@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "core/guest_hooks.h"
 #include "core/native_draw.h"
+#include "core/native_light_recorder.h"
 #include "core/native_write_watch.h"
 #include "core/native_audit.h"
 #include "core/native_readbacks.h"
@@ -1466,7 +1467,14 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     dispatch_audit_plan = (dispatch_audit_on && plan != nullptr && plan->bindings_complete) ? plan : nullptr;
     binder_plan = DispatchBinderFor(plan);
     resolved_dispatch = binder_plan != nullptr ? plan : nullptr;
+    const bool light_recorded = Core::LightRecorder::On() && plan != nullptr && plan->native_seq != 0 && Core::LightRecorder::IsLightCaller(Core::NativeDraw::RecordCallerGhidra(plan->native_seq));
+    if (light_recorded) {
+        Core::LightRecorder::Begin(Core::DebugServer::PresentCount(), Core::NativeDraw::RecordCallerGhidra(plan->native_seq), cs_program.address);
+    }
     const bool dispatch_bound = BindResources(pipeline);
+    if (light_recorded) {
+        Core::LightRecorder::End();
+    }
     resolved_dispatch = nullptr;
     binder_plan = nullptr;
     dispatch_audit_plan = nullptr;
@@ -2980,6 +2988,27 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2, cp_no_object);
+                if (Core::LightRecorder::On()) {
+                    Core::LightRecorder::Entry note{};
+                    note.kind = 1;
+                    note.via = immutable_hint != nullptr ? 1 : 0;
+                    note.written = desc.is_written ? 1 : 0;
+                    note.id = record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].id : 0;
+                    note.address = vsharp.base_address;
+                    note.size = size;
+                    u64 h = 0xcbf29ce484222325ull;
+                    const u64 bytes = memory->IsValidMapping(vsharp.base_address, std::min<u64>(size, 256)) ? std::min<u64>(size, 256) : 0;
+                    for (u64 b = 0; b < bytes; b += 4) {
+                        u32 word = 0;
+                        std::memcpy(&word, reinterpret_cast<const void*>(vsharp.base_address + b), std::min<u64>(4, bytes - b));
+                        if (b < 16) {
+                            note.words[b / 4] = word;
+                        }
+                        h = (h ^ word) * 0x100000001b3ull;
+                    }
+                    note.hash = h;
+                    Core::LightRecorder::Note(note);
+                }
                 if (Core::NativeRegistry::AuditBuffer(vsharp.base_address, size, desc.is_written, desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase)) {
                     {
                         // where did the shader get this descriptor from, and did the record write the registers it sits in?
@@ -3612,6 +3641,24 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 native_entry->image_id = image_id;
                 native_entry->image_uid = texture_cache.ImageUid(image_id);
                 native_entry->desc = desc;
+            }
+            if (Core::LightRecorder::On()) {
+                Core::LightRecorder::Entry note{};
+                note.kind = 2;
+                note.via = native_hit ? 3 : same_generation ? 1 : by_id ? 2 : 0;
+                note.id = image_engine_id;
+                note.address = desc.info.guest_address;
+                note.size = desc.info.guest_size;
+                note.slot = image_id.index;
+                note.uid = texture_cache.ImageUid(image_id);
+                u64 h = 0xcbf29ce484222325ull;
+                u32 words[8] = {};
+                std::memcpy(words, &tsharp, std::min<size_t>(sizeof(words), sizeof(AmdGpu::Image)));
+                for (const u32 word : words) {
+                    h = (h ^ word) * 0x100000001b3ull;
+                }
+                note.hash = h;
+                Core::LightRecorder::Note(note);
             }
             if (set_record) {
                 set_found[num_images - 1] = image_id;
