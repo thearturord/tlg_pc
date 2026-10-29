@@ -75,6 +75,8 @@ struct Hook {
 };
 
 std::vector<std::unique_ptr<Hook>> hooks;
+/// set when InstallForEboot is done: the present thread's OnFrame reads `hooks` only after (it grew under OnFrame and crashed it once, 2026-10-29)
+std::atomic<bool> hooks_ready{false};
 std::ofstream counts_file;
 std::ofstream args_file;
 std::ofstream deref_file;
@@ -577,6 +579,11 @@ u64 ExitStub(u64 exit_handler) {
 }
 
 void InstallForEboot(VAddr base, u64 image_size) {
+    struct ReadyAtExit {
+        ~ReadyAtExit() {
+            hooks_ready.store(true, std::memory_order_release);
+        }
+    } ready_at_exit;
     NativeDraw::SetImageBase(base);
     stub_area_base = base;
     InstallSpans(base, image_size);
@@ -796,7 +803,7 @@ bool IsActive() {
 }
 
 void OnFrame() {
-    if (hooks.empty()) {
+    if (!hooks_ready.load(std::memory_order_acquire) || hooks.empty()) {
         return;
     }
     const u64 frame = frame_index.fetch_add(1, std::memory_order_relaxed) + 1;

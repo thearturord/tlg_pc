@@ -152,6 +152,7 @@ public:
         std::array<std::atomic<u64>, 9> rejected{}; ///< 0 no record entry, 1 null or huge V#, 2 no engine object, 3 not immutable, 4 outside the object, 5 not synchronized, 6 no arena yet, 7 arena moved, 8 clamped
     };
     std::array<u64, 18> TakeResolveStats();
+    std::atomic<u64> image_words_planned{0}, image_words_verified{0}, image_words_differing{0}, image_layout_differing{0}; ///< R3 step 2 counters
     /// R1b verify counters (cumulative): copies checked, copies that differed from guest memory
     [[nodiscard]] std::pair<u64, u64> ObjectCopyVerify() const noexcept {
         return {buffer_cache.object_copy_checks.load(std::memory_order_relaxed), buffer_cache.object_copy_stale.load(std::memory_order_relaxed)};
@@ -576,6 +577,8 @@ private:
     const DrawPlan* DispatchBinderFor(const DispatchPlan* plan);
     const DispatchPlan* dispatch_audit_plan{}; ///< B9: the plan of the dispatch being bound; its record's descriptors are compared with the guest's (TLG_DISPATCH_AUDIT=1)
     const DrawPlan* binder_plan{};   ///< N3: the plan whose record binds the resources of the draw being recorded (null: from the flat user data)
+    /// R3 step 2: the record words of image `index` of `stage` as the command processor found them (the binder plan's bindings), or false when it did not resolve it
+    bool PlannedImageWords(const Shader::Info& stage, u32 index, u32 dwords, const u32*& words, u32& binding_index) const;
     const DrawPlan* resolved_draw{};         ///< R2: the draw being bound, when its plan carries resolved bindings
     const DispatchPlan* resolved_dispatch{}; ///< R2: the dispatch being bound
     ResolveStats resolve_stats;

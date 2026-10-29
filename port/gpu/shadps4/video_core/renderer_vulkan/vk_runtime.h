@@ -82,6 +82,10 @@ public:
     [[nodiscard]] bool PlanHasWrites() const noexcept {
         return live_plan_writes != 0;
     }
+    /// R3 step 2: the planner decides the image layouts (after a transit to a layout, CurrentLayout of an image with a backing is that layout)
+    [[nodiscard]] bool PlannerDecidesLayouts() const noexcept {
+        return live_plan_on && live_plan_decides;
+    }
 
     void FlushBarriers();
 

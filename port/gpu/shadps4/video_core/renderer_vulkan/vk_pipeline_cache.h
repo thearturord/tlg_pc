@@ -180,6 +180,10 @@ struct StagePlan {
     boost::container::small_vector<RingBinding, 8> ring; ///< T1: filled by the command processor thread, read by the raster thread
     boost::container::small_vector<ResolvedBuffer, 8> resolved; ///< R2: by the stage's buffer index (empty: none resolved)
     u64 resolved_epoch{}; ///< R2: the immutable epoch the objects were looked up at
+    /// R3 step 2: by the stage's image index, where the record holds the image's descriptor words: (binding index << 8) | dword offset in it,
+    /// ImageNoEntry (the record has none) or ImageUnknown (not resolved: the raster thread looks itself)
+    boost::container::small_vector<u32, 8> image_words;
+    static constexpr u32 ImageUnknown = ~0u, ImageNoEntry = ~0u - 1;
     Shader::Info* info{};
     boost::container::small_vector<PreparedImage, 8> images;
     bool images_prepared{};

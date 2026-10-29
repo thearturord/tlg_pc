@@ -827,6 +827,7 @@ void ResetStage(StagePlan& stage) {
     stage.flat_skipped = false;
     stage.pgm_base = 0;
     stage.resolved.clear();
+    stage.image_words.clear();
 }
 } // namespace
 
@@ -2190,6 +2191,10 @@ void Rasterizer::ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) 
     if (!on || !Core::NativeResources::ImmutableResidencyEnabled() || NativeBinderMode() == 3 || inplace_on) {
         return;
     }
+    static const bool images_on = [] {
+        const char* e = std::getenv("TLG_RESOLVE_IMAGES");
+        return e == nullptr || *e != '0';
+    }();
     // R2b: the engine's default and dynamic buffers too (resident buffers): the arena holds their contents while their generation is the synchronized one
     static const bool mutable_on = [] {
         const char* e = std::getenv("TLG_RESOLVE_MUTABLE");
@@ -2199,8 +2204,33 @@ void Rasterizer::ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) 
                              Core::NativeResources::ImmutableBuffer* const* handles) {
         out.resolved.clear();
         out.resolved_epoch = Core::NativeResources::ImmutableEpoch();
+        out.image_words.clear();
         if (count == 0) {
             return;
+        }
+        if (images_on) {
+            // R3 step 2: the record entry of each image of the stage (the raster thread's BinderWords rule: the first match; a second match with other words, or
+            // a compute stage the dispatch binder does not serve, leaves it to the raster thread)
+            out.image_words.resize(info.images.size(), StagePlan::ImageUnknown);
+            for (u32 i = 0; i < info.images.size(); ++i) {
+                const auto& image = info.images[i];
+                if (image.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad || (s == 5 && DispatchBinderMode() != 2)) {
+                    continue;
+                }
+                const u32 dwords = image.is_r128 ? 4 : 8;
+                u32 first = 0, second = 0;
+                const u32* words = FindRecordWords(info, list, count, s, 2, image.sharp_fetch.offsets[0], dwords, &first, false);
+                if (words == nullptr) {
+                    out.image_words[i] = StagePlan::ImageNoEntry;
+                    continue;
+                }
+                const u32* other = first + 1 < count ? FindRecordWords(info, list + first + 1, count - first - 1, s, 2, image.sharp_fetch.offsets[0], dwords, &second, false) : nullptr;
+                if (other != nullptr && std::memcmp(words, other, dwords * sizeof(u32)) != 0) {
+                    continue;
+                }
+                out.image_words[i] = (first << 8) | static_cast<u32>(words - list[first].words);
+                image_words_planned.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         out.resolved.resize(info.buffers.size());
         for (u32 i = 0; i < info.buffers.size(); ++i) {
@@ -2269,6 +2299,41 @@ void Rasterizer::ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) 
     if (dispatch_plan != nullptr && dispatch_plan->pipeline != nullptr && dispatch_plan->bindings_complete && dispatch_plan->binding_count != 0 && DispatchBinderMode() != 0) {
         resolve(dispatch_plan->stage, dispatch_plan->pipeline->GetStage(Shader::SwStage::Compute), 5u, dispatch_plan->bindings.data(), dispatch_plan->binding_count, nullptr);
     }
+}
+
+bool Rasterizer::PlannedImageWords(const Shader::Info& stage, u32 index, u32 dwords, const u32*& words, u32& binding_index) const {
+    const StagePlan* rs = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
+                          : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
+                                                                                                      : nullptr;
+    if (rs == nullptr || binder_plan == nullptr || index >= rs->image_words.size() || rs->image_words[index] == StagePlan::ImageUnknown) {
+        return false;
+    }
+    const u32 entry = rs->image_words[index];
+    if (entry == StagePlan::ImageNoEntry) {
+        words = nullptr;
+        binding_index = ~0u;
+    } else {
+        binding_index = entry >> 8;
+        if (binding_index >= binder_plan->binding_count || (entry & 0xff) + dwords > 8) {
+            return false;
+        }
+        words = binder_plan->bindings[binding_index].words + (entry & 0xff);
+    }
+    static const u32 every = [] {
+        const char* e = std::getenv("TLG_R3_VERIFY");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 0u;
+    }();
+    static thread_local u64 counter = 0;
+    if (every != 0 && ++counter % every == 0) {
+        // verify: the raster thread's own lookup gives the same words
+        u32 check_index = ~0u;
+        const u32* check = BinderWords(stage, stage.images[index].sharp_fetch.offsets[0], dwords, 2, &check_index);
+        const_cast<Rasterizer*>(this)->image_words_verified.fetch_add(1, std::memory_order_relaxed);
+        if ((check == nullptr) != (words == nullptr) || (check != nullptr && std::memcmp(check, words, dwords * sizeof(u32)) != 0)) {
+            const_cast<Rasterizer*>(this)->image_words_differing.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return true;
 }
 
 std::array<u64, 18> Rasterizer::TakeResolveStats() {
@@ -3146,7 +3211,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         u64 image_engine_id = 0; // L1(b): the engine's id of the view object the record's binding names
         if (binder_plan != nullptr && image_desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad) {
             u32 identity_binding = ~0u;
-            if (const u32* words = BinderWords(stage, image_desc.sharp_fetch.offsets[0], image_desc.is_r128 ? 4 : 8, 2, &identity_binding)) {
+            const u32* planned_words = nullptr;
+            const u32 image_index = static_cast<u32>(&image_desc - stage.images.data());
+            if (!PlannedImageWords(stage, image_index, image_desc.is_r128 ? 4 : 8, planned_words, identity_binding)) {
+                planned_words = BinderWords(stage, image_desc.sharp_fetch.offsets[0], image_desc.is_r128 ? 4 : 8, 2, &identity_binding);
+            }
+            if (const u32* words = planned_words) {
                 if (identity_binding != ~0u) {
                     image_engine_id = binder_plan->bindings[identity_binding].id;
                 }
@@ -3399,8 +3469,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             // The image is either bound as storage in a separate descriptor or bound as render
             // target in feedback loop. Depth images are excluded because they can't be bound as
             // storage and feedback loop doesn't make sense for them
+            vk::ImageLayout transit_layout = vk::ImageLayout::eGeneral; // R3 step 2: the layout the transit leaves the image in
             if ((binding.force_general || binding.is_target) && !image.info.props.is_depth) {
                 if (instance.IsAttachmentFeedbackLoopLayoutSupported() && image.binding.is_target) {
+                    transit_layout = vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
                     needs_barrier |= transit(
                         &image, vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
                         vk::PipelineStageFlagBits2::eAllGraphics, vk::AccessFlagBits2::eShaderRead);
@@ -3420,6 +3492,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     const auto new_layout = image.info.props.is_depth
                                                 ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                                 : vk::ImageLayout::eShaderReadOnlyOptimal;
+                    transit_layout = new_layout;
                     needs_barrier |= transit(
                         &image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
                         vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
@@ -3428,8 +3501,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
 
-            image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
-                                     runtime.CurrentLayout(image));
+            vk::ImageLayout bound_layout = transit_layout;
+            if (!image.backing || !runtime.PlannerDecidesLayouts()) {
+                bound_layout = runtime.CurrentLayout(image);
+            } else if (static const bool verify = std::getenv("TLG_R3_VERIFY") != nullptr; verify && bound_layout != runtime.CurrentLayout(image)) {
+                image_layout_differing.fetch_add(1, std::memory_order_relaxed);
+                bound_layout = runtime.CurrentLayout(image);
+            }
+            image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view, bound_layout);
             if (set_record && i < TextureSet::MaxImages) {
                 if (binding.force_general || binding.is_target || is_storage) {
                     set_record = false;

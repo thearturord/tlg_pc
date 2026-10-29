@@ -1704,6 +1704,9 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                 const auto r = rasterizer->TakeResolveStats();
                 Core::DebugServer::Publish("native_backend", {{"buffers_resolved_by_the_command_processor", r[0]}, {"bound_from_the_resolution", r[1]},
                                                               {"resolution_stale_at_bind", r[2]},
+                                                              {"images", {{"record_words_resolved_by_the_command_processor", rasterizer->image_words_planned.exchange(0)},
+                                                                          {"verified", rasterizer->image_words_verified.load()}, {"WORDS_DIFFERING", rasterizer->image_words_differing.load()},
+                                                                          {"LAYOUT_DIFFERING", rasterizer->image_layout_differing.load()}}},
                                                               {"object_copy_verify", {{"checked", rasterizer->ObjectCopyVerify().first}, {"DIFFERENT", rasterizer->ObjectCopyVerify().second}}},
                                                               {"stale_why", {{"epoch", r[12]}, {"gone", r[13]}, {"not_synchronized", r[14]}, {"generation_moved", r[15]}, {"arena", r[16]}, {"tracker_dirty", r[17]}}},
                                                               {"not_resolved", {{"no_record_entry", r[3]}, {"null_or_huge", r[4]}, {"no_engine_object", r[5]}, {"not_immutable", r[6]},
