@@ -88,6 +88,9 @@ void NoteHarvested(u64 address, u64 bytes, bool in_upload_ring);
 /// B8.2 (`TLG_B8_LIFETIME`): 0 off, 1 audit (images the engine's deleted textures leave behind are marked, a later use is counted), 2 native (an engine texture's
 /// images are freed when the engine deletes it, in order with the GPU work; the B3 table drops the ids of deleted views in both modes)
 [[nodiscard]] u32 B8LifetimeMode() noexcept;
+/// B8.3 (`TLG_B8_FIND`): 0 off, 1 audit (the image found by the engine texture's id is compared with the lookup by address), 2 native (an engine texture's
+/// image is found by its id; the page table lookup only runs when the texture has no matching image yet or no engine texture owns the memory)
+[[nodiscard]] u32 B8FindMode() noexcept;
 /// B8.2: the engine deleted a texture (`texture` true) or a view; queued with the next submission's batch
 void NoteEngineDelete(u64 id, u64 address, u64 bytes, bool texture);
 /// Where a deletion is carried out (raster thread, in order with the GPU work); set by the rasterizer
@@ -111,6 +114,11 @@ enum B8Count : u32 {
     B8UsedAfterDeleteReused,    ///< audit: an image of a deleted texture used again while a new engine texture owns its memory (native mode makes a new image)
     B8UsedAfterDeleteNoOwner,   ///< audit: ... while no engine texture owns its memory (native mode would lose it: must stay 0)
     B8ViewIdsDropped,           ///< B3 entries of deleted views dropped
+    B8FindById,                 ///< B8.3: image lookups answered by the engine texture's id
+    B8FindByIdOther,            ///< ... audit: the lookup by address found another image
+    B8FindNoImageYet,           ///< ... the texture has no matching image yet (page table lookup, then owned)
+    B8FindNoOwner,              ///< ... no engine texture starts at the memory (page table lookup)
+    B8FindOwned,                ///< images given to an engine texture
     B8Counts,
 };
 void NoteB8(B8Count what) noexcept;

@@ -124,7 +124,7 @@ public:
     /// dirtied (`newer` false, the second application: an image the GPU wrote since is left alone)
     void NoteAnnouncedWrite(VAddr addr, size_t size, bool newer);
     /// B8.2: the engine deleted the texture whose memory is [address, address + bytes): its images (same memory, not bigger) are freed (`free`) or marked (audit)
-    void NoteEngineTextureDelete(VAddr address, u64 bytes, bool free);
+    void NoteEngineTextureDelete(u64 id, VAddr address, u64 bytes, bool free);
     static void NoteRefreshedForWriteWatch(Image& image);
 
     /// Marks an image as dirty if it exists at the provided address.
@@ -470,6 +470,8 @@ private:
     PageManager& tracker;
     PageTable page_table;
     Common::SlotVector<Image> slot_images;
+    /// B8.3: the images of each engine texture (by its id; slot and uid, a stale entry is skipped), raster thread
+    std::unordered_map<u64, SmallVector<std::pair<ImageId, u64>, 2>> engine_images;
     Common::SlotVector<ImageView> slot_image_views;
     Common::SlotVector<Sampler> slot_samplers;
     BlitHelper blit_helper;

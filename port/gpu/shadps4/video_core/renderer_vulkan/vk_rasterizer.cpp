@@ -575,7 +575,7 @@ void Rasterizer::EngineObjectDeleted(u64 id, VAddr address, u64 bytes, bool text
         native_image_keys.erase(it);
     }
     if (texture) {
-        texture_cache.NoteEngineTextureDelete(address, bytes, Core::NativeUpdates::B8LifetimeMode() == 2);
+        texture_cache.NoteEngineTextureDelete(id, address, bytes, Core::NativeUpdates::B8LifetimeMode() == 2);
     }
 }
 

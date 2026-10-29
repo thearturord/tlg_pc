@@ -436,6 +436,14 @@ u32 B8LifetimeMode() noexcept {
     return mode;
 }
 
+u32 B8FindMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_B8_FIND");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 0u;
+    }();
+    return mode;
+}
+
 bool B8VerifyOn() noexcept {
     return B8ImageMode() == 2 && B8VerifyEvery() != 0;
 }
@@ -473,6 +481,8 @@ nlohmann::json B8Report() {
                           {"their_images", c(B8DeletedImages)}, {"images_bigger_left", c(B8DeletedImagesBigger)}, {"images_freed", c(B8DeletedImagesFreed)},
                           {"used_after_delete_new_owner", c(B8UsedAfterDeleteReused)}, {"USED_AFTER_DELETE_NO_OWNER", c(B8UsedAfterDeleteNoOwner)},
                           {"view_ids_dropped", c(B8ViewIdsDropped)}}},
+            {"find", {{"mode", B8FindMode()}, {"by_engine_id", c(B8FindById)}, {"AUDIT_OTHER_IMAGE_BY_ADDRESS", c(B8FindByIdOther)},
+                      {"no_image_yet", c(B8FindNoImageYet)}, {"no_engine_owner", c(B8FindNoOwner)}, {"images_owned", c(B8FindOwned)}}},
             {"note", "B8.1, cumulative: images refreshed by the engine's announcements instead of write faults"}};
 }
 
