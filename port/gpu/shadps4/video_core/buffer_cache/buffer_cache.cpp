@@ -811,9 +811,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     auto& memo = bind_memos[Vulkan::Scheduler::SideSelected() ? 1 : 0];
     const u64 tick = scheduler.CurrentTick();
     if (memo.tick != tick) {
-        // a new command buffer: the game may have changed anything since
+        // a new command buffer: copies in the stream buffer belong to the old one (the game may rewrite their memory between submissions); answers that name
+        // an arena or a placed buffer stay valid until a write or a move erases them (the frame has about 13 command buffers)
         memo.tick = tick;
-        memo.entries.clear();
+        for (auto it = memo.entries.begin(); it != memo.entries.end();) {
+            it->second.erase(std::remove_if(it->second.begin(), it->second.end(), [&](const BindMemoEntry& e) { return e.buffer == &stream_buffer; }), it->second.end());
+            it = it->second.empty() ? memo.entries.erase(it) : std::next(it);
+        }
     }
     const u64 epoch = bind_memo_epoch.load(std::memory_order_acquire);
     const u64 ranges = range_epoch.load(std::memory_order_acquire);
