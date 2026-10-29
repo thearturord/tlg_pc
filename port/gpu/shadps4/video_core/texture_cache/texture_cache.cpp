@@ -1459,10 +1459,10 @@ void TextureCache::RefreshImage(Image& image) {
         // Dark frame (2026-10-29): an image inside the frame ring (UntrackedRing: its pages are never write protected, so no fault, no write watch and no announcement marks it
         // dirty) keeps what the ring held when it was uploaded. The game maps small dynamic textures (R32F 4x4 / 16x16, call site 0x1c98a17) into the ring every frame and the
         // draws sample them there; when the ring wraps, a new one lands on the address of an old image that is still registered and the old contents are drawn with. The bytes
-        // decide: a ring image whose guest bytes differ from the ones it was uploaded with is uploaded again (`TLG_RING_IMAGE_CHECK=0` turns the check off).
+        // decide: a ring image whose guest bytes differ from the ones it was uploaded with is uploaded again (`TLG_RING_IMAGE_CHECK=1`; off by default).
         static const bool ring_check = [] {
-            const char* e = std::getenv("TLG_RING_IMAGE_CHECK");
-            return e == nullptr || *e != '0';
+            const char* e = std::getenv("TLG_RING_IMAGE_CHECK"); // off by default: the owner's walking play (2026-10-29) had 5 dark frames and 0 catches, so it is not the cause
+            return e != nullptr && *e == '1';
         }();
         const auto& ring = UntrackedRing::Get();
         if (ring_check && ring.Active() && image.info.guest_size <= (256u << 10) && image.info.guest_address >= ring.Start() &&
