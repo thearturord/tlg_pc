@@ -32,7 +32,15 @@ T Rd(u64 base, u64 offset) {
 std::shared_mutex table_mutex;
 std::unordered_map<u64, Object> by_id;
 std::unordered_map<u64, u64> id_by_object;
-std::map<VAddr, u64> resource_by_address; ///< live resources by their memory (address -> id)
+/// live resources by their memory: what the walks by address need, kept inline (the raster thread walks this for every announcement and upload; a hash
+/// lookup per entry was the hottest code of the raster thread, 2026-10-30 profile)
+struct AddrEntry {
+    u64 id;
+    VAddr end;
+    Kind kind;
+    u32 usage, cpu_access;
+};
+std::map<VAddr, AddrEntry> resource_by_address;
 
 std::atomic<u64> resources_noted{0}, views_noted{0}, deletes_noted{0}, deletes_unknown{0}, bad_reads{0};
 std::array<std::atomic<u64>, 9> live_by_kind{};
@@ -109,10 +117,16 @@ void Insert(const Object& object) {
         }
         id_by_object.erase(it->second.object);
     }
+    if (const auto old = by_id.find(object.id); old != by_id.end() && old->second.address != object.address) {
+        if (const auto at = resource_by_address.find(old->second.address); at != resource_by_address.end() && at->second.id == object.id) {
+            resource_by_address.erase(at);
+        }
+    }
     by_id[object.id] = object;
     id_by_object[object.object] = object.id;
     if (object.kind >= Kind::Buffer && object.kind <= Kind::Texture3D && object.address != 0) {
-        resource_by_address[object.address] = object.id;
+        const u64 bytes = object.kind == Kind::Buffer ? std::max<u64>(object.bytes, 1) : object.bytes;
+        resource_by_address[object.address] = AddrEntry{object.id, object.address + bytes, object.kind, object.usage, object.cpu_access};
     }
     live_by_kind[static_cast<u32>(object.kind)].fetch_add(1, std::memory_order_relaxed);
 }
@@ -209,15 +223,14 @@ void NoteDelete(u64 object) {
         entry->second.alive = false;
         live_by_kind[static_cast<u32>(entry->second.kind)].fetch_sub(1, std::memory_order_relaxed);
         const Object& gone = entry->second;
-        if (const auto at = resource_by_address.find(gone.address); at != resource_by_address.end() && at->second == gone.id) {
+        if (const auto at = resource_by_address.find(gone.address); at != resource_by_address.end() && at->second.id == gone.id) {
             resource_by_address.erase(at); // a deleted resource leaves the map by memory (the walks below would count it)
         }
         const bool texture = gone.kind >= Kind::Texture1D && gone.kind <= Kind::Texture3D;
         if (texture && gone.address != 0) { // (a texture whose size read 0 at creation still owns images: its lists go too)
             // B8.2: another live texture at the same memory (an alias) keeps the images (they are not freed; the deleted texture's lists still go)
             const auto at = resource_by_address.find(gone.address);
-            const auto owner = at != resource_by_address.end() && at->second != gone.id ? by_id.find(at->second) : by_id.end();
-            const bool alias = owner != by_id.end() && owner->second.alive && owner->second.kind >= Kind::Texture1D && owner->second.kind <= Kind::Texture3D;
+            const bool alias = at != resource_by_address.end() && at->second.id != gone.id && at->second.kind >= Kind::Texture1D && at->second.kind <= Kind::Texture3D;
             if (alias) {
                 Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8TextureAliasKept);
             }
@@ -234,18 +247,19 @@ void NoteDelete(u64 object) {
 bool ResourceAt(VAddr address, Object& out) {
     std::shared_lock lock{table_mutex};
     auto it = resource_by_address.upper_bound(address);
-    while (it != resource_by_address.begin()) {
-        --it;
-        const auto entry = by_id.find(it->second);
-        if (entry != by_id.end() && entry->second.alive && address < entry->second.address + std::max<u64>(entry->second.bytes, 1)) {
-            out = entry->second;
-            return true;
-        }
-        if (entry != by_id.end() && entry->second.alive) {
-            return false; // the nearest live resource below ends before the address
-        }
+    if (it == resource_by_address.begin()) {
+        return false;
     }
-    return false;
+    --it;
+    if (address >= std::max(it->second.end, it->first + 1)) {
+        return false; // the nearest resource below ends before the address
+    }
+    const auto entry = by_id.find(it->second.id);
+    if (entry == by_id.end()) {
+        return false;
+    }
+    out = entry->second;
+    return true;
 }
 
 bool TexturesIn(VAddr address, u64 size, std::vector<u64>& out) {
@@ -262,17 +276,16 @@ bool TexturesIn(VAddr address, u64 size, std::vector<u64>& out) {
         u32 below = 0; // entries that start before the range: a few are looked at (a texture that starts earlier and reaches in)
         while (it != resource_by_address.begin() && below < 16) {
             --it;
-            const auto entry = by_id.find(it->second);
-            if (it->first < address && entry != by_id.end() && entry->second.alive) {
-                ++below; // only live entries count (dead ones are skipped)
+            const AddrEntry& e = it->second;
+            if (it->first < address) {
+                ++below;
             }
-            if (entry == by_id.end() || !entry->second.alive || entry->second.kind < Kind::Texture1D || entry->second.kind > Kind::Texture3D ||
-                entry->second.address != it->first || it->first + entry->second.bytes <= address) {
+            if (e.kind < Kind::Texture1D || e.kind > Kind::Texture3D || e.end <= address) {
                 continue;
             }
-            out.push_back(entry->second.id);
+            out.push_back(e.id);
             if (num_spans < spans.size()) {
-                spans[num_spans++] = {std::max(it->first, address), std::min(it->first + entry->second.bytes, end)};
+                spans[num_spans++] = {std::max(it->first, address), std::min(e.end, end)};
             } else {
                 overflow = true;
             }
@@ -302,16 +315,14 @@ void BuffersIn(VAddr address, u64 size, std::vector<BufferPart>& out) {
     u32 below = 0; // entries that start before the range: a few are looked at (a buffer that starts earlier and reaches in)
     while (it != resource_by_address.begin() && below < 16) {
         --it;
-        const auto entry = by_id.find(it->second);
-        if (it->first < address && entry != by_id.end() && entry->second.alive) {
-            ++below; // only live entries count (dead ones are skipped)
+        const AddrEntry& e = it->second;
+        if (it->first < address) {
+            ++below;
         }
-        if (entry == by_id.end() || !entry->second.alive || entry->second.kind != Kind::Buffer || entry->second.address != it->first ||
-            it->first + std::max<u64>(entry->second.bytes, 1) <= address) {
+        if (e.kind != Kind::Buffer || e.end <= address) {
             continue;
         }
-        out.push_back({entry->second.id, std::max(it->first, address), std::min<VAddr>(it->first + std::max<u64>(entry->second.bytes, 1), end), entry->second.usage,
-                       entry->second.cpu_access, it->first, it->first + std::max<u64>(entry->second.bytes, 1)});
+        out.push_back({e.id, std::max(it->first, address), std::min<VAddr>(e.end, end), e.usage, e.cpu_access, it->first, e.end});
     }
 }
 

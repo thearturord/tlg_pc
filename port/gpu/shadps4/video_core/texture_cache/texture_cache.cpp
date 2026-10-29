@@ -472,6 +472,9 @@ void TextureCache::EngineImagesIn(const std::vector<u64>& ids, VAddr address, u6
 }
 
 void TextureCache::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
+    if (engine_pending_clears.empty() && !AnyImageOverlaps(addr, size)) {
+        return; // no image in this memory (most announcements: buffer contents); the page table answers that in a few lookups
+    }
     SmallVector<ImageId, 8> image_ids;
     // B8.4: a range the engine's textures cover finds its images through them (their lists); B8.5: a range engine buffers cover, through the buffers' lists;
     // only memory neither covers whole asks the page table
@@ -989,9 +992,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                 }
             }
         }
-        if (answer != nullptr && !ImageUnchangedSince(answer->image_id, answer->uid, answer->generation, info.guest_address, info.guest_size)) {
-            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8FindAnswerStale);
-            answer = nullptr;
+        if (answer != nullptr) {
+            if (!ImageUnchangedSince(answer->image_id, answer->uid, answer->generation, info.guest_address, info.guest_size)) {
+                Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8FindAnswerStale);
+                answer = nullptr;
+            } else {
+                // valid up to now: the next check only reads the events after this one (it used to read every event since the answer was made)
+                const_cast<EngineAnswer*>(answer)->generation = image_generation.load(std::memory_order_acquire);
+            }
         }
         if (answer != nullptr) {
             Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8FindByAnswer);
