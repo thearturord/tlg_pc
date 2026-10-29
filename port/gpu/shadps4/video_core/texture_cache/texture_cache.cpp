@@ -714,8 +714,6 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
             RefreshImage(new_image);
         }
         new_image.flags &= ~ImageFlagBits::Dirty;
-        // When creating a depth buffer through overlap resolution don't clear it on first use.
-        new_image.info.meta_info.htile_clear_mask = 0;
         runtime.CopyColorAndDepth(&cache_image, &new_image);
 
         // Free the cache image.
@@ -1101,9 +1099,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                 Image& target = slot_images[found];
                 const EngineClear clear = pending->second;
                 engine_pending_clears.erase(pending);
-                if (target.info.props.is_depth == clear.depth && target.info.resources.levels == 1) {
-                    const SubresourceRange range{.base = {0, 0}, .extent = {1, static_cast<u16>(target.info.resources.layers)}};
-                    if (clear.fast) {
+                const u32 layers = clear.layer_count == 0 ? target.info.resources.layers : clear.layer_count;
+                if (target.info.props.is_depth == clear.depth && clear.mip < target.info.resources.levels && clear.first_layer + layers <= target.info.resources.layers) {
+                    const SubresourceRange range{.base = {static_cast<u16>(clear.mip), static_cast<u16>(clear.first_layer)}, .extent = {1, static_cast<u16>(layers)}};
+                    const bool whole = target.info.resources.levels == 1 && clear.first_layer == 0 && layers == target.info.resources.layers;
+                    if (!whole && True(target.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty))) {
+                        RefreshImage(target); // the rest of the image from memory first
+                    }
+                    if (clear.fast && whole) {
                         target.pending_fast_clear = EngineColorValue(target.info.pixel_format, clear.value);
                     } else {
                         if (clear.depth) {
@@ -1112,7 +1115,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                         } else {
                             runtime.ClearImage(&target, range, EngineColorValue(target.info.pixel_format, clear.value));
                         }
-                        target.flags &= ~(ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty);
+                        if (whole) {
+                            target.flags &= ~(ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty);
+                        }
                         target.flags |= ImageFlagBits::GpuModified;
                     }
                     Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeClearAtFirstImage);
@@ -1489,7 +1494,6 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
                                      .owner_id = image_id,
                                      .owner_uid = image.image_uid,
                                      .num_samples = image.info.num_samples,
-                                     .clear_mask = image.info.meta_info.htile_clear_mask,
                                  });
     }
 

@@ -586,91 +586,54 @@ void Rasterizer::SetEngineClear(const Core::NativeDevice::ClearRecord* record) {
         return;
     }
     engine_clear = *record;
-    // bisect switches: TLG_B11_KINDS=color or depth (only that kind runs natively), TLG_B11_SKIP=0 (the work inside the clear still runs)
-    static const u32 kinds = [] {
-        const char* e = std::getenv("TLG_B11_KINDS");
-        return e == nullptr ? 3u : std::string_view{e} == "color" ? 1u : std::string_view{e} == "depth" ? 2u : 3u;
-    }();
-    static const bool skip = [] {
-        const char* e = std::getenv("TLG_B11_SKIP");
-        return e == nullptr || *e != '0';
-    }();
-    if (Core::NativeDevice::B11ClearsOn() && (kinds & (1u << engine_clear.kind)) != 0) {
-        engine_clear_skip = NativeClear(engine_clear) && skip;
-    }
+    engine_clear_skip = NativeClear(engine_clear);
 }
 
 bool Rasterizer::NativeClear(const Core::NativeDevice::ClearRecord& record) {
-    // A color fast clear (the target has a meta surface) writes only the CMASK on the console: the color memory changes when a fast clear eliminate runs, and a texture
-    // read before that sees the old pixels; the game's image depends on it (owner play 2026-10-29: Trico's feathers over the view when it ran as a full clear).
-    // It keeps its path (the eliminate clears); TLG_B11_FAST=1 runs it as a Vulkan clear anyway (study).
-    // Step 5 (TLG_B11_FAST, default 2): the fast clear is kept on the engine texture's images as a pending clear (Image::pending_fast_clear), applied where the
-    // console's CMASK would take effect: the next render pass on the image, or the fast clear eliminate. 0 keeps the old path (the meta fill recognized as a
-    // clear of the CMASK), 1 clears at once (study: wrong, see above).
-    const u32 fast_mode = B11FastMode();
+    // B11: the engine's clear as a Vulkan clear of the texture's images at its place in the stream. A color fast clear (the target has a meta surface) writes only
+    // the CMASK on the console: the memory changes when the fast clear eliminate runs, and a texture read before that sees the old pixels (the game depends on it:
+    // Trico's feathers over the view when it ran as a full clear, owner play 2026-10-29). It is kept on the image as a pending clear, applied as the clear of the
+    // next render pass on the image or at the eliminate (audit against the old CMASK tracking: 8,832 same decisions, 0 value differences).
     const bool fast_clear = record.kind == 0 && record.path == 1;
-    if (fast_clear && fast_mode == 0) {
-        Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeFastClearKept);
-        return false;
-    }
     Core::NativeDevice::Object resource;
-    if (!Core::NativeDevice::Lookup(record.resource_id, resource) || resource.depth > 1 || record.layer_count == 0) {
-        // a 3D texture's slices: the old path
+    if (!Core::NativeDevice::Lookup(record.resource_id, resource)) {
         Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeNotEligible);
         return false;
     }
+    // a view of a 3D texture (slices): the whole texture
+    const bool slices = resource.depth > 1 || record.layer_count == 0;
     decltype(std::declval<VideoCore::TextureCache&>().EngineImagesOfType()) ids;
     texture_cache.EngineImagesOf(record.resource_id, ids);
-    // B11 step 4: the view's mip and layers, in every image of the texture that holds them (an image of the texture's memory with the texture's size; it may
-    // hold fewer mips or layers). A partial clear of an image with CPU changes not uploaded yet keeps the old path (the upload would cover the whole image).
+    // the view's mip and layers, in every image of the texture that holds them (an image of the texture's memory with the texture's size; it may hold fewer mips
+    // or layers); an image of another size at that memory is another view of it and is left alone
     boost::container::small_vector<std::pair<VideoCore::ImageId, VideoCore::SubresourceRange>, 4> targets;
     for (const auto image_id : ids) {
         const auto& image = texture_cache.GetImage(image_id);
-        if (image.info.props.is_depth != (record.kind == 1)) {
+        if (image.info.props.is_depth != (record.kind == 1) || image.info.size.width != resource.width || image.info.size.height != resource.height) {
             continue;
         }
-        if (image.info.size.width != resource.width || image.info.size.height != resource.height) {
-            Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeNotEligible);
-            return false;
-        }
         const u32 levels = image.info.resources.levels, layers = image.info.resources.layers;
+        if (slices) {
+            targets.emplace_back(image_id, VideoCore::SubresourceRange{.base = {static_cast<u16>(std::min(record.mip, levels - 1)), 0},
+                                                                       .extent = {1, static_cast<u16>(layers)}});
+            continue;
+        }
         if (record.mip >= levels || record.first_layer + record.layer_count > layers) {
             continue;
         }
-        const VideoCore::SubresourceRange range{.base = {static_cast<u16>(record.mip), static_cast<u16>(record.first_layer)},
-                                                .extent = {1, static_cast<u16>(record.layer_count)}};
-        const bool whole = levels == 1 && record.first_layer == 0 && record.layer_count == layers;
-        if (!whole && True(image.flags & (VideoCore::ImageFlagBits::CpuDirty | VideoCore::ImageFlagBits::MaybeCpuDirty))) {
-            Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeNotEligible);
-            return false;
-        }
-        targets.emplace_back(image_id, range);
+        targets.emplace_back(image_id, VideoCore::SubresourceRange{.base = {static_cast<u16>(record.mip), static_cast<u16>(record.first_layer)},
+                                                                   .extent = {1, static_cast<u16>(record.layer_count)}});
     }
     if (targets.empty()) {
-        // B11 step 6: a clear of the whole texture before its first image is kept on the texture and applied when the image is made
-        const bool whole = resource.mips == 1 && record.first_layer == 0 && record.layer_count == std::max<u32>(resource.layers, 1);
-        if (!ids.empty() || !whole || fast_mode == 3) {
-            Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeNoImage);
-            return false;
-        }
-        VideoCore::TextureCache::EngineClear clear{.depth = record.kind == 1, .fast = fast_clear && fast_mode == 2, .flags = record.flags, .stencil = record.stencil};
+        // a clear before the texture's first image waits on the texture and is applied when the image is made
+        VideoCore::TextureCache::EngineClear clear{.depth = record.kind == 1, .fast = fast_clear, .flags = record.flags, .stencil = record.stencil,
+                                                   .mip = record.mip, .first_layer = slices ? 0 : record.first_layer, .layer_count = slices ? 0 : record.layer_count};
         std::memcpy(clear.value, record.value, sizeof(clear.value));
-        if (fast_clear && fast_mode == 1) {
-            clear.fast = false;
-        }
         texture_cache.SetEnginePendingClear(record.resource_id, clear);
         Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeClearBeforeImage);
         Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeDone);
         ++recorded_work;
         return true;
-    }
-    if (fast_clear && fast_mode >= 2 && std::ranges::any_of(targets, [&](const auto& t) {
-            const auto& image = texture_cache.GetImage(t.first);
-            return image.info.resources.levels != 1 || t.second.base.layer != 0 || t.second.extent.layers != image.info.resources.layers;
-        })) {
-        // a pending clear is kept per image: a fast clear of a part of an image keeps the old path
-        Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeFastClearKept);
-        return false;
     }
     if (record.mip != 0 || record.first_layer != 0 || resource.mips > 1 || resource.layers > 1) {
         Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeSubresource);
@@ -678,12 +641,19 @@ bool Rasterizer::NativeClear(const Core::NativeDevice::ClearRecord& record) {
     for (const auto& [image_id, range] : targets) {
         auto& image = texture_cache.GetImage(image_id);
         const bool whole = image.info.resources.levels == 1 && range.base.layer == 0 && range.extent.layers == image.info.resources.layers;
+        if (!whole && True(image.flags & (VideoCore::ImageFlagBits::CpuDirty | VideoCore::ImageFlagBits::MaybeCpuDirty))) {
+            // the rest of the image takes its CPU changes first (the upload covers the whole image)
+            texture_cache.UpdateImage(image_id);
+        }
         if (record.kind == 0) {
             const vk::ClearValue value = VideoCore::TextureCache::EngineColorValue(image.info.pixel_format, record.value);
-            if (fast_clear && fast_mode >= 2) {
+            if (fast_clear && whole) {
                 image.pending_fast_clear = value;
                 Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeFastClearPending);
                 continue;
+            }
+            if (fast_clear) {
+                Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeFastClearKept); // a fast clear of a part of an image: cleared at once
             }
             runtime.ClearImage(&image, range, value);
         } else {
@@ -697,42 +667,9 @@ bool Rasterizer::NativeClear(const Core::NativeDevice::ClearRecord& record) {
         image.flags |= VideoCore::ImageFlagBits::GpuModified;
         Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeImages);
     }
-    if (fast_clear && fast_mode == 3) {
-        return false; // audit: the old path runs too and is compared where the pending clear is used
-    }
     Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeDone);
     ++recorded_work;
     return true;
-}
-
-u32 Rasterizer::B11FastMode() {
-    static const u32 mode = [] {
-        const char* e = std::getenv("TLG_B11_FAST");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 2u;
-    }();
-    return mode;
-}
-
-void Rasterizer::AuditFastClear(bool old_clear, const vk::ClearValue& old_value, const std::optional<vk::ClearValue>& pending, VAddr address) {
-    using namespace Core::NativeDevice;
-    if (old_clear == pending.has_value()) {
-        NoteClearNative(old_clear ? FastAuditBothClear : FastAuditNeither);
-        if (old_clear && std::memcmp(old_value.color.uint32.data(), pending->color.uint32.data(), 16) != 0) {
-            NoteClearNative(FastAuditValueDiffers);
-            static std::atomic<u32> logged{0};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
-                LOG_WARNING(Render_Vulkan, "B11 fast clear audit at {:#x}: old value {:#x} {:#x} {:#x} {:#x}, engine {:#x} {:#x} {:#x} {:#x}", address, old_value.color.uint32[0],
-                            old_value.color.uint32[1], old_value.color.uint32[2], old_value.color.uint32[3], pending->color.uint32[0], pending->color.uint32[1],
-                            pending->color.uint32[2], pending->color.uint32[3]);
-            }
-        }
-        return;
-    }
-    NoteClearNative(old_clear ? FastAuditOldOnly : FastAuditPendingOnly);
-    static std::atomic<u32> logged{0};
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
-        LOG_WARNING(Render_Vulkan, "B11 fast clear audit at {:#x}: old path {}, pending engine clear {}", address, old_clear, pending.has_value());
-    }
 }
 
 void Rasterizer::EngineObjectDeleted(u64 id, VAddr address, u64 bytes, u32 what) {
@@ -1215,40 +1152,18 @@ void Rasterizer::EliminateFastClear(const DrawInputs& inputs, const AmdGpu::CbDb
     VideoCore::TextureCache::ImageDesc desc(col_buf, cb0);
     const auto image_id = texture_cache.FindImage(desc);
     const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
-    if (B11FastMode() == 3 && !engine_clear_on) {
-        auto& image = texture_cache.GetImage(image_id);
-        AuditFastClear(texture_cache.IsMetaCleared(col_buf.CmaskAddress(), col_buf.view.slice_start), LiverpoolToVK::ColorBufferClearValue(col_buf), image.pending_fast_clear,
-                       col_buf.Address());
-        image.pending_fast_clear.reset();
-    }
-    if (auto& image = texture_cache.GetImage(image_id); image.pending_fast_clear && !engine_clear_on) {
-        // B11 step 5: the engine fast clear pending on the image is written now (the eliminate is where the console writes it into the memory)
-        const vk::ClearValue value = *image.pending_fast_clear;
-        image.pending_fast_clear.reset();
-        for (u32 slice = col_buf.view.slice_start; slice <= col_buf.view.slice_max; ++slice) {
-            texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
-        }
-        Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeFastClearAtEliminate);
-        runtime.ClearImage(&image, desc.view_info.range, value);
-        return;
-    }
-    if (!texture_cache.IsMetaCleared(col_buf.CmaskAddress(), col_buf.view.slice_start)) {
+    auto& image = texture_cache.GetImage(image_id);
+    if (!image.pending_fast_clear || SkipForEngineClear()) {
         Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseFastClearEliminateNothing, engine_clear_on);
         return;
     }
-    if (SkipForEngineClear()) {
-        return;
-    }
+    // B11: the engine fast clear pending on the image is written now (the eliminate is where the console writes it into the memory)
     Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseFastClearEliminate, engine_clear_on);
-    for (u32 slice = col_buf.view.slice_start; slice <= col_buf.view.slice_max; ++slice) {
-        texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
-    }
-    auto& image = texture_cache.GetImage(image_id);
-    const auto clear_value = LiverpoolToVK::ColorBufferClearValue(col_buf);
-
-    ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}:M={:#x}", col_buf.Address(),
-                                 col_buf.CmaskAddress()));
-    runtime.ClearImage(&image, desc.view_info.range, clear_value);
+    const vk::ClearValue value = *image.pending_fast_clear;
+    image.pending_fast_clear.reset();
+    Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeFastClearAtEliminate);
+    ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}", col_buf.Address()));
+    runtime.ClearImage(&image, desc.view_info.range, value);
     ScopeMarkerEnd();
 }
 
@@ -1269,7 +1184,6 @@ void Rasterizer::ClearDepthTarget(const DrawInputs& regs, const AmdGpu::CbDbExte
     auto& image = texture_cache.GetImage(image_id);
     const bool clear_depth = regs.depth_render_control.depth_clear_enable && regs.depth_buffer.DepthValid();
     const bool clear_stencil = regs.depth_render_control.stencil_clear_enable && regs.depth_buffer.StencilValid();
-    texture_cache.TouchMeta(htile_address, desc.view_info.range.base.layer, false);
     ScopeMarkerBegin(fmt::format("ClearDepthTarget:{:#x}", regs.depth_buffer.DepthAddress()));
     runtime.ClearDepthStencilImage(&image, desc.view_info.range, clear_depth, regs.depth_clear, clear_stencil,
                                    regs.stencil_clear);
@@ -2298,22 +2212,6 @@ bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
         }
     }
 
-    // Metadata surfaces are tiled and thus need address calculation to be written properly.
-    // If a shader wants to encode HTILE, for example, from a depth image it will have to compute
-    // proper tile address from dispatch invocation id. This address calculation contains an xor
-    // operation so use it as a heuristic for metadata writes that are probably not clears.
-    if (!info.has_bitwise_xor) {
-        // Assume if a shader writes metadata without address calculation, it is a clear shader.
-        for (const auto& desc : info.buffers) {
-            const VAddr address = desc.GetSharp(info).base_address;
-            if (!desc.IsSpecial() && desc.is_written && texture_cache.ClearMeta(address)) {
-                Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseMetaClearDispatch, engine_clear_on); // B11 census
-                // Assume all slices were updates
-                LOG_TRACE(Render_Vulkan, "Metadata update skipped");
-                return true;
-            }
-        }
-    }
     return false;
 }
 
@@ -4203,14 +4101,9 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         const auto mip = image_view.info.range.base.level;
 
         const auto& col_buf = regs.color_buffers[cb];
-        bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
-        texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
-        // B11 step 5: an engine fast clear pending on the image is the render pass's clear (its value is the engine's)
+        // B11: an engine fast clear pending on the image is the render pass's clear (its value is the engine's)
+        bool is_clear = false;
         std::optional<vk::ClearValue> engine_clear_value;
-        if (B11FastMode() == 3) {
-            AuditFastClear(is_clear, LiverpoolToVK::ColorBufferClearValue(col_buf), image->pending_fast_clear, col_buf.Address());
-            image->pending_fast_clear.reset();
-        }
         if (image->pending_fast_clear) {
             engine_clear_value = image->pending_fast_clear;
             image->pending_fast_clear.reset();
@@ -4243,8 +4136,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         state.height = std::min<u32>(state.height, std::max(image->info.size.height >> mip, 1u));
         state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
 
-        const auto clear_value =
-            engine_clear_value ? *engine_clear_value : is_clear ? LiverpoolToVK::ColorBufferClearValue(col_buf) : vk::ClearValue{};
+        const auto clear_value = engine_clear_value ? *engine_clear_value : vk::ClearValue{};
         auto& attachment = state.color_attachments[cb];
         attachment.image_view = *image_view.image_view;
         attachment.image_layout = runtime.CurrentLayout(*image);
@@ -4268,12 +4160,8 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         Core::NativeDevice::CheckTarget(true, image.info.guest_address, image.info.size.width, image.info.size.height); // B4 census
 
         const auto slice = image_view.info.range.base.layer;
-        const bool is_depth_clear =
-            (regs.depth_render_control.depth_clear_enable && regs.depth_control.depth_enable &&
-             regs.depth_control.depth_write_enable) ||
-            texture_cache.IsMetaCleared(htile_address, slice);
+        const bool is_depth_clear = regs.depth_render_control.depth_clear_enable && regs.depth_control.depth_enable && regs.depth_control.depth_write_enable;
         const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
-        texture_cache.TouchMeta(htile_address, slice, false);
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
 
         const bool has_stencil = image.info.props.has_stencil;
@@ -4837,8 +4725,11 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     Core::ResourceAudit::Note(is_gds ? Core::ResourceAudit::GdsFill : Core::ResourceAudit::MemoryCopyDst, address, num_bytes, true);
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
+    if (!is_gds && texture_cache.GetMetaInfo(address) && SkipForEngineClear()) {
+        // B11: the meta fill of an engine clear that ran natively (the CMASK / HTILE are not the image's state any more)
+        return;
+    }
     if (!is_gds) {
-        texture_cache.ClearMeta(address);
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);

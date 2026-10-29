@@ -65,7 +65,6 @@ struct ImageInfo {
         VAddr cmask_addr;
         VAddr fmask_addr;
         VAddr htile_addr;
-        s32 htile_clear_mask = -1;
     } meta_info{};
 
     ImageProperties props;

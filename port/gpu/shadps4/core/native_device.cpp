@@ -602,14 +602,6 @@ void TakeClears(u64 begin, u64 end, std::vector<ClearRecord>& out) {
     }
 }
 
-bool B11ClearsOn() noexcept {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_B11_CLEARS");
-        return e == nullptr || *e != '0'; // default on since 2026-10-30 (steps 4 to 6: views of a mip or layer, fast clears pending, clears before the first image); =0 off
-    }();
-    return on;
-}
-
 void NoteClearNative(ClearNative what, u64 n) {
     clear_native[what].fetch_add(n, std::memory_order_relaxed);
 }
@@ -648,15 +640,12 @@ nlohmann::json ClearReport() {
                           {"dropped_never_submitted", clear_match[MatchDropped].load()}, {"met_by_the_command_processor", clear_match[MatchEntered].load()},
                           {"entries_inside", {{"tags", clear_match[MatchEntriesTag].load()}, {"syncs", clear_match[MatchEntriesSync].load()},
                                               {"packets", clear_match[MatchEntriesPacket].load()}, {"other", clear_match[MatchEntriesOther].load()}}}}},
-            {"native", {{"on", B11ClearsOn()}, {"clears_done_as_vulkan_clears", clear_native[NativeDone].load()}, {"images_cleared", clear_native[NativeImages].load()},
-                        {"not_eligible_mips_or_layers", clear_native[NativeNotEligible].load()}, {"no_image_yet_old_path", clear_native[NativeNoImage].load()},
-                        {"work_skipped_inside", clear_native[NativeSkippedWork].load()}, {"color_fast_clears_kept_on_their_path", clear_native[NativeFastClearKept].load()},
+            {"native", {{"clears_done_as_vulkan_clears", clear_native[NativeDone].load()}, {"images_cleared", clear_native[NativeImages].load()},
+                        {"not_found_in_the_object_table", clear_native[NativeNotEligible].load()},
+                        {"work_skipped_inside", clear_native[NativeSkippedWork].load()}, {"fast_clears_of_a_part_cleared_at_once", clear_native[NativeFastClearKept].load()},
                         {"of_one_mip_or_layer_or_a_mipped_texture", clear_native[NativeSubresource].load()},
                         {"fast_clears_pending", clear_native[NativeFastClearPending].load()}, {"fast_clears_applied_at_a_render_pass", clear_native[NativeFastClearAtRenderPass].load()},
                         {"fast_clears_applied_at_the_eliminate", clear_native[NativeFastClearAtEliminate].load()},
-                        {"fast_audit", {{"both_clear", clear_native[FastAuditBothClear].load()}, {"neither", clear_native[FastAuditNeither].load()},
-                                        {"old_path_only", clear_native[FastAuditOldOnly].load()}, {"pending_only", clear_native[FastAuditPendingOnly].load()},
-                                        {"value_differs", clear_native[FastAuditValueDiffers].load()}}},
                         {"before_the_first_image", clear_native[NativeClearBeforeImage].load()}, {"applied_at_the_first_image", clear_native[NativeClearAtFirstImage].load()},
                         {"first_image_did_not_fit", clear_native[NativeClearFirstImageMismatch].load()}}},
             {"back_end_inside_vs_outside_a_clear", {

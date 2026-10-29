@@ -271,9 +271,6 @@ public:
     void SetEngineClear(const Core::NativeDevice::ClearRecord* record);
     /// B11 step 3: the clear as a Vulkan clear of the target's own images; false when it cannot (the old path runs)
     bool NativeClear(const Core::NativeDevice::ClearRecord& record);
-    /// B11 step 5: TLG_B11_FAST (0 old path, 1 clear at once, 2 pending clear on the image (default), 3 audit: pending kept next to the old path and compared)
-    static u32 B11FastMode();
-    void AuditFastClear(bool old_clear, const vk::ClearValue& old_value, const std::optional<vk::ClearValue>& pending, VAddr address);
     /// B11 step 3: true when the work at hand belongs to an engine clear that ran natively (it is skipped)
     bool SkipForEngineClear() {
         if (engine_clear_on && engine_clear_skip) {

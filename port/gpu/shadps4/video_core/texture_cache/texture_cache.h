@@ -129,11 +129,12 @@ public:
     void NoteEngineTextureCreate(VAddr address, u64 bytes);
     /// B8.4: the images listed for the engine textures `ids` (their own and their remembered answers) that meet [address, address + size), each once
     void EngineImagesIn(const std::vector<u64>& ids, VAddr address, u64 size, SmallVector<ImageId, 8>& out) const;
-    /// B11 step 6: an engine clear of a texture that has no image yet (whole texture: one mip, all layers); applied to its first image when the lookup lists it
+    /// B11: an engine clear of a texture that has no image yet; applied to its first image when the lookup lists it
     struct EngineClear {
         bool depth{}, fast{};
         u32 flags{}, stencil{};
         float value[4]{};
+        u32 mip{}, first_layer{}, layer_count{}; ///< layer_count 0: every layer
     };
     void SetEnginePendingClear(u64 id, const EngineClear& clear) {
         engine_pending_clears[id] = clear;
@@ -289,7 +290,6 @@ public:
         ImageId owner_id{};
         u64 owner_uid{};
         u32 num_samples = 1;
-        s32 clear_mask = -1;
     };
 
     /// Returns metadata information if the specified address belongs to a live image.
@@ -316,39 +316,6 @@ public:
             return it->second.type;
         }
         return std::nullopt;
-    }
-
-    /// Returns true if a slice of the specified metadata surface has been cleared.
-    bool IsMetaCleared(VAddr address, u32 slice) const {
-        const auto& it = surface_metas.find(address);
-        if (it != surface_metas.end()) {
-            return it->second.clear_mask & (1u << slice);
-        }
-        return false;
-    }
-
-    /// Clears all slices of the specified metadata surface.
-    bool ClearMeta(VAddr address) {
-        auto it = surface_metas.find(address);
-        if (it != surface_metas.end()) {
-            it->second.clear_mask = u32(-1);
-            return true;
-        }
-        return false;
-    }
-
-    /// Updates the state of a slice of the specified metadata surface.
-    bool TouchMeta(VAddr address, u32 slice, bool is_clear) {
-        auto it = surface_metas.find(address);
-        if (it != surface_metas.end()) {
-            if (is_clear) {
-                it->second.clear_mask |= 1u << slice;
-            } else {
-                it->second.clear_mask &= ~(1u << slice);
-            }
-            return true;
-        }
-        return false;
     }
 
     /// Runs the garbage collector.
