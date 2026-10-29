@@ -482,6 +482,31 @@ u64 PS4_SYSV_ABI ClearExit() {
     return f.ret;
 }
 
+/// B11 step 4: the subresources an RTV (`dsv` false) or DSV names, from its description (Format +0x40, ViewDimension +0x44, then the D3D11 union;
+/// the DSV has Flags at +0x48 before the union). Dimensions: RTV 2/3 1D(array), 4/5 2D(array), 6/7 2D MS(array), 8 3D; DSV 1/2 1D(array),
+/// 3/4 2D(array), 5/6 2D MS(array) (JsRenderTargetView.cpp / JsDepthStencilView.cpp, CreateRenderTargetViewDesc 0x2491370, CreateDepthStencilViewDesc 0x2474fb0)
+void ReadViewRange(u64 view, bool dsv, ClearRecord& r) {
+    const u32 dim = Rd<u32>(view, 0x44);
+    const u64 u = dsv ? 0x4c : 0x48;
+    r.mip = 0, r.first_layer = 0, r.layer_count = 1;
+    const bool plain = dsv ? (dim == 1 || dim == 3) : (dim == 2 || dim == 4);
+    const bool array = dsv ? (dim == 2 || dim == 4) : (dim == 3 || dim == 5);
+    const bool ms = dsv ? dim == 5 : dim == 6;
+    const bool ms_array = dsv ? dim == 6 : dim == 7;
+    if (plain) {
+        r.mip = Rd<u32>(view, u);
+    } else if (array) {
+        r.mip = Rd<u32>(view, u);
+        r.first_layer = Rd<u32>(view, u + 4);
+        r.layer_count = Rd<u32>(view, u + 8);
+    } else if (ms_array) {
+        r.first_layer = Rd<u32>(view, u);
+        r.layer_count = Rd<u32>(view, u + 4);
+    } else if (!ms) {
+        r.layer_count = 0; // 3D (slices) or not a texture view
+    }
+}
+
 u64 ClearExitStub() {
     static const u64 stub = Core::GuestHooks::ExitStub(reinterpret_cast<u64>(&ClearExit));
     return stub;
@@ -509,6 +534,7 @@ u64 PS4_SYSV_ABI ClearRtvEnter(Core::GuestHooks::MidContext* c) {
         r.view_id = Rd<u64>(c->rsi, 0x10);
         r.resource_id = resource != 0 ? Rd<u64>(resource, 0x10) : 0;
         r.address = resource != 0 ? Rd<u64>(resource, 0x30) : 0;
+        ReadViewRange(c->rsi, false, r);
         if (c->rdx != 0) {
             std::memcpy(r.value, reinterpret_cast<const void*>(c->rdx), sizeof(r.value));
         }
@@ -548,6 +574,7 @@ u64 PS4_SYSV_ABI ClearDsvEnter(Core::GuestHooks::MidContext* c) {
         r.resource_id = resource != 0 ? Rd<u64>(resource, 0x10) : 0;
         r.address = resource != 0 ? Rd<u64>(resource, 0x30) : 0;
         std::memcpy(&r.value[0], c->ymm[0], sizeof(float));
+        ReadViewRange(c->rsi, true, r);
     }
     clear_counts[ClearDepthNoSurface].fetch_add(f.path == 0 ? 1 : 0, std::memory_order_relaxed);
     if (flags >= 1 && flags <= 3) {
@@ -623,7 +650,8 @@ nlohmann::json ClearReport() {
                                               {"packets", clear_match[MatchEntriesPacket].load()}, {"other", clear_match[MatchEntriesOther].load()}}}}},
             {"native", {{"on", B11ClearsOn()}, {"clears_done_as_vulkan_clears", clear_native[NativeDone].load()}, {"images_cleared", clear_native[NativeImages].load()},
                         {"not_eligible_mips_or_layers", clear_native[NativeNotEligible].load()}, {"no_image_yet_old_path", clear_native[NativeNoImage].load()},
-                        {"work_skipped_inside", clear_native[NativeSkippedWork].load()}, {"color_fast_clears_kept_on_their_path", clear_native[NativeFastClearKept].load()}}},
+                        {"work_skipped_inside", clear_native[NativeSkippedWork].load()}, {"color_fast_clears_kept_on_their_path", clear_native[NativeFastClearKept].load()},
+                        {"of_one_mip_or_layer_or_a_mipped_texture", clear_native[NativeSubresource].load()}}},
             {"back_end_inside_vs_outside_a_clear", {
                 {"meta_clear_dispatch", {clear_uses[UseMetaClearDispatch][1].load(), clear_uses[UseMetaClearDispatch][0].load()}},
                 {"fast_clear_eliminate_clearing", {clear_uses[UseFastClearEliminate][1].load(), clear_uses[UseFastClearEliminate][0].load()}},

@@ -108,6 +108,9 @@ struct ClearRecord {
     u32 flags{}, stencil{};
     u64 view_id{}, resource_id{}, address{};
     float value[4]{}; ///< color, or depth in [0]
+    /// the view's subresources (B11 step 4, from the view's description at +0x40): `mip`, layers [first_layer, first_layer + layer_count);
+    /// layer_count 0: the view is of a 3D texture (slices) or unknown
+    u32 mip{}, first_layer{}, layer_count{1};
 };
 /// The clears recorded in [begin, end) (a submitted command buffer), in order; taken out of the pending list
 void TakeClears(u64 begin, u64 end, std::vector<ClearRecord>& out);
@@ -119,7 +122,7 @@ void NoteClearEntered(const ClearRecord& clear, const u32 (&entries)[4]);
 /// B11 step 3 (`TLG_B11_CLEARS=1`): the engine's clear runs as a Vulkan clear of the target's images at its place in the stream; the work inside its packets
 /// (the meta fill, the fast clear eliminate, the depth target clear, its draws and dispatches) is skipped
 [[nodiscard]] bool B11ClearsOn() noexcept;
-enum ClearNative : u32 { NativeDone, NativeImages, NativeNotEligible, NativeNoImage, NativeSkippedWork, NativeFastClearKept, ClearNatives };
+enum ClearNative : u32 { NativeDone, NativeImages, NativeNotEligible, NativeNoImage, NativeSkippedWork, NativeFastClearKept, NativeSubresource, ClearNatives };
 void NoteClearNative(ClearNative what, u64 n = 1);
 
 } // namespace Core::NativeDevice

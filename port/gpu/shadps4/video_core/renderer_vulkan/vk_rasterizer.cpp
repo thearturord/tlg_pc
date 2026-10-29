@@ -611,24 +611,49 @@ bool Rasterizer::NativeClear(const Core::NativeDevice::ClearRecord& record) {
         return false;
     }
     Core::NativeDevice::Object resource;
-    if (!Core::NativeDevice::Lookup(record.resource_id, resource) || resource.mips > 1 || resource.layers > 1 || resource.depth > 1) {
-        // a view of one mip or layer would need the view's range: the old path
+    if (!Core::NativeDevice::Lookup(record.resource_id, resource) || resource.depth > 1 || record.layer_count == 0) {
+        // a 3D texture's slices: the old path
         Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeNotEligible);
         return false;
     }
     decltype(std::declval<VideoCore::TextureCache&>().EngineImagesOfType()) ids;
     texture_cache.EngineImagesOf(record.resource_id, ids);
-    if (ids.empty()) {
+    // B11 step 4: the view's mip and layers, in every image of the texture that holds them (an image of the texture's memory with the texture's size; it may
+    // hold fewer mips or layers). A partial clear of an image with CPU changes not uploaded yet keeps the old path (the upload would cover the whole image).
+    boost::container::small_vector<std::pair<VideoCore::ImageId, VideoCore::SubresourceRange>, 4> targets;
+    for (const auto image_id : ids) {
+        const auto& image = texture_cache.GetImage(image_id);
+        if (image.info.props.is_depth != (record.kind == 1)) {
+            continue;
+        }
+        if (image.info.size.width != resource.width || image.info.size.height != resource.height) {
+            Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeNotEligible);
+            return false;
+        }
+        const u32 levels = image.info.resources.levels, layers = image.info.resources.layers;
+        if (record.mip >= levels || record.first_layer + record.layer_count > layers) {
+            continue;
+        }
+        const VideoCore::SubresourceRange range{.base = {static_cast<u16>(record.mip), static_cast<u16>(record.first_layer)},
+                                                .extent = {1, static_cast<u16>(record.layer_count)}};
+        const bool whole = levels == 1 && record.first_layer == 0 && record.layer_count == layers;
+        if (!whole && True(image.flags & (VideoCore::ImageFlagBits::CpuDirty | VideoCore::ImageFlagBits::MaybeCpuDirty))) {
+            Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeNotEligible);
+            return false;
+        }
+        targets.emplace_back(image_id, range);
+    }
+    if (targets.empty()) {
         Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeNoImage);
         return false;
     }
-    for (const auto image_id : ids) {
+    if (record.mip != 0 || record.first_layer != 0 || resource.mips > 1 || resource.layers > 1) {
+        Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeSubresource);
+    }
+    for (const auto& [image_id, range] : targets) {
         auto& image = texture_cache.GetImage(image_id);
-        const VideoCore::SubresourceRange range{.base = {0, 0}, .extent = {image.info.resources.levels, image.info.resources.layers}};
+        const bool whole = image.info.resources.levels == 1 && range.base.layer == 0 && range.extent.layers == image.info.resources.layers;
         if (record.kind == 0) {
-            if (image.info.props.is_depth) {
-                continue;
-            }
             vk::ClearValue value{};
             const std::string format = vk::to_string(image.info.pixel_format);
             if (format.find("Uint") != std::string::npos || format.find("Sint") != std::string::npos) {
@@ -642,14 +667,13 @@ bool Rasterizer::NativeClear(const Core::NativeDevice::ClearRecord& record) {
             }
             runtime.ClearImage(&image, range, value);
         } else {
-            if (!image.info.props.is_depth) {
-                continue;
-            }
             runtime.ClearDepthStencilImage(&image, range, (record.flags & 1) != 0, record.value[0], (record.flags & 2) != 0, record.stencil);
             image.usage.depth_target = true;
         }
         // the image is what the clear made it: nothing older from memory is uploaded over it
-        image.flags &= ~(VideoCore::ImageFlagBits::CpuDirty | VideoCore::ImageFlagBits::MaybeCpuDirty);
+        if (whole) {
+            image.flags &= ~(VideoCore::ImageFlagBits::CpuDirty | VideoCore::ImageFlagBits::MaybeCpuDirty);
+        }
         image.flags |= VideoCore::ImageFlagBits::GpuModified;
         Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeImages);
     }
