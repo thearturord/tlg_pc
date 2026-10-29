@@ -4634,7 +4634,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     // B5 (`TLG_B5_GPU_COPIES=1`): every copy runs on the GPU between the two ranges; the CPU copy inside PS4 memory below was the emulation of the console's DMA
     static const bool b5_gpu_copies = [] {
         const char* e = std::getenv("TLG_B5_GPU_COPIES");
-        return e != nullptr && *e == '1';
+        return e == nullptr || *e != '0'; // B7: default on (owner play 2026-10-29)
     }();
     if (b5_gpu_copies) {
         b5_copies_on_gpu.fetch_add(1, std::memory_order_relaxed);

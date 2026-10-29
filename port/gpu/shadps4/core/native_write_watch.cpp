@@ -25,6 +25,7 @@ int runtime_memory_ww_enabled(void);
 size_t runtime_memory_ww_regions(uintptr_t* starts, uint64_t* sizes, size_t capacity);
 size_t runtime_memory_ww_harvest(uintptr_t address, uint64_t size, uintptr_t* pages, size_t capacity, int take_pending);
 int runtime_memory_ww_pending(void);
+void runtime_memory_ww_set_quiet(int quiet);
 void runtime_memory_ww_stats(uint64_t out[4]);
 }
 
@@ -53,6 +54,10 @@ struct LocalCounts {
 };
 thread_local LocalCounts t_counts;
 } // namespace
+
+void SetQuiet(bool quiet) noexcept {
+    runtime_memory_ww_set_quiet(quiet ? 1 : 0);
+}
 
 void OnEpoch() noexcept {
     // B2 cutover: the engine's announced updates take effect where the harvest's epoch moves

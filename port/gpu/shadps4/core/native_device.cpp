@@ -225,7 +225,7 @@ bool ResourceAt(VAddr address, Object& out) {
 bool B6NativeOn() noexcept {
     static const bool on = [] {
         const char* e = std::getenv("TLG_B6_NATIVE");
-        return e != nullptr && *e == '1';
+        return e == nullptr || *e != '0'; // B7: default on (owner play 2026-10-29)
     }();
     return on;
 }

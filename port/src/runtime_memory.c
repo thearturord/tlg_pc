@@ -352,9 +352,28 @@ static HostRegion *ww_region(uintptr_t a) {
 /* A write of the GPU side into a watched region: snapshot the pages, hand the CPU's writes so far to the pending list, write
  * (lifting a protection for the moment), drop the write watch bits the write set, and compare the pages with snapshot plus
  * write: a page that differs was written by the CPU in the meantime and goes to the pending list too. */
+static volatile long ww_quiet; /* B7: nobody harvests the write watch: a GPU side write needs no snapshot, collect or reset */
 static void ww_write(HostRegion *r, uintptr_t at, const unsigned char *data, uint64_t n) {
     uintptr_t p0=at&~(uintptr_t)4095, p1=(at+n+4095)&~(uintptr_t)4095;
     size_t len=p1-p0;
+    if (ww_quiet) {
+        AcquireSRWLockShared(&ww_lock);
+        int rw=r && r->ro && p0>=r->start && p1<=r->end;
+        for (uintptr_t pg=p0; rw && pg<p1; pg+=4096) rw=!r->ro[(pg-r->start)>>12];
+        ReleaseSRWLockShared(&ww_lock);
+        if (rw) { memcpy((void *)at,data,n); InterlockedAdd64(&ww_stat_backing_pages,(LONG64)(len/4096)); return; }
+        /* a protected page: lift it for the write, nothing else */
+        AcquireSRWLockExclusive(&ww_lock);
+        ProtRun *qruns=NULL; size_t qn=0, qcap=0;
+        qn=save_protections(p0,p1,&qruns,0,&qcap);
+        DWORD qold;
+        for (size_t i=0;i<qn;++i) if (qruns[i].protect!=PAGE_READWRITE) VirtualProtect((void *)qruns[i].start,qruns[i].end-qruns[i].start,PAGE_READWRITE,&qold);
+        memcpy((void *)at,data,n);
+        for (size_t i=0;i<qn;++i) if (qruns[i].protect!=PAGE_READWRITE) VirtualProtect((void *)qruns[i].start,qruns[i].end-qruns[i].start,qruns[i].protect,&qold);
+        free(qruns);
+        ReleaseSRWLockExclusive(&ww_lock);
+        return;
+    }
     static __thread unsigned char *snap; static __thread size_t snap_capacity;
     if (snap_capacity<len) { free(snap); snap=malloc(len); snap_capacity=snap ? len : 0; }
     AcquireSRWLockExclusive(&ww_lock);
@@ -1055,6 +1074,7 @@ void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int 
 #ifdef _WIN32
 int runtime_memory_ww_enabled(void) { return ww_enabled(); }
 int runtime_memory_ww_pending(void) { return ww_pending_any!=0; }
+void runtime_memory_ww_set_quiet(int quiet) { InterlockedExchange(&ww_quiet,quiet ? 1 : 0); }
 /* The watched regions (start, size), at most capacity of them; returns how many exist. */
 size_t runtime_memory_ww_regions(uintptr_t *starts, uint64_t *sizes, size_t capacity) {
     read_lock();
@@ -1100,6 +1120,7 @@ void runtime_memory_ww_stats(uint64_t out[4]) {
 #else
 int runtime_memory_ww_enabled(void) { return 0; }
 int runtime_memory_ww_pending(void) { return 0; }
+void runtime_memory_ww_set_quiet(int quiet) { (void)quiet; }
 size_t runtime_memory_ww_regions(uintptr_t *starts, uint64_t *sizes, size_t capacity) { (void)starts; (void)sizes; (void)capacity; return 0; }
 size_t runtime_memory_ww_harvest(uintptr_t address, uint64_t size, uintptr_t *pages, size_t capacity, int take_pending) {
     (void)address; (void)size; (void)pages; (void)capacity; (void)take_pending; return 0;

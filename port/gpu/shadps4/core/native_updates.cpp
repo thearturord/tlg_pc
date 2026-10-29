@@ -280,7 +280,7 @@ std::atomic<u32> misses_logged{0};
 u32 B2NativeMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_B2_NATIVE");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 0u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 2u; // B7: mode 2 by default (owner play 2026-10-29)
     }();
     return mode;
 }

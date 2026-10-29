@@ -132,6 +132,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         [this](VAddr address, u64 size, u32 timeout_ms) { return WaitForExplicitDownloads(address, size, timeout_ms); });
     // B2 cutover: an applied announcement is a CPU write for the caches
     Core::NativeUpdates::SetApply([](void* context, u64 address, u64 size, bool newer) { static_cast<BufferCache*>(context)->ApplyCpuWrite(address, size, newer); }, this);
+    if (Core::NativeUpdates::B2NativeMode() == 2 && !Core::NativeUpdates::HarvestAuditOn() && !(std::getenv("TLG_B2_REFEREE") != nullptr && *std::getenv("TLG_B2_REFEREE") == '1')) {
+        Core::WriteWatch::SetQuiet(true); // B7: the write watch is not the referee any more
+    }
 }
 
 BufferCache::~BufferCache() {
@@ -168,6 +171,14 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
 
 void BufferCache::HarvestWriteWatch(VAddr device_addr, u64 size, bool image) {
     if (!Core::WriteWatch::Enabled()) {
+        return;
+    }
+    // B7: with the engine's announcements deciding (mode 2) the write watch would only count misses: it is not asked any more (TLG_B2_AUDIT=1 keeps it as the referee)
+    static const bool referee = Core::NativeUpdates::B2NativeMode() != 2 || Core::NativeUpdates::HarvestAuditOn() || [] {
+        const char* e = std::getenv("TLG_B2_REFEREE");
+        return e != nullptr && *e == '1';
+    }();
+    if (!referee) {
         return;
     }
     t_audit_begin = device_addr;
