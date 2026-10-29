@@ -2056,7 +2056,14 @@ void Liverpool::RasterMain(std::stop_token stoken) {
 
 Liverpool::Liverpool()
     : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
-      fence_wait_shortcut{EmulatorSettings.GetReadbackFenceWaitShortcut()} {
+      fence_wait_shortcut{[] {
+          // dark frame experiment (`TLG_FENCE_SHORTCUT=0..3`): the level of the fence wait shortcut for this run, over the settings (1: the compute queues' waits poll memory instead of
+          // passing on a fence the other queue has only recorded; 0: no queue passes early)
+          if (const char* e = std::getenv("TLG_FENCE_SHORTCUT"); e != nullptr && *e >= '0' && *e <= '3') {
+              return static_cast<u32>(*e - '0');
+          }
+          return static_cast<u32>(EmulatorSettings.GetReadbackFenceWaitShortcut());
+      }()} {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     // B2: announcements of a passed memory wait go to the raster thread in order with the work around it
     Core::NativeUpdates::SetQueue(
