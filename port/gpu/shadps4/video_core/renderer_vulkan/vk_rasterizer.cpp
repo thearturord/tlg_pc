@@ -1560,7 +1560,15 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Dis
     dispatch_audit_plan = (dispatch_audit_on && plan != nullptr && plan->bindings_complete) ? plan : nullptr;
     binder_plan = DispatchBinderFor(plan);
     resolved_dispatch = binder_plan != nullptr ? plan : nullptr;
+    // dark frame: the indirect dispatches (the deferred sun pass CS_Deferred is one, two a frame) are recorded with all their inputs, caller tag 0xd15 + the record's call site
+    const bool indirect_recorded = Core::LightRecorder::On();
+    if (indirect_recorded) {
+        Core::LightRecorder::Begin(Core::DebugServer::PresentCount(), 0xd1500000000ull | (plan != nullptr && plan->native_seq != 0 ? Core::NativeDraw::RecordCallerGhidra(plan->native_seq) : 0), current_cs->address);
+    }
     const bool dispatch_bound = BindResources(pipeline);
+    if (indirect_recorded) {
+        Core::LightRecorder::End();
+    }
     resolved_dispatch = nullptr;
     binder_plan = nullptr;
     dispatch_audit_plan = nullptr;
