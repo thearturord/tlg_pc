@@ -152,6 +152,7 @@ public:
         std::array<std::atomic<u64>, 9> rejected{}; ///< 0 no record entry, 1 null or huge V#, 2 no engine object, 3 not immutable, 4 outside the object, 5 not synchronized, 6 no arena yet, 7 arena moved, 8 clamped
     };
     std::array<u64, 18> TakeResolveStats();
+    std::array<std::atomic<u64>, 4> slot_census{}; ///< R4 census: new buffer slots from the stream ring, -, other buffers; 3 slot hits
     std::atomic<u64> image_words_planned{0}, image_words_verified{0}, image_words_differing{0}, image_layout_differing{0}; ///< R3 step 2 counters
     /// R1b verify counters (cumulative): copies checked, copies that differed from guest memory
     [[nodiscard]] std::pair<u64, u64> ObjectCopyVerify() const noexcept {

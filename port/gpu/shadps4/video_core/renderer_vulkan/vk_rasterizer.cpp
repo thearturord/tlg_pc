@@ -2931,7 +2931,15 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         if (indexed_active && stage.indexed && Shader::Indexed::IsIndexedBufferType(desc.buffer_type)) {
             auto* indexed = IndexedData::Get();
             const auto& info = buffer_infos.back();
+            const u64 made_before = indexed->stats.buffer_new.load(std::memory_order_relaxed);
             const u32 slot = indexed->BufferSlot(info.buffer, info.offset, info.range);
+            if (indexed->stats.buffer_new.load(std::memory_order_relaxed) != made_before) {
+                // R4 census: which buffers make new slots (0 stream ring, 1 an arena, 2 other)
+                const bool stream = info.buffer == buffer_cache.GetStreamBuffer().Handle();
+                slot_census[stream ? 0 : 2].fetch_add(1, std::memory_order_relaxed);
+            } else {
+                slot_census[3].fetch_add(1, std::memory_order_relaxed);
+            }
             NoteIndexedRow(slot);
             const u32 every = indexed->VerifyEvery();
             if (every != 0 && indexed->stats.draws.load(std::memory_order_relaxed) % every == 0) {
