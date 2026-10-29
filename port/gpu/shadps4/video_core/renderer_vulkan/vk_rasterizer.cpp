@@ -702,7 +702,7 @@ static bool TextureIdsOn() {
 static u32 TextureIdsVerifyEvery() {
     static const u32 every = [] {
         const char* e = std::getenv("TLG_TEXTURE_IDS_VERIFY");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 1024u; // P1: 1 in 1024 by default (64 until 2026-10-28)
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 0u; // TLG_TEXTURE_IDS_VERIFY: off by default since 2026-10-30 (1 in 1024 until then)
     }();
     return every;
 }

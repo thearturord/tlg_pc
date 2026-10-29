@@ -166,7 +166,7 @@ private:
     vk::UniqueSampler default_sampler;
     vk::DescriptorSet set{};
     bool table_ready{false};
-    u32 verify_every{64};
+    u32 verify_every{0}; // TLG_INDEXED_VERIFY=N: off by default since 2026-10-30
 
     std::mutex mutex;
     std::array<Table, NumTables> tables;

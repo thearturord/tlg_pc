@@ -147,7 +147,7 @@ auto Timed(CallId id, F&& body) {
 struct Config {
     bool on{false};
     std::array<bool, 16> views{};
-    u32 verify_every{256}; // default: one pass in 256 is checked against the engine's loop
+    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_*_GEN_VERIFY=N checks one pass in N against the engine's loop)
 };
 const Config& Cfg() {
     static const Config config = [] {
@@ -1467,7 +1467,7 @@ u64 HandleLookup(u64 render_device, u64 object) {
     }();
     static const u32 verify_every = [] {
         const char* e = std::getenv("TLG_GEN_NATIVE_LEAF_VERIFY");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 64u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 64u; // stays on: calling the engine's own lookup also sets up what two site generators need (with 0 they decline every pass, 2026-10-30)
     }();
     const auto engine = [&] { return reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64)>(Global(FunctionHandleLookup))(render_device, object); };
     if (!native_on) {
@@ -1869,7 +1869,7 @@ void GenerateGBuffer(Target& t, const GPlan& plan, u32 pass_flags) {
 
 struct GConfig {
     bool on{false};
-    u32 verify_every{256}; // default: one pass in 256 is checked against the engine's loop
+    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_*_GEN_VERIFY=N checks one pass in N against the engine's loop)
 };
 const GConfig& GCfg() {
     static const GConfig config = [] {
@@ -1931,7 +1931,7 @@ u64 FindVariant(u64 cache, u64 material, u32 flags, u32 flags2, u32 mesh_word, u
     }();
     static const u32 verify_every = [] {
         const char* e = std::getenv("TLG_GEN_NATIVE_LEAF_VERIFY");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 64u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 64u; // stays on: calling the engine's own lookup also sets up what two site generators need (with 0 they decline every pass, 2026-10-30)
     }();
     const auto engine = [&] { return reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u32, u32, u32, void*, u64)>(Global(FunctionFindVariant))(cache, material, flags, flags2, mesh_word, token, 0); };
     if (!native_on) {
@@ -2592,7 +2592,7 @@ void GenerateForward(Target& t, const FPlan& plan) {
 
 struct FConfig {
     bool on{false};
-    u32 verify_every{256}; // default: one pass in 256 is checked against the engine's loop
+    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_*_GEN_VERIFY=N checks one pass in N against the engine's loop)
 };
 const FConfig& FCfg() {
     static const FConfig config = [] {
@@ -3075,7 +3075,7 @@ void GenerateDecal(Target& t, const DPlan& plan) {
 
 struct DConfig {
     bool on{false};
-    u32 verify_every{256}; // default: one pass in 256 is checked against the engine's loop
+    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_*_GEN_VERIFY=N checks one pass in N against the engine's loop)
 };
 const DConfig& DCfg() {
     static const DConfig config = [] {
@@ -3703,7 +3703,7 @@ void GenerateSkin(Target& t, const SkinPlan& p) {
 
 struct SConfig {
     bool on{false};
-    u32 verify_every{256}; // default: one pass in 256 is checked against the engine's loop
+    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_*_GEN_VERIFY=N checks one pass in N against the engine's loop)
 };
 const SConfig& SCfg() {
     static const SConfig config = [] {
@@ -4353,7 +4353,7 @@ void GenerateWet(Target& t, const WetPlan& p) {
 
 struct WConfig {
     bool on{false};
-    u32 verify_every{256}; // default: one pass in 256 is checked against the engine's loop
+    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_*_GEN_VERIFY=N checks one pass in N against the engine's loop)
 };
 const WConfig& WCfg() {
     static const WConfig config = [] {
@@ -4804,7 +4804,7 @@ void GenerateInst(Target& t, const InstPlan& p) {
 
 struct IConfig {
     bool on{false};
-    u32 verify_every{256}; // default: one pass in 256 is checked against the engine's loop
+    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_*_GEN_VERIFY=N checks one pass in N against the engine's loop)
 };
 const IConfig& ICfg() {
     static const IConfig config = [] {

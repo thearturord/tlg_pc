@@ -39,7 +39,7 @@ bool Plausible(u64 pointer) {
 
 struct Config {
     bool on{true};
-    u32 verify_every{256};
+    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_SITE_GEN_VERIFY=N)
 };
 const Config& Cfg() {
     static const Config config = [] {

@@ -2688,7 +2688,7 @@ bool NativeListOn() {
 u32 NativeListVerifyEvery() {
     static const u32 every = [] {
         const char* e = std::getenv("TLG_NATIVE_LIST_VERIFY");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 256u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 0u; // off by default since 2026-10-30
     }();
     return every;
 }

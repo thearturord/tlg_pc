@@ -868,7 +868,7 @@ u32 ResidentCap() {
 u32 ResidentVerifyInterval() {
     static const u32 interval = [] {
         const char* e = std::getenv("TLG_RESIDENT_VERIFY"); // P1: 1 in 1024 by default (64 until 2026-10-28; the regression sets its own)
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 1024u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 0u; // off by default since 2026-10-30
     }();
     return interval;
 }

@@ -1221,9 +1221,9 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         // register path to compare the fixed state
         static const u64 first = [] {
             const char* e = std::getenv("TLG_FIXED_VERIFY_FIRST");
-            return e != nullptr && *e != 0 ? std::strtoull(e, nullptr, 10) : 20000ull;
+            return e != nullptr && *e != 0 ? std::strtoull(e, nullptr, 10) : 0ull; // off by default since 2026-10-30
         }();
-        native_fixed_verify = n < first || (n & 255) == 0;
+        native_fixed_verify = n < first || (first != 0 && (n & 255) == 0);
     }
     bool planned_from_record = false;
     if (draw.typed) {

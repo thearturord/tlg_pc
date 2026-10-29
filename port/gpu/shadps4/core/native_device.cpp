@@ -364,8 +364,16 @@ bool Lookup(u64 id, Object& out) {
     return true;
 }
 
+static bool ShadowChecksOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_SHADOW_CHECKS");
+        return e != nullptr && *e == '1';
+    }();
+    return on;
+}
+
 void CheckImage(u64 id, VAddr address, u32 width, u32 height) {
-    if (!Enabled() || id == 0) {
+    if (!Enabled() || id == 0 || !ShadowChecksOn()) { // B1 shadow census: TLG_SHADOW_CHECKS=1 (off by default since 2026-10-30)
         return;
     }
     Object object;
@@ -382,7 +390,7 @@ void CheckImage(u64 id, VAddr address, u32 width, u32 height) {
 }
 
 void CheckBuffer(u64 id, VAddr address, u64 size) {
-    if (!Enabled() || id == 0) {
+    if (!Enabled() || id == 0 || !ShadowChecksOn()) {
         return;
     }
     Object object;
@@ -411,7 +419,7 @@ std::atomic<u32> targets_logged{0};
 } // namespace
 
 void CheckTarget(bool depth, VAddr address, u32 width, u32 height) {
-    if (!Enabled()) {
+    if (!Enabled() || !ShadowChecksOn()) {
         return;
     }
     Object o;
