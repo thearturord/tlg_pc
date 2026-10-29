@@ -1502,7 +1502,7 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
                 });
                 static std::atomic<u64> issued{0};
                 if (issued.fetch_add(1, std::memory_order_relaxed) == 0) {
-                    LOG_INFO(Render_Vulkan, "TLG_LIGHT_FULL_BARRIER: full barriers before the lighting dispatches");
+                    LOG_WARNING(Render_Vulkan, "TLG_LIGHT_FULL_BARRIER: full barriers before the lighting dispatches");
                 }
             }
         }
