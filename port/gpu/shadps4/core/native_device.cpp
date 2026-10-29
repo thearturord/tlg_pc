@@ -605,7 +605,7 @@ void TakeClears(u64 begin, u64 end, std::vector<ClearRecord>& out) {
 bool B11ClearsOn() noexcept {
     static const bool on = [] {
         const char* e = std::getenv("TLG_B11_CLEARS");
-        return e != nullptr && *e == '1';
+        return e == nullptr || *e != '0'; // default on since 2026-10-30 (steps 4 to 6: views of a mip or layer, fast clears pending, clears before the first image); =0 off
     }();
     return on;
 }

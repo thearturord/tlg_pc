@@ -452,7 +452,7 @@ u32 B8VerifyEvery() {
 u32 B8ImageMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_B8_IMAGES");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 0u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 2u; // default 2 since 2026-10-30 (owner play of the B8-B9 script; =0 off, =1 audit)
     }();
     return mode;
 }
@@ -460,7 +460,7 @@ u32 B8ImageMode() noexcept {
 u32 B8LifetimeMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_B8_LIFETIME");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 0u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 2u; // default 2 since 2026-10-30 (owner play of the B8-B9 script; =0 off, =1 audit)
     }();
     return mode;
 }
@@ -468,7 +468,7 @@ u32 B8LifetimeMode() noexcept {
 u32 B8FindMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_B8_FIND");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 0u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 2u; // default 2 since 2026-10-30 (owner play of the B8-B9 script; =0 off, =1 audit)
     }();
     return mode;
 }
@@ -541,7 +541,7 @@ std::array<std::atomic<u64>, B9Counts> b9_counts{};
 u32 B9BufferMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_B9_BUFFERS");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 0u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 2u; // default 2 since 2026-10-30 (owner play of the B8-B9 script; =0 off, =1 audit)
     }();
     return mode;
 }
@@ -549,7 +549,7 @@ u32 B9BufferMode() noexcept {
 u32 B9LifetimeMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_B9_LIFETIME");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 0u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 2u; // default 2 since 2026-10-30 (owner play of the B8-B9 script; =0 off, =1 audit)
     }();
     return mode;
 }
@@ -557,7 +557,7 @@ u32 B9LifetimeMode() noexcept {
 u32 B9QueryMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_B9_QUERIES");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 0u;
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 2u; // default 2 since 2026-10-30 (owner play of the B8-B9 script; =0 off, =1 audit)
     }();
     return mode;
 }
@@ -565,7 +565,7 @@ u32 B9QueryMode() noexcept {
 bool B9TrackerOff() noexcept {
     static const bool off = [] {
         const char* e = std::getenv("TLG_B9_TRACKER");
-        return e != nullptr && *e == '0' && B9BufferMode() == 2 && B9QueryMode() == 2;
+        return (e == nullptr || *e == '0') && B9BufferMode() == 2 && B9QueryMode() == 2; // default off since 2026-10-30; TLG_B9_TRACKER=1 keeps it
     }();
     return off;
 }
@@ -573,7 +573,7 @@ bool B9TrackerOff() noexcept {
 bool B9PlaceOn() noexcept {
     static const bool on = [] {
         const char* e = std::getenv("TLG_B9_PLACE");
-        return e != nullptr && *e == '1' && B9TrackerOff() && B9LifetimeMode() == 2;
+        return (e == nullptr || *e != '0') && B9TrackerOff() && B9LifetimeMode() == 2; // default on since 2026-10-30; =0 off
     }();
     return on;
 }
