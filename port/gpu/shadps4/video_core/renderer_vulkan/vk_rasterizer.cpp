@@ -581,12 +581,32 @@ void Rasterizer::SetEngineClear(const Core::NativeDevice::ClearRecord* record) {
         return;
     }
     engine_clear = *record;
-    if (Core::NativeDevice::B11ClearsOn()) {
-        engine_clear_skip = NativeClear(engine_clear);
+    // bisect switches: TLG_B11_KINDS=color or depth (only that kind runs natively), TLG_B11_SKIP=0 (the work inside the clear still runs)
+    static const u32 kinds = [] {
+        const char* e = std::getenv("TLG_B11_KINDS");
+        return e == nullptr ? 3u : std::string_view{e} == "color" ? 1u : std::string_view{e} == "depth" ? 2u : 3u;
+    }();
+    static const bool skip = [] {
+        const char* e = std::getenv("TLG_B11_SKIP");
+        return e == nullptr || *e != '0';
+    }();
+    if (Core::NativeDevice::B11ClearsOn() && (kinds & (1u << engine_clear.kind)) != 0) {
+        engine_clear_skip = NativeClear(engine_clear) && skip;
     }
 }
 
 bool Rasterizer::NativeClear(const Core::NativeDevice::ClearRecord& record) {
+    // A color fast clear (the target has a meta surface) writes only the CMASK on the console: the color memory changes when a fast clear eliminate runs, and a texture
+    // read before that sees the old pixels; the game's image depends on it (owner play 2026-10-29: Trico's feathers over the view when it ran as a full clear).
+    // It keeps its path (the eliminate clears); TLG_B11_FAST=1 runs it as a Vulkan clear anyway (study).
+    static const bool fast_native = [] {
+        const char* e = std::getenv("TLG_B11_FAST");
+        return e != nullptr && *e == '1';
+    }();
+    if (record.kind == 0 && record.path == 1 && !fast_native) {
+        Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeFastClearKept);
+        return false;
+    }
     Core::NativeDevice::Object resource;
     if (!Core::NativeDevice::Lookup(record.resource_id, resource) || resource.mips > 1 || resource.layers > 1 || resource.depth > 1) {
         // a view of one mip or layer would need the view's range: the old path

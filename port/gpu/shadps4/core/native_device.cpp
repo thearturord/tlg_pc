@@ -623,7 +623,7 @@ nlohmann::json ClearReport() {
                                               {"packets", clear_match[MatchEntriesPacket].load()}, {"other", clear_match[MatchEntriesOther].load()}}}}},
             {"native", {{"on", B11ClearsOn()}, {"clears_done_as_vulkan_clears", clear_native[NativeDone].load()}, {"images_cleared", clear_native[NativeImages].load()},
                         {"not_eligible_mips_or_layers", clear_native[NativeNotEligible].load()}, {"no_image_yet_old_path", clear_native[NativeNoImage].load()},
-                        {"work_skipped_inside", clear_native[NativeSkippedWork].load()}}},
+                        {"work_skipped_inside", clear_native[NativeSkippedWork].load()}, {"color_fast_clears_kept_on_their_path", clear_native[NativeFastClearKept].load()}}},
             {"back_end_inside_vs_outside_a_clear", {
                 {"meta_clear_dispatch", {clear_uses[UseMetaClearDispatch][1].load(), clear_uses[UseMetaClearDispatch][0].load()}},
                 {"fast_clear_eliminate_clearing", {clear_uses[UseFastClearEliminate][1].load(), clear_uses[UseFastClearEliminate][0].load()}},
