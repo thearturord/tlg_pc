@@ -576,6 +576,10 @@ void Rasterizer::EngineObjectDeleted(u64 id, VAddr address, u64 bytes, u32 what)
         Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8ViewIdsDropped);
         native_image_keys.erase(it);
     }
+    if (what == 4) {
+        buffer_cache.NoteEngineBufferDelete(id, address, bytes, Core::NativeUpdates::B9LifetimeMode() == 2);
+        return;
+    }
     if (what == 1 || what == 3) {
         // a texture with a live alias at its memory keeps its images (its lists go)
         texture_cache.NoteEngineTextureDelete(id, address, bytes, Core::NativeUpdates::B8LifetimeMode() == 2 && what == 1);

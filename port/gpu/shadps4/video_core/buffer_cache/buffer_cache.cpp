@@ -197,6 +197,48 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
     }
 }
 
+void BufferCache::NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool native) {
+    Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9BuffersDeleted);
+    {
+        std::scoped_lock lock{object_dirty_mutex};
+        if (const auto it = object_dirty.find(id); it != object_dirty.end()) {
+            if (!it->second.m_ranges_set.empty()) {
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9DeletedPending);
+            }
+            object_dirty.erase(it);
+        }
+    }
+    if (bytes == 0) {
+        return;
+    }
+    bool gpu_written;
+    {
+        std::shared_lock lock{gpu_ranges_mutex};
+        gpu_written = gpu_modified_ranges.Intersects(address, bytes);
+    }
+    if (!gpu_written) {
+        return;
+    }
+    Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9DeletedGpuWritten);
+    // another live buffer over the same memory (an alias, a buffer holding this one) keeps what the GPU wrote there
+    static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
+    parts.clear();
+    Core::NativeDevice::BuffersIn(address, bytes, parts);
+    if (!parts.empty()) {
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9DeletedAlias);
+        return;
+    }
+    if (native) {
+        // the GPU's bytes of a buffer that is gone are nobody's: the next owner's uploads are not kept back for them
+        {
+            std::unique_lock lock{gpu_ranges_mutex};
+            gpu_modified_ranges.Subtract(address, bytes);
+        }
+        InvalidateStreamReuse(address, bytes);
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9DeletedGpuDropped);
+    }
+}
+
 void BufferCache::HarvestWriteWatch(VAddr device_addr, u64 size, bool image) {
     if (!Core::WriteWatch::Enabled()) {
         return;

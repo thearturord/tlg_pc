@@ -91,7 +91,8 @@ void NoteHarvested(u64 address, u64 bytes, bool in_upload_ring);
 /// B8.3 (`TLG_B8_FIND`): 0 off, 1 audit (the image found by the engine texture's id is compared with the lookup by address), 2 native (an engine texture's
 /// image is found by its id; the page table lookup only runs when the texture has no matching image yet or no engine texture owns the memory)
 [[nodiscard]] u32 B8FindMode() noexcept;
-/// B8.2: the engine deleted a view (`what` 0), a texture (1) or a texture another live texture shares the memory with (3); queued with the next submission's batch
+/// B8.2: the engine deleted a view (`what` 0), a texture (1), a texture another live texture shares the memory with (3) or a buffer (4, B9.2); queued with the next
+/// submission's batch
 void NoteEngineDelete(u64 id, u64 address, u64 bytes, u32 what);
 /// Where a deletion is carried out (raster thread, in order with the GPU work); set by the rasterizer
 void SetDelete(void (*fn)(void* context, u64 id, u64 address, u64 bytes, u32 what), void* context);
@@ -155,6 +156,9 @@ void NoteB8Unannounced(u64 address, u64 size, bool by_fault) noexcept;
 /// B9.1 verify (`TLG_B9_VERIFY=N`, native mode): every Nth page keeps a CPU copy of what the GPU copy holds; after a native upload the request's bytes on the page must
 /// equal memory (a byte the engine wrote and did not announce shows up here)
 [[nodiscard]] u32 B9VerifyEvery() noexcept;
+/// B9.2 (`TLG_B9_LIFETIME`): 0 off, 1 audit (an engine buffer's deletion is carried out in order and counted: its announced bytes go, what it leaves behind is
+/// counted), 2 native (also the GPU written bytes and stream copies of its memory go, unless another live buffer shares the memory)
+[[nodiscard]] u32 B9LifetimeMode() noexcept;
 enum B9Count : u32 {
     B9AnnouncedOnBuffer,   ///< announcements inside one engine buffer
     B9AnnouncedClipped,    ///< announcements that meet several buffers or reach past one (each buffer takes its part)
@@ -170,6 +174,11 @@ enum B9Count : u32 {
     B9VerifyChecked,       ///< verify: request pages compared
     B9VerifyMiss,          ///< ... differing from memory after the upload (fixed by a page upload)
     B9VerifyLate,          ///< ... of those, announced afterwards (the game wrote ahead of the raster thread: the page tracker had the same timing)
+    B9BuffersDeleted,      ///< B9.2: engine buffer deletions carried out
+    B9DeletedPending,      ///< ... with announced bytes never uploaded (dropped)
+    B9DeletedGpuWritten,   ///< ... whose memory held GPU written bytes
+    B9DeletedAlias,        ///< ... whose memory another live buffer shares (its GPU written bytes stay)
+    B9DeletedGpuDropped,   ///< native: GPU written bytes dropped with the buffer
     B9Counts,
 };
 void NoteB9(B9Count what, u64 n = 1) noexcept;

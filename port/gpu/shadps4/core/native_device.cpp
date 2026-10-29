@@ -219,6 +219,8 @@ void NoteDelete(u64 object) {
             Core::NativeUpdates::NoteEngineDelete(gone.id, gone.address, gone.bytes, alias ? 3u : 1u);
         } else if (gone.kind == Kind::ShaderResourceView || gone.kind == Kind::UnorderedAccessView) {
             Core::NativeUpdates::NoteEngineDelete(gone.id, gone.address, gone.bytes, 0u);
+        } else if (gone.kind == Kind::Buffer && gone.address != 0) {
+            Core::NativeUpdates::NoteEngineDelete(gone.id, gone.address, gone.bytes, 4u); // B9.2
         }
     }
     id_by_object.erase(it);

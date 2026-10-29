@@ -332,7 +332,7 @@ void NoteEngineCreate(u64 id, u64 address, u64 bytes) {
 }
 
 void NoteEngineDelete(u64 id, u64 address, u64 bytes, u32 what) {
-    if (B8LifetimeMode() == 0 || B2NativeMode() == 0) {
+    if ((what == 4 ? B9LifetimeMode() : B8LifetimeMode()) == 0 || B2NativeMode() == 0) {
         return;
     }
     std::scoped_lock lock{pending_mutex};
@@ -528,6 +528,14 @@ u32 B9BufferMode() noexcept {
     return mode;
 }
 
+u32 B9LifetimeMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_B9_LIFETIME");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 0u;
+    }();
+    return mode;
+}
+
 u32 B9VerifyEvery() noexcept {
     static const u32 n = [] {
         const char* e = std::getenv("TLG_B9_VERIFY");
@@ -547,6 +555,9 @@ nlohmann::json B9Report() {
             {"uploads", {{"inside_one_buffer", c(B9SyncByObject)}, {"other_ranges", c(B9SyncNoObject)}}},
             {"TRACKER_ONLY_RANGES", c(B9TrackerOnlyRanges)}, {"tracker_ranges_announced_outside_the_request", c(B9TrackerElsewhere)}, {"tracker_only_bytes", c(B9TrackerOnlyBytes)}, {"announced_only_ranges", c(B9ObjectOnlyRanges)},
             {"bytes_by_page_tracker", c(B9BytesByTracker)}, {"bytes_by_announcements", c(B9BytesByObject)},
+            {"lifetime", {{"mode", B9LifetimeMode()}, {"buffers_deleted", c(B9BuffersDeleted)}, {"with_announced_bytes_never_uploaded", c(B9DeletedPending)},
+                          {"with_gpu_written_bytes", c(B9DeletedGpuWritten)}, {"memory_shared_with_a_live_buffer", c(B9DeletedAlias)},
+                          {"gpu_written_bytes_dropped", c(B9DeletedGpuDropped)}}},
             {"verify", {{"every_nth_page", B9VerifyEvery()}, {"pages_checked", c(B9VerifyChecked)}, {"differing", c(B9VerifyMiss)},
                         {"of_those_announced_later", c(B9VerifyLate)}, {"MISSES_never_announced", c(B9VerifyMiss) - std::min(c(B9VerifyMiss), c(B9VerifyLate))}}},
             {"note", "B9.1, cumulative: engine buffers uploaded by their announced bytes instead of the page tracker's pages"}};
