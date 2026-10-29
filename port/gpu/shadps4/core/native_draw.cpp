@@ -8443,6 +8443,12 @@ u64 FindHandler(const std::string& name) {
     if (name == "mid_probe_b7") {
         return reinterpret_cast<u64>(&MidProbeB7);
     }
+    if (name == "b11_clear_rtv") {
+        return reinterpret_cast<u64>(&NativeDevice::ClearRtvEnter);
+    }
+    if (name == "b11_clear_dsv") {
+        return reinterpret_cast<u64>(&NativeDevice::ClearDsvEnter);
+    }
     if (name == "alloc_garlic_memory") {
         return reinterpret_cast<u64>(&GpuAlloc<0>);
     }

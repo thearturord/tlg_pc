@@ -414,6 +414,136 @@ void CheckTarget(bool depth, VAddr address, u32 width, u32 height) {
     }
 }
 
+namespace {
+/// B11 census
+struct ClearFrame {
+    u64 ret{}, ctx{}, cursor{};
+    u32 kind{}; ///< 0 color, 1 depth / stencil
+    u32 path{}; ///< color: 0 the resource has no surface pointer at +0x58 (a fill of its memory), 1 it has; depth: the same at +0x48
+};
+thread_local ClearFrame clear_stack[8];
+thread_local u32 clear_depth = 0;
+enum ClearCount : u32 { ClearColor, ClearDepth, ClearColorFill, ClearDepthNoSurface, ClearUnreadable, ClearPackets, ClearDwords, ClearDepthFlags1, ClearDepthFlags2, ClearDepthFlags3, ClearCounts };
+std::array<std::atomic<u64>, ClearCounts> clear_counts{};
+std::mutex clear_mutex;
+std::map<u32, u64> clear_opcodes; ///< (kind * 2 + path) << 8 | opcode -> packets
+std::map<u32, u64> clear_shapes;  ///< (kind * 2 + path) << 16 | packets in the clear -> clears
+std::atomic<u32> clear_logged{0};
+
+u64 PS4_SYSV_ABI ClearExit() {
+    const ClearFrame f = clear_stack[--clear_depth];
+    const u64 end = Rd<u64>(f.ctx, 0x47d0);
+    const u32 group = f.kind * 2 + f.path;
+    if (end < f.cursor || end - f.cursor > (u64{64} << 10)) {
+        clear_counts[ClearUnreadable].fetch_add(1, std::memory_order_relaxed); // the command buffer moved to a new chunk
+        return f.ret;
+    }
+    u32 packets = 0;
+    std::scoped_lock lock{clear_mutex};
+    for (u64 at = f.cursor; at + 4 <= end;) {
+        const u32 header = Rd<u32>(at, 0);
+        const u32 type = header >> 30;
+        if (type == 3) {
+            const u32 opcode = (header >> 8) & 0xff;
+            const u32 count = ((header >> 16) & 0x3fff) + 2;
+            ++clear_opcodes[group << 8 | opcode];
+            ++packets;
+            at += u64{count} * 4;
+        } else if (type == 0) {
+            const u32 count = ((header >> 16) & 0x3fff) + 2;
+            ++clear_opcodes[group << 8 | 0xfe]; // a type 0 register write
+            ++packets;
+            at += u64{count} * 4;
+        } else {
+            at += 4; // type 2 filler
+        }
+    }
+    clear_counts[ClearPackets].fetch_add(packets, std::memory_order_relaxed);
+    clear_counts[ClearDwords].fetch_add((end - f.cursor) / 4, std::memory_order_relaxed);
+    ++clear_shapes[group << 16 | std::min<u32>(packets, 0xffff)];
+    return f.ret;
+}
+
+u64 ClearExitStub() {
+    static const u64 stub = Core::GuestHooks::ExitStub(reinterpret_cast<u64>(&ClearExit));
+    return stub;
+}
+} // namespace
+
+u64 PS4_SYSV_ABI ClearRtvEnter(Core::GuestHooks::MidContext* c) {
+    const u64 stub = ClearExitStub();
+    if (clear_depth >= 8 || stub == 0 || c->rdi == 0 || c->rsi == 0) {
+        return 0;
+    }
+    ClearFrame& f = clear_stack[clear_depth++];
+    f.ctx = c->rdi;
+    f.kind = 0;
+    f.cursor = Rd<u64>(c->rdi, 0x47d0);
+    const u64 resource = Rd<u64>(c->rsi, 0x30);
+    f.path = resource != 0 && Rd<u64>(resource, 0x58) != 0 ? 1 : 0;
+    clear_counts[ClearColor].fetch_add(1, std::memory_order_relaxed);
+    clear_counts[ClearColorFill].fetch_add(f.path == 0 ? 1 : 0, std::memory_order_relaxed);
+    if (clear_logged.fetch_add(1, std::memory_order_relaxed) < 16 && c->rdx != 0) {
+        LOG_WARNING(Core, "B11: ClearRenderTargetView rtv id {} resource id {} memory {:#x} surface {:#x} color {} {} {} {}", Rd<u64>(c->rsi, 0x10),
+                    resource != 0 ? Rd<u64>(resource, 0x10) : 0, resource != 0 ? Rd<u64>(resource, 0x30) : 0, resource != 0 ? Rd<u64>(resource, 0x58) : 0,
+                    Rd<float>(c->rdx, 0), Rd<float>(c->rdx, 4), Rd<float>(c->rdx, 8), Rd<float>(c->rdx, 12));
+    }
+    u64* ret_slot = reinterpret_cast<u64*>(c->rsp + 16); // the hook sits after push rbp; mov rbp, rsp; push r15 (the B0 count hook displaced those 6 bytes)
+    f.ret = *ret_slot;
+    *ret_slot = stub; // the function returns into the exit stub
+    return 0;
+}
+
+u64 PS4_SYSV_ABI ClearDsvEnter(Core::GuestHooks::MidContext* c) {
+    const u64 stub = ClearExitStub();
+    if (clear_depth >= 8 || stub == 0 || c->rdi == 0 || c->rsi == 0) {
+        return 0;
+    }
+    ClearFrame& f = clear_stack[clear_depth++];
+    f.ctx = c->rdi;
+    f.kind = 1;
+    f.cursor = Rd<u64>(c->rdi, 0x47d0);
+    const u64 resource = Rd<u64>(c->rsi, 0x30);
+    f.path = resource != 0 && Rd<u64>(resource, 0x48) != 0 ? 1 : 0;
+    const u32 flags = static_cast<u32>(c->rdx);
+    clear_counts[ClearDepth].fetch_add(1, std::memory_order_relaxed);
+    clear_counts[ClearDepthNoSurface].fetch_add(f.path == 0 ? 1 : 0, std::memory_order_relaxed);
+    if (flags >= 1 && flags <= 3) {
+        clear_counts[ClearDepthFlags1 + flags - 1].fetch_add(1, std::memory_order_relaxed);
+    }
+    float depth;
+    std::memcpy(&depth, c->ymm[0], sizeof(depth));
+    if (clear_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_WARNING(Core, "B11: ClearDepthStencilView dsv id {} resource id {} memory {:#x} surface {:#x} flags {} depth {} stencil {}", Rd<u64>(c->rsi, 0x10),
+                    resource != 0 ? Rd<u64>(resource, 0x10) : 0, resource != 0 ? Rd<u64>(resource, 0x30) : 0, resource != 0 ? Rd<u64>(resource, 0x48) : 0, flags, depth,
+                    static_cast<u32>(c->rcx & 0xff));
+    }
+    u64* ret_slot = reinterpret_cast<u64*>(c->rsp + 16); // the hook sits after push rbp; mov rbp, rsp; push r15 (the B0 count hook displaced those 6 bytes)
+    f.ret = *ret_slot;
+    *ret_slot = stub;
+    return 0;
+}
+
+nlohmann::json ClearReport() {
+    const auto c = [](ClearCount what) { return clear_counts[what].load(std::memory_order_relaxed); };
+    nlohmann::json opcodes = nlohmann::json::object();
+    nlohmann::json shapes = nlohmann::json::object();
+    static constexpr const char* groups[] = {"color_fill", "color_surface", "depth_no_surface", "depth_surface"};
+    {
+        std::scoped_lock lock{clear_mutex};
+        for (const auto& [key, n] : clear_opcodes) {
+            opcodes[fmt::format("{} {:#04x}", groups[(key >> 8) & 3], key & 0xff)] = n;
+        }
+        for (const auto& [key, n] : clear_shapes) {
+            shapes[fmt::format("{} {} packets", groups[(key >> 16) & 3], key & 0xffff)] = n;
+        }
+    }
+    return {{"color_clears", c(ClearColor)}, {"of_those_fills", c(ClearColorFill)}, {"depth_clears", c(ClearDepth)}, {"of_those_without_surface", c(ClearDepthNoSurface)},
+            {"depth_flags", {c(ClearDepthFlags1), c(ClearDepthFlags2), c(ClearDepthFlags3)}}, {"unreadable_new_chunk", c(ClearUnreadable)},
+            {"packets", c(ClearPackets)}, {"dwords", c(ClearDwords)}, {"packets_by_opcode", opcodes}, {"clears_by_packet_count", shapes},
+            {"note", "B11 census, cumulative: the packets each engine clear writes into its command buffer"}};
+}
+
 nlohmann::json Report() {
     nlohmann::json out;
     out["enabled"] = Enabled();

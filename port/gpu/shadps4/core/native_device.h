@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include "common/types.h"
+#include "core/guest_hooks.h"
 
 /// The native back end's device layer (documents/tlg/native plan/native-backend-100-plan.md, B1 onward). The engine renders through a Direct3D 11 style
 /// device layer (`JsDevice`, `JsDeviceContext`); every object it creates (buffers, textures, the four kinds of views) carries a unique 64 bit id (+0x10,
@@ -92,5 +93,12 @@ u64 PS4_SYSV_ABI ViewCreatedUav(u64 resource, u64 desc, u64 out, u64 a3, u64 a4,
 u64 PS4_SYSV_ABI ViewCreatedRtv(u64 resource, u64 desc, u64 out, u64 a3, u64 a4, u64 a5, u64 ret);
 u64 PS4_SYSV_ABI ViewCreatedDsv(u64 resource, u64 desc, u64 out, u64 a3, u64 a4, u64 a5, u64 ret);
 u64 PS4_SYSV_ABI DelayDelete(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret);
+
+/// B11 census: mid hooks at +6 (after the 6 bytes the B0 count hook displaced) of `JsDeviceContext::ClearRenderTargetView` (0x2483380: ctx, rtv, color[4]) and `ClearDepthStencilView` (0x24860c0: depth in
+/// xmm0, ctx, dsv, flags, stencil). They record the target and the value and bracket the packets the clear writes into the context's command buffer (its write cursor at
+/// ctx+0x47d0 before and after, through an exit stub); the packets are decoded by opcode (names in the hooks file: `b11_clear_rtv`, `b11_clear_dsv`)
+u64 PS4_SYSV_ABI ClearRtvEnter(Core::GuestHooks::MidContext* c);
+u64 PS4_SYSV_ABI ClearDsvEnter(Core::GuestHooks::MidContext* c);
+[[nodiscard]] nlohmann::json ClearReport();
 
 } // namespace Core::NativeDevice
