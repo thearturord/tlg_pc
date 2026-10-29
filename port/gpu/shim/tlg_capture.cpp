@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +19,8 @@
 #include <vector>
 
 #include "tlg_capture.h"
+#include "core/native_light_recorder.h"
+#include <fmt/format.h>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include <vk_mem_alloc.h>
@@ -42,7 +45,7 @@ using Clock = std::chrono::steady_clock;
 constexpr u32 VideoSlots = 4;
 constexpr u32 VideoMaxWidth = 1920, VideoMaxHeight = 1080;
 
-enum class Kind : u8 { Screenshot, VideoFrame, VideoEnd };
+enum class Kind : u8 { Screenshot, VideoFrame, VideoEnd, DarkFrame };
 
 /// A host visible buffer the frame is copied into
 struct Slot {
@@ -82,6 +85,19 @@ VkImage small_image{};
 VmaAllocation small_allocation{};
 u32 small_width{}, small_height{};
 vk::Format small_format{};
+
+// dark frame monitor (TLG_DARK_FRAMES=1): every presented frame is shrunk to 256x144 and read back; a frame clearly darker than both neighbours
+// (the one frame "black screen" the owner sees) is logged
+constexpr u32 MonitorSlots = 8, MonitorWidth = 256, MonitorHeight = 144;
+std::array<Slot, MonitorSlots> monitor_slots{};
+VkImage monitor_image{};
+VmaAllocation monitor_allocation{};
+vk::Format monitor_format{};
+u64 monitor_frames{}, monitor_dropped{}, monitor_dark{};
+std::array<double, 3> monitor_means{};
+std::array<u64, 3> monitor_ticks{};
+std::array<std::vector<u8>, 3> monitor_pixels{}; // B, G, R, A of the last three frames
+constexpr u64 MonitorPictures = 50;               // dark frames saved as pictures (the frame between its neighbours) per run
 
 // writer thread
 std::mutex jobs_mutex;
@@ -163,10 +179,22 @@ void WriteScreenshot(const Job& job) {
         LOG_ERROR(Render, "screenshot: PNG encoding failed");
         return;
     }
-    const auto path = OutputPath(".png");
+    std::filesystem::path path;
+    if (job.kind == Kind::DarkFrame) {
+        auto dir = Common::FS::GetUserPath(Common::FS::PathType::ScreenshotsDir) / "dark_frames";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        path = dir / OutputPath(fmt::format("_dark{:03}.png", job.pts_ms).c_str()).filename();
+    } else {
+        path = OutputPath(".png");
+    }
     if (std::FILE* file = std::fopen(path.string().c_str(), "wb")) {
         std::fwrite(png, 1, length, file);
         std::fclose(file);
+        if (job.kind == Kind::DarkFrame) {
+            mz_free(png);
+            return;
+        }
         LOG_INFO(Render, "screenshot saved: {} ({}x{})", path.string(), job.width, job.height);
         TlgOverlay::SaveToast(4);
     } else {
@@ -304,6 +332,7 @@ void WriterLoop() {
         }
         switch (job.kind) {
         case Kind::Screenshot:
+        case Kind::DarkFrame:
             WriteScreenshot(job);
             break;
         case Kind::VideoFrame:
@@ -403,6 +432,117 @@ void CopyToSlot(vk::CommandBuffer cmdbuf, vk::Image image, u32 width, u32 height
     cmdbuf.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, vk::Buffer{slot.buffer}, region);
 }
 
+bool MonitorOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_DARK_FRAMES");
+        const bool v = e != nullptr && *e == '1';
+        if (v) {
+            LOG_INFO(Render, "dark frame monitor on (TLG_DARK_FRAMES=1)");
+        }
+        return v;
+    }();
+    return on;
+}
+
+/// Shrinks `image` (TransferSrcOptimal) into `target` and copies that into `slot`
+void ShrinkToSlot(vk::CommandBuffer cmdbuf, vk::Image image, u32 width, u32 height, VkImage target, u32 w, u32 h, Slot& slot) {
+    const vk::ImageSubresourceRange range{.aspectMask = vk::ImageAspectFlagBits::eColor, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1};
+    const vk::ImageMemoryBarrier to_dst{.srcAccessMask = vk::AccessFlagBits::eTransferRead,
+                                        .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+                                        .oldLayout = vk::ImageLayout::eUndefined,
+                                        .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                        .image = vk::Image{target},
+                                        .subresourceRange = range};
+    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, to_dst);
+    const vk::ImageBlit blit{
+        .srcSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
+        .srcOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{static_cast<s32>(width), static_cast<s32>(height), 1}},
+        .dstSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
+        .dstOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{static_cast<s32>(w), static_cast<s32>(h), 1}},
+    };
+    cmdbuf.blitImage(image, vk::ImageLayout::eTransferSrcOptimal, vk::Image{target}, vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
+    const vk::ImageMemoryBarrier to_src{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                                        .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+                                        .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                                        .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                        .image = vk::Image{target},
+                                        .subresourceRange = range};
+    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, to_src);
+    CopyToSlot(cmdbuf, vk::Image{target}, w, h, slot);
+}
+
+/// Mean of R, G and B (0 to 255) of a read back monitor frame
+double MeanBrightness(const Slot& slot) {
+    Job job{.width = slot.width, .height = slot.height, .format = slot.format};
+    const u8* data = static_cast<const u8*>(slot.mapped);
+    job.pixels.assign(data, data + u64{slot.width} * slot.height * 4);
+    std::vector<u8> bgra;
+    ToBgra(job, bgra);
+    u64 sum = 0;
+    for (size_t i = 0; i < bgra.size(); i += 4) {
+        sum += u64{bgra[i]} + bgra[i + 1] + bgra[i + 2];
+    }
+    monitor_pixels = {std::move(monitor_pixels[1]), std::move(monitor_pixels[2]), std::move(bgra)};
+    return double(sum) / (3.0 * double(u64{slot.width} * slot.height));
+}
+
+/// A frame darker than both neighbours by more than 2 (of 255) and by more than twice the neighbours' difference is a dark frame
+void MonitorFrame(double mean, u64 tick) {
+    monitor_means = {monitor_means[1], monitor_means[2], mean};
+    monitor_ticks = {monitor_ticks[1], monitor_ticks[2], tick};
+    if (++monitor_frames < 3) {
+        return;
+    }
+    const double neighbours = std::min(monitor_means[0], monitor_means[2]), spread = std::abs(monitor_means[0] - monitor_means[2]);
+    const double drop = neighbours - monitor_means[1];
+    if (drop > 2.0 && drop > 2.0 * spread) {
+        ++monitor_dark;
+        Core::LightRecorder::Dump(fmt::format("dark{}", monitor_dark).c_str(), monitor_frames - 1);
+        LOG_WARNING(Render, "dark frame {}: monitor frame {} (tick {}) brightness {:.1f}, neighbours {:.1f} and {:.1f}", monitor_dark, monitor_frames - 1,
+                    monitor_ticks[1], monitor_means[1], monitor_means[0], monitor_means[2]);
+        constexpr u64 row = u64{MonitorWidth} * 4;
+        if (monitor_dark <= MonitorPictures && std::ranges::all_of(monitor_pixels, [](const auto& p) { return p.size() == row * MonitorHeight; })) {
+            // user/screenshots/dark_frames: the frame before, the dark frame, the frame after
+            Job job{.kind = Kind::DarkFrame, .width = MonitorWidth * 3, .height = MonitorHeight, .format = vk::Format::eB8G8R8A8Unorm, .pts_ms = static_cast<s64>(monitor_dark)};
+            job.pixels.resize(row * 3 * MonitorHeight);
+            for (u32 y = 0; y < MonitorHeight; ++y) {
+                for (u32 f = 0; f < 3; ++f) {
+                    std::memcpy(job.pixels.data() + (u64{y} * 3 + f) * row, monitor_pixels[f].data() + u64{y} * row, row);
+                }
+            }
+            Submit(std::move(job));
+        }
+    }
+    {
+        // bright frames (2026-10-29: the owner saw the frame get brighter for two frames too): one or two frames brighter than the frames around them, the same rule as a dark frame
+        static std::array<double, 4> last{};
+        static u64 bright = 0;
+        last = {last[1], last[2], last[3], mean};
+        if (monitor_frames >= 4) {
+            const double single_neighbours = std::max(monitor_means[0], monitor_means[2]), single_spread = std::abs(monitor_means[0] - monitor_means[2]);
+            const double single_rise = monitor_means[1] - single_neighbours;
+            const double pair_neighbours = std::max(last[0], last[3]), pair_spread = std::abs(last[0] - last[3]);
+            const double pair_rise = std::min(last[1], last[2]) - pair_neighbours;
+            const bool single = single_rise > 2.0 && single_rise > 2.0 * single_spread;
+            const bool pair = !single && pair_rise > 2.0 && pair_rise > 2.0 * pair_spread;
+            if (single || pair) {
+                ++bright;
+                const u64 frame = single ? monitor_frames - 1 : monitor_frames - 2;
+                Core::LightRecorder::Dump(fmt::format("bright{}", bright).c_str(), frame);
+                LOG_WARNING(Render, "bright frame {}: monitor frame {} ({}), brightness {:.1f}, around it {:.1f} and {:.1f}", bright, frame, single ? "one frame" : "two frames, this is the second",
+                            single ? monitor_means[1] : last[2], single ? monitor_means[0] : last[0], single ? monitor_means[2] : last[3]);
+            }
+        }
+    }
+    if (monitor_frames % 600 == 0) {
+        LOG_INFO(Render, "dark frame monitor: {} frames, {} dark, {} dropped", monitor_frames, monitor_dark, monitor_dropped);
+    }
+}
+
 } // namespace
 
 void RequestScreenshot() {
@@ -497,6 +637,47 @@ void Record(const Vulkan::Instance& instance, vk::CommandBuffer cmdbuf, vk::Imag
             copied = true;
         }
     }
+    if (MonitorOn()) {
+        Slot* slot = nullptr;
+        for (auto& s : monitor_slots) {
+            if (!s.busy) {
+                slot = &s;
+                break;
+            }
+        }
+        const bool all_free = std::ranges::none_of(monitor_slots, [](const Slot& s) { return s.busy; });
+        if (monitor_image != VK_NULL_HANDLE && monitor_format != format && all_free) {
+            vmaDestroyImage(vk_instance->GetAllocator(), monitor_image, monitor_allocation);
+            monitor_image = VK_NULL_HANDLE;
+        }
+        if (monitor_image == VK_NULL_HANDLE && all_free) {
+            const VkImageCreateInfo image_info{.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                                               .imageType = VK_IMAGE_TYPE_2D,
+                                               .format = static_cast<VkFormat>(format),
+                                               .extent = {MonitorWidth, MonitorHeight, 1},
+                                               .mipLevels = 1,
+                                               .arrayLayers = 1,
+                                               .samples = VK_SAMPLE_COUNT_1_BIT,
+                                               .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                               .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+            const VmaAllocationCreateInfo alloc_info{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+            if (vmaCreateImage(vk_instance->GetAllocator(), &image_info, &alloc_info, &monitor_image, &monitor_allocation, nullptr) != VK_SUCCESS) {
+                monitor_image = VK_NULL_HANDLE;
+            }
+            monitor_format = format;
+        }
+        if (slot == nullptr || monitor_image == VK_NULL_HANDLE || monitor_format != format || !EnsureSlot(*slot, u64{MonitorWidth} * MonitorHeight * 4)) {
+            ++monitor_dropped;
+        } else {
+            ShrinkToSlot(cmdbuf, image, width, height, monitor_image, MonitorWidth, MonitorHeight, *slot);
+            slot->busy = true;
+            slot->tick = tick;
+            slot->width = MonitorWidth;
+            slot->height = MonitorHeight;
+            slot->format = format;
+            copied = true;
+        }
+    }
     if (copied) {
         // the copies are read by the host once the submission is done
         const vk::MemoryBarrier to_host{.srcAccessMask = vk::AccessFlagBits::eTransferWrite, .dstAccessMask = vk::AccessFlagBits::eHostRead};
@@ -505,7 +686,7 @@ void Record(const Vulkan::Instance& instance, vk::CommandBuffer cmdbuf, vk::Imag
 }
 
 void Poll(Vulkan::Scheduler& scheduler) {
-    // self test (TLG_CAPTURE_TEST=N): a screenshot and a 5 second video N seconds after the first frame
+    // self test (TLG_CAPTURE_TEST=N): a screenshot and a video (TLG_CAPTURE_TEST_SECONDS, default 5) N seconds after the first frame
     static const double test_after = [] {
         const char* e = std::getenv("TLG_CAPTURE_TEST");
         return e != nullptr && *e != 0 ? std::atof(e) : 0.0;
@@ -514,8 +695,12 @@ void Poll(Vulkan::Scheduler& scheduler) {
     static bool test_done = false;
     if (test_after > 0.0 && !test_done && Clock::now() - first_poll >= std::chrono::milliseconds(static_cast<s64>(test_after * 1000.0))) {
         test_done = true;
+        static const double test_seconds = [] {
+            const char* e = std::getenv("TLG_CAPTURE_TEST_SECONDS");
+            return e != nullptr && *e != 0 ? std::atof(e) : 5.0;
+        }();
         RequestScreenshot();
-        RequestVideo(5.0);
+        RequestVideo(test_seconds);
     }
     if (vk_instance == nullptr) {
         return;
@@ -543,6 +728,24 @@ void Poll(Vulkan::Scheduler& scheduler) {
             break; // keep the order: a later one waits for this one
         }
         hand_over(*slot);
+    }
+    if (MonitorOn()) {
+        std::array<Slot*, MonitorSlots> monitor_order{};
+        for (u32 i = 0; i < MonitorSlots; ++i) {
+            monitor_order[i] = &monitor_slots[i];
+        }
+        std::ranges::sort(monitor_order, [](const Slot* a, const Slot* b) { return a->tick < b->tick; });
+        for (Slot* slot : monitor_order) {
+            if (!slot->busy) {
+                continue;
+            }
+            if (!scheduler.IsFree(slot->tick)) {
+                break;
+            }
+            vmaInvalidateAllocation(vk_instance->GetAllocator(), slot->allocation, 0, VK_WHOLE_SIZE);
+            MonitorFrame(MeanBrightness(*slot), slot->tick);
+            slot->busy = false;
+        }
     }
     if (video_ending && std::ranges::none_of(video_slots, [](const Slot& s) { return s.busy; })) {
         video_ending = false;
