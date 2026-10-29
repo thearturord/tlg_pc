@@ -30,7 +30,7 @@ struct Entry {
 
 /// Per frame signature (raster thread): every draw and dispatch adds itself (`kind`: 0 dispatch, 1 to 5 draw of class z / shadow, g buffer, forward, other, indirect, 6 untagged draw; `key`: the
 /// pipeline or program), so a frame with a pass missing, doubled or a different pipeline shows in its counts and its order independent signature.
-void FrameOp(u64 present, u32 kind, u64 key);
+void FrameOp(u64 present, u32 kind, u64 key, u64 image_generation);
 
 /// The image a recorded copy dispatch (the CopyResource upload kernel at 0x247ea43 / 0x1c98a17: the average luminance copy among them) writes: its guest memory is what the CPU reads back
 /// (the auto exposure takes its luminance from it). Up to 8 blocks are watched; at every present change the float contents of each (mean, non zero count) are sampled into the frame census,

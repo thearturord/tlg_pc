@@ -32,6 +32,7 @@ struct FrameSig {
     u64 present{~0ull};
     u32 counts[8]{};
     u64 signature{};
+    u64 image_generation_first{}, image_generation_last{}; ///< the texture cache's image generation at the first and the last operation of the frame (an image registered or unregistered moves it)
     float watch_mean[8]{};
     u32 watch_nonzero[8]{};
 };
@@ -99,7 +100,7 @@ void Watch(u64 address, u64 bytes) {
     }
 }
 
-void FrameOp(u64 present, u32 kind, u64 key) {
+void FrameOp(u64 present, u32 kind, u64 key, u64 image_generation) {
     if (present != last_sampled_present) {
         // the previous present is complete: what the watched blocks hold now (the CPU's view of the luminance copies)
         FrameSig& done = frame_ring[last_sampled_present % FrameRing];
@@ -130,6 +131,10 @@ void FrameOp(u64 present, u32 kind, u64 key) {
         f = {};
         f.present = present;
     }
+    if (f.counts[0] + f.counts[1] + f.counts[2] + f.counts[3] + f.counts[4] + f.counts[5] + f.counts[6] + f.counts[7] == 0) {
+        f.image_generation_first = image_generation;
+    }
+    f.image_generation_last = image_generation;
     ++f.counts[kind & 7];
     u64 h = (key ^ (u64{kind} << 56)) * 0x9E3779B97F4A7C15ull;
     h ^= h >> 29;
@@ -199,6 +204,7 @@ void WriteDump(const std::string& tag, u64 detail) {
             if (f.present != ~0ull && f.present + 220 >= detail && f.present <= detail + 8) {
                 text += fmt::format("frame {} dispatches {} draws z/shadow {} gbuffer {} forward {} other {} indirect {} untagged {} signature {:016x}\n", f.present, f.counts[0], f.counts[1], f.counts[2], f.counts[3], f.counts[4],
                                     f.counts[5], f.counts[6], f.signature);
+                text += fmt::format("imggen {} {} {}\n", f.present, f.image_generation_first, f.image_generation_last);
                 std::string watch;
                 for (u32 i = 0; i < watched_count; ++i) {
                     watch += fmt::format(" [{:#x} mean {:.6g} nonzero {}]", watched[i].address, f.watch_mean[i], f.watch_nonzero[i]);

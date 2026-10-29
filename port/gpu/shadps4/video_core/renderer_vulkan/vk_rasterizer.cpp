@@ -1216,7 +1216,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     }
     if (Core::LightRecorder::On()) {
         const u32 draw_class = tag.valid ? (tag.meta & 0xff) : 15u;
-        Core::LightRecorder::FrameOp(Core::DebugServer::PresentCount(), draw_class < 5 ? draw_class + 1 : 6, reinterpret_cast<u64>(pipeline));
+        Core::LightRecorder::FrameOp(Core::DebugServer::PresentCount(), draw_class < 5 ? draw_class + 1 : 6, reinterpret_cast<u64>(pipeline), texture_cache.ImageGeneration());
     }
     FixedState fixed_storage;
     const FixedState& fixed = FixedFor(plan, fixed_storage);
@@ -1441,7 +1441,7 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     }
     runtime.SetHazardProgram(cs_program.address);
     if (Core::LightRecorder::On()) {
-        Core::LightRecorder::FrameOp(Core::DebugServer::PresentCount(), 0, cs_program.address);
+        Core::LightRecorder::FrameOp(Core::DebugServer::PresentCount(), 0, cs_program.address, texture_cache.ImageGeneration());
     }
     if (IdentityAuditOn()) {
         // C1 / C2 audit: the pipeline of a program address
