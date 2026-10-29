@@ -385,6 +385,62 @@ void NoteHarvested(u64 address, u64 bytes, bool in_upload_ring) {
     }
 }
 
+namespace {
+std::array<std::atomic<u64>, B8Counts> b8_counts{};
+std::atomic<u64> b8_samples{0};
+u32 B8VerifyEvery() {
+    static const u32 n = [] {
+        const char* e = std::getenv("TLG_B8_VERIFY");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 0u;
+    }();
+    return n;
+}
+} // namespace
+
+u32 B8ImageMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_B8_IMAGES");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 0u;
+    }();
+    return mode;
+}
+
+bool B8VerifyOn() noexcept {
+    return B8ImageMode() == 2 && B8VerifyEvery() != 0;
+}
+
+bool B8VerifySample() noexcept {
+    return B8VerifyOn() && b8_samples.fetch_add(1, std::memory_order_relaxed) % B8VerifyEvery() == 0;
+}
+
+void NoteB8(B8Count what) noexcept {
+    b8_counts[what].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteB8Unannounced(u64 address, u64 size, bool by_fault) noexcept {
+    NoteB8(B8FoundWithout);
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+        LOG_WARNING(Core, "B8: image {:#x}+{:#x} changed by the CPU with no announcement ({}), owner {}", address, size, by_fault ? "write fault" : "verify hash",
+                    Core::NativeDevice::OwnerName(address));
+    }
+}
+
+nlohmann::json B8Report() {
+    const auto c = [](B8Count what) { return b8_counts[what].load(std::memory_order_relaxed); };
+    const u64 found = c(B8FoundWithout), later = c(B8AnnouncedLater);
+    return {{"mode", B8ImageMode()},
+            {"refreshes_by_announcement", c(B8RefreshAnnounced)},
+            {"refreshes_by_fault_and_announcement", c(B8RefreshFaultAndAnnounced)},
+            {"changes_found_without_announcement", found},
+            {"of_those_announced_later", later},
+            {"MISSES_never_announced", found > later ? found - later : 0},
+            {"announcements_on_images", c(B8AnnouncedOnImage)},
+            {"second_applications_kept_for_gpu", c(B8KeptForGpu)},
+            {"verify_checked", c(B8VerifyChecked)},
+            {"note", "B8.1, cumulative: images refreshed by the engine's announcements instead of write faults"}};
+}
+
 nlohmann::json HarvestAuditReport() {
     nlohmann::json j;
     j["enabled"] = HarvestAuditOn();

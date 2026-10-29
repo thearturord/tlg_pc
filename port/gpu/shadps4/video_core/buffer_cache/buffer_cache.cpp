@@ -164,7 +164,11 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
     }
     Core::NativeResources::NoteCpuWrite(address, size);
     memory_tracker->MarkRegionAsCpuModified(address, size);
-    if (Core::WriteWatch::LiftImages()) {
+    const u32 b8 = Core::NativeUpdates::B8ImageMode();
+    if (b8 != 0) {
+        texture_cache.NoteAnnouncedWrite(address, size, newer);
+    }
+    if (b8 != 2 && Core::WriteWatch::LiftImages()) {
         texture_cache.InvalidatePagesWritten(address, size);
     }
 }

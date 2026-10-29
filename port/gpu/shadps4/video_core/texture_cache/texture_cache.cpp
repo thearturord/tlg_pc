@@ -14,6 +14,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "core/native_resources.h"
+#include "core/native_updates.h"
 #include "core/native_write_watch.h"
 #include "core/resource_audit.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -35,6 +36,7 @@ static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_SAMPLERS = std::numeric_limits<u16>::max();
 
 namespace {
+constexpr u8 B8Fault = 1, B8Announced = 2, B8Owed = 4; ///< Image::b8_marks
 enum ImageSite : u32 { SiteFind, SiteOverlap, SiteExpand, SiteStencil, NumImageSites };
 std::array<std::atomic<u64>, NumImageSites> images_created{};
 std::atomic<u64> images_freed{};
@@ -276,6 +278,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
+            image.b8_marks |= B8Fault;
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
@@ -347,6 +350,34 @@ void TextureCache::InvalidatePagesWritten(VAddr addr, size_t size) {
             }
         }
         if (dirty) {
+            image.flags |= ImageFlagBits::CpuDirty;
+            UntrackImage(image_id);
+        }
+    }
+}
+
+void TextureCache::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
+    const bool native = Core::NativeUpdates::B8ImageMode() == 2;
+    SmallVector<ImageId, 8> image_ids;
+    ForEachImageInRegion(addr, size, [&](ImageId image_id, Image&) { image_ids.push_back(image_id); });
+    for (const auto image_id : image_ids) {
+        Image& image = slot_images[image_id];
+        std::scoped_lock lk{image.mutex};
+        if (!image.Overlaps(addr, size)) {
+            continue;
+        }
+        Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8AnnouncedOnImage);
+        if ((image.b8_marks & B8Owed) != 0) {
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8AnnouncedLater);
+            image.b8_marks &= ~B8Owed;
+        }
+        if (!newer && True(image.flags & ImageFlagBits::GpuModified)) {
+            // the GPU wrote the image after the first application: its bytes are newer than the CPU's
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8KeptForGpu);
+            continue;
+        }
+        image.b8_marks |= B8Announced;
+        if (native) {
             image.flags |= ImageFlagBits::CpuDirty;
             UntrackImage(image_id);
         }
@@ -979,6 +1010,27 @@ void TextureCache::RefreshImage(Image& image) {
         }
     };
     harvest_shared_pages();
+    const u32 b8 = Core::NativeUpdates::B8ImageMode();
+    if (image.b8_hash != 0 && False(image.flags & ImageFlagBits::Dirty) && False(image.flags & ImageFlagBits::GpuModified) && Core::NativeUpdates::B8VerifySample()) {
+        // B8.1 verify: an image no announcement dirtied must still hold the bytes of its last refresh
+        Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8VerifyChecked);
+        if ((XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size) | 1) != image.b8_hash) {
+            Core::NativeUpdates::NoteB8Unannounced(image.info.guest_address, image.info.guest_size, false);
+            image.b8_marks |= B8Owed;
+            image.flags |= ImageFlagBits::CpuDirty;
+            buffer_cache.InvalidateMemory(image.info.guest_address, image.info.guest_size, false);
+        }
+    }
+    if (b8 != 0 && True(image.flags & ImageFlagBits::CpuDirty) && (image.b8_marks & (B8Fault | B8Announced)) != 0) {
+        // B8.1: what told us the image changed
+        if ((image.b8_marks & B8Announced) != 0) {
+            Core::NativeUpdates::NoteB8((image.b8_marks & B8Fault) != 0 ? Core::NativeUpdates::B8RefreshFaultAndAnnounced : Core::NativeUpdates::B8RefreshAnnounced);
+        } else {
+            Core::NativeUpdates::NoteB8Unannounced(image.info.guest_address, image.info.guest_size, true);
+            image.b8_marks |= B8Owed;
+        }
+        image.b8_marks &= B8Owed;
+    }
     if (False(image.flags & ImageFlagBits::Dirty) && image.ww_hash != 0 && False(image.flags & ImageFlagBits::GpuModified) &&
         Core::WriteWatch::SampleImageCheck()) {
         // verify: an image that is not dirty must still hold the bytes of its last refresh
@@ -1067,6 +1119,9 @@ void TextureCache::RefreshImage(Image& image) {
     Core::NativeResources::NoteImageUpload(image.info.guest_address, image.info.guest_size,
                                            BufferCache::last_image_source_gpu);
     NoteRefreshedForWriteWatch(image);
+    image.b8_hash = Core::NativeUpdates::B8VerifyOn() && !BufferCache::last_image_source_gpu
+                        ? XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size) | 1
+                        : 0;
     image.ww_hash = Core::WriteWatch::VerifyOn() && !BufferCache::last_image_source_gpu
                         ? XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size) | 1
                         : 0;

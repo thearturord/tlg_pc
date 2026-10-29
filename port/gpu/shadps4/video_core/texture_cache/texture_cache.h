@@ -120,6 +120,9 @@ public:
     /// the range is CPU dirty; an image that only shares its first or last page with the range is dirty when its own bytes on that page
     /// changed since its last refresh (hashes taken by NoteRefreshedForWriteWatch), as the fault (which knew the bytes) decided.
     void InvalidatePagesWritten(VAddr addr, size_t size);
+    /// B8.1: the engine announced a CPU write of [addr, addr + size) (applied in order on the raster thread); the images it touches are marked, and in native mode
+    /// dirtied (`newer` false, the second application: an image the GPU wrote since is left alone)
+    void NoteAnnouncedWrite(VAddr addr, size_t size, bool newer);
     static void NoteRefreshedForWriteWatch(Image& image);
 
     /// Marks an image as dirty if it exists at the provided address.

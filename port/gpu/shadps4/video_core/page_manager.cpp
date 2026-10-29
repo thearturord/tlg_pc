@@ -59,10 +59,11 @@ struct PageManager::Impl {
         u8 num_image_watchers; ///< the texture cache's share of num_write_watchers
         u8 num_image_interior; ///< of those, the watches of an image that covers the whole page
         u8 write_watched;      ///< the runtime records CPU writes to this page (Core::WriteWatch): 1 the buffer cache needs no protection, 2 only an
-                               ///< image covering the whole page does (a page an image shares with other data is checked by the write watch)
+                               ///< image covering the whole page does (a page an image shares with other data is checked by the write watch), 3 none
+                               ///< (B8.1: the engine's announcements refresh images)
 
         Core::MemoryPermission WritePerm() const noexcept {
-            if (num_write_watchers == 0 || (write_watched == 2 && num_image_interior == 0) || (write_watched == 1 && num_image_watchers == 0)) {
+            if (num_write_watchers == 0 || write_watched == 3 || (write_watched == 2 && num_image_interior == 0) || (write_watched == 1 && num_image_watchers == 0)) {
                 return Core::MemoryPermission::Write;
             }
             return Core::MemoryPermission::None;
@@ -123,11 +124,11 @@ struct PageManager::Impl {
         if (Core::WriteWatch::LiftProtection() && Core::WriteWatch::Watched(address, size)) {
             for (u64 page = address >> PM_PAGE_BITS, end = (address + size) >> PM_PAGE_BITS; page < end; ++page) {
                 if (PageState* state = cached_pages.find(page)) {
-                    state->write_watched = Core::WriteWatch::LiftImages() ? 2 : 1;
+                    state->write_watched = Core::NativeUpdates::B8ImageMode() == 2 ? 3 : Core::WriteWatch::LiftImages() ? 2 : 1;
                 }
             }
             LOG_INFO(Render, "write watch: no protection of {:#x}+{:#x} for the buffer cache{}", address, size,
-                     Core::WriteWatch::LiftImages() ? " and the texture cache" : "");
+                     Core::NativeUpdates::B8ImageMode() == 2 ? " and the texture cache (B8.1)" : Core::WriteWatch::LiftImages() ? " and the texture cache" : "");
         }
     }
 

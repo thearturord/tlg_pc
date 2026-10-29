@@ -155,6 +155,8 @@ public:
     u64 image_uid{};
     u64 ww_hash{}; ///< write watch image verify: hash of the guest bytes at the last refresh (0: none)
     u64 ww_head_hash{}, ww_tail_hash{}; ///< write watch: hash of the image's bytes on its first / last page at the last refresh (0: none)
+    u64 b8_hash{};  ///< B8.1 verify: hash of the guest bytes at the last CPU refresh (0: none)
+    u8 b8_marks{};  ///< B8.1: what dirtied the image since its last refresh (1 a write fault, 2 an announcement), 4 a change found without one, still owed
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};

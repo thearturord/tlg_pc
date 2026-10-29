@@ -1722,6 +1722,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                                                               {"b3_images", {{"by_engine_id", rasterizer->b3_stats[0].exchange(0)}, {"first_sight", rasterizer->b3_stats[1].exchange(0)},
                                                                              {"image_changed", rasterizer->b3_stats[2].exchange(0)}, {"verified_same", rasterizer->b3_stats[3].load()}, {"VERIFIED_OTHER_IMAGE", rasterizer->b3_stats[4].load()}}},
                                                               {"b2_audit", Core::NativeUpdates::HarvestAuditReport()},
+                                                              {"b8_images", Core::NativeUpdates::B8Report()},
                                                               {"object_copy_verify", {{"checked", rasterizer->ObjectCopyVerify().first}, {"DIFFERENT", rasterizer->ObjectCopyVerify().second}}},
                                                               {"stale_why", {{"epoch", r[12]}, {"gone", r[13]}, {"not_synchronized", r[14]}, {"generation_moved", r[15]}, {"arena", r[16]}, {"tracker_dirty", r[17]}}},
                                                               {"not_resolved", {{"no_record_entry", r[3]}, {"null_or_huge", r[4]}, {"no_engine_object", r[5]}, {"not_immutable", r[6]},

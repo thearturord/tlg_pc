@@ -80,6 +80,27 @@ void NoteMiss(u64 page, u64 bytes);
 void NoteHarvested(u64 address, u64 bytes, bool in_upload_ring);
 [[nodiscard]] nlohmann::json HarvestAuditReport();
 
+/// B8.1 (`TLG_B8_IMAGES`): 0 off, 1 audit (texture memory stays write protected; a fault that dirtied an image no announcement explains is counted), 2 native (the
+/// announcements alone refresh images, texture memory is not write protected; `TLG_B8_VERIFY=N` hashes every Nth bound image that is not dirty against its last refresh)
+[[nodiscard]] u32 B8ImageMode() noexcept;
+/// B8.1 verify: true for every Nth check (0: verify off)
+[[nodiscard]] bool B8VerifySample() noexcept;
+[[nodiscard]] bool B8VerifyOn() noexcept;
+enum B8Count : u32 {
+    B8RefreshAnnounced,         ///< a CPU refresh of an image an announcement dirtied (no fault)
+    B8RefreshFaultAndAnnounced, ///< ... dirtied by a fault and an announcement
+    B8FoundWithout,             ///< a CPU change of an image no announcement explained when it was refreshed (a fault, or the verify's hash)
+    B8AnnouncedLater,           ///< ... of those, announced afterwards (the game wrote ahead of the raster thread: a timing case, not a miss)
+    B8VerifyChecked,            ///< images the verify hashed
+    B8AnnouncedOnImage,         ///< announcements that touched an image
+    B8KeptForGpu,               ///< second applications that left an image the GPU wrote since alone
+    B8Counts,
+};
+void NoteB8(B8Count what) noexcept;
+/// An image a CPU change reached without an announcement (first few logged with the owner)
+void NoteB8Unannounced(u64 address, u64 size, bool by_fault) noexcept;
+[[nodiscard]] nlohmann::json B8Report();
+
 nlohmann::json Report();
 
 } // namespace Core::NativeUpdates
