@@ -262,7 +262,7 @@ public:
     bool IsMapped(VAddr addr, u64 size);
     /// N5h: see BufferCache::SupersedeGpuWritten.
     /// B8.2: the engine deleted a texture or view (raster thread, in order with the GPU work)
-    void EngineObjectDeleted(u64 id, VAddr address, u64 bytes, bool texture);
+    void EngineObjectDeleted(u64 id, VAddr address, u64 bytes, u32 what);
     void SupersedeGpuWritten(VAddr addr, u64 size) {
         buffer_cache.SupersedeGpuWritten(addr, size);
     }

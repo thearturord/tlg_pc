@@ -120,7 +120,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     LOG_INFO(Render, "texture set memo: {}", texture_set_on ? "on" : "off");
     // B8.2: the engine's deletions, in order with the GPU work (raster thread)
     Core::NativeUpdates::SetDelete(
-        [](void* context, u64 id, u64 address, u64 bytes, bool texture) { static_cast<Rasterizer*>(context)->EngineObjectDeleted(id, address, bytes, texture); }, this);
+        [](void* context, u64 id, u64 address, u64 bytes, u32 what) { static_cast<Rasterizer*>(context)->EngineObjectDeleted(id, address, bytes, what); }, this);
+    Core::NativeUpdates::SetCreate(
+        [](void* context, u64, u64 address, u64 bytes) { static_cast<Rasterizer*>(context)->texture_cache.NoteEngineTextureCreate(address, bytes); }, this);
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
@@ -565,7 +567,7 @@ static bool B3ImagesOn() {
     return on;
 }
 
-void Rasterizer::EngineObjectDeleted(u64 id, VAddr address, u64 bytes, bool texture) {
+void Rasterizer::EngineObjectDeleted(u64 id, VAddr address, u64 bytes, u32 what) {
     if (const auto it = native_image_keys.find(id); it != native_image_keys.end()) {
         // B3: the deleted view's entries leave the table (the id is never used again)
         for (const u64 key : it->second) {
@@ -574,8 +576,9 @@ void Rasterizer::EngineObjectDeleted(u64 id, VAddr address, u64 bytes, bool text
         Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8ViewIdsDropped);
         native_image_keys.erase(it);
     }
-    if (texture) {
-        texture_cache.NoteEngineTextureDelete(id, address, bytes, Core::NativeUpdates::B8LifetimeMode() == 2);
+    if (what == 1 || what == 3) {
+        // a texture with a live alias at its memory keeps its images (its lists go)
+        texture_cache.NoteEngineTextureDelete(id, address, bytes, Core::NativeUpdates::B8LifetimeMode() == 2 && what == 1);
     }
 }
 

@@ -62,7 +62,7 @@ void SetApply(void (*fn)(void* context, u64 address, u64 size, bool newer), void
 /// The announcements of one submission: applied once (`first`) and the previous submission's again (`again`)
 struct Batch {
     std::vector<std::pair<u64, u64>> first, again;
-    std::vector<std::array<u64, 4>> deleted; ///< B8.2: engine objects deleted before the submission (id, memory, bytes, 1 texture / 0 view)
+    std::vector<std::array<u64, 4>> deleted; ///< B8.2: engine objects deleted or created before the submission (id, memory, bytes, what: 0 view, 1 texture, 2 created texture, 3 texture with an alias)
     [[nodiscard]] bool Empty() const noexcept {
         return first.empty() && again.empty() && deleted.empty();
     }
@@ -91,10 +91,13 @@ void NoteHarvested(u64 address, u64 bytes, bool in_upload_ring);
 /// B8.3 (`TLG_B8_FIND`): 0 off, 1 audit (the image found by the engine texture's id is compared with the lookup by address), 2 native (an engine texture's
 /// image is found by its id; the page table lookup only runs when the texture has no matching image yet or no engine texture owns the memory)
 [[nodiscard]] u32 B8FindMode() noexcept;
-/// B8.2: the engine deleted a texture (`texture` true) or a view; queued with the next submission's batch
-void NoteEngineDelete(u64 id, u64 address, u64 bytes, bool texture);
+/// B8.2: the engine deleted a view (`what` 0), a texture (1) or a texture another live texture shares the memory with (3); queued with the next submission's batch
+void NoteEngineDelete(u64 id, u64 address, u64 bytes, u32 what);
 /// Where a deletion is carried out (raster thread, in order with the GPU work); set by the rasterizer
-void SetDelete(void (*fn)(void* context, u64 id, u64 address, u64 bytes, bool texture), void* context);
+void SetDelete(void (*fn)(void* context, u64 id, u64 address, u64 bytes, u32 what), void* context);
+/// B8.4: the engine created a texture (its memory gets a new owner); queued with the next submission's batch like a deletion
+void NoteEngineCreate(u64 id, u64 address, u64 bytes);
+void SetCreate(void (*fn)(void* context, u64 id, u64 address, u64 bytes), void* context);
 /// B8.1 verify: true for every Nth check (0: verify off)
 [[nodiscard]] bool B8VerifySample() noexcept;
 [[nodiscard]] bool B8VerifyOn() noexcept;
@@ -124,6 +127,17 @@ enum B8Count : u32 {
     B8FindAnswerStale,          ///< ... an image was registered or removed in the range since: the page table lookup runs again
     B8FirstNoOverlap,           ///< B8.4 census: a page table lookup for an engine texture that met no image in its memory
     B8FirstOverlap,             ///< ... that met images (overlap resolution ran)
+    B8RouteAnnounce,            ///< B8.4: announcements whose images were found through the engine textures of the range
+    B8RouteAnnounceFallback,    ///< ... the range is not covered by engine textures (page table)
+    B8RouteMissed,              ///< ... audit: an image the page table finds and the engine textures' lists do not (not looked up since: refreshed when adopted)
+    B8RouteMissedListed,        ///< ... of those, images a lookup already gave out (a gap in the lists: must stay 0)
+    B8Adopted,                  ///< B8.4: an older image a page table lookup gave out for the first time (native mode: refreshed from memory, its announcements may have been missed)
+    B8AdoptedGpu,               ///< ... the GPU wrote it: kept
+    B8CreatedTextures,          ///< B8.4: engine texture creations carried out
+    B8CreatedUnlisted,          ///< ... older images in the new texture's memory, unlisted (refreshed when a lookup gives them out again)
+    B8RouteCopy,                ///< B8.4: copies whose image was found through the engine texture at the address
+    B8RouteCopyFallback,        ///< ... no engine texture starts at the address (page table)
+    B8RouteCopyOther,           ///< ... audit: the page table gives another answer
     B8Counts,
 };
 void NoteB8(B8Count what) noexcept;

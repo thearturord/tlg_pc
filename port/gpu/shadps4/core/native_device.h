@@ -5,6 +5,7 @@
 
 #include <array>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -56,6 +57,8 @@ void NoteDelete(u64 object);
 [[nodiscard]] bool Lookup(u64 id, Object& out);
 /// The live resource (buffer or texture) whose memory holds `address`, copied (false: none)
 [[nodiscard]] bool ResourceAt(VAddr address, Object& out);
+/// B8.4: the live textures whose memory meets [address, address + size) (ids appended to `out`); true when together they cover the whole range
+[[nodiscard]] bool TexturesIn(VAddr address, u64 size, std::vector<u64>& out);
 /// A short name of what owns `address` (for audits): "buffer usage U bind B", "texture_2d usage U bind B", "none"
 [[nodiscard]] std::string OwnerName(VAddr address);
 

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -97,6 +98,9 @@ bool ReadResourceObject(u64 object, Object& out) {
 
 void Insert(const Object& object) {
     std::unique_lock lock{table_mutex};
+    if (!by_id.contains(object.id) && object.kind >= Kind::Texture1D && object.kind <= Kind::Texture3D && object.address != 0 && object.bytes != 0) {
+        Core::NativeUpdates::NoteEngineCreate(object.id, object.address, object.bytes); // B8.4: the memory's older images are unlisted, in order with the GPU work
+    }
     if (const auto it = by_id.find(object.id); it != by_id.end()) {
         if (it->second.alive) {
             live_by_kind[static_cast<u32>(it->second.kind)].fetch_sub(1, std::memory_order_relaxed);
@@ -204,17 +208,17 @@ void NoteDelete(u64 object) {
         live_by_kind[static_cast<u32>(entry->second.kind)].fetch_sub(1, std::memory_order_relaxed);
         const Object& gone = entry->second;
         const bool texture = gone.kind >= Kind::Texture1D && gone.kind <= Kind::Texture3D;
-        if (texture && gone.address != 0 && gone.bytes != 0) {
-            // B8.2: another live texture at the same memory (an alias) keeps the images
+        if (texture && gone.address != 0) { // (a texture whose size read 0 at creation still owns images: its lists go too)
+            // B8.2: another live texture at the same memory (an alias) keeps the images (they are not freed; the deleted texture's lists still go)
             const auto at = resource_by_address.find(gone.address);
             const auto owner = at != resource_by_address.end() && at->second != gone.id ? by_id.find(at->second) : by_id.end();
-            if (owner != by_id.end() && owner->second.alive) {
+            const bool alias = owner != by_id.end() && owner->second.alive && owner->second.kind >= Kind::Texture1D && owner->second.kind <= Kind::Texture3D;
+            if (alias) {
                 Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8TextureAliasKept);
-            } else {
-                Core::NativeUpdates::NoteEngineDelete(gone.id, gone.address, gone.bytes, true);
             }
+            Core::NativeUpdates::NoteEngineDelete(gone.id, gone.address, gone.bytes, alias ? 3u : 1u);
         } else if (gone.kind == Kind::ShaderResourceView || gone.kind == Kind::UnorderedAccessView) {
-            Core::NativeUpdates::NoteEngineDelete(gone.id, gone.address, gone.bytes, false);
+            Core::NativeUpdates::NoteEngineDelete(gone.id, gone.address, gone.bytes, 0u);
         }
     }
     id_by_object.erase(it);
@@ -235,6 +239,50 @@ bool ResourceAt(VAddr address, Object& out) {
         }
     }
     return false;
+}
+
+bool TexturesIn(VAddr address, u64 size, std::vector<u64>& out) {
+    if (size == 0) {
+        return false;
+    }
+    const VAddr end = address + size;
+    std::array<std::pair<VAddr, VAddr>, 16> spans;
+    u32 num_spans = 0;
+    bool overflow = false;
+    {
+        std::shared_lock lock{table_mutex};
+        auto it = resource_by_address.lower_bound(end);
+        u32 below = 0; // entries that start before the range: a few are looked at (a texture that starts earlier and reaches in)
+        while (it != resource_by_address.begin() && below < 16) {
+            --it;
+            if (it->first < address) {
+                ++below;
+            }
+            const auto entry = by_id.find(it->second);
+            if (entry == by_id.end() || !entry->second.alive || entry->second.kind < Kind::Texture1D || entry->second.kind > Kind::Texture3D ||
+                entry->second.address != it->first || it->first + entry->second.bytes <= address) {
+                continue;
+            }
+            out.push_back(entry->second.id);
+            if (num_spans < spans.size()) {
+                spans[num_spans++] = {std::max(it->first, address), std::min(it->first + entry->second.bytes, end)};
+            } else {
+                overflow = true;
+            }
+        }
+    }
+    if (overflow || num_spans == 0) {
+        return false;
+    }
+    std::sort(spans.begin(), spans.begin() + num_spans);
+    VAddr covered = address;
+    for (u32 i = 0; i < num_spans && covered < end; ++i) {
+        if (spans[i].first > covered) {
+            return false;
+        }
+        covered = std::max(covered, spans[i].second);
+    }
+    return covered >= end;
 }
 
 bool B6NativeOn() noexcept {

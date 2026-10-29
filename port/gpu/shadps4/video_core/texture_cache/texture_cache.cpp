@@ -37,7 +37,7 @@ static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_SAMPLERS = std::numeric_limits<u16>::max();
 
 namespace {
-constexpr u8 B8Fault = 1, B8Announced = 2, B8Owed = 4, B8Deleted = 8; ///< Image::b8_marks
+constexpr u8 B8Fault = 1, B8Announced = 2, B8Owed = 4, B8Deleted = 8, B8Listed = 16; ///< Image::b8_marks
 enum ImageSite : u32 { SiteFind, SiteOverlap, SiteExpand, SiteStencil, NumImageSites };
 std::array<std::atomic<u64>, NumImageSites> images_created{};
 std::atomic<u64> images_freed{};
@@ -357,10 +357,83 @@ void TextureCache::InvalidatePagesWritten(VAddr addr, size_t size) {
     }
 }
 
+void TextureCache::NoteEngineTextureCreate(VAddr address, u64 bytes) {
+    Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8CreatedTextures);
+    ForEachImageInRegion(address, bytes, [&](ImageId, Image& image) {
+        if ((image.b8_marks & B8Listed) != 0) {
+            image.b8_marks &= ~B8Listed;
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8CreatedUnlisted);
+        }
+    });
+}
+
+void TextureCache::EngineImagesIn(const std::vector<u64>& ids, VAddr address, u64 size, SmallVector<ImageId, 8>& out) const {
+    const auto add = [&](ImageId image_id, u64 uid) {
+        if (!slot_images.IsAllocated(image_id)) {
+            return;
+        }
+        const Image& image = slot_images[image_id];
+        if (image.image_uid != uid || False(image.flags & ImageFlagBits::Registered) || !image.Overlaps(address, size) ||
+            std::ranges::find(out, image_id) != out.end()) {
+            return;
+        }
+        out.push_back(image_id);
+    };
+    for (const u64 id : ids) {
+        if (const auto it = engine_images.find(id); it != engine_images.end()) {
+            for (const auto& [image_id, uid] : it->second) {
+                add(image_id, uid);
+            }
+        }
+        if (const auto it = engine_answers.find(id); it != engine_answers.end()) {
+            for (const auto& a : it->second) {
+                add(a.image_id, a.uid);
+            }
+        }
+    }
+}
+
 void TextureCache::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
     const bool native = Core::NativeUpdates::B8ImageMode() == 2;
     SmallVector<ImageId, 8> image_ids;
-    ForEachImageInRegion(addr, size, [&](ImageId image_id, Image&) { image_ids.push_back(image_id); });
+    // B8.4: a range the engine's textures cover finds its images through them (their lists), not through the page table
+    const u32 b8_find = Core::NativeUpdates::B8FindMode();
+    bool routed = false;
+    if (b8_find != 0) {
+        static thread_local std::vector<u64> ids;
+        ids.clear();
+        if (Core::NativeDevice::TexturesIn(addr, size, ids)) {
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8RouteAnnounce);
+            EngineImagesIn(ids, addr, size, image_ids);
+            routed = b8_find == 2;
+            if (!routed) {
+                ForEachImageInRegion(addr, size, [&](ImageId image_id, Image& image) {
+                    if (std::ranges::find(image_ids, image_id) != image_ids.end()) {
+                        return;
+                    }
+                    Core::NativeUpdates::NoteB8((image.b8_marks & B8Listed) != 0 ? Core::NativeUpdates::B8RouteMissedListed : Core::NativeUpdates::B8RouteMissed);
+                    static std::atomic<u32> logged{0};
+                    if ((image.b8_marks & B8Listed) != 0 && logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+                        Core::NativeDevice::Object at;
+                        const bool has = Core::NativeDevice::ResourceAt(image.info.guest_address, at);
+                        LOG_WARNING(Render_Vulkan,
+                                    "B8.4 audit: announcement {:#x}+{:#x} ({} textures): image {:#x}+{:#x} ({}x{} layers {} mips {} uid {} marks {:#x}) is in no engine texture's list; "
+                                    "at its memory: {} (id {} at {:#x}+{:#x} kind {} {}x{}); listed by {:#x} (alive {})",
+                                    addr, size, ids.size(), image.info.guest_address, image.info.guest_size, image.info.size.width, image.info.size.height,
+                                    image.info.resources.layers, image.info.resources.levels, image.image_uid, image.b8_marks, Core::NativeDevice::OwnerName(image.info.guest_address),
+                                    has ? at.id : 0, has ? at.address : 0, has ? at.bytes : 0, has ? static_cast<u32>(at.kind) : 0, has ? at.width : 0, has ? at.height : 0,
+                                    image.b8_listed_by, Core::NativeDevice::Lookup(image.b8_listed_by & ~(3ull << 62), at) && at.alive);
+                    }
+                });
+                image_ids.clear();
+            }
+        } else {
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8RouteAnnounceFallback);
+        }
+    }
+    if (!routed) {
+        ForEachImageInRegion(addr, size, [&](ImageId image_id, Image&) { image_ids.push_back(image_id); });
+    }
     for (const auto image_id : image_ids) {
         Image& image = slot_images[image_id];
         std::scoped_lock lk{image.mutex};
@@ -387,8 +460,27 @@ void TextureCache::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
 
 void TextureCache::NoteEngineTextureDelete(u64 id, VAddr address, u64 bytes, bool free) {
     Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8TexturesDeleted);
+    // B8.4: the images the texture's lists held are no longer kept current through it: the next lookup that gives one out refreshes it (adoption)
+    const auto unlist = [&](ImageId image_id, u64 uid) {
+        if (slot_images.IsAllocated(image_id) && slot_images[image_id].image_uid == uid) {
+            slot_images[image_id].b8_marks &= ~B8Listed;
+        }
+    };
+    if (const auto it = engine_images.find(id); it != engine_images.end()) {
+        for (const auto& [image_id, uid] : it->second) {
+            unlist(image_id, uid);
+        }
+    }
+    if (const auto it = engine_answers.find(id); it != engine_answers.end()) {
+        for (const auto& a : it->second) {
+            unlist(a.image_id, a.uid);
+        }
+    }
     engine_images.erase(id);
     engine_answers.erase(id);
+    if (bytes == 0) {
+        return;
+    }
     SmallVector<ImageId, 4> image_ids;
     ForEachImageInRegion(address, bytes, [&](ImageId image_id, Image& image) {
         if (image.info.guest_address != address) {
@@ -779,9 +871,18 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
     // B8.3: the engine texture that starts at this memory, and its image that matches the description exactly (the perfect match below, found by id)
     const u32 b8_find = Core::NativeUpdates::B8FindMode();
+    const u64 uid_floor = Image::NewestUid(); // images up to this uid existed before this lookup
     u64 owner_id = 0;
     u64 owner_bytes = 0;
     ImageId by_id{};
+    // the perfect match below, for an image of the engine texture's list
+    const auto exact_match = [&](const Image& cache_image) {
+        return True(cache_image.flags & ImageFlagBits::Registered) && cache_image.info.guest_address == info.guest_address &&
+               cache_image.info.guest_size == info.guest_size && cache_image.info.size == info.size &&
+               IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) &&
+               !(cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1}) && !(exact_fmt && info.pixel_format != cache_image.info.pixel_format) &&
+               !(cache_image.info.resources < info.resources);
+    };
     if (b8_find != 0) {
         Core::NativeDevice::Object owner;
         if (Core::NativeDevice::ResourceAt(info.guest_address, owner) && owner.address == info.guest_address && owner.kind != Core::NativeDevice::Kind::Buffer) {
@@ -792,11 +893,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                     if (!slot_images.IsAllocated(cache_id) || slot_images[cache_id].image_uid != uid) {
                         continue;
                     }
-                    const auto& cache_image = slot_images[cache_id];
-                    if (False(cache_image.flags & ImageFlagBits::Registered) || cache_image.info.guest_address != info.guest_address ||
-                        cache_image.info.guest_size != info.guest_size || cache_image.info.size != info.size ||
-                        !IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
-                        (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1}) || (exact_fmt && info.pixel_format != cache_image.info.pixel_format) || cache_image.info.resources < info.resources) {
+                    if (!exact_match(slot_images[cache_id])) {
                         continue;
                     }
                     by_id = cache_id;
@@ -856,9 +953,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         }
     }
     // B8.3: the image the lookup by address returns becomes the engine texture's when it lies at its memory
-    const auto own = [&](ImageId found) {
+    const auto own = [&](ImageId found) -> bool {
         if (owner_id == 0) {
-            return;
+            return false;
         }
         if (by_id && found != by_id) {
             Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8FindByIdOther);
@@ -870,14 +967,16 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         }
         const Image& image = slot_images[found];
         if (image.info.guest_address != info.guest_address || (owner_bytes != 0 && image.info.guest_size > owner_bytes)) {
-            return;
+            return false; // not the texture's own image: remembered as an answer below
         }
         auto& list = engine_images[owner_id];
         if (std::ranges::find(list, std::make_pair(found, image.image_uid)) == list.end()) {
             list.erase(std::remove_if(list.begin(), list.end(), [&](const auto& e) { return !slot_images.IsAllocated(e.first) || slot_images[e.first].image_uid != e.second; }), list.end());
             list.emplace_back(found, image.image_uid);
+            slot_images[found].b8_listed_by = owner_id;
             Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8FindOwned);
         }
+        return true;
     };
 
     SmallVector<ImageId, 8> image_ids;
@@ -961,13 +1060,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         desc.view_info.range.base.layer = view_slice;
     }
 
-    if (view_mip <= 0 && view_slice <= 0) {
-        own(image_id);
-    }
+    const bool owned = view_mip <= 0 && view_slice <= 0 && own(image_id);
     if (answer_key != 0) {
         const Image& found = slot_images[image_id];
-        const bool exact = found.info.guest_address == info.guest_address && found.info.guest_size == info.guest_size && found.info.size == info.size &&
-                           found.info.pixel_format == info.pixel_format && found.info.type == info.type && !(found.info.resources < info.resources);
         if (answer != nullptr && (answer->image_id != image_id || answer->uid != found.image_uid || answer->mip != view_mip || answer->slice != view_slice)) {
             Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8FindAnswerOther);
             static std::atomic<u32> logged{0};
@@ -976,8 +1071,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                             info.guest_address, answer->image_id.index, answer->mip, answer->slice, image_id.index, view_mip, view_slice);
             }
         }
-        if (!exact) {
-            // remembered: the next lookup of this request is answered by the engine texture's id
+        if (!owned || !exact_match(found) || view_mip > 0 || view_slice > 0) {
+            // remembered (every answer the texture's own list does not give): the next lookup of this request is answered by the engine texture's id
             auto& list = engine_answers[owner_id];
             EngineAnswer fresh{answer_key, image_id, found.image_uid, ImageGeneration(), view_mip, view_slice};
             bool replaced = false;
@@ -990,6 +1085,40 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             if (!replaced) {
                 list.push_back(fresh);
             }
+            slot_images[image_id].b8_listed_by = owner_id | (1ull << 63);
+        }
+    }
+    if (b8_find != 0) {
+        // B8.4: an older image given out for the first time may have missed announcements (the lists did not hold it): refreshed from memory
+        Image& found = slot_images[image_id];
+        if ((found.b8_marks & B8Listed) == 0) {
+            found.b8_marks |= B8Listed;
+            if (found.image_uid <= uid_floor) {
+                const bool gpu = True(found.flags & ImageFlagBits::GpuModified);
+                Core::NativeUpdates::NoteB8(gpu ? Core::NativeUpdates::B8AdoptedGpu : Core::NativeUpdates::B8Adopted);
+                if (b8_find == 2 && !gpu) {
+                    found.flags |= ImageFlagBits::CpuDirty;
+                }
+            }
+        }
+    }
+    if (b8_find != 0 && owner_id == 0) {
+        // B8.4: an image inside engine textures' memory that none of them starts at is listed with them (key 0: never an answer), so their lists hold every image of
+        // their memory
+        static thread_local std::vector<u64> ids;
+        ids.clear();
+        const Image& found = slot_images[image_id];
+        if (Core::NativeDevice::TexturesIn(found.info.guest_address, found.info.guest_size, ids) || !ids.empty()) {
+            for (const u64 id : ids) {
+                auto& list = engine_answers[id];
+                if (std::ranges::none_of(list, [&](const EngineAnswer& a) { return a.image_id == image_id && a.uid == found.image_uid; })) {
+                    list.erase(std::remove_if(list.begin(), list.end(),
+                                              [&](const EngineAnswer& a) { return a.key == 0 && (!slot_images.IsAllocated(a.image_id) || slot_images[a.image_id].image_uid != a.uid); }),
+                               list.end());
+                    list.push_back(EngineAnswer{0, image_id, found.image_uid, 0, -1, -1});
+                    slot_images[image_id].b8_listed_by = id | (1ull << 62);
+                }
+            }
         }
     }
     return image_id;
@@ -997,12 +1126,50 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     SmallVector<ImageId, 4> image_ids;
-    ForEachImageWithAddress(address, [&](ImageId image_id, Image& image) {
-        if (ensure_valid && !image.SafeToDownload()) {
-            return;
+    // B8.4: memory an engine texture starts at finds its images through the texture's lists
+    const u32 b8_find = Core::NativeUpdates::B8FindMode();
+    bool routed = false;
+    bool owner_found = false;
+    SmallVector<ImageId, 8> engine_ids;
+    if (b8_find != 0) {
+        Core::NativeDevice::Object owner;
+        if (Core::NativeDevice::ResourceAt(address, owner) && owner.address == address && owner.kind != Core::NativeDevice::Kind::Buffer) {
+            owner_found = true;
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8RouteCopy);
+            static thread_local std::vector<u64> ids;
+            ids.assign(1, owner.id);
+            EngineImagesIn(ids, address, 1, engine_ids);
+            routed = b8_find == 2;
+        } else {
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8RouteCopyFallback);
         }
-        image_ids.push_back(image_id);
-    });
+    }
+    if (routed) {
+        for (const ImageId image_id : engine_ids) {
+            const Image& image = slot_images[image_id];
+            if (image.info.guest_address != address || (ensure_valid && !image.SafeToDownload())) {
+                continue;
+            }
+            image_ids.push_back(image_id);
+        }
+    } else {
+        ForEachImageWithAddress(address, [&](ImageId image_id, Image& image) {
+            if (ensure_valid && !image.SafeToDownload()) {
+                return;
+            }
+            image_ids.push_back(image_id);
+        });
+        if (b8_find == 1 && owner_found) {
+            // audit: the page table's candidates against the engine texture's
+            // a candidate the texture's lists lack that a lookup gave out (one no lookup gave out since is refreshed when adopted)
+            for (const ImageId image_id : image_ids) {
+                if (std::ranges::find(engine_ids, image_id) == engine_ids.end() && (slot_images[image_id].b8_marks & B8Listed) != 0) {
+                    Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8RouteCopyOther);
+                    break;
+                }
+            }
+        }
+    }
     if (image_ids.size() == 1) {
         // Sometimes image size might not exactly match with requested buffer size
         // If we only found 1 candidate image use it without too many questions.

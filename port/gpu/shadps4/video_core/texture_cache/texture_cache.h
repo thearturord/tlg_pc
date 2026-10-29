@@ -125,6 +125,10 @@ public:
     void NoteAnnouncedWrite(VAddr addr, size_t size, bool newer);
     /// B8.2: the engine deleted the texture whose memory is [address, address + bytes): its images (same memory, not bigger) are freed (`free`) or marked (audit)
     void NoteEngineTextureDelete(u64 id, VAddr address, u64 bytes, bool free);
+    /// B8.4: the engine created a texture at [address, address + bytes): older images in that memory are unlisted (a lookup that gives one out refreshes it)
+    void NoteEngineTextureCreate(VAddr address, u64 bytes);
+    /// B8.4: the images listed for the engine textures `ids` (their own and their remembered answers) that meet [address, address + size), each once
+    void EngineImagesIn(const std::vector<u64>& ids, VAddr address, u64 size, SmallVector<ImageId, 8>& out) const;
     static void NoteRefreshedForWriteWatch(Image& image);
 
     /// Marks an image as dirty if it exists at the provided address.

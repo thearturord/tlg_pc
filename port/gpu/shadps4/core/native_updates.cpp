@@ -268,7 +268,9 @@ namespace {
 std::mutex pending_mutex;
 std::vector<std::pair<u64, u64>> pending_ranges, applied_last;
 std::vector<std::array<u64, 4>> pending_deleted;
-void (*delete_fn)(void*, u64, u64, u64, bool) = nullptr;
+void (*delete_fn)(void*, u64, u64, u64, u32) = nullptr;
+void (*create_fn)(void*, u64, u64, u64) = nullptr;
+void* create_context = nullptr;
 void* delete_context = nullptr;
 void (*apply_fn)(void*, u64, u64, bool) = nullptr;
 void* apply_context = nullptr;
@@ -311,24 +313,43 @@ Batch TakeBatch() {
     return batch;
 }
 
-void SetDelete(void (*fn)(void*, u64, u64, u64, bool), void* context) {
+void SetDelete(void (*fn)(void*, u64, u64, u64, u32), void* context) {
     delete_context = context;
     delete_fn = fn;
 }
 
-void NoteEngineDelete(u64 id, u64 address, u64 bytes, bool texture) {
+void SetCreate(void (*fn)(void*, u64, u64, u64), void* context) {
+    create_context = context;
+    create_fn = fn;
+}
+
+void NoteEngineCreate(u64 id, u64 address, u64 bytes) {
+    if (B8FindMode() == 0 || B2NativeMode() == 0) {
+        return;
+    }
+    std::scoped_lock lock{pending_mutex};
+    pending_deleted.push_back({id, address, bytes, 2u});
+}
+
+void NoteEngineDelete(u64 id, u64 address, u64 bytes, u32 what) {
     if (B8LifetimeMode() == 0 || B2NativeMode() == 0) {
         return;
     }
     std::scoped_lock lock{pending_mutex};
-    pending_deleted.push_back({id, address, bytes, texture ? 1u : 0u});
+    pending_deleted.push_back({id, address, bytes, what});
 }
 
 void ApplyBatch(const Batch& batch) {
     if (delete_fn != nullptr) {
         // deletions first: the work of this submission comes after them in the game's order, and no announcement of it touches a deleted object
         for (const auto& d : batch.deleted) {
-            delete_fn(delete_context, d[0], d[1], d[2], d[3] != 0);
+            if (d[3] == 2) {
+                if (create_fn != nullptr) {
+                    create_fn(create_context, d[0], d[1], d[2]);
+                }
+            } else {
+                delete_fn(delete_context, d[0], d[1], d[2], static_cast<u32>(d[3]));
+            }
         }
     }
     if (apply_fn == nullptr) {
@@ -485,6 +506,11 @@ nlohmann::json B8Report() {
                       {"no_image_yet", c(B8FindNoImageYet)}, {"no_engine_owner", c(B8FindNoOwner)}, {"images_owned", c(B8FindOwned)},
                       {"by_remembered_answer", c(B8FindByAnswer)}, {"AUDIT_OTHER_ANSWER_BY_ADDRESS", c(B8FindAnswerOther)}, {"answer_stale", c(B8FindAnswerStale)},
                       {"page_table_lookups_no_overlap", c(B8FirstNoOverlap)}, {"page_table_lookups_with_overlap", c(B8FirstOverlap)}}},
+            {"route", {{"announcements_by_engine_textures", c(B8RouteAnnounce)}, {"announcements_page_table", c(B8RouteAnnounceFallback)},
+                       {"audit_images_missed_not_looked_up", c(B8RouteMissed)}, {"AUDIT_IMAGES_MISSED_LISTED", c(B8RouteMissedListed)},
+                       {"images_adopted", c(B8Adopted)}, {"images_adopted_gpu_written", c(B8AdoptedGpu)},
+                       {"textures_created", c(B8CreatedTextures)}, {"older_images_unlisted_at_creation", c(B8CreatedUnlisted)}, {"copies_by_engine_texture", c(B8RouteCopy)}, {"copies_page_table", c(B8RouteCopyFallback)},
+                       {"AUDIT_COPY_OTHER", c(B8RouteCopyOther)}}},
             {"note", "B8.1, cumulative: images refreshed by the engine's announcements instead of write faults"}};
 }
 
