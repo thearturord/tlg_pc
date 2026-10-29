@@ -27,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/host_compatibility.h"
+#include <fmt/format.h>
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
 
@@ -203,12 +204,14 @@ void TextureCache::RecordImageDownloads(ReadbackBatch& batch, u32 fence_kind) {
     download_images.clear();
 }
 
-void TextureCache::NoteImageEvent(const ImageInfo& info) noexcept {
+void TextureCache::NoteImageEvent(const ImageInfo& info, bool registered) noexcept {
     const u64 generation = image_generation.fetch_add(1, std::memory_order_release) + 1;
     ImageEvent& event = image_events[generation % ImageEventRing];
     event.generation.store(0, std::memory_order_release);
     event.address.store(info.guest_address, std::memory_order_relaxed);
     event.size.store(info.guest_size, std::memory_order_relaxed);
+    event.format.store((registered ? 1ull : 0ull) | (static_cast<u64>(info.pixel_format) << 8) | (static_cast<u64>(info.type) << 40), std::memory_order_relaxed);
+    event.shape.store(u64{info.size.width} | (u64{info.size.height} << 16) | (u64{info.resources.levels} << 32) | (u64{info.resources.layers} << 40) | (u64{info.num_samples} << 48), std::memory_order_relaxed);
     event.generation.store(generation, std::memory_order_release);
 }
 
@@ -243,6 +246,23 @@ bool TextureCache::ImageUnchangedSince(ImageId image_id, u64 uid, u64 since, VAd
         }
     }
     return true;
+}
+
+std::string TextureCache::DescribeImageEvents(u64 first, u64 last) const {
+    std::string out;
+    if (last <= first || last - first > ImageEventRing) {
+        return out;
+    }
+    for (u64 generation = first + 1; generation <= last; ++generation) {
+        const ImageEvent& event = image_events[generation % ImageEventRing];
+        if (event.generation.load(std::memory_order_acquire) != generation) {
+            continue;
+        }
+        const u64 format = event.format.load(std::memory_order_relaxed), shape = event.shape.load(std::memory_order_relaxed);
+        out += fmt::format("  image event {} {} addr {:#x} size {:#x} format {} type {} {}x{} levels {} layers {} samples {}\n", generation, (format & 1) ? "REGISTER  " : "UNREGISTER", event.address.load(std::memory_order_relaxed),
+                           event.size.load(std::memory_order_relaxed), (format >> 8) & 0xffffffffull, format >> 40, shape & 0xffff, (shape >> 16) & 0xffff, (shape >> 32) & 0xff, (shape >> 40) & 0xff, shape >> 48);
+    }
+    return out;
 }
 
 void TextureCache::TouchFoundImage(ImageId image_id) {
@@ -1539,7 +1559,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
-    NoteImageEvent(image.info);
+    NoteImageEvent(image.info, true);
     Core::NativeResources::NoteImageCensus(image.info.guest_address, image.info.size.width, image.info.size.height, (image.usage_flags & vk::ImageUsageFlagBits::eColorAttachment) ? true : false,
                                            image.info.props.is_depth != 0); // B1 census
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
@@ -1560,7 +1580,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
-    NoteImageEvent(image.info);
+    NoteImageEvent(image.info, false);
     image_lru_cache.Free(image);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {

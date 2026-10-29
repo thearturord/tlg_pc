@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <string>
+
 #include "common/types.h"
 
 namespace Core::LightRecorder {
@@ -45,5 +47,8 @@ void End();
 /// Asks for the ring to be written to user/log/light_recorder_<tag>.txt once four more frames have been recorded (the monitor sees a dark frame a frame or two after it was presented, and
 /// the frames after it are needed to tell a one frame change from a ping pong); any thread.
 void Dump(const char* tag, u64 detail);
+
+/// The texture cache's description of its image events between two generations (set once by the rasterizer; the dump prints the events of the frames around the dark one).
+void SetEventDescriber(std::string (*describe)(void* context, u64 first, u64 last), void* context);
 
 } // namespace Core::LightRecorder

@@ -85,6 +85,14 @@ bool IsLightCaller(u64 caller) {
     return false;
 }
 
+std::string (*event_describer)(void*, u64, u64) = nullptr;
+void* event_describer_context = nullptr;
+
+void SetEventDescriber(std::string (*describe)(void*, u64, u64), void* context) {
+    event_describer_context = context;
+    event_describer = describe;
+}
+
 void Watch(u64 address, u64 bytes) {
     if (!recording || current.caller != 0x247ea43 || bytes == 0 || bytes > 8192) {
         return;
@@ -212,6 +220,19 @@ void WriteDump(const std::string& tag, u64 detail) {
                 if (!watch.empty()) {
                     text += fmt::format("watch {}{}\n", f.present, watch);
                 }
+            }
+        }
+        if (event_describer != nullptr) {
+            u64 first = ~0ull, last = 0;
+            for (const FrameSig& f : frame_ring) {
+                if (f.present != ~0ull && f.present + 6 >= detail && f.present <= detail + 1 && f.image_generation_first != 0) {
+                    first = std::min(first, f.image_generation_first);
+                    last = std::max(last, f.image_generation_last);
+                }
+            }
+            if (first != ~0ull) {
+                text += fmt::format("image events between generation {} and {} (presents {} to {}):\n", first, last, detail - 6, detail + 1);
+                text += event_describer(event_describer_context, first > 0 ? first - 1 : 0, last);
             }
         }
         for (const Record& r : ring) {

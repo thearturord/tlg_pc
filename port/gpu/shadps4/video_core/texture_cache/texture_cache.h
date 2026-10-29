@@ -527,10 +527,16 @@ private:
         std::atomic<u64> generation{};
         std::atomic<u64> address{};
         std::atomic<u64> size{};
+        std::atomic<u64> format{}; ///< bit 0 registered (else unregistered), vk format << 8, image type << 40 (the light recorder reads these)
+        std::atomic<u64> shape{};  ///< width | height << 16 | levels << 32 | layers << 40 | samples << 48
     };
     static constexpr u64 ImageEventRing = 4096;
     std::array<ImageEvent, ImageEventRing> image_events{};
-    void NoteImageEvent(const ImageInfo& info) noexcept;
+    void NoteImageEvent(const ImageInfo& info, bool registered) noexcept;
+public:
+    /// The registrations and unregistrations of the generations (first, last] as text, for the light recorder.
+    [[nodiscard]] std::string DescribeImageEvents(u64 first, u64 last) const;
+private:
     absl::flat_hash_map<VAddr, MetaDataInfo> surface_metas;
 };
 

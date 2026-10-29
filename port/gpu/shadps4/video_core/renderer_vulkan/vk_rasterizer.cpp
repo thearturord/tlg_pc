@@ -81,6 +81,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       encoder_debug{EmulatorSettings.GetCpEncoderDebug()},
       full_eop_fences{EmulatorSettings.GetCpEncoderMode() >= 2 || (encoder_debug & 4) != 0},
       flush_commands{EmulatorSettings.GetCpFlushCommands()} {
+    Core::LightRecorder::SetEventDescriber([](void* context, u64 first, u64 last) { return static_cast<VideoCore::TextureCache*>(context)->DescribeImageEvents(first, last); }, &texture_cache);
     VideoCore::ReadbackPolicy::InitFromSettings();
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
@@ -3004,7 +3005,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     note.address = vsharp.base_address;
                     note.size = size;
                     u64 h = 0xcbf29ce484222325ull;
-                    const u64 hashed = std::min<u64>(size, 16384); // a light constant block is below 2 KB; a big buffer is hashed by its first 16 KB
+                    const u64 hashed = std::min<u64>(size, 2048); // a light constant block is below 2 KB (more costs too much with the copy dispatches recorded too)
                     const u64 bytes = memory->IsValidMapping(vsharp.base_address, hashed) ? hashed : 0;
                     for (u64 b = 0; b < bytes; b += 4) {
                         u32 word = 0;
