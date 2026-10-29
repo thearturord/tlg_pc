@@ -173,6 +173,7 @@ struct ResolvedBuffer {
     VAddr address{};
     u32 size{};
     u32 generation{};
+    bool no_object{}; ///< the lookup by address found no engine object (the raster thread need not look again while the immutable epoch holds)
 };
 
 struct StagePlan {

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <absl/container/node_hash_map.h>
 #include <map>
 
 #include "common/interval_set.h"
@@ -168,7 +169,7 @@ private:
         struct State {
             List read, write;
         };
-        std::unordered_map<u64, State> buffers;
+        absl::node_hash_map<u64, State> buffers; // R5 step 1: node map (stable references, faster lookups than std)
         bool memory_pending{false};
         bool bounded{true};
     };
@@ -186,7 +187,7 @@ private:
     struct SeenBuffer {
         u64 base{}, size{};
     };
-    std::unordered_map<u64, SeenBuffer> live_seen; ///< buffer object -> the guest range it covered when last seen (a change is a rebase)
+    absl::node_hash_map<u64, SeenBuffer> live_seen; ///< buffer object -> the guest range it covered when last seen (a change is a rebase)
     LivePlanStats live_stats{};
     /// the list a range lives in (0 = all guest memory, else the buffer's own offset space) and its start there
     u64 LivePlanSpace(const VideoCore::Buffer* handle, u64 offset, u64& begin);
@@ -196,7 +197,7 @@ private:
         VideoCore::Image::State state;
         std::vector<VideoCore::Image::State> subresources;
     };
-    std::unordered_map<u64, ImagePlan> image_plan;
+    absl::node_hash_map<u64, ImagePlan> image_plan;
     static u64 ImagePlanKey(const VideoCore::Image& image, u32 num_samples) {
         return (image.image_uid << 6) | (num_samples & 63);
     }

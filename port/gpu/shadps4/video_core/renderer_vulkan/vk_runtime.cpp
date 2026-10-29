@@ -505,22 +505,25 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
     const u32 layout_before = hazard_audit_on && image->backing ? HazardLayoutIndex(image->backing->state.layout) : 0;
-    image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
+    if (tracker_on || !live_plan_on) {
+        // R5 step 2 (2026-10-29): the image's own state only next to the planner as a comparison (`TLG_BARRIER_TRACKER=1`), as P1 did for buffers
+        image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
+    }
     if (live_plan_on) {
         // L4, images: the planner's barriers next to the image's own; mode 3 takes the planner's
         VideoCore::Image::Barriers planned;
         PlanImageBarriers(image, planned, dst_layout, dst_access, dst_stage, subres_range);
         ++live_stats.image_transits;
         live_stats.image_barriers += planned.size();
-        bool same = planned.size() == image_barriers.size() - prev_num_barriers;
-        for (size_t i = 0; same && i < planned.size(); ++i) {
+        bool same = !tracker_on || planned.size() == image_barriers.size() - prev_num_barriers;
+        for (size_t i = 0; tracker_on && same && i < planned.size(); ++i) {
             const auto& a = planned[i];
             const auto& b = image_barriers[prev_num_barriers + i];
             same = a.srcStageMask == b.srcStageMask && a.srcAccessMask == b.srcAccessMask && a.dstStageMask == b.dstStageMask &&
                    a.dstAccessMask == b.dstAccessMask && a.oldLayout == b.oldLayout && a.newLayout == b.newLayout && a.image == b.image &&
                    a.subresourceRange == b.subresourceRange;
         }
-        if (!same) {
+        if (!same && tracker_on) {
             ++live_stats.image_differences;
             static u32 logged = 0;
             if (logged++ < 24) {

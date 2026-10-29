@@ -122,7 +122,7 @@ public:
                                                              bool is_written,
                                                              bool is_texel_buffer = false,
                                                              Core::NativeResources::ImmutableBuffer* immutable_hint = nullptr,
-                                                             bool verify_hint = false);
+                                                             bool verify_hint = false, bool known_no_object = false);
 
     /// The arena range of a copy destination that is downloaded in stream order (an explicit readback): the CPU's pending writes are
     /// uploaded, the range is not marked GPU modified.

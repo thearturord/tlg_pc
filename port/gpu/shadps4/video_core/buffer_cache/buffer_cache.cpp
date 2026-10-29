@@ -570,7 +570,7 @@ u64 BufferCache::PreSynchronize(VAddr device_addr, u64 size) {
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer,
-                                                        Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint) {
+                                                        Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
     Core::ResourceAudit::Note(Core::ResourceAudit::BufferUse, device_addr, size, is_written);
     HarvestWriteWatch(device_addr, size);
     if (static const bool census = [] { const char* e = std::getenv("TLG_LIFT_CENSUS"); return e != nullptr && *e == '1'; }(); census && Core::NativeRegistry::enabled.load(std::memory_order_relaxed)) {
@@ -578,7 +578,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }
     // An immutable engine buffer (see NativeResources::ImmutableBuffer): after one synchronization of the whole buffer it is
     // read straight from the arena.
-    if (!is_written && !is_texel_buffer && Core::NativeResources::ImmutableResidencyEnabled()) {
+    // known_no_object (R2): the command processor's lookup by address found no engine object and none was registered since
+    if (!is_written && !is_texel_buffer && !known_no_object && Core::NativeResources::ImmutableResidencyEnabled()) {
         Core::NativeResources::ImmutableBuffer* immutable = nullptr;
         if (immutable_hint != nullptr) {
             // N3c: the handle of the engine id replaces the lookup by address; it must contain the request

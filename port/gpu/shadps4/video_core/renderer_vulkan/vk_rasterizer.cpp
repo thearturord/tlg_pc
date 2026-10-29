@@ -134,6 +134,14 @@ enum CensusKind : u32 {
     CImageStorage, CImageTransit, CImageTransitTrue, CBindResources, CBufferInPlace, CBufferResolved,
     CGeometryVertexRing = 24, CGeometryVertexHandle, CGeometryVertexAddress, CGeometryIndexRing, CGeometryIndexHandle, CGeometryIndexAddress,
 };
+/// C1 / C2 identity audits (image ids, program pipelines): a hash map insert per image and per dispatch, off unless `TLG_IDENTITY_AUDIT=1` (2026-10-29)
+bool IdentityAuditOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_IDENTITY_AUDIT");
+        return e != nullptr && *e == '1';
+    }();
+    return on;
+}
 bool DescCensusOn() {
     static const bool on = [] {
         const char* e = std::getenv("TLG_DESC_CENSUS");
@@ -1284,7 +1292,7 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
         return;
     }
     runtime.SetHazardProgram(cs_program.address);
-    {
+    if (IdentityAuditOn()) {
         // C1 / C2 audit: the pipeline of a program address
         auto& audit = g_identity_audit;
         audit.dispatches.fetch_add(1, std::memory_order_relaxed);
@@ -1933,7 +1941,11 @@ void Rasterizer::ResetBindings(bool is_compute) {
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
+    const auto* stream = &buffer_cache.GetStreamBuffer();
     for (const auto [buffer, offset, size, src_access] : bound_buffers) {
+        if (buffer == stream && !(src_access & vk::AccessFlagBits2::eShaderWrite)) {
+            continue; // R5: only the host writes the stream ring, so a read of it is no hazard for anything later
+        }
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
                                           : vk::PipelineStageFlagBits2::eAllGraphics;
         runtime.AccessBuffer(buffer, offset, size, dst_stage, src_access);
@@ -2224,6 +2236,9 @@ void Rasterizer::ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) 
                                                                                               : Core::NativeResources::FindImmutableById(list[first].id);
             if (object == nullptr || (object->usage != 1 && !mutable_on) || v.base_address < object->begin || v.base_address + bytes > object->end) {
                 reject(object == nullptr ? 2 : object->usage != 1 && !mutable_on ? 3 : 4);
+                if (object == nullptr && (NativeHandleMode() == 2 || (handles == nullptr && list[first].id == 0))) {
+                    out.resolved[i].no_object = true; // what ObtainBuffer's own lookup by address would find
+                }
                 continue;
             }
             const u32 generation = object->generation.load(std::memory_order_acquire);
@@ -2514,6 +2529,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     Core::NativeRegistry::AuditBinding(static_cast<u32>(stage.sw_stage), false, 0xffff, nullptr, 0);
                 }
             }
+            bool cp_no_object = false;
+            if (const StagePlan* ns = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
+                                      : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
+                                                                                                                  : nullptr) {
+                cp_no_object = buffer_index < ns->resolved.size() && ns->resolved[buffer_index].no_object && ns->resolved_epoch == Core::NativeResources::ImmutableEpoch();
+            }
             if (const StagePlan* rs = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
                                       : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
                                                                                                                   : nullptr;
@@ -2742,7 +2763,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     Core::NativeUploads::SetWriter(Core::NativeUpdates::WhoWrote(vsharp.base_address, size));
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-                    vsharp.base_address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2);
+                    vsharp.base_address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2, cp_no_object);
                 if (Core::NativeRegistry::AuditBuffer(vsharp.base_address, size, desc.is_written, desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase)) {
                     {
                         // where did the shader get this descriptor from, and did the record write the registers it sits in?
@@ -3131,7 +3152,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 }
                 chosen_tsharp = image_desc.FromWords(words);
                 image_from_record = true;
-                {
+                if (IdentityAuditOn()) {
                     const u32* record_words = words;
                     const auto& raw = chosen_tsharp;
                     if (identity_binding != ~0u) {
