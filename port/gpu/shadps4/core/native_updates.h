@@ -209,6 +209,12 @@ enum B9Count : u32 {
     B9DemotedByRequest,    ///< ... of those, by a request over the edge
     B9PlacedFreed,         ///< buffers freed at the engine's deletion
     B9ReadbackOverPlaced,  ///< a fault readback over a placed buffer's memory (it reads the arena: must stay 0)
+    B9Groups,              ///< B9.4 step 2: placements of a block of several engine buffers (a request over several, or over a placed buffer's edge)
+    B9GroupMembers,        ///< ... engine buffers in those blocks
+    B9GroupReused,         ///< ... placed buffers whose contents a block took over
+    B9Adopted,             ///< a new engine buffer inside a placed block that overlaps no live member: it joins the block
+    B9MemberLeft,          ///< an engine buffer deleted out of a block that still has members
+    B9ArenaOverBuffers,    ///< requests served by the arena although engine buffers meet them (aliased memory, textures in the block, too big)
     B9BuffersDeleted,      ///< B9.2: engine buffer deletions carried out
     B9DeletedPending,      ///< ... with announced bytes never uploaded (dropped)
     B9DeletedGpuWritten,   ///< ... whose memory held GPU written bytes

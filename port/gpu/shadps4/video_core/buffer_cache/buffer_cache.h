@@ -151,7 +151,7 @@ public:
     /// B9.3: the engine buffer that holds all of [addr, addr + size) (0: none)
     [[nodiscard]] u64 BufferHolding(VAddr addr, size_t size) const;
     /// B9.4: a new engine resource at [address, address + bytes): placed buffers under it move back into the arena
-    void NoteEngineResourceCreate(VAddr address, u64 bytes);
+    void NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, bool texture);
     /// B9.1: [address, address + size) changed on the CPU: each engine buffer it meets keeps its part, the rest waits for the first buffer upload over it. Returns the
     /// parts no buffer holds (B9.3 step 2: what the page tracker still marks)
     void MarkBuffersChanged(VAddr address, u64 size, bool announced, std::vector<std::pair<VAddr, VAddr>>* gaps);
@@ -313,8 +313,8 @@ private:
     const Buffer* BufferFor(VAddr address, u64 size, bool demote_spanning = true, bool written = false);
     static constexpr u64 PlacedSlack = 64; ///< B9.4: a read may run this far past a placed buffer's end (vertex fetch rounding); the bytes there are not memory's
     struct PlacedBuffer {
-        u64 id{};
-        VAddr begin{}, end{}; ///< the engine buffer's memory (the Vulkan buffer starts at begin aligned down to 256: the same offset alignment as the arena)
+        std::vector<u64> ids; ///< the engine buffers it holds (one, or a block the engine laid out next to each other and binds as one range)
+        VAddr begin{}, end{}; ///< the memory it holds (the Vulkan buffer starts at begin aligned down to 256: the same offset alignment as the arena)
         std::unique_ptr<Buffer> buffer;
     };
     std::map<VAddr, PlacedBuffer> placed;
@@ -322,7 +322,7 @@ private:
     mutable std::mutex placed_mutex;
     PlacedBuffer* PlacedAt(VAddr address, u64 size, bool written = true);
     bool PlacedMeets(VAddr address, u64 size) const;
-    const Buffer* Place(u64 id, VAddr begin, VAddr end);
+    const Buffer* Place(std::vector<u64> ids, VAddr begin, VAddr end);
     void Demote(VAddr begin, bool by_request);
     void DropPlaced(VAddr begin);
     void ForgetShadows(VAddr begin, VAddr end);

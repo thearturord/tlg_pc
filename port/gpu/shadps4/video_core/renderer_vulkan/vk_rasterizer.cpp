@@ -122,12 +122,12 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     Core::NativeUpdates::SetDelete(
         [](void* context, u64 id, u64 address, u64 bytes, u32 what) { static_cast<Rasterizer*>(context)->EngineObjectDeleted(id, address, bytes, what); }, this);
     Core::NativeUpdates::SetCreate(
-        [](void* context, u64, u64 address, u64 bytes, bool texture) {
+        [](void* context, u64 id, u64 address, u64 bytes, bool texture) {
             auto* self = static_cast<Rasterizer*>(context);
             if (texture) {
                 self->texture_cache.NoteEngineTextureCreate(address, bytes);
             }
-            self->buffer_cache.NoteEngineResourceCreate(address, bytes); // B9.4: a placed buffer under the new resource moves back into the arena
+            self->buffer_cache.NoteEngineResourceCreate(id, address, bytes, texture); // B9.4: a placed buffer under the new resource moves back into the arena (or takes it in)
         },
         this);
 

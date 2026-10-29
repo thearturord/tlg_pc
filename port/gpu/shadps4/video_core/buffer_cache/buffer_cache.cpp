@@ -242,15 +242,30 @@ void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, st
 void BufferCache::NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool native) {
     Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9BuffersDeleted);
     if (Core::NativeUpdates::B9PlaceOn()) {
-        bool mine = false;
+        // B9.4: the block that holds it loses the member; a block with no member left is freed (its contents are gone with them)
+        VAddr block = 0;
+        bool last = false;
         {
             std::scoped_lock lock{placed_mutex};
-            const auto it = placed.find(address);
-            mine = it != placed.end() && it->second.id == id;
+            auto it = placed.upper_bound(address);
+            if (it != placed.begin()) {
+                --it;
+                auto& ids = it->second.ids;
+                if (const auto at = std::ranges::find(ids, id); at != ids.end()) {
+                    ids.erase(at);
+                    block = it->first;
+                    last = ids.empty();
+                }
+            }
         }
-        if (mine) {
-            DropPlaced(address); // B9.4: its contents are gone with it (the engine's memory may hold a new resource next)
+        if (block != 0 && last) {
+            DropPlaced(block);
             Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedFreed);
+        } else if (block != 0) {
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9MemberLeft);
+            if (auto* object = Core::NativeResources::FindImmutableById(id)) {
+                object->gpu_arena_epoch.store(~u64{0}, std::memory_order_release);
+            }
         }
         place_refused.erase(id);
     }
@@ -1078,18 +1093,43 @@ bool BufferCache::PlacedMeets(VAddr address, u64 size) const {
     return false;
 }
 
-const Buffer* BufferCache::Place(u64 id, VAddr begin, VAddr end) {
+const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
     const VAddr base = begin & ~VAddr{255};
-    auto buffer = std::make_unique<Buffer>(instance, base, end - base + PlacedSlack, MemoryType::DeviceLocal, fmt::format("engine buffer {} {:#x}+{:#x}", id, begin, end - begin));
+    auto buffer = std::make_unique<Buffer>(instance, base, end - base + PlacedSlack, MemoryType::DeviceLocal,
+                                           fmt::format("engine buffer {}{} {:#x}+{:#x}", ids.front(), ids.size() > 1 ? "+" : "", begin, end - begin));
     Buffer* dst = buffer.get();
-    // its contents: the CPU's bytes from memory, the bytes the GPU wrote (and nothing newer since) from the arena
+    scheduler.EndRendering();
+    // placed buffers inside the block: their contents come over as they are
+    boost::container::small_vector<VAddr, 4> inside;
+    for (auto it = placed.lower_bound(begin); it != placed.end() && it->first < end; ++it) {
+        inside.push_back(it->first);
+        const vk::BufferCopy copy{it->second.buffer->Offset(it->second.begin), dst->Offset(it->second.begin), it->second.end - it->second.begin};
+        runtime.CopyBuffer(it->second.buffer.get(), dst, std::span<const vk::BufferCopy>{&copy, 1});
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9GroupReused);
+    }
+    // the rest: the CPU's bytes from memory, the bytes the GPU wrote (and nothing newer since) from the arena
+    boost::container::small_vector<std::pair<u64, u64>, 8> rest;
+    {
+        VAddr at = begin;
+        for (const VAddr b : inside) {
+            const auto& entry = placed.at(b);
+            if (entry.begin > at) {
+                rest.emplace_back(at, entry.begin - at);
+            }
+            at = entry.end;
+        }
+        if (at < end) {
+            rest.emplace_back(at, end - at);
+        }
+    }
     boost::container::small_vector<std::pair<u64, u64>, 8> gpu_pieces, cpu_pieces;
     {
         std::shared_lock lock{gpu_ranges_mutex};
-        gpu_modified_ranges.ForEachInRange(begin, end - begin, [&](u64 a, u64 e) { gpu_pieces.emplace_back(a, e - a); });
-        gpu_modified_ranges.ForEachNotInRange(begin, end - begin, [&](u64 a, u64 n) { cpu_pieces.emplace_back(a, n); });
+        for (const auto& [a, n] : rest) {
+            gpu_modified_ranges.ForEachInRange(a, n, [&](u64 x, u64 e) { gpu_pieces.emplace_back(x, e - x); });
+            gpu_modified_ranges.ForEachNotInRange(a, n, [&](u64 x, u64 m) { cpu_pieces.emplace_back(x, m); });
+        }
     }
-    scheduler.EndRendering();
     if (!gpu_pieces.empty()) {
         Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedGpuCopied);
         const u64 first_block = begin >> block_shift, last_block = (end - 1) >> block_shift;
@@ -1118,27 +1158,44 @@ const Buffer* BufferCache::Place(u64 id, VAddr begin, VAddr end) {
         runtime.CopyBuffer(staging.buffer, dst, copies);
     }
     {
-        // the buffer holds memory as it is now: its announced bytes are uploaded
+        // the block holds memory as it is now: the announced bytes outside the placed buffers it took over are uploaded (those inside stay announced:
+        // the members' next uploads put them in)
         std::scoped_lock lock{object_dirty_mutex};
-        if (const auto it = object_dirty.find(id); it != object_dirty.end()) {
-            it->second.Subtract(begin, end - begin);
+        for (const u64 id : ids) {
+            if (const auto it = object_dirty.find(id); it != object_dirty.end()) {
+                for (const auto& [a, n] : rest) {
+                    it->second.Subtract(a, n);
+                }
+            }
         }
-        b9_unattributed.Subtract(begin, end - begin);
-        all_object_dirty.Subtract(begin, end - begin);
+        for (const auto& [a, n] : rest) {
+            b9_unattributed.Subtract(a, n);
+            all_object_dirty.Subtract(a, n);
+        }
+    }
+    // the placed buffers inside are replaced (freed after the GPU is done, the copies above included)
+    for (const VAddr b : inside) {
+        DropPlaced(b);
     }
     {
         std::scoped_lock lock{placed_mutex};
-        placed.emplace(begin, PlacedBuffer{id, begin, end, std::move(buffer)});
+        placed.emplace(begin, PlacedBuffer{ids, begin, end, std::move(buffer)});
     }
     ForgetShadows(begin, end);
     Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9Placed);
     Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedBytes, end - begin);
+    if (ids.size() > 1 || !inside.empty()) {
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9Groups);
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9GroupMembers, ids.size());
+    }
     range_epoch.fetch_add(1, std::memory_order_acq_rel); // the upload memo's answers (this command buffer only) that name the arena for this memory are stale
-    if (auto* object = Core::NativeResources::FindImmutableById(id)) {
-        // the resident object's binding resolution (R2) names its own buffer from now on; the other objects' resolutions stay valid
-        object->gpu_arena.store(dst, std::memory_order_relaxed);
-        object->gpu_arena_base.store(dst->cpu_addr, std::memory_order_relaxed);
-        object->gpu_arena_epoch.store(ArenaEpoch(), std::memory_order_release);
+    for (const u64 id : ids) {
+        if (auto* object = Core::NativeResources::FindImmutableById(id)) {
+            // the resident object's binding resolution (R2) names the block's buffer from now on; the other objects' resolutions stay valid
+            object->gpu_arena.store(dst, std::memory_order_relaxed);
+            object->gpu_arena_base.store(dst->cpu_addr, std::memory_order_relaxed);
+            object->gpu_arena_epoch.store(ArenaEpoch(), std::memory_order_release);
+        }
     }
     return dst;
 }
@@ -1155,20 +1212,22 @@ void BufferCache::ForgetShadows(VAddr begin, VAddr end) {
 
 void BufferCache::DropPlaced(VAddr begin) {
     std::unique_ptr<Buffer> buffer;
-    u64 id = 0;
+    std::vector<u64> ids;
     {
         std::scoped_lock lock{placed_mutex};
         const auto it = placed.find(begin);
         if (it == placed.end()) {
             return;
         }
-        id = it->second.id;
+        ids = std::move(it->second.ids);
         buffer = std::move(it->second.buffer);
         placed.erase(it);
     }
     range_epoch.fetch_add(1, std::memory_order_acq_rel);
-    if (auto* object = Core::NativeResources::FindImmutableById(id)) {
-        object->gpu_arena_epoch.store(~u64{0}, std::memory_order_release); // its binding resolution is made again (it names the arena next)
+    for (const u64 id : ids) {
+        if (auto* object = Core::NativeResources::FindImmutableById(id)) {
+            object->gpu_arena_epoch.store(~u64{0}, std::memory_order_release); // its binding resolution is made again
+        }
     }
     // freed once the GPU is done with the work recorded so far (its descriptor slots are dropped by the buffer's destructor)
     scheduler.DeferOperation([b = std::move(buffer)]() mutable { b.reset(); });
@@ -1195,12 +1254,14 @@ void BufferCache::Demote(VAddr begin, bool by_request) {
     Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9Demoted);
     if (by_request) {
         Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9DemotedByRequest);
-        place_refused.insert(entry->id);
+        for (const u64 id : entry->ids) {
+            place_refused.insert(id);
+        }
     }
     DropPlaced(begin);
 }
 
-void BufferCache::NoteEngineResourceCreate(VAddr address, u64 bytes) {
+void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, bool texture) {
     if (!Core::NativeUpdates::B9PlaceOn() || bytes == 0) {
         return;
     }
@@ -1218,6 +1279,36 @@ void BufferCache::NoteEngineResourceCreate(VAddr address, u64 bytes) {
             }
         }
     }
+    if (!texture && under.size() == 1) {
+        // a new buffer inside one placed block that overlaps no live member of it (a gap, or a deleted member's memory): it joins the block
+        auto& entry = placed.at(under[0]);
+        if (address >= entry.begin && address + bytes <= entry.end) {
+            static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
+            static thread_local std::vector<u64> textures;
+            parts.clear();
+            textures.clear();
+            Core::NativeDevice::BuffersIn(address, bytes, parts);
+            (void)Core::NativeDevice::TexturesIn(address, bytes, textures);
+            const bool alone = textures.empty() && std::ranges::all_of(parts, [&](const auto& part) { return part.id == id; });
+            if (alone) {
+                entry.ids.push_back(id);
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9Adopted);
+                {
+                    // the block holds older bytes there (a deleted member's, a gap's): the new buffer's first upload takes all of its memory, as a placement would
+                    std::scoped_lock lock{object_dirty_mutex};
+                    object_dirty[id].Add(address, bytes);
+                    all_object_dirty.Add(address, bytes);
+                }
+                b9_epoch.fetch_add(1, std::memory_order_acq_rel);
+                if (auto* object = Core::NativeResources::FindImmutableById(id)) {
+                    object->gpu_arena.store(entry.buffer.get(), std::memory_order_relaxed);
+                    object->gpu_arena_base.store(entry.buffer->cpu_addr, std::memory_order_relaxed);
+                    object->gpu_arena_epoch.store(ArenaEpoch(), std::memory_order_release);
+                }
+                return;
+            }
+        }
+    }
     for (const VAddr begin : under) {
         Demote(begin, false);
     }
@@ -1229,6 +1320,68 @@ const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanni
             Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedServed);
             return entry->buffer.get();
         }
+        // the block the request needs: the engine buffers it meets and the placed buffers it meets, grown until no buffer reaches over its edges
+        static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
+        static thread_local std::vector<u64> textures;
+        VAddr lo = address, hi = address + size;
+        std::vector<u64> ids;
+        bool refused = false;
+        bool any_buffer = false;
+        for (u32 round = 0; round < 4; ++round) {
+            parts.clear();
+            Core::NativeDevice::BuffersIn(lo, hi - lo, parts);
+            VAddr new_lo = lo, new_hi = hi;
+            for (const auto& part : parts) {
+                new_lo = std::min(new_lo, part.object_begin);
+                new_hi = std::max(new_hi, part.object_end);
+            }
+            for (auto it = placed.upper_bound(new_lo) == placed.begin() ? placed.begin() : std::prev(placed.upper_bound(new_lo)); it != placed.end() && it->first < new_hi; ++it) {
+                if (it->second.end > new_lo) {
+                    new_lo = std::min(new_lo, it->second.begin);
+                    new_hi = std::max(new_hi, it->second.end);
+                }
+            }
+            if (new_lo == lo && new_hi == hi) {
+                break;
+            }
+            lo = new_lo;
+            hi = new_hi;
+        }
+        any_buffer = !parts.empty();
+        // the members must not overlap each other, no texture may lie in the block, none may have been moved back by a request before
+        std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.object_begin < b.object_begin; });
+        VAddr last_end = 0;
+        for (const auto& part : parts) {
+            if (part.object_begin < last_end || part.object_end > hi || part.object_begin < lo || place_refused.contains(part.id)) {
+                refused = true;
+            }
+            last_end = std::max(last_end, part.object_end);
+            ids.push_back(part.id);
+        }
+        textures.clear();
+        (void)Core::NativeDevice::TexturesIn(lo, hi - lo, textures);
+        const bool too_big = hi - lo > (u64{256} << 20);
+        static const bool groups = [] {
+            // opt-in for now: with groups the default scene ended in a lost device in 3 of 4 headless runs (cause open, see the plan's B9.4 step 2)
+            const char* e = std::getenv("TLG_B9_GROUPS");
+            return e != nullptr && *e == '1';
+        }();
+        // without groups (TLG_B9_GROUPS=0): only a request inside one engine buffer places it (B9.4 step 1)
+        const bool single = ids.size() == 1 && lo == parts.front().object_begin && hi == parts.front().object_end && !PlacedMeets(lo, hi - lo);
+        if (any_buffer && !refused && textures.empty() && !too_big && (groups || single) && (demote_spanning || !PlacedMeets(address, size))) {
+            if (ids.size() > 1 || PlacedMeets(lo, hi - lo) || lo != parts.front().object_begin || hi != parts.back().object_end) {
+                static std::atomic<u32> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    LOG_WARNING(Render_Vulkan, "B9.4: request {:#x}+{:#x} places a block {:#x}+{:#x} of {} engine buffers", address, size, lo, hi - lo, ids.size());
+                }
+            }
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedServed);
+            return Place(std::move(ids), lo, hi);
+        }
+        if (any_buffer) {
+            Core::NativeUpdates::NoteB9(too_big ? Core::NativeUpdates::B9PlaceRefusedSize : textures.empty() && !refused ? Core::NativeUpdates::B9ArenaOverBuffers
+                                                                                                                       : Core::NativeUpdates::B9PlaceRefusedAlias);
+        }
         if (PlacedMeets(address, size)) {
             if (!demote_spanning) {
                 return nullptr;
@@ -1237,40 +1390,14 @@ const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanni
             for (auto it = placed.begin(); it != placed.end(); ++it) {
                 if (it->second.begin < address + size && address < it->second.end) {
                     met.push_back(it->first);
-                    static std::atomic<u32> logged{0};
-                    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                        LOG_WARNING(Render_Vulkan, "B9.4: request {:#x}+{:#x} runs over the edge of placed engine buffer {} {:#x}+{:#x} ({}; at the request: {})", address, size,
-                                    it->second.id, it->second.begin, it->second.end - it->second.begin, Core::NativeDevice::OwnerName(it->second.begin),
-                                    Core::NativeDevice::OwnerName(address));
-                    }
                 }
             }
             for (const VAddr begin : met) {
                 Demote(begin, true);
             }
-        } else {
-            Core::NativeDevice::Object object;
-            if (Core::NativeDevice::ResourceAt(address, object) && object.kind == Core::NativeDevice::Kind::Buffer && object.alive &&
-                address + size <= object.address + std::max<u64>(object.bytes, 1)) {
-                const VAddr begin = object.address, end = object.address + object.bytes;
-                if (object.bytes == 0 || object.bytes > (u64{256} << 20)) {
-                    Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlaceRefusedSize);
-                } else if (place_refused.contains(object.id)) {
-                    // moved back by a request over its edge: it stays in the arena
-                } else {
-                    static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
-                    static thread_local std::vector<u64> textures;
-                    parts.clear();
-                    textures.clear();
-                    Core::NativeDevice::BuffersIn(begin, end - begin, parts);
-                    (void)Core::NativeDevice::TexturesIn(begin, end - begin, textures);
-                    if (parts.size() == 1 && parts[0].id == object.id && textures.empty()) {
-                        Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedServed);
-                        return Place(object.id, begin, end);
-                    }
-                    Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlaceRefusedAlias);
-                }
-            }
+        }
+        if (any_buffer) {
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9ArenaOverBuffers);
         }
     }
     const u64 first_block = address >> block_shift, last_block = (address + size - 1) >> block_shift;
@@ -1288,6 +1415,35 @@ u64 BufferCache::BufferHolding(VAddr addr, size_t size) const {
 }
 
 bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
+    if (Core::NativeUpdates::B9TrackerOff()) {
+        // B9.3 step 2: the tracker is not kept for engine buffers: a range over several of them is answered by theirs, the bytes between them by the tracker
+        static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
+        parts.clear();
+        Core::NativeDevice::BuffersIn(addr, size, parts);
+        if (parts.size() > 1 || (parts.size() == 1 && (parts[0].begin != addr || parts[0].end != addr + size))) {
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9CpuQueries);
+            std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });
+            VAddr at = addr;
+            {
+                std::scoped_lock lock{object_dirty_mutex};
+                if (b9_unattributed.Intersects(addr, size)) {
+                    return true;
+                }
+                for (const auto& part : parts) {
+                    if (const auto it = object_dirty.find(part.id); it != object_dirty.end() && it->second.Intersects(part.begin, part.end - part.begin)) {
+                        return true;
+                    }
+                }
+            }
+            for (const auto& part : parts) {
+                if (part.begin > at && memory_tracker->IsRegionCpuModified(at, part.begin - at)) {
+                    return true;
+                }
+                at = std::max<VAddr>(at, part.end);
+            }
+            return at < addr + size && memory_tracker->IsRegionCpuModified(at, addr + size - at);
+        }
+    }
     // B9.3: a range inside one engine buffer: changed when the buffer holds announced bytes there that were not uploaded
     if (const u32 mode = Core::NativeUpdates::B9QueryMode(); mode != 0 && Core::NativeUpdates::B9BufferMode() != 0) {
         if (const u64 id = BufferHolding(addr, size); id != 0) {
@@ -1323,6 +1479,17 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
 }
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
+    if (Core::NativeUpdates::B9TrackerOff()) {
+        // B9.3 step 2: a range that meets engine buffers is answered by the GPU written bytes (the tracker has no GPU marks for them any more)
+        static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
+        parts.clear();
+        Core::NativeDevice::BuffersIn(addr, size, parts);
+        if (!parts.empty() && BufferHolding(addr, size) == 0) {
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9GpuQueries);
+            std::shared_lock lock{gpu_ranges_mutex};
+            return gpu_modified_ranges.Intersects(addr, size) || memory_tracker->IsRegionGpuModified(addr, size);
+        }
+    }
     // B9.3: a range inside one engine buffer: written when the GPU wrote bytes of it that were not superseded or downloaded since
     if (const u32 mode = Core::NativeUpdates::B9QueryMode(); mode != 0 && Core::NativeUpdates::B9BufferMode() != 0) {
         if (BufferHolding(addr, size) != 0) {
@@ -1527,12 +1694,31 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
     HarvestWriteWatch(device_addr, size);
+    // B9.4: a placed buffer holds [begin, end) of its block; a read into its slack must not take (and lose) the bytes of the memory after it
+    VAddr held_lo = device_addr, held_hi = device_addr + size;
+    if (arena->mem_type != MemoryType::Sparse) {
+        std::scoped_lock lock{placed_mutex};
+        for (auto it = placed.upper_bound(arena->cpu_addr + 255); it != placed.begin();) {
+            --it;
+            if (it->second.buffer.get() == arena) {
+                held_lo = std::max<VAddr>(held_lo, it->second.begin);
+                held_hi = std::min<VAddr>(held_hi, it->second.end);
+                break;
+            }
+            if (it->first < arena->cpu_addr) {
+                break;
+            }
+        }
+        if (held_lo >= held_hi) {
+            return false;
+        }
+    }
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
     const auto add_piece = [&](u64 addr, u64 copy_size) {
         if (arena->mem_type != MemoryType::Sparse) {
-            // B9.4: a placed engine buffer takes only what lies inside it (a page range of the tracker, or a read past its end into the slack, can reach beyond)
-            const u64 lo = std::max<u64>(addr, arena->cpu_addr), hi = std::min<u64>(addr + copy_size, arena->cpu_addr + arena->size_bytes);
+            // B9.4: a placed engine buffer takes only the memory it holds (a page range of the tracker, or a read past its end into the slack, can reach beyond)
+            const u64 lo = std::max<u64>(addr, held_lo), hi = std::min<u64>(addr + copy_size, held_hi);
             if (lo >= hi) {
                 return;
             }
@@ -1567,30 +1753,63 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             add_piece(a, n);
         }
     };
-    // B9.1: an upload inside one engine buffer: its announced bytes against the page tracker's ranges
+    // B9.1: an upload over engine buffers: their announced bytes against the page tracker's ranges (B9.4 step 2: a request may cover several buffers of a block;
+    // the bytes between them, which no buffer holds, keep the tracker)
     const u32 b9 = Core::NativeUpdates::B9BufferMode();
-    u64 b9_object = 0;
+    u64 b9_object = 0; // the first engine buffer the request meets (0: none)
     bool b9_cpu_read = false; // a buffer the CPU reads (staging, CPU read access): its memory also takes downloads, which the verify's copy does not see
     boost::container::small_vector<std::pair<u64, u64>, 8> b9_pieces;
+    boost::container::small_vector<std::pair<u64, u64>, 4> b9_gaps; // the request's bytes no engine buffer holds
     if (b9 != 0) {
-        Core::NativeDevice::Object object;
-        if (Core::NativeDevice::ResourceAt(device_addr, object) && object.kind == Core::NativeDevice::Kind::Buffer &&
-            device_addr + size <= object.address + std::max<u64>(object.bytes, 1)) {
-            b9_object = object.id;
-            b9_cpu_read = object.usage == 3 || (object.cpu_access & 0x20000) != 0;
-            std::scoped_lock lock{object_dirty_mutex};
-            if (const auto it = object_dirty.find(b9_object); it != object_dirty.end()) {
-                it->second.ForEachInRange(device_addr, size, [&](u64 a, u64 e) { b9_pieces.emplace_back(a, e - a); }); // (start, end) pairs
-                it->second.Subtract(device_addr, size);
+        static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
+        parts.clear();
+        Core::NativeDevice::BuffersIn(held_lo, held_hi - held_lo, parts);
+        if (parts.empty()) {
+            // the walk by memory found nothing: the buffer holding the request, found the long way (the request's bytes must not be left to the tracker)
+            Core::NativeDevice::Object object;
+            if (Core::NativeDevice::ResourceAt(device_addr, object) && object.kind == Core::NativeDevice::Kind::Buffer) {
+                const VAddr object_end = object.address + std::max<u64>(object.bytes, 1);
+                parts.push_back({object.id, held_lo, std::min<VAddr>(object_end, held_hi), object.usage, object.cpu_access, object.address, object_end});
             }
-            b9_unattributed.ForEachInRange(device_addr, size, [&](u64 a, u64 e) { b9_pieces.emplace_back(a, e - a); });
-            b9_unattributed.Subtract(device_addr, size);
+        }
+        if (!parts.empty()) {
+            std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });
+            b9_object = parts.front().id;
+            VAddr at = held_lo;
+            for (const auto& part : parts) {
+                b9_cpu_read |= part.usage == 3 || (part.cpu_access & 0x20000) != 0;
+                if (part.begin > at) {
+                    b9_gaps.emplace_back(at, part.begin - at);
+                }
+                at = std::max<VAddr>(at, part.end);
+            }
+            if (at < held_hi) {
+                b9_gaps.emplace_back(at, held_hi - at);
+            }
+            std::scoped_lock lock{object_dirty_mutex};
+            for (const auto& part : parts) {
+                if (const auto it = object_dirty.find(part.id); it != object_dirty.end()) {
+                    it->second.ForEachInRange(part.begin, part.end - part.begin, [&](u64 a, u64 e) { b9_pieces.emplace_back(a, e - a); }); // (start, end) pairs
+                    it->second.Subtract(part.begin, part.end - part.begin);
+                }
+                b9_unattributed.ForEachInRange(part.begin, part.end - part.begin, [&](u64 a, u64 e) { b9_pieces.emplace_back(a, e - a); });
+                b9_unattributed.Subtract(part.begin, part.end - part.begin);
+            }
             for (const auto& [a, n] : b9_pieces) {
                 all_object_dirty.Subtract(a, n);
             }
         }
         Core::NativeUpdates::NoteB9(b9_object != 0 ? Core::NativeUpdates::B9SyncByObject : Core::NativeUpdates::B9SyncNoObject);
     }
+    // the parts of [addr, addr + n) between the engine buffers of the request (they keep the tracker's copies in native mode)
+    const auto for_each_gap = [&](u64 addr, u64 n, auto&& fn) {
+        for (const auto& [g, gn] : b9_gaps) {
+            const u64 lo = std::max<u64>(addr, g), hi = std::min<u64>(addr + n, g + gn);
+            if (lo < hi) {
+                fn(lo, hi - lo);
+            }
+        }
+    };
     const auto b9_forget = [&](u64 addr, u64 n) {
         // audit: bytes an upload of no engine buffer took (texture memory, unowned memory) leave the announced set
         if (b9 != 0 && b9_object == 0) {
@@ -1639,6 +1858,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 }
             }
             if (b9_native) {
+                for_each_gap(addr, copy_size, [&](u64 a, u64 n) { add_copy(a, n); });
                 return;
             }
         }
@@ -1648,7 +1868,10 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     const auto tracker_ranges = [&](VAddr a, u64 n) {
         if (!b9_no_tracker) {
             memory_tracker->ForEachUploadRange(a, n, is_written, tracker_copy);
+            return;
         }
+        // the tracker is not kept for engine buffers: it is asked only for the bytes between them
+        for_each_gap(a, n, [&](u64 g, u64 gn) { memory_tracker->ForEachUploadRange(g, gn, is_written, [&](u64 x, u64 xn) { add_copy(x, xn); }); });
     };
     const auto& ring = UntrackedRing::Get();
     VAddr ring_lo = 0, ring_hi = 0; // the part the untracked ring uploads whole (native mode adds no announced piece there)
@@ -1723,12 +1946,12 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 }
             }
         }
-        const u64 req_end = device_addr + size;
-        for (u64 page = device_addr & ~u64{4095}; page < req_end; page += 4096) {
+        const u64 req_end = held_hi; // the bytes the destination holds (a placed buffer's slack is not memory's)
+        for (u64 page = held_lo & ~u64{4095}; page < req_end; page += 4096) {
             if (!sampled(page)) {
                 continue;
             }
-            const u64 lo = std::max<u64>(device_addr, page), hi = std::min<u64>(req_end, page + 4096);
+            const u64 lo = std::max<u64>(held_lo, page), hi = std::min<u64>(req_end, page + 4096);
             bool gpu_written;
             {
                 std::shared_lock lock{gpu_ranges_mutex};

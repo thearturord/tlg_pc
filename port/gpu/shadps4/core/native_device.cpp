@@ -209,6 +209,9 @@ void NoteDelete(u64 object) {
         entry->second.alive = false;
         live_by_kind[static_cast<u32>(entry->second.kind)].fetch_sub(1, std::memory_order_relaxed);
         const Object& gone = entry->second;
+        if (const auto at = resource_by_address.find(gone.address); at != resource_by_address.end() && at->second == gone.id) {
+            resource_by_address.erase(at); // a deleted resource leaves the map by memory (the walks below would count it)
+        }
         const bool texture = gone.kind >= Kind::Texture1D && gone.kind <= Kind::Texture3D;
         if (texture && gone.address != 0) { // (a texture whose size read 0 at creation still owns images: its lists go too)
             // B8.2: another live texture at the same memory (an alias) keeps the images (they are not freed; the deleted texture's lists still go)
@@ -259,10 +262,10 @@ bool TexturesIn(VAddr address, u64 size, std::vector<u64>& out) {
         u32 below = 0; // entries that start before the range: a few are looked at (a texture that starts earlier and reaches in)
         while (it != resource_by_address.begin() && below < 16) {
             --it;
-            if (it->first < address) {
-                ++below;
-            }
             const auto entry = by_id.find(it->second);
+            if (it->first < address && entry != by_id.end() && entry->second.alive) {
+                ++below; // only live entries count (dead ones are skipped)
+            }
             if (entry == by_id.end() || !entry->second.alive || entry->second.kind < Kind::Texture1D || entry->second.kind > Kind::Texture3D ||
                 entry->second.address != it->first || it->first + entry->second.bytes <= address) {
                 continue;
@@ -299,16 +302,16 @@ void BuffersIn(VAddr address, u64 size, std::vector<BufferPart>& out) {
     u32 below = 0; // entries that start before the range: a few are looked at (a buffer that starts earlier and reaches in)
     while (it != resource_by_address.begin() && below < 16) {
         --it;
-        if (it->first < address) {
-            ++below;
-        }
         const auto entry = by_id.find(it->second);
+        if (it->first < address && entry != by_id.end() && entry->second.alive) {
+            ++below; // only live entries count (dead ones are skipped)
+        }
         if (entry == by_id.end() || !entry->second.alive || entry->second.kind != Kind::Buffer || entry->second.address != it->first ||
             it->first + std::max<u64>(entry->second.bytes, 1) <= address) {
             continue;
         }
         out.push_back({entry->second.id, std::max(it->first, address), std::min<VAddr>(it->first + std::max<u64>(entry->second.bytes, 1), end), entry->second.usage,
-                       entry->second.cpu_access});
+                       entry->second.cpu_access, it->first, it->first + std::max<u64>(entry->second.bytes, 1)});
     }
 }
 

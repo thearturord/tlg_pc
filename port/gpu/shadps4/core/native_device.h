@@ -62,8 +62,9 @@ void NoteDelete(u64 object);
 /// B9.1: the live buffers whose memory meets [address, address + size), each with the part of the range inside it (appended to `out`)
 struct BufferPart {
     u64 id;
-    VAddr begin, end;
+    VAddr begin, end;               ///< the part of the asked range inside the buffer
     u32 usage, cpu_access;
+    VAddr object_begin, object_end; ///< the buffer's whole memory
 };
 void BuffersIn(VAddr address, u64 size, std::vector<BufferPart>& out);
 /// A short name of what owns `address` (for audits): "buffer usage U bind B", "texture_2d usage U bind B", "none"
