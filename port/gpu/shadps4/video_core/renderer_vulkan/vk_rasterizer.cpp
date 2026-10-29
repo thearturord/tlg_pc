@@ -3667,6 +3667,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 }
                 note.hash = h;
                 Core::LightRecorder::Note(note);
+                if (image_desc.is_written) {
+                    Core::LightRecorder::Watch(desc.info.guest_address, desc.info.guest_size);
+                }
             }
             if (set_record) {
                 set_found[num_images - 1] = image_id;

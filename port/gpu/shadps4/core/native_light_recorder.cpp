@@ -9,7 +9,10 @@
 #include <string>
 #include <vector>
 
+#include <cstring>
 #include <fmt/format.h>
+
+#include "core/memory.h"
 
 #include "common/path_util.h"
 
@@ -29,7 +32,16 @@ struct FrameSig {
     u64 present{~0ull};
     u32 counts[8]{};
     u64 signature{};
+    float watch_mean[8]{};
+    u32 watch_nonzero[8]{};
 };
+struct Watched {
+    u64 address{};
+    u64 bytes{};
+};
+Watched watched[8];
+u32 watched_count = 0;
+u64 last_sampled_present = ~0ull;
 constexpr size_t FrameRing = 1024;
 FrameSig frame_ring[FrameRing];
 
@@ -38,7 +50,7 @@ const std::vector<u64>& Callers() {
         std::vector<u64> out;
         const char* e = std::getenv("TLG_LIGHT_RECORDER_CALLERS");
         if (e == nullptr || *e == 0) {
-            return std::vector<u64>{0x1c6456d, 0x1c67f59, 0x1c68036, 0x1c44f64};
+            return std::vector<u64>{0x1c6456d, 0x1c67f59, 0x1c68036, 0x1c44f64, 0x247ea43, 0x1c98a17};
         }
         for (const char* at = e; *at != 0;) {
             char* end = nullptr;
@@ -72,7 +84,47 @@ bool IsLightCaller(u64 caller) {
     return false;
 }
 
+void Watch(u64 address, u64 bytes) {
+    if (!recording || current.caller != 0x247ea43 || bytes == 0 || bytes > 8192) {
+        return;
+    }
+    for (u32 i = 0; i < watched_count; ++i) {
+        if (watched[i].address == address) {
+            watched[i].bytes = bytes;
+            return;
+        }
+    }
+    if (watched_count < 8) {
+        watched[watched_count++] = {address, bytes};
+    }
+}
+
 void FrameOp(u64 present, u32 kind, u64 key) {
+    if (present != last_sampled_present) {
+        // the previous present is complete: what the watched blocks hold now (the CPU's view of the luminance copies)
+        FrameSig& done = frame_ring[last_sampled_present % FrameRing];
+        if (last_sampled_present != ~0ull && done.present == last_sampled_present) {
+            auto* memory = Core::Memory::Instance();
+            for (u32 i = 0; i < watched_count; ++i) {
+                if (!memory->IsValidMapping(watched[i].address, watched[i].bytes)) {
+                    continue;
+                }
+                double sum = 0;
+                u32 nonzero = 0;
+                for (u64 b = 0; b + 4 <= watched[i].bytes; b += 4) {
+                    float v = 0;
+                    std::memcpy(&v, reinterpret_cast<const void*>(watched[i].address + b), 4);
+                    if (v == v && v > -1e30f && v < 1e30f) {
+                        sum += v;
+                    }
+                    nonzero += v != 0 ? 1 : 0;
+                }
+                done.watch_mean[i] = static_cast<float>(sum / std::max<u64>(watched[i].bytes / 4, 1));
+                done.watch_nonzero[i] = nonzero;
+            }
+        }
+        last_sampled_present = present;
+    }
     FrameSig& f = frame_ring[present % FrameRing];
     if (f.present != present) {
         f = {};
@@ -147,6 +199,13 @@ void WriteDump(const std::string& tag, u64 detail) {
             if (f.present != ~0ull && f.present + 220 >= detail && f.present <= detail + 8) {
                 text += fmt::format("frame {} dispatches {} draws z/shadow {} gbuffer {} forward {} other {} indirect {} untagged {} signature {:016x}\n", f.present, f.counts[0], f.counts[1], f.counts[2], f.counts[3], f.counts[4],
                                     f.counts[5], f.counts[6], f.signature);
+                std::string watch;
+                for (u32 i = 0; i < watched_count; ++i) {
+                    watch += fmt::format(" [{:#x} mean {:.6g} nonzero {}]", watched[i].address, f.watch_mean[i], f.watch_nonzero[i]);
+                }
+                if (!watch.empty()) {
+                    text += fmt::format("watch {}{}\n", f.present, watch);
+                }
             }
         }
         for (const Record& r : ring) {

@@ -32,6 +32,11 @@ struct Entry {
 /// pipeline or program), so a frame with a pass missing, doubled or a different pipeline shows in its counts and its order independent signature.
 void FrameOp(u64 present, u32 kind, u64 key);
 
+/// The image a recorded copy dispatch (the CopyResource upload kernel at 0x247ea43 / 0x1c98a17: the average luminance copy among them) writes: its guest memory is what the CPU reads back
+/// (the auto exposure takes its luminance from it). Up to 8 blocks are watched; at every present change the float contents of each (mean, non zero count) are sampled into the frame census,
+/// so a frame whose exposure input was zero, stale or wrong shows as an outlier in the dump. Raster thread.
+void Watch(u64 address, u64 bytes);
+
 /// A lighting dispatch is being bound (raster thread).
 void Begin(u64 present, u64 caller, u64 program);
 void Note(const Entry& entry);
