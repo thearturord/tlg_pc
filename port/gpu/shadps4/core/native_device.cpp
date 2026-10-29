@@ -13,6 +13,7 @@
 #include "core/guest_hooks.h"
 #include "core/native_device.h"
 #include "core/native_resources.h"
+#include "core/native_updates.h"
 
 namespace Core::NativeDevice {
 
@@ -201,6 +202,20 @@ void NoteDelete(u64 object) {
     if (const auto entry = by_id.find(it->second); entry != by_id.end() && entry->second.alive) {
         entry->second.alive = false;
         live_by_kind[static_cast<u32>(entry->second.kind)].fetch_sub(1, std::memory_order_relaxed);
+        const Object& gone = entry->second;
+        const bool texture = gone.kind >= Kind::Texture1D && gone.kind <= Kind::Texture3D;
+        if (texture && gone.address != 0 && gone.bytes != 0) {
+            // B8.2: another live texture at the same memory (an alias) keeps the images
+            const auto at = resource_by_address.find(gone.address);
+            const auto owner = at != resource_by_address.end() && at->second != gone.id ? by_id.find(at->second) : by_id.end();
+            if (owner != by_id.end() && owner->second.alive) {
+                Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8TextureAliasKept);
+            } else {
+                Core::NativeUpdates::NoteEngineDelete(gone.id, gone.address, gone.bytes, true);
+            }
+        } else if (gone.kind == Kind::ShaderResourceView || gone.kind == Kind::UnorderedAccessView) {
+            Core::NativeUpdates::NoteEngineDelete(gone.id, gone.address, gone.bytes, false);
+        }
     }
     id_by_object.erase(it);
 }

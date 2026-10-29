@@ -14,6 +14,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "core/native_resources.h"
+#include "core/native_device.h"
 #include "core/native_updates.h"
 #include "core/native_write_watch.h"
 #include "core/resource_audit.h"
@@ -36,7 +37,7 @@ static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_SAMPLERS = std::numeric_limits<u16>::max();
 
 namespace {
-constexpr u8 B8Fault = 1, B8Announced = 2, B8Owed = 4; ///< Image::b8_marks
+constexpr u8 B8Fault = 1, B8Announced = 2, B8Owed = 4, B8Deleted = 8; ///< Image::b8_marks
 enum ImageSite : u32 { SiteFind, SiteOverlap, SiteExpand, SiteStencil, NumImageSites };
 std::array<std::atomic<u64>, NumImageSites> images_created{};
 std::atomic<u64> images_freed{};
@@ -380,6 +381,30 @@ void TextureCache::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
         if (native) {
             image.flags |= ImageFlagBits::CpuDirty;
             UntrackImage(image_id);
+        }
+    }
+}
+
+void TextureCache::NoteEngineTextureDelete(VAddr address, u64 bytes, bool free) {
+    Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8TexturesDeleted);
+    SmallVector<ImageId, 4> image_ids;
+    ForEachImageInRegion(address, bytes, [&](ImageId image_id, Image& image) {
+        if (image.info.guest_address != address) {
+            return;
+        }
+        if (image.info.guest_size > bytes) {
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8DeletedImagesBigger);
+            return;
+        }
+        image_ids.push_back(image_id);
+    });
+    for (const auto image_id : image_ids) {
+        Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8DeletedImages);
+        if (free) {
+            FreeImage(image_id);
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8DeletedImagesFreed);
+        } else {
+            slot_images[image_id].b8_marks |= B8Deleted;
         }
     }
 }
@@ -1010,6 +1035,20 @@ void TextureCache::RefreshImage(Image& image) {
         }
     };
     harvest_shared_pages();
+    if ((image.b8_marks & B8Deleted) != 0) {
+        // B8.2 audit: an image the engine deleted the texture of is used again
+        image.b8_marks &= ~B8Deleted;
+        Core::NativeDevice::Object owner;
+        const bool owned = Core::NativeDevice::ResourceAt(image.info.guest_address, owner) && owner.kind != Core::NativeDevice::Kind::Buffer;
+        Core::NativeUpdates::NoteB8(owned ? Core::NativeUpdates::B8UsedAfterDeleteReused : Core::NativeUpdates::B8UsedAfterDeleteNoOwner);
+        if (!owned) {
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+                LOG_WARNING(Render_Vulkan, "B8.2: image {:#x}+{:#x} ({}x{}) used after the engine deleted its texture, no engine texture owns the memory now",
+                            image.info.guest_address, image.info.guest_size, image.info.size.width, image.info.size.height);
+            }
+        }
+    }
     const u32 b8 = Core::NativeUpdates::B8ImageMode();
     if (image.b8_hash != 0 && False(image.flags & ImageFlagBits::Dirty) && False(image.flags & ImageFlagBits::GpuModified) && Core::NativeUpdates::B8VerifySample()) {
         // B8.1 verify: an image no announcement dirtied must still hold the bytes of its last refresh

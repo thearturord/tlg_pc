@@ -118,6 +118,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         texture_sets = std::make_unique<TextureSet[]>(TextureSetSlots);
     }
     LOG_INFO(Render, "texture set memo: {}", texture_set_on ? "on" : "off");
+    // B8.2: the engine's deletions, in order with the GPU work (raster thread)
+    Core::NativeUpdates::SetDelete(
+        [](void* context, u64 id, u64 address, u64 bytes, bool texture) { static_cast<Rasterizer*>(context)->EngineObjectDeleted(id, address, bytes, texture); }, this);
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
@@ -560,6 +563,20 @@ static bool B3ImagesOn() {
         return e == nullptr || *e != '0';
     }();
     return on;
+}
+
+void Rasterizer::EngineObjectDeleted(u64 id, VAddr address, u64 bytes, bool texture) {
+    if (const auto it = native_image_keys.find(id); it != native_image_keys.end()) {
+        // B3: the deleted view's entries leave the table (the id is never used again)
+        for (const u64 key : it->second) {
+            native_images.erase(key);
+        }
+        Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8ViewIdsDropped);
+        native_image_keys.erase(it);
+    }
+    if (texture) {
+        texture_cache.NoteEngineTextureDelete(address, bytes, Core::NativeUpdates::B8LifetimeMode() == 2);
+    }
 }
 
 static bool TextureIdsOn() {
@@ -3463,6 +3480,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 }
             }
             if (native_entry != nullptr && !native_hit && image_id) {
+                if (!native_entry->valid) {
+                    native_image_keys[image_engine_id].push_back((image_engine_id << 8) ^ (key[4] * 0x9E3779B97F4A7C15ull) ^ i);
+                }
                 native_entry->valid = true;
                 native_entry->id = image_engine_id;
                 native_entry->flags = key[4];

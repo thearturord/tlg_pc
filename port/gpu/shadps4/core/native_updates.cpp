@@ -267,6 +267,9 @@ void MarkAnnounced(u64 address, u64 size) {
 namespace {
 std::mutex pending_mutex;
 std::vector<std::pair<u64, u64>> pending_ranges, applied_last;
+std::vector<std::array<u64, 4>> pending_deleted;
+void (*delete_fn)(void*, u64, u64, u64, bool) = nullptr;
+void* delete_context = nullptr;
 void (*apply_fn)(void*, u64, u64, bool) = nullptr;
 void* apply_context = nullptr;
 void (*queue_fn)(void*, Batch&&) = nullptr;
@@ -302,12 +305,32 @@ Batch TakeBatch() {
     }
     std::scoped_lock lock{pending_mutex};
     batch.first.swap(pending_ranges);
+    batch.deleted.swap(pending_deleted);
     batch.again = applied_last;
     applied_last = batch.first;
     return batch;
 }
 
+void SetDelete(void (*fn)(void*, u64, u64, u64, bool), void* context) {
+    delete_context = context;
+    delete_fn = fn;
+}
+
+void NoteEngineDelete(u64 id, u64 address, u64 bytes, bool texture) {
+    if (B8LifetimeMode() == 0 || B2NativeMode() == 0) {
+        return;
+    }
+    std::scoped_lock lock{pending_mutex};
+    pending_deleted.push_back({id, address, bytes, texture ? 1u : 0u});
+}
+
 void ApplyBatch(const Batch& batch) {
+    if (delete_fn != nullptr) {
+        // deletions first: the work of this submission comes after them in the game's order, and no announcement of it touches a deleted object
+        for (const auto& d : batch.deleted) {
+            delete_fn(delete_context, d[0], d[1], d[2], d[3] != 0);
+        }
+    }
     if (apply_fn == nullptr) {
         return;
     }
@@ -405,6 +428,14 @@ u32 B8ImageMode() noexcept {
     return mode;
 }
 
+u32 B8LifetimeMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_B8_LIFETIME");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 0u;
+    }();
+    return mode;
+}
+
 bool B8VerifyOn() noexcept {
     return B8ImageMode() == 2 && B8VerifyEvery() != 0;
 }
@@ -438,6 +469,10 @@ nlohmann::json B8Report() {
             {"announcements_on_images", c(B8AnnouncedOnImage)},
             {"second_applications_kept_for_gpu", c(B8KeptForGpu)},
             {"verify_checked", c(B8VerifyChecked)},
+            {"lifetime", {{"mode", B8LifetimeMode()}, {"textures_deleted", c(B8TexturesDeleted)}, {"alias_kept", c(B8TextureAliasKept)},
+                          {"their_images", c(B8DeletedImages)}, {"images_bigger_left", c(B8DeletedImagesBigger)}, {"images_freed", c(B8DeletedImagesFreed)},
+                          {"used_after_delete_new_owner", c(B8UsedAfterDeleteReused)}, {"USED_AFTER_DELETE_NO_OWNER", c(B8UsedAfterDeleteNoOwner)},
+                          {"view_ids_dropped", c(B8ViewIdsDropped)}}},
             {"note", "B8.1, cumulative: images refreshed by the engine's announcements instead of write faults"}};
 }
 

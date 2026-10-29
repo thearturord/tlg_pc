@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <array>
 #include <utility>
 #include <vector>
 #include <atomic>
@@ -61,8 +62,9 @@ void SetApply(void (*fn)(void* context, u64 address, u64 size, bool newer), void
 /// The announcements of one submission: applied once (`first`) and the previous submission's again (`again`)
 struct Batch {
     std::vector<std::pair<u64, u64>> first, again;
+    std::vector<std::array<u64, 4>> deleted; ///< B8.2: engine objects deleted before the submission (id, memory, bytes, 1 texture / 0 view)
     [[nodiscard]] bool Empty() const noexcept {
-        return first.empty() && again.empty();
+        return first.empty() && again.empty() && deleted.empty();
     }
 };
 /// Takes the announcements made since the last batch (B2 cutover; empty when off)
@@ -83,6 +85,13 @@ void NoteHarvested(u64 address, u64 bytes, bool in_upload_ring);
 /// B8.1 (`TLG_B8_IMAGES`): 0 off, 1 audit (texture memory stays write protected; a fault that dirtied an image no announcement explains is counted), 2 native (the
 /// announcements alone refresh images, texture memory is not write protected; `TLG_B8_VERIFY=N` hashes every Nth bound image that is not dirty against its last refresh)
 [[nodiscard]] u32 B8ImageMode() noexcept;
+/// B8.2 (`TLG_B8_LIFETIME`): 0 off, 1 audit (images the engine's deleted textures leave behind are marked, a later use is counted), 2 native (an engine texture's
+/// images are freed when the engine deletes it, in order with the GPU work; the B3 table drops the ids of deleted views in both modes)
+[[nodiscard]] u32 B8LifetimeMode() noexcept;
+/// B8.2: the engine deleted a texture (`texture` true) or a view; queued with the next submission's batch
+void NoteEngineDelete(u64 id, u64 address, u64 bytes, bool texture);
+/// Where a deletion is carried out (raster thread, in order with the GPU work); set by the rasterizer
+void SetDelete(void (*fn)(void* context, u64 id, u64 address, u64 bytes, bool texture), void* context);
 /// B8.1 verify: true for every Nth check (0: verify off)
 [[nodiscard]] bool B8VerifySample() noexcept;
 [[nodiscard]] bool B8VerifyOn() noexcept;
@@ -94,6 +103,14 @@ enum B8Count : u32 {
     B8VerifyChecked,            ///< images the verify hashed
     B8AnnouncedOnImage,         ///< announcements that touched an image
     B8KeptForGpu,               ///< second applications that left an image the GPU wrote since alone
+    B8TexturesDeleted,          ///< B8.2: engine texture deletions carried out
+    B8TextureAliasKept,         ///< ... skipped: another live engine texture has the same memory
+    B8DeletedImages,            ///< images of a deleted texture (same memory, not bigger than the object)
+    B8DeletedImagesBigger,      ///< images at a deleted texture's memory but bigger than the object (left alone)
+    B8DeletedImagesFreed,       ///< native mode: images freed at the engine's deletion
+    B8UsedAfterDeleteReused,    ///< audit: an image of a deleted texture used again while a new engine texture owns its memory (native mode makes a new image)
+    B8UsedAfterDeleteNoOwner,   ///< audit: ... while no engine texture owns its memory (native mode would lose it: must stay 0)
+    B8ViewIdsDropped,           ///< B3 entries of deleted views dropped
     B8Counts,
 };
 void NoteB8(B8Count what) noexcept;

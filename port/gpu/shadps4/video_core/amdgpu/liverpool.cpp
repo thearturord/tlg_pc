@@ -2063,12 +2063,13 @@ Liverpool::Liverpool()
 }
 
 void Liverpool::QueueAnnounced(Core::NativeDirect::Buffer& direct) {
-    if (direct.announced_first.empty() && direct.announced_again.empty()) {
+    if (direct.announced_first.empty() && direct.announced_again.empty() && direct.announced_deleted.empty()) {
         return;
     }
     Core::NativeUpdates::Batch batch;
     batch.first = std::move(direct.announced_first);
     batch.again = std::move(direct.announced_again);
+    batch.deleted = std::move(direct.announced_deleted);
     RasterRun([b = std::move(batch)] { Core::NativeUpdates::ApplyBatch(b); });
 }
 
@@ -3106,6 +3107,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bo
         if (direct) {
             direct->announced_first = std::move(announced.first);
             direct->announced_again = std::move(announced.again);
+            direct->announced_deleted = std::move(announced.deleted);
         } else {
             RasterRun([batch = std::move(announced)] { Core::NativeUpdates::ApplyBatch(batch); });
         }
@@ -3139,6 +3141,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
         if (direct) {
             direct->announced_first = std::move(announced.first);
             direct->announced_again = std::move(announced.again);
+            direct->announced_deleted = std::move(announced.deleted);
         } else {
             RasterRun([batch = std::move(announced)] { Core::NativeUpdates::ApplyBatch(batch); });
         }

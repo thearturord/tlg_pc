@@ -261,6 +261,8 @@ public:
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
     /// N5h: see BufferCache::SupersedeGpuWritten.
+    /// B8.2: the engine deleted a texture or view (raster thread, in order with the GPU work)
+    void EngineObjectDeleted(u64 id, VAddr address, u64 bytes, bool texture);
     void SupersedeGpuWritten(VAddr addr, u64 size) {
         buffer_cache.SupersedeGpuWritten(addr, size);
     }
@@ -567,6 +569,7 @@ private:
         VideoCore::TextureCache::ImageDesc desc;
     };
     std::unordered_map<u64, NativeImage> native_images;
+    std::unordered_map<u64, std::vector<u64>> native_image_keys; ///< B8.2: the native_images keys of each view id (dropped at the engine's deletion)
 public:
     std::array<std::atomic<u64>, 5> b6_downloads{}; ///< B6: copy results downloaded into PS4 memory / left on the GPU (no CPU reader)
     std::atomic<u64> b5_copies_on_gpu{0}, b5_copies_on_cpu{0}; ///< B5: guest copies run on the GPU / as a CPU copy in PS4 memory
