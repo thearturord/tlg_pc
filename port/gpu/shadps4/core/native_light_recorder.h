@@ -28,6 +28,10 @@ struct Entry {
     u32 words[4]{}; ///< buffer: the first four dwords of the guest memory now
 };
 
+/// Per frame signature (raster thread): every draw and dispatch adds itself (`kind`: 0 dispatch, 1 to 5 draw of class z / shadow, g buffer, forward, other, indirect, 6 untagged draw; `key`: the
+/// pipeline or program), so a frame with a pass missing, doubled or a different pipeline shows in its counts and its order independent signature.
+void FrameOp(u64 present, u32 kind, u64 key);
+
 /// A lighting dispatch is being bound (raster thread).
 void Begin(u64 present, u64 caller, u64 program);
 void Note(const Entry& entry);

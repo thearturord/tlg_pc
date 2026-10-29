@@ -1214,6 +1214,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     if (!pipeline) {
         return;
     }
+    if (Core::LightRecorder::On()) {
+        const u32 draw_class = tag.valid ? (tag.meta & 0xff) : 15u;
+        Core::LightRecorder::FrameOp(Core::DebugServer::PresentCount(), draw_class < 5 ? draw_class + 1 : 6, reinterpret_cast<u64>(pipeline));
+    }
     FixedState fixed_storage;
     const FixedState& fixed = FixedFor(plan, fixed_storage);
     DrawInputs inputs_storage;
@@ -1436,6 +1440,9 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
         return;
     }
     runtime.SetHazardProgram(cs_program.address);
+    if (Core::LightRecorder::On()) {
+        Core::LightRecorder::FrameOp(Core::DebugServer::PresentCount(), 0, cs_program.address);
+    }
     if (IdentityAuditOn()) {
         // C1 / C2 audit: the pipeline of a program address
         auto& audit = g_identity_audit;
@@ -2997,7 +3004,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     note.address = vsharp.base_address;
                     note.size = size;
                     u64 h = 0xcbf29ce484222325ull;
-                    const u64 bytes = memory->IsValidMapping(vsharp.base_address, std::min<u64>(size, 256)) ? std::min<u64>(size, 256) : 0;
+                    const u64 hashed = std::min<u64>(size, 16384); // a light constant block is below 2 KB; a big buffer is hashed by its first 16 KB
+                    const u64 bytes = memory->IsValidMapping(vsharp.base_address, hashed) ? hashed : 0;
                     for (u64 b = 0; b < bytes; b += 4) {
                         u32 word = 0;
                         std::memcpy(&word, reinterpret_cast<const void*>(vsharp.base_address + b), std::min<u64>(4, bytes - b));

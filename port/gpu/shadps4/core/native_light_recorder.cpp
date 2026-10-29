@@ -25,6 +25,13 @@ std::deque<Record> ring;
 thread_local Record current;
 thread_local bool recording = false;
 constexpr size_t RingSize = 800;
+struct FrameSig {
+    u64 present{~0ull};
+    u32 counts[8]{};
+    u64 signature{};
+};
+constexpr size_t FrameRing = 1024;
+FrameSig frame_ring[FrameRing];
 
 const std::vector<u64>& Callers() {
     static const std::vector<u64> list = [] {
@@ -63,6 +70,18 @@ bool IsLightCaller(u64 caller) {
         }
     }
     return false;
+}
+
+void FrameOp(u64 present, u32 kind, u64 key) {
+    FrameSig& f = frame_ring[present % FrameRing];
+    if (f.present != present) {
+        f = {};
+        f.present = present;
+    }
+    ++f.counts[kind & 7];
+    u64 h = (key ^ (u64{kind} << 56)) * 0x9E3779B97F4A7C15ull;
+    h ^= h >> 29;
+    f.signature += h;
 }
 
 void Begin(u64 present, u64 caller, u64 program) {
@@ -124,6 +143,12 @@ void WriteDump(const std::string& tag, u64 detail) {
     {
         std::scoped_lock lock{mutex};
         text += fmt::format("light recorder: {} {} ({} dispatches)\n", tag, detail, ring.size());
+        for (const FrameSig& f : frame_ring) {
+            if (f.present != ~0ull && f.present + 220 >= detail && f.present <= detail + 8) {
+                text += fmt::format("frame {} dispatches {} draws z/shadow {} gbuffer {} forward {} other {} indirect {} untagged {} signature {:016x}\n", f.present, f.counts[0], f.counts[1], f.counts[2], f.counts[3], f.counts[4],
+                                    f.counts[5], f.counts[6], f.signature);
+            }
+        }
         for (const Record& r : ring) {
             text += fmt::format("present {} caller {:#x} program {:#x}\n", r.present, r.caller, r.program);
             for (const Entry& e : r.entries) {
