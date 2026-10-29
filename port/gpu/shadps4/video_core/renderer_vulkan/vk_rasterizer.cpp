@@ -1477,6 +1477,36 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     binder_plan = DispatchBinderFor(plan);
     resolved_dispatch = binder_plan != nullptr ? plan : nullptr;
     const bool light_recorded = Core::LightRecorder::On() && plan != nullptr && plan->native_seq != 0 && Core::LightRecorder::IsLightCaller(Core::NativeDraw::RecordCallerGhidra(plan->native_seq));
+    {
+        // Dark frame experiment (`TLG_LIGHT_FULL_BARRIER=1`): a full memory barrier (every earlier command's writes visible to every later command) before each dispatch of the four
+        // lighting passes (LightVolume 0x1c6456d, its rasterize 0x1c67f59 and chromatic aberration 0x1c68036, ambient lighting 0x1c44f64). If the dark frames go away with it, the
+        // sun / fog passes read the shadow maps (or another input) before the work that writes them was ordered before them.
+        static const bool full_barrier = [] {
+            const char* e = std::getenv("TLG_LIGHT_FULL_BARRIER");
+            return e != nullptr && *e == '1';
+        }();
+        if (full_barrier && plan != nullptr && plan->native_seq != 0) {
+            const u64 caller = Core::NativeDraw::RecordCallerGhidra(plan->native_seq);
+            if (caller == 0x1c6456d || caller == 0x1c67f59 || caller == 0x1c68036 || caller == 0x1c44f64) {
+                runtime.FlushBarriers();
+                scheduler.EndRendering();
+                const vk::MemoryBarrier2 barrier = {
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                };
+                scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+                    .memoryBarrierCount = 1,
+                    .pMemoryBarriers = &barrier,
+                });
+                static std::atomic<u64> issued{0};
+                if (issued.fetch_add(1, std::memory_order_relaxed) == 0) {
+                    LOG_INFO(Render_Vulkan, "TLG_LIGHT_FULL_BARRIER: full barriers before the lighting dispatches");
+                }
+            }
+        }
+    }
     if (light_recorded) {
         Core::LightRecorder::Begin(Core::DebugServer::PresentCount(), Core::NativeDraw::RecordCallerGhidra(plan->native_seq), cs_program.address);
     }
