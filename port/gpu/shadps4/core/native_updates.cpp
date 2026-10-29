@@ -536,6 +536,14 @@ u32 B9LifetimeMode() noexcept {
     return mode;
 }
 
+u32 B9QueryMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_B9_QUERIES");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 0u;
+    }();
+    return mode;
+}
+
 u32 B9VerifyEvery() noexcept {
     static const u32 n = [] {
         const char* e = std::getenv("TLG_B9_VERIFY");
@@ -555,6 +563,11 @@ nlohmann::json B9Report() {
             {"uploads", {{"inside_one_buffer", c(B9SyncByObject)}, {"other_ranges", c(B9SyncNoObject)}}},
             {"TRACKER_ONLY_RANGES", c(B9TrackerOnlyRanges)}, {"tracker_ranges_announced_outside_the_request", c(B9TrackerElsewhere)}, {"tracker_only_bytes", c(B9TrackerOnlyBytes)}, {"announced_only_ranges", c(B9ObjectOnlyRanges)},
             {"bytes_by_page_tracker", c(B9BytesByTracker)}, {"bytes_by_announcements", c(B9BytesByObject)},
+            {"queries", {{"mode", B9QueryMode()},
+                         {"cpu_changed", {{"asked", c(B9CpuQueries)}, {"same_answer", c(B9CpuAgree)}, {"tracker_yes_neighbor_bytes", c(B9CpuTrackerNeighbor)},
+                                          {"TRACKER_YES_NO_ANNOUNCED_BYTE", c(B9CpuTrackerOnly)}, {"buffer_yes_tracker_no", c(B9CpuObjectOnly)}}},
+                         {"gpu_written", {{"asked", c(B9GpuQueries)}, {"same_answer", c(B9GpuAgree)}, {"tracker_yes_bytes_elsewhere_on_the_page", c(B9GpuTrackerPage)},
+                                          {"tracker_yes_no_gpu_byte_on_the_pages", c(B9GpuTrackerOnly)}, {"bytes_yes_tracker_no", c(B9GpuBytesOnly)}}}}},
             {"lifetime", {{"mode", B9LifetimeMode()}, {"buffers_deleted", c(B9BuffersDeleted)}, {"with_announced_bytes_never_uploaded", c(B9DeletedPending)},
                           {"with_gpu_written_bytes", c(B9DeletedGpuWritten)}, {"memory_shared_with_a_live_buffer", c(B9DeletedAlias)},
                           {"gpu_written_bytes_dropped", c(B9DeletedGpuDropped)}}},

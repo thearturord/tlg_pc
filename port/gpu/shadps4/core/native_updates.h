@@ -159,6 +159,9 @@ void NoteB8Unannounced(u64 address, u64 size, bool by_fault) noexcept;
 /// B9.2 (`TLG_B9_LIFETIME`): 0 off, 1 audit (an engine buffer's deletion is carried out in order and counted: its announced bytes go, what it leaves behind is
 /// counted), 2 native (also the GPU written bytes and stream copies of its memory go, unless another live buffer shares the memory)
 [[nodiscard]] u32 B9LifetimeMode() noexcept;
+/// B9.3 (`TLG_B9_QUERIES`): 0 off, 1 audit (for a range inside one engine buffer, "did the CPU change it" and "did the GPU write it" are answered by the buffer's state
+/// and compared with the page tracker), 2 native (the buffer's state answers: its announced bytes, the GPU written bytes)
+[[nodiscard]] u32 B9QueryMode() noexcept;
 enum B9Count : u32 {
     B9AnnouncedOnBuffer,   ///< announcements inside one engine buffer
     B9AnnouncedClipped,    ///< announcements that meet several buffers or reach past one (each buffer takes its part)
@@ -174,6 +177,16 @@ enum B9Count : u32 {
     B9VerifyChecked,       ///< verify: request pages compared
     B9VerifyMiss,          ///< ... differing from memory after the upload (fixed by a page upload)
     B9VerifyLate,          ///< ... of those, announced afterwards (the game wrote ahead of the raster thread: the page tracker had the same timing)
+    B9CpuQueries,          ///< B9.3: CPU changed? for a range inside one engine buffer
+    B9CpuAgree,
+    B9CpuTrackerNeighbor,  ///< ... tracker yes, buffer no: the page's announced bytes are another buffer's (page granularity)
+    B9CpuTrackerOnly,      ///< ... tracker yes, buffer no, no announced byte on the pages (must stay 0)
+    B9CpuObjectOnly,       ///< ... buffer yes, tracker no (the page was uploaded whole for a neighbor; native uploads again: safe)
+    B9GpuQueries,          ///< B9.3: GPU written? for a range inside one engine buffer
+    B9GpuAgree,
+    B9GpuTrackerPage,      ///< ... tracker yes, bytes no: GPU written bytes elsewhere on the page (page granularity)
+    B9GpuTrackerOnly,      ///< ... tracker yes, no GPU written byte on the pages (the tracker keeps a page's mark after the bytes were superseded or downloaded)
+    B9GpuBytesOnly,        ///< ... bytes yes, tracker no (native answers yes: the arena's bytes are kept, the safe way round)
     B9BuffersDeleted,      ///< B9.2: engine buffer deletions carried out
     B9DeletedPending,      ///< ... with announced bytes never uploaded (dropped)
     B9DeletedGpuWritten,   ///< ... whose memory held GPU written bytes

@@ -767,7 +767,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             // a resident buffer is also asked of the tracker: the fault handler marks a page after it bumped the generation (the mark can land after a synchronization that
             // saw nothing), so the generation alone is not enough; the tracker's dirty bit is the safety net of the engine's own knowledge
             if (immutable->synced.load(std::memory_order_acquire) && !Core::NativeResources::ImmutableCheck(*immutable) &&
-                (immutable->usage == 1 || !memory_tracker->IsRegionCpuModified(device_addr, size))) {
+                (immutable->usage == 1 || !IsRegionCpuModified(device_addr, size))) {
                 const auto* arena = GetArena(device_addr >> block_shift, (device_addr + size - 1) >> block_shift);
                 if (immutable->gpu_arena_epoch.load(std::memory_order_relaxed) != ArenaEpoch() && immutable->begin >= arena->cpu_addr &&
                     immutable->end <= arena->cpu_addr + arena->size_bytes) {
@@ -994,12 +994,79 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     return {staging.buffer, staging.offset};
 }
 
+u64 BufferCache::BufferHolding(VAddr addr, size_t size) const {
+    Core::NativeDevice::Object object;
+    if (Core::NativeDevice::ResourceAt(addr, object) && object.kind == Core::NativeDevice::Kind::Buffer && addr + size <= object.address + std::max<u64>(object.bytes, 1)) {
+        return object.id;
+    }
+    return 0;
+}
+
 bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
+    // B9.3: a range inside one engine buffer: changed when the buffer holds announced bytes there that were not uploaded
+    if (const u32 mode = Core::NativeUpdates::B9QueryMode(); mode != 0 && Core::NativeUpdates::B9BufferMode() != 0) {
+        if (const u64 id = BufferHolding(addr, size); id != 0) {
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9CpuQueries);
+            bool object_says;
+            {
+                std::scoped_lock lock{object_dirty_mutex};
+                const auto it = object_dirty.find(id);
+                object_says = (it != object_dirty.end() && it->second.Intersects(addr, size)) || b9_unattributed.Intersects(addr, size);
+            }
+            if (mode == 2) {
+                return object_says;
+            }
+            const bool tracker_says = memory_tracker->IsRegionCpuModified(addr, size);
+            if (tracker_says == object_says) {
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9CpuAgree);
+            } else if (object_says) {
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9CpuObjectOnly);
+            } else {
+                const VAddr lo = addr & ~VAddr{4095}, hi = (addr + size + 4095) & ~VAddr{4095};
+                bool neighbor;
+                {
+                    std::scoped_lock lock{object_dirty_mutex};
+                    neighbor = all_object_dirty.Intersects(lo, hi - lo);
+                }
+                Core::NativeUpdates::NoteB9(neighbor ? Core::NativeUpdates::B9CpuTrackerNeighbor : Core::NativeUpdates::B9CpuTrackerOnly);
+            }
+            return tracker_says;
+        }
+    }
     HarvestWriteWatch(addr, size);
     return memory_tracker->IsRegionCpuModified(addr, size);
 }
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
+    // B9.3: a range inside one engine buffer: written when the GPU wrote bytes of it that were not superseded or downloaded since
+    if (const u32 mode = Core::NativeUpdates::B9QueryMode(); mode != 0 && Core::NativeUpdates::B9BufferMode() != 0) {
+        if (BufferHolding(addr, size) != 0) {
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9GpuQueries);
+            bool bytes_say;
+            {
+                std::shared_lock lock{gpu_ranges_mutex};
+                bytes_say = gpu_modified_ranges.Intersects(addr, size);
+            }
+            if (mode == 2) {
+                return bytes_say;
+            }
+            const bool tracker_says = memory_tracker->IsRegionGpuModified(addr, size);
+            if (tracker_says == bytes_say) {
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9GpuAgree);
+            } else if (bytes_say) {
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9GpuBytesOnly);
+            } else {
+                const VAddr lo = addr & ~VAddr{4095}, hi = (addr + size + 4095) & ~VAddr{4095};
+                bool page;
+                {
+                    std::shared_lock lock{gpu_ranges_mutex};
+                    page = gpu_modified_ranges.Intersects(lo, hi - lo);
+                }
+                Core::NativeUpdates::NoteB9(page ? Core::NativeUpdates::B9GpuTrackerPage : Core::NativeUpdates::B9GpuTrackerOnly);
+            }
+            return tracker_says;
+        }
+    }
     return memory_tracker->IsRegionGpuModified(addr, size);
 }
 

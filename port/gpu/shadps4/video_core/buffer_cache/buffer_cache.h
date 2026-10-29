@@ -148,6 +148,8 @@ public:
     /// B9.2: the engine deleted the buffer `id` at [address, address + bytes) (raster thread, in order): its announced bytes go; in native mode also the GPU written
     /// bytes and stream copies of its memory, unless another live buffer shares the memory
     void NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool native);
+    /// B9.3: the engine buffer that holds all of [addr, addr + size) (0: none)
+    [[nodiscard]] u64 BufferHolding(VAddr addr, size_t size) const;
     /// R1: changes when an arena is replaced
     [[nodiscard]] u64 ArenaEpoch() const noexcept {
         return arena_epoch.load(std::memory_order_acquire);
