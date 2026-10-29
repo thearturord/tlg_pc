@@ -140,6 +140,14 @@ public:
     }
     /// B11: the clear value of an engine color clear for `format` (integer formats take the values as integers)
     static vk::ClearValue EngineColorValue(vk::Format format, const float (&value)[4]);
+    /// B8.5: an engine buffer was created (images already in its memory join its list) / deleted (its list goes)
+    void NoteEngineBufferCreate(u64 id, VAddr address, u64 bytes);
+    void NoteEngineBufferDelete(u64 id) {
+        buffer_images.erase(id);
+        buffers_known.erase(id);
+    }
+    /// B8.5: the images the engine buffers meeting [address, address + size) list (each once); false when live buffers do not cover the range whole
+    bool BufferImagesIn(VAddr address, u64 size, SmallVector<ImageId, 8>& out);
     /// B11: the type EngineImagesOf fills
     static SmallVector<ImageId, 4> EngineImagesOfType();
     /// B11: the engine texture's own images (its list, registered)
@@ -500,6 +508,8 @@ private:
     /// B8.3: the images of each engine texture (by its id; slot and uid, a stale entry is skipped), raster thread
     std::unordered_map<u64, SmallVector<std::pair<ImageId, u64>, 2>> engine_images;
     std::unordered_map<u64, EngineClear> engine_pending_clears; ///< B11 step 6, by engine texture id
+    std::unordered_map<u64, SmallVector<std::pair<ImageId, u64>, 2>> buffer_images; ///< B8.5, by engine buffer id: the images in its memory
+    std::unordered_set<u64> buffers_known; ///< B8.5: engine buffers whose creation was handled (their memory's older images listed)
     /// B8.4: the other answers of each engine texture's lookups (a view of another format or size, a mip or layer of a bigger image), by the request; valid while no
     /// image was registered or removed in the range since (the event ring)
     struct EngineAnswer {

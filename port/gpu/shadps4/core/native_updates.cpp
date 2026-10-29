@@ -473,6 +473,14 @@ u32 B8FindMode() noexcept {
     return mode;
 }
 
+u32 B8BufferImagesMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_B8_BUFFER_IMAGES");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 2u;
+    }();
+    return B8FindMode() == 0 ? 0u : mode;
+}
+
 bool B8VerifyOn() noexcept {
     return B8ImageMode() == 2 && B8VerifyEvery() != 0;
 }
@@ -521,6 +529,8 @@ nlohmann::json B8Report() {
                        {"first_lookups_by_engine_textures", c(B8FirstByEngine)}, {"first_lookups_page_table", c(B8FirstFallback)},
                        {"AUDIT_FIRST_CANDIDATE_MISSED", c(B8FirstMissedListed)}, {"audit_first_stale_left_out", c(B8FirstStaleLeft)}, {"copies_by_engine_texture", c(B8RouteCopy)}, {"copies_page_table", c(B8RouteCopyFallback)},
                        {"AUDIT_COPY_OTHER", c(B8RouteCopyOther)}}},
+            {"buffer_images", {{"mode", B8BufferImagesMode()}, {"announcements_by_engine_buffers", c(B8BufAnnounce)}, {"copies_by_engine_buffers", c(B8BufCopy)},
+                               {"images_listed", c(B8BufListed)}, {"AUDIT_MISSED", c(B8BufMissed)}, {"not_covered_page_table", c(B8BufNotCovered)}}},
             {"note", "B8.1, cumulative: images refreshed by the engine's announcements instead of write faults"}};
 }
 

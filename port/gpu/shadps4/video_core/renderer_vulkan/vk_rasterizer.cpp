@@ -129,6 +129,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             auto* self = static_cast<Rasterizer*>(context);
             if (texture) {
                 self->texture_cache.NoteEngineTextureCreate(address, bytes);
+            } else {
+                self->texture_cache.NoteEngineBufferCreate(id, address, bytes); // B8.5
             }
             self->buffer_cache.NoteEngineResourceCreate(id, address, bytes, texture); // B9.4: a placed buffer under the new resource moves back into the arena (or takes it in)
         },
@@ -743,6 +745,7 @@ void Rasterizer::EngineObjectDeleted(u64 id, VAddr address, u64 bytes, u32 what)
         native_image_keys.erase(it);
     }
     if (what == 4) {
+        texture_cache.NoteEngineBufferDelete(id); // B8.5
         buffer_cache.NoteEngineBufferDelete(id, address, bytes, Core::NativeUpdates::B9LifetimeMode() == 2);
         return;
     }

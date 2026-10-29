@@ -388,6 +388,63 @@ void TextureCache::NoteEngineTextureCreate(VAddr address, u64 bytes) {
     });
 }
 
+void TextureCache::NoteEngineBufferCreate(u64 id, VAddr address, u64 bytes) {
+    if (Core::NativeUpdates::B8BufferImagesMode() == 0 || !buffers_known.insert(id).second) {
+        return;
+    }
+    auto& list = buffer_images[id];
+    ForEachImageInRegion(address, bytes, [&](ImageId image_id, Image& image) {
+        list.emplace_back(image_id, image.image_uid);
+        Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8BufListed);
+    });
+    if (list.empty()) {
+        buffer_images.erase(id);
+    }
+}
+
+bool TextureCache::BufferImagesIn(VAddr address, u64 size, SmallVector<ImageId, 8>& out) {
+    static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
+    parts.clear();
+    Core::NativeDevice::BuffersIn(address, size, parts);
+    if (parts.empty()) {
+        return false;
+    }
+    std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });
+    VAddr covered = address;
+    for (const auto& part : parts) {
+        if (part.begin > covered) {
+            return false;
+        }
+        covered = std::max(covered, part.end);
+    }
+    if (covered < address + size) {
+        return false;
+    }
+    for (const auto& part : parts) {
+        if (!buffers_known.contains(part.id)) {
+            // the buffer's creation is still queued (the guest thread made it, its announcements can come first): its older images are listed now
+            NoteEngineBufferCreate(part.id, part.object_begin, part.object_end - part.object_begin);
+        }
+        const auto it = buffer_images.find(part.id);
+        if (it == buffer_images.end()) {
+            continue;
+        }
+        auto& list = it->second;
+        list.erase(std::remove_if(list.begin(), list.end(),
+                                  [&](const auto& e) {
+                                      return !slot_images.IsAllocated(e.first) || slot_images[e.first].image_uid != e.second ||
+                                             False(slot_images[e.first].flags & ImageFlagBits::Registered);
+                                  }),
+                   list.end());
+        for (const auto& [image_id, uid] : list) {
+            if (slot_images[image_id].Overlaps(address, size) && std::ranges::find(out, image_id) == out.end()) {
+                out.push_back(image_id);
+            }
+        }
+    }
+    return true;
+}
+
 void TextureCache::EngineImagesIn(const std::vector<u64>& ids, VAddr address, u64 size, SmallVector<ImageId, 8>& out) const {
     const auto add = [&](ImageId image_id, u64 uid) {
         if (!slot_images.IsAllocated(image_id)) {
@@ -457,6 +514,41 @@ void TextureCache::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
             }
         } else {
             Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8RouteAnnounceFallback);
+            // B8.5: memory of engine buffers finds its images through the buffers' lists
+            if (const u32 by_buffers = Core::NativeUpdates::B8BufferImagesMode(); by_buffers != 0) {
+                if (BufferImagesIn(addr, size, image_ids)) {
+                    Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8BufAnnounce);
+                    routed = by_buffers == 2;
+                    if (!routed) {
+                        ForEachImageInRegion(addr, size, [&](ImageId image_id, Image&) {
+                            if (std::ranges::find(image_ids, image_id) == image_ids.end()) {
+                                Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8BufMissed);
+                                static std::atomic<u32> logged{0};
+                                if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+                                    const Image& image = slot_images[image_id];
+                                    std::vector<Core::NativeDevice::BufferPart> now;
+                                    Core::NativeDevice::BuffersIn(image.info.guest_address, image.info.guest_size, now);
+                                    std::string where;
+                                    for (const auto& part : now) {
+                                        const auto it = buffer_images.find(part.id);
+                                        const bool has = it != buffer_images.end() && std::ranges::find(it->second, std::make_pair(image_id, image.image_uid)) != it->second.end();
+                                        where += fmt::format(" [{} {:#x}+{:#x} listed {}]", part.id, part.object_begin, part.object_end - part.object_begin, has);
+                                    }
+                                    Core::NativeDevice::Object at;
+                                    const bool has_at = Core::NativeDevice::ResourceAt(image.info.guest_address, at);
+                                    LOG_WARNING(Render_Vulkan, "B8.5 audit: announcement {:#x}+{:#x}: image {:#x}+{:#x} ({}x{} uid {}) is in no engine buffer's list; at its memory: {} (id {} {:#x}+{:#x}); buffers over the image now:{}",
+                                                addr, size, image.info.guest_address, image.info.guest_size, image.info.size.width, image.info.size.height, image.image_uid,
+                                                Core::NativeDevice::OwnerName(image.info.guest_address), has_at ? at.id : 0, has_at ? at.address : 0, has_at ? at.bytes : 0, where);
+                                }
+                            }
+                        });
+                        image_ids.clear();
+                    }
+                } else {
+                    image_ids.clear();
+                    Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8BufNotCovered);
+                }
+            }
         }
     }
     if (!routed) {
@@ -1239,6 +1331,18 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
             routed = b8_find == 2;
         } else {
             Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8RouteCopyFallback);
+            // B8.5: an image at engine buffer memory is found through the buffers' lists
+            if (const u32 by_buffers = Core::NativeUpdates::B8BufferImagesMode(); by_buffers != 0 && BufferImagesIn(address, 1, engine_ids)) {
+                Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8BufCopy);
+                routed = by_buffers == 2;
+                if (!routed) {
+                    ForEachImageWithAddress(address, [&](ImageId image_id, Image&) {
+                        if (std::ranges::find(engine_ids, image_id) == engine_ids.end()) {
+                            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8BufMissed);
+                        }
+                    });
+                }
+            }
         }
     }
     if (routed) {
@@ -1624,6 +1728,19 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image_lru_cache.Insert(image, gc_tick);
     const auto& info = image.info;
     ASSERT_MSG((info.guest_address & 0xff) == 0, "Trying to register an unaligned image");
+    if (Core::NativeUpdates::B8BufferImagesMode() != 0) {
+        // B8.5: an image in engine buffer memory is listed by each buffer it meets
+        static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
+        parts.clear();
+        Core::NativeDevice::BuffersIn(info.guest_address, info.guest_size, parts);
+        for (const auto& part : parts) {
+            auto& list = buffer_images[part.id];
+            if (std::ranges::find(list, std::make_pair(image_id, image.image_uid)) == list.end()) {
+                list.emplace_back(image_id, image.image_uid);
+                Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8BufListed);
+            }
+        }
+    }
     ForEachPage(info.guest_address, info.guest_size, [this, image_id, info](u64 page) {
         page_table[page].entries.emplace_back(BucketEntry{
             .key = u32(info.guest_address >> 8),

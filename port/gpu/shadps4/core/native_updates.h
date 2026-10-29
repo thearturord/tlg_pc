@@ -91,6 +91,9 @@ void NoteHarvested(u64 address, u64 bytes, bool in_upload_ring);
 /// B8.3 (`TLG_B8_FIND`): 0 off, 1 audit (the image found by the engine texture's id is compared with the lookup by address), 2 native (an engine texture's
 /// image is found by its id; the page table lookup only runs when the texture has no matching image yet or no engine texture owns the memory)
 [[nodiscard]] u32 B8FindMode() noexcept;
+/// B8.5 (`TLG_B8_BUFFER_IMAGES`): images in engine buffer memory (formatted reads, render targets in a buffer's memory) are listed by the buffer; announcements
+/// and copies over buffer memory find them there instead of in the page table. 0 off, 1 audit (page table kept, lists compared), 2 native (default)
+[[nodiscard]] u32 B8BufferImagesMode() noexcept;
 /// B8.2: the engine deleted a view (`what` 0), a texture (1), a texture another live texture shares the memory with (3) or a buffer (4, B9.2); queued with the next
 /// submission's batch
 void NoteEngineDelete(u64 id, u64 address, u64 bytes, u32 what);
@@ -145,6 +148,11 @@ enum B8Count : u32 {
     B8RouteCopy,                ///< B8.4: copies whose image was found through the engine texture at the address
     B8RouteCopyFallback,        ///< ... no engine texture starts at the address (page table)
     B8RouteCopyOther,           ///< ... audit: the page table gives another answer
+    B8BufAnnounce,              ///< B8.5: announcements over engine buffer memory whose images came from the buffers' lists
+    B8BufCopy,                  ///< ... copies at engine buffer memory, same
+    B8BufListed,                ///< ... images listed by an engine buffer (at registration, or at the buffer's creation)
+    B8BufMissed,                ///< ... audit: an image the page table finds that the buffers' lists lack (must stay 0)
+    B8BufNotCovered,            ///< ... ranges neither textures nor buffers cover whole (page table)
     B8Counts,
 };
 void NoteB8(B8Count what) noexcept;
