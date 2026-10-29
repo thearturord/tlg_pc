@@ -29,6 +29,8 @@ std::string_view BufferTypeName(MemoryType type) {
         return "DeviceLocal";
     case MemoryType::Sparse:
         return "Sparse";
+    case MemoryType::DeviceMapped:
+        return "DeviceMapped";
     default:
         return "Invalid";
     }
@@ -54,6 +56,9 @@ static StreamPlacement StreamMemory() {
 }
 
 [[nodiscard]] VkMemoryPropertyFlags MemoryUsagePreferredVmaFlags(MemoryType type) {
+    if (type == MemoryType::DeviceMapped) {
+        return VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    }
     if (type == MemoryType::Stream && StreamMemory() == StreamPlacement::Cached) {
         return VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     }
@@ -68,6 +73,7 @@ static StreamPlacement StreamMemory() {
     switch (type) {
     case MemoryType::HostUncached:
     case MemoryType::Stream:
+    case MemoryType::DeviceMapped:
         return VMA_ALLOCATION_CREATE_MAPPED_BIT |
                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
     case MemoryType::HostCached:
@@ -85,6 +91,7 @@ static StreamPlacement StreamMemory() {
     switch (type) {
     case MemoryType::DeviceLocal:
     case MemoryType::Stream:
+    case MemoryType::DeviceMapped:
         return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     case MemoryType::HostUncached:
     case MemoryType::HostCached:
@@ -180,6 +187,7 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
             mapped_data = std::span<u8>{std::bit_cast<u8*>(alloc_info.pMappedData), size_bytes};
         }
         is_coherent = property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        is_device_local = property_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     }
 }
 

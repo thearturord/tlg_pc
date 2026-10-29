@@ -1670,6 +1670,7 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    buffer_cache.ZeroCopyVerifyPoll();
     if (encoder_debug & 2) {
         scheduler.SyncEncoder();
     }

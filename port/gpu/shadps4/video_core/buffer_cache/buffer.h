@@ -33,6 +33,7 @@ enum class MemoryType : u8 {
     HostCached,   ///< Requires a host visible memory type optimized for GPU to CPU readbacks
     Stream,       ///< Requests device local host visible buffer, falling back host memory.
     Sparse,       ///< Requires an unbacked sparse resident buffer.
+    DeviceMapped, ///< Device local memory the CPU can write (resizable BAR), mapped; falls back to whatever VMA finds (callers check is_device_local)
 };
 
 constexpr vk::BufferUsageFlags ReadFlags =
@@ -121,10 +122,21 @@ struct Buffer {
     /// Makes device writes in provided range visible to the host.
     void Invalidate(u64 offset, u64 size);
 
+    /// Zero copy (TLG_ZERO_COPY): the tick of the last submission that used this buffer, per stream (0 graphics, 1 the side stream; raster thread),
+    /// set by the barrier planner for every access it plans
+    void NoteGpuUse(u64 tick) noexcept {
+        constexpr u64 side_tag = 1ull << 62;
+        u64& slot = last_gpu_tick[(tick & side_tag) != 0 ? 1 : 0];
+        slot = std::max(slot, tick);
+    }
+
     VAddr cpu_addr = 0;
     size_t size_bytes = 0;
     std::span<u8> mapped_data{};
     bool is_coherent{};
+    bool is_device_local{};
+    u64 last_gpu_tick[2]{};
+    u64 gpu_write_generation{}; ///< zero copy verify: bumped by every planned GPU write into the buffer
     MemoryType mem_type{MemoryType::DeviceLocal};
     UniqueBuffer buffer;
 };

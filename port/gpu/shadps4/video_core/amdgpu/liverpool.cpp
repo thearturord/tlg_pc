@@ -1723,7 +1723,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                                                                              {"image_changed", rasterizer->b3_stats[2].exchange(0)}, {"verified_same", rasterizer->b3_stats[3].load()}, {"VERIFIED_OTHER_IMAGE", rasterizer->b3_stats[4].load()}}},
                                                               {"b2_audit", Core::NativeUpdates::HarvestAuditReport()},
                                                               {"b8_images", Core::NativeUpdates::B8Report()},
-                                                              {"b9_buffers", Core::NativeUpdates::B9Report()},
+                                                              {"b9_buffers", Core::NativeUpdates::B9Report()}, {"zero_copy", rasterizer->GetBufferCache().ZeroCopyReport()},
                                                               {"b11_clears", Core::NativeDevice::ClearReport()},
                                                               {"b9_raw_address_shaders", {{"binds_reading_memory_by_address", rasterizer->b9_dma_binds.exchange(0)}, {"all_binds", rasterizer->b9_all_binds.exchange(0)}}},
                                                               {"object_copy_verify", {{"checked", rasterizer->ObjectCopyVerify().first}, {"DIFFERENT", rasterizer->ObjectCopyVerify().second}}},

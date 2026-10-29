@@ -288,6 +288,7 @@ u64 Runtime::LiveObjectSpace(const VideoCore::Buffer* handle, u64 offset, u64& b
     if (handle->mem_type != VideoCore::MemoryType::Sparse && handle->CpuAddr() != 0) {
         // B10: a placed engine buffer (or block) is its own Vulkan buffer: its hazards are its own, in its own offset space
         ++live_stats.object_space_queries;
+        const_cast<VideoCore::Buffer*>(handle)->NoteGpuUse(scheduler.CurrentTick()); // zero copy: the CPU writes it directly only once this is finished
         begin = offset;
         return reinterpret_cast<u64>(handle);
     }
@@ -1292,6 +1293,7 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         auto& space = live_object.buffers[LiveObjectSpace(handle, offset, begin)];
         if (src_access & WRITE_MASK) {
             LivePlanAdd(space.write, begin, begin + size);
+            ++const_cast<VideoCore::Buffer*>(handle)->gpu_write_generation;
         }
         if (src_access & READ_MASK) {
             LivePlanAdd(space.read, begin, begin + size);

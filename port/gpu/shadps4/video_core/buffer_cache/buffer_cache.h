@@ -319,6 +319,26 @@ private:
         std::unique_ptr<Buffer> buffer;
     };
     std::map<VAddr, PlacedBuffer> placed;
+    // zero copy (TLG_ZERO_COPY=1, zero-copy-dynamic-buffers.md): counters, the verify's pending checks
+    std::array<std::atomic<u64>, 10> zero_copy_counts{};
+    std::atomic<bool> zero_copy_unavailable{false};
+    struct ZeroCopyCheck {
+        const Buffer* buffer{};
+        u64 offset{};
+        u64 tick{};
+        u64 generation{};
+        std::vector<u8> bytes;
+    };
+    std::vector<ZeroCopyCheck> zero_copy_checks;
+    void ZeroCopyVerifyNote(const Buffer* buffer, std::span<const vk::BufferCopy> copies);
+
+public:
+    [[nodiscard]] bool ZeroCopyOn() const noexcept;
+    /// raster thread, once per submission: the verify's checks whose submission finished
+    void ZeroCopyVerifyPoll();
+    [[nodiscard]] nlohmann::json ZeroCopyReport() const;
+
+private:
     std::unordered_set<u64> place_refused; ///< B9.4: engine buffers a request over their edge moved back into the arena (they stay there until deleted) ///< B9.4: by begin (raster thread; placed_mutex for the readers on other threads)
     mutable std::mutex placed_mutex;
     PlacedBuffer* PlacedAt(VAddr address, u64 size, bool written = true);
