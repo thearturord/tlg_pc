@@ -36,9 +36,11 @@ extern std::atomic<u32> epoch;
 /// the epoch without the time window: guest submissions and passed memory waits only (the images' rule, see Harvest)
 extern std::atomic<u32> base_epoch;
 /// a guest submission (graphics or compute) or a passed wait on memory
+void OnEpoch() noexcept;
 inline void BumpEpoch() noexcept {
     base_epoch.fetch_add(1, std::memory_order_acq_rel);
     epoch.fetch_add(1, std::memory_order_acq_rel);
+    OnEpoch();
 }
 
 /// O1: the command processor harvests the ranges of a draw or dispatch when it plans it and stores the epoch it read before (the plan's `ww_epoch`). The raster

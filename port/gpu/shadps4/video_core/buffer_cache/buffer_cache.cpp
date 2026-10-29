@@ -130,6 +130,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     }
     Core::NativeReadbacks::SetLandingGate(
         [this](VAddr address, u64 size, u32 timeout_ms) { return WaitForExplicitDownloads(address, size, timeout_ms); });
+    // B2 cutover: an applied announcement is a CPU write for the caches
+    Core::NativeUpdates::SetApply([](void* context, u64 address, u64 size) { static_cast<BufferCache*>(context)->ApplyCpuWrite(address, size); }, this);
 }
 
 BufferCache::~BufferCache() {
@@ -152,6 +154,14 @@ namespace {
 thread_local VAddr t_audit_begin = 0, t_audit_end = 0; ///< B2 audit: the range of the current harvest request
 } // namespace
 
+void BufferCache::ApplyCpuWrite(VAddr address, u64 size) {
+    Core::NativeResources::NoteCpuWrite(address, size);
+    memory_tracker->MarkRegionAsCpuModified(address, size);
+    if (Core::WriteWatch::LiftImages()) {
+        texture_cache.InvalidatePagesWritten(address, size);
+    }
+}
+
 void BufferCache::HarvestWriteWatch(VAddr device_addr, u64 size, bool image) {
     if (!Core::WriteWatch::Enabled()) {
         return;
@@ -164,6 +174,32 @@ void BufferCache::HarvestWriteWatch(VAddr device_addr, u64 size, bool image) {
         device_addr, size,
         [](void* context, VAddr page, u64 bytes) {
             auto* self = static_cast<BufferCache*>(context);
+            if (const u32 mode = Core::NativeUpdates::B2NativeMode(); mode != 0) {
+                // B2 cutover: the announcements marked what the engine wrote; a page here none covered is a miss (mode 1 replays it, mode 2 does not)
+                VAddr run = 0;
+                u64 run_bytes = 0;
+                const auto flush = [&] {
+                    if (run_bytes != 0) {
+                        Core::NativeUpdates::NoteMiss(run, run_bytes);
+                        if (mode == 1) {
+                            self->ApplyCpuWrite(run, run_bytes);
+                        }
+                    }
+                    run_bytes = 0;
+                };
+                for (VAddr p = page; p < page + bytes; p += 4096) {
+                    if (Core::NativeUpdates::ConsumeMark(p)) {
+                        flush();
+                    } else {
+                        if (run_bytes == 0) {
+                            run = p;
+                        }
+                        run_bytes += 4096;
+                    }
+                }
+                flush();
+                return;
+            }
             if (Core::NativeUpdates::HarvestAuditOn()) {
                 // only the part the GPU asked for (the harvest covers whole blocks)
                 const VAddr a = std::max<VAddr>(page, t_audit_begin), b = std::min<VAddr>(page + bytes, t_audit_end);

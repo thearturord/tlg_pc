@@ -16,6 +16,7 @@
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
+#include "core/native_updates.h"
 #include "core/native_write_watch.h"
 #include "video_core/untracked_ring.h"
 
@@ -52,6 +53,11 @@ struct LocalCounts {
 };
 thread_local LocalCounts t_counts;
 } // namespace
+
+void OnEpoch() noexcept {
+    // B2 cutover: the engine's announced updates take effect where the harvest's epoch moves
+    Core::NativeUpdates::ApplyPending();
+}
 
 void SetKnownEpoch(u32 known, u32 known_base) noexcept {
     t_known_epoch = known;

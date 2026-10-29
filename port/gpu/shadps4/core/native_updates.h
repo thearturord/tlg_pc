@@ -47,6 +47,20 @@ u32 WhoWrote(u64 address, u64 size);
 /// B2 gate (`TLG_B2_AUDIT=1`): every page the write watch finds written is checked against the pages an announcement covered since the page's last harvest.
 /// The pages of an announcement are marked (a direct mapped table of 1 M pages); a harvested page with no mark is a CPU write no engine update explains.
 [[nodiscard]] bool HarvestAuditOn() noexcept;
+
+/// B2 cutover (`TLG_B2_NATIVE`): 0 off (the write watch decides what the CPU changed), 1 the engine's announcements decide and the write watch only replays the pages
+/// no announcement covered (counted as misses), 2 the announcements alone (misses are counted, not replayed: the fully native mode).
+/// Announcements are queued and applied when the command processor reaches the game's next submission or passed memory wait (the point the write watch harvests
+/// from), and once more one submission later, so an announcer that fires before its write is covered too.
+[[nodiscard]] u32 B2NativeMode() noexcept;
+/// The buffer cache's marking of a range the CPU changed (what a harvest's replay does)
+void SetApply(void (*fn)(void* context, u64 address, u64 size), void* context);
+/// Command processor: applies the queued announcements (called where the write watch's epoch moves)
+void ApplyPending();
+/// A harvested page: true when an announcement covered it since its last harvest (the mark is consumed)
+[[nodiscard]] bool ConsumeMark(u64 page);
+/// B2 cutover: a harvested page no announcement covered
+void NoteMiss(u64 page, u64 bytes);
 void NoteHarvested(u64 address, u64 bytes, bool in_upload_ring);
 [[nodiscard]] nlohmann::json HarvestAuditReport();
 

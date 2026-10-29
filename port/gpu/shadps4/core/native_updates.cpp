@@ -264,6 +264,75 @@ void MarkAnnounced(u64 address, u64 size) {
 }
 } // namespace
 
+namespace {
+std::mutex pending_mutex;
+std::vector<std::pair<u64, u64>> pending_ranges, applied_last;
+void (*apply_fn)(void*, u64, u64) = nullptr;
+void* apply_context = nullptr;
+std::atomic<u64> b2_applied_ranges{0}, b2_applied_bytes{0}, b2_reapplied_ranges{0}, b2_misses{0}, b2_miss_pages{0}, b2_skipped_pages{0};
+std::mutex miss_mutex;
+std::unordered_map<std::string, u64> misses_by_owner;
+std::atomic<u32> misses_logged{0};
+} // namespace
+
+u32 B2NativeMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_B2_NATIVE");
+        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 0u;
+    }();
+    return mode;
+}
+
+void SetApply(void (*fn)(void*, u64, u64), void* context) {
+    apply_context = context;
+    apply_fn = fn;
+}
+
+void ApplyPending() {
+    if (B2NativeMode() == 0 || apply_fn == nullptr) {
+        return;
+    }
+    std::vector<std::pair<u64, u64>> now;
+    std::vector<std::pair<u64, u64>> again;
+    {
+        std::scoped_lock lock{pending_mutex};
+        now.swap(pending_ranges);
+        again.swap(applied_last);
+    }
+    for (const auto& [address, size] : again) {
+        apply_fn(apply_context, address, size);
+    }
+    for (const auto& [address, size] : now) {
+        apply_fn(apply_context, address, size);
+        b2_applied_bytes.fetch_add(size, std::memory_order_relaxed);
+    }
+    b2_applied_ranges.fetch_add(now.size(), std::memory_order_relaxed);
+    b2_reapplied_ranges.fetch_add(again.size(), std::memory_order_relaxed);
+    std::scoped_lock lock{pending_mutex};
+    applied_last = std::move(now);
+}
+
+bool ConsumeMark(u64 page) {
+    const bool announced = MarkOf(page)->exchange(0, std::memory_order_relaxed) == (page | 1);
+    if (announced) {
+        b2_skipped_pages.fetch_add(1, std::memory_order_relaxed);
+    }
+    return announced;
+}
+
+void NoteMiss(u64 page, u64 bytes) {
+    b2_misses.fetch_add(1, std::memory_order_relaxed);
+    b2_miss_pages.fetch_add((bytes + 4095) / 4096, std::memory_order_relaxed);
+    const std::string owner = NativeDevice::OwnerName(page);
+    {
+        std::scoped_lock lock{miss_mutex};
+        ++misses_by_owner[owner];
+    }
+    if (misses_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_WARNING(Core, "B2 native: {:#x}+{:#x} written with no announcement ({})", page, bytes, owner);
+    }
+}
+
 bool HarvestAuditOn() noexcept {
     static const bool on = [] {
         const char* e = std::getenv("TLG_B2_AUDIT");
@@ -317,6 +386,17 @@ nlohmann::json HarvestAuditReport() {
         j["unannounced_other_pages_by_owner"] = std::move(owners);
     }
     j["note"] = "B2 gate: pages the write watch found written, against the engine's announced updates since their last harvest (cumulative)";
+    j["native"] = {{"mode", B2NativeMode()}, {"announcements_applied", b2_applied_ranges.load()}, {"bytes_applied", b2_applied_bytes.load()},
+                   {"announcements_applied_again", b2_reapplied_ranges.load()}, {"harvested_pages_announced_not_replayed", b2_skipped_pages.load()},
+                   {"MISSES", b2_misses.load()}, {"miss_pages", b2_miss_pages.load()}};
+    {
+        std::scoped_lock lock{miss_mutex};
+        nlohmann::json owners = nlohmann::json::object();
+        for (const auto& [name, n] : misses_by_owner) {
+            owners[name] = n;
+        }
+        j["native"]["misses_by_owner"] = std::move(owners);
+    }
     return j;
 }
 
@@ -324,8 +404,12 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread) {
     if (address == 0 || size == 0) {
         return;
     }
-    if (HarvestAuditOn()) {
+    if (HarvestAuditOn() || B2NativeMode() != 0) {
         MarkAnnounced(address, size);
+    }
+    if (B2NativeMode() != 0) {
+        std::scoped_lock lock{pending_mutex};
+        pending_ranges.emplace_back(address, size);
     }
     NativeResources::NoteAnnouncedWrite(address, size); // C1: resident buffers on those pages are not synchronized any more
     if (AuditFaults()) {

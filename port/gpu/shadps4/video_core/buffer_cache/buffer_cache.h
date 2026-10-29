@@ -143,6 +143,8 @@ public:
         return STREAM_THRESHOLD;
     }
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
+    /// What a CPU write of [address, address + size) means for the caches (the harvest's replay; B2: an applied announcement)
+    void ApplyCpuWrite(VAddr address, u64 size);
     /// R1: changes when an arena is replaced
     [[nodiscard]] u64 ArenaEpoch() const noexcept {
         return arena_epoch.load(std::memory_order_acquire);
