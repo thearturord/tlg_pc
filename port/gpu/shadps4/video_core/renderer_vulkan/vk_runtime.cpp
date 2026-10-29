@@ -110,11 +110,8 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     // C8 (2026-10-28): the planner always decides; the tracker runs next to it and is only compared
     live_plan_on = true;
     live_plan_decides = true;
-    // B10: buffer hazards by object, default on (=1 audit next to the address planner, =0 by address only)
+    // B10: buffer hazards by object (no switch since the cleanup of 2026-10-30)
     b10_mode = 2;
-    if (const char* e = std::getenv("TLG_B10_OBJECTS"); e != nullptr && *e != 0) {
-        b10_mode = static_cast<u32>(std::clamp(std::atoi(e), 0, 2));
-    }
     // P1 (2026-10-28): the tracker and the exact list next to the planner are a comparison only (0 differences over the owner's plays): off by default
     if (const char* e = std::getenv("TLG_BARRIER_TRACKER"); (e != nullptr && *e == '1') || hazard_audit_on) {
         tracker_on = true;

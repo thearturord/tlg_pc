@@ -282,13 +282,6 @@ std::unordered_map<std::string, u64> misses_by_owner;
 std::atomic<u32> misses_logged{0};
 } // namespace
 
-u32 B2NativeMode() noexcept {
-    static const u32 mode = [] {
-        const char* e = std::getenv("TLG_B2_NATIVE");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 2u; // B7: mode 2 by default (owner play 2026-10-29)
-    }();
-    return mode;
-}
 
 void SetApply(void (*fn)(void*, u64, u64, bool), void* context) {
     apply_context = context;
@@ -449,37 +442,9 @@ u32 B8VerifyEvery() {
 }
 } // namespace
 
-u32 B8ImageMode() noexcept {
-    static const u32 mode = [] {
-        const char* e = std::getenv("TLG_B8_IMAGES");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 2u; // default 2 since 2026-10-30 (owner play of the B8-B9 script; =0 off, =1 audit)
-    }();
-    return mode;
-}
 
-u32 B8LifetimeMode() noexcept {
-    static const u32 mode = [] {
-        const char* e = std::getenv("TLG_B8_LIFETIME");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 2u; // default 2 since 2026-10-30 (owner play of the B8-B9 script; =0 off, =1 audit)
-    }();
-    return mode;
-}
 
-u32 B8FindMode() noexcept {
-    static const u32 mode = [] {
-        const char* e = std::getenv("TLG_B8_FIND");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 2u; // default 2 since 2026-10-30 (owner play of the B8-B9 script; =0 off, =1 audit)
-    }();
-    return mode;
-}
 
-u32 B8BufferImagesMode() noexcept {
-    static const u32 mode = [] {
-        const char* e = std::getenv("TLG_B8_BUFFER_IMAGES");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 2u;
-    }();
-    return B8FindMode() == 0 ? 0u : mode;
-}
 
 bool B8VerifyOn() noexcept {
     return B8ImageMode() == 2 && B8VerifyEvery() != 0;
@@ -538,53 +503,11 @@ namespace {
 std::array<std::atomic<u64>, B9Counts> b9_counts{};
 } // namespace
 
-u32 B9BufferMode() noexcept {
-    static const u32 mode = [] {
-        const char* e = std::getenv("TLG_B9_BUFFERS");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 2u; // default 2 since 2026-10-30 (owner play of the B8-B9 script; =0 off, =1 audit)
-    }();
-    return mode;
-}
 
-u32 B9LifetimeMode() noexcept {
-    static const u32 mode = [] {
-        const char* e = std::getenv("TLG_B9_LIFETIME");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 2u; // default 2 since 2026-10-30 (owner play of the B8-B9 script; =0 off, =1 audit)
-    }();
-    return mode;
-}
 
-u32 B9QueryMode() noexcept {
-    static const u32 mode = [] {
-        const char* e = std::getenv("TLG_B9_QUERIES");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::clamp(std::atoi(e), 0, 2)) : 2u; // default 2 since 2026-10-30 (owner play of the B8-B9 script; =0 off, =1 audit)
-    }();
-    return mode;
-}
 
-bool B9TrackerOff() noexcept {
-    static const bool off = [] {
-        const char* e = std::getenv("TLG_B9_TRACKER");
-        return (e == nullptr || *e == '0') && B9BufferMode() == 2 && B9QueryMode() == 2; // default off since 2026-10-30; TLG_B9_TRACKER=1 keeps it
-    }();
-    return off;
-}
 
-bool B9PlaceOn() noexcept {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_B9_PLACE");
-        return (e == nullptr || *e != '0') && B9TrackerOff() && B9LifetimeMode() == 2; // default on since 2026-10-30; =0 off
-    }();
-    return on;
-}
 
-bool B9AliasesOn() noexcept {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_B9_ALIASES");
-        return e == nullptr || *e != '0'; // default on (B9.4 step 4: 3 of 3 headless runs clean, 0 requests left on the arena over engine buffers)
-    }();
-    return on;
-}
 
 u32 B9VerifyEvery() noexcept {
     static const u32 n = [] {

@@ -1411,14 +1411,8 @@ const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanni
             textures.clear();
         }
         const bool too_big = hi - lo > (u64{256} << 20);
-        static const bool groups = [] {
-            // TLG_B9_GROUPS=0 turns blocks off (B9.4 step 3: on after the freed-buffer resolutions were fixed, 5 of 5 headless runs clean)
-            const char* e = std::getenv("TLG_B9_GROUPS");
-            return e == nullptr || *e != '0';
-        }();
-        // without groups (TLG_B9_GROUPS=0): only a request inside one engine buffer places it (B9.4 step 1)
-        const bool single = ids.size() == 1 && lo == parts.front().object_begin && hi == parts.front().object_end && !PlacedMeets(lo, hi - lo);
-        if (any_buffer && !refused && textures.empty() && !too_big && (groups || single) && (demote_spanning || !PlacedMeets(address, size))) {
+        // blocks (B9.4 step 3): a request over several engine buffers places the block they cover
+        if (any_buffer && !refused && textures.empty() && !too_big && (demote_spanning || !PlacedMeets(address, size))) {
             if (ids.size() > 1 || PlacedMeets(lo, hi - lo) || lo != parts.front().object_begin || hi != parts.back().object_end) {
                 static std::atomic<u32> logged{0};
                 if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {

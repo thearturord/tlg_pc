@@ -55,7 +55,9 @@ u32 WhoWrote(u64 address, u64 size);
 /// no announcement covered (counted as misses), 2 the announcements alone (misses are counted, not replayed: the fully native mode).
 /// Announcements are queued and applied when the command processor reaches the game's next submission or passed memory wait (the point the write watch harvests
 /// from), and once more one submission later, so an announcer that fires before its write is covered too.
-[[nodiscard]] u32 B2NativeMode() noexcept;
+[[nodiscard]] constexpr u32 B2NativeMode() noexcept {
+    return 2u; // native, no switch since the cleanup of 2026-10-30
+}
 /// The buffer cache's marking of a range the CPU changed (what a harvest's replay does); `newer` (first application): the CPU's bytes are newer than anything the
 /// GPU wrote there before (the GPU written marks of the range are dropped); false for the second application one submission later
 void SetApply(void (*fn)(void* context, u64 address, u64 size, bool newer), void* context);
@@ -84,16 +86,24 @@ void NoteHarvested(u64 address, u64 bytes, bool in_upload_ring);
 
 /// B8.1 (`TLG_B8_IMAGES`): 0 off, 1 audit (texture memory stays write protected; a fault that dirtied an image no announcement explains is counted), 2 native (the
 /// announcements alone refresh images, texture memory is not write protected; `TLG_B8_VERIFY=N` hashes every Nth bound image that is not dirty against its last refresh)
-[[nodiscard]] u32 B8ImageMode() noexcept;
+[[nodiscard]] constexpr u32 B8ImageMode() noexcept {
+    return 2u; // native, no switch since the cleanup of 2026-10-30
+}
 /// B8.2 (`TLG_B8_LIFETIME`): 0 off, 1 audit (images the engine's deleted textures leave behind are marked, a later use is counted), 2 native (an engine texture's
 /// images are freed when the engine deletes it, in order with the GPU work; the B3 table drops the ids of deleted views in both modes)
-[[nodiscard]] u32 B8LifetimeMode() noexcept;
+[[nodiscard]] constexpr u32 B8LifetimeMode() noexcept {
+    return 2u; // native, no switch since the cleanup of 2026-10-30
+}
 /// B8.3 (`TLG_B8_FIND`): 0 off, 1 audit (the image found by the engine texture's id is compared with the lookup by address), 2 native (an engine texture's
 /// image is found by its id; the page table lookup only runs when the texture has no matching image yet or no engine texture owns the memory)
-[[nodiscard]] u32 B8FindMode() noexcept;
+[[nodiscard]] constexpr u32 B8FindMode() noexcept {
+    return 2u; // native, no switch since the cleanup of 2026-10-30
+}
 /// B8.5 (`TLG_B8_BUFFER_IMAGES`): images in engine buffer memory (formatted reads, render targets in a buffer's memory) are listed by the buffer; announcements
 /// and copies over buffer memory find them there instead of in the page table. 0 off, 1 audit (page table kept, lists compared), 2 native (default)
-[[nodiscard]] u32 B8BufferImagesMode() noexcept;
+[[nodiscard]] constexpr u32 B8BufferImagesMode() noexcept {
+    return 2u; // native, no switch since the cleanup of 2026-10-30
+}
 /// B8.2: the engine deleted a view (`what` 0), a texture (1), a texture another live texture shares the memory with (3) or a buffer (4, B9.2); queued with the next
 /// submission's batch
 void NoteEngineDelete(u64 id, u64 address, u64 bytes, u32 what);
@@ -162,26 +172,38 @@ void NoteB8Unannounced(u64 address, u64 size, bool by_fault) noexcept;
 
 /// B9.1 (`TLG_B9_BUFFERS`): 0 off, 1 audit (each engine buffer keeps the bytes the engine announced since their last upload; an upload compares them with the page
 /// tracker's ranges), 2 native (an engine buffer's upload copies its announced bytes; the page tracker only keeps its marks for the other paths)
-[[nodiscard]] u32 B9BufferMode() noexcept;
+[[nodiscard]] constexpr u32 B9BufferMode() noexcept {
+    return 2u; // native, no switch since the cleanup of 2026-10-30
+}
 /// B9.1 verify (`TLG_B9_VERIFY=N`, native mode): every Nth page keeps a CPU copy of what the GPU copy holds; after a native upload the request's bytes on the page must
 /// equal memory (a byte the engine wrote and did not announce shows up here)
 [[nodiscard]] u32 B9VerifyEvery() noexcept;
 /// B9.2 (`TLG_B9_LIFETIME`): 0 off, 1 audit (an engine buffer's deletion is carried out in order and counted: its announced bytes go, what it leaves behind is
 /// counted), 2 native (also the GPU written bytes and stream copies of its memory go, unless another live buffer shares the memory)
-[[nodiscard]] u32 B9LifetimeMode() noexcept;
+[[nodiscard]] constexpr u32 B9LifetimeMode() noexcept {
+    return 2u; // native, no switch since the cleanup of 2026-10-30
+}
 /// B9.3 (`TLG_B9_QUERIES`): 0 off, 1 audit (for a range inside one engine buffer, "did the CPU change it" and "did the GPU write it" are answered by the buffer's state
 /// and compared with the page tracker), 2 native (the buffer's state answers: its announced bytes, the GPU written bytes)
-[[nodiscard]] u32 B9QueryMode() noexcept;
+[[nodiscard]] constexpr u32 B9QueryMode() noexcept {
+    return 2u; // native, no switch since the cleanup of 2026-10-30
+}
 /// B9.3 step 2 (`TLG_B9_TRACKER=0`, with B9.1 and B9.3 native): the page tracker is not kept for engine buffers any more (announced bytes and CPU changes found
 /// otherwise mark the buffers; uploads inside one engine buffer neither ask nor clear the tracker); other memory keeps it
-[[nodiscard]] bool B9TrackerOff() noexcept;
+[[nodiscard]] constexpr bool B9TrackerOff() noexcept {
+    return true; // native, no switch since the cleanup of 2026-10-30
+}
 /// B9.4 (`TLG_B9_PLACE=1`, with B9.1 to B9.3 native): an engine buffer that shares its memory with no other live resource gets a Vulkan buffer of its own at its first
 /// use; every request inside it is served from that buffer instead of the arena. A new resource over its memory, or a request that runs over its edge, moves it back
 /// into the arena; the engine's deletion frees it.
-[[nodiscard]] bool B9PlaceOn() noexcept;
+[[nodiscard]] constexpr bool B9PlaceOn() noexcept {
+    return true; // native, no switch since the cleanup of 2026-10-30
+}
 /// B9.4 step 4 (`TLG_B9_ALIASES`, default on, =0 off): a block may hold engine buffers that overlap each other and textures (one Vulkan buffer is one memory range, as the arena
 /// was); a buffer created over a block's members joins it, a texture created inside a block leaves it in place
-[[nodiscard]] bool B9AliasesOn() noexcept;
+[[nodiscard]] constexpr bool B9AliasesOn() noexcept {
+    return true; // native, no switch since the cleanup of 2026-10-30
+}
 enum B9Count : u32 {
     B9AnnouncedOnBuffer,   ///< announcements inside one engine buffer
     B9AnnouncedClipped,    ///< announcements that meet several buffers or reach past one (each buffer takes its part)
