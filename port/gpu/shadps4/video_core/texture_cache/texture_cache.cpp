@@ -5,6 +5,7 @@
 #include <fstream>
 #include <limits>
 #include <xxhash.h>
+#include "video_core/untracked_ring.h"
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -1452,6 +1453,31 @@ void TextureCache::RefreshImage(Image& image) {
         Core::WriteWatch::NoteImageCheck(changed, image.info.guest_address, image.info.guest_size);
         if (changed) {
             image.flags |= ImageFlagBits::CpuDirty;
+        }
+    }
+    {
+        // Dark frame (2026-10-29): an image inside the frame ring (UntrackedRing: its pages are never write protected, so no fault, no write watch and no announcement marks it
+        // dirty) keeps what the ring held when it was uploaded. The game maps small dynamic textures (R32F 4x4 / 16x16, call site 0x1c98a17) into the ring every frame and the
+        // draws sample them there; when the ring wraps, a new one lands on the address of an old image that is still registered and the old contents are drawn with. The bytes
+        // decide: a ring image whose guest bytes differ from the ones it was uploaded with is uploaded again (`TLG_RING_IMAGE_CHECK=0` turns the check off).
+        static const bool ring_check = [] {
+            const char* e = std::getenv("TLG_RING_IMAGE_CHECK");
+            return e == nullptr || *e != '0';
+        }();
+        const auto& ring = UntrackedRing::Get();
+        if (ring_check && ring.Active() && image.info.guest_size <= (256u << 10) && image.info.guest_address >= ring.Start() &&
+            image.info.guest_address + image.info.guest_size <= ring.End() && False(image.flags & ImageFlagBits::GpuModified)) {
+            const u64 now = XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size) | 1;
+            if (image.ring_hash != 0 && now != image.ring_hash && False(image.flags & ImageFlagBits::Dirty)) {
+                static std::atomic<u64> stale{0};
+                const u64 n = stale.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n <= 20 || (n & (n - 1)) == 0) {
+                    LOG_WARNING(Render_Vulkan, "ring image stale ({} so far): {:#x}+{:#x} {}x{} format {} held old bytes, uploaded again", n, image.info.guest_address, image.info.guest_size, image.info.size.width,
+                                image.info.size.height, static_cast<u32>(image.info.pixel_format));
+                }
+                image.flags |= ImageFlagBits::CpuDirty;
+            }
+            image.ring_hash = now;
         }
     }
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
