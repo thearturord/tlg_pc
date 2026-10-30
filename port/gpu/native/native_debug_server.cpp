@@ -23,6 +23,7 @@
 #include "native/native_pass.h"
 #include "native/native_registry.h"
 #include "native/native_census.h"
+#include "native/native_frame_gate.h"
 #include "native/native_updates.h"
 #include "native/native_drain_audit.h"
 #include "native/native_uploads.h"
@@ -575,6 +576,8 @@ void RegisterBuiltins() {
     Register("/", "list of endpoints", Index);
     Register("/status", "uptime, presented frames, fps", Status);
     Register("/native", "native renderer counters (cumulative)", Native);
+    Register("/frame_gate", "frames in flight: the setting, frames submitted, end-of-pipe interrupts, waits of the gate",
+             [](const Params&) { return Core::FrameGate::Status(); });
     Register("/emulation", "E0 census (cumulative): raw PM4 packets that still execute and their registers, constant engine submissions, image refresh / detile / overlap calls",
              [](const Params&) { return Core::NativeCensus::Report(); });
     Register("/capture",

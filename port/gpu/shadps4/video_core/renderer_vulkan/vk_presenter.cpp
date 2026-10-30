@@ -4,6 +4,7 @@
 #include "native/native_debug_server.h"
 #include "native/native_timeline.h"
 #include "native/native_hooks.h"
+#include "native/native_frame_gate.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
@@ -565,8 +566,12 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // ahead and then blocked wherever a resource ran out, so flips (and the guest's frame
     // timing) came in bursts: 12.5/25 ms alternation at 80 FPS. 0 turns it off.
     // The in-game menu changes it live (TlgSettings::frames_queued; TLG_FRAMES_AHEAD at start).
-    const u32 frames_ahead = u32(std::max(0, TlgSettings::Get().frames_queued.load()));
-    if (!frames_ahead) {
+    // Frames in flight (native/native_frame_gate.h, the json / TLG_FRAMES_IN_FLIGHT): 1 keeps the value above; 0 waits for the frame just made; 2 waits two flips back.
+    const u32 frames_ahead = Core::FrameGate::PresenterAhead(u32(std::max(0, TlgSettings::Get().frames_queued.load())));
+    if (Core::FrameGate::Depth() == 0) {
+        recent_frame_ticks.clear();
+        draw_scheduler.Wait(frame->ready_tick);
+    } else if (!frames_ahead) {
         recent_frame_ticks.clear();
     } else {
         recent_frame_ticks.push_back(frame->ready_tick);

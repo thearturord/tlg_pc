@@ -8,6 +8,7 @@
 #include "native/native_stream_submit.h"
 #include "native/native_timeline.h"
 #include "native/native_draw.h"
+#include "native/native_frame_gate.h"
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -99,6 +100,16 @@ static void WaitGpuIdle() {
     TlgFreeze::WaitScope wait{"GPU idle (submit done)"}; // tlg: freeze report
     std::unique_lock lock{m_wait_idle};
     cv_lock.wait(lock, [] { return submission_lock == 0; });
+}
+
+/// Frames in flight (native/native_frame_gate.h): depth 0 and 1 wait for an idle GPU as before; depth 2 does not (the idle wait would hold the game to one
+/// frame). A frame submit at depth 2 waits for a free frame slot instead (WaitForSlot, in the flip submit); compute kicks and plain submits do not wait: they
+/// belong to the frame being recorded, which may start while two older frames are unfinished.
+static void WaitSubmitAllowed() {
+    if (Core::FrameGate::Depth() >= 2) {
+        return;
+    }
+    WaitGpuIdle();
 }
 
 // Write a special NOP packet with N DWs data block
@@ -321,7 +332,7 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     std::scoped_lock lk{m_submit_lock};
     {
         Core::FrameTimeline::Span wait_span{Core::FrameTimeline::DingDongWait};
-        WaitGpuIdle();
+        WaitSubmitAllowed();
     }
     if (Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
         const u64 now = Core::FrameTimeline::Now();
@@ -1612,7 +1623,7 @@ s32 PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDoneForWorkload(u64 workload, u32* gp
     liverpool->SubmitGfx(dcb_span, {});
 
     const bool idle_at_flip_done = liverpool->IsGpuIdleForGame();
-    if (!idle_at_flip_done) {
+    if (!idle_at_flip_done && Core::FrameGate::Depth() < 2) {
         submission_lock = true;
     }
     Core::FrameTimeline::Mark(Core::FrameTimeline::SubmitDone, (idle_at_flip_done ? 0 : 1) | (idle_at_flip_done ? 2 : 0) | 8);
@@ -2589,17 +2600,25 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     auto* cmdbuf = dcb_gpu_addrs[count - 1];
     const auto size_dw = dcb_sizes_in_bytes[count - 1] / 4;
 
-    std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    s32 submit_result;
+    {
+        std::scoped_lock lk{m_submit_lock};
+        WaitSubmitAllowed();
+        Core::FrameGate::WaitForSlot();
 
-    const s32 patch_result =
-        PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode, flip_arg, nullptr /*unk*/);
-    if (patch_result != ORBIS_OK) {
-        return patch_result;
+        const s32 patch_result =
+            PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode, flip_arg, nullptr /*unk*/);
+        if (patch_result != ORBIS_OK) {
+            return patch_result;
+        }
+
+        Core::FrameGate::NoteSubmitFlip();
+        submit_result = PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
+                                      const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
     }
-
-    return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
-                         const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
+    // Frames in flight 0: the game gets its thread back when the frame's end-of-pipe interrupt came (outside the submit lock)
+    Core::FrameGate::WaitOwnFrame();
+    return submit_result;
 }
 
 s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
@@ -2633,7 +2652,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
     }
 
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    WaitSubmitAllowed();
 
     return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
                          const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
@@ -2652,7 +2671,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
     const bool idle_at_done = liverpool->IsGpuIdleForGame();
-    if (!idle_at_done) {
+    if (!idle_at_done && Core::FrameGate::Depth() < 2) {
         submission_lock = true;
     }
     Core::FrameTimeline::Mark(Core::FrameTimeline::SubmitDone, (idle_at_done ? 0 : 1) | (idle_at_done ? 2 : 0) | 4);

@@ -24,6 +24,7 @@
 #include "native/native_audit.h"
 #include "native/native_census.h"
 #include "native/native_direct.h"
+#include "native/native_frame_gate.h"
 #include "native/native_draw.h"
 #include "native/native_uploads.h"
 #include "native/native_drain_audit.h"
@@ -639,7 +640,10 @@ void Liverpool::SignalGraphicsEop(const Core::NativeSync::Fence& event_eop) {
     }
     // The packet is copied: the signal may run after the command buffer is reused.
     Core::FrameTimeline::Mark(Core::FrameTimeline::EopParsed, event_eop.address);
-    static constexpr auto irq = [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); };
+    static constexpr auto irq = [] {
+        Core::FrameGate::NoteEndOfPipe(); // frames in flight: the frame is finished
+        Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
+    };
     auto signal = [this, eop = event_eop] {
         RunFenceSignal(
             *this, gpu_id,
