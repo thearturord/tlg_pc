@@ -215,7 +215,6 @@ Liverpool::Task Liverpool::ProcessDirectAsc(std::shared_ptr<Core::NativeDirect::
             break;
         case EntryKind::Flip:
         case EntryKind::StateBuffer:
-        case EntryKind::Packet:
             break;
         case EntryKind::Sync: {
             std::array<u32, 8> restored;
@@ -627,38 +626,66 @@ void Liverpool::QueueAnnounced(Core::NativeDirect::Buffer& direct) {
 
 /// A pure graphics command buffer: the entries copied at submit (Core::NativeDirect::Build), executed in order. No packet is decoded;
 /// every entry runs the function the walk runs for its packet.
-// E5 (documents/tlg/native plan/no-emulation-plan.md): the raw PM4 packets the game's own stream still carries. The default scene (E0 census, 2026-10-30) has exactly
-// three kinds: the occlusion query pair (EVENT_WRITE PIXEL_PIPE_STAT_CONTROL / PIXEL_PIPE_STAT_DUMP with index ZPASS_DONE, and a SET_CONTEXT_REG of context register
-// 1, DB_COUNT_CONTROL) and CP DMA (17 per run). Anything else is recorded as a rare event (the packet still executes as before) so the cutscene and the heavy scene
-// show what else would need a typed record before the generic packet executors can go.
-static void NoteUnexpectedRawPacket(u32 opcode, const u32* words, u32 dwords) {
-    bool expected = false;
-    switch (opcode) {
-    // 0x50 (CP DMA with the control dword 0x84004000) is a tag since E5 as well; every raw packet that reaches here was not converted
-    // 0x46 (the occlusion query's EVENT_WRITE pair) and 0x69 (DB_COUNT_CONTROL) are tags since E5; one that is still raw here was not converted
-    default:
-        break;
-    }
-    if (!expected) {
-        char detail[160];
-        std::snprintf(detail, sizeof detail, "raw PM4 packet opcode %#x, %u dwords: %08x %08x %08x %08x", opcode, dwords, words[0], dwords > 1 ? words[1] : 0u,
-                      dwords > 2 ? words[2] : 0u, dwords > 3 ? words[3] : 0u);
-        Core::RareEvents::Note("raw_pm4_packet_" + std::to_string(opcode), detail);
+/// The constant engine buffer (CCB) of a submission, run in full before the submission's entries. The game submits one at start (E0 census: 10 WRITE_CONST_RAM, 2 DUMP_CONST_RAM,
+/// the counter packets and a NOP, 452 dwords): the constant RAM is a 48 KB heap, a dump copies a part of it to guest memory in order with the draws. The counters that order
+/// the constant engine against the draw engine need nothing here (it has finished when the entries start), so they are ignored. An opcode this does not know is a rare event.
+void Liverpool::ExecuteConstantEngine(std::span<const u32> ccb) {
+    while (!ccb.empty()) {
+        const auto* header = reinterpret_cast<const PM4Header*>(ccb.data());
+        if (header->type != 3) {
+            Core::RareEvents::Note("constant_engine_not_type3", "a constant engine packet that is not type 3");
+            return;
+        }
+        const PM4ItOpcode opcode = header->type3.opcode;
+        const u32 dwords = header->type3.NumWords() + 1; // NumWords counts the body: the header dword is one more
+        if (dwords > ccb.size()) {
+            Core::RareEvents::Note("constant_engine_bad_length", "a constant engine packet that runs past its buffer");
+            return;
+        }
+        Core::NativeCensus::NoteCePacket(static_cast<u32>(opcode), dwords);
+        switch (opcode) {
+        case PM4ItOpcode::Nop:
+        case PM4ItOpcode::IncrementCeCounter:
+        case PM4ItOpcode::WaitOnDeCounterDiff:
+            break;
+        case PM4ItOpcode::WriteConstRam: {
+            const auto* write_const = reinterpret_cast<const PM4WriteConstRam*>(header);
+            std::memcpy(cblock.constants_heap.data() + write_const->Offset(), &write_const->data, write_const->Size());
+            break;
+        }
+        case PM4ItOpcode::DumpConstRam: {
+            const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
+            void* destination = dump_const->Address<void*>();
+            const u8* source = cblock.constants_heap.data() + dump_const->Offset();
+            const u32 bytes = dump_const->Size();
+            if (split_active) {
+                // a command processor write to guest memory: done in order with the draws
+                Core::DrainAudit::SetNextWrite(reinterpret_cast<u64>(destination), bytes);
+                RasterRun([destination, copy = std::vector<u8>(source, source + bytes)] { std::memcpy(destination, copy.data(), copy.size()); }, false, true);
+            } else {
+                std::memcpy(destination, source, bytes);
+            }
+            break;
+        }
+        case PM4ItOpcode::IndirectBufferConst: {
+            const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            ExecuteConstantEngine({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
+            break;
+        }
+        default:
+            Core::RareEvents::Note("constant_engine_opcode_" + std::to_string(static_cast<u32>(opcode)), "an opcode the constant engine buffer did not hold in the default scene");
+            break;
+        }
+        ccb = ccb.subspan(dwords);
     }
 }
 
 Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buffer> direct, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
-    cblock.Reset();
-    // the constant engine buffer of the submission runs as its own task next to the entries, as in the walk
-    Task ce_task{};
-    if (!ccb.empty()) {
-        ce_task = ProcessCeUpdate(ccb);
-        RESUME_GFX(ce_task);
-    }
     QueueAnnounced(*direct);
     if (!ccb.empty()) {
         Core::NativeCensus::NoteCeSubmission(static_cast<u32>(ccb.size()));
+        ExecuteConstantEngine(ccb);
     }
     Core::EntryDump::Span entry_dump{0, reinterpret_cast<const u32*>(direct->begin), direct->dwords};
     using Core::NativeDirect::EntryKind;
@@ -689,7 +716,7 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
             RasterRun([this, record = direct->clears[clear_at]] { rasterizer->SetEngineClear(&record); });
         }
         if (in_clear) {
-            ++clear_entries[entry.kind == EntryKind::Tag ? 0 : entry.kind == EntryKind::Sync ? 1 : entry.kind == EntryKind::Packet ? 2 : 3];
+            ++clear_entries[entry.kind == EntryKind::Tag ? 0 : entry.kind == EntryKind::Sync ? 1 : 3];
         }
         entry_dump.Packet(entry.words.data(), entry.address, entry.dwords != 0);
         Core::NativeCensus::NoteEntry(0, static_cast<u32>(entry.kind), entry.opcode);
@@ -700,35 +727,6 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
         case EntryKind::Flip:
             RasterRun([] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); });
             break;
-        case EntryKind::Packet: {
-            const auto* packet = reinterpret_cast<const PM4Header*>(direct->PacketWords(entry));
-            Core::NativeCensus::NoteRawPacket(entry.opcode, reinterpret_cast<const u32*>(packet), entry.dwords);
-            NoteUnexpectedRawPacket(entry.opcode, reinterpret_cast<const u32*>(packet), entry.dwords);
-            if (entry.opcode == 0x76 || entry.opcode == 0x69) {
-                const u32* words = reinterpret_cast<const u32*>(packet);
-                Core::NativeCensus::NoteRegisterPacket(entry.opcode, words[1], words[0] >> 16 & 0x3fff);
-            }
-            if (entry.opcode == 0x76) {
-                ExecuteSetShReg(packet);
-            } else if (entry.opcode == 0x69) {
-                ExecuteSetContextReg(packet);
-            } else if (entry.opcode == 0x46) {
-                ExecuteEventWrite(packet);
-            } else if (entry.opcode == 0x85) {
-                ++cblock.de_count;
-            } else if (entry.opcode == 0x86) {
-                while (cblock.ce_count <= cblock.de_count && !ce_task.handle.done()) {
-                    RESUME_GFX(ce_task);
-                }
-            } else if (entry.opcode == 0x15) {
-                ExecuteDispatchDirect(packet, direct->begin);
-            } else if (entry.opcode == 0x37) {
-                ExecuteWriteData(packet);
-            } else {
-                ExecuteDma(*reinterpret_cast<const PM4DmaData*>(packet));
-            }
-            break;
-        }
         case EntryKind::StateBuffer: {
             u64 pointer;
             std::memcpy(&pointer, &entry.seq, sizeof(pointer));
@@ -779,12 +777,6 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
         }
     }
     leave_clear();
-    if (ce_task.handle) {
-        while (!ce_task.handle.done()) {
-            RESUME_GFX(ce_task);
-        }
-        ce_task.handle.destroy();
-    }
     FIBER_EXIT;
 }
 

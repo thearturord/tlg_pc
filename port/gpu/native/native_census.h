@@ -19,6 +19,8 @@ void NoteRawPacket(u32 opcode, const u32* words, u32 dwords);
 void NoteOtherPacket(u32 opcode);
 /// Work (a draw: kind 0, a dispatch: kind 1) the raster thread skipped because it sits inside a native engine clear, by program hash (B11 investigation)
 void NoteSkippedInClear(u32 kind, u64 program_hash, u64 index_or_groups);
+/// A packet of a constant engine buffer, by opcode and dwords
+void NoteCePacket(u32 opcode, u32 dwords);
 /// A submission with a constant engine buffer (CCB) of `dwords`
 void NoteCeSubmission(u32 dwords);
 

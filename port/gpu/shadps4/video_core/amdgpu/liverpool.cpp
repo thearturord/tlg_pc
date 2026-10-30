@@ -22,6 +22,7 @@
 #include "core/libraries/videoout/driver.h"
 #include "core/memory.h"
 #include "native/native_audit.h"
+#include "native/native_census.h"
 #include "native/native_direct.h"
 #include "native/native_draw.h"
 #include "native/native_uploads.h"
@@ -1897,85 +1898,6 @@ void Liverpool::Process(std::stop_token stoken) {
     }
 }
 
-Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
-    FIBER_ENTER(ccb_task_name);
-
-    while (!ccb.empty()) {
-        ProcessCommands();
-
-        const auto* header = reinterpret_cast<const PM4Header*>(ccb.data());
-        const u32 type = header->type;
-        if (type != 3) {
-            // No other types of packets were spotted so far
-            UNREACHABLE_MSG("Invalid PM4 type {}", type);
-        }
-
-        const PM4ItOpcode opcode = header->type3.opcode;
-        const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
-        switch (opcode) {
-        case PM4ItOpcode::Nop: {
-            // const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
-            break;
-        }
-        case PM4ItOpcode::WriteConstRam: {
-            const auto* write_const = reinterpret_cast<const PM4WriteConstRam*>(header);
-            memcpy(cblock.constants_heap.data() + write_const->Offset(), &write_const->data,
-                   write_const->Size());
-            break;
-        }
-        case PM4ItOpcode::DumpConstRam: {
-            const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
-            if (split_active) {
-                // A command processor write to guest memory: done in order with the draws.
-                void* dst = dump_const->Address<void*>();
-                const u8* src = cblock.constants_heap.data() + dump_const->Offset();
-                Core::DrainAudit::SetNextWrite(reinterpret_cast<u64>(dst), dump_const->Size());
-                RasterRun(
-                    [dst, bytes = std::vector<u8>(src, src + dump_const->Size())] {
-                        std::memcpy(dst, bytes.data(), bytes.size());
-                    },
-                    false, true);
-            } else {
-                memcpy(dump_const->Address<void*>(),
-                       cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
-            }
-            break;
-        }
-        case PM4ItOpcode::IncrementCeCounter: {
-            ++cblock.ce_count;
-            break;
-        }
-        case PM4ItOpcode::WaitOnDeCounterDiff: {
-            const auto diff = it_body[0];
-            while ((cblock.de_count - cblock.ce_count) >= diff) {
-                YIELD_CE();
-            }
-            break;
-        }
-        case PM4ItOpcode::IndirectBufferConst: {
-            const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-            auto task =
-                ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
-            RESUME_CE(task);
-
-            while (!task.handle.done()) {
-                YIELD_CE();
-                RESUME_CE(task);
-            }
-            task.handle.destroy();
-            break;
-        }
-        default:
-            const u32 count = header->type3.NumWords();
-            UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
-                            static_cast<u32>(opcode), count);
-        }
-        ccb = NextPacket(ccb, header->type3.NumWords() + 1);
-    }
-
-    FIBER_EXIT;
-}
-
 namespace {
 /// With native execution on: which command packets the game's own code still writes, grouped by the native tag that
 /// came last in the stream (per 5 s, logged): 0 before any tag, 1 after the tag of an executed draw, 2 draw on the
@@ -2152,81 +2074,6 @@ Liverpool::Task Liverpool::DirectWait(const PM4CmdWaitRegMem& wait_packet) {
     FIBER_EXIT;
 }
 
-void Liverpool::ExecuteSetContextReg(const PM4Header* header) {
-    const u32 count = header->type3.NumWords();
-    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-    const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
-    const auto* payload = reinterpret_cast<const u32*>(header + 2);
-
-    std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
-    MirrorRegs(reg_addr, count - 1);
-
-    // In the case of HW, render target memory has alignment as color block operates on
-    // tiles. There is no information of actual resource extents stored in CB context
-    // regs, so any deduction of it from slices/pitch will lead to a larger surface
-    // created. The same applies to the depth targets. Fortunately, the guest always
-    // sends a trailing NOP packet right after the context regs setup, so we can use the
-    // heuristic below and extract the hint to determine actual resource dims.
-
-    switch (reg_addr) {
-    case ContextRegs::CbColor0Base:
-    case ContextRegs::CbColor1Base:
-    case ContextRegs::CbColor2Base:
-    case ContextRegs::CbColor3Base:
-    case ContextRegs::CbColor4Base:
-    case ContextRegs::CbColor5Base:
-    case ContextRegs::CbColor6Base:
-    case ContextRegs::CbColor7Base: {
-        const auto col_buf_id = (reg_addr - ContextRegs::CbColor0Base) /
-                                (ContextRegs::CbColor1Base - ContextRegs::CbColor0Base);
-        ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
-
-        const auto nop_offset = header->type3.count;
-        if (nop_offset == 0x0e || nop_offset == 0x0d || nop_offset == 0x0b) {
-            ASSERT_MSG(payload[nop_offset] == 0xc0001000,
-                       "NOP hint is missing in CB setup sequence");
-            last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
-        } else {
-            last_cb_extent[col_buf_id].raw = 0;
-        }
-        break;
-    }
-    case ContextRegs::CbColor0Cmask:
-    case ContextRegs::CbColor1Cmask:
-    case ContextRegs::CbColor2Cmask:
-    case ContextRegs::CbColor3Cmask:
-    case ContextRegs::CbColor4Cmask:
-    case ContextRegs::CbColor5Cmask:
-    case ContextRegs::CbColor6Cmask:
-    case ContextRegs::CbColor7Cmask: {
-        const auto col_buf_id =
-            (reg_addr - ContextRegs::CbColor0Cmask) /
-            (ContextRegs::CbColor1Cmask - ContextRegs::CbColor0Cmask);
-        ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
-
-        const auto nop_offset = header->type3.count;
-        if (nop_offset == 0x04) {
-            ASSERT_MSG(payload[nop_offset] == 0xc0001000,
-                       "NOP hint is missing in CB setup sequence");
-            last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
-        }
-        break;
-    }
-    case ContextRegs::DbZInfo: {
-        if (header->type3.count == 8) {
-            ASSERT_MSG(payload[20] == 0xc0001000,
-                       "NOP hint is missing in DB setup sequence");
-            last_db_extent.raw = payload[21];
-        } else {
-            last_db_extent.raw = 0;
-        }
-        break;
-    }
-    default:
-        break;
-    }
-}
-
 void Liverpool::ExecuteEventWrite(const PM4Header* header) {
     const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
     LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
@@ -2257,54 +2104,6 @@ void Liverpool::ExecuteEventWrite(const PM4Header* header) {
             pixel_counter += OcclusionCounterStep;
         }
     }
-}
-
-/// The graphics queue's SET_SH_REG, DISPATCH_DIRECT and WRITE_DATA: the walk's cases, also run for the entries of a direct buffer.
-void Liverpool::ExecuteSetShReg(const PM4Header* header) {
-    const u32 count = header->type3.NumWords();
-    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-    const auto set_size = (count - 1) * sizeof(u32);
-
-    if (set_data->reg_offset >= 0x200 && set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
-        ASSERT(set_size <= sizeof(ComputeProgram));
-        auto* addr = reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state) + (set_data->reg_offset - 0x200);
-        std::memcpy(addr, header + 2, set_size);
-    } else {
-        std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset], header + 2, set_size);
-        MirrorRegs(Regs::ShRegWordOffset + set_data->reg_offset, set_size / sizeof(u32));
-        Core::NativeRegistry::NoteShPacket(set_data->reg_offset, reinterpret_cast<const u32*>(header + 2), static_cast<u32>(set_size / sizeof(u32)));
-    }
-}
-
-void Liverpool::ExecuteDispatchDirect(const PM4Header* header, u64 base_addr) {
-    const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
-    auto& cs_program = GetCsRegs();
-    cs_program.dim_x = dispatch_direct->dim_x;
-    cs_program.dim_y = dispatch_direct->dim_y;
-    cs_program.dim_z = dispatch_direct->dim_z;
-    cs_program.dispatch_initiator = dispatch_direct->dispatch_initiator;
-    if (DebugState.DumpingCurrentReg()) {
-        DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header), cs_program);
-    }
-    if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
-        return;
-    }
-    RasterCall call{};
-    call.kind = RasterCall::Kind::DispatchDirect;
-    call.marker = "gfx:{}:DispatchDirect";
-    call.cmd_address = header;
-    RasterDispatch(call);
-}
-
-void Liverpool::ExecuteWriteData(const PM4Header* header) {
-    const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
-    ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
-    const u32 data_size = (header->type3.count.Value() - 2) * 4;
-    u64* address = write_data->Address<u64*>();
-    if (write_data->wr_one_addr.Value()) {
-        UNREACHABLE();
-    }
-    CpWriteData(address, write_data->data, data_size, GfxQueueId);
 }
 
 // C8 (2026-10-28): the packet interpreter is removed. Every command buffer of the game runs on the native direct path (ProcessDirect); one that

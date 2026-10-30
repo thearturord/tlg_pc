@@ -12,6 +12,7 @@
 #include "common/logging/log.h"
 #include "native/native_hooks.h"
 #include "native/native_direct.h"
+#include "native/native_debug_server.h"
 #include "native/native_census.h"
 #include "native/native_draw.h"
 #include "video_core/amdgpu/pm4_cmds.h"
@@ -24,7 +25,7 @@ namespace {
 
 using AmdGpu::PM4CmdNop;
 
-enum class Class : u8 { Inert, Tag, Sync, Flip, Indirect, Packet, Other };
+enum class Class : u8 { Inert, Tag, Sync, Flip, Indirect, Other };
 
 struct Classified {
     Class cls;
@@ -39,8 +40,19 @@ constexpr u32 OtherIndirect = 3;     ///< an indirect buffer that cannot be foll
 constexpr u32 OtherConstantBuffer = 4; ///< the submission has a constant engine buffer
 constexpr u32 BuildOnlyLimit = 5;    ///< indices below this (and above 1) are only found by the build
 
-bool RegisterPacketsOn() {
-    return VideoCore::ReadbackPolicy::Get().register_packets.load(std::memory_order_relaxed) != 0;
+/// A raw PM4 packet of a kind the stream used to execute (see Classify): reported as a rare event (user/log/rare_events.txt), not executed
+void NoteFormerRawPacket(const u32* words, u32 opcode, u32 dwords) {
+    switch (opcode) {
+    case 0x50: case 0x46: case 0x69: case 0x76: case 0x15: case 0x37: case 0x85: case 0x86: {
+        char detail[160];
+        std::snprintf(detail, sizeof detail, "raw PM4 packet opcode %#x, %u dwords, not executed: %08x %08x %08x %08x", opcode, dwords, words[0], dwords > 1 ? words[1] : 0u,
+                      dwords > 2 ? words[2] : 0u, dwords > 3 ? words[3] : 0u);
+        Core::RareEvents::Note("raw_pm4_packet_" + std::to_string(opcode), detail);
+        break;
+    }
+    default:
+        break;
+    }
 }
 
 Classified Classify(const u32* packet, bool markers, u32 queue) {
@@ -51,27 +63,8 @@ Classified Classify(const u32* packet, bool markers, u32 queue) {
     if (opcode == 0x3f) {
         return {Class::Indirect, opcode, dwords};
     }
-    if (opcode == 0x50 && queue == 0 && dwords == 7) {
-        return {Class::Packet, opcode, dwords}; // a CP DMA of the graphics queue: self-contained, no register state
-    }
-    if (queue == 0 && RegisterPacketsOn()) {
-        // SET_SH_REG and DISPATCH_DIRECT (the game's own compute helpers, such as the texture map) and a CPU style write to memory: the
-        // walk's cases, run from the list
-        if (opcode == 0x76 || (opcode == 0x15 && dwords == 5)) {
-            return {Class::Packet, opcode, dwords};
-        }
-        // the graphics side of the constant engine's synchronization (increment the draw engine counter, wait on the constant engine counter)
-        // context register writes (the extent hints of the targets follow them in the buffer) and event writes: the walk's cases
-        if (opcode == 0x69 || opcode == 0x46) {
-            return {Class::Packet, opcode, dwords};
-        }
-        if ((opcode == 0x85 && dwords == 2) || (opcode == 0x86 && dwords == 2)) {
-            return {Class::Packet, opcode, dwords};
-        }
-        if (opcode == 0x37 && dwords >= 4 && (packet[1] & 0x10000) == 0 && (((packet[1] >> 8) & 0xf) == 2 || ((packet[1] >> 8) & 0xf) == 5)) {
-            return {Class::Packet, opcode, dwords};
-        }
-    }
+    // E5 (2026-10-30): no raw PM4 packet is executed any more. The ones the game's stream used to carry (CP DMA, the occlusion query events and DB_COUNT_CONTROL, constant
+    // engine counters, SET_SH_REG, SET_CONTEXT_REG, DISPATCH_DIRECT, WRITE_DATA) are tags (ConvertSyncPacket) or have no reader; a leftover one is an Other and a rare event.
     // C10: the index buffer state of a draw that a record took over (INDEX_BUFFER_SIZE 0x13 and INDEX_BASE 0x26 sit right before the draw's native tag in the spear cutscene's
     // buffers): the tag's record carries its own index data and nothing else consumes the state. Inert adds no entry (like Other) and only keeps the buffer from being counted as mixed;
     // an indexed draw packet the walk would execute (0x27 and the like) is still an Other
@@ -134,15 +127,9 @@ void AddEntry(Buffer& buffer, EntryKind kind, const u32* packet, u32 dwords, u64
     entry.kind = kind;
     entry.opcode = opcode;
     entry.address = address;
-    if (kind == EntryKind::Packet && dwords > entry.words.size()) {
-        entry.dwords = dwords;
-        entry.seq = buffer.pool.size();
-        buffer.pool.insert(buffer.pool.end(), packet, packet + dwords);
-    } else {
-        entry.dwords = std::min<u32>(dwords, entry.words.size());
-        for (u32 i = 0; i < entry.dwords; ++i) {
-            entry.words[i] = packet[i];
-        }
+    entry.dwords = std::min<u32>(dwords, entry.words.size());
+    for (u32 i = 0; i < entry.dwords; ++i) {
+        entry.words[i] = packet[i];
     }
     if (kind == EntryKind::Tag) {
         entry.seq = packet[9] | static_cast<u64>(packet[10]) << 32;
@@ -187,22 +174,10 @@ void AddSpan(Buffer& buffer, const u32* begin, u32 dwords, u32 depth, bool marke
         case Class::Flip:
             AddEntry(buffer, EntryKind::Flip, at, packet.dwords, address, 0);
             break;
-        case Class::Packet:
-            if (packet.opcode == 0x69) {
-                // the walk reads the NOP packet with the extent hint of a target that follows the register write (up to 22 dwords after it)
-                constexpr u32 HintDwords = 24;
-                if (at + packet.dwords + HintDwords > end) {
-                    ++buffer.other[0x69];
-                    break;
-                }
-                AddEntry(buffer, EntryKind::Packet, at, packet.dwords + HintDwords, address, packet.opcode);
-                break;
-            }
-            AddEntry(buffer, EntryKind::Packet, at, packet.dwords, address, packet.opcode);
-            break;
         case Class::Other:
             ++buffer.other[packet.opcode & 255];
             Core::NativeCensus::NoteOtherPacket(packet.opcode);
+            NoteFormerRawPacket(at, packet.opcode, packet.dwords);
             break;
         case Class::Indirect: {
             const IndirectTarget target = IndirectOf(at);
@@ -354,7 +329,7 @@ std::shared_ptr<Buffer> Build(u32 queue, const u32* dcb, u32 dwords, bool has_co
 void Buffer::Expect(EntryKind kind, u64 address, u32 opcode, u64 seq) {
     if (cursor < entries.size()) {
         const Entry& entry = entries[cursor];
-        if (entry.kind == kind && entry.address == address && entry.opcode == opcode && (kind == EntryKind::StateBuffer || kind == EntryKind::Packet || entry.seq == seq)) {
+        if (entry.kind == kind && entry.address == address && entry.opcode == opcode && (kind == EntryKind::StateBuffer || entry.seq == seq)) {
             ++cursor;
             ++matched;
             return;
@@ -402,9 +377,6 @@ void Buffer::Walk(const u32* packet) {
         break;
     case Class::Flip:
         Expect(EntryKind::Flip, address, 0, 0);
-        break;
-    case Class::Packet:
-        Expect(EntryKind::Packet, address, found.opcode, 0);
         break;
     case Class::Other:
         ++walk_other[found.opcode & 255];

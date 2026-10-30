@@ -258,12 +258,8 @@ private:
     Task DirectWait(const PM4CmdWaitRegMem& wait);
     void StartNativeTag(const u32* tag);
     void ExecuteDma(const PM4DmaData& dma);
-    void ExecuteSetShReg(const PM4Header* header);
-    void ExecuteSetContextReg(const PM4Header* header);
     void ExecuteEventWrite(const PM4Header* header);
-    void ExecuteDispatchDirect(const PM4Header* header, u64 base_addr);
-    void ExecuteWriteData(const PM4Header* header);
-    Task ProcessCeUpdate(std::span<const u32> ccb);
+    void ExecuteConstantEngine(std::span<const u32> ccb); ///< native/native_liverpool.cpp
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid, std::shared_ptr<Core::NativeDirect::Buffer> direct = {});
     Task ProcessDirectAsc(std::shared_ptr<Core::NativeDirect::Buffer> direct, u32 vqid);

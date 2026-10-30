@@ -16,7 +16,7 @@
 // builds the list and compares it with what the packet walk finds; nothing executes from it yet.
 namespace Core::NativeDirect {
 
-enum class EntryKind : u8 { Tag, Sync, Flip, StateBuffer, Packet };
+enum class EntryKind : u8 { Tag, Sync, Flip, StateBuffer };
 
 struct Entry {
     EntryKind kind{};

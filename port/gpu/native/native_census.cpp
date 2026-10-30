@@ -32,6 +32,7 @@ std::array<std::atomic<u64>, 256> other_packets{};
 struct SkipKey { u32 kind; u64 hash; bool operator<(const SkipKey& o) const { return kind != o.kind ? kind < o.kind : hash < o.hash; } };
 std::map<SkipKey, std::pair<u64, u64>> skipped_in_clear; // (count, last size argument)
 std::mutex skip_mutex;
+std::array<std::atomic<u64>, 256> ce_opcodes{}, ce_opcode_dwords{};
 std::mutex sample_mutex;
 std::array<std::vector<std::string>, 256> samples; // the first words of the first packets of each opcode
 std::array<std::atomic<u64>, NumImageEvents> image_events{}, image_bytes{};
@@ -88,6 +89,11 @@ void NoteSkippedInClear(u32 kind, u64 program_hash, u64 size) {
     auto& entry = skipped_in_clear[{kind, program_hash}];
     ++entry.first;
     entry.second = size;
+}
+
+void NoteCePacket(u32 opcode, u32 dwords) {
+    ce_opcodes[opcode & 0xff].fetch_add(1, std::memory_order_relaxed);
+    ce_opcode_dwords[opcode & 0xff].fetch_add(dwords, std::memory_order_relaxed);
 }
 
 void NoteCeSubmission(u32 dwords) {
@@ -185,7 +191,15 @@ nlohmann::json Report() {
         }
     }
     out["skipped_inside_engine_clears"] = skipped;
-    out["constant_engine"] = {{"ccb_submissions", ce_submissions.load()}, {"ccb_dwords", ce_dwords.load()}};
+    json ce_ops = json::object();
+    for (u32 o = 0; o < 256; ++o) {
+        if (const u64 n = ce_opcodes[o].load()) {
+            char key[8];
+            std::snprintf(key, sizeof key, "0x%02x", o);
+            ce_ops[key] = {{"packets", n}, {"dwords", ce_opcode_dwords[o].load()}};
+        }
+    }
+    out["constant_engine"] = {{"ccb_submissions", ce_submissions.load()}, {"ccb_dwords", ce_dwords.load()}, {"by_opcode", ce_ops}};
     json images = json::object();
     for (u32 i = 0; i < NumImageEvents; ++i) {
         images[ImageNames[i]] = {{"calls", image_events[i].load()}, {"bytes", image_bytes[i].load()}};
