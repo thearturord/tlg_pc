@@ -728,11 +728,9 @@ void Rasterizer::ClearDepthTarget(const DrawInputs& regs, const AmdGpu::CbDbExte
 // draws and dispatches of the previous state); the census of the skipped work found 4,105 such draws and 4,000 dispatches in 20 s that the native clear dropped.
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseDraw, engine_clear_on);
-    if (SkipForEngineClear()) {
-        if (plan != nullptr) {
-            Core::NativeCensus::NoteSkippedInClear(0, plan->stages[0].info != nullptr ? plan->stages[0].info->pgm_hash : 0, plan->inputs.num_indices);
-        }
-        // (counted only: see the note at the top of this file's B11 section)
+    if (SkipForEngineClear() && plan != nullptr) {
+        // a draw inside a clear's range is never the clear's own (the clear function draws nothing): counted as "run" (kind 2)
+        Core::NativeCensus::NoteSkippedInClear(2, plan->native_seq != 0 ? Core::NativeDraw::RecordCallerGhidra(plan->native_seq) : (0x100000000ull | plan->op_class), plan->op_class);
     }
     RENDERER_TRACE;
 
@@ -966,9 +964,11 @@ void Rasterizer::SetExplicitImageReadback(bool on) {
 
 void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseDispatch, engine_clear_on);
-    if (SkipForEngineClear()) {
-        if (plan != nullptr) {
-            Core::NativeCensus::NoteSkippedInClear(1, plan->stage.info != nullptr ? plan->stage.info->pgm_hash : 0, plan->cs.dim_x);
+    if (SkipForEngineClear() && plan != nullptr) {
+        const bool own = IsEngineClearOwnWork(plan->native_seq);
+        Core::NativeCensus::NoteSkippedInClear(own ? 1 : 3, plan->native_seq != 0 ? Core::NativeDraw::RecordCallerGhidra(plan->native_seq) : 0, plan->cs.dim_x);
+        if (own) {
+            return; // the clear's own fill: the native clear did it
         }
     }
     RENDERER_TRACE;

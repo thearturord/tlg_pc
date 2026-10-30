@@ -181,7 +181,7 @@ nlohmann::json Report() {
         for (const auto& [key, v] : skipped_in_clear) {
             char hash[24];
             std::snprintf(hash, sizeof hash, "%#llx", static_cast<unsigned long long>(key.hash));
-            skipped.push_back({{"kind", key.kind == 0 ? "draw" : "dispatch"}, {"program_hash", hash}, {"count", v.first}, {"last_size", v.second}});
+            skipped.push_back({{"kind", key.kind == 0 ? "draw skipped" : key.kind == 1 ? "dispatch skipped (the clear's own fill)" : key.kind == 2 ? "draw run (inside the range, not the clear's)" : "dispatch run (inside the range, not the clear's)"}, {"program_hash", hash}, {"count", v.first}, {"last_size", v.second}});
         }
     }
     out["skipped_inside_engine_clears"] = skipped;
