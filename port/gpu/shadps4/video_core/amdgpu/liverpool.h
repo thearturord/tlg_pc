@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "native/native_sync.h"
 #include "native/native_direct.h"
 #include "native/native_draw.h"
 
@@ -47,10 +48,6 @@ struct VideoOutPort;
 namespace AmdGpu {
 
 union PM4Header;
-struct PM4CmdWaitRegMem;
-struct PM4CmdEventWriteEop;
-struct PM4DmaData;
-struct PM4CmdReleaseMem;
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -255,19 +252,19 @@ private:
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
     Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, std::shared_ptr<Core::NativeDirect::Buffer> direct = {});
     Task ProcessDirect(std::shared_ptr<Core::NativeDirect::Buffer> direct, std::span<const u32> ccb = {});
-    Task DirectWait(const PM4CmdWaitRegMem& wait);
+    Task DirectWait(const Core::NativeSync::LabelWait& wait);
     void StartNativeTag(const u32* tag);
-    void ExecuteDma(const PM4DmaData& dma);
-    void ExecuteEventWrite(const PM4Header* header);
+    void ExecuteDma(const Core::NativeSync::DmaCopy& dma);
+    void FakeOcclusionDump(VAddr address); ///< TLG_REAL_OCCLUSION=0: the made up answer
     void ExecuteConstantEngine(std::span<const u32> ccb); ///< native/native_liverpool.cpp
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid, std::shared_ptr<Core::NativeDirect::Buffer> direct = {});
     Task ProcessDirectAsc(std::shared_ptr<Core::NativeDirect::Buffer> direct, u32 vqid);
     /// B2: queues the announced updates a submission carries to the raster thread (before its work)
     void QueueAnnounced(Core::NativeDirect::Buffer& direct);
-    Task DirectWaitAsc(const PM4CmdWaitRegMem& wait, u32 vqid);
+    Task DirectWaitAsc(const Core::NativeSync::LabelWait& wait, u32 vqid);
     void StartAscTag(const u32* tag, const void* address, u32 vqid);
-    void SignalComputeRelease(const PM4CmdReleaseMem& release, u32 vqid, u32 pipe_id);
+    void SignalComputeRelease(const Core::NativeSync::Fence& release, u32 vqid, u32 pipe_id);
 
     void ProcessCommands();
     void Process(std::stop_token stoken);
@@ -296,7 +293,7 @@ private:
     void RasterDispatch(const RasterCall& call);
     /// Draws the pending native draw tag from its record instead of from command packets.
     void ExecuteNativeDraw(const void* header = nullptr, u32 asc_vqid = ~0u, u32 index_count = ~0u);
-    void SignalGraphicsEop(const PM4CmdEventWriteEop& event_eop);
+    void SignalGraphicsEop(const Core::NativeSync::Fence& eop);
     bool native_follow_pending{}; ///< an executed draw waits for its draw packet (index count)
     void RasterPush(RasterOp&& op, bool wait);
     /// Blocks until every queued closure that writes guest memory has run.
@@ -397,7 +394,7 @@ private:
     void SetFenceTick(VAddr address, u64 seq);
     [[nodiscard]] u64 GetFenceTick(VAddr address, u64 seq);
     void RetireFence(VAddr address, u64 seq);
-    FenceMatch MatchRecordedFence(const PM4CmdWaitRegMem& wait_reg_mem);
+    FenceMatch MatchRecordedFence(const Core::NativeSync::LabelWait& wait_reg_mem);
 
     /// readback_fence_wait_shortcut: 0 = off, 1 = graphics queue waits, 2 = graphics and compute
     /// queue waits, 3 = like 2 plus a GPU barrier that orders the work after the wait on the
@@ -409,11 +406,11 @@ private:
     }
 
     /// Called when a wait passed on a recorded fence: orders the following GPU work after it.
-    void OnWaitPassedOnFence(const PM4CmdWaitRegMem& wait_reg_mem, const FenceMatch& match,
+    void OnWaitPassedOnFence(const Core::NativeSync::LabelWait& wait_reg_mem, const FenceMatch& match,
                              u32 queue);
 
     /// Logs a command stream wait that has been blocked for more than 2 seconds.
-    void ReportLongWait(const PM4CmdWaitRegMem& wait_reg_mem, const char* queue, u64 wait_start,
+    void ReportLongWait(const Core::NativeSync::LabelWait& wait_reg_mem, const char* queue, u64 wait_start,
                         bool& reported);
     /// Logs a MemSemaphore/Rewind wait that has been blocked for more than 2 seconds.
     void ReportLongSpin(const char* what, const void* address, u64 wait_start, bool& reported);

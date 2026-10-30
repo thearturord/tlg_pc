@@ -633,35 +633,38 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
     RasterPush(std::move(op), false);
 }
 
-void Liverpool::SignalGraphicsEop(const PM4CmdEventWriteEop& event_eop) {
+void Liverpool::SignalGraphicsEop(const Core::NativeSync::Fence& event_eop) {
+    if (!event_eop.valid) {
+        return;
+    }
     // The packet is copied: the signal may run after the command buffer is reused.
-    Core::FrameTimeline::Mark(Core::FrameTimeline::EopParsed, event_eop.Address<u8>() ? reinterpret_cast<u64>(event_eop.Address<u8>()) : 0);
+    Core::FrameTimeline::Mark(Core::FrameTimeline::EopParsed, event_eop.address);
     static constexpr auto irq = [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); };
     auto signal = [this, eop = event_eop] {
         RunFenceSignal(
             *this, gpu_id,
             [&] {
                 bool backed = true;
-                eop.SignalFence(
+                eop.Signal(
                     [&](void* address, u64 data, u32 num_bytes) {
                         backed &= TryWriteFenceOffThread(rasterizer, address, data, num_bytes);
                     },
                     [] {});
                 if (backed) {
                     // Writes landed, now raise the interrupt (if any) after them.
-                    eop.SignalFence(NoFenceWrite, irq);
+                    eop.Signal(NoFenceWrite, irq);
                 }
                 return backed;
             },
-            [eop] { eop.SignalFence(WriteFenceMemory, irq); });
+            [eop] { eop.Signal(WriteFenceMemory, irq); });
     };
-    const auto eop_data_sel = event_eop.data_sel.Value();
-    const u32 eop_bytes = eop_data_sel == DataSelect::Data32Low ? sizeof(u32) : eop_data_sel == DataSelect::Data64 ? sizeof(u64) : 0;
-    SignalFenceAfterReadbacks(std::move(signal), false, reinterpret_cast<VAddr>(event_eop.Address<u8>()), event_eop.DataQWord(), eop_bytes,
-                              GfxQueueId, VideoCore::FenceGfxEop);
+    SignalFenceAfterReadbacks(std::move(signal), false, static_cast<VAddr>(event_eop.address), event_eop.value, event_eop.Bytes(), GfxQueueId, VideoCore::FenceGfxEop);
 }
 
-void Liverpool::SignalComputeRelease(const PM4CmdReleaseMem& release_mem, u32 vqid, u32 pipe_id) {
+void Liverpool::SignalComputeRelease(const Core::NativeSync::Fence& release_mem, u32 vqid, u32 pipe_id) {
+    if (!release_mem.valid) {
+        return;
+    }
     // The packet is copied: the signal may run after the command buffer is reused.
     auto signal = [this, release = release_mem, pipe_id] {
         const auto irq = [pipe_id] { Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id)); };
@@ -672,28 +675,26 @@ void Liverpool::SignalComputeRelease(const PM4CmdReleaseMem& release_mem, u32 vq
             *this, gpu_id,
             [&] {
                 bool backed = true;
-                release.SignalFence(
+                release.Signal(
                     [&](void* address, u64 data, u32 num_bytes) { backed &= TryWriteFenceOffThread(rasterizer, address, data, num_bytes); },
                     [] {}, [](VAddr, u16, u16) {});
                 if (backed) {
-                    release.SignalFence(NoFenceWrite, irq, [](VAddr, u16, u16) {});
+                    release.Signal(NoFenceWrite, irq, [](VAddr, u16, u16) {});
                 }
                 return backed;
             },
-            [release, irq, gds_to_mem] { release.SignalFence(WriteFenceMemory, irq, gds_to_mem); });
+            [release, irq, gds_to_mem] { release.Signal(WriteFenceMemory, irq, gds_to_mem); });
     };
     // Copying from GDS records GPU work, which must happen on the raster thread.
-    const auto release_data_sel = release_mem.data_sel.Value();
-    const u32 release_bytes = release_data_sel == DataSelect::Data32Low ? sizeof(u32) : release_data_sel == DataSelect::Data64 ? sizeof(u64) : 0;
-    SignalFenceAfterReadbacks(std::move(signal), release_data_sel == DataSelect::GdsMemStore, release_mem.Address<VAddr>(), release_mem.DataQWord(),
-                              release_bytes, vqid + 1, VideoCore::FenceComputeRelease);
+    SignalFenceAfterReadbacks(std::move(signal), release_mem.source == Core::NativeSync::Source::GdsCopy, static_cast<VAddr>(release_mem.address), release_mem.value,
+                              release_mem.Bytes(), vqid + 1, VideoCore::FenceComputeRelease);
 }
 
 /// The async queue's wait on a memory label (the walk's WaitRegMem case for a tag).
-Liverpool::Task Liverpool::DirectWaitAsc(const PM4CmdWaitRegMem& wait_packet, u32 vqid) {
+Liverpool::Task Liverpool::DirectWaitAsc(const Core::NativeSync::LabelWait& wait_packet, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
-    const PM4CmdWaitRegMem* wait_reg_mem = &wait_packet;
-    ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+    const Core::NativeSync::LabelWait* wait_reg_mem = &wait_packet;
+    ASSERT(!wait_reg_mem->pfp);
     if (!wait_reg_mem->Test(regs.reg_array)) {
         using VideoCore::ReadbackStats::WaitClass;
         const u64 wait_start = VideoCore::ReadbackStats::NowNs();
@@ -729,36 +730,40 @@ Liverpool::Task Liverpool::DirectWaitAsc(const PM4CmdWaitRegMem& wait_packet, u3
     FIBER_EXIT;
 }
 
-void Liverpool::ExecuteDma(const PM4DmaData& dma_packet) {
-    const auto* dma_data = &dma_packet;
-    if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
+void Liverpool::ExecuteDma(const Core::NativeSync::DmaCopy& dma) {
+    using Kind = Core::NativeSync::DmaCopy::Kind;
+    if (dma.kind == Kind::Ignored || !rasterizer) {
         return;
     }
-    ASSERT(dma_data->command.das == 0);
-    if (dma_data->dst_sel == DmaDataDst::Memory || dma_data->dst_sel == DmaDataDst::MemoryUsingL2) {
-        Core::DrainAudit::SetNextWrite(dma_data->DstAddress<VAddr>(), dma_data->NumBytes());
+    if (dma.kind == Kind::Unknown) {
+        Core::RareEvents::Note("dma_unknown_kind", "a CP DMA with a source / destination pair the game never used");
+        return;
+    }
+    if (dma.kind == Kind::FillGuest || dma.kind == Kind::GdsToMemory || dma.kind == Kind::MemoryToMemory) {
+        Core::DrainAudit::SetNextWrite(static_cast<VAddr>(dma.destination), dma.bytes);
     } else {
         Core::DrainAudit::SetNextWrite(Core::DrainAudit::NoGuestMemory, 0);
     }
     RasterRun(
-        [this, dma = *dma_data] {
-            const auto* dma_data = &dma;
-            if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
-                rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(), dma_data->data, true);
-            } else if ((dma_data->src_sel == DmaDataSrc::Memory || dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
-                       dma_data->dst_sel == DmaDataDst::Gds) {
-                rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(), true, false);
-            } else if (dma_data->src_sel == DmaDataSrc::Data &&
-                       (dma_data->dst_sel == DmaDataDst::Memory || dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(), dma_data->data, false);
-            } else if (dma_data->src_sel == DmaDataSrc::Gds &&
-                       (dma_data->dst_sel == DmaDataDst::Memory || dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo, dma_data->NumBytes(), false, true);
-            } else if ((dma_data->src_sel == DmaDataSrc::Memory || dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
-                       (dma_data->dst_sel == DmaDataDst::Memory || dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(), false, false);
-            } else {
-                UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel), u32(dma_data->dst_sel));
+        [this, dma] {
+            switch (dma.kind) {
+            case Kind::FillGds:
+                rasterizer->FillBuffer(dma.destination, dma.bytes, dma.fill, true);
+                break;
+            case Kind::MemoryToGds:
+                rasterizer->CopyBuffer(dma.destination, static_cast<VAddr>(dma.source), dma.bytes, true, false);
+                break;
+            case Kind::FillGuest:
+                rasterizer->FillBuffer(static_cast<VAddr>(dma.destination), dma.bytes, dma.fill, false);
+                break;
+            case Kind::GdsToMemory:
+                rasterizer->CopyBuffer(static_cast<VAddr>(dma.destination), dma.source, dma.bytes, false, true);
+                break;
+            case Kind::MemoryToMemory:
+                rasterizer->CopyBuffer(static_cast<VAddr>(dma.destination), static_cast<VAddr>(dma.source), dma.bytes, false, false);
+                break;
+            default:
+                break;
             }
         },
         false, true);
@@ -1512,8 +1517,8 @@ void Liverpool::RetireFence(VAddr address, u64 seq) {
     }
 }
 
-Liverpool::FenceMatch Liverpool::MatchRecordedFence(const PM4CmdWaitRegMem& wait_reg_mem) {
-    if (wait_reg_mem.mem_space.Value() != PM4CmdWaitRegMem::MemSpace::Memory) {
+Liverpool::FenceMatch Liverpool::MatchRecordedFence(const Core::NativeSync::LabelWait& wait_reg_mem) {
+    if (!wait_reg_mem.memory) {
         return {};
     }
     const VAddr wait_address = wait_reg_mem.Address<VAddr>();
@@ -1562,7 +1567,7 @@ Liverpool::FenceMatch Liverpool::MatchRecordedFence(const PM4CmdWaitRegMem& wait
     return {};
 }
 
-void Liverpool::OnWaitPassedOnFence(const PM4CmdWaitRegMem& wait_reg_mem, const FenceMatch& match,
+void Liverpool::OnWaitPassedOnFence(const Core::NativeSync::LabelWait& wait_reg_mem, const FenceMatch& match,
                                     u32 queue) {
     if (fence_wait_shortcut >= 3 && rasterizer) {
         // Recorded in order with the draws queued before and after this wait.
@@ -1582,20 +1587,20 @@ void Liverpool::OnWaitPassedOnFence(const PM4CmdWaitRegMem& wait_reg_mem, const 
                      "Fence timeline: compute ring {} passed a wait on {:#x} (func={} ref={:#x} "
                      "mask={:#x}) with value {:#x} recorded by queue {}; memory holds {:#x}, "
                      "held {:#x} before the fence",
-                     queue - 1, address, static_cast<u32>(wait_reg_mem.function.Value()),
+                     queue - 1, address, static_cast<u32>(wait_reg_mem.function),
                      wait_reg_mem.ref, wait_reg_mem.mask, match.value, match.queue,
                      *wait_reg_mem.Address(), match.initial);
         }
     }
 }
 
-void Liverpool::ReportLongWait(const PM4CmdWaitRegMem& wait_reg_mem, const char* queue,
+void Liverpool::ReportLongWait(const Core::NativeSync::LabelWait& wait_reg_mem, const char* queue,
                                u64 wait_start, bool& reported) {
     if (reported || VideoCore::ReadbackStats::NowNs() - wait_start < 2'000'000'000ULL) {
         return;
     }
     reported = true;
-    const bool is_memory = wait_reg_mem.mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory;
+    const bool is_memory = wait_reg_mem.memory;
     const u32 value = is_memory ? *wait_reg_mem.Address() : regs.reg_array[wait_reg_mem.Reg()];
     std::string pending;
     {
@@ -1611,7 +1616,7 @@ void Liverpool::ReportLongWait(const PM4CmdWaitRegMem& wait_reg_mem, const char*
                 "mask={:#x}; pending fence writes:{}",
                 queue, is_memory ? "memory" : "register",
                 is_memory ? wait_reg_mem.Address<VAddr>() : VAddr{wait_reg_mem.Reg()}, value,
-                static_cast<u32>(wait_reg_mem.function.Value()), wait_reg_mem.ref,
+                static_cast<u32>(wait_reg_mem.function), wait_reg_mem.ref,
                 wait_reg_mem.mask, pending.empty() ? " none" : pending);
 }
 
@@ -2031,9 +2036,9 @@ void CountComputeQueueCommand(const PM4Header* header, PM4ItOpcode opcode) {
 
 /// A wait of the graphics queue on a memory label (the walk's WaitRegMem case for a tag): tests the label, passes on the recorded
 /// fence timeline, and yields to the other queues until the label has the value.
-Liverpool::Task Liverpool::DirectWait(const PM4CmdWaitRegMem& wait_packet) {
+Liverpool::Task Liverpool::DirectWait(const Core::NativeSync::LabelWait& wait_packet) {
     FIBER_ENTER(dcb_task_name);
-    const PM4CmdWaitRegMem* wait_reg_mem = &wait_packet;
+    const Core::NativeSync::LabelWait* wait_reg_mem = &wait_packet;
     const u64* wait_addr = wait_reg_mem->Address<u64*>();
     if (vo_port->IsVoLabel(wait_addr) && num_submits == mapped_queues[GfxQueueId].submits.size()) {
         VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::FlipSleep};
@@ -2074,36 +2079,23 @@ Liverpool::Task Liverpool::DirectWait(const PM4CmdWaitRegMem& wait_packet) {
     FIBER_EXIT;
 }
 
-void Liverpool::ExecuteEventWrite(const PM4Header* header) {
-    const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
-    LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
-              magic_enum::enum_name(event->event_type.Value()),
-              magic_enum::enum_name(event->event_index.Value()));
-    if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
-        // TODO: handle proper synchronization, for now signal that update is done
-        // immediately
-        regs.cp_strmout_cntl.offset_update_done = 1;
-        MirrorObject(&regs.cp_strmout_cntl, sizeof(regs.cp_strmout_cntl));
-    } else if (event->event_index.Value() == EventIndex::ZpassDone) {
-        if (event->event_type.Value() == EventType::PixelPipeStatDump) {
-            static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
-            static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
-            u64* results = event->Address<u64*>();
-            const u64 counter_value = pixel_counter | OcclusionCounterValidMask;
-            const s32 pairs = num_counter_pairs;
-            RasterRun([this, results, counter_value, pairs] {
-                if (rasterizer) {
-                    rasterizer->NoteCpGuestWrite(reinterpret_cast<VAddr>(results),
-                                                 pairs * 16);
-                }
-                u64* out = results;
-                for (s32 i = 0; i < pairs; ++i, out += 2) {
-                    *out = counter_value;
-                }
-            });
-            pixel_counter += OcclusionCounterStep;
+void Liverpool::FakeOcclusionDump(VAddr address) {
+    // TLG_REAL_OCCLUSION=0: a made up answer, every query reads "visible" (the counters of each pair differ by a fixed step)
+    static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
+    static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
+    u64* results = reinterpret_cast<u64*>(address);
+    const u64 counter_value = pixel_counter | OcclusionCounterValidMask;
+    const s32 pairs = num_counter_pairs;
+    RasterRun([this, results, counter_value, pairs] {
+        if (rasterizer) {
+            rasterizer->NoteCpGuestWrite(reinterpret_cast<VAddr>(results), pairs * 16);
         }
-    }
+        u64* out = results;
+        for (s32 i = 0; i < pairs; ++i, out += 2) {
+            *out = counter_value;
+        }
+    });
+    pixel_counter += OcclusionCounterStep;
 }
 
 // C8 (2026-10-28): the packet interpreter is removed. Every command buffer of the game runs on the native direct path (ProcessDirect); one that

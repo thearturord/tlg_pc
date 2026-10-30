@@ -220,12 +220,12 @@ Liverpool::Task Liverpool::ProcessDirectAsc(std::shared_ptr<Core::NativeDirect::
             std::array<u32, 8> restored;
             const u32 opcode = Core::NativeDraw::RestoreSyncTag(entry.words.data(), restored);
             if (opcode == 0x49) {
-                SignalComputeRelease(*reinterpret_cast<const PM4CmdReleaseMem*>(restored.data()), vqid, queue.pipe_id);
+                SignalComputeRelease(Core::NativeSync::DecodeRelease(restored.data()), vqid, queue.pipe_id);
             } else if (opcode == 0x37) {
-                const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(restored.data());
-                CpWriteData(write_data->Address<void*>(), write_data->data, (write_data->header.count.Value() - 2) * 4, vqid + 1);
+                const auto write = Core::NativeSync::DecodeWrite(restored.data());
+                CpWriteData(reinterpret_cast<void*>(write.address), write.data, write.bytes, vqid + 1);
             } else if (opcode == 0x3c) {
-                auto task = DirectWaitAsc(*reinterpret_cast<const PM4CmdWaitRegMem*>(restored.data()), vqid);
+                auto task = DirectWaitAsc(Core::NativeSync::DecodeWait(restored.data()), vqid);
                 RESUME_ASC(task, vqid);
                 while (!task.handle.done()) {
                     YIELD_ASC(vqid);
@@ -737,20 +737,20 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
             std::array<u32, 8> restored;
             const u32 opcode = Core::NativeDraw::RestoreSyncTag(entry.words.data(), restored);
             if (opcode == 0x47) {
-                SignalGraphicsEop(*reinterpret_cast<const PM4CmdEventWriteEop*>(restored.data()));
+                SignalGraphicsEop(Core::NativeSync::DecodeEop(restored.data()));
             } else if (opcode == 0x37) {
-                const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(restored.data());
-                CpWriteData(write_data->Address<u64*>(), write_data->data, (write_data->header.count.Value() - 2) * 4, GfxQueueId);
+                const auto write = Core::NativeSync::DecodeWrite(restored.data());
+                CpWriteData(reinterpret_cast<u64*>(write.address), write.data, write.bytes, GfxQueueId);
             } else if (opcode == 0x50) {
                 // a CP DMA copy (E5: it travels as a sync tag, not as a raw packet)
-                ExecuteDma(*reinterpret_cast<const PM4DmaData*>(restored.data()));
+                ExecuteDma(Core::NativeSync::DecodeDma(restored.data()));
             } else if (opcode == 0x46) {
                 // the occlusion query's Z pass dump (E5: it travels as a sync tag, not as a raw packet). With real queries it only names the result block
                 // (the begin dumps to the block, the end to the block + 8); the answer is written when the graphics card has counted
                 if (Core::NativeOcclusion::Enabled()) {
-                    occlusion_dump_address = static_cast<VAddr>(restored[2] & 0xfffffff8u) | static_cast<VAddr>(restored[3] & 0xffu) << 32;
+                    occlusion_dump_address = static_cast<VAddr>(Core::NativeSync::DecodeEventAddress(restored.data()));
                 } else {
-                    ExecuteEventWrite(reinterpret_cast<const PM4Header*>(restored.data()));
+                    FakeOcclusionDump(static_cast<VAddr>(Core::NativeSync::DecodeEventAddress(restored.data())));
                 }
             } else if (opcode == 0x69) {
                 // DB_COUNT_CONTROL: 0x11000102 begins the counting of an occlusion query, 0x11000100 ends it
@@ -764,7 +764,7 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
                     }
                 }
             } else if (opcode == 0x3c) {
-                auto task = DirectWait(*reinterpret_cast<const PM4CmdWaitRegMem*>(restored.data()));
+                auto task = DirectWait(Core::NativeSync::DecodeWait(restored.data()));
                 RESUME_GFX(task);
                 while (!task.handle.done()) {
                     YIELD_GFX();
