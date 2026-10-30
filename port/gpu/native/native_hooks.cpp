@@ -1,0 +1,926 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <span>
+#include <string>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <fmt/ranges.h>
+#include <nlohmann/json.hpp>
+#include <Zydis/Zydis.h>
+#include <xbyak/xbyak.h>
+#include "common/decoder.h"
+#include "common/logging/log.h"
+#include "common/memory_patcher.h"
+#include "common/path_util.h"
+#include "core/cpu_patches.h"
+#include "native/native_debug_server.h"
+#include "native/native_timeline.h"
+#include "native/native_hooks.h"
+#include "native/native_draw.h"
+#include "core/memory.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+using namespace Xbyak::util;
+
+namespace Core::GuestHooks {
+
+namespace {
+
+constexpr u64 RingHeaderSize = 64;
+constexpr u64 RingEntrySize = 64;
+constexpr size_t MinDisplacedBytes = 5; // size of a near jump
+constexpr size_t MaxDisplacedBytes = 15;
+
+enum class Mode { Count, Args, Snap, Call, Mid };
+
+struct Deref {
+    u32 reg{};  // index into rdi, rsi, rdx, rcx, r8, r9
+    u64 offset{};
+    u32 size{}; // 1, 2, 4 or 8
+};
+
+struct Hook {
+    std::string name;
+    std::vector<Deref> derefs;
+    std::vector<Deref> snaps; ///< Mode Snap: values read at call time from [reg + offset].
+    u64 entry_size{RingEntrySize};
+    u64 handler{}; ///< Mode Call: address of the host function (PS4_SYSV_ABI).
+    u64 original_call{}; ///< Mode Call: entry that runs the guest function itself (displaced instructions, then the body).
+    u64 offset{};
+    Mode mode{Mode::Count};
+    u8* entry{};
+
+    // header (64 bytes): u64 index, then for "args" hooks the ring of 64-byte entries:
+    //   rdi rsi rdx rcx r8 r9 ret seq
+    std::unique_ptr<u8[]> storage;
+    u8* header{};
+    u64 ring_entries{};
+    u64 last_count{};
+
+    std::atomic<u64>* counter() const {
+        return reinterpret_cast<std::atomic<u64>*>(header);
+    }
+};
+
+std::vector<std::unique_ptr<Hook>> hooks;
+/// set when InstallForEboot is done: the present thread's OnFrame reads `hooks` only after (it grew under OnFrame and crashed it once, 2026-10-29)
+std::atomic<bool> hooks_ready{false};
+std::ofstream counts_file;
+std::ofstream args_file;
+std::ofstream deref_file;
+std::ofstream snap_file;
+std::ofstream fault_file;
+bool log_csv = false; ///< "log_csv" in the hook file: write the per frame csv files (large, for investigations)
+std::atomic<u64> frame_index{0};
+
+// Write faults seen by the fault handler: {frame, address}, drained once per frame.
+constexpr u64 FaultRingSize = 1u << 20;
+struct FaultRecord {
+    std::atomic<u64> frame{~0ull};
+    std::atomic<u64> address{};
+    std::atomic<u64> rip{};
+    std::atomic<u64> size{};
+    std::atomic<u64> stack[3]{};
+};
+thread_local u64 current_fault_rip = 0;
+thread_local u64 current_fault_stack[3] = {};
+std::unique_ptr<FaultRecord[]> fault_ring;
+std::atomic<u64> fault_head{0};
+u64 fault_tail = 0;
+
+std::filesystem::path ConfigPath() {
+    const auto& serial = MemoryPatcher::g_game_serial;
+    return Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (serial + ".hooks.json");
+}
+
+u64 ParseHex(const nlohmann::json& value) {
+    if (value.is_number_unsigned()) {
+        return value.get<u64>();
+    }
+    return std::stoull(value.get<std::string>(), nullptr, 16);
+}
+
+/// Decodes whole instructions from `code` until at least MinDisplacedBytes are covered. Returns 0 if
+/// an instruction cannot be copied to another address unchanged.
+size_t DisplacedLength(const u8* code, std::string& why) {
+    size_t length = 0;
+    while (length < MinDisplacedBytes) {
+        ZydisDecodedInstruction inst;
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        const auto status = Common::Decoder::Instance()->decodeInstruction(
+            inst, operands, const_cast<u8*>(code) + length, MaxDisplacedBytes);
+        if (!ZYAN_SUCCESS(status)) {
+            why = "cannot decode instruction at +" + std::to_string(length);
+            return 0;
+        }
+        if ((inst.attributes & ZYDIS_ATTRIB_IS_RELATIVE) != 0) {
+            why = "relative operand at +" + std::to_string(length);
+            return 0;
+        }
+        switch (inst.meta.category) {
+        case ZYDIS_CATEGORY_CALL:
+        case ZYDIS_CATEGORY_COND_BR:
+        case ZYDIS_CATEGORY_UNCOND_BR:
+        case ZYDIS_CATEGORY_RET:
+        case ZYDIS_CATEGORY_INTERRUPT:
+        case ZYDIS_CATEGORY_SYSCALL:
+            why = "branch or call at +" + std::to_string(length);
+            return 0;
+        default:
+            break;
+        }
+        length += inst.length;
+        if (length > MaxDisplacedBytes) {
+            why = "displaced bytes exceed the limit";
+            return 0;
+        }
+    }
+    return length;
+}
+
+/// Stub for a counter-only hook: lock inc [header].
+void EmitCountStub(Xbyak::CodeGenerator& c, const Hook& hook) {
+    c.pushfq();
+    c.push(r10);
+    c.mov(r10, reinterpret_cast<u64>(hook.header));
+    c.lock();
+    c.inc(qword[r10]);
+    c.pop(r10);
+    c.popfq();
+}
+
+/// Stub for an argument-recording hook. Takes a slot with lock xadd, stores rdi..r9 and the return
+/// address, and publishes the sequence number last.
+void EmitArgsStub(Xbyak::CodeGenerator& c, const Hook& hook) {
+    c.pushfq();
+    c.push(rax);
+    c.push(r10);
+    c.push(r11);
+    c.mov(r10, reinterpret_cast<u64>(hook.header));
+    c.mov(r11d, 1);
+    c.lock();
+    c.xadd(qword[r10], r11); // r11 = sequence number of this call
+    c.mov(rax, r11);
+    c.and_(rax, static_cast<uint32_t>(hook.ring_entries - 1));
+    c.shl(rax, hook.entry_size == 128 ? 7 : 6);
+    c.lea(r10, ptr[r10 + rax + RingHeaderSize]);
+    c.mov(ptr[r10 + 0], rdi);
+    c.mov(ptr[r10 + 8], rsi);
+    c.mov(ptr[r10 + 16], rdx);
+    c.mov(ptr[r10 + 24], rcx);
+    c.mov(ptr[r10 + 32], r8);
+    c.mov(ptr[r10 + 40], r9);
+    c.mov(rax, ptr[rsp + 32]); // return address: [r11][r10][rax][flags][ret]
+    c.mov(ptr[r10 + 48], rax);
+    // Snap mode: values read from the objects the arguments point to, at call time.
+    static const Xbyak::Reg64* const arg_regs[] = {&rdi, &rsi, &rdx, &rcx, &r8, &r9};
+    for (size_t i = 0; i < hook.snaps.size(); ++i) {
+        const auto& snap = hook.snaps[i];
+        const auto& base = *arg_regs[snap.reg];
+        const int disp = static_cast<int>(snap.offset);
+        if (snap.size == 8) {
+            c.mov(rax, ptr[base + disp]);
+        } else if (snap.size == 4) {
+            c.mov(eax, ptr[base + disp]);
+        } else if (snap.size == 2) {
+            c.movzx(eax, word[base + disp]);
+        } else {
+            c.movzx(eax, byte[base + disp]);
+        }
+        c.mov(ptr[r10 + 64 + 8 * static_cast<int>(i)], rax);
+    }
+    c.mov(ptr[r10 + 56], r11); // publish
+    c.pop(r11);
+    c.pop(r10);
+    c.pop(rax);
+    c.popfq();
+}
+
+/// Stub for a hook that calls a host function: saves the caller-saved registers and the argument registers, calls
+/// handler(rdi, rsi, rdx, rcx, r8, r9, return address, rsp of the caller). A non-zero result skips the hooked function (the stub
+/// returns to its caller; with bit 63 set the rest of the result is returned as its value); zero runs the displaced instructions and continues in the function.
+void EmitCallStub(Xbyak::CodeGenerator& c, Hook& hook, const u8* original, size_t displaced,
+                  const u8* resume) {
+    Xbyak::Label handled;
+    const auto save = [&] {
+        c.pushfq();
+        c.push(rax);
+        c.push(rcx);
+        c.push(rdx);
+        c.push(rsi);
+        c.push(rdi);
+        c.push(r8);
+        c.push(r9);
+        c.push(r10);
+        c.push(r11);
+        // 16 bytes for the seventh and eighth argument, 128 bytes for xmm0-7; with the 80 bytes above and the
+        // return address, rsp is 16-byte aligned at the call.
+        c.sub(rsp, 152);
+        for (int i = 0; i < 8; ++i) {
+            c.movdqu(ptr[rsp + 16 + 16 * i], Xbyak::Xmm(i));
+        }
+    };
+    const auto restore = [&] {
+        for (int i = 0; i < 8; ++i) {
+            c.movdqu(Xbyak::Xmm(i), ptr[rsp + 16 + 16 * i]);
+        }
+        c.add(rsp, 152);
+        c.pop(r11);
+        c.pop(r10);
+        c.pop(r9);
+        c.pop(r8);
+        c.pop(rdi);
+        c.pop(rsi);
+        c.pop(rdx);
+        c.pop(rcx);
+        c.pop(rax);
+        c.popfq();
+    };
+    save();
+    c.mov(rax, ptr[rsp + 152 + 80]); // return address of the hooked function
+    c.mov(ptr[rsp], rax);
+    c.lea(rax, ptr[rsp + 152 + 80 + 8]); // rsp of the caller (after the return)
+    c.mov(ptr[rsp + 8], rax);
+    c.mov(rax, hook.handler);
+    c.call(rax);
+    c.test(rax, rax);
+    c.jnz(handled, Xbyak::CodeGenerator::T_NEAR);
+    restore();
+    c.db(original, displaced);
+    c.jmp(resume, Xbyak::CodeGenerator::T_NEAR);
+    c.L(handled);
+    // a result with bit 63 set is also the return value of the skipped function (the saved rax is replaced)
+    Xbyak::Label plain;
+    c.mov(r10, 0x8000000000000000ull);
+    c.test(rax, r10);
+    c.jz(plain);
+    c.btr(rax, 63);
+    c.mov(ptr[rsp + 152 + 64], rax);
+    c.L(plain);
+    restore();
+    c.ret();
+    hook.original_call = c.getCurr<u64>();
+    c.db(original, displaced);
+    c.jmp(resume, Xbyak::CodeGenerator::T_NEAR);
+}
+
+/// Mode Mid (see MidContext). The stub keeps the interrupted code's registers in a MidContext on its stack: 128 bytes of red zone are skipped, a slot for the continue address,
+/// flags and the fifteen registers, rip and rsp, the sixteen ymm registers; the handler is called with the stack aligned and a pointer to the context in rdi.
+void EmitMidStub(Xbyak::CodeGenerator& c, Hook& hook, const u8* original, size_t displaced, const u8* resume) {
+    constexpr int YmmBytes = 16 * 32;
+    constexpr int Fields = 16;       // rip, rsp
+    constexpr int RegsAndFlags = 128; // fifteen registers and the flags
+    constexpr int Slot = 8;
+    constexpr int RedZone = 128;
+    constexpr int ContinueSlotInContext = YmmBytes + Fields + RegsAndFlags; // the slot below the interrupted rsp's red zone, from the context
+    Xbyak::Label take;
+    const auto save = [&] {
+        c.lea(rsp, ptr[rsp - (RedZone + Slot)]);
+        c.pushfq();
+        c.push(rax);
+        c.push(rcx);
+        c.push(rdx);
+        c.push(rbx);
+        c.push(rbp);
+        c.push(rsi);
+        c.push(rdi);
+        c.push(r8);
+        c.push(r9);
+        c.push(r10);
+        c.push(r11);
+        c.push(r12);
+        c.push(r13);
+        c.push(r14);
+        c.push(r15);
+        c.sub(rsp, Fields + YmmBytes);
+        for (int i = 0; i < 16; ++i) {
+            c.vmovups(ptr[rsp + 32 * i], Xbyak::Ymm(i));
+        }
+        c.mov(rax, reinterpret_cast<u64>(hook.entry));
+        c.mov(ptr[rsp + YmmBytes], rax);
+        c.lea(rax, ptr[rsp + (YmmBytes + Fields + RegsAndFlags + Slot + RedZone)]);
+        c.mov(ptr[rsp + YmmBytes + 8], rax);
+    };
+    const auto restore = [&] {
+        for (int i = 0; i < 16; ++i) {
+            c.vmovups(Xbyak::Ymm(i), ptr[rsp + 32 * i]);
+        }
+        c.add(rsp, Fields + YmmBytes);
+        c.pop(r15);
+        c.pop(r14);
+        c.pop(r13);
+        c.pop(r12);
+        c.pop(r11);
+        c.pop(r10);
+        c.pop(r9);
+        c.pop(r8);
+        c.pop(rdi);
+        c.pop(rsi);
+        c.pop(rbp);
+        c.pop(rbx);
+        c.pop(rdx);
+        c.pop(rcx);
+        c.pop(rax);
+        c.popfq();
+    };
+    save();
+    c.mov(r12, rsp); // the context; r12 is callee saved
+    c.mov(rdi, rsp);
+    c.and_(rsp, -16);
+    c.mov(rax, hook.handler);
+    c.call(rax);
+    c.mov(rsp, r12);
+    c.test(rax, rax);
+    c.jnz(take, Xbyak::CodeGenerator::T_NEAR);
+    restore();
+    c.add(rsp, RedZone + Slot);
+    c.db(original, displaced);
+    c.jmp(resume, Xbyak::CodeGenerator::T_NEAR);
+    c.L(take);
+    c.mov(ptr[rsp + ContinueSlotInContext], rax);
+    restore();
+    c.ret(RedZone);
+}
+
+bool InstallHook(Hook& hook, u8* image_base, u64 image_size) {
+    if (hook.offset + 16 > image_size) {
+        LOG_ERROR(Core, "guest hook '{}': offset {:#x} is outside the image", hook.name, hook.offset);
+        return false;
+    }
+    u8* entry = image_base + hook.offset;
+    std::string why;
+    const size_t displaced = DisplacedLength(entry, why);
+    if (displaced == 0) {
+        LOG_ERROR(Core, "guest hook '{}' at {:#x} refused: {}", hook.name, hook.offset, why);
+        return false;
+    }
+    u8 original[MaxDisplacedBytes];
+    std::memcpy(original, entry, displaced);
+    LOG_INFO(Core, "guest hook '{}' code bytes {}", hook.name, fmt::format("{:02x}", fmt::join(std::span<const u8>{entry, 8}, "")));
+
+    const u64 storage_size =
+        RingHeaderSize +
+        (hook.mode == Mode::Snap || hook.mode == Mode::Args ? hook.ring_entries * hook.entry_size : 0) + 64;
+    hook.storage = std::make_unique<u8[]>(storage_size);
+    std::memset(hook.storage.get(), 0, storage_size);
+    const auto raw = reinterpret_cast<u64>(hook.storage.get());
+    hook.header = reinterpret_cast<u8*>((raw + 63) & ~u64{63});
+
+    const u8* stub = nullptr;
+    const bool emitted = EmitInTrampolineArea(entry, [&](Xbyak::CodeGenerator& c) {
+        stub = c.getCurr<const u8*>();
+        if (hook.mode == Mode::Call) {
+            EmitCallStub(c, hook, original, displaced, entry + displaced);
+            return true;
+        }
+        if (hook.mode == Mode::Mid) {
+            hook.entry = entry;
+            EmitMidStub(c, hook, original, displaced, entry + displaced);
+            return true;
+        }
+        if (hook.mode != Mode::Count) {
+            EmitArgsStub(c, hook);
+        } else {
+            EmitCountStub(c, hook);
+        }
+        c.db(original, displaced);
+        c.jmp(entry + displaced, Xbyak::CodeGenerator::T_NEAR);
+        return true;
+    });
+    if (!emitted) {
+        LOG_ERROR(Core, "guest hook '{}': no room in the trampoline area", hook.name);
+        return false;
+    }
+
+    const s64 rel = reinterpret_cast<s64>(stub) - reinterpret_cast<s64>(entry + 5);
+    if (rel < INT32_MIN || rel > INT32_MAX) {
+        LOG_ERROR(Core, "guest hook '{}': trampoline is out of near-jump range", hook.name);
+        return false;
+    }
+    u8 patch[MaxDisplacedBytes];
+    patch[0] = 0xE9;
+    const auto rel32 = static_cast<s32>(rel);
+    std::memcpy(&patch[1], &rel32, sizeof(rel32));
+    std::memset(&patch[5], 0x90, displaced - 5);
+    std::memcpy(entry, patch, displaced);
+#ifdef _WIN32
+    FlushInstructionCache(GetCurrentProcess(), entry, displaced);
+#endif
+    hook.entry = entry;
+    LOG_INFO(Core, "guest hook '{}' installed at {:#x} ({} bytes displaced, mode {})", hook.name,
+             reinterpret_cast<u64>(entry), displaced, hook.mode == Mode::Call   ? "call"
+                 : hook.mode == Mode::Mid  ? "mid"
+                 : hook.mode == Mode::Snap ? "snap"
+                 : hook.mode == Mode::Args ? "args"
+                                           : "count");
+    return true;
+}
+
+// ---- Frame profiler spans (documents/tlg/frame-profiler.md) ----
+// A spans file (<serial>.spans.json in the custom configs folder) lists guest functions that are reached through a vtable slot: the slot is pointed at a small stub
+// that records the function's start and end into the frame timeline capture while a capture runs. With no capture running the stub costs two calls that return at
+// once. Entries: {"name": "...", "slot": ghidra address of the vtable slot, "target": ghidra address of the function the slot holds}; the slot must hold the target
+// or the entry is refused.
+u64 PS4_SYSV_ABI SpanEnter(u64 id) {
+    return FrameTimeline::capture_active.load(std::memory_order_relaxed) ? FrameTimeline::Now() : 0;
+}
+
+void PS4_SYSV_ABI SpanExit(u64 id, u64 start) {
+    if (start != 0) {
+        const u64 end = FrameTimeline::Now();
+        FrameTimeline::Record(FrameTimeline::GuestSpan, (end - start) | (id << 48), end, start);
+    }
+}
+
+std::vector<std::string> span_names_installed;
+VAddr stub_area_base = 0;
+
+u64 ExitStubImpl(u64 handler) {
+    static std::mutex mutex;
+    static std::unordered_map<u64, u64> stubs;
+    std::lock_guard lock{mutex};
+    if (const auto it = stubs.find(handler); it != stubs.end()) {
+        return it->second;
+    }
+    u64 address = 0;
+    const bool emitted = EmitInTrampolineArea(reinterpret_cast<const void*>(stub_area_base), [&](Xbyak::CodeGenerator& c) {
+        address = c.getCurr<u64>();
+        // Reached by the `ret` of the hooked function: rsp is 16 byte aligned here. Layout: [xmm0, xmm1 (32)] [flags] [rdx] [rax] [slot for the original return address].
+        c.sub(rsp, 8);
+        c.push(rax);
+        c.push(rdx);
+        c.pushfq();
+        c.sub(rsp, 32);
+        c.movdqu(ptr[rsp], xmm0);
+        c.movdqu(ptr[rsp + 16], xmm1);
+        c.mov(rax, handler);
+        c.call(rax);
+        c.mov(ptr[rsp + 56], rax);
+        c.movdqu(xmm0, ptr[rsp]);
+        c.movdqu(xmm1, ptr[rsp + 16]);
+        c.add(rsp, 32);
+        c.popfq();
+        c.pop(rdx);
+        c.pop(rax);
+        c.ret();
+        return true;
+    });
+    stubs[handler] = emitted ? address : 0;
+    return stubs[handler];
+}
+
+void InstallSpans(VAddr base, u64 image_size) {
+    const auto path = Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (MemoryPatcher::g_game_serial + ".spans.json");
+    if (!std::filesystem::exists(path)) {
+        return;
+    }
+    nlohmann::json config;
+    try {
+        std::ifstream in(path);
+        in >> config;
+    } catch (const std::exception& e) {
+        LOG_ERROR(Core, "frame profiler spans: cannot read {}: {}", path.string(), e.what());
+        return;
+    }
+    u32 installed = 0;
+    try {
+        const u64 ghidra_base = config.contains("ghidra_image_base") ? ParseHex(config.at("ghidra_image_base")) : 0x1000000;
+        for (const auto& item : config.at("spans")) {
+            const auto name = item.at("name").get<std::string>();
+            const u64 slot_offset = ParseHex(item.at("slot")) - ghidra_base;
+            const u64 target_offset = ParseHex(item.at("target")) - ghidra_base;
+            if (slot_offset + 8 > image_size || target_offset >= image_size) {
+                LOG_ERROR(Core, "frame profiler span '{}': outside the image", name);
+                continue;
+            }
+            auto* slot = reinterpret_cast<u64*>(base + slot_offset);
+            const u64 original = base + target_offset;
+            if (*slot != original) {
+                LOG_ERROR(Core, "frame profiler span '{}': the slot holds {:#x}, expected {:#x}: skipped", name, *slot, original);
+                continue;
+            }
+            const u32 id = static_cast<u32>(span_names_installed.size());
+            const u8* stub = nullptr;
+            const bool emitted = EmitInTrampolineArea(reinterpret_cast<const void*>(original), [&](Xbyak::CodeGenerator& c) {
+                stub = c.getCurr<const u8*>();
+                // Entry: rsp is 8 mod 16. Eight pushes keep it 8 mod 16, the sub makes it 16 aligned for the calls.
+                c.push(rbx);
+                c.push(r12);
+                c.push(rdi);
+                c.push(rsi);
+                c.push(rdx);
+                c.push(rcx);
+                c.push(r8);
+                c.push(r9);
+                c.sub(rsp, 8);
+                c.mov(r12d, id);
+                c.mov(edi, r12d);
+                c.mov(rax, reinterpret_cast<u64>(&SpanEnter));
+                c.call(rax);
+                c.mov(rbx, rax);
+                c.add(rsp, 8);
+                c.pop(r9);
+                c.pop(r8);
+                c.pop(rcx);
+                c.pop(rdx);
+                c.pop(rsi);
+                c.pop(rdi);
+                c.sub(rsp, 8);
+                c.mov(rax, original);
+                c.call(rax); // the function itself, with the caller's own argument registers
+                c.mov(edi, r12d);
+                c.mov(rsi, rbx);
+                c.mov(rax, reinterpret_cast<u64>(&SpanExit));
+                c.call(rax);
+                c.add(rsp, 8);
+                c.pop(r12);
+                c.pop(rbx);
+                c.ret();
+                return true;
+            });
+            if (!emitted) {
+                LOG_ERROR(Core, "frame profiler span '{}': no room in the trampoline area", name);
+                continue;
+            }
+#ifdef _WIN32
+            DWORD old = 0;
+            VirtualProtect(slot, 8, PAGE_READWRITE, &old);
+            *slot = reinterpret_cast<u64>(stub);
+            VirtualProtect(slot, 8, old, &old);
+#else
+            *slot = reinterpret_cast<u64>(stub);
+#endif
+            span_names_installed.push_back(name);
+            FrameTimeline::RegisterSpan(id, name);
+            ++installed;
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR(Core, "frame profiler spans: bad file {}: {}", path.string(), e.what());
+    }
+    LOG_WARNING(Core, "frame profiler: {} spans installed from {}", installed, path.filename().string());
+}
+
+} // namespace
+
+u64 ExitStub(u64 exit_handler) {
+    return ExitStubImpl(exit_handler);
+}
+
+void InstallForEboot(VAddr base, u64 image_size) {
+    struct ReadyAtExit {
+        ~ReadyAtExit() {
+            hooks_ready.store(true, std::memory_order_release);
+        }
+    } ready_at_exit;
+    NativeDraw::SetImageBase(base);
+    stub_area_base = base;
+    InstallSpans(base, image_size);
+    const auto path = ConfigPath();
+    if (!std::filesystem::exists(path)) {
+        return;
+    }
+    nlohmann::json config;
+    try {
+        std::ifstream in(path);
+        in >> config;
+    } catch (const std::exception& e) {
+        LOG_ERROR(Core, "guest hooks: cannot read {}: {}", path.string(), e.what());
+        return;
+    }
+
+    try {
+        const u64 ghidra_base = config.contains("ghidra_image_base")
+                                    ? ParseHex(config.at("ghidra_image_base"))
+                                    : 0x1000000;
+        log_csv = config.value("log_csv", false);
+        u64 ring_entries = config.value("ring_entries", u64{16384});
+        if (ring_entries < 16 || (ring_entries & (ring_entries - 1)) != 0 ||
+            ring_entries > (1u << 24)) {
+            LOG_WARNING(Core, "guest hooks: ring_entries must be a power of two in 16..16M, using 16384");
+            ring_entries = 16384;
+        }
+
+        // The hook file is made for one build of the game's code: where an entry names the bytes the code must have, all of them must match.
+        u32 mismatches = 0;
+        for (const auto& item : config.at("hooks")) {
+            if (!item.contains("expect")) {
+                continue;
+            }
+            const auto address = item.contains("ghidra") ? ParseHex(item.at("ghidra")) - ghidra_base : ParseHex(item.at("offset"));
+            const auto expect = item.at("expect").get<std::string>();
+            std::string found;
+            if (address + expect.size() / 2 <= image_size) {
+                found = fmt::format("{:02x}", fmt::join(std::span<const u8>{reinterpret_cast<const u8*>(base) + address, expect.size() / 2}, ""));
+            }
+            if (found != expect) {
+                if (mismatches++ < 3) {
+                    LOG_ERROR(Core, "guest hooks: '{}' expects the code bytes {} at {:#x}, the game has {}", item.value("name", std::string()),
+                              expect, address, found);
+                }
+            }
+        }
+        if (mismatches != 0) {
+            LOG_ERROR(Core, "guest hooks: {} hooks do not match this build of the game (the hook file is made for The Last Guardian 1.03): no hook is installed",
+                      mismatches);
+            return;
+        }
+
+        u32 installed = 0;
+        u32 failed = 0;
+        for (const auto& item : config.at("hooks")) {
+            auto hook = std::make_unique<Hook>();
+            hook->name = item.at("name").get<std::string>();
+            if (item.contains("ghidra")) {
+                const u64 address = ParseHex(item.at("ghidra"));
+                if (address < ghidra_base) {
+                    LOG_ERROR(Core, "guest hook '{}': address below the image base", hook->name);
+                    ++failed;
+                    continue;
+                }
+                hook->offset = address - ghidra_base;
+            } else {
+                hook->offset = ParseHex(item.at("offset"));
+            }
+            {
+                const auto mode_name = item.value("mode", std::string("count"));
+                hook->mode = mode_name == "call"   ? Mode::Call
+                             : mode_name == "mid"  ? Mode::Mid
+                             : mode_name == "snap" ? Mode::Snap
+                             : mode_name == "args" ? Mode::Args
+                                                   : Mode::Count;
+            }
+            if (hook->mode == Mode::Call || hook->mode == Mode::Mid) {
+                hook->handler = NativeDraw::FindHandler(item.value("handler", std::string()));
+                if (hook->handler == 0) {
+                    LOG_ERROR(Core, "guest hook '{}': unknown handler '{}'", hook->name,
+                              item.value("handler", std::string()));
+                    ++failed;
+                    continue;
+                }
+            }
+            if (hook->mode == Mode::Snap && item.contains("snap")) {
+                static const char* const snap_reg_names[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+                hook->entry_size = 128;
+                for (const auto& d : item.at("snap")) {
+                    Deref snap;
+                    const auto name = d.at("reg").get<std::string>();
+                    snap.reg = 99;
+                    for (u32 i = 0; i < 6; ++i) {
+                        if (name == snap_reg_names[i]) {
+                            snap.reg = i;
+                        }
+                    }
+                    snap.offset = ParseHex(d.at("off"));
+                    snap.size = d.value("size", 8u);
+                    if (snap.reg == 99 ||
+                        (snap.size != 1 && snap.size != 2 && snap.size != 4 && snap.size != 8) ||
+                        snap.offset > 0x7fffffff || hook->snaps.size() >= 8) {
+                        LOG_ERROR(Core, "guest hook '{}': bad snap entry", hook->name);
+                        continue;
+                    }
+                    hook->snaps.push_back(snap);
+                }
+            }
+            if (item.contains("deref")) {
+                static const char* const reg_names[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+                for (const auto& d : item.at("deref")) {
+                    Deref deref;
+                    const auto name = d.at("reg").get<std::string>();
+                    deref.reg = 99;
+                    for (u32 i = 0; i < 6; ++i) {
+                        if (name == reg_names[i]) {
+                            deref.reg = i;
+                        }
+                    }
+                    deref.offset = ParseHex(d.at("off"));
+                    deref.size = d.value("size", 8u);
+                    if (deref.reg == 99 ||
+                        (deref.size != 1 && deref.size != 2 && deref.size != 4 && deref.size != 8) ||
+                        hook->derefs.size() >= 6) {
+                        LOG_ERROR(Core, "guest hook '{}': bad deref entry", hook->name);
+                        continue;
+                    }
+                    hook->derefs.push_back(deref);
+                }
+            }
+            hook->ring_entries = ring_entries;
+            if (InstallHook(*hook, reinterpret_cast<u8*>(base), image_size)) {
+                hooks.push_back(std::move(hook));
+                ++installed;
+            } else {
+                ++failed;
+            }
+        }
+        LOG_INFO(Core, "guest hooks: {} installed, {} failed ({})", installed, failed, path.string());
+    } catch (const std::exception& e) {
+        LOG_ERROR(Core, "guest hooks: bad configuration {}: {}", path.string(), e.what());
+    }
+
+    if (hooks.empty()) {
+        return;
+    }
+    if (!log_csv) {
+        return;
+    }
+    const auto log_dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
+    counts_file.open(log_dir / "guest_hooks.csv", std::ios::trunc);
+    counts_file << "frame,name,calls,total\n";
+    const bool any_args = std::any_of(hooks.begin(), hooks.end(), [](const auto& h) {
+        return h->mode == Mode::Args || h->mode == Mode::Snap;
+    });
+    if (std::any_of(hooks.begin(), hooks.end(),
+                    [](const auto& h) { return h->mode == Mode::Snap; })) {
+        snap_file.open(log_dir / "guest_hooks_snap.csv", std::ios::trunc);
+        snap_file << "frame,name,seq,ret,rdi,rsi,rdx,rcx,r8,r9,s0,s1,s2,s3,s4,s5,s6,s7\n";
+    }
+    if (any_args) {
+        args_file.open(log_dir / "guest_hooks_args.csv", std::ios::trunc);
+        args_file << "frame,name,seq,rdi,rsi,rdx,rcx,r8,r9,ret\n";
+    }
+    if (std::any_of(hooks.begin(), hooks.end(),
+                    [](const auto& h) { return !h->derefs.empty(); })) {
+        deref_file.open(log_dir / "guest_hooks_deref.csv", std::ios::trunc);
+        deref_file << "frame,name,seq,d0,d1,d2,d3,d4,d5\n";
+    }
+    fault_ring = std::make_unique<FaultRecord[]>(FaultRingSize);
+    fault_file.open(log_dir / "write_faults.csv", std::ios::trunc);
+    fault_file << "frame,page,npages,rip,st0,st1,st2\n";
+}
+
+u64 FaultRip() {
+    return current_fault_rip;
+}
+
+u64 FaultStack(u32 index) {
+    return index < 3 ? current_fault_stack[index] : 0;
+}
+
+void SetFaultRip(u64 rip, const u64* stack_words) {
+    current_fault_rip = rip;
+    for (int i = 0; i < 3; ++i) {
+        current_fault_stack[i] = stack_words ? stack_words[i] : 0;
+    }
+}
+
+void NoteWriteFault(VAddr address, u64 size) {
+    if (!fault_ring) {
+        return;
+    }
+    const u64 slot = fault_head.fetch_add(1, std::memory_order_relaxed) & (FaultRingSize - 1);
+    fault_ring[slot].address.store(address, std::memory_order_relaxed);
+    fault_ring[slot].rip.store(current_fault_rip, std::memory_order_relaxed);
+    fault_ring[slot].size.store(size, std::memory_order_relaxed);
+    for (int i = 0; i < 3; ++i) {
+        fault_ring[slot].stack[i].store(current_fault_stack[i], std::memory_order_relaxed);
+    }
+    fault_ring[slot].frame.store(frame_index.load(std::memory_order_relaxed),
+                                 std::memory_order_release);
+}
+
+u64 OriginalEntry(const char* name) {
+    for (const auto& hook : hooks) {
+        if (hook->name == name) {
+            return hook->original_call;
+        }
+    }
+    return 0;
+}
+
+bool IsActive() {
+    return !hooks.empty();
+}
+
+void OnFrame() {
+    if (!hooks_ready.load(std::memory_order_acquire) || hooks.empty()) {
+        return;
+    }
+    const u64 frame = frame_index.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Write faults of the frame that just ended, one line per page.
+    if (fault_ring) {
+        const u64 head = fault_head.load(std::memory_order_acquire);
+        if (head - fault_tail > FaultRingSize) {
+            fault_tail = head - FaultRingSize;
+        }
+        std::unordered_set<u64> seen;
+        for (u64 i = fault_tail; i < head; ++i) {
+            const auto& record = fault_ring[i & (FaultRingSize - 1)];
+            const u64 fault_frame = record.frame.load(std::memory_order_acquire);
+            if (fault_frame == ~0ull) {
+                continue;
+            }
+            const u64 address = record.address.load(std::memory_order_relaxed);
+            const u64 page = address & ~u64{0xFFF};
+            const u64 size = record.size.load(std::memory_order_relaxed);
+            const u64 rip = record.rip.load(std::memory_order_relaxed);
+            const u64 npages = ((address + (size ? size : 1) - 1) >> 12) - (address >> 12) + 1;
+            if (seen.insert(page ^ (fault_frame << 52) ^ (npages << 40)).second) {
+                fault_file << fault_frame << ',' << std::hex << page << ',' << npages << ',' << rip;
+                for (int i = 0; i < 3; ++i) {
+                    fault_file << ',' << record.stack[i].load(std::memory_order_relaxed);
+                }
+                fault_file << std::dec << '\n';
+            }
+        }
+        fault_tail = head;
+    }
+    nlohmann::json published_calls = nlohmann::json::object();
+    for (auto& hook : hooks) {
+        const u64 total = hook->counter()->load(std::memory_order_relaxed);
+        const u64 delta = total - hook->last_count;
+        published_calls[hook->name] = {{"calls_last_frame", delta}, {"total", total}};
+        if (delta != 0 && counts_file.is_open()) {
+            counts_file << frame << ',' << hook->name << ',' << delta << ',' << total << '\n';
+        }
+        if ((hook->mode == Mode::Args || hook->mode == Mode::Snap) && args_file.is_open() && delta != 0) {
+            const u64 first =
+                total - hook->last_count > hook->ring_entries ? total - hook->ring_entries
+                                                              : hook->last_count;
+            for (u64 seq = first; seq < total; ++seq) {
+                const u64 slot = seq & (hook->ring_entries - 1);
+                const auto* entry = reinterpret_cast<const volatile u64*>(
+                    hook->header + RingHeaderSize + slot * hook->entry_size);
+                u64 values[16];
+                for (u64 i = 0; i < hook->entry_size / 8; ++i) {
+                    values[i] = entry[i];
+                }
+                if (values[7] != seq) {
+                    continue; // not published yet, or overwritten
+                }
+                if (hook->mode == Mode::Snap && snap_file.is_open()) {
+                    snap_file << frame << ',' << hook->name << ',' << seq << std::hex << ',' << values[6];
+                    for (size_t r = 0; r < 6; ++r) {
+                        snap_file << ',' << values[r];
+                    }
+                    for (size_t s = 0; s < 8; ++s) {
+                        snap_file << ',';
+                        if (s < hook->snaps.size()) {
+                            snap_file << values[8 + s];
+                        }
+                    }
+                    snap_file << std::dec << '\n';
+                    continue; // snap hooks do not write the argument file
+                }
+                args_file << frame << ',' << hook->name << ',' << seq;
+                args_file << std::hex;
+                for (int i = 0; i < 7; ++i) {
+                    args_file << ',' << values[i];
+                }
+                args_file << std::dec << '\n';
+                if (!hook->derefs.empty() && deref_file.is_open()) {
+                    deref_file << frame << ',' << hook->name << ',' << seq << std::hex;
+                    for (size_t d = 0; d < 6; ++d) {
+                        deref_file << ',';
+                        if (d >= hook->derefs.size()) {
+                            continue;
+                        }
+                        const auto& deref = hook->derefs[d];
+                        const u64 address = values[deref.reg] + deref.offset;
+                        u64 value = ~0ull;
+                        if (values[deref.reg] != 0 &&
+                            Core::Memory::Instance()->IsValidMapping(address, deref.size)) {
+                            value = 0;
+                            std::memcpy(&value, reinterpret_cast<const void*>(address), deref.size);
+                        }
+                        deref_file << value;
+                    }
+                    deref_file << std::dec << '\n';
+                }
+            }
+        }
+        hook->last_count = total;
+    }
+    DebugServer::Publish("hooks", std::move(published_calls));
+    if (frame == 600) {
+        for (const auto& hook : hooks) {
+            LOG_INFO(Core, "guest hooks, total calls after 600 frames: {} = {}", hook->name,
+                     hook->counter()->load(std::memory_order_relaxed));
+        }
+    }
+    if (frame % 60 == 0 && counts_file.is_open()) {
+        counts_file.flush();
+        if (args_file.is_open()) {
+            args_file.flush();
+        }
+        if (deref_file.is_open()) {
+            deref_file.flush();
+        }
+        fault_file.flush();
+        if (snap_file.is_open()) {
+            snap_file.flush();
+        }
+    }
+}
+
+} // namespace Core::GuestHooks

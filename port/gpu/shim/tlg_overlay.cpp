@@ -14,7 +14,7 @@
 #include <vector>
 
 #include <SDL3/SDL.h>
-#include "core/frame_timeline.h"
+#include "native/native_timeline.h"
 #include "tlg_settings.h"
 #include "tlg_orbs.h"
 #include "tlg_actors.h"

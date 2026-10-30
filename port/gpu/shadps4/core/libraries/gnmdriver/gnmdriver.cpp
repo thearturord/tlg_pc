@@ -4,10 +4,10 @@
 #include <chrono>
 #include <map>
 #include <mutex>
-#include "core/stream_probe.h"
-#include "core/stream_submit.h"
-#include "core/frame_timeline.h"
-#include "core/native_draw.h"
+#include "native/native_stream_probe.h"
+#include "native/native_stream_submit.h"
+#include "native/native_timeline.h"
+#include "native/native_draw.h"
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -29,8 +29,8 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
-#include "video_core/native_draw_tag.h"
-#include "video_core/readback_policy.h"
+#include "native/native_draw_tag.h"
+#include "native/native_readback_policy.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "tlg_freeze.h"
 

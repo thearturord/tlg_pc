@@ -4,7 +4,7 @@
 #pragma once
 
 #include "video_core/amdgpu/cb_db_extent.h"
-#include "video_core/readback_policy.h"
+#include "native/native_readback_policy.h"
 
 #include "video_core/amdgpu/draw_state.h"
 #include <deque>
@@ -14,14 +14,14 @@
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "common/unique_function.h"
-#include "video_core/native_draw_tag.h"
+#include "native/native_draw_tag.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include <span>
 #include <string>
-#include "core/native_device.h"
-#include "core/native_draw.h"
-#include "core/native_uploads.h"
+#include "native/native_device.h"
+#include "native/native_draw.h"
+#include "native/native_uploads.h"
 #include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "video_core/renderer_vulkan/vk_constant_ring.h"
@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "native/native_occlusion.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -269,6 +270,9 @@ public:
     void EngineObjectDeleted(u64 id, VAddr address, u64 bytes, u32 what);
     /// B11: the engine clear whose packets the raster thread is running now (null: none); the record is copied
     void SetEngineClear(const Core::NativeDevice::ClearRecord* record);
+    /// Real occlusion queries (native/native_occlusion.h): the game begins / ends the counting for the result block at `address`
+    void OcclusionOpen(VAddr address, u32 pairs);
+    void OcclusionClose(VAddr address);
     /// B11 step 3: the clear as a Vulkan clear of the target's own images; false when it cannot (the old path runs)
     bool NativeClear(const Core::NativeDevice::ClearRecord& record);
     /// B11 step 3: true when the work at hand belongs to an engine clear that ran natively (it is skipped)
@@ -531,6 +535,7 @@ private:
 
     const Instance& instance;
     Scheduler& scheduler;
+    std::unique_ptr<Core::NativeOcclusion::Queries> occlusion;
     std::unique_ptr<Scheduler::SideScope> side_scope;
     u32 side_windows{};
     bool side_requested{};

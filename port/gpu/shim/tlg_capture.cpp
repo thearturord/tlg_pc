@@ -19,7 +19,7 @@
 #include <vector>
 
 #include "tlg_capture.h"
-#include "core/native_light_recorder.h"
+#include "native/native_light_recorder.h"
 #include <fmt/format.h>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"

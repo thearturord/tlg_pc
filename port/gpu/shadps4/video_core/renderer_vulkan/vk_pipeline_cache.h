@@ -3,9 +3,9 @@
 
 #pragma once
 
-#include "core/native_binding.h"
-#include "core/native_draw.h"
-#include "core/native_resources.h"
+#include "native/native_binding.h"
+#include "native/native_draw.h"
+#include "native/native_resources.h"
 #include "video_core/amdgpu/draw_state.h"
 #include <functional>
 #include <memory>

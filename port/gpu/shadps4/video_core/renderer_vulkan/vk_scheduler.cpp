@@ -3,8 +3,8 @@
 
 #include <chrono>
 #include <thread>
-#include "core/frame_timeline.h"
-#include "core/native_pass.h"
+#include "native/native_timeline.h"
+#include "native/native_pass.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/logging/log.h"

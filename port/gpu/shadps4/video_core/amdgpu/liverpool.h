@@ -3,11 +3,11 @@
 
 #pragma once
 
-#include "core/native_direct.h"
-#include "core/native_draw.h"
+#include "native/native_direct.h"
+#include "native/native_draw.h"
 
-#include "video_core/native_draw_tag.h"
-#include "video_core/readback_policy.h"
+#include "native/native_draw_tag.h"
+#include "native/native_readback_policy.h"
 
 #include <source_location>
 #include <condition_variable>
@@ -461,6 +461,7 @@ private:
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
     u64 pixel_counter{};
+    VAddr occlusion_dump_address{}; ///< the result block address of the last occlusion query dump the command processor passed (native/native_occlusion.h)
 
     struct ConstantEngine {
         void Reset() {

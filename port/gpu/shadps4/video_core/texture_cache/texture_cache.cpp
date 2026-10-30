@@ -5,7 +5,9 @@
 #include <fstream>
 #include <limits>
 #include <xxhash.h>
-#include "video_core/untracked_ring.h"
+#include "native/native_census.h"
+#include "native/native_image_marks.h"
+#include "native/native_untracked_ring.h"
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -14,15 +16,15 @@
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
-#include "core/native_resources.h"
-#include "core/native_device.h"
-#include "core/native_updates.h"
-#include "core/native_write_watch.h"
-#include "core/resource_audit.h"
+#include "native/native_resources.h"
+#include "native/native_device.h"
+#include "native/native_updates.h"
+#include "native/native_write_watch.h"
+#include "native/native_resource_audit.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/readback_batch.h"
 #include "video_core/page_manager.h"
-#include "video_core/readback_policy.h"
+#include "native/native_readback_policy.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -39,7 +41,6 @@ static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_SAMPLERS = std::numeric_limits<u16>::max();
 
 namespace {
-constexpr u8 B8Fault = 1, B8Announced = 2, B8Owed = 4, B8Deleted = 8, B8Listed = 16; ///< Image::b8_marks
 enum ImageSite : u32 { SiteFind, SiteOverlap, SiteExpand, SiteStencil, NumImageSites };
 std::array<std::atomic<u64>, NumImageSites> images_created{};
 std::atomic<u64> images_freed{};
@@ -378,193 +379,6 @@ void TextureCache::InvalidatePagesWritten(VAddr addr, size_t size) {
     }
 }
 
-void TextureCache::NoteEngineTextureCreate(VAddr address, u64 bytes) {
-    Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8CreatedTextures);
-    ForEachImageInRegion(address, bytes, [&](ImageId, Image& image) {
-        if ((image.b8_marks & B8Listed) != 0) {
-            image.b8_marks &= ~B8Listed;
-            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8CreatedUnlisted);
-        }
-    });
-}
-
-void TextureCache::NoteEngineBufferCreate(u64 id, VAddr address, u64 bytes) {
-    if (Core::NativeUpdates::B8BufferImagesMode() == 0 || !buffers_known.insert(id).second) {
-        return;
-    }
-    auto& list = buffer_images[id];
-    ForEachImageInRegion(address, bytes, [&](ImageId image_id, Image& image) {
-        list.emplace_back(image_id, image.image_uid);
-        Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8BufListed);
-    });
-    if (list.empty()) {
-        buffer_images.erase(id);
-    }
-}
-
-bool TextureCache::BufferImagesIn(VAddr address, u64 size, SmallVector<ImageId, 8>& out) {
-    static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
-    parts.clear();
-    Core::NativeDevice::BuffersIn(address, size, parts);
-    if (parts.empty()) {
-        return false;
-    }
-    std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });
-    VAddr covered = address;
-    for (const auto& part : parts) {
-        if (part.begin > covered) {
-            return false;
-        }
-        covered = std::max(covered, part.end);
-    }
-    if (covered < address + size) {
-        return false;
-    }
-    for (const auto& part : parts) {
-        if (!buffers_known.contains(part.id)) {
-            // the buffer's creation is still queued (the guest thread made it, its announcements can come first): its older images are listed now
-            NoteEngineBufferCreate(part.id, part.object_begin, part.object_end - part.object_begin);
-        }
-        const auto it = buffer_images.find(part.id);
-        if (it == buffer_images.end()) {
-            continue;
-        }
-        auto& list = it->second;
-        list.erase(std::remove_if(list.begin(), list.end(),
-                                  [&](const auto& e) {
-                                      return !slot_images.IsAllocated(e.first) || slot_images[e.first].image_uid != e.second ||
-                                             False(slot_images[e.first].flags & ImageFlagBits::Registered);
-                                  }),
-                   list.end());
-        for (const auto& [image_id, uid] : list) {
-            if (slot_images[image_id].Overlaps(address, size) && std::ranges::find(out, image_id) == out.end()) {
-                out.push_back(image_id);
-            }
-        }
-    }
-    return true;
-}
-
-void TextureCache::EngineImagesIn(const std::vector<u64>& ids, VAddr address, u64 size, SmallVector<ImageId, 8>& out) const {
-    const auto add = [&](ImageId image_id, u64 uid) {
-        if (!slot_images.IsAllocated(image_id)) {
-            return;
-        }
-        const Image& image = slot_images[image_id];
-        if (image.image_uid != uid || False(image.flags & ImageFlagBits::Registered) || !image.Overlaps(address, size) ||
-            std::ranges::find(out, image_id) != out.end()) {
-            return;
-        }
-        out.push_back(image_id);
-    };
-    for (const u64 id : ids) {
-        if (const auto it = engine_images.find(id); it != engine_images.end()) {
-            for (const auto& [image_id, uid] : it->second) {
-                add(image_id, uid);
-            }
-        }
-        if (const auto it = engine_answers.find(id); it != engine_answers.end()) {
-            for (const auto& a : it->second) {
-                add(a.image_id, a.uid);
-            }
-        }
-    }
-}
-
-void TextureCache::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
-    if (engine_pending_clears.empty() && !AnyImageOverlaps(addr, size)) {
-        return; // no image in this memory (most announcements: buffer contents); the page table answers that in a few lookups
-    }
-    SmallVector<ImageId, 8> image_ids;
-    // B8.4: a range the engine's textures cover finds its images through them (their lists); B8.5: a range engine buffers cover, through the buffers' lists;
-    // only memory neither covers whole asks the page table
-    static thread_local std::vector<u64> ids;
-    ids.clear();
-    const bool covered_by_textures = Core::NativeDevice::TexturesIn(addr, size, ids);
-    if (!engine_pending_clears.empty()) {
-        // B11: a CPU write to a texture whose clear waits for its first image comes after the clear: the clear is gone
-        for (const u64 id : ids) {
-            engine_pending_clears.erase(id);
-        }
-    }
-    if (covered_by_textures) {
-        Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8RouteAnnounce);
-        EngineImagesIn(ids, addr, size, image_ids);
-    } else if (BufferImagesIn(addr, size, image_ids)) {
-        Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8BufAnnounce);
-    } else {
-        image_ids.clear();
-        Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8BufNotCovered);
-        ForEachImageInRegion(addr, size, [&](ImageId image_id, Image&) { image_ids.push_back(image_id); });
-    }
-    for (const auto image_id : image_ids) {
-        Image& image = slot_images[image_id];
-        std::scoped_lock lk{image.mutex};
-        if (!image.Overlaps(addr, size)) {
-            continue;
-        }
-        Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8AnnouncedOnImage);
-        if ((image.b8_marks & B8Owed) != 0) {
-            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8AnnouncedLater);
-            image.b8_marks &= ~B8Owed;
-        }
-        if (!newer && True(image.flags & ImageFlagBits::GpuModified)) {
-            // the GPU wrote the image after the first application: its bytes are newer than the CPU's
-            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8KeptForGpu);
-            continue;
-        }
-        image.b8_marks |= B8Announced;
-        image.flags |= ImageFlagBits::CpuDirty;
-        UntrackImage(image_id);
-    }
-}
-
-void TextureCache::NoteEngineTextureDelete(u64 id, VAddr address, u64 bytes, bool free) {
-    Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8TexturesDeleted);
-    // B8.4: the images the texture's lists held are no longer kept current through it: the next lookup that gives one out refreshes it (adoption)
-    const auto unlist = [&](ImageId image_id, u64 uid) {
-        if (slot_images.IsAllocated(image_id) && slot_images[image_id].image_uid == uid) {
-            slot_images[image_id].b8_marks &= ~B8Listed;
-        }
-    };
-    if (const auto it = engine_images.find(id); it != engine_images.end()) {
-        for (const auto& [image_id, uid] : it->second) {
-            unlist(image_id, uid);
-        }
-    }
-    if (const auto it = engine_answers.find(id); it != engine_answers.end()) {
-        for (const auto& a : it->second) {
-            unlist(a.image_id, a.uid);
-        }
-    }
-    engine_images.erase(id);
-    engine_answers.erase(id);
-    engine_pending_clears.erase(id);
-    if (bytes == 0) {
-        return;
-    }
-    SmallVector<ImageId, 4> image_ids;
-    ForEachImageInRegion(address, bytes, [&](ImageId image_id, Image& image) {
-        if (image.info.guest_address != address) {
-            return;
-        }
-        if (image.info.guest_size > bytes) {
-            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8DeletedImagesBigger);
-            return;
-        }
-        image_ids.push_back(image_id);
-    });
-    for (const auto image_id : image_ids) {
-        Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8DeletedImages);
-        if (free) {
-            FreeImage(image_id);
-            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8DeletedImagesFreed);
-        } else {
-            slot_images[image_id].b8_marks |= B8Deleted;
-        }
-    }
-}
-
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, const char* by) {
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Only consider images that match base address.
@@ -595,6 +409,7 @@ void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
 
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, BindingType binding,
                                           ImageId cache_image_id) {
+    Core::NativeCensus::NoteImage(Core::NativeCensus::ImageDepthOverlap);
     auto& cache_image = slot_images[cache_image_id];
 
     if (!cache_image.info.props.is_depth && !requested_info.props.is_depth) {
@@ -670,6 +485,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                                                            BindingType binding,
                                                            ImageId cache_image_id,
                                                            ImageId merged_image_id) {
+    Core::NativeCensus::NoteImage(Core::NativeCensus::ImageOverlap);
     static constexpr u64 NUM_FRAMES_BEFORE_REMOVAL = 32;
 
     auto& cache_image = slot_images[cache_image_id];
@@ -905,6 +721,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
+    Core::NativeCensus::NoteImage(Core::NativeCensus::ImageExpand);
     NoteImageCreated(SiteExpand, info);
     const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
     RegisterImage(new_image_id);
@@ -1454,6 +1271,7 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
 }
 
 void TextureCache::RefreshImage(Image& image) {
+    Core::NativeCensus::NoteImage(Core::NativeCensus::ImageRefresh, image.info.guest_size);
     // L3 write watch: an image's first and last page, when it shares them with other data, are not protected; their CPU writes are learned
     // here, before the dirty flags are read (the pages the image covers whole stay protected and fault as before)
     const auto harvest_shared_pages = [&] {
@@ -1607,6 +1425,7 @@ void TextureCache::RefreshImage(Image& image) {
 
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
+    Core::NativeCensus::NoteImage(Core::NativeCensus::ImageDetile, image.info.guest_size);
     const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
     for (auto& copy : image_copies) {
         copy.bufferOffset += offset;
@@ -1961,21 +1780,6 @@ void TextureCache::DeleteImage(ImageId image_id) {
         slot_images.Erase(image_id);
         images_freed.fetch_add(1, std::memory_order_relaxed);
     });
-}
-
-vk::ClearValue TextureCache::EngineColorValue(vk::Format format, const float (&value)[4]) {
-    vk::ClearValue out{};
-    const std::string name = vk::to_string(format);
-    if (name.find("Uint") != std::string::npos || name.find("Sint") != std::string::npos) {
-        for (u32 i = 0; i < 4; ++i) {
-            out.color.int32[i] = static_cast<s32>(value[i]);
-        }
-    } else {
-        for (u32 i = 0; i < 4; ++i) {
-            out.color.float32[i] = value[i];
-        }
-    }
-    return out;
 }
 
 } // namespace VideoCore

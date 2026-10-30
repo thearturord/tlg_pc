@@ -187,7 +187,8 @@ set(COMMON
 find_package(absl REQUIRED) # tlg-native: our texture cache uses absl::flat_hash_map
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 # tlg-native: our native render path (records, hooks, debug server, readbacks).
-file(GLOB NATIVE_CORE CONFIGURE_DEPENDS shadps4/core/*.cpp)
+# The native renderer lives in native/ (next to shadps4/, not inside it): included as "native/<name>.h".
+file(GLOB NATIVE_CORE CONFIGURE_DEPENDS native/*.cpp shadps4/core/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
 # Windows: a DLL cannot leave the runtime_* symbols for tlg-probe.exe to resolve, so the
@@ -213,7 +214,7 @@ target_compile_definitions(tlggpu PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES
     TLG_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
 set_source_files_properties(shim/tlg_overlay.cpp PROPERTIES
     OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf)
-target_include_directories(tlggpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
+target_include_directories(tlggpu PRIVATE shim shadps4 ${CMAKE_CURRENT_SOURCE_DIR} ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 target_compile_definitions(tlggpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(tlggpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers -fms-extensions)
 target_compile_definitions(tlggpu PRIVATE TLG_PORT=1) # tlg-native: code shared with the shadPS4 tree switches on this (fault recovery of the native guards)

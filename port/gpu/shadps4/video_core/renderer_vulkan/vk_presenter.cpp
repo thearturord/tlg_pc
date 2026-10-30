@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "core/debug_server.h"
-#include "core/frame_timeline.h"
-#include "core/guest_hooks.h"
+#include "native/native_debug_server.h"
+#include "native/native_timeline.h"
+#include "native/native_hooks.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"

@@ -3,8 +3,8 @@
 
 #pragma once
 
-#include "core/native_resources.h"
-#include "video_core/readback_policy.h"
+#include "native/native_resources.h"
+#include "native/native_readback_policy.h"
 
 #include <condition_variable>
 #include <mutex>

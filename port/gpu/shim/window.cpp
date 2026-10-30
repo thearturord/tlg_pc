@@ -10,7 +10,7 @@
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
-#include "core/frame_timeline.h"
+#include "native/native_timeline.h"
 #include "sdl_window.h"
 #include "tlg_capture.h"
 #include "tlg_overlay.h"

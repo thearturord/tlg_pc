@@ -5,7 +5,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
-#include "core/frame_timeline.h"
+#include "native/native_timeline.h"
 #include "video_core/renderer_vulkan/vk_gpu_timeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
