@@ -1354,6 +1354,15 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             }
         }
     };
+    // E4: bytes a page tracker range still uploads, named (first 24)
+    const auto e4_tracker_upload = [&](u64 x, u64 xn, const char* how) {
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4TrackerUploads, xn);
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+            LOG_WARNING(Render_Vulkan, "E4: tracker upload ({}) {:#x}+{:#x} ({}) request {:#x}+{:#x}{} object {}", how, x, xn, Core::NativeDevice::OwnerName(x), device_addr, size,
+                        is_written ? ", written" : "", b9_object);
+        }
+    };
     // a page tracker range (the copies of the tracker): compared with the announced bytes; native mode leaves the copy to the announcements
     const auto tracker_copy = [&](u64 addr, u64 copy_size) {
         e4_note_tracker(addr, copy_size);
@@ -1388,11 +1397,12 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 }
             }
             if (b9_native) {
-                for_each_gap(addr, copy_size, [&](u64 a, u64 n) { add_copy(a, n); });
+                for_each_gap(addr, copy_size, [&](u64 a, u64 n) { e4_tracker_upload(a, n, "native gap"); add_copy(a, n); });
                 return;
             }
         }
         b9_forget(addr, copy_size);
+        e4_tracker_upload(addr, copy_size, "copy");
         add_copy(addr, copy_size);
     };
     // E4 (`TLG_E4_ANNOUNCED=0` turns it off): memory no engine buffer holds takes the announced bytes (the placement already copied the rest). The tracker is still asked so its state
@@ -1401,18 +1411,33 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         const char* e = std::getenv("TLG_E4_ANNOUNCED");
         return e == nullptr || *e != '0'; // default on (owner play 2026-10-31); =0 is the way back
     }();
-    const auto tracker_ranges = [&](VAddr a, u64 n) {
-        if (e4_from_announced && b9_object == 0 && b9 != 0) {
-            memory_tracker->ForEachUploadRange(a, n, is_written, [&](u64 x, u64 xn) { e4_note_tracker(x, xn); });
-            boost::container::small_vector<std::pair<u64, u64>, 8> from_announced;
-            {
-                std::scoped_lock lock{object_dirty_mutex};
-                all_object_dirty.ForEachInRange(a, n, [&](u64 x, u64 e) { from_announced.emplace_back(x, e - x); });
+    // the announced bytes inside [x, x + xn) of memory no engine buffer holds (a request over unowned memory, or a gap between the buffers of one): uploaded, then no longer announced
+    const auto take_announced = [&](u64 x, u64 xn) {
+        boost::container::small_vector<std::pair<u64, u64>, 8> from_announced;
+        {
+            std::scoped_lock lock{object_dirty_mutex};
+            all_object_dirty.ForEachInRange(x, xn, [&](u64 lo, u64 e) { from_announced.emplace_back(lo, e - lo); });
+            for (const auto& [lo, n] : from_announced) {
+                all_object_dirty.Subtract(lo, n);
+                b9_unattributed.Subtract(lo, n);
             }
-            for (const auto& [x, xn] : from_announced) {
-                Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4AnnouncedUploads, xn);
-                b9_forget(x, xn);
-                add_copy(x, xn);
+        }
+        for (const auto& [lo, n] : from_announced) {
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4AnnouncedUploads, n);
+            add_copy(lo, n);
+        }
+    };
+    const auto tracker_ranges = [&](VAddr a, u64 n) {
+        if (e4_from_announced && b9 != 0) {
+            // the tracker is still asked so its marks stay as they were, but its ranges are not uploaded
+            if (b9_object == 0) {
+                memory_tracker->ForEachUploadRange(a, n, is_written, [&](u64 x, u64 xn) { e4_note_tracker(x, xn); });
+                take_announced(a, n);
+            } else {
+                for_each_gap(a, n, [&](u64 g, u64 gn) {
+                    memory_tracker->ForEachUploadRange(g, gn, is_written, [&](u64 x, u64 xn) { e4_note_tracker(x, xn); });
+                    take_announced(g, gn);
+                });
             }
             return;
         }
@@ -1421,7 +1446,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             return;
         }
         // the tracker is not kept for engine buffers: it is asked only for the bytes between them
-        for_each_gap(a, n, [&](u64 g, u64 gn) { memory_tracker->ForEachUploadRange(g, gn, is_written, [&](u64 x, u64 xn) { add_copy(x, xn); }); });
+        for_each_gap(a, n, [&](u64 g, u64 gn) { memory_tracker->ForEachUploadRange(g, gn, is_written, [&](u64 x, u64 xn) { e4_tracker_upload(x, xn, "gap"); add_copy(x, xn); }); });
     };
     const auto& ring = UntrackedRing::Get();
     VAddr ring_lo = 0, ring_hi = 0; // the part the untracked ring uploads whole (native mode adds no announced piece there)
