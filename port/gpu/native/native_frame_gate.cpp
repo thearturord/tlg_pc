@@ -48,7 +48,7 @@ struct Config {
 
 Config LoadConfig() {
     Config config;
-    int depth = 1;
+    int depth = 0; // default 0 since 2026-10-31 (the owner played it at 120 fps)
     int game_waits = -1;
     int presenter_waits = -1;
     const char* source = "default";
@@ -58,7 +58,7 @@ Config LoadConfig() {
             nlohmann::json config;
             std::ifstream in(path);
             in >> config;
-            depth = config.value("frames_in_flight", 1);
+            depth = config.value("frames_in_flight", 0);
             game_waits = config.value("game_waits_own_frame", -1);
             presenter_waits = config.value("presenter_waits_own_frame", -1);
             source = "json";

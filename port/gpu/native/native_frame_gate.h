@@ -7,9 +7,9 @@
 /// Frames in flight: one setting for every place that works on the "frame N+1" rule (documents/tlg/native plan/no-emulation-plan.md, section 13).
 /// Endpoint `/frame_gate`. Not an in-game setting: `user/custom_configs/<serial>.frames.json` `{"frames_in_flight": 1}`, or the environment variable `TLG_FRAMES_IN_FLIGHT` (wins).
 ///
-///   0  the game waits for its own frame: `sceGnmSubmitAndFlipCommandBuffers` returns when the frame's end-of-pipe interrupt came, the presenter waits for the
+///   0  (default since 2026-10-31) the game waits for its own frame: `sceGnmSubmitAndFlipCommandBuffers` returns when the frame's end-of-pipe interrupt came, the presenter waits for the
 ///      frame it just made (lowest input delay)
-///   1  today (default): the game submits frame N after the end-of-pipe of frame N-1; the Gnm submit lock waits for an idle GPU; the presenter waits for the
+///   1  the earlier default: the game submits frame N after the end-of-pipe of frame N-1; the Gnm submit lock waits for an idle GPU; the presenter waits for the
 ///      frame one flip back (`frames_queued`, 1)
 ///   2  the game may be two frames ahead (the most its engine supports: 3 frame contexts and 3 display buffers, read in Ghidra): the Gnm idle wait goes and a frame submit waits for
 ///      "fewer than 2 unfinished frames", the game's own submit gate gets one credit (see CreditGuestGate), the presenter waits for the frame two flips back
