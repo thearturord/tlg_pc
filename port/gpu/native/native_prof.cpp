@@ -1101,6 +1101,10 @@ void Analyze(const FrameTimeline::CapEvent* events, u64 count, u64 start_ns, u64
     std::ofstream(dir / "prof_latest.html", std::ios::binary) << html;
     std::ofstream(dir / "prof_latest.txt", std::ios::binary) << text;
     std::ofstream(dir / "prof_latest.json", std::ios::binary) << json.dump(1);
+    // the same files under the name the raster thread reports had (raster_latest.*), next to the others
+    std::ofstream(dir / "raster_latest.html", std::ios::binary) << html;
+    std::ofstream(dir / "raster_latest.txt", std::ios::binary) << text;
+    std::ofstream(dir / "raster_latest.json", std::ios::binary) << json.dump(1);
     text += fmt::format("(written to {}, {} and {}; /prof_baseline keeps this report to compare the next ones against)\n", html_path.string(), text_path.string(), json_path.string());
 #ifdef _WIN32
     if (g_open.load()) {

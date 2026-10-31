@@ -25,7 +25,7 @@
 /// The name before the first '.' is the probe's GROUP ("raster", "buffer", "texture", ...). A capture can record chosen groups and chosen levels, so the cost can be kept low and the
 /// question narrowed: `/prof?groups=raster,buffer&level=3&threads=GpuRaster,GpuCommandProcessor&seconds=10`. Tags only attach to an outermost scope that was recorded.
 ///
-/// WHAT A CAPTURE GIVES (user/log/prof_<time>.html / .txt / .json, also prof_latest.*): per thread the busy time per frame, the probes ranked by their own time and the tree of how they nest,
+/// WHAT A CAPTURE GIVES (user/log/prof_<time>.html / .txt / .json, also prof_latest.* and raster_latest.*): per thread the busy time per frame, the probes ranked by their own time and the tree of how they nest,
 /// the operations ranked by every tag, the counters, and the slowest single operations with what took the time in each. The measured cost of a probe is subtracted (the report says how much).
 /// `/prof_baseline` keeps a report; the next reports show the change against it per probe, so an optimisation can be measured by running the same capture again.
 ///
