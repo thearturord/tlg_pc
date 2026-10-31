@@ -65,8 +65,31 @@ void BufferCache::NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool 
             }
         }
         if (block != 0 && last) {
-            DropPlaced(block);
-            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedFreed);
+            // E4: the block's last engine buffer is gone, but the GPU wrote bytes of it outside that buffer (memory no engine buffer owns, taken in when the block grew):
+            // nobody deleted those and there is no arena that keeps them, so the block stays as their pseudo resource
+            u64 foreign = 0;
+            {
+                std::shared_lock lock{gpu_ranges_mutex};
+                const auto& entry = placed.at(block);
+                gpu_modified_ranges.ForEachInRange(entry.begin, entry.end - entry.begin, [&](u64 x, u64 e) {
+                    const u64 lo = std::max<u64>(x, entry.begin), hi = std::min<u64>(e, entry.end);
+                    if (lo < address) {
+                        foreign += std::min<u64>(hi, address) - lo;
+                    }
+                    if (hi > address + bytes) {
+                        foreign += hi - std::max<u64>(lo, address + bytes);
+                    }
+                });
+            }
+            if (foreign != 0) {
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4FreedWithForeignGpu);
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4FreedForeignGpuBytes, foreign);
+                std::scoped_lock lock{placed_mutex};
+                placed.at(block).ids.push_back((u64{1} << 63) | block);
+            } else {
+                DropPlaced(block);
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedFreed);
+            }
         } else if (block != 0) {
             Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9MemberLeft);
             if (auto* object = Core::NativeResources::FindImmutableById(id)) {
@@ -238,8 +261,18 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
         }
     }
     if (!gpu_pieces.empty()) {
-        // E4: bytes the GPU wrote that no placed buffer holds any more (their buffer was freed): they are gone, as the engine's deletion says
+        // E4: bytes the GPU wrote that no placed buffer holds (should stay near 0: a block with GPU bytes of memory no engine buffer owns is not freed)
         Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedGpuCopied);
+        u64 lost = 0;
+        for (const auto& [a, e] : gpu_pieces) {
+            lost += e;
+        }
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4GpuBytesLost, lost);
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+            LOG_WARNING(Render_Vulkan, "E4: placing {:#x}+{:#x} ({} ids, first {:#x}): {} GPU written bytes no placed buffer holds, first {:#x} ({})", begin, end - begin, ids.size(), ids.front(), lost,
+                        gpu_pieces[0].first, Core::NativeDevice::OwnerName(gpu_pieces[0].first));
+        }
     }
     u64 total = 0;
     for (const auto& [a, n] : cpu_pieces) {
