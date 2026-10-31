@@ -46,6 +46,7 @@
 #include "native/native_raycast_cpu.h"
 #include "native/native_registry.h"
 #include "native/native_resources.h"
+#include "native/native_target_desc.h"
 #include "native/native_updates.h"
 #include "native/native_zpass_audit.h"
 #include "native/native_zpass_gen.h"
@@ -3017,6 +3018,9 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     if (kind <= 2 && record_sig != nullptr && SynthAuditOn()) {
         synth_audit_ctx = ctx;
         SynthAuditNote(*record_sig, kind, slot);
+    }
+    if (kind <= 2 && Core::NativeTargetDesc::Enabled()) {
+        Core::NativeTargetDesc::Observe(ctx); // E7 Task 2: shadow only, compares the target blocks with the engine's objects
     }
     mr.Mark(1);
     slot.fixed = nullptr;

@@ -17,6 +17,7 @@
 #include "native/native_device.h"
 #include "native/native_resources.h"
 #include "native/native_updates.h"
+#include "native/native_target_desc.h"
 
 namespace Core::NativeDevice {
 
@@ -926,6 +927,7 @@ nlohmann::json Report() {
         out["e2_census"] = std::move(census);
     }
     out["e2_derive"] = Core::NativeImageDesc::Report();
+    out["e2_targets"] = Core::NativeTargetDesc::Report();
     out["note"] = "B1 native device table (cumulative); bindings: the texture cache's / buffer cache's answer against the engine object the record names";
     return out;
 }

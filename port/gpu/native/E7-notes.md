@@ -128,13 +128,28 @@ Constants (native_updates.h): `B2NativeMode()` (line 56), `B8ImageMode()` (78) a
 (88), `B9BufferMode` (185), `B9LifetimeMode` (193), `B9QueryMode` (198), `B9PlaceOn` (209) and `B9AliasesOn` (214) are `constexpr` too (values not read by me yet). Their call sites
 still contain the dead branches; that is Task 3 material, not touched.
 
-## 4. Task 2 plan (not started)
+## 4. Task 2 (built, not compiled)
 
-`TargetDesc` per bound target from: the resource `Object` (`address`, `width`, `height`, `mips`, `layers`, `format`, `bind`), the view's description at `+0x40..+0x53`
-(format, dimension, mip/slice range; read live from the view object since `NoteView` for RTV/DSV may not keep `desc[]`), and sample count from `Object::object + 0x194`.
-Compare with `ColorBuffer`/`DepthBuffer` decoded fields: format/number format/swizzle, tile mode, pitch, extent (against the hint), layers/base slice, samples, base
-addresses. Fields with no engine source (section 1.3) are not compared. Where to run it: at the `exec_inputs` fill point (once per distinct block hash) and in the P5/P8 paths, which keeps the
-cost off the typed hot path. Counters published like `e2_census`. Everything behind `TLG_TARGET_DESC=1`.
+`native/native_target_desc.{h,cpp}`, switch `TLG_TARGET_DESC=1` (default off; with it off the only cost is one `Enabled()` check per draw record). `Observe(ctx)` is called by the
+record builder in native_draw.cpp right after the `Synthesize` / state package block, for draw records only (`kind <= 2`), so the engine objects are alive. It does not read the
+register image: the console words are decoded straight from the view blocks (colour: 14 dwords at `view + 0x54` are the `ColorBuffer` layout, the extent word is dword 15;
+depth: 8 dwords at `dsv + 0x58` are `DepthBuffer`, dword 8 is `DepthView`, dword 12 the extent), which is the same data `Synthesize` copies into the registers.
+
+What it compares ("object" = engine objects, "words" = console words): data/number format (via `NativeImageDesc::Derive` of the resource and the view's own format), tile mode (tiling index),
+pitch (mip 0 only), the hint extent against the mip extent, first slice and slice count (from the view description), sample count (resource `+0x194`), base address (mip 0 only),
+colour cmask address and clear words 0/1 against resource `+0x58`, `+0x150`, `+0x154` (only when `info.fast_clear` is set), depth z format and stencil presence (small DXGI table: 40, 20, 55;
+other formats are counted as `format_not_in_the_table` and show in the tuples).
+
+Output: `/stats` -> native_backend.device.e2_targets (and the exit counters file). `colour` / `depth`: `observed` (every target of every record), `evaluated` (view or block changed since the thread last
+saw the slot), `differing`, `differing_fields`, `extent_hint` (none / equal / larger / smaller than the mip extent). `tuples`: one entry per distinct `(dxgi_view, dxgi_resource, samples, info|z_info raw,
+attrib|stencil_info raw, mip, dimension, aux)` with `count` = observations (answers Q2, Q3, Q5). `extent_shapes`: `(hint w/h, pitch, height from the words, resource w/h, mip)` with counts (Q4).
+`first_differences`: the first 16 differing evaluations with both values of every differing field (also in the log and in user/log/rare_events.txt as `target_desc_differs`).
+`aux` bits: colour 0 cmask words set, 1 fmask words set, 2 resource `+0x58` set; depth 0 write base = read base, 1 htile base word set, 2 resource `+0x48` set, 3-4 DSV flags (`+0x48` & 3).
+
+Limits: operations (fast clear eliminate, depth clear, resolve) are not observed (their `ctx` targets are not the operation's); `Derive` counts a "no view" or "view with desc" in its own E2 counters
+for each call, so `e2_derive` is slightly inflated in a run with this switch on; `static_assert`s check `sizeof(ColorBuffer) == 15 dwords`, `DepthBuffer == 8 dwords`, `DepthView == 1 dword`
+(they hold by the register index asserts in regs.cpp, but I could not compile them). Not compiled: only `clang -fsyntax-only` on the new file, whose own errors were limited to the `LOG_WARNING`
+line, which fails here because the container's spdlog is a different version from the port's.
 
 ## 5. What I need from the local side
 
