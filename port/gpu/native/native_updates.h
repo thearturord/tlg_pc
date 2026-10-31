@@ -280,6 +280,12 @@ enum B9Count : u32 {
     E4CensusRepeatNoAnnouncement, ///< E4 census: tracker pages uploaded again with no announced byte on them (a CPU write only the tracker saw)
     E4CensusAnnouncedBytes, ///< E4 census: announced bytes in such requests
     E4CensusAnnouncedNotUploaded, ///< E4 census: of those, bytes the tracker did not upload
+    E4QCpuAgree,        ///< E4 query census: "did the CPU change it" for memory the engine's buffers do not answer: tracker and announced-not-uploaded bytes say the same
+    E4QCpuTrackerOnly,  ///< the tracker says yes, the announced bytes say no
+    E4QCpuNativeOnly,   ///< the announced bytes say yes, the tracker says no
+    E4QGpuAgree,        ///< the same for "did the GPU write it": tracker and `gpu_modified_ranges`
+    E4QGpuTrackerOnly,
+    E4QGpuNativeOnly,
     E4ProtectNone, ///< E4: bytes the page manager protected against all access (GPU written pages)
     E4ProtectRead, ///< E4: bytes protected against writes only (CPU write watch)
     E4ProtectOther, ///< E4: other protections

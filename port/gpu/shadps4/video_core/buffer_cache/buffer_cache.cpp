@@ -653,6 +653,56 @@ const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanni
     return Place(std::move(ids), lo, hi);
 }
 
+namespace {
+/// E4 (`TLG_E4_QUERIES=0` turns it off): memory no engine buffer answers for is answered by the announced and GPU written bytes, not by the page tracker
+bool E4NativeQueries() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_E4_QUERIES");
+        return e == nullptr || *e != '0'; // default on (owner play pending 2026-10-31); =0 is the way back
+    }();
+    return on;
+}
+bool E4Census() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_E4_QUERY_CENSUS");
+        return e == nullptr || *e != '0'; // counts the disagreements between the tracker and the announced / GPU written bytes
+    }();
+    return on || E4NativeQueries();
+}
+} // namespace
+
+bool BufferCache::TrackerCpuQuery(VAddr addr, size_t size) {
+    const bool tracker_says = memory_tracker->IsRegionCpuModified(addr, size);
+    if (E4Census()) {
+        bool native_says;
+        {
+            std::scoped_lock lock{object_dirty_mutex};
+            native_says = all_object_dirty.Intersects(addr, size) || b9_unattributed.Intersects(addr, size);
+        }
+        Core::NativeUpdates::NoteB9(tracker_says == native_says ? Core::NativeUpdates::E4QCpuAgree
+                                    : tracker_says              ? Core::NativeUpdates::E4QCpuTrackerOnly
+                                                                : Core::NativeUpdates::E4QCpuNativeOnly);
+        return E4NativeQueries() ? native_says : tracker_says;
+    }
+    return tracker_says;
+}
+
+bool BufferCache::TrackerGpuQuery(VAddr addr, size_t size) {
+    const bool tracker_says = memory_tracker->IsRegionGpuModified(addr, size);
+    if (E4Census()) {
+        bool native_says;
+        {
+            std::shared_lock lock{gpu_ranges_mutex};
+            native_says = gpu_modified_ranges.Intersects(addr, size);
+        }
+        Core::NativeUpdates::NoteB9(tracker_says == native_says ? Core::NativeUpdates::E4QGpuAgree
+                                    : tracker_says              ? Core::NativeUpdates::E4QGpuTrackerOnly
+                                                                : Core::NativeUpdates::E4QGpuNativeOnly);
+        return E4NativeQueries() ? native_says : tracker_says;
+    }
+    return tracker_says;
+}
+
 bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
     if (Core::NativeUpdates::B9TrackerOff()) {
         // B9.3 step 2: the tracker is not kept for engine buffers: a range over several of them is answered by theirs, the bytes between them by the tracker
@@ -675,12 +725,12 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
                 }
             }
             for (const auto& part : parts) {
-                if (part.begin > at && memory_tracker->IsRegionCpuModified(at, part.begin - at)) {
+                if (part.begin > at && TrackerCpuQuery(at, part.begin - at)) {
                     return true;
                 }
                 at = std::max<VAddr>(at, part.end);
             }
-            return at < addr + size && memory_tracker->IsRegionCpuModified(at, addr + size - at);
+            return at < addr + size && TrackerCpuQuery(at, addr + size - at);
         }
     }
     // B9.3: a range inside one engine buffer: changed when the buffer holds announced bytes there that were not uploaded
@@ -713,7 +763,7 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
             return tracker_says;
         }
     }
-    return memory_tracker->IsRegionCpuModified(addr, size);
+    return TrackerCpuQuery(addr, size);
 }
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
@@ -725,7 +775,14 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
         if (!parts.empty() && BufferHolding(addr, size) == 0) {
             Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9GpuQueries);
             std::shared_lock lock{gpu_ranges_mutex};
-            return gpu_modified_ranges.Intersects(addr, size) || memory_tracker->IsRegionGpuModified(addr, size);
+            if (gpu_modified_ranges.Intersects(addr, size)) {
+                return true;
+            }
+            const bool tracker_says = memory_tracker->IsRegionGpuModified(addr, size); // here the bytes say no
+            if (E4Census()) {
+                Core::NativeUpdates::NoteB9(tracker_says ? Core::NativeUpdates::E4QGpuTrackerOnly : Core::NativeUpdates::E4QGpuAgree);
+            }
+            return E4NativeQueries() ? false : tracker_says;
         }
     }
     // B9.3: a range inside one engine buffer: written when the GPU wrote bytes of it that were not superseded or downloaded since
@@ -757,7 +814,7 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
             return tracker_says;
         }
     }
-    return memory_tracker->IsRegionGpuModified(addr, size);
+    return TrackerGpuQuery(addr, size);
 }
 
 void BufferCache::SupersedeGpuWritten(VAddr addr, size_t size) {
