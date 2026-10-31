@@ -37,8 +37,6 @@ The design, the phases (E0 to E9), every census and the decisions are written do
 
 ## Known issues
 
-- The kid is missing part of his hair in some runs.
-- The shadow under the water flickers in some runs.
 - One dark or bright frame while walking (sunlight and fog missing for one frame); a bisect is open.
 - The original port's temporal upscalers (FSR 3/4, TAA), scene resolution and post effects are **not ported** to this build yet.
 - Not played yet after the memory change: other cutscenes and long sessions. Black patches on the ground after removing the arena were fixed (they came from freeing a block that held GPU-written bytes); if you see them again, please report where.
@@ -101,8 +99,6 @@ O projeto, as fases (E0 a E9), cada contagem e as decisões estão escritos no p
 
 ## Problemas conhecidos
 
-- Falta parte do cabelo do menino em algumas execuções.
-- A sombra sobre a água cintila em algumas execuções.
 - Um quadro escuro ou claro demais ao andar (sem luz do sol e névoa por um quadro); a busca da causa está aberta.
 - Os upscalers temporais do port original (FSR 3/4, TAA), a resolução de cena e os efeitos de pós-processamento **ainda não foram portados** para esta build.
 - Ainda não jogado depois da mudança de memória: outras cutscenes e sessões longas. As manchas pretas no chão que apareceram ao remover a arena foram corrigidas (vinham de liberar um bloco que guardava bytes escritos pela GPU); se aparecerem de novo, avise onde.
