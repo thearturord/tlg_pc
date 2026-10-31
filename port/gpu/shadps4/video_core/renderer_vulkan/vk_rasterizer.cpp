@@ -141,7 +141,6 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
-        buffer_cache.SubmitPendingArenaBinds(info);
     });
 }
 
@@ -1229,7 +1228,6 @@ void Rasterizer::OnSubmit() {
     if (encoder_debug & 2) {
         scheduler.SyncEncoder();
     }
-    buffer_cache.TickFrame();
     ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
     runtime.TickFrame();
@@ -1373,8 +1371,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
     }
 
     if (uses_dma) {
-        b9_dma_binds.fetch_add(1, std::memory_order_relaxed); // B9.4 census: a shader reads memory by a raw PS4 address (needs the address mirror)
-        buffer_cache.SynchronizeDmaBuffers();
+        b9_dma_binds.fetch_add(1, std::memory_order_relaxed); // E4: a shader that reads memory by a raw PS4 address (TLG_DIRECT_MEMORY_ACCESS, off): there is no address mirror to serve it
     }
     b9_all_binds.fetch_add(1, std::memory_order_relaxed);
 
@@ -1868,12 +1865,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     const u64 offset = vk_buffer.Copy(planes.data(), ubo_size, alignment);
                     buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
                 }
-            } else if (desc.buffer_type == Shader::BufferType::BdaPagetable) {
-                const auto* bda_buffer = buffer_cache.GetBdaPageTableBuffer();
-                buffer_infos.emplace_back(bda_buffer->Handle(), 0, bda_buffer->SizeBytes());
-            } else if (desc.buffer_type == Shader::BufferType::FaultBuffer) {
-                const auto* fault_buffer = buffer_cache.GetFaultBuffer();
-                buffer_infos.emplace_back(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 if (indexed_active && stage.indexed) {
                     Core::RareEvents::Note("c9_shared_memory", fmt::format("compute shader {:#x}: the shared memory is a storage buffer with a slot of its own per dispatch", stage.pgm_hash));

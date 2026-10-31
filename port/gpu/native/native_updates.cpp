@@ -571,6 +571,7 @@ nlohmann::json B9Report() {
             {"lifetime", {{"mode", B9LifetimeMode()}, {"buffers_deleted", c(B9BuffersDeleted)}, {"with_announced_bytes_never_uploaded", c(B9DeletedPending)},
                           {"with_gpu_written_bytes", c(B9DeletedGpuWritten)}, {"memory_shared_with_a_live_buffer", c(B9DeletedAlias)},
                           {"gpu_written_bytes_dropped", c(B9DeletedGpuDropped)}}},
+            {"e4_no_arena", {{"pseudo_placements", c(E4PseudoPlaced)}, {"pseudo_ring", c(E4PseudoRing)}, {"fault_readback_windows", c(E4ReadbackWindows)}, {"demotes_kept", c(E4DemoteKept)}}},
             {"verify", {{"every_nth_page", B9VerifyEvery()}, {"pages_checked", c(B9VerifyChecked)}, {"differing", c(B9VerifyMiss)},
                         {"of_those_announced_later", c(B9VerifyLate)}, {"MISSES_never_announced", c(B9VerifyMiss) - std::min(c(B9VerifyMiss), c(B9VerifyLate))}}},
             {"note", "B9.1, cumulative: engine buffers uploaded by their announced bytes instead of the page tracker's pages"}};

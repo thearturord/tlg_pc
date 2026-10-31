@@ -234,19 +234,12 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
         std::shared_lock lock{gpu_ranges_mutex};
         for (const auto& [a, n] : rest) {
             gpu_modified_ranges.ForEachInRange(a, n, [&](u64 x, u64 e) { gpu_pieces.emplace_back(x, e - x); });
-            gpu_modified_ranges.ForEachNotInRange(a, n, [&](u64 x, u64 m) { cpu_pieces.emplace_back(x, m); });
+            cpu_pieces.emplace_back(a, n);
         }
     }
     if (!gpu_pieces.empty()) {
+        // E4: bytes the GPU wrote that no placed buffer holds any more (their buffer was freed): they are gone, as the engine's deletion says
         Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedGpuCopied);
-        const u64 first_block = begin >> block_shift, last_block = (end - 1) >> block_shift;
-        const auto* arena = GetArena(first_block, last_block);
-        EnsureResident(arena, first_block, last_block);
-        boost::container::small_vector<vk::BufferCopy, 8> copies;
-        for (const auto& [a, n] : gpu_pieces) {
-            copies.push_back({arena->Offset(a), dst->Offset(a), n});
-        }
-        runtime.CopyBuffer(arena, dst, copies);
     }
     u64 total = 0;
     for (const auto& [a, n] : cpu_pieces) {
@@ -309,7 +302,7 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
 }
 
 void BufferCache::NoteResolutionUser(const Buffer* buffer, u64 id) {
-    if (buffer->mem_type == MemoryType::Sparse || id == 0) {
+    if (id == 0) {
         return;
     }
     std::scoped_lock lock{placed_mutex};
@@ -352,31 +345,8 @@ void BufferCache::DropPlaced(VAddr begin) {
 }
 
 void BufferCache::Demote(VAddr begin, bool by_request) {
-    PlacedBuffer* entry = nullptr;
-    {
-        std::scoped_lock lock{placed_mutex};
-        const auto it = placed.find(begin);
-        if (it == placed.end()) {
-            return;
-        }
-        entry = &it->second;
-    }
-    // the arena takes the buffer's contents (CPU bytes announced since and not uploaded stay announced: the next upload puts them into the arena)
-    scheduler.EndRendering();
-    const u64 first_block = entry->begin >> block_shift, last_block = (entry->end - 1) >> block_shift;
-    const auto* arena = GetArena(first_block, last_block);
-    EnsureResident(arena, first_block, last_block);
-    const vk::BufferCopy copy{entry->buffer->Offset(entry->begin), arena->Offset(entry->begin), entry->end - entry->begin};
-    runtime.CopyBuffer(entry->buffer.get(), arena, std::span<const vk::BufferCopy>{&copy, 1});
-    ForgetShadows(entry->begin, entry->end);
-    Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9Demoted);
-    if (by_request) {
-        Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9DemotedByRequest);
-        for (const u64 id : entry->ids) {
-            place_refused.insert(id);
-        }
-    }
-    DropPlaced(begin);
+    // E4: there is no arena to move to. The block stays; the next request that reaches over it grows the block (Place copies the placed buffers inside)
+    Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4DemoteKept);
 }
 
 void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, bool texture) {
@@ -525,7 +495,6 @@ nlohmann::json BufferCache::ZeroCopyReport() const {
             {"uploads_copied_gpu_still_using_the_buffer", zero_copy_counts[3].load()},
             {"bytes_copied_gpu_still_using_the_buffer", zero_copy_counts[4].load()},
             {"verify_checked", zero_copy_counts[5].load()},
-            {"uploads_into_the_arena", zero_copy_counts[7].load()},
             {"uploads_into_placed_device_local", zero_copy_counts[8].load()},
             {"uploads_into_placed_cpu_writable", zero_copy_counts[9].load()},
             {"VERIFY_CHANGED", zero_copy_counts[6].load()}};

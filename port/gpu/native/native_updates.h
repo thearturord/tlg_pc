@@ -279,9 +279,16 @@ enum B9Count : u32 {
     B9DeletedGpuWritten,   ///< ... whose memory held GPU written bytes
     B9DeletedAlias,        ///< ... whose memory another live buffer shares (its GPU written bytes stay)
     B9DeletedGpuDropped,   ///< native: GPU written bytes dropped with the buffer
+    E4PseudoPlaced,        ///< E4: placements of a pseudo resource (memory no engine buffer owns)
+    E4PseudoRing,          ///< ... of those, the frame allocator's ring
+    E4DemoteKept,          ///< E4: a move back to the arena that was not made (the block stays)
+    E4ReadbackWindows,     ///< E4: fault readback windows downloaded from placed buffers
     B9Counts,
 };
 void NoteB9(B9Count what, u64 n = 1) noexcept;
+[[nodiscard]] constexpr bool E4PseudoOn() noexcept {
+    return true; // E4: memory no engine buffer owns is a pseudo resource, there is no arena to fall back to
+}
 [[nodiscard]] nlohmann::json B9Report();
 
 nlohmann::json Report();

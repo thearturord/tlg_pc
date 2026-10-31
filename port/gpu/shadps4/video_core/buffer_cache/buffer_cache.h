@@ -27,7 +27,6 @@
 #include "common/types.h"
 #include "common/unique_function.h"
 #include "video_core/buffer_cache/buffer.h"
-#include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
@@ -54,11 +53,6 @@ class PageManager;
 class ReadbackBatch;
 
 class BufferCache {
-    static constexpr u64 ADDRESS_SPACE_BITS = 40;
-    static constexpr u64 ARENA_PAGE_BITS = 32;
-    static constexpr u64 ARENA_PAGE_SIZE = u64{1} << ARENA_PAGE_BITS;
-    static constexpr u64 NUM_ARENA_PAGES = u64{1} << (ADDRESS_SPACE_BITS - ARENA_PAGE_BITS);
-    static constexpr u64 MIN_BLOCK_SIZE = 16_KB;
     static constexpr u64 STREAM_THRESHOLD = 16_KB;
 
 public:
@@ -76,27 +70,15 @@ public:
         return null_index_buffer.get();
     }
 
-    /// Retrieves the device local DBA page table buffer.
-    [[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept {
-        return bda_pagetable_buffer.get();
-    }
-
-    /// Retrieves the fault buffer.
-    [[nodiscard]] Buffer* GetFaultBuffer() noexcept {
-        return fault_manager->GetFaultBuffer();
-    }
-
     /// Retrieves the stream buffer.
     [[nodiscard]] StreamBuffer& GetStreamBuffer() noexcept {
         return stream_buffer;
     }
 
-    /// Returns minimum granularity of a sparse memory bind.
+    /// The block granularity the shader recompiler's raw address access used (that access is off: TLG_DIRECT_MEMORY_ACCESS)
     u32 GetSparsePageShift() const noexcept {
-        return block_shift;
+        return 14;
     }
-
-    void TickFrame();
 
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
@@ -188,15 +170,9 @@ public:
     /// N5h: new contents were written into the range by the CPU (a creation, an initialization, a Map / Unmap): what the GPU wrote there before is gone.
     void SupersedeGpuWritten(VAddr addr, size_t size);
 
-    /// Synchronizes all buffers needed for DMA.
-    void SynchronizeDmaBuffers();
-
     void SetSideUploadEpoch(u64 epoch) {
         side_upload_epoch = epoch;
     }
-
-    /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
-    void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
     /// True once if downloads for the priority thread were recorded since the last call (the
     /// command buffer must reach the GPU soon).
@@ -230,30 +206,13 @@ public:
     void WaitForDownloads(VAddr device_addr, u64 size);
 
 private:
-    struct ArenaBinds {
-        const Buffer* arena;
-        boost::container::small_vector<vk::SparseMemoryBind, 32> binds;
-    };
-
-    ArenaBinds* BindsForArena(const Buffer* arena) {
-        auto it = std::ranges::find(pending_binds, arena, &ArenaBinds::arena);
-        if (it != pending_binds.end()) {
-            return std::addressof(*it);
-        }
-        return &pending_binds.emplace_back(arena);
-    }
-
-    const Buffer* GetArena(u64 first_block, u64 last_block);
-
-    void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
-
     struct DownloadResult {
         u64 bytes{};
     };
 
     using DownloadCopies = boost::container::small_vector<vk::BufferCopy, 1>;
 
-    DownloadResult DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+    DownloadResult DownloadMemory(VAddr device_addr, u64 size);
 
     /// Gathers GPU modified ranges to download and clears them from the modified range set.
     u64 CollectDownloadCopies(const Buffer* arena, VAddr device_addr, u64 size,
@@ -269,7 +228,13 @@ private:
 
     /// Window around a readback request: GPU-modified ranges come as many small scattered
     /// islands, so a download is widened to the 512 KB block around the request.
-    std::pair<VAddr, VAddr> ReadbackWindow(const Buffer* arena, VAddr device_addr, u64 size) const;
+    std::pair<VAddr, VAddr> ReadbackWindow(VAddr device_addr, u64 size) const;
+    /// E4: the placed buffers that hold [addr, addr + size), each with the part of the range it holds (the arena used to be the one buffer of every range)
+    struct DownloadSource {
+        const Buffer* buffer;
+        VAddr begin, end;
+    };
+    boost::container::small_vector<DownloadSource, 4> DownloadSourcesIn(VAddr addr, u64 size);
 
     /// Readback for a guest thread: the command processor records and submits the downloads and
     /// goes on while the faulting thread waits for them to land.
@@ -445,32 +410,6 @@ private:
     std::vector<std::unique_ptr<Buffer>> dma_pool;
     std::atomic<u32> async_recorded{};
 
-    std::unique_ptr<FaultManager> fault_manager;
-    std::unique_ptr<Buffer> bda_pagetable_buffer;
-    bool fault_process_pending{};
-
-    std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
-    std::deque<Buffer> arenas;
-    std::vector<ArenaBinds> pending_binds;
-    Vulkan::Semaphore memory_semaphore;
-    u64 last_bind_tick{}; ///< memory_semaphore value of the latest sparse bind submission
-
-    struct Backing : public Interval {
-        vk::DeviceMemory memory;
-        u64 offset;
-        constexpr bool CanMergeWith(const Backing& other) const noexcept {
-            return memory == other.memory && offset + (end - start) == other.offset;
-        }
-        constexpr Backing SubRange(u64 a, u64 b) const noexcept {
-            return {{a, b}, memory, offset + (a - start)};
-        }
-    };
-    IntervalList<Backing> resident_ranges;
-    /// Blocks verified resident (block + 1; 0 = empty). Residency is never revoked, so entries stay valid.
-    std::array<u64, 4096> resident_block_cache{};
-    /// Ranges of more blocks (vertex and index buffers) verified resident, round robin.
-    std::array<std::pair<u64, u64>, 8> resident_range_cache{};
-    u32 resident_range_next{};
     /// Upload ring ranges already uploaded in the current command buffer (see UntrackedRing).
     struct RingUpload {
         u64 lo{};
@@ -478,12 +417,6 @@ private:
         u64 tick{};
     };
     std::array<RingUpload, 256> ring_uploads{};
-
-    u32 arena_memory_type_index{};
-    u32 block_size{};
-    u32 block_shift{};
-    u32 blocks_per_arena_page{};
-    u32 blocks_per_arena_page_shift{};
 };
 
 } // namespace VideoCore

@@ -63,26 +63,6 @@ static_assert(CmaskColorExpandedValue(2) == 0xDDDDDDDD);
 static_assert(CmaskColorExpandedValue(4) == 0xEEEEEEEE);
 static_assert(CmaskColorExpandedValue(8) == 0xFFFFFFFF);
 
-static constexpr auto ARENA_USAGE =
-    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
-    vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eStorageBuffer |
-    vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer |
-    vk::BufferUsageFlagBits::eIndirectBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress;
-
-std::optional<u32> FindMemoryType(const vk::PhysicalDeviceMemoryProperties& properties,
-                                  vk::MemoryPropertyFlags wanted, u32 memory_type_bits) {
-    for (u32 i = 0; i < properties.memoryTypeCount; ++i) {
-        if (((memory_type_bits >> i) & 1) == 0) {
-            continue;
-        }
-        const auto flags = properties.memoryTypes[i].propertyFlags;
-        if ((flags & wanted) == wanted) {
-            return i;
-        }
-    }
-    return std::nullopt;
-}
-
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
                          TextureCache& texture_cache_, PageManager& tracker)
@@ -93,38 +73,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       stream_reuse_enabled{EmulatorSettings.IsReadbackStreamReuseEnabled()},
-      async_guest_faults{EmulatorSettings.IsReadbackAsyncGuestFaultsEnabled()},
-      memory_semaphore{instance} {
-    const vk::BufferCreateInfo probe_ci = {
-        .flags =
-            vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
-        .size = ARENA_PAGE_SIZE,
-        .usage = ARENA_USAGE,
-        .sharingMode = vk::SharingMode::eExclusive,
-    };
-    const vk::DeviceBufferMemoryRequirements req_info = {
-        .pCreateInfo = &probe_ci,
-    };
-    const auto device = instance.GetDevice();
-    const auto reqs = device.getBufferMemoryRequirements(req_info).memoryRequirements;
-    block_size = Common::AlignUp(std::max<u64>(reqs.alignment, MIN_BLOCK_SIZE), reqs.alignment);
-    ASSERT_MSG(std::popcount(block_size) == 1, "Sparse block size {} is not a power of 2",
-               block_size);
-    block_shift = std::bit_width(block_size) - 1;
-    blocks_per_arena_page = ARENA_PAGE_SIZE / block_size;
-    blocks_per_arena_page_shift = ARENA_PAGE_BITS - block_shift;
-    arena_memory_type_index =
-        FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
-                       reqs.memoryTypeBits)
-            .value();
-
-    const u64 bda_pagetable_size =
-        (blocks_per_arena_page * NUM_ARENA_PAGES) * sizeof(vk::DeviceAddress);
-    fault_manager = std::make_unique<FaultManager>(instance, scheduler, *this, block_shift,
-                                                   blocks_per_arena_page * NUM_ARENA_PAGES);
-    bda_pagetable_buffer = std::make_unique<Buffer>(
-        instance, 0, bda_pagetable_size, MemoryType::DeviceLocal, "BDA Page Table Buffer");
-    runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
+      async_guest_faults{EmulatorSettings.IsReadbackAsyncGuestFaultsEnabled()} {
     if (!instance.IsMaintenance6Supported()) {
         null_index_buffer = std::make_unique<Buffer>(instance, 0, NULL_INDEX_BUFFER_SIZE,
                                                      MemoryType::DeviceLocal, "Null Index Buffer");
@@ -141,12 +90,6 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
 BufferCache::~BufferCache() {
     Core::NativeReadbacks::SetLandingGate({});
-}
-
-void BufferCache::TickFrame() {
-    if (std::exchange(fault_process_pending, false)) {
-        fault_manager->ProcessFaultBuffer();
-    }
 }
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
@@ -318,16 +261,24 @@ static u64 SteadyNowNs() {
                                 .count());
 }
 
-std::pair<VAddr, VAddr> BufferCache::ReadbackWindow(const Buffer* arena, VAddr device_addr,
-                                                    u64 size) const {
+std::pair<VAddr, VAddr> BufferCache::ReadbackWindow(VAddr device_addr, u64 size) const {
     constexpr u64 WindowSize = 512_KB;
-    const VAddr arena_start = arena->cpu_addr;
-    const VAddr arena_end = arena_start + arena->size_bytes;
-    const VAddr window_start =
-        std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena_start);
-    const VAddr window_end =
-        std::min<VAddr>(std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
+    const VAddr window_start = Common::AlignDown(device_addr, WindowSize);
+    const VAddr window_end = std::max<VAddr>(window_start + WindowSize, device_addr + size);
     return {window_start, window_end};
+}
+
+boost::container::small_vector<BufferCache::DownloadSource, 4> BufferCache::DownloadSourcesIn(VAddr addr, u64 size) {
+    boost::container::small_vector<DownloadSource, 4> out;
+    std::scoped_lock lock{placed_mutex};
+    for (auto it = placed.upper_bound(addr) == placed.begin() ? placed.begin() : std::prev(placed.upper_bound(addr)); it != placed.end() && it->first < addr + size; ++it) {
+        const VAddr lo = std::max<VAddr>(addr, it->second.begin);
+        const VAddr hi = std::min<VAddr>(addr + size, it->second.end);
+        if (lo < hi) {
+            out.push_back({it->second.buffer.get(), lo, hi});
+        }
+    }
+    return out;
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
@@ -336,20 +287,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         return;
     }
     const auto flush_request = [this, device_addr, size, is_write] {
-        const u32 first_block = device_addr >> block_shift;
-        const u32 last_block = (device_addr + size - 1) >> block_shift;
-        const auto* arena = GetArena(first_block, last_block);
-        if (Core::NativeUpdates::B9PlaceOn()) {
-            std::scoped_lock lock{placed_mutex};
-            if (PlacedMeets(device_addr, size)) {
-                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9ReadbackOverPlaced);
-            }
-        }
-
-        const auto [window_start, window_end] = ReadbackWindow(arena, device_addr, size);
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4ReadbackWindows);
+        const auto [window_start, window_end] = ReadbackWindow(device_addr, size);
         const u64 window_size = window_end - window_start;
         ApplyPendingUnmarks();
-        auto result = DownloadMemory(arena, window_start, window_size);
+        auto result = DownloadMemory(window_start, window_size);
         const VAddr page_start = Common::AlignDown(device_addr, BYTES_PER_PAGE);
         const VAddr page_end = Common::AlignUp(device_addr + size, BYTES_PER_PAGE);
         const u64 page_size = page_end - page_start;
@@ -377,8 +319,7 @@ void BufferCache::FinishFaultReadback(VAddr device_addr, u64 size, bool is_write
     // The faulting page must end up accessible, or the access faults again forever. Download the
     // page, then drop a GPU mark with nothing left behind it.
     if (memory_tracker->IsRegionGpuModified(page_start, page_size)) {
-        const auto* arena = GetArena(page_start >> block_shift, (page_end - 1) >> block_shift);
-        bytes += DownloadMemory(arena, page_start, page_size).bytes;
+        bytes += DownloadMemory(page_start, page_size).bytes;
         // Downloads of this page have landed by now, so a mark with no GPU write behind it is
         // stale.
         const bool still_marked = memory_tracker->IsRegionGpuModified(page_start, page_size);
@@ -425,36 +366,24 @@ void BufferCache::ReadMemoryForGuest(VAddr device_addr, u64 size, bool is_write)
     // thread is released. Guest memory and protections are not touched yet.
     liverpool->SendCommand<true>([&] {
         ApplyPendingUnmarks();
-        const u32 first_block = device_addr >> block_shift;
-        const u32 last_block = (device_addr + size - 1) >> block_shift;
-        const auto* arena = GetArena(first_block, last_block);
-        if (Core::NativeUpdates::B9PlaceOn()) {
-            std::scoped_lock lock{placed_mutex};
-            if (PlacedMeets(device_addr, size)) {
-                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9ReadbackOverPlaced);
-            }
-        }
-        const auto [win_start, win_end] = ReadbackWindow(arena, device_addr, size);
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4ReadbackWindows);
+        const auto [win_start, win_end] = ReadbackWindow(device_addr, size);
         window_start = win_start;
         window_size = win_end - win_start;
         std::vector<Common::UniqueFunction<void>> callbacks;
         const auto record = [&](VAddr range_start, u64 range_size) {
-            DownloadCopies copies;
-            const u64 total = CollectDownloadCopies(arena, range_start, range_size, copies);
-            if (total == 0) {
-                return;
+            for (const auto& source : DownloadSourcesIn(range_start, range_size)) {
+                DownloadCopies copies;
+                const u64 total = CollectDownloadCopies(source.buffer, source.begin, source.end - source.begin, copies);
+                if (total == 0) {
+                    continue;
+                }
+                bytes += total;
+                callbacks.push_back(RecordDownloadCopies(source.buffer, source.begin, source.end - source.begin, std::move(copies), total, true));
             }
-            bytes += total;
-            callbacks.push_back(RecordDownloadCopies(arena, range_start, range_size,
-                                                     std::move(copies), total, true));
         };
         record(window_start, window_size);
-        const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
-        const VAddr range_start = std::max<VAddr>(page_start, arena->cpu_addr);
-        const VAddr range_end = std::min<VAddr>(page_end, arena_end);
-        if (range_end > range_start) {
-            record(range_start, range_end - range_start);
-        }
+        record(page_start, page_size);
         if (!callbacks.empty()) {
             recorded = true;
             scheduler.DeferPriorityOperation(
@@ -562,18 +491,20 @@ Common::UniqueFunction<void> BufferCache::RecordDownloadCopies(const Buffer* are
     };
 }
 
-BufferCache::DownloadResult BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr,
-                                                        u64 size) {
-    DownloadCopies copies;
-    const u64 total_size_bytes = CollectDownloadCopies(arena, device_addr, size, copies);
-    if (total_size_bytes == 0) {
-        return {};
+BufferCache::DownloadResult BufferCache::DownloadMemory(VAddr device_addr, u64 size) {
+    u64 total = 0;
+    for (const auto& source : DownloadSourcesIn(device_addr, size)) {
+        DownloadCopies copies;
+        const u64 total_size_bytes = CollectDownloadCopies(source.buffer, source.begin, source.end - source.begin, copies);
+        if (total_size_bytes == 0) {
+            continue;
+        }
+        auto write_data = RecordDownloadCopies(source.buffer, source.begin, source.end - source.begin, std::move(copies), total_size_bytes, false);
+        scheduler.Finish();
+        write_data();
+        total += total_size_bytes;
     }
-    auto write_data = RecordDownloadCopies(arena, device_addr, size, std::move(copies),
-                                           total_size_bytes, false);
-    scheduler.Finish();
-    write_data();
-    return {.bytes = total_size_bytes};
+    return {.bytes = total};
 }
 
 void BufferCache::ApplyPendingUnmarks() {
@@ -873,7 +804,6 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
                     if (interval != 0 && resident_hits.fetch_add(1, std::memory_order_relaxed) % interval == 0) {
                         // verify: one synchronization of the request; anything it has to upload means the answer without it would have been stale
                         last_upload_bytes = 0;
-                        EnsureResident(arena, device_addr >> block_shift, (device_addr + size - 1) >> block_shift);
                         SynchronizeMemory(arena, device_addr, size, false, false);
                         Core::NativeResources::NoteResident(2);
                         if (last_upload_bytes != 0) {
@@ -1054,103 +984,81 @@ void BufferCache::ForgetShadows(VAddr begin, VAddr end) {
 }
 
 const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanning, bool written) {
-    if (Core::NativeUpdates::B9PlaceOn()) {
-        if (const PlacedBuffer* entry = PlacedAt(address, size, written)) {
-            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedServed);
-            return entry->buffer.get();
-        }
-        // the block the request needs: the engine buffers it meets and the placed buffers it meets, grown until no buffer reaches over its edges
-        static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
-        static thread_local std::vector<u64> textures;
-        VAddr lo = address, hi = address + size;
-        std::vector<u64> ids;
-        bool refused = false;
-        bool any_buffer = false;
-        for (u32 round = 0; round < 4; ++round) {
-            parts.clear();
-            Core::NativeDevice::BuffersIn(lo, hi - lo, parts);
-            VAddr new_lo = lo, new_hi = hi;
-            for (const auto& part : parts) {
-                new_lo = std::min(new_lo, part.object_begin);
-                new_hi = std::max(new_hi, part.object_end);
-            }
-            for (auto it = placed.upper_bound(new_lo) == placed.begin() ? placed.begin() : std::prev(placed.upper_bound(new_lo)); it != placed.end() && it->first < new_hi; ++it) {
-                if (it->second.end > new_lo) {
-                    new_lo = std::min(new_lo, it->second.begin);
-                    new_hi = std::max(new_hi, it->second.end);
-                }
-            }
-            if (new_lo == lo && new_hi == hi) {
-                break;
-            }
-            lo = new_lo;
-            hi = new_hi;
-        }
-        any_buffer = !parts.empty();
-        // the members must not overlap each other, no texture may lie in the block, none may have been moved back by a request before
-        std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.object_begin < b.object_begin; });
-        // (B9.4 step 4, TLG_B9_ALIASES=1: overlapping members and textures are allowed: one Vulkan buffer is one memory range, as the arena was)
-        const bool aliases = Core::NativeUpdates::B9AliasesOn();
-        VAddr last_end = 0;
-        bool overlapping = false;
+    if (const PlacedBuffer* entry = PlacedAt(address, size, written)) {
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedServed);
+        return entry->buffer.get();
+    }
+    if (!demote_spanning && PlacedMeets(address, size)) {
+        return nullptr; // a range over placed buffers' edges is left to their own requests
+    }
+    // the block the request needs: the engine buffers it meets and the placed buffers it meets, grown until no buffer reaches over its edges
+    static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
+    static thread_local std::vector<u64> textures;
+    VAddr lo = address, hi = address + size;
+    for (u32 round = 0; round < 4; ++round) {
+        parts.clear();
+        Core::NativeDevice::BuffersIn(lo, hi - lo, parts);
+        VAddr new_lo = lo, new_hi = hi;
         for (const auto& part : parts) {
-            overlapping |= part.object_begin < last_end;
-            if ((part.object_begin < last_end && !aliases) || part.object_end > hi || part.object_begin < lo || place_refused.contains(part.id)) {
-                refused = true;
-            }
-            last_end = std::max(last_end, part.object_end);
-            ids.push_back(part.id);
+            new_lo = std::min(new_lo, part.object_begin);
+            new_hi = std::max(new_hi, part.object_end);
         }
-        textures.clear();
-        (void)Core::NativeDevice::TexturesIn(lo, hi - lo, textures);
-        const bool with_textures = !textures.empty();
-        if (aliases) {
-            textures.clear();
-        }
-        const bool too_big = hi - lo > (u64{256} << 20);
-        // blocks (B9.4 step 3): a request over several engine buffers places the block they cover
-        if (any_buffer && !refused && textures.empty() && !too_big && (demote_spanning || !PlacedMeets(address, size))) {
-            if (ids.size() > 1 || PlacedMeets(lo, hi - lo) || lo != parts.front().object_begin || hi != parts.back().object_end) {
-                static std::atomic<u32> logged{0};
-                if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
-                    LOG_WARNING(Render_Vulkan, "B9.4: request {:#x}+{:#x} places a block {:#x}+{:#x} of {} engine buffers", address, size, lo, hi - lo, ids.size());
-                }
-            }
-            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedServed);
-            if (overlapping) {
-                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9BlockAliased);
-            }
-            if (with_textures) {
-                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9BlockWithTextures);
-            }
-            return Place(std::move(ids), lo, hi);
-        }
-        if (any_buffer) {
-            Core::NativeUpdates::NoteB9(too_big ? Core::NativeUpdates::B9PlaceRefusedSize : textures.empty() && !refused ? Core::NativeUpdates::B9ArenaOverBuffers
-                                                                                                                       : Core::NativeUpdates::B9PlaceRefusedAlias);
-        }
-        if (PlacedMeets(address, size)) {
-            if (!demote_spanning) {
-                return nullptr;
-            }
-            boost::container::small_vector<VAddr, 4> met;
-            for (auto it = placed.begin(); it != placed.end(); ++it) {
-                if (it->second.begin < address + size && address < it->second.end) {
-                    met.push_back(it->first);
-                }
-            }
-            for (const VAddr begin : met) {
-                Demote(begin, true);
+        for (auto it = placed.upper_bound(new_lo) == placed.begin() ? placed.begin() : std::prev(placed.upper_bound(new_lo)); it != placed.end() && it->first < new_hi; ++it) {
+            if (it->second.end > new_lo) {
+                new_lo = std::min(new_lo, it->second.begin);
+                new_hi = std::max(new_hi, it->second.end);
             }
         }
-        if (any_buffer) {
-            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9ArenaOverBuffers);
+        if (new_lo == lo && new_hi == hi) {
+            break;
+        }
+        lo = new_lo;
+        hi = new_hi;
+    }
+    const bool any_buffer = !parts.empty();
+    // members may overlap each other and textures may lie in the block: one Vulkan buffer is one memory range
+    std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.object_begin < b.object_begin; });
+    std::vector<u64> ids;
+    VAddr last_end = 0;
+    bool overlapping = false;
+    for (const auto& part : parts) {
+        overlapping |= part.object_begin < last_end;
+        last_end = std::max(last_end, part.object_end);
+        ids.push_back(part.id);
+    }
+    textures.clear();
+    (void)Core::NativeDevice::TexturesIn(lo, hi - lo, textures);
+    if (!any_buffer) {
+        // E4: memory no engine buffer owns gets a pseudo resource of its own: the frame allocator's ring as a whole (the engine's allocator hook found it),
+        // any other range as the request's block (grown over the placed buffers it meets)
+        const auto& ring = VideoCore::UntrackedRing::Get();
+        if (ring.Active() && address >= ring.Start() && address + size <= ring.End() && !PlacedMeets(ring.Start(), ring.End() - ring.Start())) {
+            lo = ring.Start();
+            hi = ring.End();
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4PseudoRing);
+        }
+        ids.push_back((u64{1} << 63) | lo);
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4PseudoPlaced);
+    } else if (ids.size() > 1 || PlacedMeets(lo, hi - lo) || lo != parts.front().object_begin || hi != parts.back().object_end) {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(Render_Vulkan, "B9.4: request {:#x}+{:#x} places a block {:#x}+{:#x} of {} engine buffers", address, size, lo, hi - lo, ids.size());
         }
     }
-    const u64 first_block = address >> block_shift, last_block = (address + size - 1) >> block_shift;
-    const auto* arena = GetArena(first_block, last_block);
-    EnsureResident(arena, first_block, last_block);
-    return arena;
+    if (hi - lo > (u64{256} << 20)) {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(Render_Vulkan, "E4: request {:#x}+{:#x} places a block of {} MB", address, size, (hi - lo) >> 20);
+        }
+    }
+    Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedServed);
+    if (overlapping) {
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9BlockAliased);
+    }
+    if (!textures.empty()) {
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9BlockWithTextures);
+    }
+    return Place(std::move(ids), lo, hi);
 }
 
 bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
@@ -1272,171 +1180,12 @@ bool BufferCache::IsRangeGpuWritten(VAddr addr, size_t size) {
     return gpu_modified_ranges.Intersects(addr, size);
 }
 
-void BufferCache::SynchronizeDmaBuffers() {
-    fault_process_pending = true;
-    for (const auto& range : resident_ranges) {
-        const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
-        const VAddr device_addr = range.start << block_shift;
-        const u64 size = (range.end - range.start) << block_shift;
-        SynchronizeMemory(address_space[page], device_addr, size, false, false);
-    }
-}
-
-const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
-    const u64 first_page = first_block >> blocks_per_arena_page_shift;
-    const u64 last_page = last_block >> blocks_per_arena_page_shift;
-    ASSERT_MSG(last_page - first_page <= 1,
-               "Buffer request cannot span more than two VA arena pages");
-
-    const auto* first_arena = address_space[first_page];
-    const auto* last_arena = address_space[last_page];
-    if (first_arena == last_arena) {
-        if (!first_arena) {
-            const u64 base_block = Common::AlignDownPow2<u64>(first_block, blocks_per_arena_page);
-            const u64 num_pages = last_page - first_page + 1;
-            const auto* new_arena =
-                &arenas.emplace_back(instance, base_block << block_shift,
-                                     num_pages << ARENA_PAGE_BITS, MemoryType::Sparse);
-            address_space[first_page] = new_arena;
-            address_space[last_page] = new_arena;
-        }
-        return address_space[first_page];
-    }
-
-    LOG_WARNING(Render, "Migrating arena");
-
-    const u64 first_addr = first_arena ? first_arena->cpu_addr : (first_page << ARENA_PAGE_BITS);
-    const u64 first_size = first_arena ? first_arena->size_bytes : ARENA_PAGE_SIZE;
-    const u64 last_size = last_arena ? last_arena->size_bytes : ARENA_PAGE_SIZE;
-
-    const u64 base_block = first_addr >> block_shift;
-    const u64 total_size = first_size + last_size;
-    const u64 end_block = (first_addr + total_size) >> block_shift;
-    auto* new_arena = &arenas.emplace_back(instance, first_addr, total_size, MemoryType::Sparse);
-    auto* bind = BindsForArena(new_arena);
-    resident_ranges.ForEachInRange(base_block, end_block, [&](const Backing& backing) {
-        const u64 start = std::max(base_block, backing.start);
-        const u64 end = std::min(end_block, backing.end);
-        bind->binds.push_back(vk::SparseMemoryBind{
-            .resourceOffset = (start - base_block) << block_shift,
-            .size = (end - start) << block_shift,
-            .memory = backing.memory,
-            .memoryOffset = (backing.offset + start - backing.start) << block_shift,
-        });
-    });
-
-    u64 base_page = first_addr >> ARENA_PAGE_BITS;
-    for (u32 page = 0; page < (first_size >> ARENA_PAGE_BITS); ++page) {
-        address_space[base_page + page] = new_arena;
-    }
-    base_page = last_page;
-    for (u32 page = 0; page < (last_size >> ARENA_PAGE_BITS); ++page) {
-        address_space[base_page + page] = new_arena;
-    }
-    range_epoch.fetch_add(1, std::memory_order_acq_rel); // answers that name the old arenas are stale
-    arena_epoch.fetch_add(1, std::memory_order_acq_rel);
-    return new_arena;
-}
-
-void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
-    if (arena->mem_type != MemoryType::Sparse) {
-        return; // B9.4: a placed engine buffer is resident as a whole
-    }
-    for (const auto& [lo, hi] : resident_range_cache) {
-        if (first_block >= lo && last_block < hi) {
-            return;
-        }
-    }
-    const bool cacheable = last_block - first_block < 4;
-    if (cacheable) {
-        bool all_known = true;
-        for (u64 block = first_block; block <= last_block; ++block) {
-            if (resident_block_cache[block & 4095] != block + 1) {
-                all_known = false;
-                break;
-            }
-        }
-        if (all_known) {
-            return;
-        }
-    }
-    const auto remember = [&] {
-        if (cacheable) {
-            for (u64 block = first_block; block <= last_block; ++block) {
-                resident_block_cache[block & 4095] = block + 1;
-            }
-        } else {
-            resident_range_cache[resident_range_next++ & 7] = {first_block, last_block + 1};
-        }
-    };
-
-    u32 resident_blocks{};
-    IntervalList bind_ranges;
-    resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
-        resident_blocks += end - start;
-        bind_ranges.Add({start, end});
-    });
-
-    if (bind_ranges.Empty()) {
-        remember();
-        return;
-    }
-
-    const vk::MemoryAllocateFlagsInfo alloc_flags = {
-        .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
-    };
-    const vk::MemoryAllocateInfo alloc_info = {
-        .pNext = &alloc_flags,
-        .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
-    };
-    const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
-
-    boost::container::small_vector<vk::BufferCopy, 8> copies;
-    const auto staging =
-        staging_pool.Request(resident_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
-
-    u64 memory_offset{};
-    ArenaBinds* binds = BindsForArena(arena);
-    auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
-    u64 offset = staging.offset;
-    for (const auto& range : bind_ranges) {
-        Backing backing;
-        backing.start = range.start;
-        backing.end = range.end;
-        backing.memory = device_memory;
-        backing.offset = memory_offset >> block_shift;
-        resident_ranges.Add(backing);
-
-        LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
-
-        const auto& bind = binds->binds.emplace_back(vk::SparseMemoryBind{
-            .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
-            .size = (range.end - range.start) << block_shift,
-            .memory = device_memory,
-            .memoryOffset = memory_offset,
-        });
-        memory_offset += bind.size;
-
-        for (u32 block = 0; block < bind.size; block += block_size) {
-            *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
-        }
-        const u64 copy_size = (backing.end - backing.start) * sizeof(vk::DeviceAddress);
-        copies.emplace_back(offset, backing.start * sizeof(vk::DeviceAddress), copy_size);
-        offset += copy_size;
-    }
-
-    staging.Flush();
-    runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
-    remember();
-}
-
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
     HarvestWriteWatch(device_addr, size);
     // B9.4: a placed buffer holds [begin, end) of its block; a read into its slack must not take (and lose) the bytes of the memory after it
     VAddr held_lo = device_addr, held_hi = device_addr + size;
-    if (arena->mem_type != MemoryType::Sparse) {
+    {
         std::scoped_lock lock{placed_mutex};
         for (auto it = placed.upper_bound(arena->cpu_addr + 255); it != placed.begin();) {
             --it;
@@ -1456,7 +1205,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
     const auto add_piece = [&](u64 addr, u64 copy_size) {
-        if (arena->mem_type != MemoryType::Sparse) {
+        {
             // B9.4: a placed engine buffer takes only the memory it holds (a page range of the tracker, or a read past its end into the slack, can reach beyond)
             const u64 lo = std::max<u64>(addr, held_lo), hi = std::min<u64>(addr + copy_size, held_hi);
             if (lo >= hi) {
@@ -1746,7 +1495,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     }
     if (!copies.empty()) {
         // where uploads go: the arena (memory no placed buffer holds), a placed buffer in plain device memory, a placed buffer the CPU can write
-        zero_copy_counts[arena->mem_type == MemoryType::Sparse ? 7 : arena->mem_type == MemoryType::DeviceMapped ? 9 : 8].fetch_add(1, std::memory_order_relaxed);
+        zero_copy_counts[arena->mem_type == MemoryType::DeviceMapped ? 9 : 8].fetch_add(1, std::memory_order_relaxed);
     }
     if (!copies.empty() && arena->mem_type == MemoryType::DeviceMapped && arena->is_device_local && !arena->mapped_data.empty() && arena->CpuAddr() != 0) {
         // zero copy: the GPU is done with this engine buffer (every submission that used it finished): its bytes are written straight into its video memory,
@@ -1858,54 +1607,6 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
     auto& tile_manager = texture_cache.GetTileManager();
     tile_manager.TileImage(image, buffer_copies, arena, arena_offset);
     return true;
-}
-
-void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
-    if (pending_binds.empty()) {
-        // With a second command stream the stream that did not carry the binds has to wait for them too.
-        if (last_bind_tick != 0 && instance.HasAsyncQueue()) {
-            info.AddWait(memory_semaphore.Handle(), last_bind_tick);
-        }
-        return;
-    }
-
-    std::vector<vk::SparseBufferMemoryBindInfo> buffer_binds;
-    buffer_binds.reserve(pending_binds.size());
-
-    for (const auto& binds : pending_binds) {
-        buffer_binds.emplace_back(vk::SparseBufferMemoryBindInfo{
-            .buffer = binds.arena->Handle(),
-            .bindCount = static_cast<u32>(binds.binds.size()),
-            .pBinds = binds.binds.data(),
-        });
-    }
-
-    const u64 signal_tick = memory_semaphore.NextTick();
-    last_bind_tick = signal_tick;
-    const auto signal_sema = memory_semaphore.Handle();
-
-    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
-        .signalSemaphoreValueCount = 1u,
-        .pSignalSemaphoreValues = &signal_tick,
-    };
-
-    const vk::BindSparseInfo sparse_info = {
-        .pNext = &timeline_si,
-        .bufferBindCount = static_cast<u32>(buffer_binds.size()),
-        .pBufferBinds = buffer_binds.data(),
-        .signalSemaphoreCount = 1u,
-        .pSignalSemaphores = &signal_sema,
-    };
-
-    info.AddWait(signal_sema, signal_tick);
-    std::unique_lock queue_lock{Vulkan::Scheduler::submit_mutex, std::defer_lock};
-    if (!Vulkan::Scheduler::submit_lock_held) {
-        queue_lock.lock();
-    }
-    auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
-
-    pending_binds.clear();
 }
 
 } // namespace VideoCore

@@ -32,7 +32,6 @@ enum class MemoryType : u8 {
     HostUncached, ///< Requires a host visible memory type optimized for CPU to GPU uploads
     HostCached,   ///< Requires a host visible memory type optimized for GPU to CPU readbacks
     Stream,       ///< Requests device local host visible buffer, falling back host memory.
-    Sparse,       ///< Requires an unbacked sparse resident buffer.
     DeviceMapped, ///< Device local memory the CPU can write (resizable BAR), mapped; falls back to whatever VMA finds (callers check is_device_local)
 };
 

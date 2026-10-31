@@ -285,7 +285,7 @@ void Runtime::PlanImageBarriers(VideoCore::Image* image, VideoCore::Image::Barri
 }
 
 u64 Runtime::LiveObjectSpace(const VideoCore::Buffer* handle, u64 offset, u64& begin) {
-    if (handle->mem_type != VideoCore::MemoryType::Sparse && handle->CpuAddr() != 0) {
+    if (handle->CpuAddr() != 0) {
         // B10: a placed engine buffer (or block) is its own Vulkan buffer: its hazards are its own, in its own offset space
         ++live_stats.object_space_queries;
         const_cast<VideoCore::Buffer*>(handle)->NoteGpuUse(scheduler.CurrentTick()); // zero copy: the CPU writes it directly only once this is finished
