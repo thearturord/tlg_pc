@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <numeric>
 #include <mutex>
 #include <cmath>
 #include <tuple>
@@ -72,6 +73,12 @@ struct TagStat {
     u64 count{0}, ticks{0}, max{0}, inner{0};
 };
 
+/// The time of the outermost scope of one probe in 100 ms steps of the capture (for the chart of what a thread was busy with).
+struct RootBins {
+    u16 site{0};
+    std::vector<u64> ticks;
+};
+
 struct SlowOp {
     u64 ticks{0};
     u16 site{0};
@@ -97,6 +104,7 @@ struct ThreadData {
         slow.fill({});
         scopes = 0;
         node_overflow = 0;
+        root_bins.clear();
     }
     u32 tid{0};
     std::string name;
@@ -113,6 +121,7 @@ struct ThreadData {
     std::array<SlowOp, SlowCount> slow{};
     u64 scopes{0};
     u64 node_overflow{0};
+    std::vector<RootBins> root_bins;
 };
 
 namespace {
@@ -154,6 +163,8 @@ u32 g_cfg_level = 0;
 u64 g_cfg_mask = 0;
 double g_cost_ticks = 0.0; ///< the measured cost of one scope (Enter + Leave) in timestamp counter ticks
 u64 g_tick0 = 0, g_ns0 = 0;
+constexpr u64 BinNs = 100'000'000;
+constexpr u64 MaxBins = 700;
 
 std::mutex g_report_mutex;
 std::string g_full, g_json;
@@ -302,6 +313,28 @@ void EnterTD(ThreadData& td, u16 site) {
 }
 
 void FinishRoot(ThreadData& td, const Frame& f, u64 dur) {
+    {
+        const u64 bin = (FrameTimeline::Now() - g_ns0) / BinNs;
+        if (bin < MaxBins) {
+            RootBins* rb = nullptr;
+            for (RootBins& r : td.root_bins) {
+                if (r.site == f.site) {
+                    rb = &r;
+                    break;
+                }
+            }
+            if (rb == nullptr && td.root_bins.size() < 12) {
+                td.root_bins.push_back({f.site, {}});
+                rb = &td.root_bins.back();
+            }
+            if (rb != nullptr) {
+                if (rb->ticks.size() <= bin) {
+                    rb->ticks.resize(bin + 1, 0);
+                }
+                rb->ticks[bin] += dur;
+            }
+        }
+    }
     // the tags of the operation
     for (u32 i = 0; i < td.tag_count; ++i) {
         const TagValue& t = td.tags[i];
@@ -625,6 +658,7 @@ struct Card {
 
 struct ThreadReport {
     std::string name;
+    std::string chart; ///< svg: what the thread was busy with over time
     std::vector<Card> cards;
     std::vector<Table> tables;
     nlohmann::json json;
@@ -710,6 +744,87 @@ std::string HtmlOf(const Table& t) {
         out += "</tr>";
     }
     return out + "</table>";
+}
+
+}  // namespace
+
+namespace {
+
+struct Series {
+    std::string name;
+    std::string color;
+    std::vector<std::pair<double, double>> points; ///< (seconds, value)
+};
+
+constexpr const char* Palette[] = {"#d9534f", "#f0ad4e", "#5bc0de", "#5cb85c", "#9370db", "#4da3ff", "#ffb347", "#3ecf8e", "#c792ea", "#4fd1c5", "#e6e8eb", "#ff8a65"};
+
+/// The frame of a chart: the axes, the seconds grid, the guide lines. Returns the part of the svg before the data; the plot area is x 50..930, y 24..192.
+std::string ChartFrame(const std::string& title, double seconds, double ymax, const std::string& unit, const std::vector<std::pair<double, std::string>>& guides) {
+    std::string s = "<svg width=\"1100\" height=\"220\" xmlns=\"http://www.w3.org/2000/svg\" style=\"background:#111;display:block;margin:6px 0\">";
+    s += fmt::format("<text x=\"50\" y=\"16\" fill=\"#ddd\" font-size=\"13\">{}</text>", Escape(title));
+    const auto x_of = [&](double t) { return 50.0 + t / seconds * 880.0; };
+    const auto y_of = [&](double v) { return 192.0 - std::min(v, ymax) / ymax * 168.0; };
+    for (const auto& [value, label] : guides) {
+        if (value > ymax) {
+            continue;
+        }
+        s += fmt::format("<line x1=\"50\" x2=\"930\" y1=\"{:.1f}\" y2=\"{:.1f}\" stroke=\"#444\" stroke-dasharray=\"4 4\"/><text x=\"934\" y=\"{:.1f}\" fill=\"#888\" font-size=\"11\">{}</text>", y_of(value), y_of(value),
+                         y_of(value) + 4, Escape(label));
+    }
+    const u32 step = seconds > 40 ? 5 : seconds > 15 ? 2 : 1;
+    for (u32 t = 0; t <= static_cast<u32>(seconds); t += step) {
+        s += fmt::format("<line x1=\"{:.1f}\" x2=\"{:.1f}\" y1=\"24\" y2=\"192\" stroke=\"#2a2a2a\"/><text x=\"{:.1f}\" y=\"208\" fill=\"#888\" font-size=\"11\" text-anchor=\"middle\">{} s</text>", x_of(t), x_of(t), x_of(t), t);
+    }
+    s += fmt::format("<text x=\"46\" y=\"196\" fill=\"#888\" font-size=\"11\" text-anchor=\"end\">0 {}</text>", unit);
+    s += fmt::format("<text x=\"46\" y=\"112\" fill=\"#888\" font-size=\"11\" text-anchor=\"end\">{:.0f} {}</text>", ymax / 2, unit);
+    s += fmt::format("<text x=\"46\" y=\"28\" fill=\"#888\" font-size=\"11\" text-anchor=\"end\">{:.0f} {}</text>", ymax, unit);
+    return s;
+}
+
+std::string LineChart(const std::string& title, double seconds, const std::vector<Series>& series, double ymax, const std::string& unit, const std::vector<std::pair<double, std::string>>& guides) {
+    std::string s = ChartFrame(title, seconds, ymax, unit, guides);
+    const auto x_of = [&](double t) { return 50.0 + t / seconds * 880.0; };
+    const auto y_of = [&](double v) { return 192.0 - std::min(v, ymax) / ymax * 168.0; };
+    double legend_y = 54;
+    for (const Series& series_i : series) {
+        if (series_i.points.empty()) {
+            continue;
+        }
+        std::string points;
+        for (const auto& [t, v] : series_i.points) {
+            points += fmt::format("{:.1f},{:.1f} ", x_of(t), y_of(v));
+        }
+        s += fmt::format("<polyline fill=\"none\" stroke=\"{}\" stroke-width=\"1.6\" points=\"{}\"/>", series_i.color, points);
+        s += fmt::format("<text x=\"938\" y=\"{:.0f}\" fill=\"{}\" font-size=\"12\">{}</text>", legend_y, series_i.color, Escape(series_i.name));
+        legend_y += 16;
+    }
+    return s + "</svg>";
+}
+
+/// Stacked bars: one bar per 100 ms step, the series on top of each other.
+std::string StackedChart(const std::string& title, double seconds, const std::vector<std::pair<std::string, std::vector<double>>>& series, double ymax, const std::string& unit) {
+    std::string s = ChartFrame(title, seconds, ymax, unit, {{100.0, "100 %"}});
+    const double bar = 880.0 / std::max(1.0, seconds * 10.0);
+    const size_t bins = series.empty() ? 0 : series[0].second.size();
+    std::vector<double> base(bins, 0.0);
+    double legend_y = 54;
+    for (size_t k = 0; k < series.size(); ++k) {
+        const std::string color = Palette[k % std::size(Palette)];
+        for (size_t i = 0; i < bins; ++i) {
+            const double v = series[k].second[i];
+            if (v <= 0.0) {
+                continue;
+            }
+            const double top = std::min(ymax, base[i] + v);
+            const double y_top = 192.0 - top / ymax * 168.0;
+            const double y_bottom = 192.0 - std::min(ymax, base[i]) / ymax * 168.0;
+            s += fmt::format("<rect x=\"{:.1f}\" y=\"{:.1f}\" width=\"{:.1f}\" height=\"{:.1f}\" fill=\"{}\"/>", 50.0 + static_cast<double>(i) * bar, y_top, std::max(0.5, bar - 0.5), std::max(0.0, y_bottom - y_top), color);
+            base[i] += v;
+        }
+        s += fmt::format("<text x=\"938\" y=\"{:.0f}\" fill=\"{}\" font-size=\"12\">{}</text>", legend_y, color, Escape(series[k].first));
+        legend_y += 16;
+    }
+    return s + "</svg>";
 }
 
 }  // namespace
@@ -846,6 +961,40 @@ void Analyze(const FrameTimeline::CapEvent* events, u64 count, u64 start_ns, u64
         const double scopes_frame = static_cast<double>(td->scopes) / nframes;
         const double cost_ms_frame = scopes_frame * ms(c);
 
+        {
+            // what the thread was busy with over time: its outermost probes, as measured, in 100 ms steps
+            std::vector<const RootBins*> order;
+            for (const RootBins& r : td->root_bins) {
+                order.push_back(&r);
+            }
+            std::sort(order.begin(), order.end(), [](const RootBins* a, const RootBins* b) {
+                return std::accumulate(a->ticks.begin(), a->ticks.end(), u64{0}) > std::accumulate(b->ticks.begin(), b->ticks.end(), u64{0});
+            });
+            const size_t bins = static_cast<size_t>(seconds * 10.0) + 1;
+            std::vector<std::pair<std::string, std::vector<double>>> series;
+            std::vector<double> other(bins, 0.0);
+            bool any_other = false;
+            for (size_t k = 0; k < order.size(); ++k) {
+                std::vector<double> values(bins, 0.0);
+                for (size_t i = 0; i < order[k]->ticks.size() && i < bins; ++i) {
+                    values[i] = ms(static_cast<double>(order[k]->ticks[i])); // ms of the 100 ms step = percent of one core
+                }
+                if (k < 8) {
+                    series.emplace_back(site_name(order[k]->site), std::move(values));
+                } else {
+                    for (size_t i = 0; i < bins; ++i) {
+                        other[i] += values[i];
+                    }
+                    any_other = true;
+                }
+            }
+            if (any_other) {
+                series.emplace_back("other", std::move(other));
+            }
+            if (!series.empty()) {
+                rep.chart = StackedChart(fmt::format("{}: busy time by operation, percent of one core per 100 ms (as measured)", td->name), seconds, series, 100.0, "%");
+            }
+        }
         rep.cards.push_back({fmt::format("{:.2f} ms", ms(busy) / nframes), fmt::format("busy per frame, probe cost removed ({:.0f} % of the frame)", ms(busy) / nframes / frame_ms * 100.0)});
         rep.cards.push_back({fmt::format("{:.2f} ms", ms(busy_raw) / nframes), "busy per frame as measured"});
         rep.cards.push_back({fmt::format("{:.0f}", scopes_frame), fmt::format("scopes per frame, {:.0f} ns each when measured warm = {:.2f} ms per frame at least", ms(c) * 1e6, cost_ms_frame)});
@@ -1075,6 +1224,73 @@ void Analyze(const FrameTimeline::CapEvent* events, u64 count, u64 start_ns, u64
     html += "<h1>Profile</h1>";
     html += fmt::format("<div class=\"sub\">{:.1f} s, {} frames from {} ({:.1f} fps, {:.2f} ms per frame); level {}, {}, threads: {}{}. Times are per frame, with the measured cost of the probes removed.</div>", seconds, frames,
                         frame_source, nframes / seconds, frame_ms, g_config.level, Escape(groups_text), Escape(threads_text), have_baseline ? "; compared with prof_baseline.json" : "");
+    {
+        // the charts of the whole capture: frame time, CPU use of the busiest threads, GPU busy
+        std::vector<u64> marks;
+        const u64 bins = std::min<u64>(MaxBins, (end_ns - start_ns) / BinNs + 1);
+        std::vector<double> gpu(bins, 0.0);
+        std::unordered_map<u32, std::vector<double>> cpu;
+        for (u64 i = 0; i < count; ++i) {
+            const auto& e = events[i];
+            if (e.ns < start_ns) {
+                continue;
+            }
+            const u64 bin = (e.ns - start_ns) / BinNs;
+            if (bin >= bins) {
+                continue;
+            }
+            if (e.type == FrameTimeline::SubmitFlip) {
+                marks.push_back(e.ns);
+            } else if (e.type == FrameTimeline::ThreadCpu) {
+                auto& v = cpu[e.thread];
+                v.resize(bins, 0.0);
+                v[bin] += static_cast<double>(e.arg) / ticks_per_ns / static_cast<double>(BinNs) * 100.0;
+            } else if (e.type == FrameTimeline::GpuPass) {
+                gpu[bin] += static_cast<double>(e.arg & ((1ull << 56) - 1)) / static_cast<double>(BinNs) * 100.0;
+            }
+        }
+        std::sort(marks.begin(), marks.end());
+        Series frame_series{"frame time " + fmt::format("{:.0f} ms", frame_ms), "#cccccc", {}};
+        double frame_max = 0;
+        for (size_t i = 0; i + 1 < marks.size(); ++i) {
+            const double v = static_cast<double>(marks[i + 1] - marks[i]) / 1e6;
+            frame_max = std::max(frame_max, v);
+            frame_series.points.emplace_back(static_cast<double>(marks[i] - start_ns) / 1e9, v);
+        }
+        if (frame_series.points.size() >= 5) {
+            html += LineChart("frame time per frame (ms)", seconds, {frame_series}, std::max(50.0, std::ceil(frame_max / 10.0) * 10.0), "ms", {{1000.0 / 120.0, "120 fps"}, {1000.0 / 60.0, "60 fps"}, {1000.0 / 30.0, "30 fps"}});
+        }
+        std::vector<std::pair<u32, double>> totals;
+        for (const auto& [tid, v] : cpu) {
+            totals.emplace_back(tid, std::accumulate(v.begin(), v.end(), 0.0));
+        }
+        std::sort(totals.begin(), totals.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::vector<Series> cpu_series;
+        double cpu_max = 100.0;
+        for (size_t k = 0; k < std::min<size_t>(7, totals.size()); ++k) {
+            const u32 tid = totals[k].first;
+            const auto it = g_tid_names.find(tid);
+            Series s{it != g_tid_names.end() ? it->second : fmt::format("thread {}", tid), Palette[k % std::size(Palette)], {}};
+            for (u64 b = 0; b < bins; ++b) {
+                const double v = cpu[tid][b];
+                cpu_max = std::max(cpu_max, v);
+                s.points.emplace_back((static_cast<double>(b) + 0.5) * 0.1, v);
+            }
+            cpu_series.push_back(std::move(s));
+        }
+        if (!cpu_series.empty()) {
+            html += LineChart("CPU use of the busiest threads (percent of one core, 100 ms steps)", seconds, cpu_series, std::ceil(cpu_max / 50.0) * 50.0, "%", {{100.0, "1 core"}});
+        }
+        Series gpu_series{"GPU busy", "#337ab7", {}};
+        bool gpu_any = false;
+        for (u64 b = 0; b < bins; ++b) {
+            gpu_any |= gpu[b] > 0.0;
+            gpu_series.points.emplace_back((static_cast<double>(b) + 0.5) * 0.1, gpu[b]);
+        }
+        if (gpu_any) {
+            html += LineChart("GPU busy (passes and dispatches, 100 ms steps)", seconds, {gpu_series}, 100.0, "%", {});
+        }
+    }
     nlohmann::json json;
     json["seconds"] = seconds;
     json["frames"] = frames;
@@ -1093,6 +1309,7 @@ void Analyze(const FrameTimeline::CapEvent* events, u64 count, u64 start_ns, u64
         }
         text += "\n";
         html += "</div>";
+        html += rep.chart;
         for (const Table& t : rep.tables) {
             text += TextOf(t);
             html += HtmlOf(t);
