@@ -48,9 +48,6 @@ bool SupersedeEnabled();
 /// in milliseconds (bits 16 and up); ~0 when no announcement covers it (the window ring keeps the last 4096).
 u32 WhoWrote(u64 address, u64 size);
 
-/// B2 gate (`TLG_B2_AUDIT=1`): every page the write watch finds written is checked against the pages an announcement covered since the page's last harvest.
-/// The pages of an announcement are marked (a direct mapped table of 1 M pages); a harvested page with no mark is a CPU write no engine update explains.
-[[nodiscard]] bool HarvestAuditOn() noexcept;
 
 /// B2 cutover (`TLG_B2_NATIVE`): 0 off (the write watch decides what the CPU changed), 1 the engine's announcements decide and the write watch only replays the pages
 /// no announcement covered (counted as misses), 2 the announcements alone (misses are counted, not replayed: the fully native mode).
@@ -74,16 +71,7 @@ struct Batch {
 [[nodiscard]] Batch TakeBatch();
 /// Applies a batch (raster thread: in order with the GPU work)
 void ApplyBatch(const Batch& batch);
-/// Where the command processor queues a batch in order (the raster thread); set by the command processor
-void SetQueue(void (*fn)(void* context, Batch&& batch), void* context);
-/// A passed memory wait (command processor): the announcements made so far are queued to the raster thread
-void ApplyPending();
-/// A harvested page: true when an announcement covered it since its last harvest (the mark is consumed)
-[[nodiscard]] bool ConsumeMark(u64 page);
-/// B2 cutover: a harvested page no announcement covered
-void NoteMiss(u64 page, u64 bytes);
-void NoteHarvested(u64 address, u64 bytes, bool in_upload_ring);
-[[nodiscard]] nlohmann::json HarvestAuditReport();
+[[nodiscard]] nlohmann::json B2Report();
 
 /// B8.1 (`TLG_B8_IMAGES`): 0 off, 1 audit (texture memory stays write protected; a fault that dirtied an image no announcement explains is counted), 2 native (the
 /// announcements alone refresh images, texture memory is not write protected; `TLG_B8_VERIFY=N` hashes every Nth bound image that is not dirty against its last refresh)

@@ -153,8 +153,6 @@ public:
     SmallVector<BackingImage, 2> backing_images;
     BackingImage* backing{};
     u64 image_uid{};
-    u64 ww_hash{}; ///< write watch image verify: hash of the guest bytes at the last refresh (0: none)
-    u64 ww_head_hash{}, ww_tail_hash{}; ///< write watch: hash of the image's bytes on its first / last page at the last refresh (0: none)
     u64 ring_hash{}; ///< dark frame fix: an image inside the frame ring, hash of its guest bytes when last checked or uploaded (0: none)
     u64 b8_hash{};  ///< B8.1 verify: hash of the guest bytes at the last CPU refresh (0: none)
     u64 b8_listed_by{}; ///< B8.4 diagnosis: the engine texture whose list took the image last (bit 63: as an answer)

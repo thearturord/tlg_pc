@@ -35,7 +35,6 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
-#include "native/native_write_watch.h"
 
 #include <vk_mem_alloc.h>
 

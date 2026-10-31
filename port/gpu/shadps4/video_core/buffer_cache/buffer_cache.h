@@ -82,10 +82,6 @@ public:
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
 
-    /// L3 write watch: the pages of the range the CPU wrote since they were last asked (Core::WriteWatch) are marked CPU modified, as a
-    /// write fault would have; called before any use of the range's CPU state
-    void HarvestWriteWatch(VAddr device_addr, u64 size, bool image = false);
-
     /// O1 / C6 step 1 (`TLG_STREAM_IN_PASS=0` turns it off): a small read-only request while a render pass is open, whose bytes the GPU did not write, is served
     /// from the stream buffer, so an upload does not cut the pass
     [[nodiscard]] bool StreamWhilePassOpen(VAddr device_addr, u32 size);

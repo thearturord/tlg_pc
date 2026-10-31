@@ -15,7 +15,6 @@
 #include "native/native_draw.h"
 #include "native/native_light_recorder.h"
 #include "native/native_untracked_ring.h"
-#include "native/native_write_watch.h"
 #include "native/native_audit.h"
 #include "native/native_readbacks.h"
 #include "native/native_device.h"
@@ -699,55 +698,6 @@ const u32* Rasterizer::BinderWords(const Shader::Info& stage, u32 offset, u32 dw
         *binding_index = first;
     }
     return words;
-}
-
-void Rasterizer::HarvestAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_HARVEST_AHEAD"); // P2: on by default (verified 2026-10-28: 0 misses, 0 stale answers); 0 turns it off
-        return e == nullptr || *e != '0';
-    }();
-    if (!on || !Core::WriteWatch::Enabled() || (draw_plan == nullptr && dispatch_plan == nullptr)) {
-        return;
-    }
-    const u32 epoch = Core::WriteWatch::epoch.load(std::memory_order_acquire);
-    const u32 base_epoch = Core::WriteWatch::base_epoch.load(std::memory_order_acquire);
-    const auto buffers = [&](const auto& bindings, u32 count) {
-        for (u32 i = 0; i < count; ++i) {
-            const auto& b = bindings[i];
-            // E3.3: the pages an image shares with other data are not harvested ahead any more (the engine's announced writes tell when an image changed)
-            if (b.kind != 1) {
-                continue;
-            }
-            AmdGpu::Buffer v{};
-            std::memcpy(&v, b.words, sizeof(v));
-            const u64 bytes = v.GetSize();
-            if (v.base_address != 0 && bytes != 0 && bytes < (u64{1} << 28)) {
-                buffer_cache.HarvestWriteWatch(v.base_address, bytes);
-            }
-        }
-    };
-    if (draw_plan != nullptr) {
-        buffers(draw_plan->bindings, draw_plan->binding_count);
-        if (draw_plan->handle_epoch == Core::NativeResources::ImmutableEpoch()) {
-            for (u32 i = 0; i < draw_plan->binding_count; ++i) {
-                if (const auto* h = draw_plan->handles[i]) {
-                    buffer_cache.HarvestWriteWatch(h->begin, h->end - h->begin);
-                }
-            }
-            for (u32 i = 0; i < draw_plan->geometry_handle_count; ++i) {
-                if (const auto* h = draw_plan->geometry_handles[i]) {
-                    buffer_cache.HarvestWriteWatch(h->begin, h->end - h->begin);
-                }
-            }
-        }
-        draw_plan->ww_epoch = epoch;
-        draw_plan->ww_base_epoch = base_epoch;
-    }
-    if (dispatch_plan != nullptr) {
-        buffers(dispatch_plan->bindings, dispatch_plan->binding_count);
-        dispatch_plan->ww_epoch = epoch;
-        dispatch_plan->ww_base_epoch = base_epoch;
-    }
 }
 
 void Rasterizer::ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) {

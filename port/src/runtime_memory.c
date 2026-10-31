@@ -145,13 +145,11 @@ typedef struct { uintptr_t start, end; uint64_t phys; int mapped, ww; unsigned c
 typedef struct { uintptr_t start, end; DWORD protect; } ProtRun;
 static HostRegion *regions; static size_t region_count, region_capacity;
 static HANDLE section;
-/* ---- write watch (TLG_WRITE_WATCH=1) ----
- * GPU mappings of direct memory are private allocations with MEM_WRITE_WATCH instead of views of the
- * section: the kernel records every page written, so the GPU tracker learns CPU writes without page
- * protection or faults (runtime_memory_ww_harvest). A private allocation has no second view, so the
- * section holds their content only while they are unmapped (copied in at map, copied back at unmap),
- * and the GPU side's own writes into them (runtime_memory_write_backing) go through the guest address
- * without counting as CPU writes (ww_write). */
+/* ---- private mappings of GPU visible direct memory ----
+ * Direct memory the GPU maps is a private allocation instead of a view of the section (no write watch since E4: the engine's
+ * announcements tell what the CPU wrote). A private allocation has no second view, so the section holds its content only while it
+ * is unmapped (copied in at map, copied back at unmap), and the GPU side's own writes into it (runtime_memory_write_backing) go
+ * through the guest address (ww_write). */
 #define WW_CHUNK UINT64_C(65536)
 static void win_fail(const char *what, uintptr_t address, uint64_t size);
 static int ww_enabled(void) {
@@ -162,38 +160,13 @@ static int ww_enabled(void) {
 }
 static unsigned char *phys_used; /* one byte per 64 KiB of the section: its content may be non-zero */
 static SRWLOCK ww_lock=SRWLOCK_INIT; /* protection changes of watched regions (shared) against a GPU write into them (exclusive) */
-static SRWLOCK ww_pending_lock=SRWLOCK_INIT;
-static uintptr_t *ww_pending; static size_t ww_pending_count, ww_pending_capacity;
-static volatile long ww_pending_any;
-static volatile LONG64 ww_stat_bytes, ww_stat_backing_pages, ww_stat_backing_races, ww_stat_releases;
 static void phys_mark(uint64_t phys, uint64_t size) {
     if (!phys_used || !size) return;
     for (uint64_t c=phys/WW_CHUNK, e=(phys+size-1)/WW_CHUNK; c<=e; ++c) phys_used[c]=1;
 }
-static void ww_pending_push(uintptr_t page) {
-    AcquireSRWLockExclusive(&ww_pending_lock);
-    if (ww_pending_count==ww_pending_capacity) {
-        size_t capacity=ww_pending_capacity ? ww_pending_capacity*2 : 1024;
-        uintptr_t *next=realloc(ww_pending,capacity*sizeof(*next));
-        if (!next) { fputs("Out of memory (write watch)\n",stderr); exit(1); }
-        ww_pending=next; ww_pending_capacity=capacity;
-    }
-    ww_pending[ww_pending_count++]=page;
-    ww_pending_any=1;
-    ReleaseSRWLockExclusive(&ww_pending_lock);
-}
-/* Pages written in [a,b) (page aligned, inside one watched region) since the last reset, reset, to the pending list. */
-static void ww_collect(uintptr_t a, uintptr_t b) {
-    static __thread PVOID *found; static __thread size_t found_capacity;
-    size_t pages=(b-a)/4096;
-    if (found_capacity<pages) { free(found); found=malloc(pages*sizeof(*found)); found_capacity=found ? pages : 0; if (!found) return; }
-    ULONG_PTR count=pages; ULONG granularity=0;
-    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET,(void *)a,b-a,found,&count,&granularity)) return;
-    for (ULONG_PTR i=0;i<count;++i) ww_pending_push((uintptr_t)found[i]);
-}
 static int ww_map(HostRegion *r, DWORD protect) {
     uint64_t size=r->end-r->start;
-    if (!VirtualAlloc2(NULL,(void *)r->start,size,MEM_RESERVE|MEM_COMMIT|MEM_WRITE_WATCH|MEM_REPLACE_PLACEHOLDER,PAGE_READWRITE,NULL,0)) {
+    if (!VirtualAlloc2(NULL,(void *)r->start,size,MEM_RESERVE|MEM_COMMIT|MEM_REPLACE_PLACEHOLDER,PAGE_READWRITE,NULL,0)) {
         fprintf(stderr,"Runtime: write watched allocation of %p failed (error %lu), mapping a view\n",(void *)r->start,GetLastError());
         return 0;
     }
@@ -202,26 +175,21 @@ static int ww_map(HostRegion *r, DWORD protect) {
         uint64_t n=size-off<WW_CHUNK ? size-off : WW_CHUNK;
         if (phys_used && phys_used[(r->phys+off)/WW_CHUNK]) memcpy((void *)(r->start+off),backing_base+r->phys+off,n);
     }
-    ResetWriteWatch((void *)r->start,size);
     DWORD old;
     if (protect!=PAGE_READWRITE && !VirtualProtect((void *)r->start,size,protect,&old)) win_fail("VirtualProtect",r->start,size);
     r->ro=calloc(size/4096+1,1);
     if (r->ro && protect!=PAGE_READWRITE) memset(r->ro,1,size/4096+1);
-    InterlockedAdd64(&ww_stat_bytes,(LONG64)size);
     printf("Runtime: write watched mapping %p, size=%" PRIu64 "\n",(void *)r->start,size);
     return 1;
 }
 /* A watched region leaves: its writes go to the pending list, its content back to the section. */
 static void ww_release(HostRegion *r) {
     uint64_t size=r->end-r->start;
-    ww_collect(r->start,r->end);
     DWORD old;
     VirtualProtect((void *)r->start,size,PAGE_READONLY,&old); /* readable for the copy, whatever the tracker had */
     memcpy(backing_base+r->phys,(const void *)r->start,size);
     phys_mark(r->phys,size);
     if (!VirtualFree((void *)r->start,size,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)) win_fail("releasing a write watched allocation",r->start,size);
-    InterlockedAdd64(&ww_stat_bytes,-(LONG64)size);
-    InterlockedIncrement64(&ww_stat_releases);
     r->ww=0; r->mapped=0;
     free(r->ro); r->ro=NULL;
 }
@@ -349,62 +317,22 @@ static HostRegion *ww_region(uintptr_t a) {
     size_t i=region_index(a);
     return i<region_count && regions[i].start<=a && regions[i].mapped && regions[i].ww ? &regions[i] : NULL;
 }
-/* A write of the GPU side into a watched region: snapshot the pages, hand the CPU's writes so far to the pending list, write
- * (lifting a protection for the moment), drop the write watch bits the write set, and compare the pages with snapshot plus
- * write: a page that differs was written by the CPU in the meantime and goes to the pending list too. */
-static volatile long ww_quiet; /* B7: nobody harvests the write watch: a GPU side write needs no snapshot, collect or reset */
+/* A write of the GPU side into a watched region: a page that is protected is lifted for the write and restored after it. */
 static void ww_write(HostRegion *r, uintptr_t at, const unsigned char *data, uint64_t n) {
     uintptr_t p0=at&~(uintptr_t)4095, p1=(at+n+4095)&~(uintptr_t)4095;
-    size_t len=p1-p0;
-    if (ww_quiet) {
-        AcquireSRWLockShared(&ww_lock);
-        int rw=r && r->ro && p0>=r->start && p1<=r->end;
-        for (uintptr_t pg=p0; rw && pg<p1; pg+=4096) rw=!r->ro[(pg-r->start)>>12];
-        ReleaseSRWLockShared(&ww_lock);
-        if (rw) { memcpy((void *)at,data,n); InterlockedAdd64(&ww_stat_backing_pages,(LONG64)(len/4096)); return; }
-        /* a protected page: lift it for the write, nothing else */
-        AcquireSRWLockExclusive(&ww_lock);
-        ProtRun *qruns=NULL; size_t qn=0, qcap=0;
-        qn=save_protections(p0,p1,&qruns,0,&qcap);
-        DWORD qold;
-        for (size_t i=0;i<qn;++i) if (qruns[i].protect!=PAGE_READWRITE) VirtualProtect((void *)qruns[i].start,qruns[i].end-qruns[i].start,PAGE_READWRITE,&qold);
-        memcpy((void *)at,data,n);
-        for (size_t i=0;i<qn;++i) if (qruns[i].protect!=PAGE_READWRITE) VirtualProtect((void *)qruns[i].start,qruns[i].end-qruns[i].start,qruns[i].protect,&qold);
-        free(qruns);
-        ReleaseSRWLockExclusive(&ww_lock);
-        return;
-    }
-    static __thread unsigned char *snap; static __thread size_t snap_capacity;
-    if (snap_capacity<len) { free(snap); snap=malloc(len); snap_capacity=snap ? len : 0; }
+    AcquireSRWLockShared(&ww_lock);
+    int rw=r && r->ro && p0>=r->start && p1<=r->end;
+    for (uintptr_t pg=p0; rw && pg<p1; pg+=4096) rw=!r->ro[(pg-r->start)>>12];
+    ReleaseSRWLockShared(&ww_lock);
+    if (rw) { memcpy((void *)at,data,n); return; }
     AcquireSRWLockExclusive(&ww_lock);
-    if (snap) memcpy(snap,(const void *)p0,len);
-    ww_collect(p0,p1);
-    ProtRun *runs=NULL; size_t nruns=0, capacity=0;
-    /* P3: the region's page map says whether a page is protected; all read/write needs no query (VirtualQuery of a watched allocation walks its pages) */
-    int all_rw=r && r->ro && p0>=r->start && p1<=r->end;
-    for (uintptr_t pg=p0; all_rw && pg<p1; pg+=4096) all_rw=!r->ro[(pg-r->start)>>12];
-    if (!all_rw) nruns=save_protections(p0,p1,&runs,0,&capacity);
-    DWORD old;
-    for (size_t i=0;i<nruns;++i) if (runs[i].protect!=PAGE_READWRITE) VirtualProtect((void *)runs[i].start,runs[i].end-runs[i].start,PAGE_READWRITE,&old);
+    ProtRun *qruns=NULL; size_t qn=0, qcap=0;
+    qn=save_protections(p0,p1,&qruns,0,&qcap);
+    DWORD qold;
+    for (size_t i=0;i<qn;++i) if (qruns[i].protect!=PAGE_READWRITE) VirtualProtect((void *)qruns[i].start,qruns[i].end-qruns[i].start,PAGE_READWRITE,&qold);
     memcpy((void *)at,data,n);
-    for (size_t i=0;i<nruns;++i) if (runs[i].protect!=PAGE_READWRITE) VirtualProtect((void *)runs[i].start,runs[i].end-runs[i].start,runs[i].protect,&old);
-    free(runs);
-    { /* the write's own bits */
-        static __thread PVOID *found; static __thread size_t found_capacity;
-        size_t pages=len/4096;
-        if (found_capacity<pages) { free(found); found=malloc(pages*sizeof(*found)); found_capacity=found ? pages : 0; }
-        ULONG_PTR count=found ? pages : 0; ULONG granularity=0;
-        if (found) GetWriteWatch(WRITE_WATCH_FLAG_RESET,(void *)p0,len,found,&count,&granularity);
-    }
-    if (snap) {
-        memcpy(snap+(at-p0),data,n);
-        for (size_t off=0;off<len;off+=4096) {
-            if (memcmp(snap+off,(const void *)(p0+off),4096)) { ww_pending_push(p0+off); InterlockedIncrement64(&ww_stat_backing_races); }
-        }
-    } else {
-        for (size_t off=0;off<len;off+=4096) ww_pending_push(p0+off); /* no snapshot: report every page (an extra upload at worst) */
-    }
-    InterlockedAdd64(&ww_stat_backing_pages,(LONG64)(len/4096));
+    for (size_t i=0;i<qn;++i) if (qruns[i].protect!=PAGE_READWRITE) VirtualProtect((void *)qruns[i].start,qruns[i].end-qruns[i].start,qruns[i].protect,&qold);
+    free(qruns);
     ReleaseSRWLockExclusive(&ww_lock);
 }
 static int host_unmap(uintptr_t address, uint64_t size) { carve_host(address,address+size); return 0; }
@@ -1071,62 +999,6 @@ void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int 
 #endif
     read_unlock();
 }
-#ifdef _WIN32
-int runtime_memory_ww_enabled(void) { return ww_enabled(); }
-int runtime_memory_ww_pending(void) { return ww_pending_any!=0; }
-void runtime_memory_ww_set_quiet(int quiet) { InterlockedExchange(&ww_quiet,quiet ? 1 : 0); }
-/* The watched regions (start, size), at most capacity of them; returns how many exist. */
-size_t runtime_memory_ww_regions(uintptr_t *starts, uint64_t *sizes, size_t capacity) {
-    read_lock();
-    size_t n=0;
-    for (size_t i=0;i<region_count;++i) if (regions[i].mapped && regions[i].ww) {
-        if (n<capacity) { starts[n]=regions[i].start; sizes[n]=regions[i].end-regions[i].start; }
-        ++n;
-    }
-    read_unlock();
-    return n;
-}
-/* The 4 KiB pages of [address, address + size) the CPU wrote since the last harvest of them (write watch, reset), plus, when
- * take_pending, every page of the pending list (writes found by ww_write and ww_release). pages must hold capacity entries;
- * capacity must be at least the pages of the range. Returns the number written. */
-size_t runtime_memory_ww_harvest(uintptr_t address, uint64_t size, uintptr_t *pages, size_t capacity, int take_pending) {
-    size_t n=0;
-    read_lock();
-    uintptr_t end=address+size;
-    for (size_t i=region_index(address); i<region_count && regions[i].start<end && n<capacity; ++i) {
-        if (!regions[i].mapped || !regions[i].ww) continue;
-        uintptr_t a=(regions[i].start>address ? regions[i].start : address)&~(uintptr_t)4095;
-        uintptr_t b=((regions[i].end<end ? regions[i].end : end)+4095)&~(uintptr_t)4095;
-        ULONG_PTR count=capacity-n; ULONG granularity=0;
-        if (!GetWriteWatch(WRITE_WATCH_FLAG_RESET,(void *)a,b-a,(PVOID *)(pages+n),&count,&granularity)) n+=count;
-    }
-    read_unlock();
-    if (take_pending && ww_pending_any) {
-        AcquireSRWLockExclusive(&ww_pending_lock);
-        size_t take=ww_pending_count<capacity-n ? ww_pending_count : capacity-n;
-        memcpy(pages+n,ww_pending,take*sizeof(*pages));
-        n+=take;
-        memmove(ww_pending,ww_pending+take,(ww_pending_count-take)*sizeof(*ww_pending));
-        ww_pending_count-=take;
-        ww_pending_any=ww_pending_count!=0;
-        ReleaseSRWLockExclusive(&ww_pending_lock);
-    }
-    return n;
-}
-/* bytes watched, pages written by the GPU side into them, of those changed by the CPU meanwhile, regions released */
-void runtime_memory_ww_stats(uint64_t out[4]) {
-    out[0]=(uint64_t)ww_stat_bytes; out[1]=(uint64_t)ww_stat_backing_pages; out[2]=(uint64_t)ww_stat_backing_races; out[3]=(uint64_t)ww_stat_releases;
-}
-#else
-int runtime_memory_ww_enabled(void) { return 0; }
-int runtime_memory_ww_pending(void) { return 0; }
-void runtime_memory_ww_set_quiet(int quiet) { (void)quiet; }
-size_t runtime_memory_ww_regions(uintptr_t *starts, uint64_t *sizes, size_t capacity) { (void)starts; (void)sizes; (void)capacity; return 0; }
-size_t runtime_memory_ww_harvest(uintptr_t address, uint64_t size, uintptr_t *pages, size_t capacity, int take_pending) {
-    (void)address; (void)size; (void)pages; (void)capacity; (void)take_pending; return 0;
-}
-void runtime_memory_ww_stats(uint64_t out[4]) { out[0]=out[1]=out[2]=out[3]=0; }
-#endif
 /* Host view of a guest range, for the GPU backend: the range must be mapped. */
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {
     const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);

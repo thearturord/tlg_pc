@@ -3,7 +3,6 @@
 #include "native/native_sync.h"
 
 #include "native/native_debug_server.h"
-#include "native/native_write_watch.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 
 namespace Core::NativeSync {
@@ -187,13 +186,7 @@ bool LabelWait::TestValue(u32 value) const {
 
 bool LabelWait::Test(std::span<const u32> regs) const {
     if (memory) {
-        const bool passed = TestValue(*Address());
-        if (passed) {
-            // a label the CPU may have written after its data: data written before it matters from here (L3 write watch)
-            Core::WriteWatch::base_epoch.fetch_add(1, std::memory_order_acq_rel);
-            Core::WriteWatch::epoch.fetch_add(1, std::memory_order_acq_rel);
-        }
-        return passed;
+        return TestValue(*Address());
     }
     return TestValue(regs[reg]);
 }

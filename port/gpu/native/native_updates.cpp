@@ -245,26 +245,6 @@ void NoteWriterRange(u32 writer, u64 address, u64 size) {
 }
 
 namespace {
-constexpr u64 MarkSlots = u64{1} << 20;
-std::unique_ptr<std::atomic<u64>[]> page_marks;
-std::once_flag page_marks_once;
-std::array<std::atomic<u64>, 2> harvested_ring{}, harvested_other{}; // [announced, unannounced]
-std::array<std::atomic<u64>, 64> unannounced_by_class{};
-std::mutex owner_mutex;
-std::unordered_map<std::string, u64> unannounced_by_owner;
-std::atomic<u32> unannounced_logged{0};
-std::atomic<u64>* MarkOf(u64 page) {
-    std::call_once(page_marks_once, [] { page_marks = std::make_unique<std::atomic<u64>[]>(MarkSlots); });
-    return &page_marks[((page >> 12) * 0x9E3779B97F4A7C15ull >> 40) & (MarkSlots - 1)];
-}
-void MarkAnnounced(u64 address, u64 size) {
-    for (u64 page = address & ~u64{4095}; page < address + size; page += 4096) {
-        MarkOf(page)->store(page | 1, std::memory_order_relaxed);
-    }
-}
-} // namespace
-
-namespace {
 std::mutex pending_mutex;
 std::vector<std::pair<u64, u64>> pending_ranges, applied_last;
 std::vector<std::array<u64, 4>> pending_deleted;
@@ -274,23 +254,13 @@ void* create_context = nullptr;
 void* delete_context = nullptr;
 void (*apply_fn)(void*, u64, u64, bool) = nullptr;
 void* apply_context = nullptr;
-void (*queue_fn)(void*, Batch&&) = nullptr;
-void* queue_context = nullptr;
-std::atomic<u64> b2_applied_ranges{0}, b2_applied_bytes{0}, b2_reapplied_ranges{0}, b2_misses{0}, b2_miss_pages{0}, b2_skipped_pages{0};
-std::mutex miss_mutex;
-std::unordered_map<std::string, u64> misses_by_owner;
-std::atomic<u32> misses_logged{0};
+std::atomic<u64> b2_applied_ranges{0}, b2_applied_bytes{0}, b2_reapplied_ranges{0};
 } // namespace
 
 
 void SetApply(void (*fn)(void*, u64, u64, bool), void* context) {
     apply_context = context;
     apply_fn = fn;
-}
-
-void SetQueue(void (*fn)(void*, Batch&&), void* context) {
-    queue_context = context;
-    queue_fn = fn;
 }
 
 Batch TakeBatch() {
@@ -365,69 +335,6 @@ void ApplyBatch(const Batch& batch) {
     }
     b2_applied_ranges.fetch_add(batch.first.size(), std::memory_order_relaxed);
     b2_reapplied_ranges.fetch_add(batch.again.size(), std::memory_order_relaxed);
-}
-
-void ApplyPending() {
-    if (B2NativeMode() == 0) {
-        return;
-    }
-    Batch batch = TakeBatch();
-    if (batch.Empty()) {
-        return;
-    }
-    if (queue_fn != nullptr) {
-        queue_fn(queue_context, std::move(batch));
-    } else {
-        ApplyBatch(batch);
-    }
-}
-
-bool ConsumeMark(u64 page) {
-    const bool announced = MarkOf(page)->exchange(0, std::memory_order_relaxed) == (page | 1);
-    if (announced) {
-        b2_skipped_pages.fetch_add(1, std::memory_order_relaxed);
-    }
-    return announced;
-}
-
-void NoteMiss(u64 page, u64 bytes) {
-    b2_misses.fetch_add(1, std::memory_order_relaxed);
-    b2_miss_pages.fetch_add((bytes + 4095) / 4096, std::memory_order_relaxed);
-    const std::string owner = NativeDevice::OwnerName(page);
-    {
-        std::scoped_lock lock{miss_mutex};
-        ++misses_by_owner[owner];
-    }
-    if (misses_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-        LOG_WARNING(Core, "B2 native: {:#x}+{:#x} written with no announcement ({})", page, bytes, owner);
-    }
-}
-
-bool HarvestAuditOn() noexcept {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_B2_AUDIT");
-        return e != nullptr && *e == '1';
-    }();
-    return on;
-}
-
-void NoteHarvested(u64 address, u64 bytes, bool in_upload_ring) {
-    for (u64 page = address & ~u64{4095}; page < address + bytes; page += 4096) {
-        const bool announced = MarkOf(page)->exchange(0, std::memory_order_relaxed) == (page | 1);
-        (in_upload_ring ? harvested_ring : harvested_other)[announced ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
-        if (!announced && !in_upload_ring) {
-            const std::string owner = NativeDevice::OwnerName(page);
-            {
-                std::scoped_lock lock{owner_mutex};
-                ++unannounced_by_owner[owner];
-            }
-            static std::atomic<u32> none_logged{0};
-            if (owner == "none" ? none_logged.fetch_add(1, std::memory_order_relaxed) < 24 : unannounced_logged.fetch_add(1, std::memory_order_relaxed) < 8) {
-                LOG_WARNING(Core, "B2 audit: page {:#x} written with no announcement ({}; {}; usage class {})", page, owner, NativeResources::DescribeAddress(page),
-                            NativeResources::UsageClassNameOf(NativeResources::UsageClassOf(page)));
-            }
-        }
-    }
 }
 
 namespace {
@@ -577,52 +484,15 @@ nlohmann::json B9Report() {
             {"note", "B9.1, cumulative: engine buffers uploaded by their announced bytes instead of the page tracker's pages"}};
 }
 
-nlohmann::json HarvestAuditReport() {
-    nlohmann::json j;
-    j["enabled"] = HarvestAuditOn();
-    j["upload_ring_pages"] = {{"announced", harvested_ring[0].load()}, {"UNANNOUNCED", harvested_ring[1].load()}};
-    j["other_pages"] = {{"announced", harvested_other[0].load()}, {"UNANNOUNCED", harvested_other[1].load()}};
-    nlohmann::json by_class = nlohmann::json::object();
-    for (u32 c = 0; c < 64; ++c) {
-        if (const u64 n = unannounced_by_class[c].load()) {
-            by_class[NativeResources::UsageClassNameOf(c)] = n;
-        }
-    }
-    j["unannounced_other_pages_by_memory_class"] = std::move(by_class);
-    {
-        std::scoped_lock lock{owner_mutex};
-        std::vector<std::pair<u64, std::string>> rows;
-        for (const auto& [name, n] : unannounced_by_owner) {
-            rows.emplace_back(n, name);
-        }
-        std::sort(rows.rbegin(), rows.rend());
-        nlohmann::json owners = nlohmann::json::object();
-        for (size_t i = 0; i < rows.size() && i < 24; ++i) {
-            owners[rows[i].second] = rows[i].first;
-        }
-        j["unannounced_other_pages_by_owner"] = std::move(owners);
-    }
-    j["note"] = "B2 gate: pages the write watch found written, against the engine's announced updates since their last harvest (cumulative)";
-    j["native"] = {{"mode", B2NativeMode()}, {"announcements_applied", b2_applied_ranges.load()}, {"bytes_applied", b2_applied_bytes.load()},
-                   {"announcements_applied_again", b2_reapplied_ranges.load()}, {"harvested_pages_announced_not_replayed", b2_skipped_pages.load()},
-                   {"MISSES", b2_misses.load()}, {"miss_pages", b2_miss_pages.load()}};
-    {
-        std::scoped_lock lock{miss_mutex};
-        nlohmann::json owners = nlohmann::json::object();
-        for (const auto& [name, n] : misses_by_owner) {
-            owners[name] = n;
-        }
-        j["native"]["misses_by_owner"] = std::move(owners);
-    }
-    return j;
+nlohmann::json B2Report() {
+    return {{"mode", B2NativeMode()}, {"announcements_applied", b2_applied_ranges.load()}, {"bytes_applied", b2_applied_bytes.load()},
+            {"announcements_applied_again", b2_reapplied_ranges.load()},
+            {"note", "B2, cumulative: the engine's announced CPU writes applied to the caches"}};
 }
 
 void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread) {
     if (address == 0 || size == 0) {
         return;
-    }
-    if (HarvestAuditOn() || B2NativeMode() != 0) {
-        MarkAnnounced(address, size);
     }
     if (B2NativeMode() != 0) {
         std::scoped_lock lock{pending_mutex};

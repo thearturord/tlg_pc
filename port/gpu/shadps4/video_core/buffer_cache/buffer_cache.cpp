@@ -35,7 +35,6 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
-#include "native/native_write_watch.h"
 
 #include <vk_mem_alloc.h>
 
@@ -82,9 +81,6 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         [this](VAddr address, u64 size, u32 timeout_ms) { return WaitForExplicitDownloads(address, size, timeout_ms); });
     // B2 cutover: an applied announcement is a CPU write for the caches
     Core::NativeUpdates::SetApply([](void* context, u64 address, u64 size, bool newer) { static_cast<BufferCache*>(context)->ApplyCpuWrite(address, size, newer); }, this);
-    if (Core::NativeUpdates::B2NativeMode() == 2 && !Core::NativeUpdates::HarvestAuditOn() && !(std::getenv("TLG_B2_REFEREE") != nullptr && *std::getenv("TLG_B2_REFEREE") == '1')) {
-        Core::WriteWatch::SetQuiet(true); // B7: the write watch is not the referee any more
-    }
 }
 
 BufferCache::~BufferCache() {
@@ -100,10 +96,6 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
     // E4: no GPU bytes are flushed to guest memory here (the fault readback is gone: no page is ever made unreadable)
     memory_tracker->MarkRegionAsCpuModified(device_addr, size);
 }
-
-namespace {
-thread_local VAddr t_audit_begin = 0, t_audit_end = 0; ///< B2 audit: the range of the current harvest request
-} // namespace
 
 void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
     BindMemoErase(address, size);
@@ -134,9 +126,6 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
     const u32 b8 = Core::NativeUpdates::B8ImageMode();
     if (b8 != 0) {
         texture_cache.NoteAnnouncedWrite(address, size, newer);
-    }
-    if (b8 != 2 && Core::WriteWatch::LiftImages()) {
-        texture_cache.InvalidatePagesWritten(address, size);
     }
 }
 
@@ -180,77 +169,6 @@ void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, st
             gaps->emplace_back(at, address + size);
         }
     }
-}
-
-void BufferCache::HarvestWriteWatch(VAddr device_addr, u64 size, bool image) {
-    if (!Core::WriteWatch::Enabled()) {
-        return;
-    }
-    // B7: with the engine's announcements deciding (mode 2) the write watch would only count misses: it is not asked any more (TLG_B2_AUDIT=1 keeps it as the referee)
-    static const bool referee = Core::NativeUpdates::B2NativeMode() != 2 || Core::NativeUpdates::HarvestAuditOn() || [] {
-        const char* e = std::getenv("TLG_B2_REFEREE");
-        return e != nullptr && *e == '1';
-    }();
-    if (!referee) {
-        return;
-    }
-    t_audit_begin = device_addr;
-    t_audit_end = device_addr + size;
-    // what the write fault did for these pages (Rasterizer::InvalidateMemory, buffer side; readbacks are off whenever the
-    // protection is lifted, so the invalidation is the CPU mark); a page an image watches is still protected and faulted already
-    Core::WriteWatch::Harvest(
-        device_addr, size,
-        [](void* context, VAddr page, u64 bytes) {
-            auto* self = static_cast<BufferCache*>(context);
-            if (const u32 mode = Core::NativeUpdates::B2NativeMode(); mode != 0) {
-                // B2 cutover: the announcements marked what the engine wrote; a page here none covered is a miss (mode 1 replays it, mode 2 does not)
-                VAddr run = 0;
-                u64 run_bytes = 0;
-                const auto flush = [&] {
-                    if (run_bytes != 0) {
-                        Core::NativeUpdates::NoteMiss(run, run_bytes);
-                        if (mode == 1) {
-                            self->ApplyCpuWrite(run, run_bytes);
-                        }
-                    }
-                    run_bytes = 0;
-                };
-                for (VAddr p = page; p < page + bytes; p += 4096) {
-                    if (Core::NativeUpdates::ConsumeMark(p)) {
-                        flush();
-                    } else {
-                        if (run_bytes == 0) {
-                            run = p;
-                        }
-                        run_bytes += 4096;
-                    }
-                }
-                flush();
-                return;
-            }
-            if (Core::NativeUpdates::HarvestAuditOn()) {
-                // only the part the GPU asked for (the harvest covers whole blocks)
-                const VAddr a = std::max<VAddr>(page, t_audit_begin), b = std::min<VAddr>(page + bytes, t_audit_end);
-                if (a < b) {
-                    const auto [lo, hi] = UntrackedRing::Get().Clip(a, b - a);
-                    Core::NativeUpdates::NoteHarvested(a, b - a, lo < hi);
-                }
-            }
-            Core::NativeResources::NoteCpuWrite(page, bytes);
-            self->BindMemoBump();
-            self->memory_tracker->MarkRegionAsCpuModified(page, bytes);
-            if (Core::WriteWatch::LiftImages()) {
-                // the texture side of the fault (Rasterizer::InvalidateMemory): images on these pages are no longer protected
-                self->texture_cache.InvalidatePagesWritten(page, bytes);
-            }
-        },
-        [](void* context, VAddr page, u64 bytes) {
-            return static_cast<BufferCache*>(context)->memory_tracker->IsRegionCpuModified(page, bytes);
-        },
-        [](void* context, VAddr page, u64 bytes) {
-            return static_cast<BufferCache*>(context)->memory_tracker->IsRegionGpuModified(page, bytes);
-        },
-        this, image);
 }
 
 void BufferCache::InvalidateStreamReuse(VAddr device_addr, u64 size) {
@@ -402,7 +320,6 @@ nlohmann::json BufferCache::BindMemoReport() const {
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                                 Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
     Core::ResourceAudit::Note(Core::ResourceAudit::BufferUse, device_addr, size, is_written);
-    HarvestWriteWatch(device_addr, size);
     if (static const bool census = [] { const char* e = std::getenv("TLG_LIFT_CENSUS"); return e != nullptr && *e == '1'; }(); census && Core::NativeRegistry::enabled.load(std::memory_order_relaxed)) {
         Core::NativeRegistry::NoteRequestBuffer(device_addr, size, is_written);
     }
@@ -796,7 +713,6 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
             return tracker_says;
         }
     }
-    HarvestWriteWatch(addr, size);
     return memory_tracker->IsRegionCpuModified(addr, size);
 }
 
@@ -857,7 +773,6 @@ bool BufferCache::IsRangeGpuWritten(VAddr addr, size_t size) {
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
-    HarvestWriteWatch(device_addr, size);
     // B9.4: a placed buffer holds [begin, end) of its block; a read into its slack must not take (and lose) the bytes of the memory after it
     VAddr held_lo = device_addr, held_hi = device_addr + size;
     {
@@ -891,10 +806,6 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
         copies.emplace_back(total_size_bytes, addr, copy_size);
         total_size_bytes += copy_size;
-        if (Core::WriteWatch::VerifyOn()) {
-            // write watch verify: the page's CPU mark is cleared before its new upload hash exists; no hash meanwhile
-            Core::WriteWatch::NoteGpuSideWrite(addr, copy_size);
-        }
     };
     // B5 / B6: bytes the GPU wrote (and nothing the CPU wrote since) are the GPU's: a page upload of PS4 memory leaves them out
     static const bool keep_gpu_bytes = Core::NativeUpdates::B2NativeMode() != 0;
@@ -1302,11 +1213,6 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         if (Core::NativeAudit::Enabled()) {
             for (const auto& copy : copies) {
                 Core::NativeAudit::NoteUpload(copy.dstOffset + arena->cpu_addr, staging.mapped + (copy.srcOffset - staging.offset), copy.size);
-            }
-        }
-        if (Core::WriteWatch::VerifyOn()) {
-            for (const auto& copy : copies) {
-                Core::WriteWatch::NoteUpload(copy.dstOffset + arena->cpu_addr, staging.mapped + (copy.srcOffset - staging.offset), copy.size);
             }
         }
         runtime.CopyBuffer(staging.buffer, arena, copies);

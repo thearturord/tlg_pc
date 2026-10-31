@@ -141,9 +141,6 @@ public:
     std::array<u64, 16> TakeDescriptorCensus() noexcept;
     [[nodiscard]] bool HazardAuditOn() const noexcept;
     Runtime::HazardAudit TakeHazardAudit();
-    /// O1 (command processor thread): harvests the write watch for the buffers a planned draw or dispatch names (its record's buffer descriptors, the engine
-    /// buffers they belong to, the geometry buffers) and stores the epoch in the plan, so the raster thread need not
-    void HarvestAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan);
     /// R2 (command processor thread): resolves the shader buffer bindings of a planned draw or dispatch whose record names a resident immutable engine buffer
     /// (`TLG_RESOLVE_AHEAD=0` turns it off); the raster thread binds them after a stamp check
     void ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan);

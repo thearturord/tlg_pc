@@ -5,7 +5,6 @@
 
 #include "native/native_stream_probe.h"
 #include "native/native_timeline.h"
-#include "native/native_write_watch.h"
 #include "native/native_registry.h"
 #include "native/native_resource_audit.h"
 #include "common/arch.h"
@@ -632,9 +631,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
                                  sp.done.load(std::memory_order_acquire), call.tag.valid ? call.tag.seq : (op.draw_plan ? op.draw_plan->native_seq : 0),
                                  call.indexed, call.index_offset);
     }
-    // O1: the write watch of the operation's buffers is harvested here, on the command processor thread, not on the raster thread
-    rasterizer->HarvestAhead(op.draw_plan.get(), op.dispatch_plan.get());
-    rasterizer->ResolveAhead(op.draw_plan.get(), op.dispatch_plan.get()); // R2: after the harvest, so the generations include what it found
+    rasterizer->ResolveAhead(op.draw_plan.get(), op.dispatch_plan.get()); // R2
     RasterPush(std::move(op), false);
 }
 
@@ -838,14 +835,6 @@ DispatchStat& DispatchStatFor(u64 caller, u64 program, bool indirect, bool asc) 
 
 void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw_plan,
                                const Vulkan::DispatchPlan* dispatch_plan) {
-    // O1: the ranges the command processor harvested for this operation need no harvest here
-    Core::WriteWatch::SetKnownEpoch(draw_plan != nullptr ? draw_plan->ww_epoch : dispatch_plan != nullptr ? dispatch_plan->ww_epoch : 0u,
-                                    draw_plan != nullptr ? draw_plan->ww_base_epoch : dispatch_plan != nullptr ? dispatch_plan->ww_base_epoch : 0u);
-    struct KnownEpochScope {
-        ~KnownEpochScope() {
-            Core::WriteWatch::SetKnownEpoch(0);
-        }
-    } known_epoch_scope;
     const auto run = [&](auto&& body) {
         if (c.no_marker) {
             body();
@@ -1104,7 +1093,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                                                                                     {"downloaded_explicit_readback", rasterizer->b6_downloads[4].exchange(0)}}},
                                                               {"b3_images", {{"by_engine_id", rasterizer->b3_stats[0].exchange(0)}, {"first_sight", rasterizer->b3_stats[1].exchange(0)},
                                                                              {"image_changed", rasterizer->b3_stats[2].exchange(0)}, {"verified_same", rasterizer->b3_stats[3].load()}, {"VERIFIED_OTHER_IMAGE", rasterizer->b3_stats[4].load()}}},
-                                                              {"b2_audit", Core::NativeUpdates::HarvestAuditReport()},
+                                                              {"b2_applied", Core::NativeUpdates::B2Report()},
                                                               {"b8_images", Core::NativeUpdates::B8Report()},
                                                               {"b9_buffers", Core::NativeUpdates::B9Report()}, {"zero_copy", rasterizer->GetBufferCache().ZeroCopyReport()}, {"bind_memo", rasterizer->GetBufferCache().BindMemoReport()},
                                                               {"b11_clears", Core::NativeDevice::ClearReport()},
@@ -1145,9 +1134,6 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                     kinds[names[k]] = {{"rendering_instances", s.segments[k].load()}, {"commands", s.commands[k].load()}, {"draws", s.draws[k].load()}, {"largest_instance_commands", s.max_commands[k].load()}};
                 }
                 Core::DebugServer::Publish("segment_census", {{"by_kind_since_start", std::move(kinds)}, {"note", "C6 census: commands and draws recorded between a begin and an end of rendering, graphics stream, counts only"}});
-            }
-            if (Core::WriteWatch::Enabled()) {
-                Core::DebugServer::Publish("write_watch", Core::WriteWatch::Report());
             }
             if (rasterizer->LivePlannerOn()) {
                 const auto p = rasterizer->ReadLivePlanStats();
@@ -1448,12 +1434,6 @@ Liverpool::Liverpool()
           return static_cast<u32>(EmulatorSettings.GetReadbackFenceWaitShortcut());
       }()} {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
-    // B2: announcements of a passed memory wait go to the raster thread in order with the work around it
-    Core::NativeUpdates::SetQueue(
-        [](void* context, Core::NativeUpdates::Batch&& batch) {
-            static_cast<Liverpool*>(context)->RasterRun([b = std::move(batch)] { Core::NativeUpdates::ApplyBatch(b); });
-        },
-        this);
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
 
@@ -2192,7 +2172,6 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 }
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bool partial) {
-    Core::WriteWatch::BumpEpoch(false); // the CPU's data for this submission is written by now (L3 write watch)
     auto announced = Core::NativeUpdates::TakeBatch(); // B2: applied on the raster thread before this submission's work
     auto& queue = mapped_queues[GfxQueueId];
 
@@ -2236,7 +2215,6 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bo
 
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
-    Core::WriteWatch::BumpEpoch(false); // the CPU's data for this submission is written by now (L3 write watch)
     auto announced = Core::NativeUpdates::TakeBatch();
     auto& queue = mapped_queues[gnm_vqid];
 

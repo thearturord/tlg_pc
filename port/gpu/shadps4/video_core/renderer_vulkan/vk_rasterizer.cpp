@@ -15,7 +15,6 @@
 #include "native/native_draw.h"
 #include "native/native_light_recorder.h"
 #include "native/native_untracked_ring.h"
-#include "native/native_write_watch.h"
 #include "native/native_audit.h"
 #include "native/native_readbacks.h"
 #include "native/native_device.h"
@@ -1900,7 +1899,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 // R2: resolved by the command processor from the record's engine object; bound when its stamps hold
                 const ResolvedBuffer& r = rs->resolved[buffer_index];
                 if (rs->resolved_epoch == Core::NativeResources::ImmutableEpoch()) {
-                    buffer_cache.HarvestWriteWatch(r.address, r.size); // a CPU write since the command processor looked bumps the generation
                     const auto* object = r.object;
                     u64 copy_offset = 0;
                     if (const auto* copy = object->usage != 1 && object->alive.load(std::memory_order_acquire) && object->generation.load(std::memory_order_acquire) == r.generation

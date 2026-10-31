@@ -18,7 +18,6 @@
 #include "native/native_resources.h"
 #include "native/native_device.h"
 #include "native/native_updates.h"
-#include "native/native_write_watch.h"
 #include "native/native_resource_audit.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/readback_batch.h"
