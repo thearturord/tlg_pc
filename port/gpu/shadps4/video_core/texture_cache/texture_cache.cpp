@@ -685,7 +685,9 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         return {merged_image_id, -1, -1};
     }
 
-    // Right overlap, the image requested is a possible subresource of the image from cache.
+    // Right overlap: the image requested is a subresource (a mip or a layer) of the image from cache. This is the only overlap left besides the equal address one above:
+    // E3.3 removed the chance overlap frees and the left overlap (a cached image that is a part of the requested one: copy into the bigger image / rebind), which the
+    // E3.1 census never saw for a named lookup; stale images are left to the lifetime freeing and the garbage collection.
     if (image_info.guest_address > cache_image.info.guest_address) {
         if (auto mip = image_info.MipOf(cache_image.info); mip >= 0) {
             if (auto slice = image_info.SliceOf(cache_image.info, mip); slice >= 0) {
@@ -693,42 +695,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                 return {cache_image_id, mip, slice};
             }
         }
-
-        // Image isn't a subresource but a chance overlap.
-        Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, safe_to_delete ? 10 : 11);
-        if (safe_to_delete) {
-            FreeImage(cache_image_id);
-        }
-
+        Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 11);
         return {{}, -1, -1};
-    } else {
-        // Left overlap, the image from cache is a possible subresource of the image requested
-        if (auto mip = cache_image.info.MipOf(image_info); mip >= 0) {
-            if (auto slice = cache_image.info.SliceOf(image_info, mip); slice >= 0) {
-                // We have a larger image created and a separate one, representing a subres of it
-                // bound as render target. In this case we need to rebind render target.
-                if (cache_image.binding.is_target) {
-                    cache_image.binding.needs_rebind = 1u;
-                    if (merged_image_id) {
-                        GetImage(merged_image_id).binding.is_target = 1u;
-                    }
-
-                    FreeImage(cache_image_id);
-                    Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 12);
-                    return {merged_image_id, -1, -1};
-                }
-
-                // We need to have a larger, already allocated image to copy this one into
-                if (merged_image_id) {
-                    auto& merged_image = slot_images[merged_image_id];
-                    runtime.CopyMip(&cache_image, &merged_image, mip, slice);
-                    FreeImage(cache_image_id);
-                    Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 13);
-                } else {
-                    Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 14);
-                }
-            }
-        }
     }
 
     Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 15);
@@ -946,54 +914,22 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     };
 
     SmallVector<ImageId, 8> image_ids;
-    // B8.4 step 3: the candidates of an engine texture's first lookup are the images the engine textures covering its memory hold (their lists), not the page table's
-    bool candidates_by_engine = false;
-    SmallVector<ImageId, 8> engine_candidates;
-    bool covered = false;
-    if (b8_find != 0 && owner_id != 0) {
-        static thread_local std::vector<u64> ids;
-        ids.clear();
-        covered = Core::NativeDevice::TexturesIn(info.guest_address, info.guest_size, ids);
-        if (covered) {
-            EngineImagesIn(ids, info.guest_address, info.guest_size, engine_candidates);
-            // the page table's order (by the first page of the image in the range, then age), which overlap resolution depends on
-            const u64 first_page = info.guest_address >> Traits::PAGE_BITS;
-            std::sort(engine_candidates.begin(), engine_candidates.end(), [&](ImageId a, ImageId b) {
-                const Image& ia = slot_images[a];
-                const Image& ib = slot_images[b];
-                const u64 pa = std::max(first_page, ia.info.guest_address >> Traits::PAGE_BITS);
-                const u64 pb = std::max(first_page, ib.info.guest_address >> Traits::PAGE_BITS);
-                return pa != pb ? pa < pb : ia.image_uid < ib.image_uid;
-            });
-            candidates_by_engine = b8_find == 2;
-        }
-        Core::NativeUpdates::NoteB8(covered ? Core::NativeUpdates::B8FirstByEngine : Core::NativeUpdates::B8FirstFallback);
-    }
-    if (candidates_by_engine) {
-        image_ids = engine_candidates;
-    } else {
-        ForEachImageInRegion(info.guest_address, info.guest_size,
-                             [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
-        if (covered) {
-            // audit: the page table's candidates against the engine textures'
-            for (const ImageId image_id : image_ids) {
-                if (std::ranges::find(engine_candidates, image_id) != engine_candidates.end()) {
-                    continue;
-                }
-                const Image& image = slot_images[image_id];
-                const bool listed = (image.b8_marks & B8Listed) != 0;
-                Core::NativeUpdates::NoteB8(listed ? Core::NativeUpdates::B8FirstMissedListed : Core::NativeUpdates::B8FirstStaleLeft);
-                static std::atomic<u32> logged{0};
-                if (listed && logged.fetch_add(1, std::memory_order_relaxed) < 12) {
-                    LOG_WARNING(Render_Vulkan, "B8.4 step 3 audit: engine texture {} at {:#x}+{:#x}: candidate {:#x}+{:#x} ({}x{} uid {}) is in no covering texture's list (listed by {:#x})",
-                                owner_id, info.guest_address, info.guest_size, image.info.guest_address, image.info.guest_size, image.info.size.width,
-                                image.info.size.height, image.image_uid, image.b8_listed_by);
+    if (owner_id != 0) {
+        // E3.3: an engine texture's candidates are its own images, nothing else (E3.1 census: a named lookup never overlapped another engine texture's image)
+        if (const auto it = engine_images.find(owner_id); it != engine_images.end()) {
+            for (const auto& [cache_id, uid] : it->second) {
+                // registered only: a freed image stays allocated until its deferred deletion (the page table never listed it)
+                if (slot_images.IsAllocated(cache_id) && slot_images[cache_id].image_uid == uid && True(slot_images[cache_id].flags & ImageFlagBits::Registered) &&
+                    slot_images[cache_id].info.guest_address == info.guest_address) {
+                    image_ids.push_back(cache_id);
                 }
             }
+            std::sort(image_ids.begin(), image_ids.end(), [&](ImageId a, ImageId b) { return slot_images[a].image_uid < slot_images[b].image_uid; });
         }
-    }
-    if (owner_id != 0) {
         Core::NativeUpdates::NoteB8(image_ids.empty() ? Core::NativeUpdates::B8FirstNoOverlap : Core::NativeUpdates::B8FirstOverlap);
+    } else {
+        // no engine texture starts at the memory (video out, copies, views into the middle of a texture): the images registered over the range
+        ForEachImageInRegion(info.guest_address, info.guest_size, [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
     }
 
     ImageId image_id{};
