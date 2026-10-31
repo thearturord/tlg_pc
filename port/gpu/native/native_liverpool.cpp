@@ -38,6 +38,7 @@
 #include "native/native_flip.h"
 #include "native/native_shader_env.h"
 #include "native/native_target_desc.h"
+#include "native/native_plan_shadow.h"
 #include "native/native_display.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/liverpool_internal.h"
@@ -558,6 +559,50 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         auto candidate = make_candidate();
         if (verify == 2) {
             candidate = ReplanAfterDrain(std::move(candidate), 2, make_candidate);
+        }
+        if (Core::NativePlanShadow::On() && candidate != nullptr) {
+            // E7b Task 3: the register fallback against the native side (the record's typed values, the native fixed state)
+            const auto& in = candidate->inputs;
+            const auto& args = draw.args;
+            const char* g = "draw_args";
+            if ((args.mask & Core::NativeDraw::DrawArgs::NumIndices) != 0 && index_count == ~0u) {
+                Core::NativePlanShadow::Compare(g, "num_indices", args.num_indices, in.num_indices);
+            }
+            if ((args.mask & Core::NativeDraw::DrawArgs::NumInstances) != 0) {
+                Core::NativePlanShadow::Compare(g, "num_instances", args.num_instances, in.num_instances.num_instances);
+            }
+            if ((args.mask & Core::NativeDraw::DrawArgs::IndexBase) != 0) {
+                Core::NativePlanShadow::Compare(g, "index_base_lo", args.index_base_lo, in.index_base_address.base_addr_lo);
+                Core::NativePlanShadow::Compare(g, "index_base_hi", args.index_base_hi, in.index_base_address.base_addr_hi);
+            }
+            if ((args.mask & Core::NativeDraw::DrawArgs::IndexType) != 0) {
+                Core::NativePlanShadow::Compare(g, "index_type", args.index_type, in.index_buffer_type.raw);
+            }
+            if ((args.mask & Core::NativeDraw::DrawArgs::MaxIndexSize) != 0) {
+                Core::NativePlanShadow::Compare(g, "max_index_size", args.max_index_size, in.max_index_size);
+            }
+            for (u32 mask = draw.vs_user_data_mask; mask != 0; mask &= mask - 1) {
+                const u32 i = static_cast<u32>(std::countr_zero(mask));
+                Core::NativePlanShadow::Compare("user_data", "vs_program.user_data", draw.vs_user_data[i], exec_state.vs_program.user_data[i]);
+            }
+            for (u32 mask = draw.ps_user_data_mask; mask != 0; mask &= mask - 1) {
+                const u32 i = static_cast<u32>(std::countr_zero(mask));
+                Core::NativePlanShadow::Compare("user_data", "ps_program.user_data", draw.ps_user_data[i], exec_state.ps_program.user_data[i]);
+            }
+            if (draw.fixed != nullptr) {
+                Vulkan::ShadowCompareFixedState(*draw.fixed, Vulkan::MakeFixedState(exec_state));
+            }
+            // fields of the register image read by the fallback with no native value: how often they are not at their default
+            Core::NativePlanShadow::RegisterOnly("stages", "stage_enable.raw", exec_state.stage_enable.raw);
+            Core::NativePlanShadow::RegisterOnly("stages", "vgt_gs_mode.onchip", exec_state.vgt_gs_mode.onchip);
+            Core::NativePlanShadow::RegisterOnly("stages", "vgt_strmout_config.raw", exec_state.vgt_strmout_config.raw);
+            const auto raw32 = [](const auto& value) {
+                u32 raw = 0;
+                std::memcpy(&raw, &value, sizeof(value) < sizeof(raw) ? sizeof(value) : sizeof(raw));
+                return raw;
+            };
+            Core::NativePlanShadow::RegisterOnly("stages", "ls_hs_config", raw32(exec_state.ls_hs_config));
+            Core::NativePlanShadow::RegisterOnly("stages", "tess_config", raw32(exec_state.tess_config));
         }
         Core::NativeDraw::Live().state_planned.fetch_add(1, std::memory_order_relaxed);
         native_exec_plan = candidate.release();

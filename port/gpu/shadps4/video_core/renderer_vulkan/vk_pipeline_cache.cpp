@@ -21,6 +21,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "native/native_shader_env.h"
+#include "native/native_plan_shadow.h"
 #include "video_core/cache_storage.h"
 #include "native/native_readback_policy.h"
 #include "video_core/readback_stats.h"
@@ -343,8 +344,57 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         Core::NativeShaderEnv::DrawEnv env;
         if (!Core::NativeShaderEnv::Current(env) || (stage == HwStage::Vertex ? !env.has_vertex : !env.has_pixel)) {
             Core::NativeShaderEnv::NoteUnavailable();
-        } else {
+        } else if (!Core::NativePlanShadow::On()) {
             ApplyShaderEnv(info, env, stage, regs);
+        } else {
+            // E7b Task 3: the register built translator input against the one derived from the shader objects, field by field (the native one decides)
+            const Shader::RuntimeInfo from_registers = info;
+            ApplyShaderEnv(info, env, stage, regs);
+            const char* g = stage == HwStage::Vertex ? "shader_env.vertex" : "shader_env.pixel";
+            namespace PS = Core::NativePlanShadow;
+            PS::Compare(g, "fp_denorm_mode32", static_cast<u64>(info.props.fp_denorm_mode32), static_cast<u64>(from_registers.props.fp_denorm_mode32));
+            PS::Compare(g, "fp_denorm_mode16_64", static_cast<u64>(info.props.fp_denorm_mode16_64), static_cast<u64>(from_registers.props.fp_denorm_mode16_64));
+            PS::Compare(g, "fp_round_mode32", static_cast<u64>(info.props.fp_round_mode32), static_cast<u64>(from_registers.props.fp_round_mode32));
+            PS::Compare(g, "fp_round_mode16_64", static_cast<u64>(info.props.fp_round_mode16_64), static_cast<u64>(from_registers.props.fp_round_mode16_64));
+            PS::Compare(g, "num_allocated_vgprs", info.props.num_allocated_vgprs, from_registers.props.num_allocated_vgprs);
+            PS::Compare(g, "num_user_data", info.props.num_user_data, from_registers.props.num_user_data);
+            PS::Compare(g, "num_input_vgprs", info.props.num_input_vgprs, from_registers.props.num_input_vgprs);
+            PS::Compare(g, "dx10_clamp", info.props.dx10_clamp, from_registers.props.dx10_clamp);
+            if (stage == HwStage::Vertex) {
+                PS::Compare(g, "num_outputs", info.hw.vs.num_outputs, from_registers.hw.vs.num_outputs);
+                PS::CompareBytes(g, "outputs", &info.hw.vs.outputs, &from_registers.hw.vs.outputs, sizeof(info.hw.vs.outputs));
+                if (info.sw_stage == SwStage::Vertex) {
+                    PS::Compare(g, "step_rate_0", info.sw.vs.step_rate_0, from_registers.sw.vs.step_rate_0);
+                    PS::Compare(g, "step_rate_1", info.sw.vs.step_rate_1, from_registers.sw.vs.step_rate_1);
+                }
+            } else {
+                PS::CompareBytes(g, "en_flags", &info.hw.fs.en_flags, &from_registers.hw.fs.en_flags, sizeof(info.hw.fs.en_flags));
+                PS::CompareBytes(g, "addr_flags", &info.hw.fs.addr_flags, &from_registers.hw.fs.addr_flags, sizeof(info.hw.fs.addr_flags));
+                PS::Compare(g, "num_inputs", info.hw.fs.num_inputs, from_registers.hw.fs.num_inputs);
+                PS::Compare(g, "front_face_all_bits", info.hw.fs.front_face_all_bits, from_registers.hw.fs.front_face_all_bits);
+                PS::Compare(g, "depth_before_shader", info.hw.fs.depth_before_shader, from_registers.hw.fs.depth_before_shader);
+                PS::Compare(g, "z_export_format", static_cast<u64>(info.hw.fs.z_export_format), static_cast<u64>(from_registers.hw.fs.z_export_format));
+                PS::Compare(g, "mrtz_mask", info.hw.fs.mrtz_mask, from_registers.hw.fs.mrtz_mask);
+                PS::Compare(g, "num_samples", info.hw.fs.num_samples, from_registers.hw.fs.num_samples);
+                for (u32 i = 0; i < info.hw.fs.num_inputs && i < 32; ++i) {
+                    PS::CompareBytes(g, "inputs", &info.hw.fs.inputs[i], &from_registers.hw.fs.inputs[i], sizeof(info.hw.fs.inputs[i]));
+                }
+                for (u32 i = 0; i < Shader::MaxColorBuffers; ++i) {
+                    if (info.hw.fs.color_buffers[i].data_format != AmdGpu::DataFormat::FormatInvalid) {
+                        PS::Compare(g, "color_export_format", static_cast<u64>(info.hw.fs.color_buffers[i].export_format), static_cast<u64>(from_registers.hw.fs.color_buffers[i].export_format));
+                    }
+                }
+            }
+        }
+    }
+    if (Core::NativePlanShadow::On()) {
+        // E7b Task 3: register image fields the translator input still reads with no native value
+        namespace PS = Core::NativePlanShadow;
+        if (stage == HwStage::Fragment) {
+            PS::RegisterOnly("translator_input.fragment", "aa_config.NumSamples", regs.aa_config.NumSamples());
+            PS::RegisterOnly("translator_input.fragment", "clip_distance_emulation", info.hw.fs.clip_distance_emulation);
+        } else if (stage != HwStage::Vertex && stage != HwStage::Compute) {
+            PS::RegisterOnly("translator_input.stage_built", stage == HwStage::Local ? "local" : stage == HwStage::Hull ? "hull" : stage == HwStage::Export ? "export" : "geometry", 1);
         }
     }
     return info;
@@ -477,6 +527,18 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
     } else if (lookup_regs_pinned) {
         live.stage_key_uncached.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (Core::NativePlanShadow::On() && lookup_regs_pinned) {
+        // E7b Task 3: the programs the stages are looked up by, from the shader objects and from the register image
+        Core::NativeShaderEnv::DrawEnv env;
+        if (Core::NativeShaderEnv::Current(env)) {
+            if (env.has_vertex) {
+                Core::NativePlanShadow::Compare("program", "vs_address", env.vertex.program.address, AmdGpu::GetParams(lookup_regs->vs_program).Base());
+            }
+            if (env.has_pixel) {
+                Core::NativePlanShadow::Compare("program", "ps_address", env.pixel.program.address, AmdGpu::GetParams(lookup_regs->ps_program).Base());
+            }
+        }
     }
     if (!RefreshGraphicsKey()) {
         return nullptr;

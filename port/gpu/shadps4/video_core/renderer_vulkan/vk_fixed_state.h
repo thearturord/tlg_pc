@@ -142,6 +142,9 @@ DrawInputs MakeDrawInputs(const AmdGpu::DrawRegs& regs);
 /// The packet path: the fixed-function state of the draw described by `regs`.
 FixedState MakeFixedState(const AmdGpu::DrawRegs& regs);
 
+/// E7b Task 3 (`TLG_PLAN_SHADOW=1`): the native fixed state against the one the register image makes, one counter per field (native/native_plan_shadow.h).
+void ShadowCompareFixedState(const FixedState& native, const FixedState& registers);
+
 /// The state of a draw whose registers hold their defaults (the base the native path starts from).
 const FixedState& DefaultFixedState();
 

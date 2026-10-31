@@ -16,6 +16,7 @@
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
 #include "native/native_target_desc.h"
+#include "native/native_plan_shadow.h"
 #include "native/native_light_recorder.h"
 #include "native/native_untracked_ring.h"
 #include "native/native_readbacks.h"
@@ -448,6 +449,35 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
         exec_inputs.insert_or_assign(inputs_key, plan->inputs);
     }
     pipeline_cache.PlanGraphics(regs, plan->fixed, params, *plan, plan->executed ? exec_key : 0);
+    if (Core::NativePlanShadow::On()) {
+        // E7b Task 3: what RefreshGraphicsKey reads of the targets comes from the register image (`regs`); the inputs of the plan hold the native description. The key's fields, both ways.
+        const char* g = "pipeline_key_targets";
+        const auto& in = plan->inputs;
+        for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
+            const auto& native_cb = in.color_buffers[i];
+            const auto& reg_cb = regs.color_buffers[i];
+            if (!native_cb || !reg_cb) {
+                continue;
+            }
+            Core::NativePlanShadow::Compare(g, "color.data_format", static_cast<u64>(native_cb.GetDataFmt()), static_cast<u64>(reg_cb.GetDataFmt()));
+            Core::NativePlanShadow::Compare(g, "color.num_format", static_cast<u64>(native_cb.GetNumberFmt()), static_cast<u64>(reg_cb.GetNumberFmt()));
+            Core::NativePlanShadow::Compare(g, "color.num_conversion", static_cast<u64>(native_cb.GetNumberConversion()), static_cast<u64>(reg_cb.GetNumberConversion()));
+            const auto native_swizzle = native_cb.Swizzle();
+            const auto reg_swizzle = reg_cb.Swizzle();
+            Core::NativePlanShadow::CompareBytes(g, "color.swizzle", &native_swizzle, &reg_swizzle, sizeof(native_swizzle));
+            Core::NativePlanShadow::Compare(g, "color.num_samples", native_cb.NumSamples(), reg_cb.NumSamples());
+            Core::NativePlanShadow::Compare(g, "color.blend_bypass", native_cb.info.blend_bypass, reg_cb.info.blend_bypass);
+        }
+        if (in.depth_buffer.DepthValid() || regs.depth_buffer.DepthValid()) {
+            Core::NativePlanShadow::Compare(g, "depth.valid", in.depth_buffer.DepthValid(), regs.depth_buffer.DepthValid());
+            Core::NativePlanShadow::Compare(g, "depth.z_format", static_cast<u64>(in.depth_buffer.z_info.format), static_cast<u64>(regs.depth_buffer.z_info.format));
+            Core::NativePlanShadow::Compare(g, "depth.num_samples", in.depth_buffer.NumSamples(), regs.depth_buffer.NumSamples());
+        }
+        if (in.depth_buffer.StencilValid() || regs.depth_buffer.StencilValid()) {
+            Core::NativePlanShadow::Compare(g, "stencil.valid", in.depth_buffer.StencilValid(), regs.depth_buffer.StencilValid());
+            Core::NativePlanShadow::Compare(g, "stencil.format", static_cast<u64>(in.depth_buffer.stencil_info.format), static_cast<u64>(regs.depth_buffer.stencil_info.format));
+        }
+    }
     return plan;
 }
 

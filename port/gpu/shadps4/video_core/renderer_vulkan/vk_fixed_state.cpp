@@ -8,6 +8,7 @@
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_fixed_state.h"
+#include "native/native_plan_shadow.h"
 
 namespace Vulkan {
 
@@ -297,6 +298,63 @@ FixedState MakeFixedState(const AmdGpu::DrawRegs& regs) {
     FillPrimitive(out, regs);
     FillPipelineState(out, regs);
     return out;
+}
+
+void ShadowCompareFixedState(const FixedState& native, const FixedState& registers) {
+    if (!Core::NativePlanShadow::On()) {
+        return;
+    }
+#define SHADOW_FIELD(name) Core::NativePlanShadow::CompareBytes("fixed_state", #name, &native.name, &registers.name, sizeof(native.name))
+    SHADOW_FIELD(viewport_count);
+    SHADOW_FIELD(viewport_empty);
+    SHADOW_FIELD(clip_disabled);
+    SHADOW_FIELD(transform);
+    SHADOW_FIELD(viewports);
+    SHADOW_FIELD(scissors);
+    SHADOW_FIELD(depth_target);
+    SHADOW_FIELD(depth_test);
+    SHADOW_FIELD(depth_write);
+    SHADOW_FIELD(depth_clear);
+    SHADOW_FIELD(depth_compare);
+    SHADOW_FIELD(depth_bounds_test);
+    SHADOW_FIELD(depth_bounds_min);
+    SHADOW_FIELD(depth_bounds_max);
+    SHADOW_FIELD(depth_bias);
+    SHADOW_FIELD(depth_bias_constant);
+    SHADOW_FIELD(depth_bias_clamp);
+    SHADOW_FIELD(depth_bias_slope);
+    SHADOW_FIELD(stencil_target);
+    SHADOW_FIELD(stencil_test);
+    SHADOW_FIELD(stencil_clear);
+    Core::NativePlanShadow::Compare("fixed_state", "stencil_front_ops", native.stencil_front_ops == registers.stencil_front_ops ? 0 : 1, 0);
+    Core::NativePlanShadow::Compare("fixed_state", "stencil_back_ops", native.stencil_back_ops == registers.stencil_back_ops ? 0 : 1, 0);
+    SHADOW_FIELD(stencil_reference);
+    SHADOW_FIELD(stencil_write_mask);
+    SHADOW_FIELD(stencil_compare_mask);
+    SHADOW_FIELD(primitive_restart);
+    SHADOW_FIELD(primitive_restart_index);
+    SHADOW_FIELD(primitive_type);
+    SHADOW_FIELD(list_topology);
+    SHADOW_FIELD(patch_list_topology);
+    SHADOW_FIELD(rasterizer_discard);
+    SHADOW_FIELD(cull_mode);
+    SHADOW_FIELD(front_face);
+    SHADOW_FIELD(line_width);
+    SHADOW_FIELD(blend_constants);
+    SHADOW_FIELD(color_enabled);
+    SHADOW_FIELD(target_write_mask);
+    Core::NativePlanShadow::Compare("fixed_state", "blend", native.blend == registers.blend ? 0 : 1, 0);
+    SHADOW_FIELD(alpha_not_exported);
+    SHADOW_FIELD(logic_op_enabled);
+    SHADOW_FIELD(logic_op);
+    SHADOW_FIELD(polygon_mode);
+    SHADOW_FIELD(depth_clamp);
+    SHADOW_FIELD(depth_clip);
+    SHADOW_FIELD(negative_one_to_one);
+    SHADOW_FIELD(provoking_first);
+    SHADOW_FIELD(user_clip_plane_mask);
+    SHADOW_FIELD(degamma);
+#undef SHADOW_FIELD
 }
 
 } // namespace Vulkan
