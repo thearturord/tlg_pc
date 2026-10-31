@@ -817,6 +817,14 @@ u64 PS4_SYSV_ABI ClearDsvEnter(Core::GuestHooks::MidContext* c) {
     return 0;
 }
 
+bool CurrentDepthClear(ClearRecord& out) {
+    if (clear_depth == 0 || clear_depth > 8 || clear_record[clear_depth - 1].kind != 1) {
+        return false;
+    }
+    out = clear_record[clear_depth - 1];
+    return true;
+}
+
 void TakeClears(u64 begin, u64 end, std::vector<ClearRecord>& out) {
     std::scoped_lock lock{clear_mutex};
     for (auto it = pending_clears.lower_bound(begin); it != pending_clears.end() && it->first < end;) {

@@ -957,7 +957,8 @@ constexpr FieldDef DepthFields[] = {
     {"depth_slice_size", 7, 0x3fffff, FieldClass::Decided},
     {"view_slice_start", 8, 0x7ff, FieldClass::Decided},
     {"view_slice_max", 8, 0x7ff << 13, FieldClass::Decided},
-    {"view_read_only_bits", 8, ~(0x7ffu | (0x7ffu << 13)), FieldClass::NotNeeded},
+    {"view_read_only", 8, 0x03000000, FieldClass::NotDecidable},
+    {"view_other_bits", 8, ~(0x7ffu | (0x7ffu << 13) | 0x03000000u), FieldClass::NotNeeded},
     {"htile_base", 9, Full, FieldClass::Decided},
     {"depth_clear", 10, Full, FieldClass::NotDecidable},
     {"stencil_clear", 11, Full, FieldClass::NotDecidable},
@@ -977,6 +978,33 @@ struct FieldCounters {
     std::atomic<u64> shadow_differs{0};  ///< ... and it is not the register decode's
 };
 
+/// The values the register decode holds in a register-only field (at most 8 distinct per field, then `other`): a field with one value is a constant of the game
+struct ValueTable {
+    std::array<u32, 8> value{};
+    std::array<u64, 8> count{};
+    u32 n{0};
+    u64 other{0};
+};
+std::mutex g_value_mutex;
+std::map<u32, ValueTable> g_value_tables; ///< key: path << 16 | depth << 15 | field index (0xF000 + n: the depth clear call tables)
+
+void NoteValue(u32 key, u32 value) {
+    std::scoped_lock lock{g_value_mutex};
+    ValueTable& t = g_value_tables[key];
+    for (u32 i = 0; i < t.n; ++i) {
+        if (t.value[i] == value) {
+            ++t.count[i];
+            return;
+        }
+    }
+    if (t.n < 8) {
+        t.value[t.n] = value;
+        t.count[t.n++] = 1;
+    } else {
+        ++t.other;
+    }
+}
+
 struct PathCounters {
     std::array<FieldCounters, NumColourFields> colour;
     std::array<FieldCounters, NumDepthFields> depth;
@@ -991,6 +1019,11 @@ thread_local const TargetSet* t_scope = nullptr;
 bool ReadUseSwitch(const char* name) {
     const char* e = std::getenv(name);
     return e != nullptr && *e == '1';
+}
+
+bool RegOnlyOn() {
+    static const bool on = ReadUseSwitch("TLG_TARGET_REGONLY");
+    return on;
 }
 
 u32 Log2Samples(u32 samples, bool& ok) {
@@ -1099,6 +1132,17 @@ bool BuildColour(u64 view, u64 resource, std::array<WordOverride, ColourWords>& 
     if (samples_ok) {
         SetBits(w[5], 0x18000, samples_log2 << 15);
     }
+    if (RegOnlyOn()) {
+        // E7b Task 2, compare-only candidates for the fields no object is known to decide. linear_general: the T# says the surface is the display linear general mode; compression: the prebuilt block has an
+        // fmask (MS targets); alt_tile_mode: the T# has the Neo bit; the fmask words: the prebuilt block's for mip 0 (FUN_02491a30 never writes them, so they are 0 above it).
+        const u32 fmask_base = mip0 ? Rd<u32>(resource, 0xb0 + 9 * 4) : 0;
+        const u32 fmask_slice = mip0 ? Rd<u32>(resource, 0xb0 + 10 * 4) : 0;
+        SetShadow(w[4], 0x80, static_cast<u32>(t.tiling_index) == static_cast<u32>(AmdGpu::TileMode::DisplayLinearGeneral) ? 0x80u : 0u);
+        SetShadow(w[4], 0x4000, fmask_base != 0 ? 0x4000u : 0u);
+        SetShadow(w[4], 0x80000000u, t.alt_tile_mode != 0 ? 0x80000000u : 0u);
+        SetShadow(w[9], Full, fmask_base);
+        SetShadow(w[10], Full, fmask_slice);
+    }
     return true;
 }
 
@@ -1148,6 +1192,11 @@ bool BuildDepth(u64 view, u64 resource, std::array<WordOverride, DepthWords>& w,
             const u32 stencil_base = static_cast<u32>(Rd<u64>(resource, 0x40) >> 8);
             SetBits(w[3], Full, stencil_base);
             SetBits(w[5], Full, stencil_base);
+        } else if (RegOnlyOn()) {
+            // without a stencil the registers still hold something: compare it with the resource's stencil address
+            const u32 stencil_base = static_cast<u32>(Rd<u64>(resource, 0x40) >> 8);
+            SetShadow(w[3], Full, stencil_base);
+            SetShadow(w[5], Full, stencil_base);
         }
         const u32 pitch_pixels = static_cast<u32>(t.pitch) + 1;
         if (pitch_pixels % 8 == 0 && pitch_pixels / 8 - 1 <= 0x7ff) {
@@ -1171,6 +1220,11 @@ bool BuildDepth(u64 view, u64 resource, std::array<WordOverride, DepthWords>& w,
         }
     } else {
         g_view_unknown_range.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (RegOnlyOn() && view != 0) {
+        // the read-only bits of the depth view are the DSV description's flags (D3D11_DSV_READ_ONLY_DEPTH 1, _STENCIL 2; description +0x48)
+        const u32 flags = Rd<u32>(view, 0x48);
+        SetShadow(w[8], 0x03000000, ((flags & 1u) != 0 ? 0x01000000u : 0u) | ((flags & 2u) != 0 ? 0x02000000u : 0u));
     }
     SetBits(w[9], Full, static_cast<u32>(htile >> 8));
     // the clear values: the registers hold what the clear's setup wrote (the depth clear record: the prelude packets) or Synthesize's copy of the resource's values at the draw; the resource's
@@ -1301,7 +1355,7 @@ nlohmann::json WideReport(WideTable& table) {
 /// One dword group: the register decode `reg` (read and, when not verifying, written back) merged with the description `over`; counted per field of `fields`. Bits in `over[i].shadow` have
 /// a description value that is only compared (the registers keep them).
 template <size_t N>
-bool Merge(u32* reg, const std::array<WordOverride, N>& over, const FieldDef* fields, u32 field_count, FieldCounters* counters, bool verify, const u32* linear_general_word) {
+bool Merge(u32* reg, const std::array<WordOverride, N>& over, const FieldDef* fields, u32 field_count, FieldCounters* counters, bool verify, const u32* linear_general_word, u32 key_base) {
     bool differs = false;
     u32 merged[N];
     for (u32 i = 0; i < N; ++i) {
@@ -1317,6 +1371,9 @@ bool Merge(u32* reg, const std::array<WordOverride, N>& over, const FieldDef* fi
         const u32 covered = o.mask;
         if ((def.mask & ~covered) != 0 || (def.word == 3 && linear_general_word != nullptr && (*linear_general_word & 0x80) != 0 && (def.mask & 0x7ff) != 0)) {
             counters[f].register_only.fetch_add(1, std::memory_order_relaxed);
+            if (RegOnlyOn() && (def.cls == FieldClass::NotDecidable || (o.shadow & def.mask) != 0)) {
+                NoteValue(key_base | f, reg[def.word] & def.mask);
+            }
             if (o.shadow != 0 && (def.mask & ~o.shadow) == 0) {
                 counters[f].shadow_compared.fetch_add(1, std::memory_order_relaxed);
                 if (((reg[def.word] ^ o.value) & def.mask) != 0) {
@@ -1368,7 +1425,7 @@ void ApplyColour(Vulkan::DrawInputs& inputs, const TargetSet& set, Path path, u3
         const u32 info = words[4];
         const u32 reg0 = words[11], reg1 = words[12];
         pc.applied_colour.fetch_add(1, std::memory_order_relaxed);
-        if (Merge<ColourWords>(words, set.colour[slot], ColourFields, NumColourFields, pc.colour.data(), verify, &info)) {
+        if (Merge<ColourWords>(words, set.colour[slot], ColourFields, NumColourFields, pc.colour.data(), verify, &info, static_cast<u32>(path) << 16)) {
             pc.targets_differing.fetch_add(1, std::memory_order_relaxed);
         }
         // the table of differing clear cases (the description's words, and the clear call's colour, against the registers')
@@ -1413,7 +1470,7 @@ void ApplyDepth(Vulkan::DrawInputs& inputs, const TargetSet& set, Path path) {
     words[11] = inputs.stencil_clear;
     const u32 reg0 = words[10], reg1 = words[11];
     pc.applied_depth.fetch_add(1, std::memory_order_relaxed);
-    if (Merge<DepthWords>(words, set.depth, DepthFields, NumDepthFields, pc.depth.data(), verify, nullptr)) {
+    if (Merge<DepthWords>(words, set.depth, DepthFields, NumDepthFields, pc.depth.data(), verify, nullptr, (static_cast<u32>(path) << 16) | 0x8000u)) {
         pc.targets_differing.fetch_add(1, std::memory_order_relaxed);
     }
     // the compare-only clear values: the resource's against the register decode's
@@ -1450,6 +1507,28 @@ bool ResolveDepthTarget(u64 target, u64& view, u64& resource) {
 }
 
 } // namespace
+
+bool RegOnlyShadowOn() noexcept {
+    return RegOnlyOn();
+}
+
+namespace {
+std::atomic<u64> g_dcall_evaluated{0}, g_dcall_depth_equal{0}, g_dcall_depth_differs{0}, g_dcall_depth_absent{0}, g_dcall_stencil_equal{0}, g_dcall_stencil_differs{0}, g_dcall_stencil_absent{0};
+} // namespace
+
+void NoteDepthClearCall(u32 call_depth_bits, u32 call_stencil, u32 flags, u32 reg_depth_bits, u32 reg_stencil) {
+    if (!RegOnlyOn()) {
+        return;
+    }
+    g_dcall_evaluated.fetch_add(1, std::memory_order_relaxed);
+    (reg_depth_bits == ~0u ? g_dcall_depth_absent : reg_depth_bits == call_depth_bits ? g_dcall_depth_equal : g_dcall_depth_differs).fetch_add(1, std::memory_order_relaxed);
+    (reg_stencil == ~0u ? g_dcall_stencil_absent : reg_stencil == call_stencil ? g_dcall_stencil_equal : g_dcall_stencil_differs).fetch_add(1, std::memory_order_relaxed);
+    NoteValue(0xF001, call_depth_bits);
+    NoteValue(0xF002, reg_depth_bits);
+    NoteValue(0xF003, call_stencil);
+    NoteValue(0xF004, reg_stencil);
+    NoteValue(0xF005, flags);
+}
 
 bool UseOn() noexcept {
     // On by default since the owner's long play of 2026-10-31 (0 differences from the register decode over all three paths); TLG_TARGET_DESC_USE=0 turns it off
@@ -1596,6 +1675,35 @@ nlohmann::json UseReport() {
     j["targets_above_mip_0_with_register_geometry"] = g_mip_above_0_registers.load();
     j["pitch_not_representable"] = g_pitch_not_representable.load();
     j["view_range_unknown"] = g_view_unknown_range.load();
+    if (RegOnlyOn()) {
+        // E7b Task 2: the values the register decode holds in the register-only fields, and the candidate comparisons (`compare_only_differs` in the fields above)
+        auto& hist = j["register_value_histograms"] = nlohmann::json::object();
+        auto& call = j["depth_clear_call"] = nlohmann::json::object();
+        std::scoped_lock lock{g_value_mutex};
+        const char* call_names[5] = {"call_depth_bits", "register_depth_bits", "call_stencil", "register_stencil", "call_flags"};
+        for (const auto& [key, t] : g_value_tables) {
+            nlohmann::json rows = nlohmann::json::array();
+            for (u32 i = 0; i < t.n; ++i) {
+                rows.push_back({{"value", fmt::format("{:#x}", t.value[i])}, {"count", t.count[i]}});
+            }
+            nlohmann::json entry = {{"distinct_values_shown", t.n}, {"other_values", t.other}, {"values", std::move(rows)}};
+            if (key >= 0xF001 && key <= 0xF005) {
+                call[call_names[key - 0xF001]] = std::move(entry);
+                continue;
+            }
+            const u32 path = key >> 16, depth = (key >> 15) & 1, field = key & 0x7fff;
+            if (path < NumPaths && field < (depth != 0 ? NumDepthFields : NumColourFields)) {
+                hist[std::string(PathNames[path]) + (depth != 0 ? "/depth/" : "/colour/") + (depth != 0 ? DepthFields[field].name : ColourFields[field].name)] = std::move(entry);
+            }
+        }
+        call["evaluated"] = g_dcall_evaluated.load();
+        call["depth_equal"] = g_dcall_depth_equal.load();
+        call["depth_differs"] = g_dcall_depth_differs.load();
+        call["depth_register_absent"] = g_dcall_depth_absent.load();
+        call["stencil_equal"] = g_dcall_stencil_equal.load();
+        call["stencil_differs"] = g_dcall_stencil_differs.load();
+        call["stencil_register_absent"] = g_dcall_stencil_absent.load();
+    }
     j["clear_cases_description_vs_registers"] = WideReport(g_clear_desc_cases);
     j["clear_cases_clear_call_colour_vs_registers"] = WideReport(g_clear_call_cases);
     j["clear_cases_depth_values_vs_registers"] = WideReport(g_depth_clear_cases);

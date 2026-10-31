@@ -140,6 +140,8 @@ enum ClearUse : u32 { UseMetaClearDispatch, UseFastClearEliminate, UseFastClearE
 void NoteClearUse(ClearUse use, bool inside);
 /// The command processor met a clear's packets: entries inside by kind (0 tag, 1 sync, 2 packet, 3 other)
 void NoteClearEntered(const ClearRecord& clear, const u32 (&entries)[4]);
+/// The depth / stencil clear the game is inside of right now (its ClearDepthStencilView call has not returned): false when none. Game thread.
+[[nodiscard]] bool CurrentDepthClear(ClearRecord& out);
 enum ClearNative : u32 { NativeDone, NativeImages, NativeNotEligible, NativeSkippedWork, NativeFastClearKept, NativeSubresource, NativeFastClearPending, NativeFastClearAtRenderPass, NativeFastClearAtEliminate, NativeClearBeforeImage, NativeClearAtFirstImage, NativeClearFirstImageMismatch, ClearNatives };
 void NoteClearNative(ClearNative what, u64 n = 1);
 

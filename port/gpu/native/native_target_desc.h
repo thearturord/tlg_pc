@@ -70,4 +70,13 @@ void ApplyDepthClear(Vulkan::DrawInputs& inputs, const TargetSet* set);
 /// The fast clear eliminate record.
 void ApplyEliminate(Vulkan::DrawInputs& inputs, const TargetSet* set);
 
+/// E7b Task 2: the register-only fields of the target blocks (fmask words, alt_tile_mode, compression, linear_general, the stencil bases without a stencil, the read-only bits of the depth view,
+/// the depth and stencil clear values) get a candidate value from the engine's objects, compared with the register decode and counted (never applied), and the values the registers hold are
+/// counted per field (`register_value_histograms`: a field with one value in every draw is a constant). `TLG_TARGET_REGONLY=1`, default off.
+[[nodiscard]] bool RegOnlyShadowOn() noexcept;
+
+/// The depth clear record is being built (game thread, inside the engine's ClearDepthStencilView): the arguments of that call (`call_depth_bits` the float, `call_stencil`, `flags`) against the values the
+/// clear's setup wrote into the registers (`reg_*`; ~0u: not written). Counted under `depth_clear_call`.
+void NoteDepthClearCall(u32 call_depth_bits, u32 call_stencil, u32 flags, u32 reg_depth_bits, u32 reg_stencil);
+
 } // namespace Core::NativeTargetDesc

@@ -7358,6 +7358,15 @@ bool ConvertClearQuad(u64 target, u64 start, u64 begin, u64 end, u64 caller, con
     slot.cb_extent = {};
     slot.cb_extent_mask = 0;
     slot.db_extent = Rd<u32>(target, 0x30);
+    if (Core::NativeTargetDesc::RegOnlyShadowOn()) {
+        // E7b Task 2: the arguments of the ClearDepthStencilView call against what the clear's setup wrote into the clear registers (prelude values 1: stencil clear, 2: depth clear)
+        Core::NativeDevice::ClearRecord call;
+        if (Core::NativeDevice::CurrentDepthClear(call)) {
+            u32 depth_bits = 0;
+            std::memcpy(&depth_bits, &call.value[0], sizeof(depth_bits));
+            Core::NativeTargetDesc::NoteDepthClearCall(depth_bits, call.stencil, call.flags, prelude_values[2].second, prelude_values[1].second);
+        }
+    }
     slot.native_targets = Core::NativeTargetDesc::UseOn() ? Core::NativeTargetDesc::PrepareDepthClear(target) : nullptr; // E7 (TLG_TARGET_DESC_USE)
     slot.native_targets_seq = seq;
     slot.seq.store(seq, std::memory_order_release);
