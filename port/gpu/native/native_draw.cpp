@@ -1099,6 +1099,7 @@ struct NativeRecord {
     u64 package_for{};
     std::array<u64, MaxGeometryIds> geometry_ids{}; ///< N6.2: engine ids of the vertex and index buffers of the draw
     u32 geometry_id_count{};
+    DrawArgs args{}; ///< E1b: the draw's arguments as typed values
     u64 vs_gnm{}; ///< Gnm shader binaries of the draw (for the shader input dump)
     u64 ps_gnm{};
     u64 dbg_vs{};
@@ -3038,13 +3039,18 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
         slot.desc_key = synth_desc_key;
         // draw arguments: VGT_NUM_INDICES / VGT_NUM_INSTANCES, then for indexed draws the index buffer view
         // (IT_INDEX_BASE), the base vertex and the draw packet's maximum size
+        slot.args = {};
         if (kind != 2) {
             // an inlined draw (the count is only known to the draw packet) keeps the instance count the game set
             const bool unknown_count = a1 == Core::NativeDraw::UnknownDrawCount;
             if (!unknown_count) {
                 slot.regs[n++] = {UconfigBase + 0x24c, static_cast<u32>(a1)};
+                slot.args.mask |= DrawArgs::NumIndices;
+                slot.args.num_indices = static_cast<u32>(a1);
             }
             slot.regs[n++] = {UconfigBase + 0x24d, inline_instances != 0 ? inline_instances : 1u}; // DrawIndexedCommon and DrawAuto reset the instance count
+            slot.args.mask |= DrawArgs::NumInstances;
+            slot.args.num_instances = inline_instances != 0 ? inline_instances : 1u;
             // PrepareDraw hands the first vertex (base vertex of an indexed draw) and the first instance to the vertex shader in the
             // user data registers its block names (bytes 0xe8 / 0xe9 of the block, 0 = not used)
             if (vertex_shader != 0) {
@@ -3071,6 +3077,11 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
                 slot.regs[n++] = {ContextBase + 0x1f9, Rd<u32>(view, 0x64) & 0xff};
                 slot.regs[n++] = {ContextBase + 0x102, Rd<u32>(ctx, 0x64)};
                 slot.regs[n++] = {ContextBase + 0x29e, Rd<u32>(view, 0x68)};
+                slot.args.mask |= DrawArgs::IndexBase | DrawArgs::IndexType | DrawArgs::MaxIndexSize;
+                slot.args.index_base_lo = Rd<u32>(view, 0x60) & 0xfffffffeu;
+                slot.args.index_base_hi = Rd<u32>(view, 0x64) & 0xff;
+                slot.args.index_type = Rd<u32>(ctx, 0x64);
+                slot.args.max_index_size = Rd<u32>(view, 0x68);
                 const u64 args = Rd<u64>(a1, 0x30);
                 slot.args_addr = (args & 0xfffffff8ull) | ((args >> 32) & 0xff) << 32;
                 const u32 locations = Rd<u8>(slot.vs_gnm, 0x27);
@@ -3093,12 +3104,18 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
                 slot.regs[n++] = {ContextBase + 0x1fa, Rd<u32>(view, 0x60) & 0xfffffffeu};
                 slot.regs[n++] = {ContextBase + 0x1f9, Rd<u32>(view, 0x64) & 0xff};
                 slot.regs[n++] = {ContextBase + 0x102, Rd<u32>(ctx, 0x64)};
+                slot.args.mask |= DrawArgs::IndexBase | DrawArgs::IndexType;
+                slot.args.index_base_lo = Rd<u32>(view, 0x60) & 0xfffffffeu;
+                slot.args.index_base_hi = Rd<u32>(view, 0x64) & 0xff;
+                slot.args.index_type = Rd<u32>(ctx, 0x64);
                 if (Rd<u32>(ctx, 0x60) != 0x39) {
                     slot.flags |= SpecialPipeline;
                     synth_reason |= ReasonIndexType;
                 }
             }
             slot.regs[n++] = {ContextBase + 0x29e, static_cast<u32>(a1)};
+            slot.args.mask |= DrawArgs::MaxIndexSize;
+            slot.args.max_index_size = static_cast<u32>(a1);
         }
         if (slot.unsupported_inputs != 0) {
             slot.flags |= SpecialPipeline;
@@ -4701,6 +4718,7 @@ static bool TakeExecDrawImpl(u64 seq, ExecDraw& out, bool typed, bool allow_lazy
         out.copy_bytes = slot.copy_bytes;
     }
     out.fixed = slot.kind == 4 ? nullptr : slot.fixed;
+    out.args = slot.args;
     out.vs_gnm = slot.vs_gnm;
     out.ps_gnm = slot.ps_gnm;
     out.fetch_object = slot.dbg_fetch;

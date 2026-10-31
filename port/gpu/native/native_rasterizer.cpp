@@ -376,7 +376,47 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u32
     plan->depth_copy = plan->stencil_copy = false;
     plan->fixed = native;
     plan->inputs = cached->second;
-    ApplyExecRegisters(plan->inputs, draw, draw.group_begin[AmdGpu::Liverpool::GroupArguments], draw.group_begin[AmdGpu::Liverpool::GroupArguments + 1]);
+    // E1b: the draw's arguments. The argument registers of the record (`ApplyExecRegisters`) and the typed values the record builder set are both applied to a copy of the
+    // cached inputs and compared; with TLG_DRAW_ARGS=1 the typed values decide.
+    {
+        DrawInputs from_registers = plan->inputs;
+        ApplyExecRegisters(from_registers, draw, draw.group_begin[AmdGpu::Liverpool::GroupArguments], draw.group_begin[AmdGpu::Liverpool::GroupArguments + 1]);
+        DrawInputs typed = plan->inputs;
+        const auto& a = draw.args;
+        if ((a.mask & Core::NativeDraw::DrawArgs::NumIndices) != 0) {
+            typed.num_indices = a.num_indices;
+        }
+        if ((a.mask & Core::NativeDraw::DrawArgs::NumInstances) != 0) {
+            typed.num_instances.num_instances = a.num_instances;
+        }
+        if ((a.mask & Core::NativeDraw::DrawArgs::IndexBase) != 0) {
+            typed.index_base_address.base_addr_hi = a.index_base_hi;
+            typed.index_base_address.base_addr_lo = a.index_base_lo;
+        }
+        if ((a.mask & Core::NativeDraw::DrawArgs::IndexType) != 0) {
+            typed.index_buffer_type.raw = a.index_type;
+        }
+        if ((a.mask & Core::NativeDraw::DrawArgs::MaxIndexSize) != 0) {
+            typed.max_index_size = a.max_index_size;
+        }
+        const bool equal = typed.num_indices == from_registers.num_indices && typed.num_instances.num_instances == from_registers.num_instances.num_instances &&
+                           std::memcmp(&typed.index_base_address, &from_registers.index_base_address, sizeof(typed.index_base_address)) == 0 &&
+                           typed.index_buffer_type.raw == from_registers.index_buffer_type.raw && typed.max_index_size == from_registers.max_index_size;
+        auto& live = Core::NativeDraw::Live();
+        live.draw_args_compared.fetch_add(1, std::memory_order_relaxed);
+        if (!equal && live.draw_args_differing.fetch_add(1, std::memory_order_relaxed) < 8) {
+            Core::RareEvents::Note("draw_args_differ_from_registers",
+                                   fmt::format("mask {:#x}: num_indices {}/{} instances {}/{} index base {:#x}:{:#x} / {:#x}:{:#x} type {:#x}/{:#x} max size {}/{}", a.mask, typed.num_indices,
+                                               from_registers.num_indices, typed.num_instances.num_instances, from_registers.num_instances.num_instances, u32(typed.index_base_address.base_addr_hi),
+                                               typed.index_base_address.base_addr_lo, u32(from_registers.index_base_address.base_addr_hi), from_registers.index_base_address.base_addr_lo,
+                                               typed.index_buffer_type.raw, from_registers.index_buffer_type.raw, typed.max_index_size, from_registers.max_index_size));
+        }
+        static const bool typed_decides = [] {
+            const char* e = std::getenv("TLG_DRAW_ARGS");
+            return e != nullptr && *e == '1';
+        }();
+        plan->inputs = typed_decides ? typed : from_registers;
+    }
     if (index_count != ~0u) {
         plan->inputs.num_indices = index_count; // an inline draw: the count comes with the draw packet
     }

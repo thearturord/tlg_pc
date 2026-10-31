@@ -59,6 +59,7 @@ struct LiveCounters {
     std::atomic<u64> stage_key_hits{}, stage_key_misses{}, stage_key_uncached{}, stage_key_audits{}, stage_key_violations{};
     /// cp_exec_inputs: draws planned from the record alone, draws that could not be (no cached inputs or pipeline yet), draws planned both ways and compared, and the ones that differed
     std::atomic<u64> exec_typed{}, exec_fallback{}, exec_audits{}, exec_violations{};
+    std::atomic<u64> draw_args_compared{}, draw_args_differing{}; ///< E1b: the typed draw arguments against the ones the argument registers give
     std::array<std::atomic<u64>, 12> fixed_null{}; ///< why Fixed::Build gave no fixed state (by exit point)
     std::array<std::atomic<u64>, 3> plan_null{};   ///< why PlanExecDraw gave no plan: 0 stale surface / clip, 1 inputs not learned yet, 2 pipeline plan failed
     /// why a draw was not planned from its record: 0 the switches are not all on, 1 the record has no key (not typed, no fixed state), 2 the command processor is not split,
@@ -170,6 +171,19 @@ struct ExecRegister {
 
 /// A draw the game's render layer did not write as command packets: the registers its objects describe and the
 /// draw arguments.
+/// E1b: the arguments of a draw as typed values, set by the record builder where it used to emit the argument registers (VGT_NUM_INDICES, VGT_NUM_INSTANCES,
+/// the index buffer base, type and maximum size). `mask` says which of them the record set; the others keep what the plan's cached inputs hold.
+struct DrawArgs {
+    static constexpr u32 NumIndices = 1, NumInstances = 2, IndexBase = 4, IndexType = 8, MaxIndexSize = 16;
+    u32 mask{};
+    u32 num_indices{};
+    u32 num_instances{};
+    u32 index_base_lo{}; ///< the address's low 32 bits, bit 0 cleared
+    u32 index_base_hi{}; ///< the address's bits 32 to 39
+    u32 index_type{};    ///< the engine's index type word (index width and swap mode)
+    u32 max_index_size{};
+};
+
 struct ExecDraw {
     static constexpr u32 MaxRegisters = 320;
     u64 seq{}; ///< the record this draw was taken from (diagnostics: the native registry audit)
@@ -222,6 +236,7 @@ struct ExecDraw {
     u64 copy_destination{}; ///< dispatches of the device's buffer copy shader: the memory copy it performs (null: not one)
     u64 copy_source{};
     u32 copy_bytes{};
+    DrawArgs args{}; ///< E1b
     u64 vs_gnm{}, ps_gnm{}, fetch_object{}; ///< E1c: the Gnm blocks of the draw's vertex and pixel shader objects and the input layout's fetch object (0: unknown)
     const Vulkan::FixedState* fixed{}; ///< draws: the fixed-function state built from the engine's objects (null: from the registers)
     u32 fixed_stale{};                 ///< FixedStateStale groups of `fixed` the hardware keeps from earlier draws

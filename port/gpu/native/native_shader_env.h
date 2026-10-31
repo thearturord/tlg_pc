@@ -37,7 +37,7 @@ struct Scope {
 
 /// A derived `RuntimeInfo` was compared with the register built one: `stage` 0 vertex, 1 pixel; `differing` names the fields that differ (empty: equal).
 void NoteCompared(u32 stage, const std::string& differing);
-/// True with `TLG_SHADER_ENV=1`: the environment derived from the shader objects decides, the register built input only verifies.
+/// True: the environment derived from the shader objects decides (since the owner played it, 2026-10-31); the register built input only verifies.
 [[nodiscard]] bool Decides() noexcept;
 /// BuildRuntimeInfo ran for a stage with no native draw being planned (the packet path, the raster thread).
 void NoteUnavailable();

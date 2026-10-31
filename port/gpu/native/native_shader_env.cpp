@@ -191,11 +191,7 @@ void NoteCompared(u32 stage, const std::string& differing) {
 }
 
 bool Decides() noexcept {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_SHADER_ENV");
-        return e != nullptr && *e == '1';
-    }();
-    return on;
+    return true; // played by the owner 2026-10-31, no switch any more
 }
 
 void NoteUnavailable() {
