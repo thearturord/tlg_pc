@@ -255,3 +255,68 @@ source for the image size and `Pitch()` / `Height()` only matter for `guest_size
 Still not decidable from the engine's objects: `alt_tile_mode`, `linear_general` (0 for the display buffers), the fmask words (only the prebuilt block writes them), the clear colour of the engine's clear call
 (resource `+0x150/+0x154`, not the view), and the bits of the info word above 18 (cmask_is_linear, blend_opt_*, fmask_*, dcc_enable, cmask_addr_type): the word's known bits are format (2-6), number type
 (8-10), comp_swap (11-12), fast clear (13, resource `+0x58`), blend_clamp, blend_bypass and bit 18.
+
+## 9. Checklist for the next step: replacing the register decode with this description
+
+Verdicts: **decided** = built from the engine's objects, 0 differences in the local runs reported to me (rounds 1 to 3: colour only `info_bit18` differed in round 3, depth 0); **constant** = a
+fixed value or a small table; **not decidable** = no engine field known (why); **not compared yet** = the shadow does not check it, so I cannot call it decided. Round 4 adds the constants for
+`number_type`, `comp_swap` and bit 18 and one new check (`slice_size`), all unrun.
+
+### `AmdGpu::ColorBuffer` (dwords in block order)
+| field | verdict | how / why |
+|---|---|---|
+| `base_address` (word 0) | decided at mip 0 | `resource + 0x30` (`Object::address`), `address` 0 differences. Mip above 0: the block holds the mip's own address; not compared yet |
+| `pitch.tile_max` (1) | decided at mip 0 | T# pitch (`resource + 0x70`) and `Derive`'s pitch rule, `pitch` / `t_pitch` 0 differences. Mip above 0: not compared yet |
+| `pitch.fmask_tile_max` (1) | not needed | no reader; fmask only |
+| `slice.tile_max` (2) | not compared yet (check added in round 4: `slice_size`) | the tile aligned height (1080 -> 1088, 2160 -> 2176, 540 -> 640: not one alignment) comes from the console's tiling size math, not from the D3D11 description. The engine keeps the result in the prebuilt block (`resource + 0xb0`, word 2) and the allocation size at `resource + 0x38`; `slice_size` compares `GetColorSliceSize() * layers` with `Object::bytes` for one-mip textures. The image size itself comes from the extent word (equal to the mip extent in all cases) |
+| `view.slice_start` / `slice_max` (3) | decided | view description first slice and last slice (`first_slice`, `last_slice`, 0 differences); `slice_max` is the last index |
+| `info.endian` (bits 0-1) | constant 0 | `FUN_0246a420` sets `format << 2` and nothing in bits 0-1; no reader |
+| `info.format` (2-6) | decided | the T# data format (`resource + 0x70`), `t_data_format` 0 differences |
+| `info.linear_general` (7) | not decidable | no engine field known; 0 in the three info words quoted (0x8028, 0xa028, 0x42718); read by `Address()`, `BaseSlice()`, `GetTileMode()` only |
+| `info.number_type` (8-10) | constant (round 4) | T# number format -> number type: identity for 0-5 and 7, 9 (Srgb) -> 6; entries 6 (SnormNz), 8 and 10-15 unknown (not read in Ghidra by me); `number_type_constants` marks `observed` per entry, `number_type_not_in_the_constant_table` counts the rest; the learned table checks it |
+| `info.comp_swap` (11-12) | constant rule (round 4) | from the T# data format (channel count) and dst_sel: the stored channel `c` is read by the component whose select is `4 + c`; the swap whose row in `ColorBuffer::Swizzle()`'s table has that component order is the answer (BGRA `0xf2e` -> 1, RGBA/RG/R/RGB -> 0 for all six cases seen). Derived from the repo's swizzle table, not from `FUN_0246be80`, which I did not read; rows for 1 to 3 channels other than standard are unseen. `comp_swap_rule_unmatched` / `_ambiguous` count the cases it cannot place |
+| `info.fast_clear` (13) | decided | `resource + 0x58 != 0`, `fast_clear_flag` 0 differences |
+| `info.compression` (14) | not decidable | no engine field known; only the fmask address reads it; 0 in the quoted words; needed only if multisample colour targets exist |
+| `info.blend_clamp` (15) | constant rule | number type in {0, 1, 6}; `blend_clamp` 0 differences |
+| `info.blend_bypass` (16) | constant rule | number type in {4, 5}; 0 differences |
+| `info.simple_float` (17) | not needed | no reader; 0 in the quoted words |
+| `info.round_mode` (18) | constant rule (round 4) | `(u ^ 1)` with `u = 1` for number types 0, 1, 6, else 1 -> 0 for those types, 1 for the others (your correction of Q6); `info_bit18` |
+| `info.cmask_is_linear` (19), `blend_opt_*` (20-25), `fmask_compression_disable_ci` (26), `fmask_compress_1frag_only` (27), `dcc_enable` (28), `cmask_addr_type` (29-30) | not needed | no reader; 0 in the quoted words |
+| `info.alt_tile_mode` (31) | not decidable | Neo only (`ImageInfo.alt_tile` and the detile / cache keys read it); no engine field known |
+| `attrib.tile_mode_index` (0-4) | decided | T# tiling index, and display tiling 10 for bind flag `0x100`, 14 otherwise (`tile_mode`, `t_tile_mode` 0 differences) |
+| `attrib.fmask_tile_mode_index`, `fmask_bank_height`, `num_samples_log2`, `force_dst_alpha_1` | not needed | no reader (`fmask_tile_mode_index` is 10 in the display buffer's word 0x14a: a copy of the tile mode) |
+| `attrib.num_fragments_log2` | decided | `SampleDesc.Count` at `resource + 0x194`, `samples` 0 differences |
+| `pad0` (6) | not needed | Neo DCC base (`resource + 0x8c`), not used by Vulkan |
+| `cmask_base_address` (7) | decided at mip 0 | `resource + 0x58`, `cmask_address` 0 differences |
+| `cmask_slice.tile_max` (8) | not needed | no reader |
+| `fmask_base_address`, `fmask_slice` (9, 10) | not decidable | only the prebuilt block writes them (`FUN_02491a30` never does); no engine field named; no reader except the fmask address of `meta_info`; `prebuilt_block_cases` shows whether a view block ever differs from the prebuilt one |
+| `clear_word0/1` (11, 12) | decided as the prebuilt block's words | `resource + 0xdc/+0xe0` at mip 0, 0 above; they are not the clear call's colour (resource `+0x150/+0x154`, valid when `+0x14c != 0`); the consumer (`ColorBufferClearValue`) must take the clear call's colour from there or from the call |
+| `pad1` (13, 14) | not needed | unused |
+| the extent word (15), `CbDbExtent` | decided | mip extent of the resource (equal in 100 % of cases) |
+
+### `AmdGpu::DepthBuffer` and the depth words around it
+| field | verdict | how / why |
+|---|---|---|
+| `z_info.format` | decided | DXGI depth format of the view (or the resource's typeless one): 20 / 45 -> Z32 float + Stencil8, 40 -> Z32 float, 55 -> Z16; `format_not_in_the_table` 0 |
+| `z_info.num_samples` | decided | `SampleDesc.Count`, `samples` 0 differences |
+| `z_info.tile_mode_index` | decided | `Derive` index (0 for depth) and T# index, `tile_mode` / `t_tile_mode` 0 differences |
+| `z_info.tile_surface_enable` | decided | `resource + 0x48 != 0`, `htile_enable` 0 differences |
+| `z_info.tile_split`, `decompress_on_n_zplanes`, `allow_expclear`, `read_size`, `clear_disallowed`, `zrange_precision` | not needed | no reader (`zrange_precision` is 1 in the quoted word 0xa0000003) |
+| `stencil_info.format` | decided | same table (`stencil_format` 0 differences) |
+| `z_read_base`, `z_write_base` | decided | both `resource + 0x30 >> 8` (read-only is a view flag), `address` / `z_write_base` 0 differences |
+| `stencil_read_base`, `stencil_write_base` | decided | both `resource + 0x40 >> 8`, `stencil_address` 0 differences |
+| `depth_size.pitch_tile_max` | decided at mip 0 | T# pitch / `Derive` pitch, `pitch` / `t_pitch` 0 differences |
+| `depth_size.height_tile_max` | not compared yet | tile aligned height, same remark as `slice.tile_max`; the image size comes from the extent word |
+| `depth_slice.tile_max` | not compared yet (check added in round 4: `slice_size`) | `GetDepthSliceSize() * layers` against `Object::bytes` for one-mip textures; the stencil plane is a separate allocation (`resource + 0x40`) so it should not be in `bytes` (to be seen) |
+| `depth_view.slice_start` / `slice_max` | decided | first and last slice of the view description; plain 2D views at mip 0 carry the whole resource's range (`last_slice` 0 differences) |
+| `depth_view.z_read_only`, `stencil_read_only` | not compared yet | no reader; the DSV flags (`+0x48` bits 0 and 1) are the likely source |
+| `depth_htile_data_base` | decided | `resource + 0x48 >> 8` (block word 9), `htile_base` 0 differences |
+| `depth_clear`, `stencil_clear` | decided (same data) | `resource + 0x158` / `+0x15c`, valid when `resource + 0x48 != 0`; the register image copies them from there |
+| the depth extent word (12) | decided | mip extent of the resource |
+| `depth_control`, `depth_render_control` | out of scope here | draw state (`FixedState`) and the engine's own clear / copy / decompress operations (B11), not target description |
+
+### What the replacement still needs that the shadow does not give
+1. The tile aligned sizes (`slice.tile_max`, `height_tile_max`, `depth_slice.tile_max`) for `guest_size` and `mips_layout`: either the repo's tiling size function with the T# as input, or the engine's prebuilt block; `slice_size` will show which agrees with the allocation.
+2. Mip above 0 targets: address, pitch and the recomputed block (`FUN_02491a30` recomputes them from the T#); not compared. Whether the game binds any is visible in `tuples` (`mip` column).
+3. The clear colour of a fast clear: from the clear call or resource `+0x150/+0x154`.
+4. Multisample colour targets (fmask, `compression`): not decidable; the `tuples` `samples` column says whether any exist.

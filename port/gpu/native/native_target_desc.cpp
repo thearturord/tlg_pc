@@ -73,6 +73,7 @@ enum Field : u32 {
     FCompSwap,
     FBlendClamp,
     FInfoBit18,
+    FSliceSize,
     FieldCount,
 };
 
@@ -82,7 +83,7 @@ constexpr std::array<const char*, FieldCount> FieldNames{
     "data_format", "number_format", "tile_mode", "pitch", "extent_width", "extent_height", "first_slice", "last_slice",
     "samples", "address", "cmask_address", "clear_word0", "clear_word1", "z_format", "stencil_format",
     "t_data_format", "t_pitch", "t_tile_mode", "blend_bypass", "fast_clear_flag", "z_write_base", "stencil_address", "htile_base", "htile_enable",
-    "number_type", "comp_swap", "blend_clamp", "info_bit18",
+    "number_type", "comp_swap", "blend_clamp", "info_bit18", "slice_size",
 };
 
 std::array<std::atomic<u64>, FieldCount> g_field_diffs[2]{}; // [0] colour, [1] depth
@@ -92,6 +93,7 @@ std::atomic<u64> g_extent_none[2]{}, g_extent_equal[2]{}, g_extent_larger[2]{}, 
 std::atomic<u64> g_clear_packed_present{}, g_clear_block_equals_packed{}, g_clear_block_differs_packed{};
 std::atomic<u64> g_clear_unset{}, g_clear_unset_zero{}, g_clear_unset_equals_packed{};
 std::atomic<u64> g_unknown_depth_format{};
+std::atomic<u64> g_number_format_hits[16]{}, g_number_type_unknown{}, g_comp_swap_rule_unmatched{}, g_comp_swap_rule_ambiguous{};
 std::atomic<u64> g_tuple_overflow{}, g_shape_overflow{};
 
 /// What a target looked like, as seen by a draw (the tuples the local side asked for)
@@ -166,6 +168,73 @@ u32 Learn(std::map<u64, Learned>& table, u64 key, u32 value) {
         ++it->second.conflicts;
     }
     return it->second.value;
+}
+
+/// FUN_0246a420: the colour target's number type (info bits 8-10) from the T# number format (the table at DAT_025e1250, & 7): identity for the types the console has, Srgb (9) -> 6. The entries
+/// 6 (SnormNz), 8 and 10 to 15 are not known (not read in Ghidra, not seen): they return false and are counted; the learned table is the check.
+bool NumberTypeOf(u32 number_format, u32& number_type) {
+    switch (number_format) {
+    case 0: // Unorm
+    case 1: // Snorm
+    case 2: // Uscaled
+    case 3: // Sscaled
+    case 4: // Uint
+    case 5: // Sint
+    case 7: // Float
+        number_type = number_format;
+        return true;
+    case 9: // Srgb
+        number_type = 6;
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// The shader component (0 R, 1 G, 2 B, 3 A) each stored channel receives, per swap mode (0 standard, 1 alternate, 2 standard reverse, 3 alternate reverse) and channel count (1 to 4):
+/// the table of `ColorBuffer::Swizzle()` (regs_color.h). 255: the channel is not written.
+constexpr u8 StoredOrder[4][4][4] = {
+    {{0, 255, 255, 255}, {0, 1, 255, 255}, {0, 1, 2, 255}, {0, 1, 2, 3}}, // standard
+    {{1, 255, 255, 255}, {0, 3, 255, 255}, {0, 1, 3, 255}, {2, 1, 0, 3}}, // alternate
+    {{2, 255, 255, 255}, {1, 0, 255, 255}, {2, 1, 0, 255}, {3, 2, 1, 0}}, // standard reverse
+    {{3, 255, 255, 255}, {3, 0, 255, 255}, {3, 1, 0, 255}, {3, 0, 1, 2}}, // alternate reverse
+};
+
+/// comp_swap (info bits 11-12) from the T# data format and dst_sel. The T# dst_sel says which stored channel each of R, G, B, A reads (4 + channel; 0 and 1 are the constants), which is the
+/// inverse of what the swap mode does when the target is written: the stored channel c is read by the component k whose select is 4 + c, and the swap mode whose row of `StoredOrder` for this
+/// channel count has k at c is the answer. Derived from the repo's own swizzle table and checked against the cases seen (data format 10 / dst_sel 0xf2e -> 1; 1 / 0x204, 5 / 0x22c, 6 / 0x3ac,
+/// 9 / 0xfac and 10 / 0xfac -> 0); FUN_0246be80 itself has not been read. False: no row matches (counted).
+bool CompSwapOf(u32 data_format, u32 dst_sel, u32& swap, bool& ambiguous) {
+    const u32 channels = data_format < AmdGpu::NUM_DATA_FMTS ? AmdGpu::NumComponents(static_cast<AmdGpu::DataFormat>(data_format)) : 0;
+    if (channels < 1 || channels > 4) {
+        return false;
+    }
+    const u32 select[4] = {dst_sel & 7, (dst_sel >> 3) & 7, (dst_sel >> 6) & 7, (dst_sel >> 9) & 7};
+    u8 stored[4] = {255, 255, 255, 255};
+    for (u32 k = 0; k < 4; ++k) {
+        if (select[k] >= 4 && select[k] - 4 < channels) {
+            stored[select[k] - 4] = static_cast<u8>(k);
+        }
+    }
+    u32 matches = 0;
+    for (u32 candidate = 0; candidate < 4; ++candidate) {
+        bool ok = true;
+        bool any = false;
+        for (u32 c = 0; c < channels; ++c) {
+            if (stored[c] == 255) {
+                continue;
+            }
+            any = true;
+            ok = ok && StoredOrder[candidate][channels - 1][c] == stored[c];
+        }
+        if (ok && any) {
+            if (matches++ == 0) {
+                swap = candidate;
+            }
+        }
+    }
+    ambiguous = matches > 1;
+    return matches != 0;
 }
 
 constexpr u32 DisplayTiling = 10; ///< the display surface tiling index (tile mode of the swap chain's buffers)
@@ -526,18 +595,39 @@ Counter* Evaluate(u64 view, bool depth, u32 slot) {
         // (bit 18, the round mode place) by FUN_0246a420
         {
             const u32 number_type = cb.info.number_type;
+            const bool clamp_type = number_type == 0 || number_type == 1 || number_type == 6;
             diffs.Check(FBlendBypass, (number_type == 4 || number_type == 5) ? 1 : 0, cb.info.blend_bypass);
-            diffs.Check(FBlendClamp, (number_type == 0 || number_type == 1 || number_type == 6) ? 1 : 0, cb.info.blend_clamp);
-            diffs.Check(FInfoBit18, 1, (cb.info.raw >> 18) & 1u);
-            // number_type = DAT_025e1250[T# number format] & 7 and comp_swap = FUN_0246be80(...) & 3: the tables are not known, so they are learned from the run (the first value a key
-            // produces is the table); a key that later produces another value is a difference, i.e. the output is not a function of that key. The tables are in the report.
+            diffs.Check(FBlendClamp, clamp_type ? 1 : 0, cb.info.blend_clamp);
+            // bit 18 is (u ^ 1) with u = 1 for the number types 0, 1 and 6 (FUN_0246a420): 0 for those types, 1 for all others
+            diffs.Check(FInfoBit18, clamp_type ? 0 : 1, (cb.info.raw >> 18) & 1u);
             const u32 t_data = static_cast<u32>(resource_t.data_format);
             const u32 t_num = static_cast<u32>(resource_t.num_format);
             const u32 t_dst = static_cast<u32>(resource_t.dst_sel_x) | static_cast<u32>(resource_t.dst_sel_y) << 3 | static_cast<u32>(resource_t.dst_sel_z) << 6 |
                               static_cast<u32>(resource_t.dst_sel_w) << 9;
             const u32 comp_swap = static_cast<u32>(cb.info.comp_swap);
-            diffs.Check(FNumberType, Learn(g_learn_number_type, t_num, number_type), number_type);
-            diffs.Check(FCompSwap, Learn(g_learn_comp_swap, t_data | t_num << 8 | static_cast<u64>(t_dst) << 16, comp_swap), comp_swap);
+            // the constants: number type from the T# number format, comp_swap from the T# data format and dst_sel
+            if (t_num < 16) {
+                g_number_format_hits[t_num].fetch_add(1, std::memory_order_relaxed);
+            }
+            u32 expected_type = 0;
+            if (NumberTypeOf(t_num, expected_type)) {
+                diffs.Check(FNumberType, expected_type, number_type);
+            } else {
+                g_number_type_unknown.fetch_add(1, std::memory_order_relaxed);
+            }
+            u32 expected_swap = 0;
+            bool ambiguous = false;
+            if (CompSwapOf(t_data, t_dst, expected_swap, ambiguous)) {
+                diffs.Check(FCompSwap, expected_swap, comp_swap);
+                if (ambiguous) {
+                    g_comp_swap_rule_ambiguous.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else {
+                g_comp_swap_rule_unmatched.fetch_add(1, std::memory_order_relaxed);
+            }
+            // the learned tables stay as a check on the constants (the report shows both)
+            Learn(g_learn_number_type, t_num, number_type);
+            Learn(g_learn_comp_swap, t_data | t_num << 8 | static_cast<u64>(t_dst) << 16, comp_swap);
             Learn(g_learn_comp_coarse, t_data | static_cast<u64>(t_dst) << 8, comp_swap);
         }
         if (extent_word != 0) {
@@ -557,6 +647,10 @@ Counter* Evaluate(u64 view, bool depth, u32 slot) {
         diffs.Check(FSamples, samples, cb.NumSamples());
         if (range.mip == 0) {
             diffs.Check(FAddress, res.address, cb.Address());
+            // the size the words give (slice.tile_max, which holds the tile aligned height) against the memory the engine allocated, for a texture of one mip
+            if (res.mips <= 1 && res.kind != NativeDevice::Kind::Texture3D && cb.info.format != 0) {
+                diffs.Check(FSliceSize, res.bytes, static_cast<u64>(cb.GetColorSliceSize()) * std::max<u32>(res.layers, 1));
+            }
         }
         // Ghidra Q9: the cmask base is resource +0x58 (>> 8) and the fast clear bit is set if and only if it is not 0
         diffs.Check(FFastClear, resource_cmask != 0 ? 1 : 0, cb.info.fast_clear);
@@ -651,6 +745,9 @@ Counter* Evaluate(u64 view, bool depth, u32 slot) {
         diffs.Check(FSamples, samples, db.NumSamples());
         if (range.mip == 0) {
             diffs.Check(FAddress, res.address, db.DepthAddress());
+            if (res.mips <= 1 && db.z_info.format != AmdGpu::DepthBuffer::ZFormat::Invalid) {
+                diffs.Check(FSliceSize, res.bytes, static_cast<u64>(db.GetDepthSliceSize()) * std::max<u32>(res.layers, 1));
+            }
         }
     }
 
@@ -753,20 +850,37 @@ nlohmann::json Report() {
     j["clear_words_when_resource_14c_is_zero"] = CaseReport(g_clear_cases, {"x:block_word11", "x:block_word12", "x:resource_150", "x:resource_154", "x:prebuilt_dc", "x:prebuilt_e0", "mip", "fast_clear"});
     {
         std::scoped_lock lock{g_mutex};
+        auto& constants = j["number_type_constants"] = nlohmann::json::array();
+        for (u32 nf = 0; nf < 16; ++nf) {
+            u32 type = 0;
+            const bool known = NumberTypeOf(nf, type);
+            constants.push_back({{"t_number_format", nf}, {"number_type", known ? nlohmann::json(type) : nlohmann::json("unknown")}, {"hits", g_number_format_hits[nf].load()},
+                                 {"observed", g_number_format_hits[nf].load() != 0}});
+        }
         auto& number_types = j["learned_number_type"] = nlohmann::json::array();
         for (const auto& [key, e] : g_learn_number_type) {
-            number_types.push_back({{"t_number_format", key}, {"number_type", e.value}, {"count", e.count}, {"conflicts", e.conflicts}});
+            u32 type = 0;
+            const bool known = NumberTypeOf(static_cast<u32>(key), type);
+            number_types.push_back({{"t_number_format", key}, {"number_type", e.value}, {"count", e.count}, {"conflicts", e.conflicts}, {"constant", known ? nlohmann::json(type) : nlohmann::json("unknown")},
+                                    {"matches_constant", known && type == e.value}});
         }
         auto& comp_swaps = j["learned_comp_swap"] = nlohmann::json::array();
         for (const auto& [key, e] : g_learn_comp_swap) {
+            u32 swap = 0;
+            bool ambiguous = false;
+            const bool known = CompSwapOf(static_cast<u32>(key & 0xff), static_cast<u32>(key >> 16), swap, ambiguous);
             comp_swaps.push_back({{"t_data_format", key & 0xff}, {"t_number_format", (key >> 8) & 0xff}, {"t_dst_sel", fmt::format("{:#x}", key >> 16)}, {"comp_swap", e.value},
-                                  {"count", e.count}, {"conflicts", e.conflicts}});
+                                  {"count", e.count}, {"conflicts", e.conflicts}, {"rule", known ? nlohmann::json(swap) : nlohmann::json("no row matches")}, {"matches_rule", known && swap == e.value},
+                                  {"rule_ambiguous", ambiguous}});
         }
         auto& coarse = j["learned_comp_swap_without_number_format"] = nlohmann::json::array();
         for (const auto& [key, e] : g_learn_comp_coarse) {
             coarse.push_back({{"t_data_format", key & 0xff}, {"t_dst_sel", fmt::format("{:#x}", key >> 8)}, {"comp_swap", e.value}, {"count", e.count}, {"conflicts", e.conflicts}});
         }
     }
+    j["colour"]["number_type_not_in_the_constant_table"] = g_number_type_unknown.load();
+    j["colour"]["comp_swap_rule_unmatched"] = g_comp_swap_rule_unmatched.load();
+    j["colour"]["comp_swap_rule_ambiguous"] = g_comp_swap_rule_ambiguous.load();
     j["tuple_overflow"] = g_tuple_overflow.load();
     j["shape_overflow"] = g_shape_overflow.load();
 
