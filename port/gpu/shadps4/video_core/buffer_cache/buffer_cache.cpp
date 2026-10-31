@@ -1457,11 +1457,11 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 if (b9_shadow.size() >= 8192) {
                     continue;
                 }
-                // a new sampled page: the request's bytes are uploaded so the GPU copy and the CPU copy agree from here on
+                // a new sampled page: memory as it is now. The check only reads: a change later that no upload took is a write nobody announced (it must not change what the
+                // GPU sees: uploading here put memory's bytes over a buffer's own, garbling the picture of a new game)
                 auto copy = std::make_unique<std::array<u8, 4096>>();
                 memory->CopySparseMemory(lo, copy->data() + (lo - page), hi - lo);
                 b9_shadow.emplace(page, std::move(copy));
-                add_piece(lo, hi - lo);
                 continue;
             }
             Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9VerifyChecked);
@@ -1482,7 +1482,6 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                                 size, first, Core::NativeDevice::OwnerName(first));
                 }
                 std::memcpy(it->second->data() + (lo - page), now.data() + (lo - page), hi - lo);
-                add_piece(lo, hi - lo);
             }
         }
     }
