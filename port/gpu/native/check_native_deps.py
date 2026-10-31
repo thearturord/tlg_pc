@@ -2,7 +2,7 @@
 """Dependency rule for native/: native code may include only native/, common/, third party and system headers,
 plus the PS4-shaped headers listed in ALLOWED_PS4 below. The emulator (shadps4/) may include native/ freely.
 
-Every entry in ALLOWED_PS4 is a debt: it goes when the phase of documents/tlg/native plan/no-emulation-plan.md
+Every entry in ALLOWED_PS4 is a debt: it goes when the phase of documents/tlg/native plan/native-completion-plan.md
 named next to it is done. When the list is empty, native/ is independent of the emulation code.
 
 Run: python -I port/gpu/native/check_native_deps.py     (exit 1 on a violation, 0 otherwise)
@@ -12,16 +12,16 @@ import os, re, sys
 NATIVE = os.path.dirname(os.path.abspath(__file__))
 
 ALLOWED_PS4 = {
-    "video_core/amdgpu/pm4_cmds.h": "E5 (PM4 stream)",
-    "video_core/amdgpu/pixel_format.h": "E2 (descriptions)",
-    "video_core/amdgpu/resource.h": "E2 (descriptions: the image descriptor layout the derivation fills)",
-    "video_core/amdgpu/draw_state.h": "E1 (draw state)",
-    "video_core/amdgpu/liverpool.h": "E1/E5 (register file, command processor)",
-    "video_core/renderer_vulkan/vk_fixed_state.h": "E1 (draw state)",
-    "video_core/renderer_vulkan/liverpool_to_vk.h": "E1/E2 (format maps)",
-    "video_core/renderer_vulkan/vk_indexed_data.h": "E2 (descriptors)",
-    "video_core/renderer_vulkan/vk_identity_audit.h": "E7 (audits)",
-    "core/libraries/gnmdriver/gnmdriver.h": "E5/E6 (Gnm submission HLE)",
+    "video_core/amdgpu/pm4_cmds.h": "F1 (PM4 sync decoding)",
+    "video_core/amdgpu/pixel_format.h": "F4 (PS4 resource types)",
+    "video_core/amdgpu/resource.h": "F4 (the image descriptor layout the derivation fills)",
+    "video_core/amdgpu/draw_state.h": "F3 (register image)",
+    "video_core/amdgpu/liverpool.h": "F3/F5 (register file, command processor)",
+    "video_core/renderer_vulkan/vk_fixed_state.h": "F3 (fixed state from the register image)",
+    "video_core/renderer_vulkan/liverpool_to_vk.h": "F3/F4 (format maps)",
+    "video_core/renderer_vulkan/vk_indexed_data.h": "F4 (descriptors)",
+    "video_core/renderer_vulkan/vk_identity_audit.h": "F6 (audits)",
+    "core/libraries/gnmdriver/gnmdriver.h": "F1/F5 (Gnm submission HLE)",
 }
 # plain emulator infrastructure the native code shares (not GPU emulation); reviewed once, kept short
 ALLOWED_SHARED = {
@@ -35,11 +35,11 @@ ALLOWED_SHARED = {
 # emulator's class headers, so they are exempt from the include rule; each one is a debt that goes when its class gets a native-side
 # interface (see the plan row E-1). The list is reported so it cannot grow silently.
 MEMBER_FILES = {
-    "native_liverpool.cpp": "Liverpool (command processor): E1/E5",
-    "native_texture_cache.cpp": "TextureCache: E3",
-    "native_buffer_cache.cpp": "BufferCache: E4",
-    "native_rasterizer.cpp": "Rasterizer (consumer): E2/E3/E4",
-    "native_rasterizer_helpers.h": "Rasterizer helpers shared with vk_rasterizer.cpp: E2/E3/E4",
+    "native_liverpool.cpp": "Liverpool (command processor): F3/F5",
+    "native_texture_cache.cpp": "TextureCache: F2/F5",
+    "native_buffer_cache.cpp": "BufferCache: F4/F5",
+    "native_rasterizer.cpp": "Rasterizer (consumer): F3/F4/F5",
+    "native_rasterizer_helpers.h": "Rasterizer helpers shared with vk_rasterizer.cpp: F5",
 }
 
 include = re.compile(r'#\s*include\s+"([^"]+)"')
