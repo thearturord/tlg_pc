@@ -10,6 +10,7 @@
 #endif
 #include "common/debug.h"
 #include "native/native_debug_server.h"
+#include "native/native_config.h"
 #include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
@@ -443,7 +444,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
         // then every 256th, `verify`) are compared with the registers' state; a difference is counted and the registers win.
         auto& live = Core::NativeDraw::Live();
         live.fixed_native.fetch_add(1, std::memory_order_relaxed);
-        if ((VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 1073741824) != 0) {
+        if ((Core::NativeConfig::SdkStrip & 1073741824) != 0) {
             native_stale |= StaleClear;
         }
         // No group of the fixed-function state comes from the register mirror any more. The surface group (culling, front face, polygon
@@ -451,7 +452,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
         // value differed from the object's in nearly every such draw and changed with the frame (a period of three), which flickered tattoos,
         // leaves and whole meshes (native-isolation.md). The clip group and the clear flags never differed from the objects' values in 27 million
         // draws. Bits of native_sdk_strip restore the old behaviour for a comparison: 268435456 surface, 536870912 clip, 1073741824 clear flags.
-        const u32 strip = VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed);
+        const u32 strip = Core::NativeConfig::SdkStrip;
         const bool surface_from_mirror = (strip & 268435456) != 0;
         if (!surface_from_mirror) {
             native_stale &= ~StaleSurface;
@@ -758,7 +759,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     Core::NativeRegistry::SetCurrentDraw(plan != nullptr && plan->native_seq != 0 ? plan->native_seq : (tag.valid ? tag.seq : 0), plan != nullptr && plan->native_seq != 0);
     const bool use_tag =
         tag.valid &&
-        VideoCore::ReadbackPolicy::Get().native_draw_mode.load(std::memory_order_relaxed) >= 2;
+        Core::NativeConfig::DrawMode >= 2;
     const NativeLast last = native_last;
     native_last.valid = false;
     if (tag.valid) {
@@ -2594,7 +2595,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
             auto& cached = texture_lookup_cache[hash & 8191];
             const bool native_reuse =
-                VideoCore::ReadbackPolicy::Get().native_draw_mode.load(std::memory_order_relaxed) >=
+                Core::NativeConfig::DrawMode >=
                 2;
             // the mip fallback of the shader's view (applied to a fresh description before FindImage)
             const auto finish_desc = [&](VideoCore::TextureCache::ImageDesc& d) {

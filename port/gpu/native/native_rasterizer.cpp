@@ -10,6 +10,7 @@
 #endif
 #include "common/debug.h"
 #include "native/native_debug_server.h"
+#include "native/native_config.h"
 #include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
@@ -336,7 +337,7 @@ void Rasterizer::EngineObjectDeleted(u64 id, VAddr address, u64 bytes, u32 what)
 std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u32 native_stale, u64 exec_key, u64 inputs_key,
                                                    std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data,
                                                    const Core::NativeDraw::ExecDraw& draw, u32 index_count, u32 draw_class) {
-    const auto strip = VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed);
+    const auto strip = Core::NativeConfig::SdkStrip;
     if ((strip & 1073741824) != 0) {
         native_stale |= StaleClear;
     }

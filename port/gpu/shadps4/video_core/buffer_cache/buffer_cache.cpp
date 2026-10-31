@@ -14,6 +14,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "native/native_audit.h"
+#include "native/native_config.h"
 #include "native/native_device.h"
 #include "native/native_readbacks.h"
 #include "native/native_registry.h"
@@ -471,8 +472,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
         }
         return {&stream_buffer, offset};
     }
-    const bool memoizable = !is_texel_buffer && VideoCore::ReadbackPolicy::Get().native_draw_mode.load(
-                                                    std::memory_order_relaxed) >= 2;
+    const bool memoizable = !is_texel_buffer && Core::NativeConfig::DrawMode >= 2;
     ObtainMemo* memo = nullptr;
     u64 epoch_before = 0;
     if (memoizable) {

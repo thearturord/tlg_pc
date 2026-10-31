@@ -4,6 +4,7 @@
 #include <boost/preprocessor/stringize.hpp>
 
 #include "native/native_raycast_cpu.h"
+#include "native/native_config.h"
 #include "native/native_stream_probe.h"
 #include "native/native_timeline.h"
 #include "native/native_registry.h"
@@ -140,7 +141,7 @@ void Liverpool::ExecApplyRecord(const Core::NativeDraw::ExecDraw& draw, bool ski
             set(draw.regs[i].index, draw.regs[i].value);
         }
     };
-    if (draw.grouped != 0 && VideoCore::ReadbackPolicy::Get().group_sig.load(std::memory_order_relaxed) != 0) {
+    if (draw.grouped != 0 && Core::NativeConfig::GroupSig != 0) {
         for (u32 g = 0; g < NumRegisterGroups; ++g) {
             const u32 begin = draw.group_begin[g];
             const u32 end = draw.group_begin[g + 1];
@@ -272,7 +273,7 @@ void Liverpool::StartNativeTag(const u32* tag) {
 void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_count) {
     native_exec_calls++;
     Core::NativeDraw::ExecDraw draw;
-    if (!rasterizer || !Core::NativeDraw::TakeExecDraw(native_tag_pending.seq, draw, VideoCore::ReadbackPolicy::Get().group_sig.load(std::memory_order_relaxed) != 0)) {
+    if (!rasterizer || !Core::NativeDraw::TakeExecDraw(native_tag_pending.seq, draw, Core::NativeConfig::GroupSig != 0)) {
         native_tag_pending.valid = false;
         LOG_ERROR(Render, "native draw: the record {} is gone, a draw is lost", native_tag_pending.seq);
         return;
@@ -463,8 +464,8 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     {
         const auto& policy = VideoCore::ReadbackPolicy::Get();
         auto& live = Core::NativeDraw::Live();
-        const bool exec_on = policy.exec_inputs.load(std::memory_order_relaxed) != 0;
-        const bool switches = exec_on && policy.stage_key.load(std::memory_order_relaxed) != 0 && policy.group_sig.load(std::memory_order_relaxed) != 0;
+        const bool exec_on = Core::NativeConfig::ExecInputs != 0;
+        const bool switches = exec_on && Core::NativeConfig::StageKey != 0 && Core::NativeConfig::GroupSig != 0;
         const auto left = [&live](u32 reason) {
             live.exec_fallback.fetch_add(1, std::memory_order_relaxed);
             live.exec_reason[reason].fetch_add(1, std::memory_order_relaxed);
@@ -587,8 +588,8 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     native_fixed = draw.fixed;
     native_fixed_stale = draw.fixed_stale;
     native_exec_key = draw.stage_key != 0 && draw.grouped != 0 && !draw.cb_extents_only &&
-                              VideoCore::ReadbackPolicy::Get().stage_key.load(std::memory_order_relaxed) != 0 &&
-                              VideoCore::ReadbackPolicy::Get().group_sig.load(std::memory_order_relaxed) != 0
+                              Core::NativeConfig::StageKey != 0 &&
+                              Core::NativeConfig::GroupSig != 0
                           ? draw.stage_key
                           : 0;
     if (!planned_from_record && split_active && !draw.cb_extents_only) {

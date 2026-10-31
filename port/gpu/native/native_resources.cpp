@@ -26,6 +26,7 @@
 #endif
 #include "common/logging/log.h"
 #include "native/native_draw.h"
+#include "native/native_config.h"
 #include "native/native_registry.h"
 #include "native/native_resources.h"
 #include "native/native_readback_policy.h"
@@ -784,11 +785,11 @@ void NoteImageClear(bool done, u32 reason) {
 }
 
 bool ImageCopyEnabled() {
-    return (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 131072) != 0;
+    return (Core::NativeConfig::SdkStrip & 131072) != 0;
 }
 
 bool ImmutableResidencyEnabled() {
-    return (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 65536) != 0;
+    return (Core::NativeConfig::SdkStrip & 65536) != 0;
 }
 
 ImmutableBuffer* FindImmutable(VAddr address, u32 size) {

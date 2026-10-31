@@ -14,6 +14,7 @@
 #include <fmt/format.h>
 #include "core/memory.h"
 #include "native/native_audit.h"
+#include "native/native_config.h"
 #include "native/native_resources.h"
 #include "native/native_readback_policy.h"
 
@@ -99,7 +100,7 @@ thread_local u64 plan_caller;
 } // namespace
 
 bool StaleEnabled() {
-    return (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 134217728) != 0;
+    return (Core::NativeConfig::SdkStrip & 134217728) != 0;
 }
 
 void SetPlanCaller(u64 caller) {
@@ -146,7 +147,7 @@ void NoteStale(u32 groups, bool differs, const std::string& diff, u64 caller, u6
 
 bool Enabled() {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    return (policy.native_sdk_strip.load(std::memory_order_relaxed) & 67108864) != 0;
+    return (Core::NativeConfig::SdkStrip & 67108864) != 0;
 }
 
 void NoteUpload(VAddr address, const u8* data, u64 size) {

@@ -11,6 +11,7 @@
 #include "core/guest_heap.h"
 #include "common/logging/log.h"
 #include "native/native_hooks.h"
+#include "native/native_config.h"
 #include "native/native_direct.h"
 #include "native/native_flip.h"
 #include "native/native_display.h"
@@ -120,8 +121,8 @@ bool Plausible(const IndirectTarget& target) {
 
 bool StateTemplatesOn() {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    return policy.native_draw_exec.load(std::memory_order_relaxed) != 0 &&
-           (policy.native_sdk_strip.load(std::memory_order_relaxed) & 8192) != 0;
+    return Core::NativeConfig::DrawExec != 0 &&
+           (Core::NativeConfig::SdkStrip & 8192) != 0;
 }
 
 void AddEntry(Buffer& buffer, EntryKind kind, const u32* packet, u32 dwords, u64 address, u32 opcode) {
@@ -213,13 +214,13 @@ bool PacketPathOff() {
 }
 
 bool ExecuteEnabled() {
-    return Enabled() && (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 8388608) != 0;
+    return Enabled() && (Core::NativeConfig::SdkStrip & 8388608) != 0;
 }
 
 bool Enabled() {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    const u32 bits = policy.native_sdk_strip.load(std::memory_order_relaxed);
-    return policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && (bits & 2097152) != 0 && (bits & 4194304) != 0;
+    const u32 bits = Core::NativeConfig::SdkStrip;
+    return Core::NativeConfig::DrawExec != 0 && (bits & 2097152) != 0 && (bits & 4194304) != 0;
 }
 
 std::shared_ptr<Buffer> Build(u32 queue, const u32* dcb, u32 dwords, bool has_constant_buffer, bool markers) {

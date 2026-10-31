@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 #include <fmt/format.h>
 #include "native/native_readbacks.h"
+#include "native/native_config.h"
 #include "native/native_readback_policy.h"
 
 namespace Core::NativeReadbacks {
@@ -146,8 +147,8 @@ void NoteReadFault(VAddr address, u64 size) {
 
 bool ExplicitEnabled() {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    return policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && policy.dma_async.load(std::memory_order_relaxed) &&
-           (policy.native_sdk_strip.load(std::memory_order_relaxed) & 33554432) != 0;
+    return Core::NativeConfig::DrawExec != 0 && policy.dma_async.load(std::memory_order_relaxed) &&
+           (Core::NativeConfig::SdkStrip & 33554432) != 0;
 }
 
 void NoteExplicit(bool done, u64 bytes, u32 reason) {

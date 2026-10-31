@@ -29,6 +29,7 @@
 #endif
 #include "core/guest_heap.h"
 #include "native/native_stream_probe.h"
+#include "native/native_config.h"
 #include "native/native_stream_submit.h"
 #include "common/logging/log.h"
 #include "native/native_debug_server.h"
@@ -930,7 +931,7 @@ void CountSyncConverted(u32 kind, std::atomic<u64>& place) {
 /// Fences with game visible labels, waits on them, CPU writes and flips stay. Returns the number of packets taken out.
 u32 SweepSyncPackets(u64 begin, u64 end) {
     u32 removed = 0;
-    const u32 policy_bits = VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed);
+    const u32 policy_bits = Core::NativeConfig::SdkStrip;
     for (u64 at = begin; at < end;) {
         const u32 header = Rd<u32>(at, 0);
         if ((header >> 30) != 3) {
@@ -1009,8 +1010,8 @@ u32 SweepSyncPackets(u64 begin, u64 end) {
 
 bool SweepEnabled() {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    return policy.native_draw_exec.load(std::memory_order_relaxed) != 0 &&
-           (policy.native_sdk_strip.load(std::memory_order_relaxed) & 524288) != 0;
+    return Core::NativeConfig::DrawExec != 0 &&
+           (Core::NativeConfig::SdkStrip & 524288) != 0;
 }
 
 bool WriteDwordsAt(u64 writer, const u32* words, u32 count) {
@@ -1192,7 +1193,7 @@ std::atomic<u64> consumed_seq{0};
 /// Trust at once (`native_sdk_strip` bit 16777216): a record that the builder did not flag runs from the record from the first draw
 /// of its call site, without the warm-up in which the game's packets are compared with the record.
 bool TrustAtOnce() {
-    return (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 16777216) != 0;
+    return (Core::NativeConfig::SdkStrip & 16777216) != 0;
 }
 
 /// Draws are executed from records only for call sites whose records matched what the game's own packets produced.
@@ -2256,7 +2257,7 @@ std::unordered_multimap<u64, std::unique_ptr<Entry>> states;
 
 /// True when the fixed-function state is built from the objects (bit 15 of native_sdk_strip).
 bool Enabled() {
-    return (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 32768) != 0;
+    return (Core::NativeConfig::SdkStrip & 32768) != 0;
 }
 
 /// The fixed-function state of the draw the context describes, or null when an object is not what the builder knows.
@@ -4881,7 +4882,7 @@ std::atomic<u64> last_tag_log_ns{0};
 constexpr u32 ExecFlag = 1u << 16; ///< tag meta: the draw is executed from its record, the game wrote no packets for it
 /// Every Nth draw of a call site takes the packet path (0 = never).
 u32 AuditPeriod() {
-    return VideoCore::ReadbackPolicy::Get().native_audit_every.load(std::memory_order_relaxed);
+    return Core::NativeConfig::AuditEvery;
 }
 
 struct ExecContextState {
@@ -4936,7 +4937,7 @@ u64 TargetSignature(u64 ctx) {
 
 /// The game's own path runs PrepareDraw: remember the targets it bound.
 u64 PS4_SYSV_ABI PrepareNote(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    if (ctx != 0 && VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0) {
+    if (ctx != 0 && Core::NativeConfig::DrawExec != 0) {
         ExecState(ctx).target_signature = TargetSignature(ctx);
     }
     return 0;
@@ -5092,7 +5093,7 @@ void TrackResource(u64 ctx, u64 resource, bool native, void(PS4_SYSV_ABI* game_t
 /// use, the game's own tracking function runs (it may write barrier packets or draw internal full-screen quads).
 void RunResourceTracking(u64 ctx) {
     const VAddr base = image_base.load(std::memory_order_relaxed);
-    const bool native = VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0;
+    const bool native = Core::NativeConfig::DrawExec != 0;
     const auto track = GameTrackFunction();
     // engine objects live in the game's heap; anything else is a stale table entry (the game would fault on it too)
     const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
@@ -5129,7 +5130,7 @@ void RunResourceTracking(u64 ctx) {
 /// The resource tracking of PrepareDispatch (0x2479b70) for the compute shader's views, done natively.
 void RunComputeTracking(u64 ctx) {
     const VAddr base = image_base.load(std::memory_order_relaxed);
-    const bool native = VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0;
+    const bool native = Core::NativeConfig::DrawExec != 0;
     const auto track = GameTrackFunction();
     const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     const u64 cs = Rd<u64>(ctx, 0x4670);
@@ -5348,11 +5349,11 @@ void PrepareDrawSideEffects(u64 ctx) {
 /// `native_sdk_strip` bit 2147483648: the first draw of a vertex shader that takes a fetch shader runs the game's own draw
 /// function (it creates the fetch object inside PrepareDraw); its record is built again afterwards (bit 262144 executes it).
 bool FetchRebuildEnabled() {
-    return (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 2147483648u) != 0;
+    return (Core::NativeConfig::SdkStrip & 2147483648u) != 0;
 }
 
 bool FetchRebuildExecutes() {
-    return (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 262144u) != 0;
+    return (Core::NativeConfig::SdkStrip & 262144u) != 0;
 }
 
 using GuestDraw6 = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
@@ -5681,11 +5682,11 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
         StreamSubmit::AtHook(ctx);
     }
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || ctx == 0) {
+    if (Core::NativeConfig::DrawMode == 0 || ctx == 0) {
         return 0;
     }
     const Class cls = Classify(ret);
-    if (((policy.native_draw_classes.load(std::memory_order_relaxed) >> cls) & 1) == 0) {
+    if (((Core::NativeConfig::DrawClasses >> cls) & 1) == 0) {
         tags_skipped_class.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
@@ -5708,10 +5709,10 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
     }
     // The game's resource tracking runs first (as it does at the start of PrepareDraw): it may update view descriptors
     // and write barrier packets or draw internal quads, which then come before the tag.
-    if (policy.native_synth_verify.load(std::memory_order_relaxed) != 0) {
+    if (Core::NativeConfig::SynthVerify != 0) {
         RefreshTargets(ctx);
     }
-    if (track && policy.native_synth_verify.load(std::memory_order_relaxed) != 0) {
+    if (track && Core::NativeConfig::SynthVerify != 0) {
         const u64 vertex_shader = Rd<u64>(ctx, Ctx::VertexShader);
         if (vertex_shader != 0 && Rd<u64>(vertex_shader, 0x420) == 0 && Rd<u64>(ctx, 0x4680) == 0 &&
             Rd<u64>(ctx, 0x4688) == 0 && Rd<u32>(ctx, 0x130c8) != 0x200) {
@@ -5817,7 +5818,7 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
     std::memcpy(&words[7], &k3, sizeof(u64));
     v2_collect = v2;
     record_sig = &sig;
-    const u64 seq = policy.native_synth_verify.load(std::memory_order_relaxed) != 0 ? Guarded([&] { return MakeRecord(ctx, kind, a1, a2, a3, ret); }) : 0;
+    const u64 seq = Core::NativeConfig::SynthVerify != 0 ? Guarded([&] { return MakeRecord(ctx, kind, a1, a2, a3, ret); }) : 0;
     record_sig = nullptr;
     v2_collect = nullptr;
     if (seq != 0 && NativeZPass::Enabled()) {
@@ -5845,7 +5846,7 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
         v2->seq = seq;
         NativeRegistry::StoreDraw(*v2);
     }
-    const bool exec = seq != 0 && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligible(ctx, seq, ret);
+    const bool exec = seq != 0 && Core::NativeConfig::DrawExec != 0 && ExecEligible(ctx, seq, ret);
     if (census_site != nullptr) {
         (exec ? census_site->executed : census_site->packet_path).fetch_add(1, std::memory_order_relaxed);
     }
@@ -6066,7 +6067,7 @@ u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64
         return 0;
     }
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    if (policy.native_draw_mode.load(std::memory_order_relaxed) < 3 ||
+    if (Core::NativeConfig::DrawMode < 3 ||
         VideoCore::ReadbackPolicy::ReadbacksMode() != 0 || allocator == 0) {
         return 0;
     }
@@ -6139,9 +6140,9 @@ bool ExecEligibleCompute(u64 ctx, u64 seq, u64 caller) {
 /// packets); the flush and the dispatch packet are replaced by the tag.
 u64 TagCompute(u64 ctx, u64 x, u64 y, u64 z, u64 ret, bool exec_capable) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || ctx == 0 || x == 0 ||
-        policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
-        ((policy.native_draw_classes.load(std::memory_order_relaxed) >> Other) & 1) == 0) {
+    if (Core::NativeConfig::DrawMode == 0 || ctx == 0 || x == 0 ||
+        Core::NativeConfig::SynthVerify == 0 ||
+        ((Core::NativeConfig::DrawClasses >> Other) & 1) == 0) {
         return 0;
     }
     // The resource tracking runs natively first; the descriptor flush and the program packets of PrepareDispatch are the
@@ -6173,7 +6174,7 @@ u64 TagCompute(u64 ctx, u64 x, u64 y, u64 z, u64 ret, bool exec_capable) {
     std::memcpy(&words[9], &seq, sizeof(u64));
     words[11] = 0;
     words[12] = 0;
-    const bool exec = exec_capable && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 &&
+    const bool exec = exec_capable && Core::NativeConfig::DrawExec != 0 &&
                       ExecEligibleCompute(ctx, seq, ret);
     if (exec) {
         words[2] |= ExecFlag;
@@ -6204,10 +6205,10 @@ u64 PS4_SYSV_ABI TagDispatchIndirect(u64 ctx, u64 buffer, u64 offset, u64 a3, u6
     NativeSiteGen::NoteDispatch(ctx, buffer, offset, 0, ret); // B7: the indirect dispatch's arguments are its buffer and offset
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
-    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || ctx == 0 || !valid(buffer) ||
-        policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
-        ((policy.native_draw_classes.load(std::memory_order_relaxed) >> Other) & 1) == 0 ||
-        ((policy.native_sdk_strip.load(std::memory_order_relaxed) >> 11) & 1) == 0 || Rd<u64>(ctx, 0x4670) == 0) {
+    if (Core::NativeConfig::DrawMode == 0 || ctx == 0 || !valid(buffer) ||
+        Core::NativeConfig::SynthVerify == 0 ||
+        ((Core::NativeConfig::DrawClasses >> Other) & 1) == 0 ||
+        ((Core::NativeConfig::SdkStrip >> 11) & 1) == 0 || Rd<u64>(ctx, 0x4670) == 0) {
         return 0;
     }
     RunComputeTracking(ctx);
@@ -6237,7 +6238,7 @@ u64 PS4_SYSV_ABI TagDispatchIndirect(u64 ctx, u64 buffer, u64 offset, u64 a3, u6
     }
     slot.count = kept;
     const u64 address = (static_cast<u64>(Rd<u32>(buffer, 0x30)) & 0xfffffff8ull) | (static_cast<u64>(Rd<u32>(buffer, 0x34)) & 0xff) << 32;
-    const bool exec = policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligibleCompute(ctx, seq, ret);
+    const bool exec = Core::NativeConfig::DrawExec != 0 && ExecEligibleCompute(ctx, seq, ret);
     slot.kind = exec ? 11 : 3;
     slot.args_addr = address;
     slot.a2 = static_cast<u32>(offset);
@@ -6270,9 +6271,9 @@ u64 PS4_SYSV_ABI TagDispatchIndirect(u64 ctx, u64 buffer, u64 offset, u64 a3, u6
 u64 TagCsCopy(u64 writer, u64 destination, u64 source, u64 bytes, u64 ret) {
     const u64 ctx = writer - 0x47c0;
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || writer == 0 ||
-        policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
-        ((policy.native_draw_classes.load(std::memory_order_relaxed) >> Other) & 1) == 0) {
+    if (Core::NativeConfig::DrawMode == 0 || writer == 0 ||
+        Core::NativeConfig::SynthVerify == 0 ||
+        ((Core::NativeConfig::DrawClasses >> Other) & 1) == 0) {
         return 0;
     }
     if (bytes >= (8u << 20)) {
@@ -6291,7 +6292,7 @@ u64 TagCsCopy(u64 writer, u64 destination, u64 source, u64 bytes, u64 ret) {
     std::memcpy(&words[9], &seq, sizeof(u64));
     words[11] = 0;
     words[12] = 0;
-    const bool exec = policy.native_draw_exec.load(std::memory_order_relaxed) != 0 &&
+    const bool exec = Core::NativeConfig::DrawExec != 0 &&
                       (Rd<u8>(ctx, 0x13009) & 1) == 0 && ExecEligibleCompute(ctx, seq, ret);
     if (exec) {
         words[2] |= ExecFlag;
@@ -6320,14 +6321,14 @@ u64 PublishAscMemoryCopy(u64 jcc, u64 destination, u64 source, u64 to, u64 from,
 u64 PS4_SYSV_ABI TagAscCsCopy(u64 jcc, u64 destination, u64 source, u64 bytes_arg, u64 a4, u64 a5, u64 ret) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     const u64 bytes = bytes_arg & 0xffffffff;
-    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || jcc == 0 || Rd<u8>(jcc, 0x1c7c) == 0 || bytes == 0 ||
+    if (Core::NativeConfig::DrawMode == 0 || jcc == 0 || Rd<u8>(jcc, 0x1c7c) == 0 || bytes == 0 ||
         bytes > (1ull << 30) || destination == 0 || source == 0 ||
-        policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
-        ((policy.native_sdk_strip.load(std::memory_order_relaxed) >> 6) & 1) == 0) {
+        Core::NativeConfig::SynthVerify == 0 ||
+        ((Core::NativeConfig::SdkStrip >> 6) & 1) == 0) {
         return 0;
     }
     const auto in_guest_memory = [](u64 pointer) { return IsHeapPointer(pointer); };
-    if ((policy.native_sdk_strip.load(std::memory_order_relaxed) & 131072) != 0 && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 &&
+    if ((Core::NativeConfig::SdkStrip & 131072) != 0 && Core::NativeConfig::DrawExec != 0 &&
         in_guest_memory(destination) && in_guest_memory(source) && (bytes & 3) == 0) {
         // the device's buffer copy is a copy of memory: the command processor copies it (two images of the same layout as images)
         return PublishAscMemoryCopy(jcc, 0, 0, destination, source, bytes, ret);
@@ -6336,7 +6337,7 @@ u64 PS4_SYSV_ABI TagAscCsCopy(u64 jcc, u64 destination, u64 source, u64 bytes_ar
     if (seq == 0 || Slot(seq).flags != 0) {
         return 0;
     }
-    const bool exec = policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligibleAsc(seq, ret);
+    const bool exec = Core::NativeConfig::DrawExec != 0 && ExecEligibleAsc(seq, ret);
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
     words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
     words[1] = VideoCore::NativeTagMagic;
@@ -6370,8 +6371,8 @@ bool StripPackets(u64 begin, u64 end);
 u64 PS4_SYSV_ABI TagAscCounterReadback(u64 jcc, u64 buffer, u64 view, u64 a3, u64 a4, u64 a5, u64 ret) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
-    if (jcc == 0 || !valid(buffer) || !valid(view) || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
-        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 512) == 0) {
+    if (jcc == 0 || !valid(buffer) || !valid(view) || Core::NativeConfig::DrawExec == 0 ||
+        (Core::NativeConfig::SdkStrip & 512) == 0) {
         return 0;
     }
     const u64 memory = ((static_cast<u64>(Rd<u32>(buffer, 0x64)) & 0xfff) << 32) + Rd<u32>(buffer, 0x60);
@@ -6476,8 +6477,8 @@ u64 PublishAscMemoryCopy(u64 jcc, u64 destination, u64 source, u64 to, u64 from,
 u64 PS4_SYSV_ABI TagAscCopyResource(u64 jcc, u64 destination, u64 source, u64 a3, u64 a4, u64 a5, u64 ret) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
-    if (jcc == 0 || !valid(destination) || !valid(source) || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
-        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 1024) == 0) {
+    if (jcc == 0 || !valid(destination) || !valid(source) || Core::NativeConfig::DrawExec == 0 ||
+        (Core::NativeConfig::SdkStrip & 1024) == 0) {
         return 0;
     }
     const VAddr image = image_base.load(std::memory_order_relaxed);
@@ -6513,8 +6514,8 @@ u64 PS4_SYSV_ABI TagAscCopyResource(u64 jcc, u64 destination, u64 source, u64 a3
 u64 PS4_SYSV_ABI TagFenceSignal(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     static std::atomic<u64> original_entry{0};
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    if (ctx == 0 || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
-        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 2097152) == 0) {
+    if (ctx == 0 || Core::NativeConfig::DrawExec == 0 ||
+        (Core::NativeConfig::SdkStrip & 2097152) == 0) {
         return 0;
     }
     u64 original = original_entry.load(std::memory_order_relaxed);
@@ -6585,8 +6586,8 @@ u64 PS4_SYSV_ABI StagingWorkerWindow(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64
 u64 PS4_SYSV_ABI TagDeviceBegin(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     static std::atomic<u64> original_entry{0};
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    if (ctx == 0 || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
-        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 16384) == 0) {
+    if (ctx == 0 || Core::NativeConfig::DrawExec == 0 ||
+        (Core::NativeConfig::SdkStrip & 16384) == 0) {
         return 0;
     }
     u64 original = original_entry.load(std::memory_order_relaxed);
@@ -6648,8 +6649,8 @@ u64 PS4_SYSV_ABI TagDeviceBegin(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
 /// register write; nothing of the host reads it.
 u64 PS4_SYSV_ABI SkipResourceLimits(u64 context, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    return context != 0 && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 &&
-                   (policy.native_sdk_strip.load(std::memory_order_relaxed) & 256) != 0
+    return context != 0 && Core::NativeConfig::DrawExec != 0 &&
+                   (Core::NativeConfig::SdkStrip & 256) != 0
                ? 1
                : 0;
 }
@@ -6659,8 +6660,8 @@ u64 PS4_SYSV_ABI SkipResourceLimits(u64 context, u64 a1, u64 a2, u64 a3, u64 a4,
 u64 PS4_SYSV_ABI TagAscBegin(u64 jcc, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     static std::atomic<u64> original_entry{0};
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    if (jcc == 0 || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
-        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 256) == 0) {
+    if (jcc == 0 || Core::NativeConfig::DrawExec == 0 ||
+        (Core::NativeConfig::SdkStrip & 256) == 0) {
         return 0;
     }
     u64 original = original_entry.load(std::memory_order_relaxed);
@@ -6687,8 +6688,8 @@ u64 PS4_SYSV_ABI TagAscBegin(u64 jcc, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u6
 u64 PS4_SYSV_ABI TagCopyResource(u64 ctx, u64 destination, u64 destination_sub, u64 source, u64 source_sub, u64 a5, u64 ret) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
-    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
-        ((policy.native_sdk_strip.load(std::memory_order_relaxed) >> 4) & 1) == 0 || ctx == 0 || !valid(destination) ||
+    if (Core::NativeConfig::DrawMode == 0 || Core::NativeConfig::SynthVerify == 0 ||
+        ((Core::NativeConfig::SdkStrip >> 4) & 1) == 0 || ctx == 0 || !valid(destination) ||
         !valid(source) || destination == source) {
         return 0;
     }
@@ -6716,7 +6717,7 @@ u64 PS4_SYSV_ABI TagCopyResource(u64 ctx, u64 destination, u64 destination_sub, 
     if (seq == 0) {
         return 0;
     }
-    const bool exec = policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligibleCompute(ctx, seq, ret);
+    const bool exec = Core::NativeConfig::DrawExec != 0 && ExecEligibleCompute(ctx, seq, ret);
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
     words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
     words[1] = VideoCore::NativeTagMagic;
@@ -7012,11 +7013,11 @@ u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4
         }
     }
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    const s32 mode = policy.map_native.load(std::memory_order_relaxed);
+    const s32 mode = Core::NativeConfig::MapNative;
     const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     if (mode == 0 || ctx == 0 || !valid(resource) || subresource != 0 || (type != 2 && type != 3 && type != 4) ||
-        policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
-        policy.native_draw_exec.load(std::memory_order_relaxed) == 0 || Rd<u32>(resource, 0x124) != 3) {
+        Core::NativeConfig::DrawMode == 0 || Core::NativeConfig::SynthVerify == 0 ||
+        Core::NativeConfig::DrawExec == 0 || Rd<u32>(resource, 0x124) != 3) {
         return 0;
     }
     const u64 original = Core::GuestHooks::OriginalEntry("Map");
@@ -7101,9 +7102,9 @@ u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4
 u64 PS4_SYSV_ABI TagExCsDepthCopy(u64 ctx, u64 destination, u64 source, u64 a3, u64 a4, u64 a5, u64 ret) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
-    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
-        policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
-        ((policy.native_sdk_strip.load(std::memory_order_relaxed) >> 3) & 1) == 0 || ctx == 0 || !valid(destination) ||
+    if (Core::NativeConfig::DrawMode == 0 || Core::NativeConfig::DrawExec == 0 ||
+        Core::NativeConfig::SynthVerify == 0 ||
+        ((Core::NativeConfig::SdkStrip >> 3) & 1) == 0 || ctx == 0 || !valid(destination) ||
         !valid(source) || destination == source || (Rd<u8>(ctx, 0x13009) & 1) != 0) {
         return 0;
     }
@@ -7224,9 +7225,9 @@ void AscSideEffects(u64 jcc, u64 x, u64 y, u64 z) {
 /// With execution the record replaces all of it (the packets are only written when the game's own path runs).
 u64 TagAsc(u64 jcc, u64 x, u64 y, u64 z, u64 ret, bool allow_exec = true) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || jcc == 0 || x == 0 || y == 0 || z == 0 ||
-        policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
-        ((policy.native_draw_classes.load(std::memory_order_relaxed) >> Other) & 1) == 0) {
+    if (Core::NativeConfig::DrawMode == 0 || jcc == 0 || x == 0 || y == 0 || z == 0 ||
+        Core::NativeConfig::SynthVerify == 0 ||
+        ((Core::NativeConfig::DrawClasses >> Other) & 1) == 0) {
         return 0;
     }
     if (NativeRegistry::enabled.load(std::memory_order_relaxed)) {
@@ -7276,7 +7277,7 @@ u64 TagAsc(u64 jcc, u64 x, u64 y, u64 z, u64 ret, bool allow_exec = true) {
         tag[11] = 0;
         tag[12] = 0;
     };
-    const bool exec = allow_exec && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligibleAsc(seq, ret);
+    const bool exec = allow_exec && Core::NativeConfig::DrawExec != 0 && ExecEligibleAsc(seq, ret);
     u32 word_count = 0;
     if (exec) {
         // counters the game initializes with DMA packets: GDS fill records, in front of the dispatch
@@ -7350,13 +7351,13 @@ u64 PS4_SYSV_ABI TagFill(u64 ctx, u64 destination, u64 count_arg, u64 source, u6
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     const u32 count = static_cast<u32>(count_arg);
     const u32 size = static_cast<u32>(size_arg);
-    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
+    if (Core::NativeConfig::DrawMode == 0 || Core::NativeConfig::DrawExec == 0 ||
         ctx == 0 || size == 0 || size > 64 || count == 0 || count > (64u << 20) / 4 || source == 0 || destination == 0 ||
         (Rd<u8>(ctx, 0xe849) & 1) != 0 || (destination & 3) != 0 || !SourceDwordsEqual(source, size)) {
         if (ctx != 0 && size >= 2 && size <= 64 && count != 0 && count <= (64u << 20) / 4 && source != 0 && destination != 0 &&
-            (destination & 3) == 0 && (Rd<u8>(ctx, 0xe849) & 1) == 0 && policy.native_draw_mode.load(std::memory_order_relaxed) != 0 &&
-            policy.native_synth_verify.load(std::memory_order_relaxed) != 0 &&
-            ((policy.native_sdk_strip.load(std::memory_order_relaxed) >> 12) & 1) != 0) {
+            (destination & 3) == 0 && (Rd<u8>(ctx, 0xe849) & 1) == 0 && Core::NativeConfig::DrawMode != 0 &&
+            Core::NativeConfig::SynthVerify != 0 &&
+            ((Core::NativeConfig::SdkStrip >> 12) & 1) != 0) {
             const u64 writer = ctx;
             if (const u64 seq = Guarded([&] { return MakeFillPatternRecord(writer, destination, count, source, size, ret); });
                 seq != 0) {
@@ -7368,7 +7369,7 @@ u64 PS4_SYSV_ABI TagFill(u64 ctx, u64 destination, u64 count_arg, u64 source, u6
                 std::memcpy(&words[9], &seq, sizeof(u64));
                 words[11] = 0;
                 words[12] = 0;
-                const bool exec = policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligibleCompute(writer - 0x47c0, seq, ret);
+                const bool exec = Core::NativeConfig::DrawExec != 0 && ExecEligibleCompute(writer - 0x47c0, seq, ret);
                 if (exec) {
                     words[2] |= ExecFlag;
                 }
@@ -7442,7 +7443,7 @@ u64 PS4_SYSV_ABI TagFill(u64 ctx, u64 destination, u64 count_arg, u64 source, u6
 /// execution only the fields are set. The other modes (dispatch draw, tessellation and geometry stage sets) are never used by
 /// the game; the call then runs the game's own function.
 u64 PS4_SYSV_ABI TagModeSwitch(u64 ctx, u64 mode, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    if (ctx == 0 || VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) == 0) {
+    if (ctx == 0 || Core::NativeConfig::DrawExec == 0) {
         return 0;
     }
     const u32 current = Rd<u32>(ctx, 0x278);
@@ -7482,7 +7483,7 @@ u64 PS4_SYSV_ABI TagModeSwitch(u64 ctx, u64 mode, u64 a2, u64 a3, u64 a4, u64 a5
 /// the pipe, waits for it and rewrites it; the label is local to the function. The raster thread runs the queue's work in
 /// order, so with execution the barrier is not needed.
 u64 PS4_SYSV_ABI TagAscBarrier(u64 jcc, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    if (jcc == 0 || VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) == 0) {
+    if (jcc == 0 || Core::NativeConfig::DrawExec == 0) {
         return 0;
     }
     Live().asc_barrier_exec.fetch_add(1, std::memory_order_relaxed);
@@ -7586,8 +7587,8 @@ u64 RunAndMeasure(EmitStat& stat, const char* hook_name, u64 dcb, u64 a0, u64 a1
         }
         stat.packets.fetch_add(packets, std::memory_order_relaxed);
         stat.draws.fetch_add(draws, std::memory_order_relaxed);
-        if (strip_bit != 0 && (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & strip_bit) != 0 &&
-            VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0 && packets != 0 &&
+        if (strip_bit != 0 && (Core::NativeConfig::SdkStrip & strip_bit) != 0 &&
+            Core::NativeConfig::DrawExec != 0 && packets != 0 &&
             at == cursor_after && StripPackets(strip_from != 0 ? strip_from : cursor_before, cursor_after)) {
             stat.stripped.fetch_add(1, std::memory_order_relaxed);
         }
@@ -7601,8 +7602,8 @@ u64 RunAndMeasure(EmitStat& stat, const char* hook_name, u64 dcb, u64 a0, u64 a1
 /// resource keep the game's function (whose depth quads are stripped, see MeasureTargetEliminate).
 u64 PS4_SYSV_ABI TagTrackResource(u64 ctx, u64 resource, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     if (ctx == 0 || !IsHeapPointer(resource) || (resource & 7) != 0 ||
-        VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) == 0 ||
-        (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 2) == 0) {
+        Core::NativeConfig::DrawExec == 0 ||
+        (Core::NativeConfig::SdkStrip & 2) == 0) {
         return 0;
     }
     const auto game = GameTrackFunction();
@@ -7780,8 +7781,8 @@ u64 PS4_SYSV_ABI MeasureClearQuad(u64 dcb, u64 target, u64 a2, u64 a3, u64 a4, u
     const u64 result = RunAndMeasure(emit_stats[2], "ClearQuad", dcb, dcb, target, a2, a3, a4, a5);
     const u64 end = Rd<u64>(dcb, 0x10);
     if (result != 0 && Rd<u64>(dcb, 8) == end_marker && end > begin && IsHeapPointer(target) &&
-        (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 32) != 0 &&
-        VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0 &&
+        (Core::NativeConfig::SdkStrip & 32) != 0 &&
+        Core::NativeConfig::DrawExec != 0 &&
         (ConvertClearQuad(target, start, begin, end, ret, prelude_values) ||
          (start != begin && ConvertClearQuad(target, begin, begin, end, ret, {{{0x0, ~0u}, {0xa, ~0u}, {0xb, ~0u}, {0x200, ~0u}}})))) {
         emit_stats[2].stripped.fetch_add(1, std::memory_order_relaxed);
@@ -8882,8 +8883,8 @@ void PrepareBuffer(u64 begin, u64 end, u32 depth) {
 
 void PrepareSubmittedBuffer(const u32* dcb, u32 dwords) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    if (dcb == nullptr || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
-        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 2097152) == 0) {
+    if (dcb == nullptr || Core::NativeConfig::DrawExec == 0 ||
+        (Core::NativeConfig::SdkStrip & 2097152) == 0) {
         return;
     }
     PrepareBuffer(reinterpret_cast<u64>(dcb), reinterpret_cast<u64>(dcb) + dwords * sizeof(u32), 0);
@@ -8938,8 +8939,8 @@ u32 RestoreSyncTag(const u32* tag, std::array<u32, 8>& packet, bool count_execut
 
 bool SubmitShadowEnabled() {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    return policy.native_draw_exec.load(std::memory_order_relaxed) != 0 &&
-           (policy.native_sdk_strip.load(std::memory_order_relaxed) & 1048576) != 0;
+    return Core::NativeConfig::DrawExec != 0 &&
+           (Core::NativeConfig::SdkStrip & 1048576) != 0;
 }
 
 void NoteAnchor(u64 address, u64 seq, u32 kind) {
@@ -9475,7 +9476,7 @@ void IssueIndexedDraw(u64 ctx, u64 count, u64 first, u64 site_ghidra, u64 a4, u6
 
 bool InlineAutoDrawTagged(u32 count) {
     return image_base.load(std::memory_order_relaxed) != 0 && count != 0 && count < 0x1000000 &&
-           VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0;
+           Core::NativeConfig::DrawExec != 0;
 }
 namespace {
 /// FUN_024a4ab0 (the constant update engine's pre draw) and the draw packet: what the inlined auto draw does after a PrepareDraw that returned true (the draw was not taken over).

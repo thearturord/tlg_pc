@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "native/native_pass.h"
+#include "native/native_config.h"
 #include "native/native_registry.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -1240,8 +1241,7 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
     // without a barrier in between (thousands of tiny constant buffer ranges) made every insert shift the
     // vector; with the native draw path on, a list that holds many ranges is replaced by the one range that
     // covers them all, which can only add a barrier, never drop one.
-    const bool bounded = VideoCore::ReadbackPolicy::Get().native_draw_mode.load(
-                             std::memory_order_relaxed) >= 2;
+    const bool bounded = Core::NativeConfig::DrawMode >= 2;
     const auto add_range = [bounded](auto& list, const Interval& new_range) {
         if (!bounded) {
             list.Add(new_range);

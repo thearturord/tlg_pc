@@ -5,6 +5,7 @@
 #include <map>
 #include <mutex>
 #include "native/native_stream_probe.h"
+#include "native/native_config.h"
 #include "native/native_stream_submit.h"
 #include "native/native_timeline.h"
 #include "native/native_draw.h"
@@ -504,8 +505,8 @@ u32 PS4_SYSV_ABI sceGnmDispatchInitDefaultHardwareState(u32* cmdbuf, u32 size) {
     }
 
     if (const auto& policy = VideoCore::ReadbackPolicy::Get();
-        policy.native_draw_exec.load(std::memory_order_relaxed) != 0 &&
-        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 128) != 0) {
+        Core::NativeConfig::DrawExec != 0 &&
+        (Core::NativeConfig::SdkStrip & 128) != 0) {
         // the thread management and resource limit registers and the cache acquire have no host effect
         cmdbuf = WriteHeader<PM4ItOpcode::Nop>(cmdbuf, HwInitPacketSize - 1);
         *cmdbuf = 0;
@@ -780,12 +781,12 @@ static bool WriteNativeInitState(u32* cmdbuf, const u32* sequence, u32 sequence_
     {
         static std::atomic<u32> logged{0};
         if (logged.fetch_add(1) < 6) {
-            LOG_INFO(Lib_GnmDriver, "default hardware state requested: exec {} strip {:#x} sequence {} dwords", policy.native_draw_exec.load(),
-                     policy.native_sdk_strip.load(), sequence_dwords);
+            LOG_INFO(Lib_GnmDriver, "default hardware state requested: exec {} strip {:#x} sequence {} dwords", Core::NativeConfig::DrawExec,
+                     Core::NativeConfig::SdkStrip, sequence_dwords);
         }
     }
-    if (policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
-        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 8192) == 0) {
+    if (Core::NativeConfig::DrawExec == 0 ||
+        (Core::NativeConfig::SdkStrip & 8192) == 0) {
         return false;
     }
     static constexpr std::array ClearStateSequence{

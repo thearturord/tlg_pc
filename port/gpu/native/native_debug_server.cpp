@@ -18,6 +18,7 @@
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
 #include "native/native_debug_server.h"
+#include "native/native_config.h"
 #include "native/native_stream_probe.h"
 #include "native/native_timeline.h"
 #include "native/native_pass.h"
@@ -143,10 +144,10 @@ nlohmann::json Native(const Params&) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     nlohmann::json j;
     j["note"] = "cumulative counters of the native renderer since start; take differences for rates";
-    j["mode"] = policy.native_draw_mode.load();
-    j["exec"] = policy.native_draw_exec.load();
-    j["audit_every"] = policy.native_audit_every.load();
-    j["sdk_strip"] = policy.native_sdk_strip.load();
+    j["mode"] = Core::NativeConfig::DrawMode;
+    j["exec"] = Core::NativeConfig::DrawExec;
+    j["audit_every"] = Core::NativeConfig::AuditEvery;
+    j["sdk_strip"] = Core::NativeConfig::SdkStrip;
     j["gfx_tags"] = live.gfx_tags.load();
     j["gfx_exec"] = live.gfx_exec.load();
     j["compute_tags"] = live.compute_tags.load();
