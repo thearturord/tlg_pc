@@ -10,6 +10,7 @@
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "native/native_stall.h"
 #include "native/native_timeline.h"
 #include "sdl_window.h"
 #include "tlg_capture.h"
@@ -367,6 +368,14 @@ bool WindowSDL::PollEvents() {
         if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F9 && !event.key.repeat) {
             if (!Core::FrameTimeline::StopCapture()) {
                 Core::FrameTimeline::StartCapture(10, "f9_" + std::to_string(static_cast<long long>(std::time(nullptr))));
+            }
+            continue;
+        }
+        // tlg: F8 starts the stall profiler (a 10 s capture analysed on the spot: what the game's threads wait on, with the guest call site, and how much more the slow frames
+        // wait there; the report is an HTML page with charts, user/log/stall_<time>.html, opened in the browser) or stops a running one. F9 stays the full frame profiler.
+        if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F8 && !event.key.repeat) {
+            if (!Core::Stall::Stop()) {
+                Core::Stall::Start(10, true);
             }
             continue;
         }

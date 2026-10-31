@@ -3,6 +3,7 @@
 
 #include <boost/preprocessor/stringize.hpp>
 
+#include "native/native_raycast_cpu.h"
 #include "native/native_stream_probe.h"
 #include "native/native_timeline.h"
 #include "native/native_write_watch.h"
@@ -34,6 +35,9 @@
 #include "native/native_updates.h"
 #include "native/native_resources.h"
 #include "core/platform.h"
+#include "native/native_frame_events.h"
+#include "native/native_flip.h"
+#include "native/native_display.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/liverpool_internal.h"
 #include "video_core/amdgpu/pm4_cmds.h"
@@ -282,6 +286,9 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             RasterRun(
                 [this, destination = static_cast<VAddr>(draw.args_addr), source = static_cast<VAddr>(draw.extra_addr), bytes = draw.a1,
                  staging = draw.dst_usage == 3 && Core::NativeReadbacks::ExplicitEnabled()] {
+                    if (Core::NativeRaycast::ShadowOn()) {
+                        Core::NativeRaycast::NoteMemoryCopy(source, destination, bytes);
+                    }
                     rasterizer->CopyBuffer(destination, source, bytes, false, false, staging);
                 },
                 false, true);
@@ -296,6 +303,9 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             RasterRun(
                 [this, destination = static_cast<VAddr>(draw.args_addr), source = draw.start_index,
                  staging = draw.dst_usage == 3 && Core::NativeReadbacks::ExplicitEnabled()] {
+                    if (Core::NativeRaycast::ShadowOn()) {
+                        Core::NativeRaycast::NoteCounterCopy(source, destination);
+                    }
                     rasterizer->CopyBuffer(destination, source, sizeof(u32), false, true, staging);
                 },
                 false, true);
@@ -725,7 +735,38 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
             StartNativeTag(entry.words.data());
             break;
         case EntryKind::Flip:
-            RasterRun([] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); });
+            if (entry.words[1] == Core::NativeDisplay::WaitTagMagic) {
+                // E6.2c: wait until the display buffer is free
+                auto task = DirectWaitDisplay(entry.words[2]);
+                RESUME_GFX(task);
+                while (!task.handle.done()) {
+                    YIELD_GFX();
+                    RESUME_GFX(task);
+                }
+                task.handle.destroy();
+                break;
+            }
+            if (entry.words[1] == Core::NativeFlip::TagMagic) {
+                // E6.2b: the typed flip, the four things the rewritten tail did, in the same order
+                Core::NativeFlip::Request request;
+                if (!Core::NativeFlip::Take(entry.words[2] | static_cast<u64>(entry.words[3]) << 32, request)) {
+                    Core::RareEvents::Note("flip_request_gone", "the typed flip request of a tail was not in the ring when the command processor took it");
+                    RasterRun([] { Core::NativeFrameEvents::FlipReady(); });
+                    break;
+                }
+                const u32 one = 1;
+                Core::NativeDisplay::Lock(request.buffer_index);                                             // the display buffer is locked
+                CpWriteData(reinterpret_cast<u64*>(request.display_label), &one, sizeof(one), GfxQueueId); // ... and its label says so
+                RasterRun([] { Core::NativeFrameEvents::FlipReady(); });                                    // the flip is ready
+                if (request.has_label) {
+                    CpWriteData(reinterpret_cast<u64*>(request.label_address), &request.label_value, sizeof(u32), GfxQueueId);
+                }
+                if (request.has_fence) {
+                    SignalGraphicsEop(request.fence);
+                }
+                break;
+            }
+            Core::RareEvents::Note("flip_entry_without_request", "a flip entry that is neither a typed flip request nor a display wait");
             break;
         case EntryKind::StateBuffer: {
             u64 pointer;

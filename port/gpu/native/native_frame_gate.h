@@ -25,6 +25,17 @@ constexpr int MaxDepth = 2;
 /// 0, 1 or 2 (clamped), read once
 int Depth();
 
+/// The two waits that depth 0 adds to depth 1, switchable on their own (to find which one matters): the game's thread waits for the end-of-pipe interrupt of its
+/// own frame (`WaitOwnFrame`), and the presenter waits for the frame it just made (vk_presenter.cpp). Default: both on at depth 0, both off otherwise.
+/// Json keys `game_waits_own_frame` (0, 1, 2) / `presenter_waits_own_frame` (0, 1), environment `TLG_FIF_GAME_WAIT` / `TLG_FIF_PRESENTER_WAIT` (win).
+/// 0 off; 1 until the frame's end-of-pipe interrupt (the GPU is done and the readbacks landed); 2 until the raster thread has executed everything the frame recorded
+/// (`NoteRasterReached`: our side has read all the guest memory the frame needs, the GPU may still run) - tells a late read of guest memory from a late result.
+int GameWaitMode();
+bool GameWaitsOwnFrame();
+/// The raster thread passed the end of a frame (queued in order behind the frame's work, before its end-of-pipe signal)
+void NoteRasterReached();
+bool PresenterWaitsOwnFrame();
+
 /// A frame was handed to the command processor (`sceGnmSubmitAndFlipCommandBuffers`, before the submit)
 void NoteSubmitFlip();
 /// The end-of-pipe interrupt of a frame (the one the game's submit thread waits for) was raised
@@ -35,7 +46,7 @@ void WaitForSlot();
 /// Depth 0: blocks until every submitted frame has its end-of-pipe interrupt (times out like WaitForSlot).
 void WaitOwnFrame();
 
-/// How many flips back the presenter waits for: the value of the `frames_queued` setting for depth 1, `Depth()` otherwise (0 = the frame it just made).
+/// How many flips back the presenter waits for: 2 at depth 2, the value of the `frames_queued` setting otherwise.
 /// `queued_setting` is that setting (0 = unbounded).
 u32 PresenterAhead(u32 queued_setting);
 

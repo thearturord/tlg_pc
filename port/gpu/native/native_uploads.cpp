@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <fmt/format.h>
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -217,6 +218,24 @@ void SnapshotTake(u64 begin, u64 size, u64 stamp) {
     snap_taken_bytes.fetch_add(size, std::memory_order_relaxed);
 }
 
+namespace {
+std::atomic<u64> diff_share[5]{}; ///< by how much of the range differs: < 10 %, < 50 %, < 100 %, all, and ranges of 16 bytes or less
+std::atomic<u64> diff_by_who[9]{};
+std::mutex diff_mutex;
+std::vector<std::string> diff_samples;
+} // namespace
+
+void NoteSnapshotDiff(u64 address, u64 size, u64 first_offset, u64 diff_bytes, u32 snapshot_word, u32 guest_word, u32 who) {
+    const double share = size ? static_cast<double>(diff_bytes) / static_cast<double>(size) : 1.0;
+    diff_share[size <= 16 ? 4 : share < 0.1 ? 0 : share < 0.5 ? 1 : share < 1.0 ? 2 : 3].fetch_add(1, std::memory_order_relaxed);
+    diff_by_who[who < 8 ? who : 8].fetch_add(1, std::memory_order_relaxed);
+    std::scoped_lock lock{diff_mutex};
+    if (diff_samples.size() < 12) {
+        diff_samples.push_back(fmt::format("{:#x}+{:#x}: {} of {} bytes differ, first at +{:#x} snapshot {:#010x} guest {:#010x}, last announcer {}", address, size, diff_bytes, size, first_offset, snapshot_word,
+                                           guest_word, who < 8 ? std::to_string(who) : "none"));
+    }
+}
+
 void NoteSnapshotRing(u32 what) {
     ring_snapshot_counters[what & 7].fetch_add(1, std::memory_order_relaxed);
 }
@@ -411,6 +430,16 @@ nlohmann::json Report() {
                       {"snapshot_ring_bindings_compared_with_guest_memory", ring_snapshot_counters[2].load()},
                       {"snapshot_differs_from_guest_memory_at_bind_time", ring_snapshot_counters[3].load()},
                       {"snapshot_differed_from_guest_memory_when_planned_guest_bytes_used_instead", ring_snapshot_counters[4].load()}};
+    j["snapshots"]["differing_share_of_range"] = {{"under_10_percent", diff_share[0].load()}, {"under_50_percent", diff_share[1].load()}, {"under_100_percent", diff_share[2].load()},
+                                                  {"all", diff_share[3].load()}, {"range_of_16_bytes_or_less", diff_share[4].load()}};
+    {
+        auto& w = j["snapshots"]["differing_by_last_announcer"] = nlohmann::json::object();
+        for (u32 i = 0; i < 9; ++i) {
+            w[i < 8 ? std::to_string(i) : "none"] = diff_by_who[i].load();
+        }
+        std::scoped_lock lock{diff_mutex};
+        j["snapshots"]["differing_samples"] = diff_samples;
+    }
     {
         auto& a = j["on_demand_upload_audit"] = nlohmann::json::object();
         a["enabled"] = OnDemandAudit();

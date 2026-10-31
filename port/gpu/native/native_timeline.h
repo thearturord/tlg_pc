@@ -50,6 +50,7 @@ enum Type : u32 {
     LabelWrite = 32,  ///< a guest label write by a command stream ran (CpWriteData, or the write held behind a fence): arg = first dword | queue << 32 | (1 << 48 if the held-fence path), arg2 = address, ts = at the write
     ResourceHash = 34, ///< capture only, resource audit: content hash of a read-only buffer used by queue 1 when it was bound: arg = address, arg2 = XXH64 of the guest memory
     ResourceUse = 33, ///< capture only, resource audit: a buffer / image bound by the raster thread: arg = address | class << 48 (queue index, 0 graphics) | kind << 56 | written << 63, arg2 = size (core/resource_audit.h)
+    GameWaitSite = 35, ///< written right after a GameWait of the same thread: arg = the guest call site (return address of the blocking import), arg2 = the object
     SchedNode = 28,   ///< a node: arg = node pointer, arg2 = 1 finished waiting node seen by a poll, 2 dispatch: 2 | state << 8 | pending << 16 | flags << 32
 };
 

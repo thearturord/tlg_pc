@@ -14,6 +14,8 @@
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
+#include "native/native_display.h"
+#include "native/native_presenter.h"
 #include "common/assert.h"
 #include "tlg_toggles.h"
 #include "tlg_freeze.h"
@@ -132,10 +134,14 @@ void VideoOutDriver::Close(s32 handle) {
     // Mark as closed
     main_port.is_open = false;
     main_port.flip_rate = 0;
-    main_port.prev_index = -1;
+    Core::NativePresenter::Reset();
 
     // Clear port information
     std::memset(main_port.buffer_labels.data(), 0, sizeof(main_port.buffer_labels));
+    for (u32 i = 0; i < MaxDisplayBuffers; ++i) {
+        Core::NativeDisplay::Release(i);
+    }
+    Core::NativeDisplay::SetLabels(main_port.buffer_labels.data());
     std::memset(main_port.groups.data(), 0, sizeof(main_port.groups));
     std::memset(&main_port.vblank_status, 0, sizeof(main_port.vblank_status));
     main_port.flip_status = FlipStatus{};
@@ -235,6 +241,7 @@ int VideoOutDriver::RegisterBuffers(VideoOutPort* port, s32 startIndex, void* co
 
         // Reset flip label also when registering buffer
         port->buffer_labels[startIndex + i] = 0;
+        Core::NativeDisplay::Release(startIndex + i);
         port->SignalVoLabel();
 
         presenter->RegisterVideoOutSurface(group, address);
@@ -573,13 +580,12 @@ void VideoOutDriver::Flip(const Request& req) {
         }
     }
 
-    // Reset prev flip label
-    if (port->prev_index != -1) {
-        port->buffer_labels[port->prev_index] = 0;
+    // The buffer the screen had before is free again (E6.2d: the presenter object knows which one it was); its label goes back to 0, the console's interface
+    if (const s32 prev = Core::NativePresenter::NoteShown(req.index); prev != -1) {
+        port->buffer_labels[prev] = 0;
+        Core::NativeDisplay::Release(static_cast<u32>(prev));
         port->SignalVoLabel();
     }
-    // save to prev buf index
-    port->prev_index = req.index;
 }
 
 void VideoOutDriver::DrawBlankFrame() {
@@ -636,17 +642,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
 
-    {
-        std::scoped_lock lock{mutex};
-        requests.push({
-            .frame = frame,
-            .port = port,
-            .flip_arg = flip_arg,
-            .index = index,
-            .eop = is_eop,
-        });
-    }
-    request_cv.notify_one();
+    Core::NativePresenter::Push({.frame = frame, .port = port, .flip_arg = flip_arg, .index = index, .eop = is_eop});
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
@@ -672,33 +668,30 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         const u32 limit = u32(TlgGraphics::PresentLimit(s.fps_limit, s.applied_engine_fps));
         return limit || !fast_vblank ? limit : EmulatorSettings.GetFrameLimit();
     };
-    u32 frame_limit = current_limit();
-    auto frame_period = frame_limit ? std::chrono::nanoseconds(1000000000 / frame_limit)
-                                    : std::chrono::nanoseconds(0);
-    auto next_flip = std::chrono::steady_clock::now();
+    // E6.2d: the queue of flips, the frame limit's slots and what is on screen belong to the presenter object (native/native_presenter.h); this thread is its timer.
+    Core::NativePresenter::SetFrameLimit(current_limit(), std::chrono::steady_clock::now());
     std::printf("VideoOut: vblank %u Hz, frame limit %u FPS\n",
-                EmulatorSettings.GetVblankFrequency(), frame_limit);
+                EmulatorSettings.GetVblankFrequency(), Core::NativePresenter::FrameLimit());
 
-    const auto receive_request = [this] -> Request {
-        std::scoped_lock lk{mutex};
-        if (!requests.empty()) {
-            const auto request = requests.front();
-            requests.pop();
-            return request;
+    const auto receive_request = [] -> Request {
+        Core::NativePresenter::Request taken;
+        if (Core::NativePresenter::TryTake(taken)) {
+            return {.frame = static_cast<Vulkan::Frame*>(taken.frame),
+                    .port = static_cast<VideoOutPort*>(taken.port),
+                    .flip_arg = taken.flip_arg,
+                    .index = taken.index,
+                    .eop = taken.eop};
         }
         return {};
     };
 
     // tlg: with a frame limit (uncapped presets) a queued flip is presented as soon as it
-    // arrives and its slot allows, between vblanks, instead of on the next vblank tick.
-    bool immediate_flips = frame_limit != 0;
+    // arrives and its slot allows, between vblanks, instead of on the next vblank tick
+    // (Core::NativePresenter::ShowBetweenVblanks).
 
     while (!token.stop_requested()) {
-        if (const u32 limit = current_limit(); limit != frame_limit) {
-            frame_limit = limit;
-            frame_period = limit ? std::chrono::nanoseconds(1000000000 / limit) : std::chrono::nanoseconds(0);
-            immediate_flips = limit != 0;
-            next_flip = std::chrono::steady_clock::now();
+        if (const u32 limit = current_limit(); limit != Core::NativePresenter::FrameLimit()) {
+            Core::NativePresenter::SetFrameLimit(limit, std::chrono::steady_clock::now());
             std::printf("VideoOut: frame limit %u FPS\n", limit);
         }
         timer.Start();
@@ -713,11 +706,13 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
         const auto now = std::chrono::steady_clock::now();
-        const bool flip_slot = !frame_limit || now >= next_flip;
+        const bool flip_slot = Core::NativePresenter::SlotOpen(now);
         if (flip_slot && vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
-            if (request && frame_limit) {
-                next_flip = std::max(next_flip + frame_period, now - frame_period);
+            if (request) {
+                Core::NativePresenter::NoteTaken(now);
+            } else {
+                Core::NativePresenter::NoteStarved();
             }
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
@@ -758,19 +753,15 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             main_port.vblank_cv.notify_all();
         }
 
-        if (!immediate_flips || main_port.flip_rate != 0) {
+        if (!Core::NativePresenter::ShowBetweenVblanks() || main_port.flip_rate != 0) {
             timer.End();
             continue;
         }
         while (!token.stop_requested()) {
-            {
-                std::unique_lock lk{mutex};
-                if (!request_cv.wait_until(lk, tick_deadline,
-                                           [&] { return !requests.empty(); })) {
-                    break; // next vblank
-                }
+            if (!Core::NativePresenter::WaitForRequest(tick_deadline)) {
+                break; // next vblank
             }
-            if (std::chrono::steady_clock::now() < next_flip) {
+            if (const auto next_flip = Core::NativePresenter::NextSlot(); std::chrono::steady_clock::now() < next_flip) {
                 if (next_flip >= tick_deadline) {
                     break;
                 }
@@ -779,7 +770,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             const auto now = std::chrono::steady_clock::now();
             const auto request = receive_request();
             if (request) {
-                next_flip = std::max(next_flip + frame_period, now - frame_period);
+                Core::NativePresenter::NoteTaken(now);
                 Flip(request);
                 FRAME_END;
             }

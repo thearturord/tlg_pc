@@ -34,13 +34,23 @@ std::condition_variable changed;
 u64 submitted = 0; // under `mutex`
 u64 ended = 0;
 std::atomic<u64> peak_unfinished{0};
+u64 raster_reached = 0; // under `mutex`
 std::atomic<u64> slot_waits{0}, slot_wait_ns{0}, own_frame_waits{0}, own_frame_wait_ns{0}, timeouts{0};
 std::atomic<u64> credited{0};
 std::atomic<int> credit_state{0}; // 0 not tried, 1 done, 2 refused
 std::atomic<u64> unfinished_hist[4]{};   // frames unfinished at a submit (before it counts): 0, 1, 2, more
 
-int LoadDepth() {
+struct Config {
     int depth = 1;
+    int game_wait = 0;
+    bool presenter_waits = false;
+};
+
+Config LoadConfig() {
+    Config config;
+    int depth = 1;
+    int game_waits = -1;
+    int presenter_waits = -1;
     const char* source = "default";
     const auto path = Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (MemoryPatcher::g_game_serial + ".frames.json");
     if (std::filesystem::exists(path)) {
@@ -49,6 +59,8 @@ int LoadDepth() {
             std::ifstream in(path);
             in >> config;
             depth = config.value("frames_in_flight", 1);
+            game_waits = config.value("game_waits_own_frame", -1);
+            presenter_waits = config.value("presenter_waits_own_frame", -1);
             source = "json";
         } catch (const std::exception& e) {
             LOG_ERROR(Core, "frame gate: cannot read {}: {}", path.string(), e.what());
@@ -58,9 +70,24 @@ int LoadDepth() {
         depth = std::atoi(env);
         source = "TLG_FRAMES_IN_FLIGHT";
     }
+    if (const char* env = std::getenv("TLG_FIF_GAME_WAIT"); env && env[0]) {
+        game_waits = std::atoi(env);
+    }
+    if (const char* env = std::getenv("TLG_FIF_PRESENTER_WAIT"); env && env[0]) {
+        presenter_waits = std::atoi(env) != 0;
+    }
     const int clamped = std::clamp(depth, 0, MaxDepth);
-    LOG_INFO(Core, "frame gate: frames in flight {} ({}{})", clamped, source, clamped != depth ? ", clamped" : "");
-    return clamped;
+    config.depth = clamped;
+    config.game_wait = game_waits >= 0 ? std::min(game_waits, 2) : clamped == 0 ? 1 : 0;
+    config.presenter_waits = presenter_waits >= 0 ? presenter_waits != 0 : clamped == 0;
+    LOG_INFO(Core, "frame gate: frames in flight {} ({}{}), game wait mode {}, presenter waits for its own frame {}", clamped, source,
+             clamped != depth ? ", clamped" : "", config.game_wait, config.presenter_waits);
+    return config;
+}
+
+const Config& GetConfig() {
+    static const Config config = LoadConfig();
+    return config;
 }
 
 /// The first submit of the game: the game's own gate lets one more frame through per credit (depth 2 = one credit). Only when the guest state is exactly the
@@ -92,8 +119,19 @@ void CreditGuestGate(int credits) {
 } // namespace
 
 int Depth() {
-    static const int depth = LoadDepth();
-    return depth;
+    return GetConfig().depth;
+}
+
+int GameWaitMode() {
+    return GetConfig().game_wait;
+}
+
+bool GameWaitsOwnFrame() {
+    return GetConfig().game_wait != 0;
+}
+
+bool PresenterWaitsOwnFrame() {
+    return GetConfig().presenter_waits;
 }
 
 void NoteSubmitFlip() {
@@ -158,26 +196,41 @@ void WaitForSlot() {
     WaitFor([depth] { return submitted <= ended || submitted - ended < static_cast<u64>(depth); }, slot_waits, slot_wait_ns, "wait for a frame slot");
 }
 
+void NoteRasterReached() {
+    {
+        std::scoped_lock lock{mutex};
+        ++raster_reached;
+    }
+    changed.notify_all();
+}
+
 void WaitOwnFrame() {
-    if (Depth() != 0) {
+    const int mode = GameWaitMode();
+    if (mode == 0) {
+        return;
+    }
+    if (mode == 2) {
+        WaitFor([] { return raster_reached >= submitted; }, own_frame_waits, own_frame_wait_ns, "wait for the raster thread to reach the frame end");
         return;
     }
     WaitFor([] { return ended >= submitted; }, own_frame_waits, own_frame_wait_ns, "wait for the own frame");
 }
 
 u32 PresenterAhead(u32 queued_setting) {
-    const int depth = Depth();
-    return depth == 1 ? queued_setting : static_cast<u32>(depth);
+    return Depth() == 2 ? 2u : queued_setting;
 }
 
 nlohmann::json Status() {
     nlohmann::json j;
     j["note"] = "frames in flight (native_frame_gate.h): the setting, the frames handed to the command processor and their end-of-pipe interrupts, waits made by the gate";
     j["depth"] = Depth();
+    j["game_wait_mode"] = GameWaitMode();
+    j["presenter_waits_own_frame"] = PresenterWaitsOwnFrame();
     {
         std::scoped_lock lock{mutex};
         j["submitted_frames"] = submitted;
         j["end_of_pipe_interrupts"] = ended;
+        j["raster_reached_frame_end"] = raster_reached;
         j["unfinished_now"] = submitted > ended ? submitted - ended : 0;
     }
     j["unfinished_peak"] = peak_unfinished.load();

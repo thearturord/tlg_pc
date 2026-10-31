@@ -209,7 +209,7 @@ static void copy_wait_name(char *out,size_t size,const char *name) {
 }
 /* The GPU library's frame timeline capture (documents/tlg/frame-timeline-capture-design.md): the outermost blocking call of a thread is one wait. */
 extern void tlggpu_timeline_wait_begin(void);
-extern void tlggpu_timeline_wait_end(const char *kind,const void *object,const char *name);
+extern void tlggpu_timeline_wait_end(const char *kind,const void *object,const char *name,uintptr_t caller);
 void runtime_wait_slot_begin(RuntimeWait *w,const char *kind,const void *object,const char *name,
                              const void *const *owner,uintptr_t frame,uint64_t now_ms) {
     if (!w) return;
@@ -226,7 +226,11 @@ void runtime_wait_slot_begin(RuntimeWait *w,const char *kind,const void *object,
 void runtime_wait_slot_end(RuntimeWait *w) {
     if (!w || !w->depth) return;
     unsigned depth=--w->depth;
-    if (depth==0 && w->level[0].kind) tlggpu_timeline_wait_end(w->level[0].kind,w->level[0].object,w->level[0].name);
+    if (depth==0 && w->level[0].kind) {
+        /* the guest call site of the blocking import ([frame+8], see RuntimeWaitLevel); 0 for waits without a guest frame */
+        uintptr_t frame=w->level[0].frame;
+        tlggpu_timeline_wait_end(w->level[0].kind,w->level[0].object,w->level[0].name,frame ? ((const uintptr_t *)frame)[1] : 0);
+    }
     if (depth>=RUNTIME_WAIT_LEVELS) return;
     __atomic_add_fetch(&w->generation,1,__ATOMIC_ACQ_REL);
     __atomic_store_n(&w->level[depth].kind,NULL,__ATOMIC_RELEASE);

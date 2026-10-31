@@ -20,6 +20,7 @@
 
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "native/native_stall.h"
 #include "native/native_timeline.h"
 #include "video_core/thread_usage.h"
 
@@ -86,6 +87,20 @@ void SampleThreads(const std::stop_token& stop) {
 #endif
 
 void WriteCapture(const std::string& tag) {
+    if (Stall::ThisIsStallCapture()) {
+        // the stall profiler (F8): analysed on the spot, the events are not written
+        std::map<u32, std::string> threads;
+        for (const auto& [id, name] : VideoCore::ThreadNames()) {
+            threads[id] = name;
+        }
+        std::map<u64, std::string> names;
+        {
+            std::scoped_lock lock{capture_mutex};
+            names = capture_names;
+        }
+        Stall::Analyze(capture_events, std::min<u64>(capture_count.load(), capture_capacity), capture_start_ns, capture_end_ns, threads, names);
+        return;
+    }
     const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
     const auto base = dir / fmt::format("timeline_{}", tag);
     const u64 count = std::min<u64>(capture_count.load(), capture_capacity);
@@ -110,7 +125,7 @@ void WriteCapture(const std::string& tag) {
                   {"8", "CpWait"}, {"9", "FlipWait"}, {"10", "GameWait"}, {"11", "GameSignal"}, {"12", "CpIdleQueued"}, {"13", "RasterIdleSignal"},
                   {"14", "StreamPublish"}, {"15", "SubmitDone"}, {"16", "DingDongWait"}, {"17", "EopParsed"}, {"18", "EopSignaled"}, {"20", "StageSpan"},
                   {"21", "GpuCommandBuffer"}, {"22", "GpuPass"}, {"23", "ThreadCpu"}, {"24", "GpuClockSync"}, {"25", "GuestSpan"}, {"26", "GuestSpanInfo"},
-                  {"27", "SchedPoll"}, {"28", "SchedNode"}, {"29", "AscKick"}, {"30", "CpResume"}, {"31", "FenceSignaled"}, {"32", "LabelWrite"}, {"33", "ResourceUse"}, {"34", "ResourceHash"}};
+                  {"27", "SchedPoll"}, {"28", "SchedNode"}, {"29", "AscKick"}, {"30", "CpResume"}, {"31", "FenceSignaled"}, {"32", "LabelWrite"}, {"33", "ResourceUse"}, {"34", "ResourceHash"}, {"35", "GameWaitSite"}};
     j["stages"] = {{"1", "FrontOp"}, {"2", "FrontQueueFull"}, {"3", "FrontDrain"}, {"4", "RasterOp"}, {"5", "RasterIdle"}, {"6", "RasterPass"},
                    {"7", "EncoderReplay"}, {"8", "EncoderSubmit"}, {"9", "EncoderIdle"}};
     {

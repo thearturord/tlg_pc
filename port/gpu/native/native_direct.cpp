@@ -12,6 +12,8 @@
 #include "common/logging/log.h"
 #include "native/native_hooks.h"
 #include "native/native_direct.h"
+#include "native/native_flip.h"
+#include "native/native_display.h"
 #include "native/native_debug_server.h"
 #include "native/native_census.h"
 #include "native/native_draw.h"
@@ -92,7 +94,7 @@ Classified Classify(const u32* packet, bool markers, u32 queue) {
         }
         return {Class::Sync, sync, dwords};
     }
-    if (magic == PM4CmdNop::PayloadType::PatchedFlip) {
+    if (magic == Core::NativeFlip::TagMagic || magic == Core::NativeDisplay::WaitTagMagic) {
         return {queue == 0 ? Class::Flip : Class::Inert, 0, dwords};
     }
     if (markers && (magic == PM4CmdNop::PayloadType::DebugMarkerPush || magic == PM4CmdNop::PayloadType::DebugColorMarkerPush ||

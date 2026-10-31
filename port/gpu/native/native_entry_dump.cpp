@@ -10,6 +10,7 @@
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "native/native_flip.h"
 #include "native/native_draw.h"
 #include "native/native_entry_dump.h"
 #include "video_core/amdgpu/pm4_cmds.h"
@@ -222,7 +223,7 @@ void Span::Packet(const void* packet, u64 address, bool show) {
             }
             text = "ENTRY " + DescribePacket(reinterpret_cast<const PM4Header*>(restored.data()), static_cast<PM4ItOpcode>((restored[0] >> 8) & 0xff),
                                              (restored[0] >> 16 & 0x3fff) + 2);
-        } else if (nop->data_block[0] == PM4CmdNop::PayloadType::PatchedFlip) {
+        } else if (nop->data_block[0] == Core::NativeFlip::TagMagic) {
             flip = true;
             text = fmt::format("FLIP patched flip request");
         } else {

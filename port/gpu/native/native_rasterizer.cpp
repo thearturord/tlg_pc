@@ -1233,6 +1233,24 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
                     now.resize(size);
                     memory->CopySparseMemory(address, now.data(), size);
                     if (std::memcmp(now.data(), constant_ring->Data(*offset), size) != 0) {
+                        {
+                            const u8* snap = static_cast<const u8*>(constant_ring->Data(*offset));
+                            u64 first = ~0ull, count = 0;
+                            for (u64 i = 0; i < size; ++i) {
+                                if (snap[i] != now[i]) {
+                                    first = first == ~0ull ? i : first;
+                                    ++count;
+                                }
+                            }
+                            u32 snap_word = 0, guest_word = 0;
+                            const u64 word_at = first & ~u64{3};
+                            if (word_at + 4 <= size) {
+                                std::memcpy(&snap_word, snap + word_at, 4);
+                                std::memcpy(&guest_word, now.data() + word_at, 4);
+                            }
+                            const u32 who = Core::NativeUpdates::WhoWrote(address, size);
+                            Core::NativeUploads::NoteSnapshotDiff(address, size, first, count, snap_word, guest_word, who == ~0u ? 8 : (who & 0xff));
+                        }
                         std::memcpy(constant_ring->Data(*offset), now.data(), size);
                         Core::NativeUploads::NoteSnapshotRing(4);
                         from_snapshot = false;

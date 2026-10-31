@@ -61,6 +61,10 @@ enum class SnapshotResult : u8 {
 /// The range [begin, begin + size) as the writes before record `seq` left it. For `Found` the bytes are copied to `data` (size bytes).
 SnapshotResult SnapshotRead(u64 begin, u64 size, u64 seq, void* data);
 
+/// A snapshot differed from guest memory when the front thread planned the record: `diff_bytes` of `size` bytes differ, the first at `first_offset` (snapshot word, guest
+/// word); `who` is the announcer that wrote the range last (NativeUpdates::WhoWrote). Counted by how much of the range differs, the first samples are kept for the report.
+void NoteSnapshotDiff(u64 address, u64 size, u64 first_offset, u64 diff_bytes, u32 snapshot_word, u32 guest_word, u32 who);
+
 /// The constant ring and the snapshots: 0 a ring binding carries a snapshot, 1 refused (partly covered), 2 verified against guest memory at bind time, 3 differs from it.
 void NoteSnapshotRing(u32 what);
 

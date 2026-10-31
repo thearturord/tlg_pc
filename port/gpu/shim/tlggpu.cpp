@@ -352,7 +352,7 @@ u32 TimelineWaitKind(const char* kind) {
 extern "C" void tlggpu_timeline_wait_begin(void) {
     timeline_wait_start = Core::FrameTimeline::capture_active.load(std::memory_order_relaxed) ? Core::FrameTimeline::Now() : 0;
 }
-extern "C" void tlggpu_timeline_wait_end(const char* kind, const void* object, const char* name) {
+extern "C" void tlggpu_timeline_wait_end(const char* kind, const void* object, const char* name, uintptr_t caller) {
     const u64 start = std::exchange(timeline_wait_start, 0);
     if (start == 0 || !Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
         return;
@@ -363,6 +363,7 @@ extern "C" void tlggpu_timeline_wait_end(const char* kind, const void* object, c
     }
     const u64 id = reinterpret_cast<u64>(object);
     Core::FrameTimeline::Record(Core::FrameTimeline::GameWait, (end - start) | (u64(TimelineWaitKind(kind)) << 56), end, id);
+    Core::FrameTimeline::Record(Core::FrameTimeline::GameWaitSite, static_cast<u64>(caller), end, id); // the stall profiler pairs this with the wait above (same thread)
     Core::FrameTimeline::CaptureNote(id, name && name[0] ? name : (kind ? kind : ""));
 }
 extern "C" void tlggpu_timeline_signal(int kind, const void* object) {

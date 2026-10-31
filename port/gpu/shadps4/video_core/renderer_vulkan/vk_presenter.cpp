@@ -568,7 +568,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // The in-game menu changes it live (TlgSettings::frames_queued; TLG_FRAMES_AHEAD at start).
     // Frames in flight (native/native_frame_gate.h, the json / TLG_FRAMES_IN_FLIGHT): 1 keeps the value above; 0 waits for the frame just made; 2 waits two flips back.
     const u32 frames_ahead = Core::FrameGate::PresenterAhead(u32(std::max(0, TlgSettings::Get().frames_queued.load())));
-    if (Core::FrameGate::Depth() == 0) {
+    if (Core::FrameGate::PresenterWaitsOwnFrame()) {
         recent_frame_ticks.clear();
         draw_scheduler.Wait(frame->ready_tick);
     } else if (!frames_ahead) {

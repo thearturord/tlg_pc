@@ -35,7 +35,6 @@ struct VideoOutPort {
     std::condition_variable vo_cv;
     std::condition_variable vblank_cv;
     int flip_rate = 0;
-    int prev_index = -1;
     bool is_open = false;
     bool is_hdr = false;
 
@@ -128,10 +127,8 @@ private:
     std::jthread swap_thread; ///< before present_thread: destroyed after it
 
     std::mutex mutex;
-    std::condition_variable request_cv; ///< tlg: a flip was queued (immediate flips)
     VideoOutPort main_port{};
     std::jthread present_thread;
-    std::queue<Request> requests;
 };
 
 } // namespace Libraries::VideoOut

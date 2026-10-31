@@ -28,6 +28,10 @@
 #include "core/libraries/videoout/video_out.h"
 #include "core/memory.h"
 #include "core/platform.h"
+#include "native/native_frame_events.h"
+#include "native/native_flip.h"
+#include "native/native_display.h"
+#include "native/native_sync.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "native/native_draw_tag.h"
@@ -89,7 +93,7 @@ static u32 asc_next_offs_dw[Liverpool::NumComputeRings];
 static VAddr tessellation_factors_ring_addr = -1;
 static constexpr u32 tessellation_offchip_buffer_size = 0x800000u;
 
-static void ResetSubmissionLock(Platform::InterruptId irq) {
+static void ResetSubmissionLock(u32 irq) {
     std::unique_lock lock{m_wait_idle};
     submission_lock = 0;
     cv_lock.notify_all();
@@ -164,13 +168,13 @@ s32 PS4_SYSV_ABI sceGnmAddEqEvent(OrbisKernelEqueue eq, u64 id, void* udata) {
 
     equeue->AddEvent(kernel_event);
 
-    Platform::IrqC::Instance()->Register(
-        static_cast<Platform::InterruptId>(id),
-        [=](Platform::InterruptId irq) {
-            ASSERT_MSG(irq == static_cast<Platform::InterruptId>(id), "An unexpected IRQ occured");
+    Core::NativeFrameEvents::Subscribe(
+        static_cast<u32>(id),
+        [=](u32 irq) {
+            ASSERT_MSG(irq == static_cast<u32>(id), "An unexpected IRQ occured");
 
             // We need to convert IRQ# to event id
-            if (!IsValidEventType(irq))
+            if (!IsValidEventType(static_cast<Platform::InterruptId>(irq)))
                 return;
 
             // Event data is expected to be an event type as per sceGnmGetEqEventType.
@@ -311,7 +315,7 @@ s32 PS4_SYSV_ABI sceGnmDeleteEqEvent(OrbisKernelEqueue eq, u64 id) {
 
     equeue->RemoveEvent(id, OrbisKernelEvent::Filter::GraphicsCore);
 
-    Platform::IrqC::Instance()->Unregister(static_cast<Platform::InterruptId>(id), equeue);
+    Core::NativeFrameEvents::Unsubscribe(static_cast<u32>(id), equeue);
     return ORBIS_OK;
 }
 
@@ -1341,18 +1345,14 @@ s32 PS4_SYSV_ABI sceGnmInsertWaitFlipDone(u32* cmdbuf, u32 size, s32 vo_handle, 
         return -1;
     }
 
-    uintptr_t label_addr{};
-    ASSERT_MSG(VideoOut::sceVideoOutGetBufferLabelAddress(vo_handle, &label_addr) == 16,
-               "sceVideoOutGetBufferLabelAddress call failed");
-
-    auto* wait_reg_mem = reinterpret_cast<PM4CmdWaitRegMem*>(cmdbuf);
-    wait_reg_mem->header = PM4Type3Header{PM4ItOpcode::WaitRegMem, 5};
-    wait_reg_mem->raw = 0x13u;
-    *reinterpret_cast<uintptr_t*>(&wait_reg_mem->poll_addr_lo) =
-        (label_addr + buf_idx * sizeof(uintptr_t)) & ~0x3ull;
-    wait_reg_mem->ref = 0u;
-    wait_reg_mem->mask = 0xffff'ffffu;
-    wait_reg_mem->poll_interval = 10u;
+    // E6.2c: the wait for a free display buffer is a tag, not a WAIT_REG_MEM packet: a 7 dword nop whose word 1 names it and word 2 the buffer
+    cmdbuf[0] = 0xc0000000u | (5u << 16) | (0x10u << 8);
+    cmdbuf[1] = Core::NativeDisplay::WaitTagMagic;
+    cmdbuf[2] = buf_idx;
+    cmdbuf[3] = 0u;
+    cmdbuf[4] = 0u;
+    cmdbuf[5] = 0u;
+    cmdbuf[6] = 0u;
     return ORBIS_OK;
 }
 
@@ -1484,6 +1484,35 @@ s32 PS4_SYSV_ABI sceGnmRegisterResource(void* res_handle, void* owner_handle, co
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
+/// What the game's prepareFlip packet asks for, as typed values (E6.2b). `backup` holds the first seven words of the tail as the game wrote them: [1] the kind,
+/// [2] and [3] the label address (low word, high word; the end-of-pipe variants keep 16 bits of the high word), [4] the label value, [5] and [6] the event type fields.
+static Core::NativeFlip::Request BuildFlipRequest(const std::array<u32, 7>& backup, uintptr_t label_addr, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
+    Core::NativeFlip::Request request;
+    request.video_out_handle = vo_handle;
+    request.buffer_index = buf_idx;
+    request.flip_mode = flip_mode;
+    request.flip_arg = flip_arg;
+    request.display_label = (label_addr + buf_idx * sizeof(label_addr)) & ~0x3ull;
+    if (backup[1] == PM4CmdNop::PayloadType::PrepareFlipLabel) {
+        request.has_label = true;
+        request.label_address = (backup[2] & 0xffff'fffcull) | (static_cast<u64>(backup[3]) << 32);
+        request.label_value = backup[4];
+    }
+    if (backup[1] == PM4CmdNop::PayloadType::PrepareFlipInterruptLabel) {
+        request.has_fence = true;
+        request.fence.address = (backup[2] & 0xffff'fffcull) | (static_cast<u64>(backup[3] & 0xffffu) << 32);
+        request.fence.value = backup[4];
+        request.fence.source = Core::NativeSync::Source::Immediate32;
+        request.fence.interrupt = true;
+    }
+    if (backup[1] == PM4CmdNop::PayloadType::PrepareFlipInterrupt) {
+        request.has_fence = true;
+        request.fence.source = Core::NativeSync::Source::None;
+        request.fence.interrupt = true;
+    }
+    return request;
+}
+
 static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf_idx, u32 flip_mode,
                                    s64 flip_arg, void* unk) {
     // check for `prepareFlip` packet
@@ -1513,58 +1542,13 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
     ASSERT_MSG(VideoOut::sceVideoOutGetBufferLabelAddress(vo_handle, &label_addr) == 16,
                "sceVideoOutGetBufferLabelAddress call failed");
 
-    // Write event to lock the VO surface
-    auto* write_lock = reinterpret_cast<PM4CmdWriteData*>(cmdbuf);
-    write_lock->header = PM4Type3Header{PM4ItOpcode::WriteData, 3};
-    write_lock->raw = 0x500u;
-    const auto addr = (label_addr + buf_idx * sizeof(label_addr)) & ~0x3ull;
-    write_lock->Address<uintptr_t>(addr);
-    write_lock->data[0] = 1;
-
-    auto* nop = reinterpret_cast<PM4CmdNop*>(cmdbuf + 5);
-
-    if (backup[1] == PM4CmdNop::PayloadType::PrepareFlip) {
-        nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x39};
-        nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
-    } else {
-        if (backup[1] == PM4CmdNop::PayloadType::PrepareFlipLabel) {
-            nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x34};
-            nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
-
-            // Write event to update label
-            auto* write_label = reinterpret_cast<PM4CmdWriteData*>(cmdbuf + 0x3b);
-            write_label->header = PM4Type3Header{PM4ItOpcode::WriteData, 3};
-            write_label->raw = 0x500u;
-            write_label->dst_addr_lo = backup[2] & 0xffff'fffcu;
-            write_label->dst_addr_hi = backup[3];
-            write_label->data[0] = backup[4];
-        }
-        if (backup[1] == PM4CmdNop::PayloadType::PrepareFlipInterruptLabel) {
-            nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x33};
-            nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
-
-            auto* write_eop = reinterpret_cast<PM4CmdEventWriteEop*>(cmdbuf + 0x3a);
-            write_eop->header = PM4Type3Header{PM4ItOpcode::EventWriteEop, 4};
-            write_eop->event_control = (backup[5] & 0x3f) + 0x500u + (backup[6] & 0x3f) * 0x1000;
-            write_eop->address_lo = backup[2] & 0xffff'fffcu;
-            write_eop->data_control = (backup[3] & 0xffffu) | 0x2200'0000u;
-            write_eop->data_lo = backup[4];
-            write_eop->data_hi = 0u;
-        }
-        if (backup[1] == PM4CmdNop::PayloadType::PrepareFlipInterrupt) {
-            nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x33};
-            nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
-
-            auto* write_eop = reinterpret_cast<PM4CmdEventWriteEop*>(cmdbuf + 0x3a);
-            write_eop->header = PM4Type3Header{PM4ItOpcode::EventWriteEop, 4};
-            write_eop->event_control = (backup[5] & 0x3f) + 0x500u + (backup[6] & 0x3f) * 0x1000;
-            write_eop->address_lo = 0u;
-            write_eop->data_control = 0x100'0000u;
-            write_eop->data_lo = 0u;
-            write_eop->data_hi = 0u;
-        }
-    }
-
+    // E6.2b: the flip is a typed request. The tail's nop keeps its header (a 64 dword nop, as the game wrote it); word 1 names the request, words 2 and 3 hold its id.
+    Core::NativeFlip::NoteVariant(backup[1]);
+    const auto request = BuildFlipRequest(backup, label_addr, vo_handle, buf_idx, flip_mode, flip_arg);
+    const u64 id = Core::NativeFlip::Publish(request);
+    cmdbuf[1] = Core::NativeFlip::TagMagic;
+    cmdbuf[2] = static_cast<u32>(id);
+    cmdbuf[3] = static_cast<u32>(id >> 32);
     return ORBIS_OK;
 }
 
@@ -3246,8 +3230,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
         liverpool->ReserveCopyBufferSpace();
     }
 
-    Platform::IrqC::Instance()->Register(Platform::InterruptId::GpuIdle, ResetSubmissionLock,
-                                         nullptr);
+    Core::NativeFrameEvents::Subscribe(Core::NativeFrameEvents::GpuIdleId, ResetSubmissionLock, nullptr);
 
     LIB_FUNCTION("b0xyllnVY-I", "libSceGnmDriver", 1, "libSceGnmDriver", sceGnmAddEqEvent);
     LIB_FUNCTION("b08AgtPlHPg", "libSceGnmDriver", 1, "libSceGnmDriver", sceGnmAreSubmitsAllowed);

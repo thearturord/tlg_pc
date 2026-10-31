@@ -38,6 +38,13 @@
 #include "native/native_audit.h"
 #include "video_core/renderdoc.h"
 #include "native/native_readbacks.h"
+#include "native/native_raycast_cpu.h"
+#include "native/native_stall.h"
+#include "native/native_frame_events.h"
+#include "native/native_flip.h"
+#include "native/native_display.h"
+#include "native/native_presenter.h"
+#include "native/native_skin_cpu.h"
 #include "native/native_readback_policy.h"
 #include "video_core/thread_profiler.h"
 #include "video_core/thread_usage.h"
@@ -598,6 +605,19 @@ void RegisterBuiltins() {
              [](const Params&) { return Core::NativeAudit::Report(); });
     Register("/readbacks", "explicit readbacks, step 1: destinations of the engine's copy / counter read-back records, AsyncMap ranges, CPU read faults",
              [](const Params&) { return Core::NativeReadbacks::Report(); });
+    Register("/raycast", "CPU port of the ray against triangle shader (0xe15f3156), shadow compare against the GPU result (TLG_RAYCAST_SHADOW=1)",
+             [](const Params&) { auto j = Core::NativeRaycast::Report(); j["skin"] = Core::NativeSkinCpu::Report(); return j; });
+    Register("/stall_capture", "?seconds=10 starts the stall profiler (the same as F8); without arguments it shows whether it runs",
+             [](const Params& params) {
+                 if (params.contains("seconds")) {
+                     Core::Stall::Start(static_cast<u32>(std::min<u64>(ParseNumber(params, "seconds", 10), 60)), ParseNumber(params, "open", 0) != 0);
+                 }
+                 return nlohmann::json{{"recording", Core::Stall::Recording()}, {"report_age_s", Core::Stall::ReportAgeSeconds()}};
+             });
+    Register("/frame_events", "E6.2a: the console's frame events (end of pipe, compute releases, GPU idle, flip ready): signals and subscriber runs",
+             [](const Params&) { auto j = Core::NativeFrameEvents::Report(); j["flip_request"] = Core::NativeFlip::Report(); j["display"] = Core::NativeDisplay::Report(); j["presenter"] = Core::NativePresenter::Report(); return j; });
+    Register("/stall", "the report of the last stall profiler capture (F8): the waits and our threads ranked by how much more the slow frames contain",
+             [](const Params&) { return nlohmann::json::parse(Core::Stall::ReportJson()); });
     Register("/entrydump",
              "?frames=1: dump the next frames of the command stream as entries to log/entry_dump.txt (without frames: the state of the last request)",
              EntryDumpEndpoint);

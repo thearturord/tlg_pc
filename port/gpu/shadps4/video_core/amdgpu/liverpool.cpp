@@ -29,11 +29,14 @@
 #include "native/native_uploads.h"
 #include "native/native_drain_audit.h"
 #include "native/native_readbacks.h"
+#include "native/native_raycast_cpu.h"
 #include "native/native_entry_dump.h"
 #include "native/native_device.h"
 #include "native/native_updates.h"
 #include "native/native_resources.h"
 #include "core/platform.h"
+#include "native/native_frame_events.h"
+#include "native/native_display.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/liverpool_internal.h"
 #include "video_core/amdgpu/pm4_cmds.h"
@@ -642,7 +645,7 @@ void Liverpool::SignalGraphicsEop(const Core::NativeSync::Fence& event_eop) {
     Core::FrameTimeline::Mark(Core::FrameTimeline::EopParsed, event_eop.address);
     static constexpr auto irq = [] {
         Core::FrameGate::NoteEndOfPipe(); // frames in flight: the frame is finished
-        Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
+        Core::NativeFrameEvents::EndOfPipe();
     };
     auto signal = [this, eop = event_eop] {
         RunFenceSignal(
@@ -662,6 +665,10 @@ void Liverpool::SignalGraphicsEop(const Core::NativeSync::Fence& event_eop) {
             },
             [eop] { eop.Signal(WriteFenceMemory, irq); });
     };
+    if (event_eop.interrupt) {
+        // frames in flight, game wait mode 2: the raster thread has executed everything the frame recorded (in order, before the end-of-pipe signal below)
+        RasterRun([] { Core::FrameGate::NoteRasterReached(); });
+    }
     SignalFenceAfterReadbacks(std::move(signal), false, static_cast<VAddr>(event_eop.address), event_eop.value, event_eop.Bytes(), GfxQueueId, VideoCore::FenceGfxEop);
 }
 
@@ -671,7 +678,7 @@ void Liverpool::SignalComputeRelease(const Core::NativeSync::Fence& release_mem,
     }
     // The packet is copied: the signal may run after the command buffer is reused.
     auto signal = [this, release = release_mem, pipe_id] {
-        const auto irq = [pipe_id] { Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id)); };
+        const auto irq = [pipe_id] { Core::NativeFrameEvents::ComputeRelease(pipe_id); };
         const auto gds_to_mem = [this](VAddr dst, u16 gds_index, u16 num_dwords) {
             rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
         };
@@ -761,9 +768,15 @@ void Liverpool::ExecuteDma(const Core::NativeSync::DmaCopy& dma) {
                 rasterizer->FillBuffer(static_cast<VAddr>(dma.destination), dma.bytes, dma.fill, false);
                 break;
             case Kind::GdsToMemory:
+                if (Core::NativeRaycast::ShadowOn()) {
+                    Core::NativeRaycast::NoteCounterCopy(dma.source, dma.destination);
+                }
                 rasterizer->CopyBuffer(static_cast<VAddr>(dma.destination), dma.source, dma.bytes, false, true);
                 break;
             case Kind::MemoryToMemory:
+                if (Core::NativeRaycast::ShadowOn()) {
+                    Core::NativeRaycast::NoteMemoryCopy(dma.source, dma.destination, dma.bytes);
+                }
                 rasterizer->CopyBuffer(static_cast<VAddr>(dma.destination), static_cast<VAddr>(dma.source), dma.bytes, false, false);
                 break;
             default:
@@ -1876,7 +1889,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 submit_cv.notify_all();
                 if (!was_partial && stream_open.load(std::memory_order_acquire) != 0 && num_submits <= partial_pending.load(std::memory_order_acquire)) {
                     // everything the game submitted is done; the spans streamed for the frame it is still recording do not count: the game gets its idle signal now
-                    RasterRun([] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle); });
+                    RasterRun([] { Core::NativeFrameEvents::GpuIdle(); });
                 }
             }
         }
@@ -1902,7 +1915,7 @@ void Liverpool::Process(std::stop_token stoken) {
         }
         RasterRun([] {
             Core::FrameTimeline::Mark(Core::FrameTimeline::RasterIdleSignal);
-            Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+            Core::NativeFrameEvents::GpuIdle();
         });
     }
 }
@@ -2040,6 +2053,25 @@ void CountComputeQueueCommand(const PM4Header* header, PM4ItOpcode opcode) {
 
 /// A wait of the graphics queue on a memory label (the walk's WaitRegMem case for a tag): tests the label, passes on the recorded
 /// fence timeline, and yields to the other queues until the label has the value.
+Liverpool::Task Liverpool::DirectWaitDisplay(u32 buffer) {
+    FIBER_ENTER(dcb_task_name);
+    if (!Core::NativeDisplay::IsFree(buffer)) {
+        if (num_submits == mapped_queues[GfxQueueId].submits.size()) {
+            // nothing else to do: sleep until the present thread frees the buffer
+            VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::FlipSleep};
+            Core::FrameTimeline::Span flip_span{Core::FrameTimeline::FlipWait};
+            Core::NativeDisplay::WaitFree(buffer);
+        } else {
+            while (!Core::NativeDisplay::IsFree(buffer)) {
+                VideoCore::ReadbackStats::CpWaitYield(true);
+                YIELD_GFX();
+            }
+        }
+    }
+    Core::NativeDisplay::NoteWaitPassed(buffer);
+    FIBER_EXIT;
+}
+
 Liverpool::Task Liverpool::DirectWait(const Core::NativeSync::LabelWait& wait_packet) {
     FIBER_ENTER(dcb_task_name);
     const Core::NativeSync::LabelWait* wait_reg_mem = &wait_packet;

@@ -253,6 +253,8 @@ private:
     Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, std::shared_ptr<Core::NativeDirect::Buffer> direct = {});
     Task ProcessDirect(std::shared_ptr<Core::NativeDirect::Buffer> direct, std::span<const u32> ccb = {});
     Task DirectWait(const Core::NativeSync::LabelWait& wait);
+    /// E6.2c: the wait for a free display buffer (native/native_display.h)
+    Task DirectWaitDisplay(u32 buffer);
     void StartNativeTag(const u32* tag);
     void ExecuteDma(const Core::NativeSync::DmaCopy& dma);
     void FakeOcclusionDump(VAddr address); ///< TLG_REAL_OCCLUSION=0: the made up answer

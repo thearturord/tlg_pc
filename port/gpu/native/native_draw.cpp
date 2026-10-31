@@ -42,6 +42,7 @@
 #include "native/native_job_gen.h"
 #include "native/native_site_gen.h"
 #include "native/native_readbacks.h"
+#include "native/native_raycast_cpu.h"
 #include "native/native_registry.h"
 #include "native/native_resources.h"
 #include "native/native_updates.h"
@@ -6504,6 +6505,9 @@ u64 PS4_SYSV_ABI StagingWorkerWindow(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64
     Core::NativeReadbacks::ReaderEnter();
     reinterpret_cast<GuestFunction6>(original)(a0, a1, a2, a3, a4, a5);
     Core::NativeReadbacks::ReaderExit();
+    if (Core::NativeRaycast::ShadowOn()) {
+        Core::NativeRaycast::CompareAfterRead();
+    }
     return 1;
 }
 

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "native/native_raycast_cpu.h"
+#include "native/native_skin_cpu.h"
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -102,7 +104,89 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     return true;
 }
 
+/// Shadow run of the CPU port of the game's ray against triangle shader (native/native_raycast_cpu.h): reads the five buffers from guest memory, keeps the CPU's hit
+/// list, and lets the GPU dispatch run as before.
+static void ShadowRaycast(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program) {
+    if (info.buffers.size() < 5) {
+        return;
+    }
+    const auto sharp = [&](u32 index) { return info.buffers[index].GetSharp(info); };
+    const auto p = sharp(0), i = sharp(1), v = sharp(2), r = sharp(3), o = sharp(4);
+    const auto ptr = [](const AmdGpu::Buffer& s) { return reinterpret_cast<const u32*>(static_cast<u64>(s.base_address)); };
+    Core::NativeRaycast::Buffers buffers{};
+    buffers.params = ptr(p);
+    buffers.params_dwords = p.GetSize() / 4;
+    buffers.indices = ptr(i);
+    buffers.indices_dwords = i.GetSize() / 4;
+    buffers.vertices = ptr(v);
+    buffers.vertices_dwords = v.GetSize() / 4;
+    if (const u32* skinned = Core::NativeSkinCpu::Lookup(v.base_address, buffers.vertices_dwords)) {
+        buffers.vertices = skinned; // the GPU skinning wrote these; guest memory holds zeros
+        buffers.vertices_from_skin = true;
+    }
+    buffers.rays = ptr(r);
+    buffers.rays_dwords = r.GetSize() / 4;
+    buffers.out_base = o.base_address;
+    buffers.out_capacity = o.num_records;
+    buffers.groups_x = cs_program.dim_x;
+    Core::NativeRaycast::ShadowDispatch(buffers);
+}
+
+/// Shadow run of the CPU port of the skinning shader (native/native_skin_cpu.h).
+static void ShadowSkin(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program) {
+    if (info.buffers.size() < 6) {
+        return;
+    }
+    const auto sharp = [&](u32 index) { return info.buffers[index].GetSharp(info); };
+    const auto b0 = sharp(0), b1 = sharp(1), b2 = sharp(2), b3 = sharp(3), o4 = sharp(4), o5 = sharp(5);
+    const auto ptr = [](const AmdGpu::Buffer& s) { return reinterpret_cast<const u32*>(static_cast<u64>(s.base_address)); };
+    Core::NativeSkinCpu::Buffers buffers{};
+    buffers.b0 = ptr(b0); buffers.n0 = b0.GetSize() / 4;
+    buffers.b1 = ptr(b1); buffers.n1 = b1.GetSize() / 4;
+    buffers.b2 = ptr(b2); buffers.n2 = b2.GetSize() / 4;
+    buffers.b3 = ptr(b3); buffers.n3 = b3.GetSize() / 4;
+    buffers.out_a = o4.base_address; buffers.out_a_dwords = o4.GetSize() / 4;
+    buffers.out_b = o5.base_address; buffers.out_b_dwords = o5.GetSize() / 4;
+    buffers.groups_x = cs_program.dim_x;
+    Core::NativeSkinCpu::ShadowDispatch(buffers);
+}
+
+static void ShadowSkinWide(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program) {
+    if (info.buffers.size() < 8) {
+        return;
+    }
+    Core::NativeSkinCpu::WideBuffers buffers{};
+    for (u32 i = 0; i < 13 && i < info.buffers.size(); ++i) {
+        const auto s = info.buffers[i].GetSharp(info);
+        buffers.p[i] = reinterpret_cast<const u32*>(static_cast<u64>(s.base_address));
+        buffers.n[i] = s.GetSize() / 4;
+    }
+    const auto o6 = info.buffers[6].GetSharp(info), o7 = info.buffers[7].GetSharp(info);
+    buffers.out_a = o6.base_address; buffers.out_a_dwords = o6.GetSize() / 4;
+    buffers.out_b = o7.base_address; buffers.out_b_dwords = o7.GetSize() / 4;
+    buffers.groups_x = cs_program.dim_x;
+    Core::NativeSkinCpu::ShadowDispatchWide(buffers);
+}
+
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
+    if (Core::NativeRaycast::ShadowOn()) {
+        if (info.pgm_hash == Core::NativeSkinCpu::ShaderHashWide) {
+            ShadowSkinWide(info, cs_program);
+        }
+        if (info.pgm_hash == Core::NativeSkinCpu::ShaderHash) {
+            ShadowSkin(info, cs_program);
+        }
+        if (info.pgm_hash == Core::NativeRaycast::ShaderHash) {
+            ShadowRaycast(info, cs_program);
+            return false;
+        }
+        for (const auto& buffer : info.buffers) {
+            if (buffer.is_written) {
+                const auto sharp = buffer.GetSharp(info);
+                Core::NativeRaycast::NoteComputeWrite(static_cast<u32>(info.pgm_hash), sharp.base_address, sharp.GetSize(), cs_program.dim_x);
+            }
+        }
+    }
     switch (info.pgm_hash) {
     case COPY_SHADER_HASH:
         return ExecuteCopyShaderHLE(info, cs_program, rasterizer);
