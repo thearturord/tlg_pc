@@ -7,8 +7,8 @@ description. Where I could not tell, it says so and it is a question in the last
 
 1. **A typed draw does not read the register image for its targets at draw time.** `PlanExecDraw` (native/native_rasterizer.cpp:335) copies `DrawInputs` from the
    cache `exec_inputs[inputs_key]` (line ~380). That cache is filled by the slow path: `Rasterizer::PlanDraw` runs `plan->inputs = MakeDrawInputs(regs)` and
-   `exec_inputs.insert_or_assign(inputs_key, plan->inputs)` (vk_rasterizer.cpp, end of `PlanDraw`). `inputs_key` is a hash of the target blocks by content
-   (`view + 0x54`, 16 words per colour target; `dsv + 0x58`, 13 words, plus the depth resource's clear values; native_draw.cpp:2800-2835). So the register image feeds
+   `exec_inputs.insert_or_assign(inputs_key, plan->inputs)` (vk_rasterizer.cpp, end of `PlanDraw`). `inputs_key` is a hash of the register values of the Targets, Other and VsProgram groups of the record
+   (native_draw.cpp, `TakeExecDrawImpl` / the state package, `values.h | 1`; erratum of round 5: it is not a hash of the view blocks, `TargetSignature` is a different hash). So the register image feeds
    the target description once per distinct block hash (a "learning" draw, `plan_null[1]` in native_draw.h:64), and everything after that replays the cached
    copy. The place where a native `TargetDesc` would replace the register decode is that one fill point, plus the three operations that never go through
    `exec_inputs` (section 2).
@@ -320,3 +320,47 @@ fixed value or a small table; **not decidable** = no engine field known (why); *
 2. Mip above 0 targets: address, pitch and the recomputed block (`FUN_02491a30` recomputes them from the T#); not compared. Whether the game binds any is visible in `tuples` (`mip` column).
 3. The clear colour of a fast clear: from the clear call or resource `+0x150/+0x154`.
 4. Multisample colour targets (fmask, `compression`): not decidable; the `tuples` `samples` column says whether any exist.
+
+## 10. Round 5: the description feeds the draw (`TLG_TARGET_DESC_USE=1`, off by default) and its verify mode (`TLG_TARGET_DESC_USE_VERIFY=1`)
+
+**Switches** (each read once): `TLG_TARGET_DESC_USE=1` applies the description; `TLG_TARGET_DESC_USE_VERIFY=1` builds it and compares, and always keeps the register result (it also turns the build on by itself);
+`TLG_TARGET_DESC=1` (the shadow of rounds 1 to 4) is independent. With none of them on, the only cost is the `UseOn()` / `Enabled()` checks. Nothing is deleted.
+
+**Where the description is made and where it is used.** The engine's objects can be gone by the time the command processor plans a draw, so the description is made by the record builders on the game's thread and
+travels with the record as an immutable `TargetSet` (equal sets are shared by content, 4,096 at most; the pointer is `NativeRecord::native_targets`, valid for `native_targets_seq == seq`, copied into
+`ExecDraw::native_targets` by `TakeExecDrawImpl`):
+* **fill point** (`PlanDraw`, vk_rasterizer.cpp, right after `plan->inputs = MakeDrawInputs(regs)` and before the `exec_inputs` insert): the set of the draw is read through `Core::NativeTargetDesc::Scope`, set by
+  native_liverpool.cpp around the register-path plan (`make_candidate`). The set is made by `PrepareDraw(ctx)` in the draw record builder (kind <= 2), from the same `ctx` slots as `Observe` (colour 0-6 by the
+  count, 7 at `ctx + 0x130e0`, depth at `ctx + 0x44d0`), cached per thread while the targets' hashes do not change.
+* **depth clear** (kind 7, `ConvertClearQuad`): `PrepareDepthClear(target)`. `target` is a block pointer, not an object: the DSV is looked for at `target - 0x58` and the resource at `target - 0xf0` and either is
+  accepted only if the engine's table says the object at that address is a depth stencil view / a texture. Applied in native_liverpool.cpp after `MakeDrawInputs(exec_state)`.
+* **fast clear eliminate** (kind 4, `EmitFastClearEliminate`): `PrepareEliminate(resource)`, the colour target of the resource (mip 0, first slice 0, last slice layers - 1). Applied in `PlanExecOperation`
+  (native_rasterizer.cpp) after the record's registers.
+
+**What is replaced** (everything else keeps the register decode and is counted as `register_only`): the `Decided` fields of section 9, by dword group: colour words 0 (base), 1 (pitch), 2 (slice size, prebuilt), 3 (first and
+last slice), 4 (format, number type, comp_swap, fast clear, blend_clamp, blend_bypass, bit 18), 5 (tile mode, fragments), 7 (cmask base), 11/12 (clear words); depth words 0 (format, samples, tile mode, tile surface),
+1 (stencil format, tile surface), 2-5 (bases), 6 (pitch, tile aligned height from the prebuilt block), 7 (slice size, prebuilt), the depth view (first and last slice), the htile base, the depth and stencil clear values.
+The bits are merged into the register words (`(register & ~mask) | description`), so a field the description does not cover stays as the register path made it; the `DrawInputs` members `depth_control` and
+`depth_render_control` and the extent hints are not touched. A linear general colour target keeps the registers' `slice_start` (it holds address bits).
+
+**Mip above 0, tile aligned sizes, clear colour** (item 3): the prebuilt block of the resource (colour `+0xb0`, depth `+0xf0`) holds mip 0 only, so at mip 0 the slice size (colour word 2) and the depth height and slice size come from it
+(`source_prebuilt_block` counts each use); the clear words come from the clear call's colour (`resource + 0x150/+0x154`) when `resource + 0x14c != 0` (`source_clear_call_colour`), else from the prebuilt block (`+0xdc/+0xe0`).
+For a mip above 0 there is no engine source (`FUN_02491a30` recomputes it with the SDK size functions): address, pitch, slice size, cmask and clear words stay with the registers and are counted as `register_only`;
+`targets_above_mip_0_with_register_geometry` counts the targets.
+
+**Counters** (/stats native_backend.device.e2_targets.feeds_the_draw): `fill_point`, `depth_clear`, `eliminate`, each with `colour_targets_applied`, `depth_targets_applied`, `targets_differing_from_registers`,
+`description_without_registers`, `registers_without_description`, `no_set_for_the_record`, `object_not_found`, and per field of colour and depth (`colour_fields`, `depth_fields`): `class` (decided / not_needed /
+not_decidable), `description_used`, `register_only`, `differs_from_registers`, `source_prebuilt_block`, `source_clear_call_colour`. Expectation with the verify run: `differs_from_registers` 0 everywhere,
+`description_used` close to the number of applied targets for the decided fields, `register_only` only for the not-needed / not-decidable fields and for mip above 0 geometry.
+
+**What the verify run cannot cover.**
+1. Only the fill of an `exec_inputs` entry is compared: the 99.9 % of draws that hit the cache reuse the entry, so a later draw with the same register key but different engine objects is not seen.
+2. Draws without a set: the packet path, draws the native path does not take (`no_set_for_the_record`), and any record whose set could not be made (`object_not_found`, `sets_overflow`).
+3. Mip above 0 and multisample colour targets (fmask, compression): register source, counted, not verified; the eliminate's slice range (first 0, last layers - 1) is assumed for the whole resource.
+4. The depth clear's target is found by address arithmetic and the engine's table; if neither candidate matches, the path stays on registers (`object_not_found`).
+5. Verify compares with the register decode the description was already checked against in the shadow; a value both get wrong from the same prebuilt block is invisible, and what the picture looks like needs the owner's play with `TLG_TARGET_DESC_USE=1` (without verify), after a clean verify run.
+6. Timing: the set is made when the record is built and applied when it is planned; a resource field that changes in between (the clear colour at `+0x150`) is the case `differs_from_registers` would show.
+
+Syntax check of this round (container with Vulkan, xxhash, abseil, robin-map headers added; spdlog and magic_enum are other versions or absent): `native_target_desc.cpp` and `native_draw.cpp` compile with no error on the new lines
+(the remaining errors are the container's spdlog `LOG_*` macros and Windows types); `native_liverpool.cpp`, `native_rasterizer.cpp` and `vk_rasterizer.cpp` stop at the missing magic_enum header, so their one-line
+edits are checked by reading only.

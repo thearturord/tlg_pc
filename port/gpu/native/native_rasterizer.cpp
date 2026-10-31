@@ -15,6 +15,7 @@
 #include "native/native_draw.h"
 #include "native/native_light_recorder.h"
 #include "native/native_untracked_ring.h"
+#include "native/native_target_desc.h"
 #include "native/native_audit.h"
 #include "native/native_readbacks.h"
 #include "native/native_device.h"
@@ -453,6 +454,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecOperation(const Core::NativeDraw::
     plan->depth_copy = plan->stencil_copy = false;
     plan->inputs = DrawInputs{};
     ApplyExecRegisters(plan->inputs, draw, 0, draw.count);
+    Core::NativeTargetDesc::ApplyEliminate(plan->inputs, draw.native_targets); // E7 (TLG_TARGET_DESC_USE)
     return plan;
 }
 

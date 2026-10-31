@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -20,6 +21,7 @@
 #include "native/native_device.h"
 #include "native/native_image_desc.h"
 #include "video_core/amdgpu/draw_state.h"
+#include "video_core/renderer_vulkan/vk_fixed_state.h"
 
 namespace Core::NativeTargetDesc {
 
@@ -814,6 +816,663 @@ void Observe(u64 ctx) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Round 5: the description feeds the draw (TLG_TARGET_DESC_USE=1, default off) or is verified against the register decode (TLG_TARGET_DESC_USE_VERIFY=1, behaviour unchanged)
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+/// The bits of one dword the engine's objects decide: `mask` says which bits, `value` what they hold; `prebuilt` / `call` mark the bits whose source is the resource's prebuilt block
+/// (resource +0xb0 colour, +0xf0 depth) or the colour of the engine's clear call (resource +0x150 / +0x154)
+struct WordOverride {
+    u32 value{0};
+    u32 mask{0};
+    u32 prebuilt{0};
+    u32 call{0};
+};
+
+void SetBits(WordOverride& w, u32 mask, u32 value) {
+    w.value = (w.value & ~mask) | (value & mask);
+    w.mask |= mask;
+}
+
+void SetPrebuilt(WordOverride& w, u32 mask, u32 value) {
+    SetBits(w, mask, value);
+    w.prebuilt |= mask;
+}
+
+void SetCall(WordOverride& w, u32 mask, u32 value) {
+    SetBits(w, mask, value);
+    w.call |= mask;
+}
+
+constexpr u32 ColourWords = 15;
+constexpr u32 DepthWords = 12; ///< 0-7 DepthBuffer, 8 DepthView, 9 DB_HTILE_DATA_BASE, 10 depth clear (float bits), 11 stencil clear
+
+} // namespace
+
+struct TargetSet {
+    std::array<bool, 8> colour_valid{};
+    std::array<std::array<WordOverride, ColourWords>, 8> colour{};
+    bool depth_valid{false};
+    std::array<WordOverride, DepthWords> depth{};
+};
+
+namespace {
+
+enum class FieldClass : u8 { Decided, NotNeeded, NotDecidable };
+
+struct FieldDef {
+    const char* name;
+    u8 word;
+    u32 mask;
+    FieldClass cls;
+};
+
+constexpr u32 Full = 0xffffffffu;
+
+// the fields of the dwords of ColorBuffer (regs_color.h); E7-notes.md section 9 has the verdict of each
+constexpr FieldDef ColourFields[] = {
+    {"base_address", 0, Full, FieldClass::Decided},
+    {"pitch", 1, 0x7ff, FieldClass::Decided},
+    {"pitch_fmask", 1, 0x7ff00000, FieldClass::NotNeeded},
+    {"slice_size", 2, 0x3fffff, FieldClass::Decided},
+    {"slice_start", 3, 0x7ff, FieldClass::Decided},
+    {"slice_max", 3, 0x7ff << 13, FieldClass::Decided},
+    {"info_endian", 4, 0x3, FieldClass::NotNeeded},
+    {"info_format", 4, 0x7c, FieldClass::Decided},
+    {"info_linear_general", 4, 0x80, FieldClass::NotDecidable},
+    {"info_number_type", 4, 0x700, FieldClass::Decided},
+    {"info_comp_swap", 4, 0x1800, FieldClass::Decided},
+    {"info_fast_clear", 4, 0x2000, FieldClass::Decided},
+    {"info_compression", 4, 0x4000, FieldClass::NotDecidable},
+    {"info_blend_clamp", 4, 0x8000, FieldClass::Decided},
+    {"info_blend_bypass", 4, 0x10000, FieldClass::Decided},
+    {"info_simple_float", 4, 0x20000, FieldClass::NotNeeded},
+    {"info_round_mode", 4, 0x40000, FieldClass::Decided},
+    {"info_unused_bits", 4, 0x7ff80000, FieldClass::NotNeeded},
+    {"info_alt_tile_mode", 4, 0x80000000, FieldClass::NotDecidable},
+    {"attrib_tile_mode", 5, 0x1f, FieldClass::Decided},
+    {"attrib_fmask_bits", 5, 0xfe0, FieldClass::NotNeeded},
+    {"attrib_num_samples_log2", 5, 0x7000, FieldClass::NotNeeded},
+    {"attrib_num_fragments_log2", 5, 0x18000, FieldClass::Decided},
+    {"attrib_force_dst_alpha_1", 5, 0x20000, FieldClass::NotNeeded},
+    {"pad0", 6, Full, FieldClass::NotNeeded},
+    {"cmask_base", 7, Full, FieldClass::Decided},
+    {"cmask_slice", 8, Full, FieldClass::NotNeeded},
+    {"fmask_base", 9, Full, FieldClass::NotDecidable},
+    {"fmask_slice", 10, Full, FieldClass::NotDecidable},
+    {"clear_word0", 11, Full, FieldClass::Decided},
+    {"clear_word1", 12, Full, FieldClass::Decided},
+    {"pad1", 13, Full, FieldClass::NotNeeded},
+    {"pad1b", 14, Full, FieldClass::NotNeeded},
+};
+constexpr u32 NumColourFields = sizeof(ColourFields) / sizeof(ColourFields[0]);
+
+constexpr FieldDef DepthFields[] = {
+    {"z_format", 0, 0x3, FieldClass::Decided},
+    {"z_num_samples", 0, 0xc, FieldClass::Decided},
+    {"z_tile_mode", 0, 0x700000, FieldClass::Decided},
+    {"z_tile_surface_enable", 0, 0x20000000, FieldClass::Decided},
+    {"z_info_other", 0, ~(0x3u | 0xcu | 0x700000u | 0x20000000u), FieldClass::NotNeeded},
+    {"stencil_format", 1, 0x1, FieldClass::Decided},
+    {"stencil_tile_surface_enable", 1, 0x20000000, FieldClass::Decided},
+    {"stencil_info_other", 1, ~(0x1u | 0x20000000u), FieldClass::NotNeeded},
+    {"z_read_base", 2, Full, FieldClass::Decided},
+    {"stencil_read_base", 3, Full, FieldClass::Decided},
+    {"z_write_base", 4, Full, FieldClass::Decided},
+    {"stencil_write_base", 5, Full, FieldClass::Decided},
+    {"depth_pitch", 6, 0x7ff, FieldClass::Decided},
+    {"depth_height", 6, 0x3ff800, FieldClass::Decided},
+    {"depth_size_other", 6, ~0x3fffffu, FieldClass::NotNeeded},
+    {"depth_slice_size", 7, 0x3fffff, FieldClass::Decided},
+    {"view_slice_start", 8, 0x7ff, FieldClass::Decided},
+    {"view_slice_max", 8, 0x7ff << 13, FieldClass::Decided},
+    {"view_read_only_bits", 8, ~(0x7ffu | (0x7ffu << 13)), FieldClass::NotNeeded},
+    {"htile_base", 9, Full, FieldClass::Decided},
+    {"depth_clear", 10, Full, FieldClass::Decided},
+    {"stencil_clear", 11, Full, FieldClass::Decided},
+};
+constexpr u32 NumDepthFields = sizeof(DepthFields) / sizeof(DepthFields[0]);
+
+enum Path : u32 { PathFill, PathDepthClear, PathEliminate, NumPaths };
+constexpr const char* PathNames[NumPaths] = {"fill_point", "depth_clear", "eliminate"};
+
+struct FieldCounters {
+    std::atomic<u64> used{0};          ///< the description decided the field (all its bits)
+    std::atomic<u64> register_only{0}; ///< the register decode was the only source
+    std::atomic<u64> differs{0};       ///< the description's value is not the register decode's
+    std::atomic<u64> prebuilt{0};      ///< ... of `used`, the source was the resource's prebuilt block
+    std::atomic<u64> call_colour{0};   ///< ... of `used`, the source was the clear call's colour
+};
+
+struct PathCounters {
+    std::array<FieldCounters, NumColourFields> colour;
+    std::array<FieldCounters, NumDepthFields> depth;
+    std::atomic<u64> applied_colour{0}, applied_depth{0}, native_without_register{0}, register_without_native{0}, no_set{0}, targets_differing{0};
+};
+
+PathCounters g_path[NumPaths];
+std::atomic<u64> g_sets_built{0}, g_sets_overflow{0}, g_sets_reused{0}, g_object_not_found[NumPaths]{};
+std::atomic<u64> g_mip_above_0_registers{0}, g_view_unknown_range{0}, g_pitch_not_representable{0};
+thread_local const TargetSet* t_scope = nullptr;
+
+bool ReadUseSwitch(const char* name) {
+    const char* e = std::getenv(name);
+    return e != nullptr && *e == '1';
+}
+
+u32 Log2Samples(u32 samples, bool& ok) {
+    ok = samples == 1 || samples == 2 || samples == 4 || samples == 8;
+    return samples == 8 ? 3 : samples == 4 ? 2 : samples == 2 ? 1 : 0;
+}
+
+/// A colour target's description, from the view (null: the whole resource, mip 0) and its resource
+bool BuildColour(u64 view, u64 resource, std::array<WordOverride, ColourWords>& w) {
+    const u64 resource_id = resource != 0 ? Rd<u64>(resource, 0x10) : 0;
+    NativeDevice::Object res;
+    if (resource_id == 0 || !NativeDevice::Lookup(resource_id, res)) {
+        return false;
+    }
+    Range range;
+    if (view != 0) {
+        range = ReadRange(view, false, res);
+    } else {
+        range.count = std::max<u32>(res.kind == NativeDevice::Kind::Texture3D ? res.depth : res.layers, 1);
+    }
+    const u32 samples = std::max<u32>(res.kind == NativeDevice::Kind::Texture2D ? Rd<u32>(resource, 0x194) : 1, 1);
+    AmdGpu::Image t{};
+    std::memcpy(&t, reinterpret_cast<const void*>(resource + 0x70), sizeof(t));
+    AmdGpu::Image image{};
+    const auto derived = NativeImageDesc::Derive(resource_id, view != 0 ? Rd<u64>(view, 0x10) : 0, image) == NativeImageDesc::Result::Derived;
+    const u64 cmask = Rd<u64>(resource, 0x58);
+    const bool mip0 = range.mip == 0;
+    if (!mip0) {
+        g_mip_above_0_registers.fetch_add(1, std::memory_order_relaxed);
+    }
+    // geometry and addresses: the mip 0 block of the engine (a mip above 0 is recomputed by the SDK from the T#: no engine source, the registers keep it)
+    if (mip0) {
+        SetBits(w[0], Full, static_cast<u32>(res.address >> 8));
+        const u32 pitch_pixels = static_cast<u32>(t.pitch) + 1;
+        if (pitch_pixels % 8 == 0 && pitch_pixels / 8 - 1 <= 0x7ff) {
+            SetBits(w[1], 0x7ff, pitch_pixels / 8 - 1);
+        } else {
+            g_pitch_not_representable.fetch_add(1, std::memory_order_relaxed);
+        }
+        SetPrebuilt(w[2], 0x3fffff, Rd<u32>(resource, 0xb0 + 2 * 4)); // the tile aligned slice size: the engine's prebuilt value
+        SetBits(w[7], Full, static_cast<u32>(cmask >> 8));
+        if (Rd<u32>(resource, 0x14c) != 0) {
+            SetCall(w[11], Full, Rd<u32>(resource, 0x150)); // the colour the engine's clear call packed
+            SetCall(w[12], Full, Rd<u32>(resource, 0x154));
+        } else {
+            SetPrebuilt(w[11], Full, Rd<u32>(resource, 0xdc));
+            SetPrebuilt(w[12], Full, Rd<u32>(resource, 0xe0));
+        }
+    }
+    if (range.known && range.first <= 0x7ff && range.first + std::max<u32>(range.count, 1) - 1 <= 0x7ff) {
+        SetBits(w[3], 0x7ff, range.first);
+        SetBits(w[3], 0x7ff << 13, (range.first + std::max<u32>(range.count, 1) - 1) << 13);
+    } else {
+        g_view_unknown_range.fetch_add(1, std::memory_order_relaxed);
+    }
+    // the info word (FUN_0246a420)
+    u32 info_mask = 0, info_value = 0;
+    const u32 t_data = static_cast<u32>(t.data_format), t_num = static_cast<u32>(t.num_format);
+    const u32 t_dst = static_cast<u32>(t.dst_sel_x) | static_cast<u32>(t.dst_sel_y) << 3 | static_cast<u32>(t.dst_sel_z) << 6 | static_cast<u32>(t.dst_sel_w) << 9;
+    if (t_data <= 31) {
+        info_mask |= 0x7c;
+        info_value |= t_data << 2;
+    }
+    u32 number_type = 0;
+    if (NumberTypeOf(t_num, number_type)) {
+        const bool clamp = number_type == 0 || number_type == 1 || number_type == 6;
+        info_mask |= 0x700 | 0x8000 | 0x10000 | 0x40000;
+        info_value |= number_type << 8 | (clamp ? 0x8000u : 0u) | ((number_type == 4 || number_type == 5) ? 0x10000u : 0u) | (clamp ? 0u : 0x40000u);
+    }
+    u32 swap = 0;
+    bool ambiguous = false;
+    if (CompSwapOf(t_data, t_dst, swap, ambiguous)) {
+        info_mask |= 0x1800;
+        info_value |= swap << 11;
+    }
+    info_mask |= 0x2000;
+    info_value |= cmask != 0 ? 0x2000u : 0u;
+    SetBits(w[4], info_mask, info_value);
+    // the attribute word
+    u32 tile = 0xffffffffu;
+    if ((res.bind & DisplayBindFlag) != 0) {
+        tile = DisplayTiling;
+    } else if (derived) {
+        tile = static_cast<u32>(image.tiling_index);
+    } else {
+        tile = static_cast<u32>(t.tiling_index);
+    }
+    if (tile < 32) {
+        SetBits(w[5], 0x1f, tile);
+    }
+    bool samples_ok = false;
+    const u32 samples_log2 = Log2Samples(samples, samples_ok);
+    if (samples_ok) {
+        SetBits(w[5], 0x18000, samples_log2 << 15);
+    }
+    return true;
+}
+
+/// A depth target's description, from the view (null: the whole resource, mip 0) and its resource
+bool BuildDepth(u64 view, u64 resource, std::array<WordOverride, DepthWords>& w) {
+    const u64 resource_id = resource != 0 ? Rd<u64>(resource, 0x10) : 0;
+    NativeDevice::Object res;
+    if (resource_id == 0 || !NativeDevice::Lookup(resource_id, res)) {
+        return false;
+    }
+    Range range;
+    if (view != 0) {
+        range = ReadRange(view, true, res);
+    } else {
+        range.count = std::max<u32>(res.layers, 1);
+    }
+    const u32 dimension = view != 0 ? Rd<u32>(view, 0x44) : 0;
+    const u32 samples = std::max<u32>(res.kind == NativeDevice::Kind::Texture2D ? Rd<u32>(resource, 0x194) : 1, 1);
+    AmdGpu::Image t{};
+    std::memcpy(&t, reinterpret_cast<const void*>(resource + 0x70), sizeof(t));
+    const u64 htile = Rd<u64>(resource, 0x48);
+    const bool mip0 = range.mip == 0;
+    if (!mip0) {
+        g_mip_above_0_registers.fetch_add(1, std::memory_order_relaxed);
+    }
+    u32 z_format = 0;
+    bool stencil = false;
+    const bool known = ExpectedDepth(view != 0 ? Rd<u32>(view, 0x40) : 0, res.format, z_format, stencil);
+    if (known) {
+        SetBits(w[0], 0x3, z_format);
+        SetBits(w[1], 0x1, stencil ? 1u : 0u);
+    }
+    bool samples_ok = false;
+    const u32 samples_log2 = Log2Samples(samples, samples_ok);
+    if (samples_ok) {
+        SetBits(w[0], 0xc, samples_log2 << 2);
+    }
+    if (t.tiling_index < 8) {
+        SetBits(w[0], 0x700000, static_cast<u32>(t.tiling_index) << 20);
+    }
+    SetBits(w[0], 0x20000000, htile != 0 ? 0x20000000u : 0u);
+    SetBits(w[1], 0x20000000, htile != 0 ? 0x20000000u : 0u);
+    if (mip0) {
+        SetBits(w[2], Full, static_cast<u32>(res.address >> 8));
+        SetBits(w[4], Full, static_cast<u32>(res.address >> 8));
+        if (known && stencil) {
+            const u32 stencil_base = static_cast<u32>(Rd<u64>(resource, 0x40) >> 8);
+            SetBits(w[3], Full, stencil_base);
+            SetBits(w[5], Full, stencil_base);
+        }
+        const u32 pitch_pixels = static_cast<u32>(t.pitch) + 1;
+        if (pitch_pixels % 8 == 0 && pitch_pixels / 8 - 1 <= 0x7ff) {
+            SetBits(w[6], 0x7ff, pitch_pixels / 8 - 1);
+        } else {
+            g_pitch_not_representable.fetch_add(1, std::memory_order_relaxed);
+        }
+        SetPrebuilt(w[6], 0x3ff800, Rd<u32>(resource, 0xf0 + 6 * 4)); // the tile aligned height and slice size: the engine's prebuilt block
+        SetPrebuilt(w[7], 0x3fffff, Rd<u32>(resource, 0xf0 + 7 * 4));
+    }
+    if (range.known) {
+        Range expected = range;
+        if (dimension == 3 && mip0) {
+            expected.first = 0;
+            expected.count = std::max<u32>(res.layers, 1);
+        }
+        const u32 last = expected.first + std::max<u32>(expected.count, 1) - 1;
+        if (expected.first <= 0x7ff && last <= 0x7ff) {
+            SetBits(w[8], 0x7ff, expected.first);
+            SetBits(w[8], 0x7ff << 13, last << 13);
+        }
+    } else {
+        g_view_unknown_range.fetch_add(1, std::memory_order_relaxed);
+    }
+    SetBits(w[9], Full, static_cast<u32>(htile >> 8));
+    if (htile != 0) {
+        SetBits(w[10], Full, Rd<u32>(resource, 0x158));
+        SetBits(w[11], Full, static_cast<u32>(Rd<u8>(resource, 0x15c)));
+    }
+    return true;
+}
+
+u64 HashSet(const TargetSet& set) {
+    Hasher h;
+    const auto add = [&](const WordOverride& w) {
+        h.Add(w.value);
+        h.Add(w.mask);
+        h.Add(w.prebuilt);
+        h.Add(w.call);
+    };
+    for (u32 i = 0; i < 8; ++i) {
+        h.Add(set.colour_valid[i] ? 1 : 0);
+        if (set.colour_valid[i]) {
+            for (const auto& w : set.colour[i]) {
+                add(w);
+            }
+        }
+    }
+    h.Add(set.depth_valid ? 1 : 0);
+    if (set.depth_valid) {
+        for (const auto& w : set.depth) {
+            add(w);
+        }
+    }
+    return h.h | 1;
+}
+
+std::mutex g_set_mutex;
+std::map<u64, std::unique_ptr<TargetSet>> g_sets;
+
+/// Equal descriptions share one immutable set (the pointer travels with the records)
+const TargetSet* Intern(const TargetSet& set) {
+    const u64 hash = HashSet(set);
+    std::scoped_lock lock{g_set_mutex};
+    if (const auto it = g_sets.find(hash); it != g_sets.end()) {
+        g_sets_reused.fetch_add(1, std::memory_order_relaxed);
+        return it->second.get();
+    }
+    if (g_sets.size() >= 4096) {
+        g_sets_overflow.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    g_sets_built.fetch_add(1, std::memory_order_relaxed);
+    return g_sets.emplace(hash, std::make_unique<TargetSet>(set)).first->second.get();
+}
+
+/// One dword group: the register decode `reg` (read and, when not verifying, written back) merged with the description `over`; counted per field of `fields`
+template <size_t N>
+bool Merge(u32* reg, const std::array<WordOverride, N>& over, const FieldDef* fields, u32 field_count, FieldCounters* counters, bool verify, const u32* linear_general_word) {
+    bool differs = false;
+    u32 merged[N];
+    for (u32 i = 0; i < N; ++i) {
+        u32 mask = over[i].mask;
+        if (linear_general_word != nullptr && i == 3 && (*linear_general_word & 0x80) != 0) {
+            mask &= ~0x7ffu; // a linear general target keeps address bits in slice_start: the registers decide
+        }
+        merged[i] = (reg[i] & ~mask) | (over[i].value & mask);
+    }
+    for (u32 f = 0; f < field_count; ++f) {
+        const FieldDef& def = fields[f];
+        const u32 covered = over[def.word].mask;
+        if ((def.mask & ~covered) != 0 || (def.word == 3 && linear_general_word != nullptr && (*linear_general_word & 0x80) != 0 && (def.mask & 0x7ff) != 0)) {
+            counters[f].register_only.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        counters[f].used.fetch_add(1, std::memory_order_relaxed);
+        if ((over[def.word].prebuilt & def.mask) != 0) {
+            counters[f].prebuilt.fetch_add(1, std::memory_order_relaxed);
+        }
+        if ((over[def.word].call & def.mask) != 0) {
+            counters[f].call_colour.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (((reg[def.word] ^ merged[def.word]) & def.mask) != 0) {
+            counters[f].differs.fetch_add(1, std::memory_order_relaxed);
+            differs = true;
+        }
+    }
+    if (!verify) {
+        std::memcpy(reg, merged, sizeof(merged));
+    }
+    return differs;
+}
+
+bool ColourBound(const AmdGpu::ColorBuffer& cb) {
+    return cb.base_address != 0 && cb.info.format != 0;
+}
+
+void ApplyColour(Vulkan::DrawInputs& inputs, const TargetSet& set, Path path, u32 first_slot, u32 last_slot) {
+    PathCounters& pc = g_path[path];
+    const bool verify = VerifyOn();
+    for (u32 slot = first_slot; slot <= last_slot; ++slot) {
+        AmdGpu::ColorBuffer& cb = inputs.color_buffers[slot];
+        const bool bound = ColourBound(cb);
+        if (!set.colour_valid[slot]) {
+            if (bound) {
+                pc.register_without_native.fetch_add(1, std::memory_order_relaxed);
+            }
+            continue;
+        }
+        if (!bound) {
+            pc.native_without_register.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        u32 words[ColourWords];
+        std::memcpy(words, &cb, sizeof(words));
+        const u32 info = words[4];
+        pc.applied_colour.fetch_add(1, std::memory_order_relaxed);
+        if (Merge<ColourWords>(words, set.colour[slot], ColourFields, NumColourFields, pc.colour.data(), verify, &info)) {
+            pc.targets_differing.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!verify) {
+            std::memcpy(&cb, words, sizeof(words));
+        }
+    }
+}
+
+void ApplyDepth(Vulkan::DrawInputs& inputs, const TargetSet& set, Path path) {
+    PathCounters& pc = g_path[path];
+    const bool verify = VerifyOn();
+    const bool bound = inputs.depth_buffer.DepthValid() || inputs.depth_buffer.StencilValid();
+    if (!set.depth_valid) {
+        if (bound) {
+            pc.register_without_native.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    if (!bound) {
+        pc.native_without_register.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    u32 words[DepthWords];
+    std::memcpy(words, &inputs.depth_buffer, 8 * sizeof(u32));
+    std::memcpy(&words[8], &inputs.depth_view, sizeof(u32));
+    std::memcpy(&words[9], &inputs.depth_htile_data_base, sizeof(u32));
+    std::memcpy(&words[10], &inputs.depth_clear, sizeof(u32));
+    words[11] = inputs.stencil_clear;
+    pc.applied_depth.fetch_add(1, std::memory_order_relaxed);
+    if (Merge<DepthWords>(words, set.depth, DepthFields, NumDepthFields, pc.depth.data(), verify, nullptr)) {
+        pc.targets_differing.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!verify) {
+        std::memcpy(&inputs.depth_buffer, words, 8 * sizeof(u32));
+        std::memcpy(&inputs.depth_view, &words[8], sizeof(u32));
+        std::memcpy(&inputs.depth_htile_data_base, &words[9], sizeof(u32));
+        std::memcpy(&inputs.depth_clear, &words[10], sizeof(u32));
+        inputs.stencil_clear = words[11];
+    }
+}
+
+/// The depth clear function's `target`: the view's block (dsv + 0x58) or the resource's prebuilt block (resource + 0xf0); found by address and checked against the engine's table
+bool ResolveDepthTarget(u64 target, u64& view, u64& resource) {
+    NativeDevice::Object object;
+    const u64 as_view = target - 0x58;
+    if (NativeDevice::Lookup(Rd<u64>(as_view, 0x10), object) && object.object == as_view && object.kind == NativeDevice::Kind::DepthStencilView) {
+        view = as_view;
+        resource = Rd<u64>(as_view, 0x30);
+        return true;
+    }
+    const u64 as_resource = target - 0xf0;
+    if (NativeDevice::Lookup(Rd<u64>(as_resource, 0x10), object) && object.object == as_resource && object.kind == NativeDevice::Kind::Texture2D) {
+        view = 0;
+        resource = as_resource;
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
+bool UseOn() noexcept {
+    static const bool on = ReadUseSwitch("TLG_TARGET_DESC_USE") || ReadUseSwitch("TLG_TARGET_DESC_USE_VERIFY");
+    return on;
+}
+
+bool VerifyOn() noexcept {
+    static const bool on = ReadUseSwitch("TLG_TARGET_DESC_USE_VERIFY");
+    return on;
+}
+
+const TargetSet* PrepareDraw(u64 ctx) {
+    if (!UseOn()) {
+        return nullptr;
+    }
+    static thread_local u64 last_signature = 0;
+    static thread_local const TargetSet* last_set = nullptr;
+    const u32 count = Rd<u32>(ctx, CtxRenderTargetCount);
+    std::array<u64, NumSlots> views{};
+    Hasher signature;
+    for (u32 slot = 0; slot < NumSlots; ++slot) {
+        const bool depth = slot == 8;
+        u64 view = 0;
+        if (depth) {
+            view = Rd<u64>(ctx, CtxDepthStencilView);
+        } else if (slot == 7) {
+            view = Rd<u64>(ctx, CtxRenderTarget7);
+        } else if (slot < count) {
+            view = Rd<u64>(ctx, CtxRenderTargets + slot * 8);
+        }
+        views[slot] = view;
+        signature.Add(view);
+        if (view != 0) {
+            signature.Add(TargetHash(view, depth));
+        }
+    }
+    const u64 key = signature.h | 1;
+    if (key == last_signature) {
+        return last_set;
+    }
+    TargetSet set{};
+    for (u32 slot = 0; slot < 8; ++slot) {
+        if (views[slot] != 0) {
+            const u64 resource = Rd<u64>(views[slot], 0x30);
+            set.colour_valid[slot] = resource != 0 && Rd<u32>(views[slot] + 0x54, 0) != 0 && BuildColour(views[slot], resource, set.colour[slot]);
+        }
+    }
+    if (views[8] != 0) {
+        const u64 block = views[8] + 0x58;
+        const u64 resource = Rd<u64>(views[8], 0x30);
+        set.depth_valid = resource != 0 && (Rd<u32>(block, 8 * 4) != 0 || Rd<u32>(block, 12 * 4) != 0) && BuildDepth(views[8], resource, set.depth);
+    }
+    last_set = Intern(set);
+    last_signature = key;
+    return last_set;
+}
+
+const TargetSet* PrepareEliminate(u64 resource) {
+    if (!UseOn()) {
+        return nullptr;
+    }
+    TargetSet set{};
+    set.colour_valid[0] = BuildColour(0, resource, set.colour[0]);
+    if (!set.colour_valid[0]) {
+        g_object_not_found[PathEliminate].fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    return Intern(set);
+}
+
+const TargetSet* PrepareDepthClear(u64 target) {
+    if (!UseOn()) {
+        return nullptr;
+    }
+    u64 view = 0, resource = 0;
+    TargetSet set{};
+    if (!ResolveDepthTarget(target, view, resource) || resource == 0 || !BuildDepth(view, resource, set.depth)) {
+        g_object_not_found[PathDepthClear].fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    set.depth_valid = true;
+    return Intern(set);
+}
+
+Scope::Scope(const TargetSet* set) : previous{t_scope} {
+    t_scope = set;
+}
+
+Scope::~Scope() {
+    t_scope = previous;
+}
+
+void ApplyAtFill(Vulkan::DrawInputs& inputs) {
+    if (!UseOn()) {
+        return;
+    }
+    const TargetSet* set = t_scope;
+    if (set == nullptr) {
+        g_path[PathFill].no_set.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    ApplyColour(inputs, *set, PathFill, 0, 7);
+    ApplyDepth(inputs, *set, PathFill);
+}
+
+void ApplyDepthClear(Vulkan::DrawInputs& inputs, const TargetSet* set) {
+    if (!UseOn()) {
+        return;
+    }
+    if (set == nullptr) {
+        g_path[PathDepthClear].no_set.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    ApplyDepth(inputs, *set, PathDepthClear);
+}
+
+void ApplyEliminate(Vulkan::DrawInputs& inputs, const TargetSet* set) {
+    if (!UseOn()) {
+        return;
+    }
+    if (set == nullptr) {
+        g_path[PathEliminate].no_set.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    ApplyColour(inputs, *set, PathEliminate, 0, 0);
+}
+
+namespace {
+
+nlohmann::json UseReport() {
+    nlohmann::json j;
+    j["use"] = UseOn();
+    j["verify"] = VerifyOn();
+    j["sets_built"] = g_sets_built.load();
+    j["sets_reused_by_content"] = g_sets_reused.load();
+    j["sets_overflow"] = g_sets_overflow.load();
+    j["targets_above_mip_0_with_register_geometry"] = g_mip_above_0_registers.load();
+    j["pitch_not_representable"] = g_pitch_not_representable.load();
+    j["view_range_unknown"] = g_view_unknown_range.load();
+    const auto fields_json = [](const auto& defs, u32 count, const auto& counters) {
+        nlohmann::json out = nlohmann::json::object();
+        for (u32 f = 0; f < count; ++f) {
+            const auto& c = counters[f];
+            const u64 used = c.used.load(), only = c.register_only.load();
+            if (used == 0 && only == 0) {
+                continue;
+            }
+            const char* cls = defs[f].cls == FieldClass::Decided ? "decided" : defs[f].cls == FieldClass::NotNeeded ? "not_needed" : "not_decidable";
+            out[defs[f].name] = {{"class", cls}, {"description_used", used}, {"register_only", only}, {"differs_from_registers", c.differs.load()},
+                                 {"source_prebuilt_block", c.prebuilt.load()}, {"source_clear_call_colour", c.call_colour.load()}};
+        }
+        return out;
+    };
+    for (u32 p = 0; p < NumPaths; ++p) {
+        const PathCounters& pc = g_path[p];
+        auto& section = j[PathNames[p]];
+        section["colour_targets_applied"] = pc.applied_colour.load();
+        section["depth_targets_applied"] = pc.applied_depth.load();
+        section["targets_differing_from_registers"] = pc.targets_differing.load();
+        section["description_without_registers"] = pc.native_without_register.load();
+        section["registers_without_description"] = pc.register_without_native.load();
+        section["no_set_for_the_record"] = pc.no_set.load();
+        section["object_not_found"] = g_object_not_found[p].load();
+        section["colour_fields"] = fields_json(ColourFields, NumColourFields, pc.colour);
+        section["depth_fields"] = fields_json(DepthFields, NumDepthFields, pc.depth);
+    }
+    return j;
+}
+
+} // namespace
+
 nlohmann::json Report() {
     nlohmann::json j;
     j["enabled"] = Enabled();
@@ -881,6 +1540,7 @@ nlohmann::json Report() {
     j["colour"]["number_type_not_in_the_constant_table"] = g_number_type_unknown.load();
     j["colour"]["comp_swap_rule_unmatched"] = g_comp_swap_rule_unmatched.load();
     j["colour"]["comp_swap_rule_ambiguous"] = g_comp_swap_rule_ambiguous.load();
+    j["feeds_the_draw"] = UseReport();
     j["tuple_overflow"] = g_tuple_overflow.load();
     j["shape_overflow"] = g_shape_overflow.load();
 

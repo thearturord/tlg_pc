@@ -1115,6 +1115,8 @@ struct NativeRecord {
     u32 cb_extent_mask{};
     u32 db_extent{};
     std::array<u64, 9> target_resources{}; ///< E3: engine ids of the resources behind the bound render target views (0..7) and the depth view (8); 0: none
+    const Core::NativeTargetDesc::TargetSet* native_targets{}; ///< E7 (TLG_TARGET_DESC_USE): valid when `native_targets_seq` is this record's number
+    u64 native_targets_seq{};
     u64 args_addr{};      ///< indirect draws: the argument buffer
     u64 extra_addr{};     ///< copy records: the source address
     u32 vertex_sgpr{};    ///< indirect draws: user data registers that receive the base vertex / start instance
@@ -3022,6 +3024,10 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     if (kind <= 2 && Core::NativeTargetDesc::Enabled()) {
         Core::NativeTargetDesc::Observe(ctx); // E7 Task 2: shadow only, compares the target blocks with the engine's objects
     }
+    if (kind <= 2 && Core::NativeTargetDesc::UseOn()) {
+        slot.native_targets = Core::NativeTargetDesc::PrepareDraw(ctx); // E7 (TLG_TARGET_DESC_USE): the description travels with the record
+        slot.native_targets_seq = seq;
+    }
     mr.Mark(1);
     slot.fixed = nullptr;
     if (kind <= 2 && Fixed::Enabled()) {
@@ -4738,6 +4744,7 @@ static bool TakeExecDrawImpl(u64 seq, ExecDraw& out, bool typed, bool allow_lazy
     out.cb_extent_mask = slot.cb_extent_mask;
     out.db_extent = slot.db_extent;
     out.target_resources = slot.target_resources;
+    out.native_targets = slot.native_targets_seq == seq ? slot.native_targets : nullptr;
     out.has_extents = slot.kind != 3;
     out.cb_extents_only = slot.kind == 4;
     out.instance_sgpr = slot.instance_sgpr;
@@ -5032,6 +5039,8 @@ bool EmitFastClearEliminate(u64 ctx, u64 resource) {
     slot.cb_extent_mask = 1;
     slot.target_resources = {}; // E3: the eliminate's target is the resource itself (the ring slot may hold the ids of an earlier draw)
     slot.target_resources[0] = Rd<u64>(resource, 0x10);
+    slot.native_targets = Core::NativeTargetDesc::UseOn() ? Core::NativeTargetDesc::PrepareEliminate(resource) : nullptr; // E7 (TLG_TARGET_DESC_USE)
+    slot.native_targets_seq = seq;
     slot.seq.store(seq, std::memory_order_release);
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
     words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8);
@@ -7737,6 +7746,8 @@ bool ConvertClearQuad(u64 target, u64 start, u64 begin, u64 end, u64 caller, con
     slot.cb_extent = {};
     slot.cb_extent_mask = 0;
     slot.db_extent = Rd<u32>(target, 0x30);
+    slot.native_targets = Core::NativeTargetDesc::UseOn() ? Core::NativeTargetDesc::PrepareDepthClear(target) : nullptr; // E7 (TLG_TARGET_DESC_USE)
+    slot.native_targets_seq = seq;
     slot.seq.store(seq, std::memory_order_release);
     u32 words[TagDwords];
     words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8);

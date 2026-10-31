@@ -37,6 +37,7 @@
 #include "native/native_frame_events.h"
 #include "native/native_flip.h"
 #include "native/native_shader_env.h"
+#include "native/native_target_desc.h"
 #include "native/native_display.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/liverpool_internal.h"
@@ -344,6 +345,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             }
         }
         auto clear_inputs = Vulkan::MakeDrawInputs(exec_state);
+        Core::NativeTargetDesc::ApplyDepthClear(clear_inputs, draw.native_targets); // E7 (TLG_TARGET_DESC_USE)
         Core::NativeDraw::Live().state_planned.fetch_add(1, std::memory_order_relaxed);
         RasterRun(
             [this, extent = draw.db_extent, inputs = std::move(clear_inputs)] {
@@ -600,6 +602,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         const auto make_candidate = [&] {
             // E1c: the shader objects of the draw, for the comparison of the translator's input with the one derived from them
             Core::NativeShaderEnv::Scope shader_env{draw.vs_gnm, draw.ps_gnm, draw.fetch_object};
+            Core::NativeTargetDesc::Scope target_desc{draw.native_targets}; // E7 (TLG_TARGET_DESC_USE): PlanDraw applies the record's target description to the inputs it makes
             return rasterizer->PlanDraw(exec_state, params, native_fixed, native_fixed_stale, native_fixed_verify, native_exec_key, native_inputs_key);
         };
         auto candidate = make_candidate();

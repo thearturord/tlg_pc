@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
+#include "native/native_target_desc.h"
 #include "native/native_light_recorder.h"
 #include "native/native_untracked_ring.h"
 #include "native/native_audit.h"
@@ -495,6 +496,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
         plan->fixed = MakeFixedState(regs);
     }
     plan->inputs = MakeDrawInputs(regs);
+    Core::NativeTargetDesc::ApplyAtFill(plan->inputs); // E7 (TLG_TARGET_DESC_USE): the engine's objects decide the target part, the registers keep the rest
     if (inputs_key != 0 && plan->executed) {
         exec_inputs.insert_or_assign(inputs_key, plan->inputs);
     }
