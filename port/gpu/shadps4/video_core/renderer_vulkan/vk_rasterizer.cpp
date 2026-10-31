@@ -10,6 +10,7 @@
 #endif
 #include "common/debug.h"
 #include "native/native_debug_server.h"
+#include "native/native_e3_census.h"
 #include "native/native_config.h"
 #include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "native/native_hooks.h"
@@ -2271,7 +2272,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set,
             continue;
         }
         texture_cache.TouchFoundImage(entry.found);
-        texture_cache.UpdateImage(entry.id);
+        texture_cache.UpdateImage(entry.id, Core::NativeE3Census::Caller::RasterizerBindTextures);
     }
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];
@@ -3048,7 +3049,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
             image = &texture_cache.GetImage(image_id);
         }
-        texture_cache.UpdateImage(image_id);
+        texture_cache.UpdateImage(image_id, Core::NativeE3Census::Caller::RasterizerBeginRendering);
         runtime.SetBackingSamples(image, key.color_samples[cb]);
         Core::NativeDevice::CheckTarget(false, image->info.guest_address, image->info.size.width, image->info.size.height); // B4 census
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
@@ -3448,7 +3449,7 @@ bool Rasterizer::TryCopyImages(VAddr dst, VAddr src, u32 num_bytes) {
     }
     // images at the destination's address in other formats are stale afterwards
     texture_cache.InvalidateMemoryFromGPU(dst, num_bytes, "an image copy");
-    texture_cache.UpdateImage(src_id);
+    texture_cache.UpdateImage(src_id, Core::NativeE3Census::Caller::RasterizerTryCopyImages);
     runtime.CopyImage(&source, &destination);
     destination.flags |= VideoCore::ImageFlagBits::GpuModified;
     destination.flags &= ~VideoCore::ImageFlagBits::Dirty;
