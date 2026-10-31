@@ -23,7 +23,6 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
-#include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/buffer_cache/readback_batch.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "native/native_readback_policy.h"
@@ -68,7 +67,6 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_},
       staging_pool{runtime_.GetStagingPool()}, liverpool{liverpool_},
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
-      memory_tracker{std::make_unique<MemoryTracker>()},
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       stream_reuse_enabled{EmulatorSettings.IsReadbackStreamReuseEnabled()} {
@@ -94,7 +92,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
         MarkBuffersChanged(device_addr, size, false, nullptr);
     }
     // E4: no GPU bytes are flushed to guest memory here (the fault readback is gone: no page is ever made unreadable)
-    memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+    cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
@@ -111,16 +109,11 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
         MarkBuffersChanged(address, size, true, &gaps);
         u64 marked = 0;
         for (const auto& [a, e] : gaps) {
-            memory_tracker->MarkRegionAsCpuModified(a, e - a);
             marked += e - a;
         }
+        cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
         if (marked < size) {
             Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9TrackerMarksSkipped);
-        }
-    } else {
-        memory_tracker->MarkRegionAsCpuModified(address, size);
-        if (Core::NativeUpdates::B9BufferMode() != 0) {
-            MarkBuffersChanged(address, size, true, nullptr);
         }
     }
     const u32 b8 = Core::NativeUpdates::B8ImageMode();
@@ -488,7 +481,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
         }
         const u64 hash = (device_addr * 0x9E3779B97F4A7C15ull) ^ (u64(size) * 0xC2B2AE3D27D4EB4Full) ^ (is_written ? 0x55 : 0);
         memo = &obtain_memo[(hash >> 20) & (ObtainMemoSlots - 1)];
-        epoch_before = memory_tracker->Epoch() + range_epoch.load(std::memory_order_acquire) + b9_epoch.load(std::memory_order_acquire);
+        epoch_before = cpu_epoch.load(std::memory_order_acquire) + range_epoch.load(std::memory_order_acquire) + b9_epoch.load(std::memory_order_acquire);
         if (memo->addr == device_addr && memo->size == size && memo->flags == (is_written ? 1u : 0u) &&
             memo->epoch == epoch_before && memo->tick == scheduler.CurrentTick()) {
             Core::NativeResources::NoteBufferRequest(device_addr, size, is_written,
@@ -653,54 +646,10 @@ const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanni
     return Place(std::move(ids), lo, hi);
 }
 
-namespace {
-/// E4 (`TLG_E4_QUERIES=0` turns it off): memory no engine buffer answers for is answered by the announced and GPU written bytes, not by the page tracker
-bool E4NativeQueries() {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_E4_QUERIES");
-        return e == nullptr || *e != '0'; // default on (owner play pending 2026-10-31); =0 is the way back
-    }();
-    return on;
-}
-bool E4Census() {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_E4_QUERY_CENSUS");
-        return e == nullptr || *e != '0'; // counts the disagreements between the tracker and the announced / GPU written bytes
-    }();
-    return on || E4NativeQueries();
-}
-} // namespace
-
-bool BufferCache::TrackerCpuQuery(VAddr addr, size_t size) {
-    const bool tracker_says = memory_tracker->IsRegionCpuModified(addr, size);
-    if (E4Census()) {
-        bool native_says;
-        {
-            std::scoped_lock lock{object_dirty_mutex};
-            native_says = all_object_dirty.Intersects(addr, size) || b9_unattributed.Intersects(addr, size);
-        }
-        Core::NativeUpdates::NoteB9(tracker_says == native_says ? Core::NativeUpdates::E4QCpuAgree
-                                    : tracker_says              ? Core::NativeUpdates::E4QCpuTrackerOnly
-                                                                : Core::NativeUpdates::E4QCpuNativeOnly);
-        return E4NativeQueries() ? native_says : tracker_says;
-    }
-    return tracker_says;
-}
-
-bool BufferCache::TrackerGpuQuery(VAddr addr, size_t size) {
-    const bool tracker_says = memory_tracker->IsRegionGpuModified(addr, size);
-    if (E4Census()) {
-        bool native_says;
-        {
-            std::shared_lock lock{gpu_ranges_mutex};
-            native_says = gpu_modified_ranges.Intersects(addr, size);
-        }
-        Core::NativeUpdates::NoteB9(tracker_says == native_says ? Core::NativeUpdates::E4QGpuAgree
-                                    : tracker_says              ? Core::NativeUpdates::E4QGpuTrackerOnly
-                                                                : Core::NativeUpdates::E4QGpuNativeOnly);
-        return E4NativeQueries() ? native_says : tracker_says;
-    }
-    return tracker_says;
+bool BufferCache::NativeCpuQuery(VAddr addr, size_t size) {
+    // E4: memory no engine buffer answers for: changed when announced bytes of it were not uploaded yet
+    std::scoped_lock lock{object_dirty_mutex};
+    return all_object_dirty.Intersects(addr, size) || b9_unattributed.Intersects(addr, size);
 }
 
 bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
@@ -725,12 +674,12 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
                 }
             }
             for (const auto& part : parts) {
-                if (part.begin > at && TrackerCpuQuery(at, part.begin - at)) {
+                if (part.begin > at && NativeCpuQuery(at, part.begin - at)) {
                     return true;
                 }
                 at = std::max<VAddr>(at, part.end);
             }
-            return at < addr + size && TrackerCpuQuery(at, addr + size - at);
+            return at < addr + size && NativeCpuQuery(at, addr + size - at);
         }
     }
     // B9.3: a range inside one engine buffer: changed when the buffer holds announced bytes there that were not uploaded
@@ -743,78 +692,17 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
                 const auto it = object_dirty.find(id);
                 object_says = (it != object_dirty.end() && it->second.Intersects(addr, size)) || b9_unattributed.Intersects(addr, size);
             }
-            if (mode == 2) {
-                return object_says;
-            }
-            const bool tracker_says = memory_tracker->IsRegionCpuModified(addr, size);
-            if (tracker_says == object_says) {
-                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9CpuAgree);
-            } else if (object_says) {
-                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9CpuObjectOnly);
-            } else {
-                const VAddr lo = addr & ~VAddr{4095}, hi = (addr + size + 4095) & ~VAddr{4095};
-                bool neighbor;
-                {
-                    std::scoped_lock lock{object_dirty_mutex};
-                    neighbor = all_object_dirty.Intersects(lo, hi - lo);
-                }
-                Core::NativeUpdates::NoteB9(neighbor ? Core::NativeUpdates::B9CpuTrackerNeighbor : Core::NativeUpdates::B9CpuTrackerOnly);
-            }
-            return tracker_says;
+            return object_says;
         }
     }
-    return TrackerCpuQuery(addr, size);
+    return NativeCpuQuery(addr, size);
 }
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
-    if (Core::NativeUpdates::B9TrackerOff()) {
-        // B9.3 step 2: a range that meets engine buffers is answered by the GPU written bytes (the tracker has no GPU marks for them any more)
-        static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
-        parts.clear();
-        Core::NativeDevice::BuffersIn(addr, size, parts);
-        if (!parts.empty() && BufferHolding(addr, size) == 0) {
-            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9GpuQueries);
-            std::shared_lock lock{gpu_ranges_mutex};
-            if (gpu_modified_ranges.Intersects(addr, size)) {
-                return true;
-            }
-            const bool tracker_says = memory_tracker->IsRegionGpuModified(addr, size); // here the bytes say no
-            if (E4Census()) {
-                Core::NativeUpdates::NoteB9(tracker_says ? Core::NativeUpdates::E4QGpuTrackerOnly : Core::NativeUpdates::E4QGpuAgree);
-            }
-            return E4NativeQueries() ? false : tracker_says;
-        }
-    }
-    // B9.3: a range inside one engine buffer: written when the GPU wrote bytes of it that were not superseded or downloaded since
-    if (const u32 mode = Core::NativeUpdates::B9QueryMode(); mode != 0 && Core::NativeUpdates::B9BufferMode() != 0) {
-        if (BufferHolding(addr, size) != 0) {
-            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9GpuQueries);
-            bool bytes_say;
-            {
-                std::shared_lock lock{gpu_ranges_mutex};
-                bytes_say = gpu_modified_ranges.Intersects(addr, size);
-            }
-            if (mode == 2) {
-                return bytes_say;
-            }
-            const bool tracker_says = memory_tracker->IsRegionGpuModified(addr, size);
-            if (tracker_says == bytes_say) {
-                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9GpuAgree);
-            } else if (bytes_say) {
-                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9GpuBytesOnly);
-            } else {
-                const VAddr lo = addr & ~VAddr{4095}, hi = (addr + size + 4095) & ~VAddr{4095};
-                bool page;
-                {
-                    std::shared_lock lock{gpu_ranges_mutex};
-                    page = gpu_modified_ranges.Intersects(lo, hi - lo);
-                }
-                Core::NativeUpdates::NoteB9(page ? Core::NativeUpdates::B9GpuTrackerPage : Core::NativeUpdates::B9GpuTrackerOnly);
-            }
-            return tracker_says;
-        }
-    }
-    return TrackerGpuQuery(addr, size);
+    // E4: the GPU written bytes answer for every range (engine buffers or not): bytes a shader or a GPU copy wrote and nothing superseded or downloaded since
+    Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9GpuQueries);
+    std::shared_lock lock{gpu_ranges_mutex};
+    return gpu_modified_ranges.Intersects(addr, size);
 }
 
 void BufferCache::SupersedeGpuWritten(VAddr addr, size_t size) {
@@ -942,118 +830,8 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             }
         }
     };
-    const auto b9_forget = [&](u64 addr, u64 n) {
-        // audit: bytes an upload of no engine buffer took (texture memory, unowned memory) leave the announced set
-        if (b9 != 0 && b9_object == 0) {
-            std::scoped_lock lock{object_dirty_mutex};
-            all_object_dirty.Subtract(addr, n);
-            b9_unattributed.Subtract(addr, n);
-        }
-    };
     const bool b9_native = b9 == 2 && b9_object != 0;
-    // B9.3 step 2: an upload inside one engine buffer neither asks nor clears the page tracker
-    const bool b9_no_tracker = b9_native && Core::NativeUpdates::B9TrackerOff();
-    if (b9_no_tracker) {
-        Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9TrackerUploadsSkipped);
-    }
-    boost::container::small_vector<bool, 8> b9_piece_seen(b9_pieces.size(), false);
-    // E4 census (TLG_E4_CENSUS=1): over memory no engine buffer holds the page tracker still picks the uploads; this compares its ranges with the announced bytes
-    static const bool e4_census = [] {
-        const char* e = std::getenv("TLG_E4_CENSUS");
-        return e != nullptr && *e == '1';
-    }();
-    boost::container::small_vector<std::pair<u64, u64>, 8> e4_announced, e4_tracked;
-    const bool e4_counting = e4_census && b9_object == 0 && !(UntrackedRing::Get().Active() && [&] {
-        const auto [lo, hi] = UntrackedRing::Get().Clip(device_addr, size);
-        return lo < hi;
-    }());
-    if (e4_counting) {
-        std::scoped_lock lock{object_dirty_mutex};
-        all_object_dirty.ForEachInRange(held_lo, held_hi - held_lo, [&](u64 a, u64 e) { e4_announced.emplace_back(a, e - a); });
-        Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4CensusRequests);
-    }
-    const auto e4_note_tracker = [&](u64 x, u64 xn) {
-        if (!e4_counting) {
-            return;
-        }
-        e4_tracked.emplace_back(x, xn);
-        std::scoped_lock lock{object_dirty_mutex};
-        for (u64 page = x & ~u64{4095}; page < x + xn; page += 4096) {
-            Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4CensusTrackerPages);
-            static std::unordered_set<u64> seen;
-            const bool first = seen.insert(page).second;
-            if (!all_object_dirty.Intersects(page, 4096)) {
-                Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4CensusPagesNoAnnouncement);
-                if (first) {
-                    Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4CensusFirstPages);
-                    continue;
-                }
-                Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4CensusRepeatNoAnnouncement);
-                static std::atomic<u32> logged{0};
-                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                    LOG_WARNING(Render_Vulkan, "E4 census: tracker page {:#x} (request {:#x}+{:#x}{}) has no announced byte ({})", page, device_addr, size, is_written ? ", written" : "",
-                                Core::NativeDevice::OwnerName(page));
-                }
-            }
-        }
-    };
-    // E4: bytes a page tracker range still uploads, named (first 24)
-    const auto e4_tracker_upload = [&](u64 x, u64 xn, const char* how) {
-        Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4TrackerUploads, xn);
-        static std::atomic<u32> logged{0};
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 24) {
-            LOG_WARNING(Render_Vulkan, "E4: tracker upload ({}) {:#x}+{:#x} ({}) request {:#x}+{:#x}{} object {}", how, x, xn, Core::NativeDevice::OwnerName(x), device_addr, size,
-                        is_written ? ", written" : "", b9_object);
-        }
-    };
-    // a page tracker range (the copies of the tracker): compared with the announced bytes; native mode leaves the copy to the announcements
-    const auto tracker_copy = [&](u64 addr, u64 copy_size) {
-        e4_note_tracker(addr, copy_size);
-        if (b9_object != 0) {
-            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9BytesByTracker, copy_size);
-            bool any = false;
-            for (size_t i = 0; i < b9_pieces.size(); ++i) {
-                const auto& [a, n] = b9_pieces[i];
-                if (a < addr + copy_size && addr < a + n) {
-                    any = true;
-                    b9_piece_seen[i] = true;
-                }
-            }
-            if (!any) {
-                bool elsewhere;
-                {
-                    std::scoped_lock lock{object_dirty_mutex};
-                    elsewhere = all_object_dirty.Intersects(addr, copy_size);
-                }
-                if (elsewhere) {
-                    Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9TrackerElsewhere);
-                    any = true;
-                }
-            }
-            if (!any) {
-                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9TrackerOnlyRanges);
-                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9TrackerOnlyBytes, copy_size);
-                static std::atomic<u32> logged{0};
-                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                    LOG_WARNING(Render_Vulkan, "B9.1: page tracker range {:#x}+{:#x} of engine buffer {} ({}) has no announced byte (request {:#x}+{:#x}{})", addr,
-                                copy_size, b9_object, Core::NativeDevice::OwnerName(addr), device_addr, size, is_written ? ", written" : "");
-                }
-            }
-            if (b9_native) {
-                for_each_gap(addr, copy_size, [&](u64 a, u64 n) { e4_tracker_upload(a, n, "native gap"); add_copy(a, n); });
-                return;
-            }
-        }
-        b9_forget(addr, copy_size);
-        e4_tracker_upload(addr, copy_size, "copy");
-        add_copy(addr, copy_size);
-    };
-    // E4 (`TLG_E4_ANNOUNCED=0` turns it off): memory no engine buffer holds takes the announced bytes (the placement already copied the rest). The tracker is still asked so its state
-    // (CPU/GPU marks) stays as it was, but the ranges it returns are not uploaded.
-    static const bool e4_from_announced = [] {
-        const char* e = std::getenv("TLG_E4_ANNOUNCED");
-        return e == nullptr || *e != '0'; // default on (owner play 2026-10-31); =0 is the way back
-    }();
+    // E4: memory no engine buffer holds takes the announced bytes (the placement already copied the rest)
     // the announced bytes inside [x, x + xn) of memory no engine buffer holds (a request over unowned memory, or a gap between the buffers of one): uploaded, then no longer announced
     const auto take_announced = [&](u64 x, u64 xn) {
         boost::container::small_vector<std::pair<u64, u64>, 8> from_announced;
@@ -1069,38 +847,27 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4AnnouncedUploads, n);
             add_copy(lo, n);
         }
+        if (!from_announced.empty()) {
+            cpu_epoch.fetch_add(1, std::memory_order_acq_rel); // the upload memo's answers are stale
+        }
     };
-    const auto tracker_ranges = [&](VAddr a, u64 n) {
-        if (e4_from_announced && b9 != 0) {
-            // the tracker is still asked so its marks stay as they were, but its ranges are not uploaded
-            if (b9_object == 0) {
-                memory_tracker->ForEachUploadRange(a, n, is_written, [&](u64 x, u64 xn) { e4_note_tracker(x, xn); });
-                take_announced(a, n);
-            } else {
-                for_each_gap(a, n, [&](u64 g, u64 gn) {
-                    memory_tracker->ForEachUploadRange(g, gn, is_written, [&](u64 x, u64 xn) { e4_note_tracker(x, xn); });
-                    take_announced(g, gn);
-                });
-            }
-            return;
+    const auto announced_ranges = [&](VAddr a, u64 n) {
+        if (b9_object == 0) {
+            take_announced(a, n);
+        } else {
+            for_each_gap(a, n, take_announced);
         }
-        if (!b9_no_tracker) {
-            memory_tracker->ForEachUploadRange(a, n, is_written, tracker_copy);
-            return;
-        }
-        // the tracker is not kept for engine buffers: it is asked only for the bytes between them
-        for_each_gap(a, n, [&](u64 g, u64 gn) { memory_tracker->ForEachUploadRange(g, gn, is_written, [&](u64 x, u64 xn) { e4_tracker_upload(x, xn, "gap"); add_copy(x, xn); }); });
     };
     const auto& ring = UntrackedRing::Get();
     VAddr ring_lo = 0, ring_hi = 0; // the part the untracked ring uploads whole (native mode adds no announced piece there)
     if (ring.Active() && !is_written) {
         const auto [lo, hi] = ring.Clip(device_addr, size);
-        if (lo < hi && !(b9_no_tracker ? IsRegionGpuModified(lo, hi - lo) : memory_tracker->IsRegionGpuModified(lo, hi - lo))) {
+        if (lo < hi && !IsRegionGpuModified(lo, hi - lo)) {
             ring_lo = lo;
             ring_hi = hi;
             // Untracked upload ring: nobody told us what the CPU wrote, so the requested part is uploaded.
             if (device_addr < lo) {
-                tracker_ranges(device_addr, lo - device_addr);
+                announced_ranges(device_addr, lo - device_addr);
             }
             // Read again in the same command buffer: the data cannot have changed since the first upload.
             auto& done = ring_uploads[(lo >> 6) & 255];
@@ -1113,31 +880,17 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 Core::NativeUploads::NoteRingSkipped(hi - lo);
             }
             if (hi < device_addr + size) {
-                tracker_ranges(hi, device_addr + size - hi);
+                announced_ranges(hi, device_addr + size - hi);
             }
         } else {
-            tracker_ranges(device_addr, size);
+            announced_ranges(device_addr, size);
         }
     } else {
-        tracker_ranges(device_addr, size);
-    }
-    if (e4_counting) {
-        RangeSet left;
-        for (const auto& [a, n] : e4_announced) {
-            Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4CensusAnnouncedBytes, n);
-            left.Add(a, n);
-        }
-        for (const auto& [a, n] : e4_tracked) {
-            left.Subtract(a, n);
-        }
-        left.ForEachInRange(held_lo, held_hi - held_lo, [&](u64 a, u64 e) { Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4CensusAnnouncedNotUploaded, e - a); });
+        announced_ranges(device_addr, size);
     }
     if (b9_object != 0) {
         for (size_t i = 0; i < b9_pieces.size(); ++i) {
             auto [a, n] = b9_pieces[i];
-            if (!b9_piece_seen[i]) {
-                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9ObjectOnlyRanges);
-            }
             Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9BytesByObject, n);
             if (!b9_native) {
                 continue;

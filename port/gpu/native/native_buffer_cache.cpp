@@ -23,7 +23,6 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
-#include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/buffer_cache/readback_batch.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "native/native_readback_policy.h"

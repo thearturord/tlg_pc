@@ -273,26 +273,7 @@ enum B9Count : u32 {
     E4FreedWithForeignGpu, ///< E4: a block's last engine buffer was deleted while the GPU had written bytes of the block outside that buffer
     E4FreedForeignGpuBytes, ///< E4: those bytes
     E4GpuBytesLost,        ///< E4: GPU written bytes a new placement found in no placed buffer
-    E4CensusRequests,      ///< E4 census (TLG_E4_CENSUS=1): requests over memory no engine buffer holds that the page tracker answered
-    E4CensusTrackerPages,  ///< E4 census: pages the tracker uploaded for them
-    E4CensusPagesNoAnnouncement, ///< E4 census: of those, pages on which no announced byte exists
-    E4CensusFirstPages,    ///< E4 census: tracker pages uploaded for the first time (the tracker starts with every page marked changed; a placement already copied memory)
-    E4CensusRepeatNoAnnouncement, ///< E4 census: tracker pages uploaded again with no announced byte on them (a CPU write only the tracker saw)
-    E4CensusAnnouncedBytes, ///< E4 census: announced bytes in such requests
-    E4CensusAnnouncedNotUploaded, ///< E4 census: of those, bytes the tracker did not upload
-    E4QCpuAgree,        ///< E4 query census: "did the CPU change it" for memory the engine's buffers do not answer: tracker and announced-not-uploaded bytes say the same
-    E4QCpuTrackerOnly,  ///< the tracker says yes, the announced bytes say no
-    E4QCpuNativeOnly,   ///< the announced bytes say yes, the tracker says no
-    E4QGpuAgree,        ///< the same for "did the GPU write it": tracker and `gpu_modified_ranges`
-    E4QGpuTrackerOnly,
-    E4QGpuNativeOnly,
-    E4ProtectNone, ///< E4: bytes the page manager protected against all access (GPU written pages)
-    E4ProtectRead, ///< E4: bytes protected against writes only (CPU write watch)
-    E4ProtectOther, ///< E4: other protections
-    E4WriteFaults, ///< E4: CPU write faults on tracked pages
-    E4ReadFaults, ///< E4: CPU read faults on GPU written pages
-    E4TrackerUploads, ///< E4: bytes a page tracker range still uploads (engine buffer gaps, requests the announced mode does not take)
-    E4AnnouncedUploads, ///< `TLG_E4_ANNOUNCED=1`: bytes of unowned memory uploaded from the announced set instead of the tracker's ranges
+    E4AnnouncedUploads, ///< E4: bytes of unowned memory uploaded from the announced set
     B9Counts,
 };
 void NoteB9(B9Count what, u64 n = 1) noexcept;

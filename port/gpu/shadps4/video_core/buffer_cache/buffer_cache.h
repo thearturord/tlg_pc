@@ -48,7 +48,6 @@ class StagingBufferPool;
 namespace VideoCore {
 
 class TextureCache;
-class MemoryTracker;
 class ReadbackBatch;
 
 class BufferCache {
@@ -125,9 +124,8 @@ public:
         return STREAM_THRESHOLD;
     }
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
-    /// E4 query census: the page tracker's answer for memory no engine buffer answers for, counted against the announced / GPU written bytes (shadow, the tracker still answers)
-    [[nodiscard]] bool TrackerCpuQuery(VAddr addr, size_t size);
-    [[nodiscard]] bool TrackerGpuQuery(VAddr addr, size_t size);
+    /// E4: memory no engine buffer answers for: changed when announced bytes of it were not uploaded yet
+    [[nodiscard]] bool NativeCpuQuery(VAddr addr, size_t size);
     /// What a CPU write of [address, address + size) means for the caches (the harvest's replay; B2: an applied announcement)
     void ApplyCpuWrite(VAddr address, u64 size, bool newer = false);
     /// B9.2: the engine deleted the buffer `id` at [address, address + bytes) (raster thread, in order): its announced bytes go; in native mode also the GPU written
@@ -214,7 +212,7 @@ private:
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
     TextureCache& texture_cache;
-    std::unique_ptr<MemoryTracker> memory_tracker;
+    std::atomic<u64> cpu_epoch{1}; ///< bumped when a CPU change is applied or announced bytes are uploaded (the upload memo's answers are stale)
 
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
