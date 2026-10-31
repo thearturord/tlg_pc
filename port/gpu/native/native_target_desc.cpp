@@ -825,7 +825,7 @@ void Observe(u64 ctx) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-// Round 5: the description feeds the draw (TLG_TARGET_DESC_USE=1, default off) or is verified against the register decode (TLG_TARGET_DESC_USE_VERIFY=1, behaviour unchanged)
+// Round 5: the description feeds the draw (TLG_TARGET_DESC_USE, default on, =0 turns it off) or is verified against the register decode (TLG_TARGET_DESC_USE_VERIFY=1, behaviour unchanged)
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 namespace {
@@ -1452,7 +1452,11 @@ bool ResolveDepthTarget(u64 target, u64& view, u64& resource) {
 } // namespace
 
 bool UseOn() noexcept {
-    static const bool on = ReadUseSwitch("TLG_TARGET_DESC_USE") || ReadUseSwitch("TLG_TARGET_DESC_USE_VERIFY");
+    // On by default since the owner's long play of 2026-10-31 (0 differences from the register decode over all three paths); TLG_TARGET_DESC_USE=0 turns it off
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_TARGET_DESC_USE");
+        return e == nullptr || *e != '0' || ReadUseSwitch("TLG_TARGET_DESC_USE_VERIFY");
+    }();
     return on;
 }
 
