@@ -42,6 +42,9 @@ struct Object {
     u64 bytes{};      ///< resources: the size of the memory (+0x38 for textures, ByteWidth for buffers)
     u64 resource_id{};    ///< views: the id of the resource they look at
     Kind resource_kind{}; ///< views: the kind of that resource
+    u32 stride{};         ///< buffers: StructureByteStride
+    bool has_desc{};      ///< views: `desc` holds the first dwords of the description the view was created with (D3D11 layout: format, dimension, then the range)
+    u32 desc[8]{};
 };
 
 /// `TLG_NATIVE_DEVICE=0` turns the table off (default on: it only observes)
@@ -50,12 +53,14 @@ struct Object {
 /// The resource object after its creation returned (buffers from `CreateBuffer`, textures from their initialization)
 void NoteResource(u64 object);
 /// A view object after its creation returned
-void NoteView(Kind kind, u64 view_object);
+void NoteView(Kind kind, u64 view_object, u64 desc = 0);
 /// `AddDelayDeleteObject`: the object leaves (its id is never used again)
 void NoteDelete(u64 object);
 
 /// The live object of an id, copied (false: unknown or deleted)
 [[nodiscard]] bool Lookup(u64 id, Object& out);
+/// E2 study (`TLG_DESC_CHECKS=1`): the first 0x400 bytes of the object as they were when its creation returned
+[[nodiscard]] bool RawBytes(u64 id, u8* out, size_t size);
 /// The live resource (buffer or texture) whose memory holds `address`, copied (false: none)
 [[nodiscard]] bool ResourceAt(VAddr address, Object& out);
 /// B8.4: the live textures whose memory meets [address, address + size) (ids appended to `out`); true when together they cover the whole range
@@ -71,8 +76,24 @@ void BuffersIn(VAddr address, u64 size, std::vector<BufferPart>& out);
 /// A short name of what owns `address` (for audits): "buffer usage U bind B", "texture_2d usage U bind B", "none"
 [[nodiscard]] std::string OwnerName(VAddr address);
 
+/// E2: a Map of buffer `id` returned `address` (`size` bytes, `type` the Direct3D map type); the buffer's data is there until its next Map
+void NoteMapped(u64 id, u64 address, u64 size, u32 type);
 /// B1 shadow check: the texture cache bound an image at `address` of `width` x `height` for a binding whose record names engine object `id`
 void CheckImage(u64 id, VAddr address, u32 width, u32 height);
+/// E2 census (`TLG_DESC_CHECKS=1`): the fields of the T# a binding of engine view / texture `id` carries, against the engine's own description of the object (and of
+/// the resource a view looks at). Counts per field how often the two agree; the format pair is checked as a function of the engine format.
+struct SharpFacts {
+    u32 data_format{}, num_format{}, type{};
+    u32 width{}, height{}, depth{};       ///< the T# fields as stored (width and height are size - 1)
+    u32 base_level{}, last_level{}, base_array{}, last_array{};
+    u32 pitch{};
+    u32 dst_sel{};      ///< the four component selects packed x | y << 3 | z << 6 | w << 9
+    u32 tiling_index{}, pow2pad{};
+    VAddr address{};
+};
+void CheckImageSharp(u64 id, u64 view_id, const SharpFacts& facts);
+/// E2 census for buffers: the fields of the V# a binding of buffer `id` (through view `view_id`, or 0) carries, against the engine's buffer and view descriptions
+void CheckBufferSharp(u64 id, u64 view_id, u64 base_address, u32 stride, u32 num_records, u32 data_format, u32 num_format, bool is_constant_buffer_hint);
 /// ... and a buffer range for a binding whose record names `id`
 void CheckBuffer(u64 id, VAddr address, u64 size);
 /// B6: does the CPU read [address, address + size)? True for memory of a resource the engine created for CPU reads (staging usage or CPU read access) and for memory

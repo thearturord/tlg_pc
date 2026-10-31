@@ -6,12 +6,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
 #include "common/logging/log.h"
 #include "native/native_hooks.h"
+#include "native/native_image_desc.h"
 #include "native/native_device.h"
 #include "native/native_resources.h"
 #include "native/native_updates.h"
@@ -41,6 +43,26 @@ struct AddrEntry {
     u32 usage, cpu_access;
 };
 std::map<VAddr, AddrEntry> resource_by_address;
+
+/// E2 study (`TLG_DESC_CHECKS=1`): the first bytes of every resource and view object as they were when its creation returned (objects are recycled later)
+std::mutex raw_mutex;
+std::unordered_map<u64, std::array<u8, 0x400>> raw_by_id;
+bool RawOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_DESC_CHECKS");
+        return e != nullptr && *e == '1';
+    }();
+    return on;
+}
+void KeepRaw(u64 id, u64 object) {
+    if (!RawOn() || id == 0 || object == 0) {
+        return;
+    }
+    std::array<u8, 0x400> bytes;
+    std::memcpy(bytes.data(), reinterpret_cast<const void*>(object), bytes.size());
+    std::scoped_lock lock{raw_mutex};
+    raw_by_id[id] = bytes;
+}
 
 std::atomic<u64> resources_noted{0}, views_noted{0}, deletes_noted{0}, deletes_unknown{0}, bad_reads{0};
 std::array<std::atomic<u64>, 9> live_by_kind{};
@@ -79,7 +101,7 @@ bool ReadResourceObject(u64 object, Object& out) {
     switch (kind) {
     case 1: // ByteWidth, Usage, BindFlags, CPUAccessFlags, MiscFlags, StructureByteStride
         out.kind = Kind::Buffer;
-        out.width = d(0), out.usage = d(1), out.bind = d(2), out.cpu_access = d(3), out.misc = d(4);
+        out.width = d(0), out.usage = d(1), out.bind = d(2), out.cpu_access = d(3), out.misc = d(4), out.stride = d(5);
         out.bytes = out.width;
         break;
     case 2: // Width, MipLevels, ArraySize, Format, Usage, BindFlags
@@ -146,7 +168,7 @@ u64 ViewCreated(const char* hook_name, u64 resource, u64 desc, u64 out, u64 a3, 
     if (out != 0 && static_cast<u32>(result) == 0) {
         const u64 view = Rd<u64>(out, 0);
         if (view != 0) {
-            NoteView(ViewKind, view);
+            NoteView(ViewKind, view, desc);
         }
     }
     return 0x8000000000000000ull | (result & 0x7fffffffffffffffull);
@@ -172,10 +194,11 @@ void NoteResource(u64 object) {
         return;
     }
     resources_noted.fetch_add(1, std::memory_order_relaxed);
+    KeepRaw(entry.id, object);
     Insert(entry);
 }
 
-void NoteView(Kind kind, u64 view_object) {
+void NoteView(Kind kind, u64 view_object, u64 desc) {
     if (!Enabled() || view_object == 0) {
         return;
     }
@@ -192,11 +215,16 @@ void NoteView(Kind kind, u64 view_object) {
     }
     view.resource_id = resource.id;
     view.resource_kind = resource.kind;
+    if (desc != 0) {
+        view.has_desc = true;
+        std::memcpy(view.desc, reinterpret_cast<const void*>(desc), sizeof(view.desc));
+    }
     view.address = resource.address;
     view.bytes = resource.bytes;
     view.width = resource.width, view.height = resource.height, view.depth = resource.depth, view.mips = resource.mips, view.layers = resource.layers;
     view.format = resource.format, view.usage = resource.usage, view.bind = resource.bind, view.misc = resource.misc;
     views_noted.fetch_add(1, std::memory_order_relaxed);
+    KeepRaw(view.id, view_object);
     Insert(view);
     {
         // the resource itself is known from here on as well (textures are read once their initialization returned; their view creation comes after)
@@ -205,6 +233,7 @@ void NoteView(Kind kind, u64 view_object) {
             return;
         }
     }
+    KeepRaw(resource.id, resource_object);
     Insert(resource);
 }
 
@@ -354,6 +383,16 @@ std::string OwnerName(VAddr address) {
     return fmt::format("{} usage {} bind {:#x}", KindName(o.kind), o.usage, o.bind);
 }
 
+bool RawBytes(u64 id, u8* out, size_t size) {
+    std::scoped_lock lock{raw_mutex};
+    const auto it = raw_by_id.find(id);
+    if (it == raw_by_id.end()) {
+        return false;
+    }
+    std::memcpy(out, it->second.data(), std::min<size_t>(size, it->second.size()));
+    return true;
+}
+
 bool Lookup(u64 id, Object& out) {
     std::shared_lock lock{table_mutex};
     const auto it = by_id.find(id);
@@ -386,6 +425,170 @@ void CheckImage(u64 id, VAddr address, u32 width, u32 height) {
     if (result == 2 && mismatches_logged.fetch_add(1, std::memory_order_relaxed) < 12) {
         LOG_WARNING(Core, "B1 native device: binding of {} id {} names memory {:#x} {}x{}, the texture cache bound {:#x} {}x{}", KindName(object.kind), id, object.address,
                     object.width, object.height, address, width, height);
+    }
+}
+
+namespace {
+struct LastMap {
+    u64 address, size;
+    u32 type;
+};
+std::mutex map_mutex;
+std::unordered_map<u64, LastMap> last_map;
+} // namespace
+
+void NoteMapped(u64 id, u64 address, u64 size, u32 type) {
+    if (id == 0 || address == 0) {
+        return;
+    }
+    std::scoped_lock lock{map_mutex};
+    last_map[id] = {address, size, type};
+}
+
+namespace {
+/// E2 census state: the keys are short descriptions ("size same", "format 28 -> 5/0"), the values how often they were seen
+std::mutex sharp_mutex;
+std::map<std::string, u64> sharp_counts;
+std::atomic<u32> sharp_logged{0};
+std::atomic<u64> sharp_checked{0}, sharp_unknown{0};
+
+bool DescChecksOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_DESC_CHECKS");
+        return e != nullptr && *e == '1';
+    }();
+    return on;
+}
+} // namespace
+
+void CheckImageSharp(u64 id, u64 view_id, const SharpFacts& f) {
+    if (!Enabled() || id == 0 || !DescChecksOn()) {
+        return;
+    }
+    Object res, view;
+    if (!Lookup(id, res)) {
+        sharp_unknown.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const bool has_view = view_id != 0 && Lookup(view_id, view) && view.has_desc;
+    sharp_checked.fetch_add(1, std::memory_order_relaxed);
+    const u32 t_width = f.width + 1, t_height = f.height + 1;
+    const u32 t_levels = f.last_level + 1;
+    // AmdGpu::ImageType: 10 3D, 11 cube, 12 / 13 / 15 array types. The depth field is the layer count of an array, the number of cubes of a cube, the depth of a 3D image
+    const u32 t_layers = f.type == 10 ? 1 : f.type == 11 ? (f.depth + 1) * 6 : f.depth + 1;
+    std::string keys[7];
+    keys[0] = (t_width == res.width && t_height == res.height) ? "size: same as the resource" : "size: DIFFERENT";
+    keys[1] = f.last_level < res.mips ? (f.base_level == 0 && t_levels == res.mips ? "mips: all of the resource" : "mips: a part of the resource") : "mips: LAST LEVEL beyond the resource";
+    if (f.type == 10) {
+        keys[2] = (f.depth + 1 == res.depth) ? "depth: same" : "depth: DIFFERENT";
+    } else {
+        keys[2] = t_layers == std::max<u32>(res.layers, 1) ? "layers: same as the resource" : "layers: DIFFERENT";
+    }
+    keys[6] = f.last_array >= f.base_array && f.last_array < t_layers ? "array range: inside the layers" : "array range: OUTSIDE the layers";
+    keys[3] = fmt::format("resource kind {} type {} (resource layers {})", KindName(res.kind), f.type, res.layers > 1 ? "many" : "one");
+    // the format: the view description's when the view has one (a typeless resource has no format of its own), else the resource's
+    const u32 engine_format = has_view ? view.desc[0] : res.format;
+    keys[4] = fmt::format("format {} -> {}/{}", engine_format, f.data_format, f.num_format);
+    // properties the console's descriptor holds that no D3D11 description has: they must be functions of the format (and kind) if the engine's data is to give them
+    std::string more[4];
+    more[0] = fmt::format("swizzle {} -> {:#x}", engine_format, f.dst_sel);
+    more[1] = fmt::format("tiling {} bind {:#x} fmt {} -> {}", KindName(res.kind), res.bind, engine_format, f.tiling_index);
+    more[2] = fmt::format("pow2pad {} -> {}", KindName(res.kind), f.pow2pad);
+    more[3] = f.address == res.address ? "address: same as the resource" : "address: DIFFERENT from the resource";
+    keys[5] = !has_view ? "view format: NO VIEW DESCRIPTION" : view.desc[0] == res.format ? "view format: same as the resource" : "view format: differs from the resource";
+    std::string view_keys[3];
+    if (has_view) {
+        // D3D11_SHADER_RESOURCE_VIEW_DESC (UAV / RTV / DSV descriptions differ after the dimension): dimension, then the range
+        const u32 dim = view.desc[1];
+        view_keys[0] = fmt::format("view dimension {} -> T# type {}", dim, f.type);
+        const bool srv = view.kind == Kind::ShaderResourceView;
+        if (srv && (dim == 4 || dim == 5 || dim == 8 || dim == 9 || dim == 2 || dim == 3)) {
+            const u32 most_detailed = view.desc[2];
+            const u32 levels = view.desc[3] == 0xffffffffu ? res.mips - std::min(most_detailed, res.mips) : view.desc[3];
+            view_keys[1] = (most_detailed == f.base_level && most_detailed + levels - 1 == f.last_level) ? "srv mip range: same as the T#" : "srv mip range: DIFFERENT";
+            if (dim == 5 || dim == 3) {
+                const u32 first = view.desc[4];
+                const u32 count = view.desc[5] == 0xffffffffu ? std::max<u32>(res.layers, 1) - std::min(first, std::max<u32>(res.layers, 1)) : view.desc[5];
+                view_keys[2] = (first == f.base_array && first + count - 1 == f.last_array) ? "srv array range: same as the T#" : "srv array range: DIFFERENT";
+            }
+        } else {
+            view_keys[1] = fmt::format("{} view: range not decoded", KindName(view.kind));
+        }
+    }
+    {
+        std::scoped_lock lock{sharp_mutex};
+        for (u32 i = 0; i < 7; ++i) {
+            ++sharp_counts[keys[i]];
+        }
+        for (const auto& key : more) {
+            ++sharp_counts[key];
+        }
+        for (const auto& key : view_keys) {
+            if (!key.empty()) {
+                ++sharp_counts[key];
+            }
+        }
+    }
+    static std::atomic<u32> logged_by[3]{};
+    const u32 bad = keys[0][6] == 'D' ? 0u : keys[1][6] == 'L' ? 1u : keys[6][13] == 'O' ? 2u : 3u;
+    if (bad < 3 && logged_by[bad].fetch_add(1, std::memory_order_relaxed) < 6) {
+        LOG_WARNING(Core, "E2 census: {} id {}: T# {}x{} levels {}+{} layers {}+{} depth {} type {}, resource {}x{} mips {} layers {} depth {}", KindName(res.kind), id, t_width, t_height, f.base_level, t_levels,
+                    f.base_array, t_layers, f.depth + 1, f.type, res.width, res.height, res.mips, res.layers, res.depth);
+    }
+}
+
+void CheckBufferSharp(u64 id, u64 view_id, u64 base_address, u32 stride, u32 num_records, u32 data_format, u32 num_format, bool is_constant_buffer_hint) {
+    if (!Enabled() || id == 0 || !DescChecksOn()) {
+        return;
+    }
+    Object buf, view;
+    if (!Lookup(id, buf) || buf.kind != Kind::Buffer) {
+        sharp_unknown.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const bool view_known = view_id != 0 && Lookup(view_id, view);
+    const bool has_desc = view_known && view.has_desc;
+    const u64 size = stride != 0 ? u64(stride) * num_records : num_records;
+    std::string keys[6];
+    const u64 offset = base_address - buf.address;
+    const bool inside = base_address >= buf.address && base_address + size <= buf.address + buf.bytes;
+    const char* where = inside ? (offset == 0 && size == buf.bytes ? "whole buffer" : offset == 0 ? "from the start, shorter" : "a sub-range") : "OUTSIDE the buffer";
+    keys[0] = fmt::format("buffer v# {} | bind {:#x} | view {}", where, buf.bind, !view_known ? "none" : has_desc ? "with a description" : "default description");
+    {
+        // the object's memory pointer as it is now (a Map with discard moves it)
+        const u64 live = Rd<u64>(buf.object, 0x30);
+        const u64 live_bytes = buf.bytes;
+        const bool live_inside = base_address >= live && base_address + size <= live + live_bytes;
+        keys[4] = fmt::format("buffer live memory pointer {} | bind {:#x} | {}", live == buf.address ? "unchanged" : "MOVED", buf.bind, live_inside ? "v# inside it" : "v# OUTSIDE it");
+    }
+    {
+        LastMap map{};
+        bool have = false;
+        {
+            std::scoped_lock lock{map_mutex};
+            if (const auto it = last_map.find(id); it != last_map.end()) {
+                map = it->second;
+                have = true;
+            }
+        }
+        const char* at = base_address == buf.address ? "the object's memory" : !have ? "NO MAP KNOWN" : (base_address >= map.address && base_address < map.address + std::max<u64>(map.size, 1)) ? "inside the last Map" : "ELSEWHERE";
+        keys[5] = fmt::format("buffer v# at {} | bind {:#x} | last map type {}", at, buf.bind, have ? map.type : 0);
+    }
+    keys[1] = fmt::format("buffer stride v# {} | object stride {} | bind {:#x}", stride == 0 ? "0" : stride == buf.stride ? "same" : "other", buf.stride, buf.bind);
+    if (has_desc) {
+        // D3D11_BUFFER_SRV / UAV: format, dimension, FirstElement (or ElementOffset), NumElements
+        const u32 first = view.desc[2], count = view.desc[3];
+        const u32 element = stride != 0 ? stride : 1;
+        keys[2] = fmt::format("buffer view range {} | {}", (first == offset / element && count == num_records) ? "equals the v#" : "DIFFERENT from the v#", view.kind == Kind::ShaderResourceView ? "srv" : "uav");
+        keys[3] = fmt::format("buffer view format {} -> {}/{} stride {}", view.desc[0], data_format, num_format, stride);
+    }
+    {
+        std::scoped_lock lock{sharp_mutex};
+        for (const auto& key : keys) {
+            if (!key.empty()) {
+                ++sharp_counts[key];
+            }
+        }
     }
 }
 
@@ -702,6 +905,27 @@ nlohmann::json Report() {
             out[d ? "depth_targets" : "color_targets"][target_names[r]] = target_checks[d][r].load();
         }
     }
+    {
+        nlohmann::json census;
+        census["checked"] = sharp_checked.load();
+        census["id_not_in_the_table"] = sharp_unknown.load();
+        std::scoped_lock lock{sharp_mutex};
+        // formats: one line per engine format with the pairs seen (more than one pair means the T# format is not a function of the engine's)
+        std::map<std::string, std::string> formats;
+        for (const auto& [key, count] : sharp_counts) {
+            const size_t arrow = key.find(" -> ");
+            if (arrow != std::string::npos && (key.rfind("format ", 0) == 0 || key.rfind("swizzle ", 0) == 0 || key.rfind("tiling ", 0) == 0 || key.rfind("pow2pad ", 0) == 0)) {
+                formats[key.substr(0, arrow)] += key.substr(arrow + 4) + " x" + std::to_string(count) + "  ";
+            } else {
+                census[key] = count;
+            }
+        }
+        for (const auto& [engine, pairs] : formats) {
+            census["format_map"][engine] = pairs;
+        }
+        out["e2_census"] = std::move(census);
+    }
+    out["e2_derive"] = Core::NativeImageDesc::Report();
     out["note"] = "B1 native device table (cumulative); bindings: the texture cache's / buffer cache's answer against the engine object the record names";
     return out;
 }

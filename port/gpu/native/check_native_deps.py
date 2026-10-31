@@ -14,6 +14,7 @@ NATIVE = os.path.dirname(os.path.abspath(__file__))
 ALLOWED_PS4 = {
     "video_core/amdgpu/pm4_cmds.h": "E5 (PM4 stream)",
     "video_core/amdgpu/pixel_format.h": "E2 (descriptions)",
+    "video_core/amdgpu/resource.h": "E2 (descriptions: the image descriptor layout the derivation fills)",
     "video_core/amdgpu/draw_state.h": "E1 (draw state)",
     "video_core/amdgpu/liverpool.h": "E1/E5 (register file, command processor)",
     "video_core/renderer_vulkan/vk_fixed_state.h": "E1 (draw state)",

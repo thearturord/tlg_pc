@@ -21,6 +21,7 @@ struct RecordBinding {
     u8 entry_dwords;  ///< table entry: dwords per entry of the table (8 resource table, 4 sampler / constant buffer table)
     u16 table_base;   ///< async context entries (entry_dwords 0xfe): the dword index in the staging table where the table `table_sgpr` points to starts (a shader load at `src` of that table is index `table_base + src`)
     u64 id;      ///< the engine's unique id of the resource (the registry's key)
+    u64 view_id; ///< E2: the engine's unique id of the view object the descriptor was built from (0: the descriptor was built from the resource itself)
     u32 words[8];
 };
 

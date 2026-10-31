@@ -19,6 +19,7 @@
 #include "native/native_audit.h"
 #include "native/native_readbacks.h"
 #include "native/native_device.h"
+#include "native/native_image_desc.h"
 #include "native/native_resources.h"
 #include "native/native_pass.h"
 #include "native/native_updates.h"
@@ -2121,6 +2122,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
                 if (record_binding != ~0u && binder_plan != nullptr) {
                     Core::NativeDevice::CheckBuffer(binder_plan->bindings[record_binding].id, vsharp.base_address, size); // B1 shadow check
+                    Core::NativeDevice::CheckBufferSharp(binder_plan->bindings[record_binding].id, binder_plan->bindings[record_binding].view_id, vsharp.base_address, vsharp.stride,
+                                                         vsharp.num_records, vsharp.data_format, vsharp.num_format, false); // E2 census
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2, cp_no_object);
@@ -2450,6 +2453,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
         AmdGpu::Image chosen_tsharp;
         bool image_from_record = false;
+        u64 image_view_id = 0;   // E2: the engine's id of the view object the descriptor was built from
         u64 image_engine_id = 0; // L1(b): the engine's id of the view object the record's binding names
         if (binder_plan != nullptr && image_desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad) {
             u32 identity_binding = ~0u;
@@ -2461,9 +2465,17 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             if (const u32* words = planned_words) {
                 if (identity_binding != ~0u) {
                     image_engine_id = binder_plan->bindings[identity_binding].id;
+                    image_view_id = binder_plan->bindings[identity_binding].view_id;
                 }
                 chosen_tsharp = image_desc.FromWords(words);
                 image_from_record = true;
+                if (identity_binding != ~0u && !image_desc.is_r128 && Core::NativeImageDesc::Decides()) {
+                    // E2: the image of the binding comes from the engine's texture and view; the words of the record only verify
+                    AmdGpu::Image derived;
+                    if (Core::NativeImageDesc::Decide(image_engine_id, image_view_id, words, derived)) {
+                        chosen_tsharp = image_desc.Finish(derived);
+                    }
+                }
                 if (IdentityAuditOn()) {
                     const u32* record_words = words;
                     const auto& raw = chosen_tsharp;
@@ -2725,6 +2737,22 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
             auto* image = &texture_cache.GetImage(image_id);
             if (image_from_record && i == 0) {
+                Core::NativeImageDesc::Compare(image_engine_id, image_view_id, tsharp); // E2 shadow derivation
+                Core::NativeDevice::CheckImageSharp(image_engine_id, image_view_id, {.data_format = u32(tsharp.GetDataFmt()),
+                                                                      .num_format = u32(tsharp.GetNumberFmt()),
+                                                                      .type = u32(tsharp.type),
+                                                                      .width = u32(tsharp.width),
+                                                                      .height = u32(tsharp.height),
+                                                                      .depth = u32(tsharp.depth),
+                                                                      .base_level = u32(tsharp.base_level),
+                                                                      .last_level = u32(tsharp.last_level),
+                                                                      .base_array = u32(tsharp.base_array),
+                                                                      .last_array = u32(tsharp.last_array),
+                                                                      .pitch = u32(tsharp.pitch),
+                                                                      .dst_sel = u32(tsharp.dst_sel_x | tsharp.dst_sel_y << 3 | tsharp.dst_sel_z << 6 | tsharp.dst_sel_w << 9),
+                                                                      .tiling_index = u32(tsharp.tiling_index),
+                                                                      .pow2pad = u32(tsharp.pow2pad),
+                                                                      .address = tsharp.Address()}); // E2 census
                 Core::NativeDevice::CheckImage(image_engine_id, image->info.guest_address, image->info.size.width, image->info.size.height); // B1 shadow check
             }
             {

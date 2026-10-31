@@ -38,6 +38,7 @@
 #include "core/libraries/gnmdriver/gnmdriver.h"
 #include "native/native_timeline.h"
 #include "native/native_device.h"
+#include "native/native_image_desc.h"
 #include "native/native_draw.h"
 #include "native/native_job_gen.h"
 #include "native/native_site_gen.h"
@@ -1276,7 +1277,7 @@ thread_local std::array<u64, 2> synth_desc_key;
 thread_local NativeRegistry::DrawResources* v2_collect = nullptr; ///< the draw whose record is being built (native registry description)
 /// The object the last descriptor helper (ResourceDescriptor, ConstBufferDescriptor, SamplerDescriptor) read, for the binding list of the description.
 thread_local struct {
-    u64 object, resource, id;
+    u64 object, resource, id, view_id;
 } last_descriptor_object;
 
 void SetLastDescriptorObject(u64 object, bool sampler = false) {
@@ -1285,13 +1286,15 @@ void SetLastDescriptorObject(u64 object, bool sampler = false) {
         return;
     }
     u64 resource = object;
+    u64 view_id = 0;
     if (!sampler) {
         const u32 tag = Rd<u32>(object, 0x18);
         if (tag >= 22 && tag <= 25) {
             resource = Obj(Rd<u64>(object, 0x30)); // a view: the resource it looks at
+            view_id = Rd<u64>(object, 0x10);
         }
     }
-    last_descriptor_object = {object, resource, resource != 0 ? Rd<u64>(resource, 0x10) : 0};
+    last_descriptor_object = {object, resource, resource != 0 ? Rd<u64>(resource, 0x10) : 0, view_id};
 }
 
 /// The record whose user data are being built (NativeDraw v2 bindings go into it).
@@ -1331,8 +1334,19 @@ void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* word
     binding.entry_dwords = static_cast<u8>(entry_dwords);
     binding.table_base = static_cast<u16>(table_base);
     binding.id = last_descriptor_object.id;
+    binding.view_id = last_descriptor_object.view_id;
+    if (kind == 3 && words != nullptr) {
+        Core::NativeImageDesc::StudySampler(last_descriptor_object.object, words); // E2 study
+    }
     for (u32 i = 0; i < binding.dwords; ++i) {
         binding.words[i] = words[i];
+    }
+    if (kind == 3 && binding.dwords == 4 && Core::NativeImageDesc::Decides()) {
+        // E2: the sampler of the binding is derived from the engine's sampler object (alive here); the words the engine built only verify
+        u32 derived[4];
+        if (Core::NativeImageDesc::DeriveSampler(last_descriptor_object.object, words, derived)) {
+            std::memcpy(binding.words, derived, sizeof(derived));
+        }
     }
 }
 
@@ -6960,6 +6974,7 @@ u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4
             const u64 result = reinterpret_cast<GuestMap7>(original_map)(ctx, resource, subresource, type, a4, size, out_map);
             Core::NativeUpdates::NoteMap(Rd<u64>(resource, 0x10), Core::NativeResources::ResourceUsage(resource), static_cast<u32>(type), Rd<u64>(out_map, 0),
                                          Rd<u32>(out_map, 8), Rd<u64>(resource, 0x30), ret, size);
+            Core::NativeDevice::NoteMapped(Rd<u64>(resource, 0x10), Rd<u64>(out_map, 0), Rd<u32>(out_map, 8), static_cast<u32>(type));
             return 0x8000000000000000ull | (result & 0x7fffffffffffffffull);
         }
     }
