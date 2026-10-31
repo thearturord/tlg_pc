@@ -86,6 +86,7 @@ public:
         ImageInfo info;
         ImageViewInfo view_info;
         BindingType type{BindingType::Texture};
+        u64 engine_id{}; ///< E3: the engine resource / view the record binding names (0: none; targets, video out and copies)
 
         ImageDesc() = default;
         ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc)

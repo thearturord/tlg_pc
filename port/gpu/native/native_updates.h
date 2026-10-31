@@ -163,6 +163,13 @@ enum B8Count : u32 {
     B8BufListed,                ///< ... images listed by an engine buffer (at registration, or at the buffer's creation)
     B8BufMissed,                ///< ... audit: an image the page table finds that the buffers' lists lack (must stay 0)
     B8BufNotCovered,            ///< ... ranges neither textures nor buffers cover whole (page table)
+    E3FindUnnamed,              ///< E3 census: FindImage calls whose description names no engine object (targets, video out, copies, internal)
+    E3FindNamed,                ///< ... that name an engine resource / view (a sampled or stored texture of a record binding)
+    E3NamedSameOwner,           ///< ... named: the texture starting at the memory is the named resource (address and id agree)
+    E3NamedOtherOwner,          ///< ... named: another texture starts at the memory (the id and the address disagree)
+    E3NamedInterior,            ///< ... named: no texture starts at the memory but the named resource contains it (a view of a part: mip / slice offset)
+    E3NamedNoOwner,             ///< ... named: no engine texture holds the memory at all
+    E3NamedUnknownObject,       ///< ... named: the id is not in the engine table any more
     B8Counts,
 };
 void NoteB8(B8Count what) noexcept;

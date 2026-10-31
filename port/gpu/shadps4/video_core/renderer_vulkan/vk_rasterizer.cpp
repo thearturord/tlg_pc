@@ -2598,6 +2598,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 2;
             // the mip fallback of the shader's view (applied to a fresh description before FindImage)
             const auto finish_desc = [&](VideoCore::TextureCache::ImageDesc& d) {
+                d.engine_id = image_engine_id; // E3 census: the engine object the record names
                 if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
                     ASSERT(num_bindings == 1);
                     d.view_info.range.base.level += image_desc.constant_mip_index;

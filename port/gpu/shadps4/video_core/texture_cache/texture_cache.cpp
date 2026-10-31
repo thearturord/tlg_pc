@@ -752,6 +752,26 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     u64 owner_id = 0;
     u64 owner_bytes = 0;
     ImageId by_id{};
+    if (desc.engine_id == 0) {
+        Core::NativeUpdates::NoteB8(Core::NativeUpdates::E3FindUnnamed);
+    } else {
+        // E3 census: the resource the record names against the texture the address lookup finds
+        Core::NativeUpdates::NoteB8(Core::NativeUpdates::E3FindNamed);
+        Core::NativeDevice::Object named;
+        if (!Core::NativeDevice::Lookup(desc.engine_id, named)) {
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::E3NamedUnknownObject);
+        } else {
+            const u64 named_resource = named.resource_id != 0 ? named.resource_id : named.id;
+            Core::NativeDevice::Object at;
+            if (!Core::NativeDevice::ResourceAt(info.guest_address, at) || at.kind == Core::NativeDevice::Kind::Buffer) {
+                Core::NativeUpdates::NoteB8(Core::NativeUpdates::E3NamedNoOwner);
+            } else if (at.id != named_resource) {
+                Core::NativeUpdates::NoteB8(Core::NativeUpdates::E3NamedOtherOwner);
+            } else {
+                Core::NativeUpdates::NoteB8(at.address == info.guest_address ? Core::NativeUpdates::E3NamedSameOwner : Core::NativeUpdates::E3NamedInterior);
+            }
+        }
+    }
     // the perfect match below, for an image of the engine texture's list
     const auto exact_match = [&](const Image& cache_image) {
         return True(cache_image.flags & ImageFlagBits::Registered) && cache_image.info.guest_address == info.guest_address &&
