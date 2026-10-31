@@ -49,7 +49,6 @@ namespace VideoCore {
 
 class TextureCache;
 class MemoryTracker;
-class PageManager;
 class ReadbackBatch;
 
 class BufferCache {
@@ -58,7 +57,7 @@ class BufferCache {
 public:
     explicit BufferCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                          Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool,
-                         TextureCache& texture_cache, PageManager& tracker);
+                         TextureCache& texture_cache);
     ~BufferCache();
 
     /// Returns a pointer to GDS device local buffer.

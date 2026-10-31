@@ -36,7 +36,6 @@ class Runtime;
 namespace VideoCore {
 
 class BufferCache;
-class PageManager;
 class ReadbackBatch;
 
 class TextureCache {
@@ -107,8 +106,7 @@ public:
 
 public:
     TextureCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-                 Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache,
-                 PageManager& tracker);
+                 Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache);
     ~TextureCache();
 
     TileManager& GetTileManager() noexcept {
@@ -472,7 +470,6 @@ private:
     Vulkan::Runtime& runtime;
     AmdGpu::Liverpool* liverpool;
     BufferCache& buffer_cache;
-    PageManager& tracker;
     PageTable page_table;
     Common::SlotVector<Image> slot_images;
     /// B8.3: the images of each engine texture (by its id; slot and uid, a stale entry is skipped), raster thread

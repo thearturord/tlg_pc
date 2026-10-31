@@ -16,7 +16,6 @@
 #include "common/unique_function.h"
 #include "native/native_draw_tag.h"
 #include "video_core/buffer_cache/buffer_cache.h"
-#include "video_core/page_manager.h"
 #include <span>
 #include <string>
 #include "native/native_device.h"
@@ -541,7 +540,6 @@ private:
     u64 side_epoch{1};
     u64 side_last_end_ns{};
     Runtime& runtime;
-    VideoCore::PageManager page_manager;
     VideoCore::BufferCache buffer_cache;
     VideoCore::TextureCache texture_cache;
     AmdGpu::Liverpool* liverpool;

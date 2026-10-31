@@ -23,7 +23,6 @@
 #include "native/native_resource_audit.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/readback_batch.h"
-#include "video_core/page_manager.h"
 #include "native/native_readback_policy.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -58,9 +57,9 @@ void NoteImageCreated(ImageSite site, const ImageInfo& info) {
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
-                           BufferCache& buffer_cache_, PageManager& tracker_)
+                           BufferCache& buffer_cache_)
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, liverpool{liverpool_},
-      buffer_cache{buffer_cache_}, tracker{tracker_}, slot_images{MAX_IMAGES},
+      buffer_cache{buffer_cache_}, slot_images{MAX_IMAGES},
       slot_image_views{MAX_IMAGE_VIEWS}, slot_samplers{MAX_SAMPLERS},
       blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, runtime, buffer_cache.GetStreamBuffer()},
@@ -284,8 +283,8 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
 }
 
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
-    const auto pages_start = PageManager::GetPageAddr(addr);
-    const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
+    const auto pages_start = Common::AlignDown(addr, 4096);
+    const auto pages_end = Common::AlignUp(addr + size, 4096);
 
     SmallVector<ImageId, 8> image_ids;
     ForEachImageInRegion(pages_start, pages_end - pages_start,
@@ -1503,17 +1502,6 @@ void TextureCache::TrackImage(ImageId image_id) {
     }
 
     std::scoped_lock lk{image.mutex};
-    if (image.IsUntracked()) {
-        tracker.UpdatePageWatchers(image_begin, image.info.guest_size, PageOp::Track);
-    } else {
-        if (image_begin < image.track_addr) {
-            tracker.UpdatePageWatchers(image_begin, image.track_addr - image_begin, PageOp::Track);
-        }
-        if (image.track_addr_end < image_end) {
-            tracker.UpdatePageWatchers(image.track_addr_end, image_end - image.track_addr_end,
-                                       PageOp::Track);
-        }
-    }
     image.track_addr = image_begin;
     image.track_addr_end = image_end;
 }
@@ -1522,11 +1510,6 @@ void TextureCache::UntrackImage(ImageId image_id) {
     auto& image = slot_images[image_id];
     if (image.IsUntracked()) {
         return;
-    }
-    const auto addr = image.track_addr;
-    const auto size = image.track_addr_end - image.track_addr;
-    if (size != 0) {
-        tracker.UpdatePageWatchers(addr, size, PageOp::Untrack);
     }
     image.track_addr = 0;
     image.track_addr_end = 0;
@@ -1538,9 +1521,7 @@ void TextureCache::UntrackImageHead(ImageId image_id) {
     if (image.IsUntracked() || image_begin < image.track_addr) {
         return;
     }
-    const auto addr = tracker.GetNextPageAddr(image_begin);
-    const auto size = addr - image_begin;
-    tracker.UpdatePageWatchers(image_begin, size, PageOp::Untrack);
+    const auto addr = Common::AlignUp(image_begin + 1, 4096);
 
     image.track_addr = addr;
     if (image.track_addr == image.track_addr_end) {
@@ -1558,8 +1539,7 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
         return;
     }
     ASSERT(image.track_addr_end != 0);
-    const auto addr = tracker.GetPageAddr(image_end);
-    const auto size = image_end - addr;
+    const auto addr = Common::AlignDown(image_end, 4096);
     image.track_addr_end = addr;
     if (image.track_addr == image.track_addr_end) {
         // This image spans only 2 pages and both are modified,
@@ -1567,7 +1547,6 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
         // Cehck its hash later.
         MarkAsMaybeDirty(image_id, image);
     }
-    tracker.UpdatePageWatchers(addr, size, PageOp::Untrack);
 }
 
 void TextureCache::GarbageCollectImages() {

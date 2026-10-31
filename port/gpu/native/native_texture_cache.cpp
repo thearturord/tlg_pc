@@ -22,7 +22,6 @@
 #include "native/native_resource_audit.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/readback_batch.h"
-#include "video_core/page_manager.h"
 #include "native/native_readback_policy.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"

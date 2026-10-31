@@ -72,9 +72,9 @@ Rasterizer* supersede_target = nullptr;
 
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
                        AmdGpu::Liverpool* liverpool_)
-    : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, page_manager{this},
-      buffer_cache{instance, scheduler, runtime, liverpool_, texture_cache, page_manager},
-      texture_cache{instance, scheduler, runtime, liverpool_, buffer_cache, page_manager},
+    : instance{instance_}, scheduler{scheduler_}, runtime{runtime_},
+      buffer_cache{instance, scheduler, runtime, liverpool_, texture_cache},
+      texture_cache{instance, scheduler, runtime, liverpool_, buffer_cache},
       liverpool{liverpool_}, memory{Core::Memory::Instance()},
       pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
@@ -3633,7 +3633,7 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
-    page_manager.OnGpuMap(addr, size);
+    // E4: no page is watched any more (the engine's announcements tell what the CPU wrote)
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {

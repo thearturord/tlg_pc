@@ -20,8 +20,7 @@ public:
     static constexpr u64 MANAGER_POOL_SIZE = 32;
 
 public:
-    explicit MemoryTracker(PageManager& tracker_)
-        : tracker{&tracker_} {}
+    explicit MemoryTracker() = default;
     ~MemoryTracker() = default;
 
     /// Changes whenever the CPU / GPU modified state of any page changes (a request for the same range answered
@@ -147,7 +146,7 @@ private:
             manager_pool.emplace_back();
             auto& last_pool = manager_pool.back();
             for (size_t i = 0; i < MANAGER_POOL_SIZE; i++) {
-                std::construct_at(&last_pool[i], tracker, 0);
+                std::construct_at(&last_pool[i], VAddr{0});
                 free_managers.push_back(&last_pool[i]);
             }
         }
@@ -158,7 +157,6 @@ private:
         return new_manager;
     }
 
-    PageManager* tracker;
     std::deque<std::array<RegionManager, MANAGER_POOL_SIZE>> manager_pool;
     std::vector<RegionManager*> free_managers;
     std::array<RegionManager*, NUM_HIGH_PAGES> top_tier{};
