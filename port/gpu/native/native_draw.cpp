@@ -6175,11 +6175,11 @@ u64 PS4_SYSV_ABI TagFenceSignal(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
     const u64 after = Rd<u64>(ctx, 0x47d0);
     if (Core::NativeSync::Typed::On() && after == before + 6 * sizeof(u32) && (before & 3) == 0) {
         // E7b Task 1 (TLG_SYNC_TYPED=1): what FenceEop says it wrote, built from its own result and its documented behaviour (it stores 0x11 at the label, the packet stores 0x10 there when the GPU
-        // has finished all earlier work, no interrupt): an end-of-pipe write of a 32 bit immediate to the label it returns
+        // has finished all earlier work, no interrupt): an end-of-pipe write of a 64 bit immediate (data_sel 2 in dword 3 of the packet, Ghidra FUN_02480d60) to the label it returns
         Core::NativeSync::Fence typed;
         typed.address = label;
         typed.value = 0x10;
-        typed.source = Core::NativeSync::Source::Immediate32;
+        typed.source = Core::NativeSync::Source::Immediate64;
         typed.interrupt = false;
         Core::NativeSync::Typed::Expect(before, typed, Core::NativeSync::Typed::KindEop);
     }
