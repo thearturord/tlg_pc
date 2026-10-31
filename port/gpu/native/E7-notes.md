@@ -201,3 +201,37 @@ Ghidra (addresses from the task text; I have no decompiler access and did not gu
 
 What this resolves from section 1: `blend_bypass` (function of the number type), the cmask words and `fast_clear` (resource `+0x58`), the depth write bases and the htile base (resource), and the clear words (a
 resource field, not a view one). Still open for the target replacement: the number-type and comp_swap tables, `linear_general` and `alt_tile_mode` for targets, and the fmask words.
+
+## 7. Round 2 (after the first local run: colour 32,501 evaluated / 1,610 differ, depth 9,246 / 825, 6,785 depth `unknown_format`)
+
+Tile mode, display buffers (view ids 66/69/72, DXGI 28, attrib 0x14a, info 0x8028): the "14" came from `NativeImageDesc::Derive`, which guesses the tiling index from the bind flags (`0x20` -> 14,
+native_image_desc.cpp:116). It cannot tell a display surface from another render target, and nothing in the D3D11 description I can see (bind flags, usage, cpu access) does either. What the engine
+itself uses is the T# it keeps in the resource (`resource + 0x70`, the description `FUN_02491a30` builds the target block from), so the shadow's `tile_mode` now compares the words with that T# index,
+at every mip, and `Derive`'s guess is only listed as a fact. I could not use Ghidra from here (no decompiler in this container), so I did not look at how the swap chain creates the resource. The new
+`tile_cases` table lists, for every resource a target was bound on: bind flags (`+0x1a0`), MiscFlags (`+0x1a8` for a 2D texture), usage, cpu access, resource kind, the T# index, the words' tile mode and
+`Derive`'s index, so one run shows whether any object field separates the display buffers from the other targets if the T# index turns out not to be 10 for them. Expectation: `tile_mode` differing = 0.
+
+Depth `num_slices` (825 of 9,246): the shadow expected the single slice a plain 2D view names (dimension 3: MipSlice only). From Ghidra Q8 the block of a mip 0 plain view is copied from the resource's
+prebuilt block (`resource + 0xf0`) and only the array dimensions patch the slice range, so the words carry the slice range of the whole resource. The shadow now expects `first 0, count = resource layers` for
+dimension 3 at mip 0 (a hypothesis, not a fact). Two tables decide it: `prebuilt_block_cases` (which words of each view block differ from the resource's prebuilt block, as a bit mask, per dimension; for
+depth 12 words at `+0xf0`, for colour 16 words at `+0xb0`) and `slice_cases_that_differ` (dimension, mip, resource layers, expected and words' first/count, the DB_DEPTH_VIEW word). If the mask is 0 for dimension
+3 / mip 0 the words are the prebuilt block and the cache's image (which has the resource's layers) is counted right by the words; the view range for Vulkan still comes from the description (one slice).
+If the hypothesis is wrong the table says what the words hold instead. Expectation: `num_slices` differing = 0.
+
+Depth format table: D24_UNORM_S8_UINT (view 45, resource R24G8_TYPELESS 44) -> Z32 float + Stencil8 (seen: z_info 0xa0000003, stencil_info 0x20000001, T# data format 4, number format 7). The table now
+covers the four formats a D3D11 depth stencil view can have (20, 40, 45, 55) and maps a view with format 0 to its resource's typeless format (19, 39, 44, 53). D32_FLOAT_S8X24_UINT (20) has not been
+seen; it is assumed to go the same way as 45. `format_not_in_the_table` is 0 by construction for D3D11 formats; a value outside that set (the format switch in `FUN_02474fb0` may accept others, I could not
+read it) would be counted there. Expectation: `format_not_in_the_table` = 0 and `z_format` / `stencil_format` differing = 0.
+
+Colour clear words when `resource + 0x14c` is 0: new counters `colour.clear_colour_not_set_in_resource` (count, both block words zero, block words equal `+0x150/+0x154`) and the table
+`clear_words_when_resource_14c_is_zero` (block words 11/12, resource +0x150/+0x154, prebuilt +0xdc/+0xe0, mip, fast_clear bit). The comparison with the prebuilt block (`clear_word0/1` differing) stays on.
+
+Extent (FYI from the local run): the engine's extent word equals the mip extent in all cases and the register decode pads heights (1088 / 2176 / 640) because of tile alignment, so the extent word is the right
+source for the image size and `Pitch()` / `Height()` only matter for `guest_size`.
+
+### Fields the shadow cannot (yet) decide from the engine's objects
+* `number_type` and `comp_swap` (colour info bits 8-12): they go through `DAT_025e1250` and `FUN_0246be80` from the T# number format and `dst_sel`. The shadow does not compare them; the tuples carry
+  the T# (`t_number_format`, `t_dst_sel`) and the raw `info` word, which is what builds the table. Decidable from the T# once the table exists, not from the D3D11 description alone.
+* `alt_tile_mode` (Neo only) and `linear_general`: no object field known. `linear_general` is 0 for the display buffers (info 0x8028 has bit 7 clear); the raw `info` in the tuples shows the rest.
+* the fmask words (9, 10): written only by the prebuilt block; `prebuilt_block_cases` shows whether a view block ever differs from it there.
+* the colour clear colour of the engine's clear call: resource `+0x150/+0x154` (valid when `+0x14c != 0`), not the view; a native path takes it from the call.
