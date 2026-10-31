@@ -14,6 +14,8 @@
 #include "video_core/thread_usage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "native/native_raster_prof.h"
+
 #include "video_core/renderer_vulkan/vk_indexed_data.h"
 
 namespace Vulkan {
@@ -351,6 +353,7 @@ void SchedulerCore::HandOffToEncoder(SubmitInfo& info, u64 signal_value) {
             std::max<size_t>(1, EmulatorSettings.GetCpEncoderQueueDepth());
         {
             Core::FrameTimeline::StageScope handoff{Core::FrameTimeline::StageRasterHandoffWait, 0, 20'000};
+            const Core::RasterProf::Scope prof_handoff{Core::RasterProf::Phase::HandoffWait};
             encoder_cv.wait(lk, [this] { return encoder_jobs.size() < max_queued; });
         }
         job.list = std::move(current_list_owner);

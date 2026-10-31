@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <SDL3/SDL.h>
+#include "native/native_raster_prof.h"
 #include "native/native_stall.h"
 #include "native/native_timeline.h"
 #include "tlg_settings.h"
@@ -1258,6 +1259,8 @@ void ProfilerIndicator() {
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
     if (Core::Stall::Recording()) {
         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.1f, 1.0f), "STALL PROFILER RECORDING (F8 stops; the report opens in your browser)");
+    } else if (Core::RasterProf::Recording()) {
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "RASTER THREAD PROFILER RECORDING (Shift+F9 stops; the report opens in your browser)");
     } else {
         ImGui::TextColored(ImVec4(1.0f, 0.25f, 0.25f, 1.0f), "PROFILER RECORDING (F9 stops)");
     }

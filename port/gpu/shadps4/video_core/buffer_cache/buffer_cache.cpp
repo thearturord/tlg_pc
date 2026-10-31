@@ -19,6 +19,8 @@
 #include "native/native_registry.h"
 #include "native/native_updates.h"
 #include "native/native_e3_census.h"
+#include "native/native_raster_prof.h"
+
 #include "native/native_resources.h"
 #include "native/native_resource_audit.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -249,6 +251,7 @@ static bool BindMemoOn() {
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                         Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
+    const Core::RasterProf::Scope prof{Core::RasterProf::Phase::ObtainBuffer};
     if (is_written) {
         BindMemoErase(device_addr, size); // the GPU writes it: answers over this memory are stale
     }
