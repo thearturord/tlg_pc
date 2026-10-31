@@ -1278,7 +1278,12 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
             image.ring_hash = now;
         }
     }
-    if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
+    if (False(image.flags & ImageFlagBits::Dirty)) {
+        Core::NativeE3Census::NoteOutcome(caller, Core::NativeE3Census::Outcome::NotDirty);
+        return;
+    }
+    if (image.info.num_samples > 1) {
+        Core::NativeE3Census::NoteOutcome(caller, Core::NativeE3Census::Outcome::Multisample);
         return;
     }
 
@@ -1300,6 +1305,7 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
         const u64 hash = XXH3_64bits(addr, size);
         if (image.hash == hash) {
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
+            Core::NativeE3Census::NoteOutcome(caller, Core::NativeE3Census::Outcome::MaybeCpuDirtySameHash);
             return;
         }
         image.hash = hash;
@@ -1336,6 +1342,7 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
 
     if (image_copies.empty()) {
         image.flags &= ~ImageFlagBits::Dirty;
+        Core::NativeE3Census::NoteOutcome(caller, Core::NativeE3Census::Outcome::NoCopies);
         return;
     }
 
@@ -1352,6 +1359,14 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
     runtime.UploadImage(&image, buffer, image_copies);
     Core::NativeResources::NoteImageUpload(image.info.guest_address, image.info.guest_size,
                                            BufferCache::last_image_source_gpu);
+    Core::NativeE3Census::NoteOutcome(caller, Core::NativeE3Census::Outcome::Uploaded);
+    if (Core::NativeE3Census::AnnouncedOn()) {
+        // E7c Task 3 (TLG_E3_ANNOUNCED=1): what did the engine announce for the memory this upload reads?
+        Core::NativeE3Census::NoteAnnouncedUpload({.caller = caller, .image_uid = image.image_uid, .address = image.info.guest_address, .size = image.info.guest_size,
+                                                   .width = image.info.size.width, .height = image.info.size.height, .format = static_cast<u32>(image.info.pixel_format),
+                                                   .gpu_source = BufferCache::last_image_source_gpu, .gpu_modified_flag = is_gpu_modified,
+                                                   .usage_bits = static_cast<u32>(image.usage_flags)});
+    }
     if (Core::NativeE3Census::On()) {
         // E7 Task 4 (TLG_E3_CENSUS=1): does the upload carry bytes the image's last upload did not?
         Core::NativeE3Census::NoteUpload(caller, image.image_uid, BufferCache::last_image_source_gpu ? nullptr : std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size);

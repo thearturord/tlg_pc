@@ -48,9 +48,17 @@ struct TargetSet;
 [[nodiscard]] const TargetSet* PrepareDraw(u64 ctx);
 /// Game thread, the fast clear eliminate record: the description of the resource's colour target (mip 0, the whole resource).
 [[nodiscard]] const TargetSet* PrepareEliminate(u64 resource);
+/// The arguments of the engine's ClearDepthStencilView call a depth clear record belongs to (E7c, `TLG_TARGET_REGFREE`): the depth value as float bits, the stencil value, the flags.
+struct DepthClearCall {
+    bool valid{false};
+    u32 depth_bits{0};
+    u32 stencil{0};
+    u32 flags{0};
+};
+
 /// Game thread, the depth clear record: `target` is the depth block the clear function was called with (the view's block at +0x58, or the resource's prebuilt block at +0xf0); the view or the
 /// resource is found from it by address and checked against the engine's table.
-[[nodiscard]] const TargetSet* PrepareDepthClear(u64 target);
+[[nodiscard]] const TargetSet* PrepareDepthClear(u64 target, const struct DepthClearCall* call = nullptr);
 
 /// Command processor: the set of the draw that is being planned (the fill point reads it).
 struct Scope {
@@ -74,6 +82,13 @@ void ApplyEliminate(Vulkan::DrawInputs& inputs, const TargetSet* set);
 /// the depth and stencil clear values) get a candidate value from the engine's objects, compared with the register decode and counted (never applied), and the values the registers hold are
 /// counted per field (`register_value_histograms`: a field with one value in every draw is a constant). `TLG_TARGET_REGONLY=1`, default off.
 [[nodiscard]] bool RegOnlyShadowOn() noexcept;
+
+/// E7c (`TLG_TARGET_REGFREE=1`, default off): the register-only fields of the target blocks are not taken from the registers: info_alt_tile_mode, info_compression, info_linear_general and the depth
+/// view's read-only bits are named constants (native_config.h) applied unless a guard trips (the engine's own block or the T# says otherwise: the registers decide that draw); the depth and stencil
+/// clear values of a depth clear record come from the arguments of the ClearDepthStencilView call; the fmask words, the fmask pitch and the fmask attribute bits are zeroed for targets with one sample
+/// (nothing reads them) and kept from the registers for a multisample target. `TLG_TARGET_REGFREE_VERIFY=1` compares and keeps the registers. Counters: e2_targets.feeds_the_draw.regfree.
+[[nodiscard]] bool RegFreeOn() noexcept;
+[[nodiscard]] bool RegFreeVerifyOn() noexcept;
 
 /// The depth clear record is being built (game thread, inside the engine's ClearDepthStencilView): the arguments of that call (`call_depth_bits` the float, `call_stencil`, `flags`) against the values the
 /// clear's setup wrote into the registers (`reg_*`; ~0u: not written). Counted under `depth_clear_call`.

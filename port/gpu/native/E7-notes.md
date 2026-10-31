@@ -502,3 +502,74 @@ TextureCache::FindTexture / FindRenderTarget / FindDepthTarget through `UpdateIm
 answer). Each with `count` and `per_25s` (scaled by the observed seconds). `refresh_uploads`: for each caller the uploads from guest memory, hashed (XXH3 of the source bytes) and compared with the previous upload of the same
 image: `first_upload_of_the_image`, `bytes_differ_from_last_upload`, `bytes_same_as_last_upload` (an upload that carried nothing new), `source_gpu_written_not_hashed`, megabytes hashed and megabytes in the same-bytes uploads.
 Read it as: a caller with `per_25s` 0 over the scenes you play does not need the function; a caller whose uploads are mostly `bytes_same_as_last_upload` is refreshing without a cause.
+
+## 17. E7c (branch cloud-e7c, from native-v2 325c324): Task 1, the register-only target fields without registers (`TLG_TARGET_REGFREE=1`, off by default)
+
+Code: `native_target_desc.{h,cpp}` (`BuildColour` / `BuildDepth` / `Merge` / `Report`), `native_config.h` (the constants), `native_draw.cpp` (`ConvertClearQuad` hands the depth clear call to `PrepareDepthClear`).
+With the switch off nothing changes: `PlanDraw` and the fill point read the registers as before. `TLG_TARGET_REGFREE_VERIFY=1` builds the same values, compares them with the register decode at every fill point,
+depth clear and eliminate, counts the difference per field (`ignored_changed` / `differences`), and keeps the registers (so verify never changes what reaches the GPU).
+
+**What is applied, and the guard that goes with it**
+
+| field | applied | guard (a trip is counted in `constant_guard_trips.<field>` with one example, and the registers decide that draw) |
+|---|---|---|
+| `info_alt_tile_mode` | `TargetAltTileMode` = 0 | the T# of the engine object says alt tile mode, or the engine's own colour block (`+0x54`) has bit 31 set |
+| `info_linear_general` | `TargetLinearGeneral` = 0 | the T# tiling index is 31 (linear general), or the block has bit 7 set |
+| `info_compression` | `TargetCompression` = 0 | the target has more than one sample, or the block has bit 14 set |
+| depth `view_read_only` (DB_DEPTH_VIEW bits 24 and 25) | `DepthViewReadOnly` = 0 | the engine's depth view block has those bits set |
+| fmask words (`fmask_base`, `fmask_slice`, `pitch_fmask`, attrib fmask bits 5..11) | 0 when `num_samples == 1` | more than one sample: the registers are kept and counted in `fmask_from_registers` |
+| depth / stencil clear values of a depth clear record | the arguments of the engine's `ClearDepthStencilView` call, carried in the `TargetSet` | no call (the fill point's clear flag, a draw that clears through the flag): the registers are kept and counted in `clear_value_from_registers.<path>` |
+
+**Why my old candidate rules gave 1.** `compression`: I derived it from "the target has an fmask address". The engine fills `fmask_base` for *every* target, also one-sample targets, so the candidate was 1 for all of them
+while the hardware bit (`CB_COLOR_INFO.COMPRESSION`, bit 14) is 0 unless the target is multisample and uses fmask. The only reader of the fmask address on the host side is `image_info.cpp:80`
+(`meta_info.fmask_addr = buffer.info.compression ? buffer.FmaskAddress() : 0`), so with compression 0 the fmask words are not read at all for a one-sample target; the only other fmask readers are the shader's own
+`fmasks` list (`vk_pipeline_cache.cpp:715`, from a sampled T#, not from the target) and the `FmaskDecompress` draw class (decided from `color_control.mode`). `view_read_only`: I looked at the engine's DSV flags (`+0x48`).
+Those flags reach the hardware through the depth control / stencil write mask that `Synthesize` builds (the "read only" views disable the depth write and the stencil write), not through DB_DEPTH_VIEW bits 24 / 25, which
+the engine leaves 0. So the DSV flag is a true statement about the draw but the wrong register. The candidate rules in `TLG_TARGET_REGONLY=1` are corrected (compression candidate: `samples > 1`; read-only candidate: the constant);
+the constants are the values your register histograms showed (one value in every draw); `TLG_TARGET_REGFREE_VERIFY=1` is the check that it holds.
+
+**Depth / stencil clear values.** The clear function's setup writes the value into the clear registers through the register prelude; the same value is an argument of the call (the counters `depth_clear_call` say how often they agree). `ConvertClearQuad` reads it from the
+call (`CurrentDepthClear`) and `NoteDepthClearCall(call_depth_bits, call_stencil, flags, reg_depth_bits, reg_stencil)` counts under `depth_clear_call` how often call and prelude agree. The fill point of a draw with the clear flag
+set has no ClearDepthStencilView call record of its own: it stays register sourced, `clear_value_from_registers.fill_point_draws_with_the_clear_flag`
+says how many draws that is. If that counter is 0 in the scenes you play, the registers are not needed for the clear values at all.
+
+Counters: /stats `native_backend.device.e2_targets.feeds_the_draw.regfree` = `{on, verify_only, constants_applied, clear_value_from_call, clear_value_from_registers{fill_point, depth_clear, eliminate, fill_point_draws_with_the_clear_flag},
+fmask_from_registers, fmask_zeroed_one_sample_targets, constant_guard_trips{alt_tile_mode, linear_general, compression, view_read_only}}` (and the same in `last_counters.json`, and `user/log/target_desc_counters.json` every 30 s).
+Expected in the default scene: every difference 0, `constant_guard_trips` all 0, `fmask_from_registers` 0 (no multisample colour target is bound; if the game uses one, the count says how many draws still need the registers).
+
+## 18. Task 2: why `shader_env.pixel/inputs` differs (329 of 1179) (`TLG_PLAN_SHADOW=1`)
+
+Reading `HwFragmentRuntimeInfo::PsInput` (`runtime_info.h`): `param_index`, `is_default`, `is_flat`, `default_value` and unnamed bits 9..15 of its 16-bit bitfield. The native build leaves the padding 0; the register path
+is `info.hw.fs.inputs[i] = {.param_index = ...}` after the whole array was filled from the register image, and in the cases seen the register side holds 0xfe00 in those bits (native 0x0). `operator==` of the struct compares the whole `u16` and so reports a difference where the named fields are equal.
+`HwFragmentRuntimeInfo::operator==` compares `inputs` only up to `num_inputs` (the shader's own count), and the translator indexes inputs by the attribute of the instruction (`vector_interpolation.cpp`), so it
+never reads past `num_inputs` and never the padding.
+
+Shadow: for each pixel input slot `Compare` is now split into `inputs.named_bits` (bits 0..8), `inputs.unnamed_bits` (0xfe00) and `inputs.operator==` (the existing whole-word compare). `PS::Dump("shader_env.pixel.inputs", ...)` writes the first
+16 differing cases (pixel shader gnm address and hash, slot, the native decode, the register decode, the raw `SPI_PS_INPUT_CNTL_n` word from `regs.ps_inputs[i]`, the env interpolant fields, the vertex shader outputs). Read:
+`named_bits` differences 0 and `unnamed_bits` differences = the 329 means the difference is the padding of the struct, not a value: the native side is right (a zero padding is what the struct means), and it is not a stale register mirror
+(the register words were current: the named bits agree). If `named_bits` is ever non-zero the dump shows the case and the vertex outputs, and the call is the user's: with the dump a value in the register that the engine did not set would
+be a stale mirror.
+
+## 19. Task 3: RefreshImage with announced content (`TLG_E3_ANNOUNCED=1`) and the exits of RefreshImage (`TLG_E3_CENSUS=1`)
+
+Code: `native_e3_census.{h,cpp}`, hooks in `NativeUpdates::ApplyBatch`, `TextureCache::RefreshImage`, `BufferCache::ObtainBuffer` (where the GPU written range is added) and the three rasterizer call sites that ask for a written buffer.
+
+**What an announcement is.** A range of guest memory (address, size), nothing more: the engine says "this memory is written"; the bytes are not stored. So "the announced content" can only be the content of that memory when the announcement
+is applied. `NoteAnnounced` (raster thread, `ApplyBatch`) hashes every 4 KB page of a first-time announced range (ranges over 2 MB are marked announced without a hash) and remembers it. At the upload the pages of the image's memory are
+hashed again and compared. Both sides are raw guest bytes before any detile (the detile is a function of the bytes), so no detile is needed to compare. Classes per upload and caller:
+`announced_equal` (every announced page still has the bytes it had when announced; at least one page announced), `announced_differs` (a page changed after its announcement: a write the announcement did not cover or a write
+that came after it, the game thread runs ahead of the raster thread), `no_announcement` (no page of the image was ever announced). Details: `every_page_announced_and_hashed`, `some_page_not_announced`, page totals, up to 8 examples
+per group and class (caller, address, size, width, height, host format, pages, `first_differing_offset`, the engine texture that owns the memory, `announcements_ago`).
+Groups: `first_upload_of_the_image`, `source_gpu_written_not_hashed`, `repeat_upload`.
+
+**The 160 GPU sourced uploads.** `BufferCache::ObtainBufferForImage` takes the GPU buffer when `IsRegionGpuModified` (bytes a shader storage write, a GPU fill or a GPU copy wrote and nothing superseded since). The only place that adds
+to that set is `ObtainBuffer(..., is_written = true)`. `WriteSiteScope` names the call site around the call (shader_graphics, shader_compute, fill_buffer, copy_buffer, hle_copy); `NoteGpuWritten` keeps the last 8192 ranges with the site, and the upload
+looks up the last range that overlaps its memory: `gpu_source_uploads_by_last_writer`. Render targets are not in that set (they are images, written by draws); `gpu_source_uploads_image` counts the images with the GpuModified flag, a colour attachment,
+a depth attachment or a storage usage, and whether an engine texture owns the memory. For these uploads the class only says whether the guest pages were announced and are unchanged since: the bytes uploaded are the GPU's, not the guest's.
+
+**The exits of RefreshImage** (`TLG_E3_CENSUS=1`, `refresh_outcomes.by_reason`, per caller, with `per_25s`): `not_dirty` (no Dirty mark: the call returns at the first test), `multisample` (dirty, more than one sample, never uploaded),
+`maybe_cpu_dirty_same_hash` (the 8x8 pixel hash is unchanged), `no_copies`, `uploaded`. Their sum is `functions.RefreshImage.total`. Nothing in RefreshImage was changed or removed; the B8 verify and the ring check stay as they were.
+
+**What this can not decide.** Whether the engine's announcements cover everything the uploads read is answered for the pages hashed at announcement; a page announced by a range over 2 MB is counted as announced but is not compared
+(`pages_not_hashed_range_over_2mb`). A write after the announcement and before the upload looks the same as a write the announcement did not cover (`announced_differs`): `announcements_ago` and the example's engine texture show which
+it is; the answer needs the hook of the writer if the examples name one texture again and again.

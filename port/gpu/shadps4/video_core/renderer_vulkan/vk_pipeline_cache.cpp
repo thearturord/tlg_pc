@@ -377,7 +377,32 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                 PS::Compare(g, "mrtz_mask", info.hw.fs.mrtz_mask, from_registers.hw.fs.mrtz_mask);
                 PS::Compare(g, "num_samples", info.hw.fs.num_samples, from_registers.hw.fs.num_samples);
                 for (u32 i = 0; i < info.hw.fs.num_inputs && i < 32; ++i) {
-                    PS::CompareBytes(g, "inputs", &info.hw.fs.inputs[i], &from_registers.hw.fs.inputs[i], sizeof(info.hw.fs.inputs[i]));
+                    // E7c Task 2: the 16 bit input word is five named fields (bits 0 to 8) and 7 unnamed bits (9 to 15) that nothing reads (`PsInput::operator==` ignores them); the two are counted apart
+                    u16 native_raw = 0, register_raw = 0;
+                    std::memcpy(&native_raw, &info.hw.fs.inputs[i], sizeof(native_raw));
+                    std::memcpy(&register_raw, &from_registers.hw.fs.inputs[i], sizeof(register_raw));
+                    PS::Compare(g, "inputs.named_bits", native_raw & 0x1ffu, register_raw & 0x1ffu);
+                    PS::Compare(g, "inputs.unnamed_bits", native_raw & 0xfe00u, register_raw & 0xfe00u);
+                    PS::Compare(g, "inputs.operator==", info.hw.fs.inputs[i] == from_registers.hw.fs.inputs[i] ? 0 : 1, 0);
+                    if (native_raw != register_raw && PS::DumpWanted("shader_env.pixel.inputs")) {
+                        u32 control = 0;
+                        std::memcpy(&control, &regs.ps_inputs[i], sizeof(control));
+                        const auto& want = env.pixel.fragment.interpolants[i];
+                        const auto& vs = runtime_infos[u32(SwStage::Vertex)];
+                        std::string outputs;
+                        for (u32 o = 0; o < vs.hw.vs.num_outputs && o < 16; ++o) {
+                            outputs += fmt::format(" [{},{},{},{}]", static_cast<u32>(vs.hw.vs.outputs[o][0]), static_cast<u32>(vs.hw.vs.outputs[o][1]), static_cast<u32>(vs.hw.vs.outputs[o][2]),
+                                                   static_cast<u32>(vs.hw.vs.outputs[o][3]));
+                        }
+                        PS::Dump("shader_env.pixel.inputs",
+                                 fmt::format("{}: pixel shader gnm/code {:#x} hash {:#x}, slot {} of {}; native word {:#06x} (offset {} default {} flat {} default_value {}), register image word {:#06x} "
+                                             "(offset {} default {} flat {} default_value {}); SPI_PS_INPUT_CNTL_{} = {:#010x}; shader environment interpolant offset {} use_default {} flat {} default {}; "
+                                             "vertex shader outputs ({}):{}",
+                                             (native_raw & 0x1ff) == (register_raw & 0x1ff) ? "unnamed bits only" : "NAMED FIELDS DIFFER", env.pixel.program.address, env.pixel.program.hash, i,
+                                             info.hw.fs.num_inputs, native_raw, native_raw & 31, (native_raw >> 5) & 1, (native_raw >> 6) & 1, (native_raw >> 7) & 3, register_raw, register_raw & 31,
+                                             (register_raw >> 5) & 1, (register_raw >> 6) & 1, (register_raw >> 7) & 3, i, control, static_cast<u32>(want.input_offset), want.use_default, want.flat_shade,
+                                             static_cast<u32>(want.default_value), vs.hw.vs.num_outputs, outputs));
+                    }
                 }
                 for (u32 i = 0; i < Shader::MaxColorBuffers; ++i) {
                     if (info.hw.fs.color_buffers[i].data_format != AmdGpu::DataFormat::FormatInvalid) {

@@ -8,6 +8,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
@@ -27,6 +28,7 @@ struct Entry {
 
 std::mutex g_mutex;
 std::map<std::string, Entry> g_entries;
+std::map<std::string, std::vector<std::string>> g_dumps;
 
 Entry& EntryOf(const char* group, const char* field) {
     return g_entries[std::string(group) + "/" + field];
@@ -78,6 +80,25 @@ void CompareBytes(const char* group, const char* field, const void* native, cons
     }
 }
 
+bool DumpWanted(const char* group) {
+    if (!On()) {
+        return false;
+    }
+    std::scoped_lock lock{g_mutex};
+    return g_dumps[group].size() < 16;
+}
+
+void Dump(const char* group, const std::string& text) {
+    if (!On()) {
+        return;
+    }
+    std::scoped_lock lock{g_mutex};
+    auto& list = g_dumps[group];
+    if (list.size() < 16) {
+        list.push_back(text);
+    }
+}
+
 void RegisterOnly(const char* group, const char* field, u64 registers) {
     if (!On()) {
         return;
@@ -117,6 +138,10 @@ nlohmann::json Report() {
             row["examples"] = std::move(examples);
         }
         fields[name] = std::move(row);
+    }
+    auto& dumps = j["dumps"] = nlohmann::json::object();
+    for (const auto& [group, list] : g_dumps) {
+        dumps[group] = list;
     }
     return j;
 }

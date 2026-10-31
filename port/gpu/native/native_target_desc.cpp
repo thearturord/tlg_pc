@@ -23,6 +23,7 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "native/native_debug_server.h"
+#include "native/native_config.h"
 #include "native/native_device.h"
 #include "native/native_image_desc.h"
 #include "video_core/amdgpu/draw_state.h"
@@ -839,6 +840,7 @@ struct WordOverride {
     u32 prebuilt{0};
     u32 view_block{0};
     u32 shadow{0};
+    u32 ignore{0}; ///< applied bits that nothing reads: changed from the registers' value, counted apart (`ignored_changed`), not as a difference
 };
 
 void SetBits(WordOverride& w, u32 mask, u32 value) {
@@ -854,6 +856,11 @@ void SetPrebuilt(WordOverride& w, u32 mask, u32 value) {
 void SetViewBlock(WordOverride& w, u32 mask, u32 value) {
     SetBits(w, mask, value);
     w.view_block |= mask;
+}
+
+void SetIgnored(WordOverride& w, u32 mask, u32 value) {
+    SetBits(w, mask, value);
+    w.ignore |= mask;
 }
 
 void SetShadow(WordOverride& w, u32 mask, u32 value) {
@@ -974,6 +981,7 @@ struct FieldCounters {
     std::atomic<u64> differs{0};       ///< the description's value is not the register decode's
     std::atomic<u64> prebuilt{0};      ///< ... of `used`, the source was the resource's prebuilt block
     std::atomic<u64> view_block{0};    ///< ... of `used`, the source was the render target view's own block
+    std::atomic<u64> ignored_changed{0}; ///< applied but ignored by every reader: the register value was not the description's
     std::atomic<u64> shadow_compared{0}; ///< compare-only: the description has a value, the registers keep the field
     std::atomic<u64> shadow_differs{0};  ///< ... and it is not the register decode's
 };
@@ -1019,6 +1027,34 @@ thread_local const TargetSet* t_scope = nullptr;
 bool ReadUseSwitch(const char* name) {
     const char* e = std::getenv(name);
     return e != nullptr && *e == '1';
+}
+
+bool RegFreeVerifyEnv() {
+    static const bool on = ReadUseSwitch("TLG_TARGET_REGFREE_VERIFY");
+    return on;
+}
+
+bool RegFreeEnv() {
+    static const bool on = ReadUseSwitch("TLG_TARGET_REGFREE") || ReadUseSwitch("TLG_TARGET_REGFREE_VERIFY");
+    return on;
+}
+
+/// A guard of a register-free constant tripped: the engine's own block or the T# says the field is not the constant; the registers decide that draw
+struct TripCounter {
+    u64 count{0};
+    std::string example;
+};
+std::mutex g_trip_mutex;
+std::map<std::string, TripCounter> g_trips;
+std::atomic<u64> g_regfree_constants_applied{0}, g_fmask_from_registers{0}, g_fmask_zeroed_one_sample{0}, g_clear_from_call{0}, g_clear_from_registers_depth_clear{0};
+std::atomic<u64> g_clear_from_registers[3]{}, g_fill_clear_flag_set{0};
+
+void NoteTrip(const char* field, const std::string& example) {
+    std::scoped_lock lock{g_trip_mutex};
+    TripCounter& t = g_trips[field];
+    if (t.count++ == 0) {
+        t.example = example;
+    }
 }
 
 bool RegOnlyOn() {
@@ -1137,17 +1173,56 @@ bool BuildColour(u64 view, u64 resource, std::array<WordOverride, ColourWords>& 
         // fmask (MS targets); alt_tile_mode: the T# has the Neo bit; the fmask words: the prebuilt block's for mip 0 (FUN_02491a30 never writes them, so they are 0 above it).
         const u32 fmask_base = mip0 ? Rd<u32>(resource, 0xb0 + 9 * 4) : 0;
         const u32 fmask_slice = mip0 ? Rd<u32>(resource, 0xb0 + 10 * 4) : 0;
+        // compression: an fmask address is in the block of every target (non-zero and varying even with one sample and compression 0), so its presence says nothing; only a multisample target can have it
         SetShadow(w[4], 0x80, static_cast<u32>(t.tiling_index) == static_cast<u32>(AmdGpu::TileMode::DisplayLinearGeneral) ? 0x80u : 0u);
-        SetShadow(w[4], 0x4000, fmask_base != 0 ? 0x4000u : 0u);
+        SetShadow(w[4], 0x4000, samples > 1 ? 0x4000u : 0u);
         SetShadow(w[4], 0x80000000u, t.alt_tile_mode != 0 ? 0x80000000u : 0u);
         SetShadow(w[9], Full, fmask_base);
         SetShadow(w[10], Full, fmask_slice);
+    }
+    if (RegFreeEnv()) {
+        // E7c: the register-only fields as constants, unless the engine's own object says otherwise. `put` applies (or, in verify mode, only compares)
+        const bool verify = RegFreeVerifyEnv();
+        const auto put = [&](WordOverride& word, u32 mask, u32 value) {
+            if (verify) {
+                SetShadow(word, mask, value);
+            } else {
+                SetBits(word, mask, value);
+            }
+        };
+        const u32 block_info = view != 0 ? Rd<u32>(view + 0x54, 4 * 4) : Rd<u32>(resource, 0xb0 + 4 * 4); // the engine's own block, word 4 (the info word)
+        const auto guard = [&](const char* field, bool tripped, u32 mask, u32 value) {
+            if (tripped) {
+                NoteTrip(field, fmt::format("resource id {} dxgi {} samples {} T# tiling {} T# alt_tile {} block info {:#x}", resource_id, res.format, samples, static_cast<u32>(t.tiling_index),
+                                            static_cast<u32>(t.alt_tile_mode), block_info));
+            } else {
+                put(w[4], mask, value);
+                g_regfree_constants_applied.fetch_add(1, std::memory_order_relaxed);
+            }
+        };
+        guard("info_alt_tile_mode", t.alt_tile_mode != 0 || (block_info & 0x80000000u) != 0, 0x80000000u, Core::NativeConfig::TargetAltTileMode << 31);
+        guard("info_linear_general", static_cast<u32>(t.tiling_index) == static_cast<u32>(AmdGpu::TileMode::DisplayLinearGeneral) || (block_info & 0x80u) != 0, 0x80u,
+              Core::NativeConfig::TargetLinearGeneral << 7);
+        guard("info_compression", samples > 1 || (block_info & 0x4000u) != 0, 0x4000u, Core::NativeConfig::TargetCompression << 14);
+        // the fmask words, the fmask tile max of the pitch word and the fmask bits of the attribute word: read only through the fmask address of a target with compression (never set here)
+        // and by nothing else (grep: FmaskAddress() in ImageInfo, gated by info.compression; no reader of fmask_tile_mode_index, fmask_bank_height, pitch.fmask_tile_max)
+        if (samples == 1) {
+            if (!verify) {
+                SetIgnored(w[9], Full, 0);
+                SetIgnored(w[10], Full, 0);
+                SetIgnored(w[1], 0x7ff00000u, 0);
+                SetIgnored(w[5], 0xfe0u, 0);
+            }
+            g_fmask_zeroed_one_sample.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_fmask_from_registers.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     return true;
 }
 
 /// A depth target's description, from the view (null: the whole resource, mip 0) and its resource
-bool BuildDepth(u64 view, u64 resource, std::array<WordOverride, DepthWords>& w, ClearFacts& facts) {
+bool BuildDepth(u64 view, u64 resource, std::array<WordOverride, DepthWords>& w, ClearFacts& facts, const DepthClearCall* call = nullptr) {
     const u64 resource_id = resource != 0 ? Rd<u64>(resource, 0x10) : 0;
     NativeDevice::Object res;
     if (resource_id == 0 || !NativeDevice::Lookup(resource_id, res)) {
@@ -1222,9 +1297,34 @@ bool BuildDepth(u64 view, u64 resource, std::array<WordOverride, DepthWords>& w,
         g_view_unknown_range.fetch_add(1, std::memory_order_relaxed);
     }
     if (RegOnlyOn() && view != 0) {
-        // the read-only bits of the depth view are the DSV description's flags (D3D11_DSV_READ_ONLY_DEPTH 1, _STENCIL 2; description +0x48)
-        const u32 flags = Rd<u32>(view, 0x48);
-        SetShadow(w[8], 0x03000000, ((flags & 1u) != 0 ? 0x01000000u : 0u) | ((flags & 2u) != 0 ? 0x02000000u : 0u));
+        // the read-only bits of DB_DEPTH_VIEW (24, 25) are 0 in every observed draw even where the DSV description has the read-only flags (D3D11_DSV_READ_ONLY_DEPTH 1, _STENCIL 2; +0x48; 82 of 364
+        // fills): the engine applies those flags through the depth control (the depth write) and the stencil write mask (`Synthesize`), not through these bits; the candidate is the constant
+        SetShadow(w[8], 0x03000000, Core::NativeConfig::DepthViewReadOnly << 24);
+    }
+    if (RegFreeEnv()) {
+        const bool verify = RegFreeVerifyEnv();
+        const u32 block_view = view != 0 ? Rd<u32>(view + 0x58, 8 * 4) : Rd<u32>(resource, 0xf0 + 8 * 4); // the engine's own block, word 8 (DB_DEPTH_VIEW)
+        if ((block_view & 0x03000000u) != 0) {
+            NoteTrip("view_read_only", fmt::format("resource id {} dxgi {} samples {} block view word {:#x} dsv flags {:#x}", resource_id, res.format, samples, block_view, view != 0 ? Rd<u32>(view, 0x48) : 0u));
+        } else {
+            if (verify) {
+                SetShadow(w[8], 0x03000000, Core::NativeConfig::DepthViewReadOnly << 24);
+            } else {
+                SetBits(w[8], 0x03000000, Core::NativeConfig::DepthViewReadOnly << 24);
+            }
+            g_regfree_constants_applied.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (call != nullptr && call->valid) {
+            // the clear values of a depth clear record are the arguments of the ClearDepthStencilView call (1658 of 1658 equal the registers in the local run)
+            if (verify) {
+                SetShadow(w[10], Full, call->depth_bits);
+                SetShadow(w[11], Full, call->stencil);
+            } else {
+                SetBits(w[10], Full, call->depth_bits);
+                SetBits(w[11], Full, call->stencil);
+            }
+            g_clear_from_call.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     SetBits(w[9], Full, static_cast<u32>(htile >> 8));
     // the clear values: the registers hold what the clear's setup wrote (the depth clear record: the prelude packets) or Synthesize's copy of the resource's values at the draw; the resource's
@@ -1252,6 +1352,7 @@ u64 HashSet(const TargetSet& set) {
         h.Add(w.prebuilt);
         h.Add(w.view_block);
         h.Add(w.shadow);
+        h.Add(w.ignore);
     };
     const auto add_facts = [&](const ClearFacts& f) {
         h.Add(f.state);
@@ -1390,8 +1491,12 @@ bool Merge(u32* reg, const std::array<WordOverride, N>& over, const FieldDef* fi
             counters[f].view_block.fetch_add(1, std::memory_order_relaxed);
         }
         if (((reg[def.word] ^ merged[def.word]) & def.mask) != 0) {
-            counters[f].differs.fetch_add(1, std::memory_order_relaxed);
-            differs = true;
+            if ((o.ignore & def.mask) == def.mask) {
+                counters[f].ignored_changed.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                counters[f].differs.fetch_add(1, std::memory_order_relaxed);
+                differs = true;
+            }
         }
     }
     if (!verify) {
@@ -1470,6 +1575,14 @@ void ApplyDepth(Vulkan::DrawInputs& inputs, const TargetSet& set, Path path) {
     words[11] = inputs.stencil_clear;
     const u32 reg0 = words[10], reg1 = words[11];
     pc.applied_depth.fetch_add(1, std::memory_order_relaxed);
+    if (RegFreeEnv()) {
+        if (set.depth[10].mask == 0) {
+            g_clear_from_registers[path].fetch_add(1, std::memory_order_relaxed); // no call argument for this draw: the registers hold the clear values
+        }
+        if (path == PathFill && inputs.depth_render_control.depth_clear_enable) {
+            g_fill_clear_flag_set.fetch_add(1, std::memory_order_relaxed); // the fill point's clear values only matter when its draw clears
+        }
+    }
     if (Merge<DepthWords>(words, set.depth, DepthFields, NumDepthFields, pc.depth.data(), verify, nullptr, (static_cast<u32>(path) << 16) | 0x8000u)) {
         pc.targets_differing.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1507,6 +1620,14 @@ bool ResolveDepthTarget(u64 target, u64& view, u64& resource) {
 }
 
 } // namespace
+
+bool RegFreeOn() noexcept {
+    return RegFreeEnv();
+}
+
+bool RegFreeVerifyOn() noexcept {
+    return RegFreeVerifyEnv();
+}
 
 bool RegOnlyShadowOn() noexcept {
     return RegOnlyOn();
@@ -1605,14 +1726,14 @@ const TargetSet* PrepareEliminate(u64 resource) {
     return Intern(set);
 }
 
-const TargetSet* PrepareDepthClear(u64 target) {
+const TargetSet* PrepareDepthClear(u64 target, const DepthClearCall* call) {
     if (!UseOn()) {
         return nullptr;
     }
     StartCounterWriter();
     u64 view = 0, resource = 0;
     TargetSet set{};
-    if (!ResolveDepthTarget(target, view, resource) || resource == 0 || !BuildDepth(view, resource, set.depth, set.depth_clear_facts)) {
+    if (!ResolveDepthTarget(target, view, resource) || resource == 0 || !BuildDepth(view, resource, set.depth, set.depth_clear_facts, call)) {
         g_object_not_found[PathDepthClear].fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
@@ -1675,6 +1796,22 @@ nlohmann::json UseReport() {
     j["targets_above_mip_0_with_register_geometry"] = g_mip_above_0_registers.load();
     j["pitch_not_representable"] = g_pitch_not_representable.load();
     j["view_range_unknown"] = g_view_unknown_range.load();
+    if (RegFreeEnv()) {
+        auto& rf = j["regfree"] = nlohmann::json::object();
+        rf["on"] = true;
+        rf["verify_only"] = RegFreeVerifyEnv();
+        rf["constants_applied"] = g_regfree_constants_applied.load();
+        rf["clear_value_from_call"] = g_clear_from_call.load();
+        rf["clear_value_from_registers"] = {{"fill_point", g_clear_from_registers[PathFill].load()}, {"depth_clear", g_clear_from_registers[PathDepthClear].load()},
+                                           {"eliminate", g_clear_from_registers[PathEliminate].load()}, {"fill_point_draws_with_the_clear_flag", g_fill_clear_flag_set.load()}};
+        rf["fmask_from_registers"] = g_fmask_from_registers.load();
+        rf["fmask_zeroed_one_sample_targets"] = g_fmask_zeroed_one_sample.load();
+        auto& trips = rf["constant_guard_trips"] = nlohmann::json::object();
+        std::scoped_lock lock{g_trip_mutex};
+        for (const auto& [field, t] : g_trips) {
+            trips[field] = {{"count", t.count}, {"example", t.example}};
+        }
+    }
     if (RegOnlyOn()) {
         // E7b Task 2: the values the register decode holds in the register-only fields, and the candidate comparisons (`compare_only_differs` in the fields above)
         auto& hist = j["register_value_histograms"] = nlohmann::json::object();
@@ -1717,7 +1854,7 @@ nlohmann::json UseReport() {
             }
             const char* cls = defs[f].cls == FieldClass::Decided ? "decided" : defs[f].cls == FieldClass::NotNeeded ? "not_needed" : "not_decidable";
             out[defs[f].name] = {{"class", cls}, {"description_used", used}, {"register_only", only}, {"differs_from_registers", c.differs.load()},
-                                 {"source_prebuilt_block", c.prebuilt.load()}, {"source_view_block", c.view_block.load()}, {"compare_only", c.shadow_compared.load()},
+                                 {"source_prebuilt_block", c.prebuilt.load()}, {"source_view_block", c.view_block.load()}, {"ignored_changed", c.ignored_changed.load()}, {"compare_only", c.shadow_compared.load()},
                                  {"compare_only_differs", c.shadow_differs.load()}};
         }
         return out;

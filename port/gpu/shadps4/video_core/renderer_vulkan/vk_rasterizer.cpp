@@ -1771,6 +1771,7 @@ bool Rasterizer::HazardAuditOn() const noexcept {
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     Core::NativeUploads::SetCaller(stage.sw_stage == Shader::SwStage::Compute ? 2 : 1);
+    const Core::NativeE3Census::WriteSiteScope e3_site{stage.sw_stage == Shader::SwStage::Compute ? Core::NativeE3Census::WriteSite::ShaderCompute : Core::NativeE3Census::WriteSite::ShaderGraphics};
     const u64 alignment = instance.StorageMinAlignment();
     const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
@@ -3329,6 +3330,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         if (is_gds) {
             return {buffer_cache.GetGdsBuffer(), address};
         }
+        const Core::NativeE3Census::WriteSiteScope e3_site{Core::NativeE3Census::WriteSite::FillBuffer};
         return buffer_cache.ObtainBuffer(address, num_bytes, true);
     }();
     runtime.FillBuffer(buffer, offset, num_bytes, value);
@@ -3559,6 +3561,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         if (explicit_readback) {
             return buffer_cache.ObtainBufferForDownload(dst, num_bytes);
         }
+        const Core::NativeE3Census::WriteSiteScope e3_site{Core::NativeE3Census::WriteSite::CopyBuffer};
         return buffer_cache.ObtainBuffer(dst, num_bytes, true, true);
     }();
     const vk::BufferCopy copy = {

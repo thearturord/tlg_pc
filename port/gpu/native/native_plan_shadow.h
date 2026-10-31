@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
 #include <nlohmann/json_fwd.hpp>
 #include "common/types.h"
 
@@ -19,6 +20,10 @@ void Compare(const char* group, const char* field, u64 native, u64 registers);
 void CompareBytes(const char* group, const char* field, const void* native, const void* registers, size_t size);
 /// A register image field the native side has no value for: counts the evaluations and how often the value is not 0 (a field that is always 0 in the fallbacks is a candidate to drop).
 void RegisterOnly(const char* group, const char* field, u64 registers);
+
+/// The first 16 cases of a group are kept as text (`Dump`); `DumpWanted` says whether the group still has room, so the caller builds the text only then.
+[[nodiscard]] bool DumpWanted(const char* group);
+void Dump(const char* group, const std::string& text);
 
 [[nodiscard]] nlohmann::json Report();
 

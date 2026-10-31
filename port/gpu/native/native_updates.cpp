@@ -23,6 +23,7 @@
 #include "native/native_uploads.h"
 #include "native/native_device.h"
 #include "native/native_updates.h"
+#include "native/native_e3_census.h"
 
 namespace Core::NativeUpdates {
 
@@ -327,9 +328,11 @@ void ApplyBatch(const Batch& batch) {
         return;
     }
     for (const auto& [address, size] : batch.again) {
+        Core::NativeE3Census::NoteAnnounced(address, size, false); // E7c Task 3 (TLG_E3_ANNOUNCED=1)
         apply_fn(apply_context, address, size, false);
     }
     for (const auto& [address, size] : batch.first) {
+        Core::NativeE3Census::NoteAnnounced(address, size, true);
         apply_fn(apply_context, address, size, true);
         b2_applied_bytes.fetch_add(size, std::memory_order_relaxed);
     }

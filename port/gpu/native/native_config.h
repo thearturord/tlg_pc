@@ -21,4 +21,12 @@ inline constexpr u32 StageKey = 1;
 inline constexpr u32 GroupSig = 1;
 inline constexpr s32 MapNative = 2;
 
+/// E7c (`TLG_TARGET_REGFREE=1`): the register-only fields of the target blocks as constants of this game. Every observed colour target and depth view had 0 in each (info_alt_tile_mode, info_compression,
+/// info_linear_general, the depth view's read-only bits); the target description applies them unless the engine's own object or the resource's T# says otherwise (a guard trip: the register value is used
+/// for that draw and the trip is counted with an example).
+inline constexpr u32 TargetAltTileMode = 0;
+inline constexpr u32 TargetCompression = 0;
+inline constexpr u32 TargetLinearGeneral = 0;
+inline constexpr u32 DepthViewReadOnly = 0;
+
 } // namespace Core::NativeConfig
