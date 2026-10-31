@@ -503,21 +503,25 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             if (safe_to_delete) {
                 FreeImage(cache_image_id);
             }
+            Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 0);
             return {merged_image_id, -1, -1};
         }
 
         if (const auto depth_image_id = ResolveDepthOverlap(image_info, binding, cache_image_id)) {
+            Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 1);
             return {depth_image_id, -1, -1};
         }
 
         // Compressed view of uncompressed image with same block size.
         if (image_info.props.is_block && !cache_image.info.props.is_block) {
+            Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 2);
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
         if (image_info.guest_size == cache_image.info.guest_size &&
             (image_info.type == AmdGpu::ImageType::Color3D ||
              cache_image.info.type == AmdGpu::ImageType::Color3D)) {
+            Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 3);
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
@@ -536,12 +540,14 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             const auto& result_image = slot_images[result_id];
             const bool is_compatible =
                 IsVulkanFormatCompatible(result_image.info.pixel_format, image_info.pixel_format);
+            Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, is_compatible ? 4 : 5);
             return {is_compatible ? result_id : ImageId{}, -1, -1};
         }
 
         // Size and resources are greater, expand the image.
         if (image_info.type == cache_image.info.type &&
             image_info.resources > cache_image.info.resources) {
+            Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 6);
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
@@ -551,6 +557,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             if (safe_to_delete) {
                 FreeImage(cache_image_id);
             }
+            Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 7);
             return {merged_image_id, -1, -1};
         }
 
@@ -674,6 +681,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         ASSERT_MSG(safe_to_delete,
                    "Encountered unresolvable image overlap with equal memory address.");
         FreeImage(cache_image_id);
+        Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 8);
         return {merged_image_id, -1, -1};
     }
 
@@ -681,11 +689,13 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     if (image_info.guest_address > cache_image.info.guest_address) {
         if (auto mip = image_info.MipOf(cache_image.info); mip >= 0) {
             if (auto slice = image_info.SliceOf(cache_image.info, mip); slice >= 0) {
+                Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 9);
                 return {cache_image_id, mip, slice};
             }
         }
 
         // Image isn't a subresource but a chance overlap.
+        Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, safe_to_delete ? 10 : 11);
         if (safe_to_delete) {
             FreeImage(cache_image_id);
         }
@@ -704,6 +714,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                     }
 
                     FreeImage(cache_image_id);
+                    Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 12);
                     return {merged_image_id, -1, -1};
                 }
 
@@ -712,11 +723,15 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                     auto& merged_image = slot_images[merged_image_id];
                     runtime.CopyMip(&cache_image, &merged_image, mip, slice);
                     FreeImage(cache_image_id);
+                    Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 13);
+                } else {
+                    Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 14);
                 }
             }
         }
     }
 
+    Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 15);
     return {merged_image_id, -1, -1};
 }
 
@@ -1014,6 +1029,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             view_slice = -1;
 
             const auto& merged_info = image_id ? slot_images[image_id].info : info;
+            {
+                // E3 census: whose image the candidate is (the requested texture's own, another engine texture's, or none's)
+                const u64 listed = slot_images[cache_id].b8_listed_by & 0x3fffffffffffffffull;
+                e3_overlap_class = owner_id == 0 ? 3 : listed == 0 ? 2 : listed == owner_id ? 0 : 1;
+            }
             auto [overlap_image_id, overlap_view_mip, overlap_view_slice] =
                 ResolveOverlap(merged_info, desc.type, cache_id, image_id);
             if (overlap_image_id) {
@@ -1310,20 +1330,8 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
 
 void TextureCache::RefreshImage(Image& image) {
     Core::NativeCensus::NoteImage(Core::NativeCensus::ImageRefresh, image.info.guest_size);
-    // L3 write watch: an image's first and last page, when it shares them with other data, are not protected; their CPU writes are learned
-    // here, before the dirty flags are read (the pages the image covers whole stay protected and fault as before)
-    const auto harvest_shared_pages = [&] {
-        const VAddr begin = image.info.guest_address;
-        const VAddr end = begin + image.info.guest_size;
-        Core::WriteWatch::NoteImageRange(begin, image.info.guest_size); // P3: the command processor harvests these pages ahead next time
-        if ((begin & 4095) != 0 || image.info.guest_size < 4096) {
-            buffer_cache.HarvestWriteWatch(begin & ~VAddr{4095}, 4096, true);
-        }
-        if ((end & 4095) != 0 && ((end - 1) & ~VAddr{4095}) != (begin & ~VAddr{4095})) {
-            buffer_cache.HarvestWriteWatch((end - 1) & ~VAddr{4095}, 4096, true);
-        }
-    };
-    harvest_shared_pages();
+    // E3.3: the shared page edges of an image are no longer harvested here. The engine's announced writes tell when an image's content changed (E3.1 census: the harvest alone
+    // found a change in 0 of 8.7 million refreshes); the sampled hash check below still counts a change nothing announced.
     if ((image.b8_marks & B8Deleted) != 0) {
         // B8.2 audit: an image the engine deleted the texture of is used again
         image.b8_marks &= ~B8Deleted;
@@ -1362,12 +1370,7 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) && image.ww_hash != 0 && False(image.flags & ImageFlagBits::GpuModified) &&
         Core::WriteWatch::SampleImageCheck()) {
         // verify: an image that is not dirty must still hold the bytes of its last refresh
-        bool changed = (XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size) | 1) != image.ww_hash;
-        if (changed) {
-            // a write after the harvest above has its record by now: harvest again; still not dirty is a miss
-            harvest_shared_pages();
-            changed = False(image.flags & ImageFlagBits::Dirty);
-        }
+        const bool changed = (XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size) | 1) != image.ww_hash;
         Core::WriteWatch::NoteImageCheck(changed, image.info.guest_address, image.info.guest_size);
         if (changed) {
             image.flags |= ImageFlagBits::CpuDirty;

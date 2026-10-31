@@ -467,6 +467,13 @@ void NoteB8Unannounced(u64 address, u64 size, bool by_fault) noexcept {
     }
 }
 
+namespace {
+std::array<std::atomic<u64>, 4 * 16> e3_overlaps{};
+} // namespace
+void NoteE3Overlap(u32 cls, u32 outcome) noexcept {
+    e3_overlaps[(cls & 3) * 16 + (outcome & 15)].fetch_add(1, std::memory_order_relaxed);
+}
+
 nlohmann::json B8Report() {
     const auto c = [](B8Count what) { return b8_counts[what].load(std::memory_order_relaxed); };
     const u64 found = c(B8FoundWithout), later = c(B8AnnouncedLater);
@@ -496,6 +503,21 @@ nlohmann::json B8Report() {
                        {"AUDIT_COPY_OTHER", c(B8RouteCopyOther)}}},
             {"buffer_images", {{"mode", B8BufferImagesMode()}, {"announcements_by_engine_buffers", c(B8BufAnnounce)}, {"copies_by_engine_buffers", c(B8BufCopy)},
                                {"images_listed", c(B8BufListed)}, {"AUDIT_MISSED", c(B8BufMissed)}, {"not_covered_page_table", c(B8BufNotCovered)}}},
+            {"e3_overlap", [&] {
+                 static constexpr const char* classes[4] = {"own_image", "other_engine_texture", "unlisted", "request_has_no_engine_texture"};
+                 static constexpr const char* outcomes[16] = {"pool_free",    "depth",           "expand_block",       "expand_3d",    "view_reuse",  "view_incompatible",
+                                                              "expand_grow",  "tile_free",       "assert_free",        "right_subres", "right_freed", "right_kept",
+                                                              "left_rebind",  "left_copy_mip",   "left_nothing",       "left_none"};
+                 nlohmann::json out = nlohmann::json::object();
+                 for (u32 k = 0; k < 4; ++k) {
+                     for (u32 o = 0; o < 16; ++o) {
+                         if (const u64 n = e3_overlaps[k * 16 + o].load(std::memory_order_relaxed); n != 0) {
+                             out[classes[k]][outcomes[o]] = n;
+                         }
+                     }
+                 }
+                 return out;
+             }()},
             {"e3_find", {{"unnamed", c(E3FindUnnamed)}, {"named", c(E3FindNamed)}, {"named_same_owner", c(E3NamedSameOwner)}, {"named_OTHER_OWNER", c(E3NamedOtherOwner)},
                          {"named_interior", c(E3NamedInterior)}, {"named_no_owner", c(E3NamedNoOwner)}, {"named_unknown_object", c(E3NamedUnknownObject)},
                          {"owner_by_id", c(E3OwnerById)}, {"owner_by_id_missed", c(E3OwnerByIdMissed)}, {"id_decides", E3IdDecides()}}},

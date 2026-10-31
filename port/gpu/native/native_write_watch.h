@@ -53,13 +53,6 @@ inline void BumpEpoch(bool apply = true) noexcept {
 /// epoch holds: the harvest ran after the submission the operation belongs to), so the raster thread makes no kernel call for them.
 void SetKnownEpoch(u32 known, u32 known_base = 0) noexcept;
 
-/// P3: the command processor harvests the first and the last page of the images a planned operation samples (the pages an image may share with other
-/// data, see TextureCache::RefreshImage) and stores the base epoch it read before (the plan's `ww_base_epoch`); the raster thread then skips those
-/// image requests. The image's size comes from its last refresh (`NoteImageRange`, raster thread); an image not seen yet gets its first page only.
-void NoteImageRange(VAddr begin, u64 size) noexcept;
-/// the guest size of the image at `begin` from its last refresh (0: unknown)
-[[nodiscard]] u64 ImageSize(VAddr begin) noexcept;
-
 using Replay = void (*)(void* context, VAddr page, u64 size);
 using IsCpuDirty = bool (*)(void* context, VAddr page, u64 size);
 /// The pages of [address, address + size) the CPU wrote since their last harvest, and the pending ones the runtime found, each given

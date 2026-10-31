@@ -184,6 +184,10 @@ enum B8Count : u32 {
     B8Counts,
 };
 void NoteB8(B8Count what) noexcept;
+/// E3 census: an overlap resolution (`TextureCache::ResolveOverlap`) ended with `outcome` (0 pool free, 1 depth, 2 expand block, 3 expand 3D, 4 view reuse, 5 view incompatible,
+/// 6 expand grow, 7 tile free, 8 assert free, 9 right subresource, 10 right chance freed, 11 right chance kept, 12 left rebind, 13 left copy mip, 14 left nothing, 15 left none)
+/// for a candidate of class `cls` (0 the requested texture's own image, 1 another engine texture's, 2 unlisted, 3 the request names no engine texture)
+void NoteE3Overlap(u32 cls, u32 outcome) noexcept;
 /// An image a CPU change reached without an announcement (first few logged with the owner)
 void NoteB8Unannounced(u64 address, u64 size, bool by_fault) noexcept;
 [[nodiscard]] nlohmann::json B8Report();

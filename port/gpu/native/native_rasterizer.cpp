@@ -714,25 +714,7 @@ void Rasterizer::HarvestAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) 
     const auto buffers = [&](const auto& bindings, u32 count) {
         for (u32 i = 0; i < count; ++i) {
             const auto& b = bindings[i];
-            static const bool images_on = [] {
-                const char* e = std::getenv("TLG_HARVEST_AHEAD_IMAGES");
-                return e == nullptr || *e != '0';
-            }();
-            if (b.kind == 2 && images_on && Core::WriteWatch::LiftImages()) {
-                // P3: the pages an image may share with other data (TextureCache::RefreshImage harvests the same ones)
-                AmdGpu::Image t{};
-                std::memcpy(&t, b.words, sizeof(t));
-                const VAddr begin = t.Address();
-                if (begin == 0) {
-                    continue;
-                }
-                const u64 size = Core::WriteWatch::ImageSize(begin);
-                buffer_cache.HarvestWriteWatch(begin & ~VAddr{4095}, 4096);
-                if (const VAddr end = begin + size; size != 0 && (end & 4095) != 0 && ((end - 1) & ~VAddr{4095}) != (begin & ~VAddr{4095})) {
-                    buffer_cache.HarvestWriteWatch((end - 1) & ~VAddr{4095}, 4096);
-                }
-                continue;
-            }
+            // E3.3: the pages an image shares with other data are not harvested ahead any more (the engine's announced writes tell when an image changed)
             if (b.kind != 1) {
                 continue;
             }

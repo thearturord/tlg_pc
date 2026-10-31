@@ -243,6 +243,7 @@ public:
 
     /// Creates a new image with provided image info and copies subresources from image_id
     [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
+    u32 e3_overlap_class{}; ///< E3 census: whose image the overlap candidate being resolved is (0 the requested texture's own, 1 another engine texture's, 2 unlisted, 3 the request has no engine texture)
 
     /// Reuploads image contents.
     void RefreshImage(Image& image);

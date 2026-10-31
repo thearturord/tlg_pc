@@ -38,12 +38,6 @@ namespace {
 thread_local u32 t_known_epoch = 0;
 thread_local u32 t_known_base = 0;
 std::atomic<u64> known_skips{0}, known_image_skips{0};
-/// P3: image sizes by address (direct mapped; a slot holds the address >> 8 in its high 38 bits and the size in 256 byte units in the low 26)
-constexpr u32 ImageSlots = 1u << 16;
-std::atomic<u64> image_sizes[ImageSlots]{};
-u32 ImageSlot(VAddr begin) noexcept {
-    return static_cast<u32>(((begin >> 8) * 0x9E3779B97F4A7C15ull) >> 48) & (ImageSlots - 1);
-}
 thread_local bool t_raster = false; ///< the thread executes planned operations (it set a known epoch once)
 /// P3 census: kernel calls by who asked (0 other threads, 1 raster image, 2 raster with a plan epoch, 3 raster without one) and their time
 std::atomic<u64> class_calls[4]{}, class_ns[4]{};
@@ -68,23 +62,6 @@ void SetKnownEpoch(u32 known, u32 known_base) noexcept {
     t_known_epoch = known;
     t_known_base = known_base;
     t_raster = true;
-}
-
-void NoteImageRange(VAddr begin, u64 size) noexcept {
-    const u64 units = (size + 255) >> 8;
-    if ((begin & 255) != 0 || (begin >> 8) >= (u64{1} << 38) || units >= (u64{1} << 26)) {
-        return;
-    }
-    const u64 packed = ((begin >> 8) << 26) | units;
-    auto& slot = image_sizes[ImageSlot(begin)];
-    if (slot.load(std::memory_order_relaxed) != packed) {
-        slot.store(packed, std::memory_order_relaxed);
-    }
-}
-
-u64 ImageSize(VAddr begin) noexcept {
-    const u64 packed = image_sizes[ImageSlot(begin)].load(std::memory_order_relaxed);
-    return (packed >> 26) == (begin >> 8) && (begin & 255) == 0 ? (packed & ((u64{1} << 26) - 1)) << 8 : 0;
 }
 
 namespace {
