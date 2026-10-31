@@ -28,6 +28,7 @@ namespace {
 static_assert(sizeof(AmdGpu::ColorBuffer) == 15 * sizeof(u32));
 static_assert(sizeof(AmdGpu::DepthBuffer) == 8 * sizeof(u32));
 static_assert(sizeof(AmdGpu::DepthView) == sizeof(u32));
+static_assert(sizeof(AmdGpu::Image) == 8 * sizeof(u32));
 
 // Offsets in the engine's device context (the ones native_draw.cpp uses: Ctx::RenderTargetCount, Ctx::RenderTargets, Ctx::DepthStencilView, and the object of target 7)
 constexpr u64 CtxRenderTargetCount = 0x4484;
@@ -59,19 +60,31 @@ enum Field : u32 {
     FClearWord1,
     FZFormat,
     FStencilFormat,
+    FTFormat,
+    FTPitch,
+    FTTileMode,
+    FBlendBypass,
+    FFastClear,
+    FWriteBase,
+    FStencilAddress,
+    FHtileBase,
+    FHtileEnable,
     FieldCount,
 };
 
+// The first fifteen compare the words with the Direct3D 11 description and `NativeImageDesc::Derive`; the others (t_*, blend_bypass, ...) with what the Ghidra reading of the engine's
+// own builders says (FUN_02491a30 builds the colour info word from the resource's T# at resource +0x70; FUN_02492370 the depth block from the resource): see E7-notes.md section 6.
 constexpr std::array<const char*, FieldCount> FieldNames{
     "data_format", "number_format", "tile_mode", "pitch", "extent_width", "extent_height", "first_slice", "num_slices",
     "samples", "address", "cmask_address", "clear_word0", "clear_word1", "z_format", "stencil_format",
+    "t_data_format", "t_pitch", "t_tile_mode", "blend_bypass", "fast_clear_flag", "z_write_base", "stencil_address", "htile_base", "htile_enable",
 };
 
 std::array<std::atomic<u64>, FieldCount> g_field_diffs[2]{}; // [0] colour, [1] depth
 std::atomic<u64> g_observed[2]{}, g_cache_hits{}, g_evaluated[2]{}, g_differing[2]{}, g_unbound[2]{}, g_no_object[2]{};
 std::atomic<u64> g_derive[3]{}; // NativeImageDesc::Result: derived, unknown object, unknown format
 std::atomic<u64> g_extent_none[2]{}, g_extent_equal[2]{}, g_extent_larger[2]{}, g_extent_smaller[2]{};
-std::atomic<u64> g_clear_words_differ_without_fast_clear{}, g_cmask_in_resource_without_fast_clear{};
+std::atomic<u64> g_clear_packed_present{}, g_clear_block_equals_packed{}, g_clear_block_differs_packed{};
 std::atomic<u64> g_unknown_depth_format{};
 std::atomic<u64> g_tuple_overflow{}, g_shape_overflow{};
 
@@ -83,6 +96,7 @@ struct Key {
     u32 samples;       ///< the sample count of the resource's description (+0x194)
     u32 raw_a;         ///< colour: CB_COLORi_INFO; depth: DB_Z_INFO
     u32 raw_b;         ///< colour: CB_COLORi_ATTRIB; depth: DB_STENCIL_INFO
+    u32 t_desc;        ///< the resource's own T# (+0x70): data format | number format << 8 | dst_sel (x, y, z, w; 3 bits each) << 16
     u32 mip;
     u32 dimension;     ///< the view's dimension (+0x44)
     u32 aux;           ///< colour: bit 0 cmask words set, 1 fmask words set, 2 resource +0x58 set; depth: bit 0 write base = read base, 1 htile base set, 2 resource +0x48 set, 3.. DSV flags
@@ -256,8 +270,15 @@ u64 TargetHash(u64 view, bool depth) {
     }
     if (resource != 0) {
         hasher.Add(Rd<u64>(resource, 0x30));
+        hasher.Add(Rd<u64>(resource, 0x40));
         hasher.Add(Rd<u64>(resource, 0x48));
         hasher.Add(Rd<u64>(resource, 0x58));
+        for (u32 k = 0; k < 4; ++k) {
+            hasher.Add(Rd<u64>(resource, 0x70 + k * 8)); // the resource's own T#
+        }
+        hasher.Add(Rd<u32>(resource, 0xdc));
+        hasher.Add(Rd<u32>(resource, 0xe0));
+        hasher.Add(Rd<u32>(resource, 0x14c));
         hasher.Add(Rd<u32>(resource, 0x150));
         hasher.Add(Rd<u32>(resource, 0x154));
         hasher.Add(Rd<u32>(resource, 0x194));
@@ -310,6 +331,10 @@ Counter* Evaluate(u64 view, bool depth, u32 slot) {
     g_derive[static_cast<u32>(result)].fetch_add(1, std::memory_order_relaxed);
     const bool derived = result == NativeImageDesc::Result::Derived;
 
+    // the resource's own console texture description (T#, +0x70): the colour info word and the depth block are built from it (Ghidra: FUN_02491a30, FUN_02492370)
+    AmdGpu::Image resource_t{};
+    std::memcpy(&resource_t, reinterpret_cast<const void*>(resource + 0x70), sizeof(resource_t));
+
     Diffs diffs{kind};
     Key key{};
     key.is_depth = kind;
@@ -318,6 +343,8 @@ Counter* Evaluate(u64 view, bool depth, u32 slot) {
     key.samples = samples;
     key.mip = range.mip;
     key.dimension = dimension;
+    key.t_desc = static_cast<u32>(resource_t.data_format) | static_cast<u32>(resource_t.num_format) << 8 | static_cast<u32>(resource_t.dst_sel_x) << 16 |
+                 static_cast<u32>(resource_t.dst_sel_y) << 19 | static_cast<u32>(resource_t.dst_sel_z) << 22 | static_cast<u32>(resource_t.dst_sel_w) << 25;
     std::array<u32, 8> shape{};
     shape[0] = kind;
     shape[1] = hint_width;
@@ -343,6 +370,14 @@ Counter* Evaluate(u64 view, bool depth, u32 slot) {
                 diffs.Check(FPitch, static_cast<u64>(image.pitch) + 1, cb.Pitch());
             }
         }
+        // Ghidra Q6: info.format is the T# data format (FUN_0246a420: format = data format << 2); the number type and comp_swap go through small tables, which the tuples dump
+        diffs.Check(FTFormat, resource_t.data_format, cb.info.format);
+        if (range.mip == 0) {
+            diffs.Check(FTPitch, static_cast<u64>(resource_t.pitch) + 1, cb.Pitch());
+            diffs.Check(FTTileMode, resource_t.tiling_index, static_cast<u64>(cb.GetTileMode()));
+        }
+        // blend_bypass is set for the integer number types (4 uint, 5 sint)
+        diffs.Check(FBlendBypass, (cb.info.number_type == 4 || cb.info.number_type == 5) ? 1 : 0, cb.info.blend_bypass);
         if (extent_word != 0) {
             diffs.Check(FExtentWidth, mip_width, hint_width);
             diffs.Check(FExtentHeight, mip_height, hint_height);
@@ -356,16 +391,21 @@ Counter* Evaluate(u64 view, bool depth, u32 slot) {
         if (range.mip == 0) {
             diffs.Check(FAddress, res.address, cb.Address());
         }
-        if (cb.info.fast_clear) {
+        // Ghidra Q9: the cmask base is resource +0x58 (>> 8) and the fast clear bit is set if and only if it is not 0
+        diffs.Check(FFastClear, resource_cmask != 0 ? 1 : 0, cb.info.fast_clear);
+        if (range.mip == 0) {
             diffs.Check(FCmaskAddress, resource_cmask, cb.CmaskAddress());
-            diffs.Check(FClearWord0, Rd<u32>(resource, 0x150), cb.clear_word0);
-            diffs.Check(FClearWord1, Rd<u32>(resource, 0x154), cb.clear_word1);
-        } else {
-            if (Rd<u32>(resource, 0x150) != cb.clear_word0 || Rd<u32>(resource, 0x154) != cb.clear_word1) {
-                g_clear_words_differ_without_fast_clear.fetch_add(1, std::memory_order_relaxed);
-            }
-            if (resource_cmask != 0) {
-                g_cmask_in_resource_without_fast_clear.fetch_add(1, std::memory_order_relaxed);
+        }
+        // Ghidra Q7: block words 11 and 12 are the prebuilt block's (resource +0xdc, +0xe0) for mip 0 and 0 above it; they are NOT the colour of the engine's clear call, which lives at
+        // resource +0x150 / +0x154 (valid when +0x14c is not 0). The second pair of numbers below counts how often the two agree.
+        diffs.Check(FClearWord0, range.mip == 0 ? Rd<u32>(resource, 0xdc) : 0, cb.clear_word0);
+        diffs.Check(FClearWord1, range.mip == 0 ? Rd<u32>(resource, 0xe0) : 0, cb.clear_word1);
+        if (Rd<u32>(resource, 0x14c) != 0) {
+            g_clear_packed_present.fetch_add(1, std::memory_order_relaxed);
+            if (Rd<u32>(resource, 0x150) == cb.clear_word0 && Rd<u32>(resource, 0x154) == cb.clear_word1) {
+                g_clear_block_equals_packed.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_clear_block_differs_packed.fetch_add(1, std::memory_order_relaxed);
             }
         }
     } else {
@@ -393,6 +433,18 @@ Counter* Evaluate(u64 view, bool depth, u32 slot) {
                 diffs.Check(FPitch, static_cast<u64>(image.pitch) + 1, db.Pitch());
             }
         }
+        if (range.mip == 0) {
+            diffs.Check(FTPitch, static_cast<u64>(resource_t.pitch) + 1, db.Pitch());
+            diffs.Check(FTTileMode, resource_t.tiling_index, static_cast<u64>(db.GetTileMode()));
+        }
+        // Ghidra Q8: the read and the write base are both resource +0x30 (read-only is a view flag); the stencil bases are resource +0x40; the htile base is resource +0x48 (>> 8, block
+        // word 9) and tile_surface_enable is set if and only if it is not 0
+        diffs.Check(FWriteBase, db.DepthAddress(), db.DepthWriteAddress());
+        if (db.stencil_info.format != AmdGpu::DepthBuffer::StencilFormat::Invalid) {
+            diffs.Check(FStencilAddress, Rd<u64>(resource, 0x40), db.StencilAddress());
+        }
+        diffs.Check(FHtileBase, Rd<u64>(resource, 0x48) >> 8, Rd<u32>(block, 9 * 4));
+        diffs.Check(FHtileEnable, Rd<u64>(resource, 0x48) != 0 ? 1 : 0, db.z_info.tile_surface_enable);
         if (extent_word != 0) {
             diffs.Check(FExtentWidth, mip_width, hint_width);
             diffs.Check(FExtentHeight, mip_height, hint_height);
@@ -496,8 +548,8 @@ nlohmann::json Report() {
     }
     j["cache_hits"] = g_cache_hits.load();
     j["derive"] = {{"derived", g_derive[0].load()}, {"unknown_object", g_derive[1].load()}, {"unknown_format", g_derive[2].load()}};
-    j["colour"]["clear_words_differ_without_fast_clear"] = g_clear_words_differ_without_fast_clear.load();
-    j["colour"]["resource_cmask_set_without_fast_clear"] = g_cmask_in_resource_without_fast_clear.load();
+    j["colour"]["clear_colour_in_resource"] = {{"resource_14c_set", g_clear_packed_present.load()}, {"block_words_equal_resource_150_154", g_clear_block_equals_packed.load()},
+                                               {"block_words_differ_from_resource_150_154", g_clear_block_differs_packed.load()}};
     j["depth"]["format_not_in_the_table"] = g_unknown_depth_format.load();
     j["tuple_overflow"] = g_tuple_overflow.load();
     j["shape_overflow"] = g_shape_overflow.load();
@@ -520,7 +572,9 @@ nlohmann::json Report() {
     for (const auto& [key, n] : tuples) {
         tuple_list.push_back({{"kind", key.is_depth != 0 ? "depth" : "colour"}, {"dxgi_view", key.dxgi_view}, {"dxgi_resource", key.dxgi_resource}, {"samples", key.samples},
                               {key.is_depth != 0 ? "z_info" : "info", fmt::format("{:#x}", key.raw_a)},
-                              {key.is_depth != 0 ? "stencil_info" : "attrib", fmt::format("{:#x}", key.raw_b)}, {"mip", key.mip}, {"dimension", key.dimension},
+                              {key.is_depth != 0 ? "stencil_info" : "attrib", fmt::format("{:#x}", key.raw_b)},
+                              {"t_data_format", key.t_desc & 0xff}, {"t_number_format", (key.t_desc >> 8) & 0xff}, {"t_dst_sel", fmt::format("{:#x}", key.t_desc >> 16)},
+                              {"mip", key.mip}, {"dimension", key.dimension},
                               {"aux", fmt::format("{:#x}", key.aux)}, {"count", n}});
     }
     auto& shape_list = j["extent_shapes"] = nlohmann::json::array();

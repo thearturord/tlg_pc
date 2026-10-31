@@ -51,7 +51,7 @@ state that is already native elsewhere (`FixedState`); **N** no reader found by 
 | `attrib.num_samples_log2`, `fmask_tile_mode_index`, `fmask_bank_height`, `force_dst_alpha_1` | N | none | - |
 | `cmask_base_address`, `cmask_slice` | M | `CmaskAddress()` -> `surface_metas` -> `GetMetaInfo` -> `SkipForEngineClear` decides whether the engine's metadata fill is skipped (vk_rasterizer.cpp:3316; texture_cache.cpp:1122-1148) | resource `+0x58` / cmask address, per the SDK strings |
 | `fmask_base_address`, `fmask_slice` | M | `FmaskAddress()` (same path) | no engine source seen (second 32 byte block at view `+0x74`?) |
-| `clear_word0/1` | C | `LiverpoolToVK::ColorBufferClearValue` (liverpool_to_vk.cpp:830) -> pending fast clear colour, applied at the eliminate (vk_rasterizer.cpp:704) and at the render pass (BeginRenderingFull, vk_rasterizer.cpp:3125) | **none known.** vk_rasterizer.cpp's own comment (B11) says the words in the block differ from the colour the engine passed to `ClearRenderTargetView` in 470 of 16,656 clears (registers 0,0,0,0 vs call 1,1,1,1) and the registers are the correct one. So these two dwords have no other source yet |
+| `clear_word0/1` | C | `LiverpoolToVK::ColorBufferClearValue` (liverpool_to_vk.cpp:830) -> pending fast clear colour, applied at the eliminate (vk_rasterizer.cpp:704) and at the render pass (BeginRenderingFull, vk_rasterizer.cpp:3125) | block words 11/12 = the prebuilt block of the resource (+0xdc/+0xe0) for mip 0, 0 above (section 6). The colour the engine's clear call packs lives at resource +0x150/+0x154 (valid when +0x14c != 0). The B11 note (registers 0,0,0,0 vs call 1,1,1,1) is explained by this: the view's words never carry the call's colour |
 | `pad0`, `pad1[2]` | N | - | - |
 
 `CbDbExtent hint` (not a field of `ColorBuffer`): carried separately (`current_cb_extent`), used for `size.width/height` (see 0.2). It is the engine's own word, not a register decode.
@@ -83,7 +83,7 @@ state that is already native elsewhere (`FixedState`); **N** no reader found by 
 * **Metadata that Vulkan never needs but the code still uses for one purpose:** cmask/fmask/htile addresses only feed `surface_metas` -> `GetMetaInfo` ->
   `SkipForEngineClear` (vk_rasterizer.cpp:3316): "is this fill the engine's CMASK/HTILE clear, then skip it". That one use can be kept with the resource addresses
   (cmask `+0x58`) or by recognising the fill from the engine's clear record (B11); I have not decided which.
-* **No engine source known:** colour `clear_word0/1` (see C row), `linear_general` for targets, `blend_bypass`, `alt_tile_mode`, the fmask words, the write bases.
+* **No engine source known (before section 6):** `linear_general` for targets, `alt_tile_mode`, the fmask words. Colour `clear_word0/1`, `blend_bypass`, the cmask words, the depth write bases and the htile base were resolved by the Ghidra answers (section 6).
 * **Dead fields (N rows):** about 25 colour and depth fields have no reader at all; they can be dropped with the structs, but not before the register image is.
 
 ## 2. Producers of `exec_state` / `DrawRegs`
@@ -151,6 +151,15 @@ for each call, so `e2_derive` is slightly inflated in a run with this switch on;
 (they hold by the register index asserts in regs.cpp, but I could not compile them). Not compiled: only `clang -fsyntax-only` on the new file, whose own errors were limited to the `LOG_WARNING`
 line, which fails here because the container's spdlog is a different version from the port's.
 
+### 4.1 Changes after the Ghidra answers (section 6)
+
+The comparison now also uses the resource's own T# (`resource + 0x70`, 32 bytes, read as `AmdGpu::Image`): `t_data_format` (`cb.info.format` against the T# data format), `t_pitch` and `t_tile_mode`
+(mip 0), plus `blend_bypass` (against the integer number types 4 and 5), `fast_clear_flag` (against resource `+0x58 != 0`), the cmask address (mip 0), the colour clear words (against the prebuilt block at
+resource `+0xdc`/`+0xe0`, 0 above mip 0), and for depth `z_write_base`, `stencil_address` (resource `+0x40`), `htile_base` (resource `+0x48` >> 8, block word 9) and `htile_enable`.
+`colour.clear_colour_in_resource` counts how often the block's clear words equal the packed colour at resource `+0x150`/`+0x154` (when `+0x14c != 0`) and how often not; that is the B11 effect in numbers.
+Each tuple now carries the resource T# (`t_data_format`, `t_number_format`, `t_dst_sel`) next to the raw `info` and `attrib` words: from those I can build the T#-to-info table (number type and comp_swap
+go through the small tables `DAT_025e1250` and `FUN_0246be80`).
+
 ## 5. What I need from the local side
 
 Dumps (no Ghidra), from a headless default-scene run of 40 s with a new census switch if you want one, otherwise from the existing debug server:
@@ -173,3 +182,22 @@ Ghidra (addresses from the task text; I have no decompiler access and did not gu
   `tile_surface_enable` come from in the resource, and what `resource + 0x48` means (it is the guard for the clear values).
 * **Q9.** The second 32 byte block at RTV `+0x74` for MS targets (fmask words), and where the cmask fast-clear enable bit sits.
 * **Q10.** `ctx + 0x130e0` (target 7): confirm it is an object of the same kind (tag `0x16`) as the other seven, since `Synthesize` treats it as a view.
+
+## 6. Ghidra answers (owner, eboot, FUN_02491080 / 02491a30 / 02492370 / 02492ce0 / 0246a420 / 02483380)
+
+* **Colour info word** (Q6): `FUN_0246a420` builds it from one packed word (bits 0-7 T# data format, 8-11 T# number format, 12-23 T# dst_sel), which `FUN_02491a30` takes from the resource T# at
+  `resource + 0x70` (dword 1 data/number format, dword 3 dst_sel). Layout: `format = data format << 2`; `number_type = DAT_025e1250[number format] & 7` (bits 8-10); `comp_swap = FUN_0246be80(...) & 3`
+  (bits 11-12); bit 15 for number types 0, 1, 6; `blend_bypass` (bit 16) for number types 4 and 5; the word is XORed with 0x40000. So the colour target format is a function of the resource T#, not of the DXGI
+  format. The E2 tables (DXGI to T#) can be reused plus a second small table T# to info; one dump of `(T# data, num, dst_sel) -> (info.raw)` checks it (the tuples now carry both).
+* **Clear words** (Q7): `ClearRenderTargetView` (0x2483380) packs the colour per format (sRGB included) into resource `+0x150/+0x154` and sets `+0x14c = 1` and a serial at `+0x160`. The RTV builder
+  copies `+0x150` into view `+0x80/+0x84` first, then overwrites both with block words 11/12 (prebuilt block at `+0xb0`: `+0xdc/+0xe0` for mip 0; 0 for mip above 0). Consequence: do not derive `clear_word0/1`
+  from the view; a native path takes the colour from the clear call or from resource `+0x150/+0x154`. B11 already clears natively from the call arguments.
+* **Depth block** (Q8): `z_read_base` and `z_write_base` are both resource `+0x30 >> 8`; the stencil bases both resource `+0x40 >> 8` (read-only is a view flag, not a different address). The htile base is
+  resource `+0x48 >> 8` (block word 9) and `tile_surface_enable` is set iff `+0x48 != 0` (the same field guards the clear values at `+0x158..0x17c`). For mip 0 / MS tex2d the block is copied from
+  `resource + 0xf0..0x11f` and the slice range is patched (`FUN_0247da00`).
+* **Cmask / fmask** (Q9): cmask base is resource `+0x58 >> 8` into block word 7 and `info.fast_clear` is set iff `+0x58 != 0`. `FUN_02491a30` never writes the fmask words (9, 10); a nonzero fmask can only come from
+  the prebuilt block (mip 0, MS). Neo-mode DCC (`resource + 0x8a & 0x20`, `+0x8c` into word 13) is not needed for Vulkan.
+* **Target 7** (Q10): not looked at. `Observe` reads `ctx + 0x130e0` as a view pointer, exactly as `Synthesize` does.
+
+What this resolves from section 1: `blend_bypass` (function of the number type), the cmask words and `fast_clear` (resource `+0x58`), the depth write bases and the htile base (resource), and the clear words (a
+resource field, not a view one). Still open for the target replacement: the number-type and comp_swap tables, `linear_general` and `alt_tile_mode` for targets, and the fmask words.
