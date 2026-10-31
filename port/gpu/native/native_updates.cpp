@@ -497,7 +497,8 @@ nlohmann::json B8Report() {
             {"buffer_images", {{"mode", B8BufferImagesMode()}, {"announcements_by_engine_buffers", c(B8BufAnnounce)}, {"copies_by_engine_buffers", c(B8BufCopy)},
                                {"images_listed", c(B8BufListed)}, {"AUDIT_MISSED", c(B8BufMissed)}, {"not_covered_page_table", c(B8BufNotCovered)}}},
             {"e3_find", {{"unnamed", c(E3FindUnnamed)}, {"named", c(E3FindNamed)}, {"named_same_owner", c(E3NamedSameOwner)}, {"named_OTHER_OWNER", c(E3NamedOtherOwner)},
-                         {"named_interior", c(E3NamedInterior)}, {"named_no_owner", c(E3NamedNoOwner)}, {"named_unknown_object", c(E3NamedUnknownObject)}}},
+                         {"named_interior", c(E3NamedInterior)}, {"named_no_owner", c(E3NamedNoOwner)}, {"named_unknown_object", c(E3NamedUnknownObject)},
+                         {"owner_by_id", c(E3OwnerById)}, {"owner_by_id_missed", c(E3OwnerByIdMissed)}, {"id_decides", E3IdDecides()}}},
             {"note", "B8.1, cumulative: images refreshed by the engine's announcements instead of write faults"}};
 }
 

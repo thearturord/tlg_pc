@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 #include <atomic>
@@ -99,6 +100,14 @@ void NoteHarvested(u64 address, u64 bytes, bool in_upload_ring);
 [[nodiscard]] constexpr u32 B8FindMode() noexcept {
     return 2u; // native, no switch since the cleanup of 2026-10-30
 }
+/// E3.2: a named image description finds its engine texture by the engine's id (default on; `TLG_E3_ID=0` asks the address as before)
+[[nodiscard]] inline bool E3IdDecides() noexcept {
+    static const bool on = [] {
+        const char* env = std::getenv("TLG_E3_ID");
+        return env == nullptr || env[0] != '0';
+    }();
+    return on;
+}
 /// B8.5 (`TLG_B8_BUFFER_IMAGES`): images in engine buffer memory (formatted reads, render targets in a buffer's memory) are listed by the buffer; announcements
 /// and copies over buffer memory find them there instead of in the page table. 0 off, 1 audit (page table kept, lists compared), 2 native (default)
 [[nodiscard]] constexpr u32 B8BufferImagesMode() noexcept {
@@ -170,6 +179,8 @@ enum B8Count : u32 {
     E3NamedInterior,            ///< ... named: no texture starts at the memory but the named resource contains it (a view of a part: mip / slice offset)
     E3NamedNoOwner,             ///< ... named: no engine texture holds the memory at all
     E3NamedUnknownObject,       ///< ... named: the id is not in the engine table any more
+    E3OwnerById,                ///< E3.2: the engine texture of a lookup came from the named id (not the address)
+    E3OwnerByIdMissed,          ///< ... the id could not be resolved (the address asked instead)
     B8Counts,
 };
 void NoteB8(B8Count what) noexcept;

@@ -788,7 +788,19 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     };
     if (b8_find != 0) {
         Core::NativeDevice::Object owner;
-        if (Core::NativeDevice::ResourceAt(info.guest_address, owner) && owner.address == info.guest_address && owner.kind != Core::NativeDevice::Kind::Buffer) {
+        // E3.2: a named description (a record binding, a bound target) finds its engine texture by the id; only the unnamed ones ask the address
+        bool owner_found = false;
+        if (desc.engine_id != 0 && Core::NativeUpdates::E3IdDecides()) {
+            Core::NativeDevice::Object named;
+            if (Core::NativeDevice::Lookup(desc.engine_id, named)) {
+                owner_found = named.resource_id == 0 ? (owner = named, true) : Core::NativeDevice::Lookup(named.resource_id, owner);
+            }
+            Core::NativeUpdates::NoteB8(owner_found ? Core::NativeUpdates::E3OwnerById : Core::NativeUpdates::E3OwnerByIdMissed);
+        }
+        if (!owner_found) {
+            owner_found = Core::NativeDevice::ResourceAt(info.guest_address, owner);
+        }
+        if (owner_found && owner.address == info.guest_address && owner.kind != Core::NativeDevice::Kind::Buffer) {
             owner_id = owner.id;
             owner_bytes = owner.bytes;
             if (const auto it = engine_images.find(owner_id); it != engine_images.end()) {
