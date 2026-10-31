@@ -222,6 +222,7 @@ struct ExecDraw {
     u64 copy_destination{}; ///< dispatches of the device's buffer copy shader: the memory copy it performs (null: not one)
     u64 copy_source{};
     u32 copy_bytes{};
+    u64 vs_gnm{}, ps_gnm{}, fetch_object{}; ///< E1c: the Gnm blocks of the draw's vertex and pixel shader objects and the input layout's fetch object (0: unknown)
     const Vulkan::FixedState* fixed{}; ///< draws: the fixed-function state built from the engine's objects (null: from the registers)
     u32 fixed_stale{};                 ///< FixedStateStale groups of `fixed` the hardware keeps from earlier draws
     u32 dst_usage{~0u};                ///< copy and counter read-back records: Usage of the destination resource (3 staging)

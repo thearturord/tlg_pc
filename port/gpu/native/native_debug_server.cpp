@@ -45,6 +45,7 @@
 #include "native/native_flip.h"
 #include "native/native_display.h"
 #include "native/native_presenter.h"
+#include "native/native_shader_env.h"
 #include "native/native_skin_cpu.h"
 #include "native/native_readback_policy.h"
 #include "video_core/thread_profiler.h"
@@ -620,7 +621,7 @@ void RegisterBuiltins() {
                  return nlohmann::json{{"recording", Core::Stall::Recording()}, {"report_age_s", Core::Stall::ReportAgeSeconds()}};
              });
     Register("/frame_events", "E6.2a: the console's frame events (end of pipe, compute releases, GPU idle, flip ready): signals and subscriber runs",
-             [](const Params&) { auto j = Core::NativeFrameEvents::Report(); j["flip_request"] = Core::NativeFlip::Report(); j["display"] = Core::NativeDisplay::Report(); j["presenter"] = Core::NativePresenter::Report(); return j; });
+             [](const Params&) { auto j = Core::NativeFrameEvents::Report(); j["flip_request"] = Core::NativeFlip::Report(); j["display"] = Core::NativeDisplay::Report(); j["presenter"] = Core::NativePresenter::Report(); j["shader_env"] = Core::NativeShaderEnv::Report(); return j; });
     Register("/stall", "the report of the last stall profiler capture (F8): the waits and our threads ranked by how much more the slow frames contain",
              [](const Params&) { return nlohmann::json::parse(Core::Stall::ReportJson()); });
     Register("/entrydump",

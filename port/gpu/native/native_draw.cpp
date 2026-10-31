@@ -4701,6 +4701,9 @@ static bool TakeExecDrawImpl(u64 seq, ExecDraw& out, bool typed, bool allow_lazy
         out.copy_bytes = slot.copy_bytes;
     }
     out.fixed = slot.kind == 4 ? nullptr : slot.fixed;
+    out.vs_gnm = slot.vs_gnm;
+    out.ps_gnm = slot.ps_gnm;
+    out.fetch_object = slot.dbg_fetch;
     out.fixed_stale = slot.fixed_stale;
     out.dst_usage = slot.kind == 9 || slot.kind == 10 ? slot.dst_usage : ~0u;
     return slot.seq.load(std::memory_order_acquire) == seq;

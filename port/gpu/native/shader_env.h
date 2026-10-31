@@ -32,7 +32,7 @@ struct Program {
     u64 address{};                    ///< guest address of the code
     u64 hash{};                       ///< hash of the code (the pipeline key's stage hash)
     std::span<const u32> code{};      ///< the code itself (up to the end-of-program, found by the translator's own scan)
-    u8 vgprs{};                       ///< allocated vector registers (granule count * 4)
+    u16 vgprs{};                      ///< allocated vector registers (granule count * 4)
     u8 user_data_count{};             ///< 5 bits: how many of the 16 user data words the shader reads
     u8 input_vgpr_components{};       ///< 2 bits: vertex id, instance id, ... the stage's VGPR inputs
     u8 fp_denorm_mode32{};            ///< 2 bits

@@ -20,6 +20,7 @@
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "native/native_shader_env.h"
 #include "video_core/cache_storage.h"
 #include "native/native_readback_policy.h"
 #include "video_core/readback_stats.h"
@@ -122,6 +123,90 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
     }
 
     return num_outputs;
+}
+
+/// E1c: the fields of a stage's translator input that belong to the shader's own environment, set from the shader objects (native/native_shader_env.h) instead of from
+/// the register image. Everything else in `info` (the fixed-function inputs, the render target formats) is left as it is.
+static void ApplyShaderEnv(Shader::RuntimeInfo& info, const Core::NativeShaderEnv::DrawEnv& draw, HwStage stage, const AmdGpu::DrawRegs& regs) {
+    const Core::ShaderEnv::ShaderEnv& env = stage == HwStage::Vertex ? draw.vertex : draw.pixel;
+    info.props.fp_denorm_mode32 = static_cast<AmdGpu::FpDenormMode>(env.program.fp_denorm_mode32);
+    info.props.fp_denorm_mode16_64 = static_cast<AmdGpu::FpDenormMode>(env.program.fp_denorm_mode16_64);
+    info.props.fp_round_mode32 = static_cast<AmdGpu::FpRoundMode>(env.program.fp_round_mode32);
+    info.props.fp_round_mode16_64 = static_cast<AmdGpu::FpRoundMode>(env.program.fp_round_mode16_64);
+    info.props.num_allocated_vgprs = env.program.vgprs;
+    info.props.num_user_data = env.program.user_data_count;
+    info.props.num_input_vgprs = env.program.input_vgpr_components;
+    info.props.dx10_clamp = env.program.dx10_clamp ? 1u : 0u;
+    if (stage == HwStage::Vertex) {
+        info.hw.vs.num_outputs = MapOutputs(info.hw.vs.outputs, std::bit_cast<AmdGpu::VsOutputControl>(env.exports.vs_out_control));
+        if (info.sw_stage == SwStage::Vertex) {
+            info.sw.vs.step_rate_0 = env.rates.instance_step_rate_0;
+            info.sw.vs.step_rate_1 = env.rates.instance_step_rate_1;
+        }
+        return;
+    }
+    const auto& f = env.fragment;
+    info.hw.fs.en_flags = std::bit_cast<AmdGpu::PsInput>(f.input_enable);
+    info.hw.fs.addr_flags = std::bit_cast<AmdGpu::PsInput>(f.input_address);
+    info.hw.fs.num_inputs = f.num_interpolants;
+    info.hw.fs.front_face_all_bits = f.front_face_all_bits ? 1u : 0u;
+    info.hw.fs.depth_before_shader = f.depth_before_shader ? 1u : 0u;
+    info.hw.fs.z_export_format = static_cast<AmdGpu::ShaderExportFormat>(f.z_export_format);
+    info.hw.fs.mrtz_mask = f.depth_export_mask;
+    info.hw.fs.num_samples = f.sample_coverage ? regs.aa_config.NumSamples() : 1;
+    for (u32 i = 0; i < f.num_interpolants && i < 32; ++i) {
+        const auto& want = f.interpolants[i];
+        info.hw.fs.inputs[i] = {
+            .param_index = u16(want.input_offset),
+            .is_default = u16(want.use_default ? 1 : 0),
+            .is_flat = u16(want.flat_shade ? 1 : 0),
+            .default_value = u16(want.default_value),
+        };
+    }
+    for (u32 i = 0; i < Shader::MaxColorBuffers; ++i) {
+        // the export format of each target is the shader's (SPI_SHADER_COL_FORMAT); only the targets the key keeps bound have one
+        if (info.hw.fs.color_buffers[i].data_format != AmdGpu::DataFormat::FormatInvalid) {
+            info.hw.fs.color_buffers[i].export_format = static_cast<AmdGpu::ShaderExportFormat>(f.color_export_format[i]);
+        }
+    }
+}
+
+/// The names of the environment fields in which two translator inputs of a stage differ (separated by spaces; empty when equal).
+static std::string DiffShaderEnvFields(const Shader::RuntimeInfo& a, const Shader::RuntimeInfo& b, HwStage stage) {
+    std::string diff;
+    const auto note = [&](bool equal, const char* name) {
+        if (!equal) {
+            diff += name;
+            diff += ' ';
+        }
+    };
+    note(a.props == b.props, "props");
+    if (stage == HwStage::Vertex) {
+        note(a.hw.vs.num_outputs == b.hw.vs.num_outputs, "vs.num_outputs");
+        note(a.hw.vs.outputs == b.hw.vs.outputs, "vs.outputs");
+        if (a.sw_stage == SwStage::Vertex) {
+            note(a.sw.vs.step_rate_0 == b.sw.vs.step_rate_0, "vs.step_rate_0");
+            note(a.sw.vs.step_rate_1 == b.sw.vs.step_rate_1, "vs.step_rate_1");
+        }
+        return diff;
+    }
+    const auto& x = a.hw.fs;
+    const auto& y = b.hw.fs;
+    note(x.en_flags == y.en_flags, "fs.en_flags");
+    note(x.addr_flags == y.addr_flags, "fs.addr_flags");
+    note(x.num_inputs == y.num_inputs, "fs.num_inputs");
+    note(x.front_face_all_bits == y.front_face_all_bits, "fs.front_face_all_bits");
+    note(x.depth_before_shader == y.depth_before_shader, "fs.depth_before_shader");
+    note(x.z_export_format == y.z_export_format, "fs.z_export_format");
+    note(x.mrtz_mask == y.mrtz_mask, "fs.mrtz_mask");
+    note(x.num_samples == y.num_samples, "fs.num_samples");
+    note(std::ranges::equal(x.inputs.begin(), x.inputs.begin() + std::min<u32>(x.num_inputs, 32), y.inputs.begin(), y.inputs.begin() + std::min<u32>(y.num_inputs, 32)), "fs.inputs");
+    bool export_equal = true;
+    for (u32 i = 0; i < Shader::MaxColorBuffers; ++i) {
+        export_equal &= x.color_buffers[i].export_format == y.color_buffers[i].export_format;
+    }
+    note(export_equal, "fs.color_export_format");
+    return diff;
 }
 
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
@@ -290,6 +375,20 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
     }
     default:
         break;
+    }
+    if ((stage == HwStage::Vertex || stage == HwStage::Fragment) && (l_stage == SwStage::Vertex || l_stage == SwStage::Fragment)) {
+        // E1c: the shader's own words also come from the shader objects of the draw. The two are compared; with `TLG_SHADER_ENV=1` the objects decide.
+        Core::NativeShaderEnv::DrawEnv env;
+        if (!Core::NativeShaderEnv::Current(env) || (stage == HwStage::Vertex ? !env.has_vertex : !env.has_pixel)) {
+            Core::NativeShaderEnv::NoteUnavailable();
+        } else {
+            Shader::RuntimeInfo derived = info;
+            ApplyShaderEnv(derived, env, stage, regs);
+            Core::NativeShaderEnv::NoteCompared(stage == HwStage::Vertex ? 0 : 1, DiffShaderEnvFields(info, derived, stage));
+            if (Core::NativeShaderEnv::Decides()) {
+                info = derived;
+            }
+        }
     }
     return info;
 }

@@ -37,6 +37,7 @@
 #include "core/platform.h"
 #include "native/native_frame_events.h"
 #include "native/native_flip.h"
+#include "native/native_shader_env.h"
 #include "native/native_display.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/liverpool_internal.h"
@@ -596,6 +597,8 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         const u32 verify = LookupDrain(2);
         Core::NativeAudit::SetPlanCaller(native_tag_pending.valid ? Core::NativeDraw::RecordCaller(native_tag_pending.seq) : 0);
         const auto make_candidate = [&] {
+            // E1c: the shader objects of the draw, for the comparison of the translator's input with the one derived from them
+            Core::NativeShaderEnv::Scope shader_env{draw.vs_gnm, draw.ps_gnm, draw.fetch_object};
             return rasterizer->PlanDraw(exec_state, params, native_fixed, native_fixed_stale, native_fixed_verify, native_exec_key, native_inputs_key);
         };
         auto candidate = make_candidate();
