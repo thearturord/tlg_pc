@@ -52,7 +52,7 @@ enum Field : u32 {
     FExtentWidth,
     FExtentHeight,
     FFirstSlice,
-    FNumSlices,
+    FLastSlice,
     FSamples,
     FAddress,
     FCmaskAddress,
@@ -62,21 +62,27 @@ enum Field : u32 {
     FStencilFormat,
     FTFormat,
     FTPitch,
+    FTTileMode,
     FBlendBypass,
     FFastClear,
     FWriteBase,
     FStencilAddress,
     FHtileBase,
     FHtileEnable,
+    FNumberType,
+    FCompSwap,
+    FBlendClamp,
+    FInfoBit18,
     FieldCount,
 };
 
 // The first fifteen compare the words with the Direct3D 11 description and `NativeImageDesc::Derive`; the others (t_*, blend_bypass, ...) with what the Ghidra reading of the engine's
 // own builders says (FUN_02491a30 builds the colour info word from the resource's T# at resource +0x70; FUN_02492370 the depth block from the resource): see E7-notes.md section 6.
 constexpr std::array<const char*, FieldCount> FieldNames{
-    "data_format", "number_format", "tile_mode", "pitch", "extent_width", "extent_height", "first_slice", "num_slices",
+    "data_format", "number_format", "tile_mode", "pitch", "extent_width", "extent_height", "first_slice", "last_slice",
     "samples", "address", "cmask_address", "clear_word0", "clear_word1", "z_format", "stencil_format",
-    "t_data_format", "t_pitch", "blend_bypass", "fast_clear_flag", "z_write_base", "stencil_address", "htile_base", "htile_enable",
+    "t_data_format", "t_pitch", "t_tile_mode", "blend_bypass", "fast_clear_flag", "z_write_base", "stencil_address", "htile_base", "htile_enable",
+    "number_type", "comp_swap", "blend_clamp", "info_bit18",
 };
 
 std::array<std::atomic<u64>, FieldCount> g_field_diffs[2]{}; // [0] colour, [1] depth
@@ -113,7 +119,17 @@ struct CaseTable {
     std::atomic<u64> overflow{0};
 };
 
+/// A value the engine's builder produces from a key (the tables of FUN_0246a420 are not known): the first value seen is the table, a later different one is a conflict
+struct Learned {
+    u32 value{0};
+    u64 count{0};
+    u64 conflicts{0};
+};
+
 std::mutex g_mutex;
+std::map<u64, Learned> g_learn_number_type; ///< key: T# number format
+std::map<u64, Learned> g_learn_comp_swap;   ///< key: T# data format | number format << 8 | dst_sel << 16
+std::map<u64, Learned> g_learn_comp_coarse; ///< key: T# data format | dst_sel << 8 (does the number format matter for comp_swap?)
 CaseTable g_tile_cases;    ///< the facts about every resource a target tile mode was seen on (bind, misc, usage, T# index, words, Derive's guess)
 CaseTable g_slice_cases;   ///< every slice range that differs
 CaseTable g_prebuilt_cases; ///< which words of a view block differ from the block prebuilt in the resource
@@ -133,6 +149,27 @@ Counter* TupleCounter(const Key& key) {
     }
     return &g_tuples.try_emplace(key).first->second;
 }
+
+/// The value the table holds for `key` before this observation (the first one seen); counts the observation and a conflict when `value` differs
+u32 Learn(std::map<u64, Learned>& table, u64 key, u32 value) {
+    std::scoped_lock lock{g_mutex};
+    auto it = table.find(key);
+    if (it == table.end()) {
+        if (table.size() >= 512) {
+            return value;
+        }
+        it = table.try_emplace(key).first;
+        it->second.value = value;
+    }
+    ++it->second.count;
+    if (it->second.value != value) {
+        ++it->second.conflicts;
+    }
+    return it->second.value;
+}
+
+constexpr u32 DisplayTiling = 10; ///< the display surface tiling index (tile mode of the swap chain's buffers)
+constexpr u32 DisplayBindFlag = 0x100; ///< a bind flag of the engine's texture description that no Direct3D 11 flag has: set on the three display buffers (bind flags 0x128)
 
 void NoteCase(CaseTable& table, const CaseKey& key) {
     std::scoped_lock lock{g_mutex};
@@ -470,9 +507,13 @@ Counter* Evaluate(u64 view, bool depth, u32 slot) {
                 diffs.Check(FPitch, static_cast<u64>(image.pitch) + 1, cb.Pitch());
             }
         }
-        // The tile mode is the resource's own: the T# the engine keeps at +0x70 carries the tiling index the render target block is built with (the display buffers have index 10, the
-        // other targets 14); `NativeImageDesc::Derive` guesses it from the bind flags (0x20 -> 14) and cannot tell the two apart, so it is only listed in the facts table below.
-        diffs.Check(FTileMode, resource_t.tiling_index, static_cast<u64>(cb.GetTileMode()));
+        // The tile mode of the description: `NativeImageDesc::Derive` gives the index of an ordinary render target (bind flag 0x20 -> 14); a colour target with the engine's bind flag 0x100
+        // (the display buffers) is a display surface (index 10). Derive itself is not changed (the sampled images that decide from it are played). The T# the engine keeps at +0x70
+        // carries the same index and is compared too.
+        if (derived) {
+            diffs.Check(FTileMode, (res.bind & DisplayBindFlag) != 0 ? DisplayTiling : static_cast<u32>(image.tiling_index), static_cast<u64>(cb.GetTileMode()));
+        }
+        diffs.Check(FTTileMode, resource_t.tiling_index, static_cast<u64>(cb.GetTileMode()));
         NoteCase(g_tile_cases, {0, res.bind, ReadMisc(resource, res.kind), res.usage, res.cpu_access, static_cast<u32>(res.kind), static_cast<u32>(resource_t.tiling_index),
                                 static_cast<u32>(cb.GetTileMode()), derived ? static_cast<u32>(image.tiling_index) : 0xffu, range.mip});
         NotePrebuilt(kind, dimension, range.mip, block, resource);
@@ -481,19 +522,36 @@ Counter* Evaluate(u64 view, bool depth, u32 slot) {
         if (range.mip == 0) {
             diffs.Check(FTPitch, static_cast<u64>(resource_t.pitch) + 1, cb.Pitch());
         }
-        // blend_bypass is set for the integer number types (4 uint, 5 sint)
-        diffs.Check(FBlendBypass, (cb.info.number_type == 4 || cb.info.number_type == 5) ? 1 : 0, cb.info.blend_bypass);
+        // blend_bypass is set for the integer number types (4 uint, 5 sint), a bit in the blend_clamp place (15) for the types 0, 1 and 6, and the whole info word is XORed with 0x40000
+        // (bit 18, the round mode place) by FUN_0246a420
+        {
+            const u32 number_type = cb.info.number_type;
+            diffs.Check(FBlendBypass, (number_type == 4 || number_type == 5) ? 1 : 0, cb.info.blend_bypass);
+            diffs.Check(FBlendClamp, (number_type == 0 || number_type == 1 || number_type == 6) ? 1 : 0, cb.info.blend_clamp);
+            diffs.Check(FInfoBit18, 1, (cb.info.raw >> 18) & 1u);
+            // number_type = DAT_025e1250[T# number format] & 7 and comp_swap = FUN_0246be80(...) & 3: the tables are not known, so they are learned from the run (the first value a key
+            // produces is the table); a key that later produces another value is a difference, i.e. the output is not a function of that key. The tables are in the report.
+            const u32 t_data = static_cast<u32>(resource_t.data_format);
+            const u32 t_num = static_cast<u32>(resource_t.num_format);
+            const u32 t_dst = static_cast<u32>(resource_t.dst_sel_x) | static_cast<u32>(resource_t.dst_sel_y) << 3 | static_cast<u32>(resource_t.dst_sel_z) << 6 |
+                              static_cast<u32>(resource_t.dst_sel_w) << 9;
+            const u32 comp_swap = static_cast<u32>(cb.info.comp_swap);
+            diffs.Check(FNumberType, Learn(g_learn_number_type, t_num, number_type), number_type);
+            diffs.Check(FCompSwap, Learn(g_learn_comp_swap, t_data | t_num << 8 | static_cast<u64>(t_dst) << 16, comp_swap), comp_swap);
+            Learn(g_learn_comp_coarse, t_data | static_cast<u64>(t_dst) << 8, comp_swap);
+        }
         if (extent_word != 0) {
             diffs.Check(FExtentWidth, mip_width, hint_width);
             diffs.Check(FExtentHeight, mip_height, hint_height);
         }
         NoteExtent(kind, hint_width, hint_height, mip_width, mip_height);
         if (range.known) {
+            // the words hold the first and the last slice (slice_max is an index, `NumSlices()` is the last plus one, not the count)
             const u32 before = diffs.count;
             diffs.Check(FFirstSlice, range.first, cb.BaseSlice());
-            diffs.Check(FNumSlices, range.count, cb.NumSlices());
+            diffs.Check(FLastSlice, range.first + std::max<u32>(range.count, 1) - 1, cb.view.slice_max);
             if (diffs.count != before) {
-                NoteCase(g_slice_cases, {0, dimension, range.mip, res.layers, range.first, range.count, cb.BaseSlice(), cb.NumSlices(), dxgi_view, res.depth});
+                NoteCase(g_slice_cases, {0, dimension, range.mip, res.layers, range.first, range.count, cb.BaseSlice(), cb.view.slice_max, dxgi_view, res.depth});
             }
         }
         diffs.Check(FSamples, samples, cb.NumSamples());
@@ -550,7 +608,10 @@ Counter* Evaluate(u64 view, bool depth, u32 slot) {
         if (derived && range.mip == 0) {
             diffs.Check(FPitch, static_cast<u64>(image.pitch) + 1, db.Pitch());
         }
-        diffs.Check(FTileMode, resource_t.tiling_index, static_cast<u64>(db.GetTileMode()));
+        if (derived) {
+            diffs.Check(FTileMode, image.tiling_index, static_cast<u64>(db.GetTileMode()));
+        }
+        diffs.Check(FTTileMode, resource_t.tiling_index, static_cast<u64>(db.GetTileMode()));
         NoteCase(g_tile_cases, {1, res.bind, ReadMisc(resource, res.kind), res.usage, res.cpu_access, static_cast<u32>(res.kind), static_cast<u32>(resource_t.tiling_index),
                                 static_cast<u32>(db.GetTileMode()), derived ? static_cast<u32>(image.tiling_index) : 0xffu, range.mip});
         NotePrebuilt(kind, dimension, range.mip, block, resource);
@@ -579,11 +640,12 @@ Counter* Evaluate(u64 view, bool depth, u32 slot) {
                 expected.first = 0;
                 expected.count = std::max<u32>(res.layers, 1);
             }
+            // the words hold the first and the last slice: slice_max is an index (`NumSlices()` is the last plus one, not the count)
             const u32 before = diffs.count;
             diffs.Check(FFirstSlice, expected.first, depth_view.slice_start);
-            diffs.Check(FNumSlices, expected.count, depth_view.NumSlices());
+            diffs.Check(FLastSlice, expected.first + std::max<u32>(expected.count, 1) - 1, depth_view.slice_max);
             if (diffs.count != before) {
-                NoteCase(g_slice_cases, {1, dimension, range.mip, res.layers, expected.first, expected.count, depth_view.slice_start, depth_view.NumSlices(), dxgi_view, Rd<u32>(block, 8 * 4)});
+                NoteCase(g_slice_cases, {1, dimension, range.mip, res.layers, expected.first, expected.count, depth_view.slice_start, depth_view.slice_max, dxgi_view, Rd<u32>(block, 8 * 4)});
             }
         }
         diffs.Check(FSamples, samples, db.NumSamples());
@@ -686,9 +748,25 @@ nlohmann::json Report() {
     j["colour"]["clear_colour_not_set_in_resource"] = {{"resource_14c_zero", g_clear_unset.load()}, {"block_words_both_zero", g_clear_unset_zero.load()},
                                                        {"block_words_equal_resource_150_154", g_clear_unset_equals_packed.load()}};
     j["tile_cases"] = CaseReport(g_tile_cases, {"depth", "bind_flags", "misc_flags", "usage", "cpu_access", "resource_kind", "t_tiling_index", "words_tile_mode", "derive_tiling_index", "mip"});
-    j["slice_cases_that_differ"] = CaseReport(g_slice_cases, {"depth", "dimension", "mip", "resource_layers", "expected_first", "expected_count", "words_first", "words_count", "dxgi_view", "x:db_view_word_or_depth"});
+    j["slice_cases_that_differ"] = CaseReport(g_slice_cases, {"depth", "dimension", "mip", "resource_layers", "expected_first", "expected_count", "words_first", "words_last", "dxgi_view", "x:db_view_word_or_depth"});
     j["prebuilt_block_cases"] = CaseReport(g_prebuilt_cases, {"depth", "dimension", "mip_above_0", "x:differing_word_mask"});
     j["clear_words_when_resource_14c_is_zero"] = CaseReport(g_clear_cases, {"x:block_word11", "x:block_word12", "x:resource_150", "x:resource_154", "x:prebuilt_dc", "x:prebuilt_e0", "mip", "fast_clear"});
+    {
+        std::scoped_lock lock{g_mutex};
+        auto& number_types = j["learned_number_type"] = nlohmann::json::array();
+        for (const auto& [key, e] : g_learn_number_type) {
+            number_types.push_back({{"t_number_format", key}, {"number_type", e.value}, {"count", e.count}, {"conflicts", e.conflicts}});
+        }
+        auto& comp_swaps = j["learned_comp_swap"] = nlohmann::json::array();
+        for (const auto& [key, e] : g_learn_comp_swap) {
+            comp_swaps.push_back({{"t_data_format", key & 0xff}, {"t_number_format", (key >> 8) & 0xff}, {"t_dst_sel", fmt::format("{:#x}", key >> 16)}, {"comp_swap", e.value},
+                                  {"count", e.count}, {"conflicts", e.conflicts}});
+        }
+        auto& coarse = j["learned_comp_swap_without_number_format"] = nlohmann::json::array();
+        for (const auto& [key, e] : g_learn_comp_coarse) {
+            coarse.push_back({{"t_data_format", key & 0xff}, {"t_dst_sel", fmt::format("{:#x}", key >> 8)}, {"comp_swap", e.value}, {"count", e.count}, {"conflicts", e.conflicts}});
+        }
+    }
     j["tuple_overflow"] = g_tuple_overflow.load();
     j["shape_overflow"] = g_shape_overflow.load();
 

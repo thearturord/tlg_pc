@@ -235,3 +235,23 @@ source for the image size and `Pitch()` / `Height()` only matter for `guest_size
 * `alt_tile_mode` (Neo only) and `linear_general`: no object field known. `linear_general` is 0 for the display buffers (info 0x8028 has bit 7 clear); the raw `info` in the tuples shows the rest.
 * the fmask words (9, 10): written only by the prebuilt block; `prebuilt_block_cases` shows whether a view block ever differs from it there.
 * the colour clear colour of the engine's clear call: resource `+0x150/+0x154` (valid when `+0x14c != 0`), not the view; a native path takes it from the call.
+
+## 8. Round 3 (after round 2: colour 0 differences, depth format gaps 0)
+
+* **Slices.** The words hold the first slice and the last slice (`slice_max` is an index; `NumSlices()` is last + 1, not the count: db_view word 0x2001 = first 1, last 1). The comparison is now
+  `slice_start == first` and `slice_max == first + count - 1` for colour and depth (field `last_slice` replaces `num_slices`). The `dimension 3 / mip 0` rule of round 2 (whole resource range) stays; it
+  agrees with the new formula because it has first 0. Expectation: `first_slice` and `last_slice` differing = 0. `slice_cases_that_differ` now lists `words_last`.
+* **Display tiling.** The three display buffers are the resources with bind flags 0x128 (misc 0, T# index 10); every other colour target has T# index 14. The target description now says display tiling (index 10)
+  for a colour target with the engine's bind flag 0x100 (a flag no Direct3D 11 bind flag uses) and `Derive`'s index otherwise; `NativeImageDesc::Derive` itself is NOT changed, because the sampled images
+  that decide from it are played and a change there would reach the GPU. The comparison with the words is `tile_mode`; the T# comparison stays as `t_tile_mode` (colour and depth). Expectation: both 0.
+* **Number type, comp_swap and the rest of the info word.** The tables behind `FUN_0246a420` (`DAT_025e1250`, `FUN_0246be80`) are not known to me, and the first-run tuples are not in this session, so the
+  shadow learns them: the first value a key produces is the table, and a later different value for the same key is a difference.
+  * `number_type` is learned by the T# number format (`learned_number_type`).
+  * `comp_swap` is learned by (T# data format, T# number format, T# dst_sel) (`learned_comp_swap`); `learned_comp_swap_without_number_format` shows whether the data format and dst_sel are enough.
+  * Closed-form bits from your Q6 text: `blend_clamp` (bit 15) = number type in {0, 1, 6}; `blend_bypass` (bit 16) = number type in {4, 5}; `info_bit18` = 1 (the XOR 0x40000).
+  Differences are counted in `differing_fields` as `number_type`, `comp_swap`, `blend_clamp`, `blend_bypass`, `info_bit18`. The learned tables are in the report with their counts, so the next round can
+  turn them into constants and a real comparison. Expectation: all of these 0 if the output really is a function of those keys; a nonzero `comp_swap` or `number_type` count says an input is missing.
+
+Still not decidable from the engine's objects: `alt_tile_mode`, `linear_general` (0 for the display buffers), the fmask words (only the prebuilt block writes them), the clear colour of the engine's clear call
+(resource `+0x150/+0x154`, not the view), and the bits of the info word above 18 (cmask_is_linear, blend_opt_*, fmask_*, dcc_enable, cmask_addr_type): the word's known bits are format (2-6), number type
+(8-10), comp_swap (11-12), fast clear (13, resource `+0x58`), blend_clamp, blend_bypass and bit 18.
