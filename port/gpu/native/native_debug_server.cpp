@@ -40,6 +40,7 @@
 #include "native/native_readbacks.h"
 #include "native/native_raycast_cpu.h"
 #include "native/native_stall.h"
+#include "native/shader_env.h"
 #include "native/native_frame_events.h"
 #include "native/native_flip.h"
 #include "native/native_display.h"
@@ -50,6 +51,10 @@
 #include "video_core/thread_usage.h"
 
 namespace Core::DebugServer {
+
+// E8: the shader boundary header must compile and stay plain data
+static_assert(std::is_trivially_copyable_v<Core::ShaderEnv::FixedFunctionForShader>);
+static_assert(std::is_trivially_copyable_v<Core::ShaderEnv::FragmentIo>);
 
 namespace {
 
