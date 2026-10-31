@@ -18,7 +18,7 @@ The original port runs the game's code natively and translates the PS4 GPU comma
 | Resource descriptions (images, samplers) | **Done** for images and samplers; buffer descriptions still derive from the PS4 side |
 | Image identity (which image a draw names) | **Done** for named lookups (targets, bindings, transitions) by the engine's resource id. Not done: content refresh from announced writes, overlap handling kept for same-memory images |
 | Memory (the "arena") | **Done.** The sparse mirror of the PS4 address space, the BDA page table and the fault manager are deleted; memory no engine buffer owns is a pseudo resource |
-| Page tracker, address-keyed buffer API, write watch | **Not done.** The tracker still decides uploads for memory the engine does not own and watches GPU-written pages for CPU reads. A census shows it adds almost nothing there (16 pages in 40 s), but it is not deleted until a cutscene run says the same |
+| Page protection, write watch, address-keyed buffer API | **Mostly done.** The page manager, the GPU read watch and the fault readbacks are deleted, and the page tracker decides no upload (no page was ever protected: 0 faults). Left: the write watch module (its epoch times the announced updates), the tracker's bookkeeping bits and the address-keyed buffer API |
 | Prune (dead register and PM4 structures) | Not started |
 
 The design, the phases (E0 to E9), every census and the decisions are written down in the plan this work follows.
