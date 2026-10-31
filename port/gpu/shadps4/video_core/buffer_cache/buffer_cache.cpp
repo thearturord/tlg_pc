@@ -1395,11 +1395,11 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         b9_forget(addr, copy_size);
         add_copy(addr, copy_size);
     };
-    // E4 (`TLG_E4_ANNOUNCED=1`): memory no engine buffer holds takes the announced bytes (the placement already copied the rest). The tracker is still asked so its state
+    // E4 (`TLG_E4_ANNOUNCED=0` turns it off): memory no engine buffer holds takes the announced bytes (the placement already copied the rest). The tracker is still asked so its state
     // (CPU/GPU marks) stays as it was, but the ranges it returns are not uploaded.
     static const bool e4_from_announced = [] {
         const char* e = std::getenv("TLG_E4_ANNOUNCED");
-        return e != nullptr && *e == '1';
+        return e == nullptr || *e != '0'; // default on (owner play 2026-10-31); =0 is the way back
     }();
     const auto tracker_ranges = [&](VAddr a, u64 n) {
         if (e4_from_announced && b9_object == 0 && b9 != 0) {
