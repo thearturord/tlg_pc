@@ -126,6 +126,14 @@ std::vector<Site*>& Sites() {
     static std::vector<Site*> sites(1, nullptr);
     return sites;
 }
+std::vector<Site*>& AllSites() { // every Site object, also the ones that share a name (and so a probe id)
+    static std::vector<Site*> sites;
+    return sites;
+}
+std::unordered_map<std::string, u16>& SiteIds() {
+    static std::unordered_map<std::string, u16> ids;
+    return ids;
+}
 std::vector<std::string>& Groups() {
     static std::vector<std::string> groups;
     return groups;
@@ -408,9 +416,16 @@ double CalibrateTicks() {
 Site::Site(const char* name_, u8 level_, Kind kind_) : name{name_}, level{level_}, kind{kind_} {
     std::scoped_lock lock{g_mutex};
     auto& sites = Sites();
-    if (sites.size() < MaxSites) {
+    // probes with the same name are one probe in the report (the same code reached from two places)
+    if (const auto it = SiteIds().find(name); it != SiteIds().end()) {
+        id = it->second;
+    } else if (sites.size() < MaxSites) {
         id = static_cast<u16>(sites.size());
         sites.push_back(this);
+        SiteIds()[name] = id;
+    }
+    if (id != 0) {
+        AllSites().push_back(this);
         enabled.store(Wanted(*this), std::memory_order_relaxed);
     }
 }
@@ -418,6 +433,12 @@ Site::Site(const char* name_, u8 level_, Kind kind_) : name{name_}, level{level_
 TagKind::TagKind(const char* name_, bool hex_) : name{name_}, hex{hex_} {
     std::scoped_lock lock{g_mutex};
     auto& kinds = TagKinds();
+    for (const TagKind* existing : kinds) { // the same tag name from two places is one tag
+        if (existing != nullptr && std::strcmp(existing->name, name_) == 0) {
+            id = existing->id;
+            return;
+        }
+    }
     id = static_cast<u16>(kinds.size());
     kinds.push_back(this);
 }
@@ -527,10 +548,8 @@ bool Start(const Config& config) {
     g_ns0 = FrameTimeline::Now();
     g_tick0 = Tick();
     g_running.store(true, std::memory_order_release);
-    for (Site* site : Sites()) {
-        if (site != nullptr) {
-            site->enabled.store(Wanted(*site), std::memory_order_relaxed);
-        }
+    for (Site* site : AllSites()) {
+        site->enabled.store(Wanted(*site), std::memory_order_relaxed);
     }
     return true;
 }
@@ -693,13 +712,6 @@ std::string HtmlOf(const Table& t) {
     return out + "</table>";
 }
 
-std::string Base(const char* path) {
-    const char* slash = std::strrchr(path, '/');
-    const char* back = std::strrchr(path, '\\');
-    const char* cut = std::max(slash, back);
-    return cut != nullptr ? std::string(cut + 1) : std::string(path);
-}
-
 }  // namespace
 
 bool SetBaseline(bool clear) {
@@ -721,10 +733,8 @@ void Analyze(const FrameTimeline::CapEvent* events, u64 count, u64 start_ns, u64
     g_prof_capture.store(false);
     {
         std::scoped_lock lock{g_mutex};
-        for (Site* site : Sites()) {
-            if (site != nullptr) {
-                site->enabled.store(false, std::memory_order_relaxed);
-            }
+        for (Site* site : AllSites()) {
+            site->enabled.store(false, std::memory_order_relaxed);
         }
     }
     const u64 tick_end = Tick();
@@ -962,7 +972,7 @@ void Analyze(const FrameTimeline::CapEvent* events, u64 count, u64 start_ns, u64
                 for (size_t i = 0; i < std::min<size_t>(30, list.size()); ++i) {
                     const TagStat& s = *list[i];
                     const double ticks = std::max(0.0, static_cast<double>(s.ticks) - c * (0.5 * static_cast<double>(s.count) + static_cast<double>(s.inner)));
-                    const std::string shown = s.label != nullptr ? fmt::format("{}:{}", Base(s.label), s.value) : (tk != nullptr && tk->hex ? fmt::format("{:#x}", s.value) : fmt::format("{}", s.value));
+                    const std::string shown = s.label != nullptr ? fmt::format("{}:{}", s.label, s.value) : (tk != nullptr && tk->hex ? fmt::format("{:#x}", s.value) : fmt::format("{}", s.value));
                     t.rows.push_back({site_name(s.root), shown, fmt::format("{:.2f}", static_cast<double>(s.count) / nframes), fmt::format("{:.3f}", ms(ticks) / nframes),
                                       fmt::format("{:.1f}", us(ticks) / static_cast<double>(s.count)), fmt::format("{:.1f}", us(static_cast<double>(s.max)))});
                 }
@@ -1010,7 +1020,7 @@ void Analyze(const FrameTimeline::CapEvent* events, u64 count, u64 start_ns, u64
                     const TagValue& tv = s->tags[i];
                     const TagKind* tk = tv.kind < TagKinds().size() ? TagKinds()[tv.kind] : nullptr;
                     tags += fmt::format("{}{}={}", i ? " " : "", tk != nullptr ? tk->name : "?",
-                                        tv.label != nullptr ? fmt::format("{}:{}", Base(tv.label), tv.value) : (tk != nullptr && tk->hex ? fmt::format("{:#x}", tv.value) : fmt::format("{}", tv.value)));
+                                        tv.label != nullptr ? fmt::format("{}:{}", tv.label, tv.value) : (tk != nullptr && tk->hex ? fmt::format("{:#x}", tv.value) : fmt::format("{}", tv.value)));
                 }
                 for (u32 k = 0; k < 4; ++k) {
                     if (s->top_ticks[k] != 0) {

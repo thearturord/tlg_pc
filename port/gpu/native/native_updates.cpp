@@ -24,6 +24,7 @@
 #include "native/native_device.h"
 #include "native/native_updates.h"
 #include "native/native_e3_census.h"
+#include "native/native_prof.h"
 
 namespace Core::NativeUpdates {
 
@@ -312,7 +313,12 @@ void NoteEngineDelete(u64 id, u64 address, u64 bytes, u32 what) {
 }
 
 void ApplyBatch(const Batch& batch) {
+    TLG_PROF_LEVEL("updates.apply_batch", 1);
+    TLG_PROF_ADD("updates.ranges_first", batch.first.size());
+    TLG_PROF_ADD("updates.ranges_again", batch.again.size());
+    TLG_PROF_ADD("updates.deleted_or_created", batch.deleted.size());
     if (delete_fn != nullptr) {
+        TLG_PROF_LEVEL("updates.deletions", 2);
         // deletions first: the work of this submission comes after them in the game's order, and no announcement of it touches a deleted object
         for (const auto& d : batch.deleted) {
             if (d[3] == 2 || d[3] == 5) {
@@ -327,12 +333,17 @@ void ApplyBatch(const Batch& batch) {
     if (apply_fn == nullptr) {
         return;
     }
-    for (const auto& [address, size] : batch.again) {
-        Core::NativeE3Census::NoteAnnounced(address, size, false); // E7c Task 3 (TLG_E3_ANNOUNCED=1)
-        apply_fn(apply_context, address, size, false);
+    {
+        TLG_PROF_LEVEL("updates.apply_again", 2);
+        for (const auto& [address, size] : batch.again) {
+            Core::NativeE3Census::NoteAnnounced(address, size, false); // E7c Task 3 (TLG_E3_ANNOUNCED=1)
+            apply_fn(apply_context, address, size, false);
+        }
     }
+    TLG_PROF_LEVEL("updates.apply_first", 2);
     for (const auto& [address, size] : batch.first) {
         Core::NativeE3Census::NoteAnnounced(address, size, true);
+        TLG_PROF_ADD("updates.bytes_first", size);
         apply_fn(apply_context, address, size, true);
         b2_applied_bytes.fetch_add(size, std::memory_order_relaxed);
     }

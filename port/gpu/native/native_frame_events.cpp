@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "native/native_frame_events.h"
+#include "native/native_prof.h"
 
 #include <array>
 #include <atomic>
@@ -36,11 +37,14 @@ void Signal(u32 id) {
     auto& ctx = Of(id);
     ctx.signals.fetch_add(1, std::memory_order_relaxed);
     std::unique_lock lock{ctx.lock};
+    TLG_PROF_TAG("event_id", id, nullptr);
     for (auto& [uid, handler] : ctx.persistent) {
+        TLG_PROF_LEVEL("events.persistent_handler", 1);
         handler(id);
         ctx.persistent_runs.fetch_add(1, std::memory_order_relaxed);
     }
     if (!ctx.once.empty()) {
+        TLG_PROF_LEVEL("events.once_handler", 1);
         ctx.once.front()(id);
         ctx.once.pop();
         ctx.once_runs.fetch_add(1, std::memory_order_relaxed);
