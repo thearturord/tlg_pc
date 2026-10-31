@@ -11,7 +11,7 @@
 #include "common/debug.h"
 #include "native/native_debug_server.h"
 #include "native/native_e3_census.h"
-#include "native/native_raster_prof.h"
+#include "native/native_prof.h"
 #include "native/native_config.h"
 #include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "native/native_hooks.h"
@@ -55,6 +55,26 @@
 #include "native/native_census.h"
 
 namespace Vulkan {
+
+namespace {
+/// The names of the pass classes the draws are tagged with (Prof tag "pass_class").
+const char* PassClassName(u32 pass_class) {
+    switch (pass_class) {
+    case 0:
+        return "z prepass / shadow";
+    case 1:
+        return "g-buffer";
+    case 2:
+        return "forward";
+    case 3:
+        return "compute / other";
+    case 4:
+        return "indirect";
+    default:
+        return "untagged";
+    }
+}
+} // namespace
 
 static Shader::PushData MakeUserData(const FixedState* fixed) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -175,7 +195,7 @@ bool DescCensusOn() {
 } // namespace
 
 void Rasterizer::MaybeFlushRecorded() {
-    Core::RasterProf::Scope prof{Core::RasterProf::Phase::FlushRecorded};
+    TLG_PROF_LEVEL("raster.flush_recorded", 3);
     const u32 limit =
         VideoCore::ReadbackPolicy::Get().flush_commands.load(std::memory_order_relaxed);
     if (limit != 0 && scheduler.PendingEncoderCommands() >= limit) {
@@ -302,7 +322,7 @@ Rasterizer::DrawClassification Rasterizer::ClassifyRemaining(const DrawInputs& i
 }
 
 bool Rasterizer::FilterDraw(const DrawPlan* plan) {
-    Core::RasterProf::Scope prof{Core::RasterProf::Phase::FilterDraw};
+    TLG_PROF_LEVEL("raster.filter_draw", 3);
     // With a plan everything comes from the plan (the command processor thread made it from its own state); without one (the
     // unsplit path) from the register mirror.
     DrawInputs inputs_storage;
@@ -560,7 +580,7 @@ std::unique_ptr<DispatchPlan> Rasterizer::PlanDispatch(const AmdGpu::ComputeProg
 
 const GraphicsPipeline* Rasterizer::ResolveDrawPipeline(const DrawPlan* plan,
                                                         DrawIndirectParams params) {
-    Core::RasterProf::Scope prof{Core::RasterProf::Phase::ResolvePipeline};
+    TLG_PROF_LEVEL("raster.pipeline_lookup", 2);
     if (plan) {
         PipelineCache::ApplyPlan(*plan);
         return plan->pipeline;
@@ -575,7 +595,7 @@ const GraphicsPipeline* Rasterizer::ResolveDrawPipeline(const DrawPlan* plan,
 }
 
 const ComputePipeline* Rasterizer::ResolveDispatchPipeline(const DispatchPlan* plan) {
-    Core::RasterProf::Scope prof{Core::RasterProf::Phase::ResolvePipeline};
+    TLG_PROF_LEVEL("raster.pipeline_lookup", 2);
     if (plan) {
         PipelineCache::ApplyPlan(*plan);
         return plan->pipeline;
@@ -606,7 +626,7 @@ bool Rasterizer::TargetInputsMatch(CachedTarget& cache, const Ts&... parts) {
 }
 
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const FixedState& fixed) {
-    Core::RasterProf::Scope prof{Core::RasterProf::Phase::PrepareRenderState};
+    TLG_PROF_LEVEL("raster.prepare_render_state", 2);
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = *draw_inputs;
@@ -754,7 +774,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     RENDERER_TRACE;
 
     {
-        const Core::RasterProf::Scope prof{Core::RasterProf::Phase::PopPending};
+        TLG_PROF_LEVEL("raster.pop_pending", 3);
         scheduler.PopPendingOperations();
     }
 
@@ -764,8 +784,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     const VideoCore::NativeTag tag = std::exchange(native_tag, {});
     Core::NativeRegistry::SetDrawClass(tag.valid ? (tag.meta & 0xff) : 15);
     Core::NativeRegistry::SetCurrentDraw(plan != nullptr && plan->native_seq != 0 ? plan->native_seq : (tag.valid ? tag.seq : 0), plan != nullptr && plan->native_seq != 0);
-    if (Core::RasterProf::Active()) {
-        Core::RasterProf::NoteOp(plan != nullptr && plan->native_seq != 0 ? Core::NativeDraw::RecordCallerGhidra(plan->native_seq) : 0, tag.valid ? (tag.meta & 0xff) : 15u);
+    if (Core::Prof::Running()) {
+        const u32 pass_class = tag.valid ? (tag.meta & 0xff) : 15u;
+        TLG_PROF_TAG_HEX("caller", plan != nullptr && plan->native_seq != 0 ? Core::NativeDraw::RecordCallerGhidra(plan->native_seq) : 0);
+        TLG_PROF_TAG("pass_class", pass_class, PassClassName(pass_class));
     }
     const bool use_tag =
         tag.valid;
@@ -789,7 +811,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         const u32 draw_class = tag.valid ? (tag.meta & 0xff) : 15u;
         Core::LightRecorder::FrameOp(Core::DebugServer::PresentCount(), draw_class < 5 ? draw_class + 1 : 6, reinterpret_cast<u64>(pipeline), texture_cache.ImageGeneration());
     }
-    Core::RasterProf::Scope prof_inputs{Core::RasterProf::Phase::PlanInputs};
+    TLG_PROF_NAMED_LEVEL(prof_inputs, "raster.plan_inputs", 3);
     FixedState fixed_storage;
     const FixedState& fixed = FixedFor(plan, fixed_storage);
     DrawInputs inputs_storage;
@@ -828,7 +850,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
 
     const bool pass_barrier = needs_barrier;
     if (needs_barrier) {
-        const Core::RasterProf::Scope prof{Core::RasterProf::Phase::FlushBarriers};
+        TLG_PROF_LEVEL("raster.flush_barriers", 2);
         runtime.FlushBarriers();
     }
 
@@ -839,7 +861,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         UpdateDynamicState(pipeline, is_indexed, fixed);
     }
     {
-        const Core::RasterProf::Scope prof{Core::RasterProf::Phase::SchedBeginRendering};
+        TLG_PROF_LEVEL("sched.begin_rendering", 3);
         scheduler.BeginRendering(state);
     }
 
@@ -849,7 +871,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     {
-        const Core::RasterProf::Scope prof{Core::RasterProf::Phase::RecordDraw};
+        TLG_PROF_LEVEL("raster.record_draw", 2);
         if (same_pipeline) {
             ++native_stats.bind_skipped;
         } else {
@@ -887,8 +909,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     // audit context of this draw (class 4: indirect draws); without it the binds of this draw were compared with the previous normal draw
     Core::NativeRegistry::SetDrawClass(4);
     Core::NativeRegistry::SetCurrentDraw(plan != nullptr && plan->native_seq != 0 ? plan->native_seq : 0, plan != nullptr && plan->native_seq != 0);
-    if (Core::RasterProf::Active()) {
-        Core::RasterProf::NoteOp(plan != nullptr && plan->native_seq != 0 ? Core::NativeDraw::RecordCallerGhidra(plan->native_seq) : 0, 4);
+    if (Core::Prof::Running()) {
+        TLG_PROF_TAG_HEX("caller", plan != nullptr && plan->native_seq != 0 ? Core::NativeDraw::RecordCallerGhidra(plan->native_seq) : 0);
+        TLG_PROF_TAG("pass_class", 4, PassClassName(4));
     }
 
     if (!FilterDraw(plan)) {
@@ -1012,17 +1035,18 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     RENDERER_TRACE;
     Core::NativeRegistry::SetDrawClass(3);
     Core::NativeRegistry::SetCurrentDraw(plan != nullptr ? plan->native_seq : 0, plan != nullptr && plan->native_seq != 0);
-    if (Core::RasterProf::Active()) {
-        Core::RasterProf::NoteOp(plan != nullptr && plan->native_seq != 0 ? Core::NativeDraw::RecordCallerGhidra(plan->native_seq) : 0, 3);
+    if (Core::Prof::Running()) {
+        TLG_PROF_TAG_HEX("caller", plan != nullptr && plan->native_seq != 0 ? Core::NativeDraw::RecordCallerGhidra(plan->native_seq) : 0);
+        TLG_PROF_TAG("pass_class", 3, PassClassName(3));
     }
 
     {
-        const Core::RasterProf::Scope prof{Core::RasterProf::Phase::PopPending};
+        TLG_PROF_LEVEL("raster.pop_pending", 3);
         scheduler.PopPendingOperations();
     }
 
     {
-        const Core::RasterProf::Scope prof{Core::RasterProf::Phase::PendingFill};
+        TLG_PROF_LEVEL("raster.dispatch_fill", 3);
         if (const auto fill = std::exchange(pending_fill, {});
             fill.dwords != 0 && TryClearImage(fill.dst, fill.bytes, fill.pattern.data(), fill.dwords)) {
             return;
@@ -1064,7 +1088,7 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     {
-        const Core::RasterProf::Scope prof{Core::RasterProf::Phase::HleCheck};
+        TLG_PROF_LEVEL("raster.shader_hle", 3);
         if (ExecuteShaderHLE(cs, cs_program, *this)) {
             return;
         }
@@ -1120,19 +1144,19 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     }
 
     if (needs_barrier) {
-        const Core::RasterProf::Scope prof{Core::RasterProf::Phase::FlushBarriers};
+        TLG_PROF_LEVEL("raster.flush_barriers", 2);
         runtime.FlushBarriers();
     }
 
     {
-        const Core::RasterProf::Scope prof{Core::RasterProf::Phase::SchedEndRendering};
+        TLG_PROF_LEVEL("sched.end_rendering", 3);
         scheduler.EndRendering();
     }
     pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     {
-        const Core::RasterProf::Scope prof{Core::RasterProf::Phase::RecordDispatch};
+        TLG_PROF_LEVEL("raster.record_dispatch", 2);
         scheduler.StampDispatch(true, cs_program.address);
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
         cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
@@ -1149,12 +1173,13 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Dis
     RENDERER_TRACE;
     Core::NativeRegistry::SetDrawClass(3);
     Core::NativeRegistry::SetCurrentDraw(plan != nullptr ? plan->native_seq : 0, plan != nullptr && plan->native_seq != 0);
-    if (Core::RasterProf::Active()) {
-        Core::RasterProf::NoteOp(plan != nullptr && plan->native_seq != 0 ? Core::NativeDraw::RecordCallerGhidra(plan->native_seq) : 0, 4);
+    if (Core::Prof::Running()) {
+        TLG_PROF_TAG_HEX("caller", plan != nullptr && plan->native_seq != 0 ? Core::NativeDraw::RecordCallerGhidra(plan->native_seq) : 0);
+        TLG_PROF_TAG("pass_class", 4, PassClassName(4));
     }
 
     {
-        const Core::RasterProf::Scope prof{Core::RasterProf::Phase::PopPending};
+        TLG_PROF_LEVEL("raster.pop_pending", 3);
         scheduler.PopPendingOperations();
     }
 
@@ -1377,7 +1402,7 @@ bool Rasterizer::StageFlatSkipped(const Shader::Info& stage) const {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed) {
-    Core::RasterProf::Scope prof{Core::RasterProf::Phase::BindResources};
+    TLG_PROF_LEVEL("raster.bind_resources", 2);
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         return false;
@@ -1450,7 +1475,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
 }
 
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
-    Core::RasterProf::Scope prof{Core::RasterProf::Phase::BindVertexBuffers};
+    TLG_PROF_LEVEL("raster.bind_vertex_buffers", 2);
     Core::NativeUploads::SetCaller(3);
     const auto& regs = *draw_inputs;
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
@@ -1579,7 +1604,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 }
 
 void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
-    Core::RasterProf::Scope prof{Core::RasterProf::Phase::BindIndexBuffer};
+    TLG_PROF_LEVEL("raster.bind_index_buffer", 2);
     Core::NativeUploads::SetCaller(4);
     const auto& regs = *draw_inputs;
 
@@ -1657,7 +1682,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {
-    Core::RasterProf::Scope prof{Core::RasterProf::Phase::ResetBindings};
+    TLG_PROF_LEVEL("raster.reset_bindings", 2);
     Core::NativeUploads::SetCaller(0);
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
@@ -1823,7 +1848,7 @@ bool Rasterizer::HazardAuditOn() const noexcept {
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
-    Core::RasterProf::Scope prof{Core::RasterProf::Phase::BindBuffers};
+    TLG_PROF_LEVEL("raster.bind_buffers", 2);
     Core::NativeUploads::SetCaller(stage.sw_stage == Shader::SwStage::Compute ? 2 : 1);
     const Core::NativeE3Census::WriteSiteScope e3_site{stage.sw_stage == Shader::SwStage::Compute ? Core::NativeE3Census::WriteSite::ShaderCompute : Core::NativeE3Census::WriteSite::ShaderGraphics};
     const u64 alignment = instance.StorageMinAlignment();
@@ -2428,7 +2453,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set,
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
-    Core::RasterProf::Scope prof{Core::RasterProf::Phase::BindTextures};
+    TLG_PROF_LEVEL("raster.bind_textures", 2);
     const u32 first_image_idx = image_infos.size();
     const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
@@ -2997,7 +3022,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 }
 
 void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
-    Core::RasterProf::Scope prof{Core::RasterProf::Phase::BindSamplers};
+    TLG_PROF_LEVEL("raster.bind_samplers", 2);
     for (const auto& sampler : stage.samplers) {
         AmdGpu::Sampler ssharp;
         const u32* record_words = nullptr;
@@ -3094,7 +3119,7 @@ Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
-    Core::RasterProf::Scope prof{Core::RasterProf::Phase::BeginRendering};
+    TLG_PROF_LEVEL("raster.begin_rendering", 2);
     static const bool memo_enabled = [] {
         // Off by default until it is checked in play (documents/tlg/pc-port-draw-pipeline-architecture.md): TLG_RENDER_STATE_MEMO=1 turns it on.
         const char* env = std::getenv("TLG_RENDER_STATE_MEMO");
@@ -3705,7 +3730,7 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed,
                                     const FixedState& fixed) const {
-    Core::RasterProf::Scope prof{Core::RasterProf::Phase::DynamicState};
+    TLG_PROF_LEVEL("raster.dynamic_state", 2);
     UpdateViewportScissorState(fixed);
     UpdateDepthStencilState(fixed);
     UpdatePrimitiveState(is_indexed, fixed);

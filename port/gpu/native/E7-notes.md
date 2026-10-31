@@ -574,12 +574,29 @@ a depth attachment or a storage usage, and whether an engine texture owns the me
 (`pages_not_hashed_range_over_2mb`). A write after the announcement and before the upload looks the same as a write the announcement did not cover (`announced_differs`): `announcements_ago` and the example's engine texture show which
 it is; the answer needs the hook of the writer if the examples name one texture again and again.
 
-## 20. Shift+F9: the raster thread profiler
+## 20. The profiler (Shift+F9, `/prof`): one tool, probes in the code
 
-`native_raster_prof.{h,cpp}`. Key Shift+F9 (or `/raster_profile?seconds=10&open=1`; Shift+F9 or F9 again stops it). F8 says which thread limits the frame, F9 times the game's jobs and the stage threads as a whole; neither looks inside `shadPS4:GpuRaster`. This does.
+`native_prof.{h,cpp}` (it replaced the raster-only first version). F8 says which thread limits the frame, F9 times the game's jobs and the stage threads as a whole; this looks inside any host thread, and what it measures is chosen by probes in the code and by the capture's settings, not by the report.
 
-How it works: a 10 s capture (the same machinery as F8, so the frames are counted from `SubmitFlip`) during which the raster thread times named phases (`Phase` in the header: operation, ring use, pop of pending operations, filter, pipeline lookup, fixed state and inputs, BindResources and inside it BindBuffers / ObtainBuffer / BindTextures / FindImage / FindView / RefreshImage (with ObtainBufferForImage, DetileImage, UploadImage) / BindSamplers / GetSampler, BeginRendering, vertex and index buffers, barriers, descriptor push, dynamic state, scheduler begin/end rendering, the record of the draw or dispatch, ResetBindings, the wait for the encoder queue) as nested scopes. Nothing is written per scope: the time is accumulated on the raster thread (timestamp counter, converted at the end), by phase and by path, so the report has inclusive and own (exclusive) time. Outside a profile a scope is one relaxed atomic load.
+**Add a probe** (one line, anywhere, any thread; one relaxed load while no profile runs):
 
-Report (`user/log/raster_<time>.html` and `.txt`, also `raster_latest.*`): the cards (busy and idle ms per frame, operations per frame), the phases ranked by own time, the phase tree, the operations by engine caller (the Ghidra address `RecordCallerGhidra` gives, with the pass class), and the 12 slowest single operations with their three biggest phases. The report states how many scopes ran per frame and what that costs (an estimate of 20 to 40 ns each, not measured): compare shapes, not absolute numbers.
+```cpp
+TLG_PROF("raster.bind_buffers");              // times the rest of the block (level 2)
+TLG_PROF_LEVEL("texture.find_view", 3);       // 1 coarse (an operation), 2 normal, 3 fine (called thousands of times a frame)
+TLG_PROF_NAMED(scope, "raster.begin");        // a scope object that scope.End() can end early
+TLG_PROF_COUNT("buffer.bind_memo.hit");       // counts an event
+TLG_PROF_ADD("buffer.bytes_streamed", size);  // counts an event with a value (count, sum, max in the report)
+TLG_PROF_TAG("caller", value, label);         // names the operation being timed (the outermost probe open on the thread); TLG_PROF_TAG_HEX shows it in hex
+```
 
-Limits: only the raster thread of the split pipeline is measured (nothing is recorded if the split is off); the call into the Vulkan driver is inside `record` and the descriptor push, the draw and dispatch calls themselves are not split further; `DrawIndirect` / `DispatchIndirect` show their shared phases (BindResources and below) and the operation total only.
+The name before the first `.` is the group. Nothing else needs a change: the report lists whatever ran.
+
+**Run it.** Shift+F9 (stops again with Shift+F9 or F9): 10 s, level 2, every group, the raster thread, the report opens in the browser. `TLG_PROF_SECONDS`, `TLG_PROF_LEVEL`, `TLG_PROF_GROUPS`, `TLG_PROF_THREADS` change that default. From the debug server: `/prof?seconds=10&level=3&groups=raster,buffer&threads=GpuRaster,GpuCommandProcessor&open=1` (`threads=all` records every thread that runs a probe), `/prof_sites` lists every probe that has run with its group and level, `/prof_baseline?set=1` keeps the last report and every later report shows the change against it per probe (`?clear=1` forgets it). So an optimisation is measured by running the same capture before and after.
+
+**The report** (`user/log/prof_<time>.html`, `.txt`, `.json`, and `prof_latest.*`), per selected thread: busy ms per frame (with the measured probe cost taken off, and as measured); the probes ranked by their own time (time without the probes inside), calls per frame, mean and max; the tree of how they nest; the operations ranked by every tag name used (the function that issued a draw or dispatch, the pass class, the source line of a closure); the counters (events per frame, sum, max); the 12 slowest single operations with the probes that took their time; and the change against the baseline. The probe cost is measured when the capture starts (a warm loop of empty scopes) and subtracted per probe as half a scope for the probe itself and for each probe it contains; it is a lower bound (in the game the caches are colder; the first version, which assumed 20 to 40 ns, was low by a factor of three: 66,000 scopes a frame cost about 7 ms).
+
+**How it works.** A probe is a function-local static `Site` (registers once) and a `Scope`. While a capture runs, the capture's level and group choice enables the matching sites (`Site::enabled`), and a scope on a thread the capture selected reads the timestamp counter at entry and exit and adds the time to that thread's tables (by probe, and by the path of nesting); no event is written per scope. Counters and tags are written to the same per-thread tables. Frames are counted from the capture's `SubmitFlip` events (the same machinery as F8), so the capture also records the usual timeline events.
+
+**What is probed now.** group `raster` (operations, binding, render targets, barriers, descriptor push, the record calls), `buffer` (ObtainBuffer and counters for each path it takes), `texture` (image lookup, refresh and its upload steps, views, samplers), `sched` (the wait for the encoder). Tags: `caller`, `pass_class` on draws and dispatches, `closure_site` (file:line of the `RasterRun` call) on closures.
+
+**Limits.** Host threads only (the game's own threads are timed by the F9 guest spans); a thread created after the capture started is not selected by name; the draw and dispatch calls into the driver are inside the `record` probes and not split further.

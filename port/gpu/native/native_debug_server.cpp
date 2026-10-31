@@ -39,7 +39,7 @@
 #include "video_core/renderdoc.h"
 #include "native/native_readbacks.h"
 #include "native/native_raycast_cpu.h"
-#include "native/native_raster_prof.h"
+#include "native/native_prof.h"
 #include "native/native_stall.h"
 #include "native/shader_env.h"
 #include "native/native_frame_events.h"
@@ -581,18 +581,38 @@ void RegisterBuiltins() {
                  }
                  return nlohmann::json{{"recording", Core::Stall::Recording()}, {"report_age_s", Core::Stall::ReportAgeSeconds()}};
              });
-    Register("/raster_profile", "?seconds=10 starts the raster thread profiler (the same as Shift+F9); without arguments it shows whether it runs and the last report (phases inside the raster thread's draws and dispatches)",
+    Register("/prof", "?seconds=10&level=2&groups=raster,buffer&threads=GpuRaster&open=1 starts the profiler (the same as Shift+F9, which uses TLG_PROF_* or the defaults); without arguments it shows whether it runs and the last report. "
+                      "level: 1 coarse, 2 normal, 3 fine; groups: the part of a probe's name before the first '.' (empty: all); threads: parts of thread names, or all",
              [](const Params& params) {
-                 if (params.contains("seconds")) {
-                     Core::RasterProf::Start(static_cast<u32>(std::min<u64>(ParseNumber(params, "seconds", 10), 60)), ParseNumber(params, "open", 0) != 0);
+                 if (params.contains("seconds") || params.contains("level") || params.contains("groups") || params.contains("threads")) {
+                     Core::Prof::Config config = Core::Prof::DefaultConfig();
+                     config.open = ParseNumber(params, "open", 0) != 0;
+                     config.seconds = static_cast<u32>(std::min<u64>(ParseNumber(params, "seconds", 10), 60));
+                     config.level = static_cast<u32>(std::clamp<u64>(ParseNumber(params, "level", 2), 1, 9));
+                     config.groups.clear();
+                     config.threads.clear();
+                     if (const auto it = params.find("groups"); it != params.end()) {
+                         config.groups = it->second;
+                     }
+                     if (const auto it = params.find("threads"); it != params.end()) {
+                         config.threads = it->second;
+                     }
+                     Core::Prof::Start(config);
                  }
-                 nlohmann::json j = nlohmann::json::parse(Core::RasterProf::ReportJson(), nullptr, false);
+                 nlohmann::json j = nlohmann::json::parse(Core::Prof::ReportJson(), nullptr, false);
                  if (j.is_discarded() || !j.is_object()) {
                      j = nlohmann::json::object();
                  }
-                 j["recording"] = Core::RasterProf::Recording();
-                 j["report_age_s"] = Core::RasterProf::ReportAgeSeconds();
+                 j["recording"] = Core::Prof::Recording();
+                 j["report_age_s"] = Core::Prof::ReportAgeSeconds();
                  return j;
+             });
+    Register("/prof_sites", "every probe of the profiler that has run so far (name, group, level, kind) and the tag names",
+             [](const Params&) { return Core::Prof::SitesJson(); });
+    Register("/prof_baseline", "?set=1 keeps the last profile report as the baseline later reports are compared with; ?clear=1 forgets it",
+             [](const Params& params) {
+                 const bool clear = ParseNumber(params, "clear", 0) != 0;
+                 return nlohmann::json{{"ok", Core::Prof::SetBaseline(clear)}, {"cleared", clear}};
              });
     Register("/frame_events", "E6.2a: the console's frame events (end of pipe, compute releases, GPU idle, flip ready): signals and subscriber runs",
              [](const Params&) { auto j = Core::NativeFrameEvents::Report(); j["flip_request"] = Core::NativeFlip::Report(); j["display"] = Core::NativeDisplay::Report(); j["presenter"] = Core::NativePresenter::Report(); j["shader_env"] = Core::NativeShaderEnv::Report(); return j; });

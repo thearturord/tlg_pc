@@ -5,7 +5,7 @@
 
 #include "native/native_stream_probe.h"
 #include "native/native_timeline.h"
-#include "native/native_raster_prof.h"
+#include "native/native_prof.h"
 
 #include "native/native_registry.h"
 #include "native/native_resource_audit.h"
@@ -444,6 +444,7 @@ void Liverpool::RasterRun(Common::UniqueFunction<void>&& func, bool wait, bool w
     op.closure = std::move(func);
     op.writes_memory = writes_memory;
     op.write_line = site.line();
+    op.write_file = site.file_name();
     RasterPush(std::move(op), wait);
 }
 
@@ -838,7 +839,7 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
     };
     const ComputeProgram& cs_program = dispatch_plan ? dispatch_plan->cs : GetCsRegs();
     {
-        const Core::RasterProf::Scope prof_ring{Core::RasterProf::Phase::RingUse};
+        TLG_PROF_NAMED_LEVEL(prof_ring, "raster.ring_use", 3);
         rasterizer->BeginRingUse(draw_plan, dispatch_plan);
     }
     switch (c.kind) {
@@ -901,7 +902,7 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
         break;
     }
     {
-        const Core::RasterProf::Scope prof_ring{Core::RasterProf::Phase::RingUse};
+        TLG_PROF_NAMED_LEVEL(prof_ring, "raster.ring_use", 3);
         rasterizer->EndRingUse();
     }
     rasterizer->MaybeFlushRecorded();
@@ -909,7 +910,6 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
 
 void Liverpool::RasterMain(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuRaster");
-    Core::RasterProf::MarkRasterThread();
     if (const u32 priority = EmulatorSettings.GetCpThreadPriority(); priority >= 2) {
         Common::SetCurrentThreadPriority(static_cast<Common::ThreadPriority>(priority));
     }
@@ -991,7 +991,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             // Callbacks sent by other threads (fault readbacks, fences) run between operations,
             // like they ran between packets before.
             if (num_commands != 0) {
-                const Core::RasterProf::Scope prof_callbacks{Core::RasterProf::Phase::Callbacks};
+                TLG_PROF_NAMED_LEVEL(prof_callbacks, "raster.callbacks", 1);
                 const u64 callback_start = VideoCore::ReadbackStats::NowNs();
                 ProcessCommands();
                 sp.ns_callbacks += VideoCore::ReadbackStats::NowNs() - callback_start;
@@ -1005,12 +1005,13 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                     }
                 }
                 {
-                    using Core::RasterProf::Phase;
-                    const Phase prof_phase = op.call.kind == RasterCall::Kind::Draw           ? Phase::OpDraw
-                                             : op.call.kind == RasterCall::Kind::DrawIndirect ? Phase::OpDrawIndirect
-                                             : op.call.kind == RasterCall::Kind::DispatchDirect ? Phase::OpDispatch
-                                                                                                : Phase::OpDispatchIndirect;
-                    const Core::RasterProf::Scope prof_op{prof_phase};
+                    static Core::Prof::Site site_draw{"raster.op.draw", 1}, site_draw_indirect{"raster.op.draw_indirect", 1}, site_dispatch{"raster.op.dispatch", 1},
+                        site_dispatch_indirect{"raster.op.dispatch_indirect", 1};
+                    Core::Prof::Site& op_site = op.call.kind == RasterCall::Kind::Draw           ? site_draw
+                                                : op.call.kind == RasterCall::Kind::DrawIndirect ? site_draw_indirect
+                                                : op.call.kind == RasterCall::Kind::DispatchDirect ? site_dispatch
+                                                                                                   : site_dispatch_indirect;
+                    const Core::Prof::Scope prof_op{op_site};
                     ExecRasterCall(op.call, op.draw_plan.get(), op.dispatch_plan.get());
                 }
                 const u64 op_ns = VideoCore::ReadbackStats::NowNs() - op_start;
@@ -1028,7 +1029,8 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             } else if (op.closure) {
                 rasterizer->NativeInvalidate();
                 {
-                    const Core::RasterProf::Scope prof_closure{Core::RasterProf::Phase::OpClosure};
+                    TLG_PROF_NAMED_LEVEL(prof_closure, "raster.op.closure", 1);
+                    TLG_PROF_TAG("closure_site", op.write_line, op.write_file);
                     op.closure();
                 }
                 (op.writes_memory ? sp.ns_write_closures : sp.ns_other_closures) +=

@@ -29,7 +29,7 @@ The design, the phases (E0 to E9), every census and the decisions are written do
 - **Frames in flight:** `TLG_FRAMES_IN_FLIGHT=0|1|2` (default 1). 0 makes the game wait for its own frame.
 - **4K patch:** the mod loader accepts the RELRO segment, which allows the 4K resolution patch in `user/mods`.
 - **FPS counter** (F10) and **F11** switches between windowed and fullscreen (desktop mode, Alt+Tab works).
-- **Debug server** on `127.0.0.1:7777` (JSON): `/stats`, `/status`, `/log`, `/timeline_capture?seconds=10&tag=x`, `/stall_capture`, `/resources` and more. Press F8 for the stall profiler, F9 for the frame profiler and Shift+F9 for the raster thread profiler (what the raster thread's time goes to inside each draw and dispatch; report in `user/log/raster_<time>.html`).
+- **Debug server** on `127.0.0.1:7777` (JSON): `/stats`, `/status`, `/log`, `/timeline_capture?seconds=10&tag=x`, `/stall_capture`, `/resources` and more. Press F8 for the stall profiler, F9 for the frame profiler and Shift+F9 for the probe profiler (named probes in the code, any thread, report in `user/log/prof_<time>.html`; `/prof` configures it, `/prof_baseline` compares runs).
 - **Regression script:** a headless run that compares the native answers with the old ones (`PASS` means 0 differences).
 - **Check switches** (off by default): `TLG_B9_VERIFY=N` compares every Nth page of GPU buffers with memory and counts writes nobody announced (read only); `TLG_E4_CENSUS=1` compares the page tracker with the announced writes.
 

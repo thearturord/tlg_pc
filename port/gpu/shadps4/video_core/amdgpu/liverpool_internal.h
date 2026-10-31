@@ -49,7 +49,8 @@ struct Liverpool::RasterOp {
     bool has_call{};
     bool writes_memory{};
     u8 audit_class{0xff}; ///< Core::ResourceAudit: the queue whose command stream pushed this operation
-    u32 write_line{}; ///< Source line of the RasterRun call that queued a writes_memory closure.
+    u32 write_line{}; ///< Source line of the RasterRun call that queued a closure.
+    const char* write_file{nullptr}; ///< Its source file (a string with static storage).
     u64 position{};   ///< The queue position (Liverpool::RasterSplit::pushed after the push)
     RasterCall call{};
     Common::UniqueFunction<void> closure{};
