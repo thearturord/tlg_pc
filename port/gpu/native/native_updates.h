@@ -293,6 +293,7 @@ enum B9Count : u32 {
     E4CensusRepeatNoAnnouncement, ///< E4 census: tracker pages uploaded again with no announced byte on them (a CPU write only the tracker saw)
     E4CensusAnnouncedBytes, ///< E4 census: announced bytes in such requests
     E4CensusAnnouncedNotUploaded, ///< E4 census: of those, bytes the tracker did not upload
+    E4AnnouncedUploads, ///< `TLG_E4_ANNOUNCED=1`: bytes of unowned memory uploaded from the announced set instead of the tracker's ranges
     B9Counts,
 };
 void NoteB9(B9Count what, u64 n = 1) noexcept;

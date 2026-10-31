@@ -1395,7 +1395,27 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         b9_forget(addr, copy_size);
         add_copy(addr, copy_size);
     };
+    // E4 (`TLG_E4_ANNOUNCED=1`): memory no engine buffer holds takes the announced bytes (the placement already copied the rest). The tracker is still asked so its state
+    // (CPU/GPU marks) stays as it was, but the ranges it returns are not uploaded.
+    static const bool e4_from_announced = [] {
+        const char* e = std::getenv("TLG_E4_ANNOUNCED");
+        return e != nullptr && *e == '1';
+    }();
     const auto tracker_ranges = [&](VAddr a, u64 n) {
+        if (e4_from_announced && b9_object == 0 && b9 != 0) {
+            memory_tracker->ForEachUploadRange(a, n, is_written, [&](u64 x, u64 xn) { e4_note_tracker(x, xn); });
+            boost::container::small_vector<std::pair<u64, u64>, 8> from_announced;
+            {
+                std::scoped_lock lock{object_dirty_mutex};
+                all_object_dirty.ForEachInRange(a, n, [&](u64 x, u64 e) { from_announced.emplace_back(x, e - x); });
+            }
+            for (const auto& [x, xn] : from_announced) {
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4AnnouncedUploads, xn);
+                b9_forget(x, xn);
+                add_copy(x, xn);
+            }
+            return;
+        }
         if (!b9_no_tracker) {
             memory_tracker->ForEachUploadRange(a, n, is_written, tracker_copy);
             return;
