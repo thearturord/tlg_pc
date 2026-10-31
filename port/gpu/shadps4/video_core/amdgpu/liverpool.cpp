@@ -20,7 +20,6 @@
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/memory.h"
-#include "native/native_audit.h"
 #include "native/native_census.h"
 #include "native/native_direct.h"
 #include "native/native_frame_gate.h"
@@ -594,30 +593,17 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
                                              .instance_sgpr_offset = call.instance_sgpr_offset,
                                              .is_indirect = true}
                 : Vulkan::DrawIndirectParams{};
-        Core::NativeAudit::SetPlanCaller(call.tag.valid ? Core::NativeDraw::RecordCaller(call.tag.seq) : 0);
         if (native_exec_plan) {
             op.draw_plan.reset(std::exchange(native_exec_plan, nullptr));
         } else {
             // a draw without a plan of its record (a fast clear eliminate whose operation could not be planned) is planned from the register mirror of the direct path
             const auto make_plan = [&] {
-                return rasterizer->PlanDraw(front_state, params, native_fixed, native_fixed_stale, native_fixed_verify, native_exec_key, native_inputs_key);
+                return rasterizer->PlanDraw(front_state, params, native_fixed, native_exec_key, native_inputs_key);
             };
             op.draw_plan = make_plan();
             if (verify == 2) {
                 op.draw_plan = ReplanAfterDrain(std::move(op.draw_plan), 0, make_plan);
             }
-        }
-        if (native_audit_plan) {
-            std::unique_ptr<Vulkan::DrawPlan> typed{std::exchange(native_audit_plan, nullptr)};
-            auto& live = Core::NativeDraw::Live();
-            live.exec_audits.fetch_add(1, std::memory_order_relaxed);
-            if (op.draw_plan) {
-                const std::string diff = Vulkan::Rasterizer::DiffExecPlans(*typed, *op.draw_plan, native_audit_vertex_mask, native_audit_pixel_mask, native_audit_kind);
-                if (!diff.empty() && live.exec_violations.fetch_add(1, std::memory_order_relaxed) < 40) {
-                    LOG_INFO(Render, "native draw planned from its record differs from the register plan in: {}", diff);
-                }
-            }
-            rasterizer->RecyclePlan(std::move(typed));
         }
         if (op.draw_plan) {
             op.draw_plan->cb_extent = last_cb_extent;

@@ -56,13 +56,11 @@ struct LiveCounters {
     std::array<std::atomic<u32>, 65536> overlay_changed_by_index{};
     std::atomic<u64> overlay_group_checked{}, overlay_group_violations{};
     /// cp_group_sig: groups skipped because their identity was already applied, groups applied, skipped groups checked against the record, and violations (by group)
-    std::atomic<u64> group_sig_skipped{}, group_sig_applied{}, group_sig_audited{}, group_sig_violations{};
-    std::array<std::atomic<u64>, NumRegisterGroups> group_sig_violations_by_group{};
     /// cp_stage_key: draws whose pipeline came from the record's key, draws that went the full way and stored a key, draws without a key, full lookups of
     /// keyed draws (audits) and the ones that differed
     std::atomic<u64> stage_key_hits{}, stage_key_misses{}, stage_key_uncached{}, stage_key_audits{}, stage_key_violations{};
     /// cp_exec_inputs: draws planned from the record alone, draws that could not be (no cached inputs or pipeline yet), draws planned both ways and compared, and the ones that differed
-    std::atomic<u64> exec_typed{}, exec_fallback{}, exec_audits{}, exec_violations{};
+    std::atomic<u64> exec_typed{}, exec_fallback{};
     std::atomic<u64> draw_args_typed{}; ///< E1b: draws whose arguments came from the record's typed values
     std::array<std::atomic<u64>, 12> fixed_null{}; ///< why Fixed::Build gave no fixed state (by exit point)
     std::array<std::atomic<u64>, 3> plan_null{};   ///< why PlanExecDraw gave no plan: 0 stale surface / clip, 1 inputs not learned yet, 2 pipeline plan failed
@@ -72,7 +70,7 @@ struct LiveCounters {
     /// of the typed ones: fast clear eliminates and inline draws (the count came with the draw packet)
     std::atomic<u64> exec_fast_clear{}, exec_inline{}, exec_inline_seen{};
     /// the native path's private register block: draws and clears planned from it, plans compared with the shared register image (legacy switch on), differences
-    std::atomic<u64> state_planned{}, state_audits{}, state_violations{}, state_group_violations{};
+    std::atomic<u64> state_planned{}, state_group_violations{};
     std::atomic<u64> overlay_offered{}, overlay_unmapped{}, overlay_same{}, overlay_changed{}, overlay_records{};
     std::atomic<u64> cs_audit_dispatches{}, cs_audit_differing{};
     std::array<std::atomic<u64>, 128> cs_audit_dword{};
@@ -89,7 +87,7 @@ struct LiveCounters {
     std::atomic<u64> direct_built{}, direct_pure{}, direct_mixed{}, direct_entries{}, direct_matched{}, direct_entry_mismatch{}, direct_purity_mismatch{}, direct_incomplete{}, direct_executed{}, direct_executed_asc{};
     std::atomic<u64> track_native{}, track_fce{}, track_game_second{}, track_game_depth{};
     /// fixed-function state of native draws: used from the engine's objects, compared with the registers, and the compares that differed
-    std::atomic<u64> fixed_native{}, fixed_checked{}, fixed_diff{};
+    std::atomic<u64> fixed_native{};
     /// command packets by the group of the last native tag: 0 none, 1 executed draw, 2 packet-path draw, 3 executed
     /// dispatch, 4 packet-path dispatch, 5 fast clear eliminate
     std::array<std::atomic<u64>, 6> packets{};
@@ -135,9 +133,6 @@ void MergeCensusRead(std::array<u64, 6>& values);
 /// A1 (`TLG_SITE_CENSUS=1`, also on with `TLG_GEN_CENSUS=1`): the draws the hook tagged, by the call site that made them (ghidra return address): draws, generated ones (issued by one of the
 /// generators), draws executed natively from their record, the kinds seen. Written into `out` ranked by draws.
 void DrawSiteCensusRead(nlohmann::json& out);
-/// A5.1 (`TLG_SYNTH_AUDIT=1`): is what `Synthesize` produces (the register groups, flags, extents, shader pointers) a function of the context's engine signature (shaders, input objects,
-/// targets, fixed function state, pipeline key)? Counts the records whose signature was seen before and the components that differed.
-void SynthAuditRead(nlohmann::json& out);
 /// A5.2 (`TLG_NATIVE_LIST=1`, verify `TLG_NATIVE_LIST_VERIFY=N`, default 64): the state half of a record (the register groups of the targets, the fixed function state, the vertex and pixel
 /// program, the target extents, the flags) is taken from a package built at the first sight of the engine's state key instead of being synthesized again; counters.
 void NativeListRead(nlohmann::json& out);
@@ -242,7 +237,6 @@ struct ExecDraw {
     DrawArgs args{}; ///< E1b
     u64 vs_gnm{}, ps_gnm{}, fetch_object{}; ///< E1c: the Gnm blocks of the draw's vertex and pixel shader objects and the input layout's fetch object (0: unknown)
     const Vulkan::FixedState* fixed{}; ///< draws: the fixed-function state built from the engine's objects (null: from the registers)
-    u32 fixed_stale{};                 ///< FixedStateStale groups of `fixed` the hardware keeps from earlier draws
     u32 dst_usage{~0u};                ///< copy and counter read-back records: Usage of the destination resource (3 staging)
 };
 

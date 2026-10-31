@@ -6145,13 +6145,6 @@ nlohmann::json Report() {
         NativeDraw::NativeListRead(list);
         out["native_list"] = std::move(list);
     }
-    {
-        nlohmann::json audit = nlohmann::json::object();
-        NativeDraw::SynthAuditRead(audit);
-        if (audit["records"].get<u64>() != 0) {
-            out["synthesize_audit"] = std::move(audit);
-        }
-    }
     out["native_handle_lookup_FUN_01c59060"] = {{"answered_natively", Leaf().native.load()}, {"engine_creates_the_render_data", Leaf().engine_creating.load()},
                                                 {"null_object", Leaf().engine_null.load()}, {"verify_calls_of_the_engine", Leaf().verified.load()},
                                                 {"verify_differences", Leaf().differing.load()},

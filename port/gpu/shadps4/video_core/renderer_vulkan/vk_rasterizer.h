@@ -86,16 +86,14 @@ public:
     [[nodiscard]] std::unique_ptr<DrawPlan> PlanDraw(const AmdGpu::DrawRegs& regs,
                                                      DrawIndirectParams params,
                                                      const FixedState* native = nullptr,
-                                                     u32 native_stale = 0, bool verify = true, u64 exec_key = 0, u64 inputs_key = 0);
+                                                     u64 exec_key = 0, u64 inputs_key = 0);
     /// cp_exec_inputs: plans a native draw from its record alone. Null when the render target inputs or the pipeline of the record's keys are not known yet, or the
     /// fixed-function state needs the registers (the caller plans the old way).
-    [[nodiscard]] std::unique_ptr<DrawPlan> PlanExecDraw(const FixedState& native, u32 native_stale, u64 exec_key, u64 inputs_key,
+    [[nodiscard]] std::unique_ptr<DrawPlan> PlanExecDraw(const FixedState& native, u64 exec_key, u64 inputs_key,
                                                          std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data,
                                                          const Core::NativeDraw::ExecDraw& draw, u32 index_count = ~0u, u32 draw_class = 15);
     /// The plan of a fast clear eliminate record: the operation and the render target it works on, decoded from the record's register pairs.
     [[nodiscard]] std::unique_ptr<DrawPlan> PlanExecOperation(const Core::NativeDraw::ExecDraw& draw);
-    /// The differences between a plan made from the record and the same draw planned from the registers ("" when they agree; the user data under the masks).
-    [[nodiscard]] static std::string DiffExecPlans(const DrawPlan& typed, const DrawPlan& reference, u16 vertex_mask, u16 pixel_mask, u32 draw_kind);
     /// A hash of what the planning read from guest memory and put into the plan: pipeline, per stage the program, user data and flat user data (N6b plan verification).
     [[nodiscard]] static u64 PlanDigest(const DrawPlan& plan);
     [[nodiscard]] static u64 PlanDigest(const DispatchPlan& plan);

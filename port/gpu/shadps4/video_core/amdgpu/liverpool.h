@@ -327,7 +327,6 @@ private:
     std::array<u64, NumRegisterGroups> group_applied_sig{};
     std::array<bool, NumRegisterGroups> group_sig_valid{};
     std::array<bool, NumRegisterGroups> group_sig_full{}; ///< the group was applied with the fixed-function registers too
-    u32 group_sig_tick{};
     /// The native path's private register block: the mirror of the register file (packets and state templates write both) plus what the executed records wrote,
     /// never restored. Executed draws, clears and operations are planned from it; the shared `front_state` and its overlay serve the game's own packets only.
     DrawRegs exec_state{};
@@ -351,17 +350,10 @@ private:
     void InvalidateRegisterGroup(u32 index);
     void InvalidateRegisterGroups();
     bool native_exec_scope{}; ///< the draw being dispatched is an executed record
-    u32 native_fixed_stale{};
-    bool native_fixed_verify{};
-    u64 native_fixed_draws{};
     u64 native_inputs_key{};                        ///< identity of the render target inputs of the draw being dispatched (0: unknown)
     std::array<u32, 16> exec_vertex_user_data{};     ///< the typed user data of the last executed records, per stage
     std::array<u32, 16> exec_pixel_user_data{};
-    u32 exec_plan_tick{};
     Vulkan::DrawPlan* native_exec_plan{};            ///< a draw planned from its record: RasterDispatch pushes it instead of planning
-    Vulkan::DrawPlan* native_audit_plan{};           ///< the same draw planned from its record, to compare with the plan made from the registers
-    u16 native_audit_vertex_mask{}, native_audit_pixel_mask{};
-    u32 native_audit_kind{};
     u64 native_exec_key{}; ///< pipeline key of the draw being dispatched, from the record (0: look the pipeline up from the registers)
     const Vulkan::FixedState* native_fixed{}; ///< fixed-function state of the draw being dispatched, from the engine's objects (null: from the registers)
     /// Wakes the raster thread (it runs SendCommand callbacks) when the split is active.

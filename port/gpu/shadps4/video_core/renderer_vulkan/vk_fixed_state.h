@@ -139,22 +139,8 @@ struct DrawInputs {
 };
 
 DrawInputs MakeDrawInputs(const AmdGpu::DrawRegs& regs);
-/// Names of the members in which two sets differ (empty when equal).
-std::string DiffDrawInputs(const DrawInputs& a, const DrawInputs& b);
-
 /// The packet path: the fixed-function state of the draw described by `regs`.
 FixedState MakeFixedState(const AmdGpu::DrawRegs& regs);
-
-/// Hardware state the engine only rewrites when its own cache says it changed: a draw that does not write the group runs
-/// with what the hardware holds, which is not necessarily what the engine's objects say (the register file models that).
-enum FixedStateStale : u32 {
-    StaleSurface = 1, ///< PA_SU_SC_MODE_CNTL: culling, front face, polygon mode
-    StaleClip = 2,    ///< PA_CL_CLIP_CNTL: depth clip, clip space, rasterizer discard
-    StaleClear = 4,   ///< DB_RENDER_CONTROL: the depth / stencil clear flags of the render pass
-};
-
-/// Replaces the fields of the given groups with what the register state `regs` holds.
-void TakeFromRegisters(FixedState& out, const AmdGpu::DrawRegs& regs, u32 groups);
 
 /// The state of a draw whose registers hold their defaults (the base the native path starts from).
 const FixedState& DefaultFixedState();
@@ -162,8 +148,5 @@ const FixedState& DefaultFixedState();
 /// Sets the topology dependent fields: list / patch classification and culling (only primitives that have faces are
 /// culled; `cull_mode` is what the rasterizer state asks for).
 void SetFixedStateTopology(FixedState& out, AmdGpu::PrimitiveType type, vk::CullModeFlags cull_mode);
-
-/// Names of the fields in which two states differ, separated by spaces (empty when they are equal).
-std::string DiffFixedState(const FixedState& a, const FixedState& b);
 
 } // namespace Vulkan

@@ -1008,11 +1008,6 @@ u32 SweepSyncPackets(u64 begin, u64 end) {
     return removed;
 }
 
-bool SweepEnabled() {
-    const auto& policy = VideoCore::ReadbackPolicy::Get();
-    return true;
-}
-
 bool WriteDwordsAt(u64 writer, const u32* words, u32 count) {
     // the game's own synchronization between the last tag written to this command buffer and this one
     struct Sweep {
@@ -1021,7 +1016,7 @@ bool WriteDwordsAt(u64 writer, const u32* words, u32 count) {
         u64 last{};
     };
     static thread_local std::array<Sweep, 6> sweeps;
-    if (SweepEnabled()) {
+    {
         const u64 cursor = Rd<u64>(writer, 0x10);
         const u64 base = Rd<u64>(writer, 0x0);
         Sweep* entry = nullptr;
@@ -1134,7 +1129,6 @@ struct NativeRecord {
     u32 copy_bytes{};
     std::array<u64, 2> desc_key{}; ///< draw records: what the specialization of the vertex / pixel stage compares in the descriptors it reads
     bool readback{}; ///< compute records: the image the dispatch writes is a staging resource, returned to guest memory
-    u32 fixed_stale{}; ///< FixedStateStale groups the draw does not write (the hardware keeps what it holds)
     u32 dst_usage{~0u}; ///< copy and counter read-back records: Usage of the destination resource (3 staging), ~0u unknown
     const Vulkan::FixedState* fixed{}; ///< draw records: the fixed-function state built from the engine's objects (null: from the registers)
     u32 unsupported_inputs{}; ///< input usage types the builder does not know
@@ -2202,16 +2196,8 @@ struct Entry {
 std::mutex mutex;
 std::unordered_multimap<u64, std::unique_ptr<Entry>> states;
 
-/// True when the fixed-function state is built from the objects (bit 15 of native_sdk_strip).
-bool Enabled() {
-    return true;
-}
-
 /// The fixed-function state of the draw the context describes, or null when an object is not what the builder knows.
-/// `stale` receives the groups the draw's own state writes leave to the hardware: the engine writes the rasterizer
-/// registers only while its state is dirty and PA_SU_SC_MODE_CNTL only when its cached copy differs.
-const Vulkan::FixedState* Build(u64 ctx, const DeviceAddresses& dev, u32& stale) {
-    stale = 0;
+const Vulkan::FixedState* Build(u64 ctx, const DeviceAddresses& dev) {
     u64 blend = Rd<u64>(ctx, Ctx::BlendState);
     u64 raster = Rd<u64>(ctx, Ctx::RasterizerState);
     u64 ds = Rd<u64>(ctx, Ctx::DepthStencilState);
@@ -2226,11 +2212,6 @@ const Vulkan::FixedState* Build(u64 ctx, const DeviceAddresses& dev, u32& stale)
     }
     if (blend == 0 || raster == 0 || ds == 0 || dev.topology_table == 0) {
         { Live().fixed_null[0].fetch_add(1, std::memory_order_relaxed); return nullptr; }
-    }
-    if (Rd<u8>(ctx, 0x46d8) == 0) {
-        stale = Vulkan::StaleSurface | Vulkan::StaleClip;
-    } else if (Rd<u32>(ctx, 0x46d0) == Rd<u32>(raster, 0x4c)) {
-        stale = Vulkan::StaleSurface;
     }
     const u64 dsv = Rd<u64>(ctx, Ctx::DepthStencilView);
     const u32 dsv_flags = dsv ? Rd<u32>(dsv, 0x48) : 0;
@@ -2506,195 +2487,8 @@ struct PhaseClockMr {
     ~PhaseClockMr() { Mark(5); }
 };
 
-// ---- A5.1: is Synthesize a function of the engine signature? ----------------------------------------------------------------------------------------
 const std::array<u8, 65536>& GroupTable();
 thread_local const Signature* record_sig = nullptr;
-thread_local u64 synth_audit_ctx = 0;
-constexpr u32 SynthComponents = NumRegisterGroups + 6; // the register groups, then flags, reason, color extents, depth extent, target info, shader pointers
-struct SynthAuditEntry {
-    std::atomic<u64> key{0};
-    std::atomic<u32> ready{0};
-    std::array<u64, SynthComponents> comp{};
-};
-std::array<SynthAuditEntry, 1u << 18> synth_audit_table;
-std::atomic<u64> synth_audit_records{0}, synth_audit_seen_before{0}, synth_audit_no_slot{0}, synth_audit_violating_records{0};
-std::array<std::atomic<u64>, SynthComponents> synth_audit_component_violations;
-std::atomic<u32> synth_audit_logged{0};
-/// diagnosis: the registers of the first draw of a signature (a smaller table) and, per register index, how often a later draw with the same signature had another value
-struct SynthAuditRegs {
-    std::atomic<u64> key{0};
-    u32 count{0};
-    std::array<ExecRegister, 400> regs{};
-};
-std::vector<SynthAuditRegs>* synth_audit_regs = nullptr;
-std::array<std::atomic<u64>, 65536> synth_audit_reg_diffs;
-std::array<std::atomic<u32>, 65536> synth_audit_reg_example;
-std::atomic<u64> synth_audit_count_differs{0}, synth_audit_order_differs{0};
-std::array<std::atomic<u64>, 65536> synth_audit_reg_presence;
-bool SynthAuditOn() {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_SYNTH_AUDIT");
-        return e != nullptr && *e != 0 && *e != '0';
-    }();
-    return on;
-}
-void SynthAuditNote(const Signature& sig, u32 kind, const NativeRecord& slot) {
-    std::array<u64, SynthComponents> comp{};
-    const auto& table = GroupTable();
-    std::array<Hasher, NumRegisterGroups> groups;
-    for (u32 i = 0; i < slot.count; ++i) {
-        const u32 g = table[slot.regs[i].index & 0xffff];
-        groups[g].Add(slot.regs[i].index);
-        groups[g].Add(slot.regs[i].value);
-    }
-    for (u32 g = 0; g < NumRegisterGroups; ++g) {
-        comp[g] = groups[g].h | 1;
-    }
-    {
-        Hasher h;
-        h.Add(synth_flags);
-        comp[NumRegisterGroups + 0] = h.h | 1;
-    }
-    {
-        Hasher h;
-        h.Add(synth_reason);
-        comp[NumRegisterGroups + 1] = h.h | 1;
-    }
-    {
-        Hasher h;
-        for (const u32 e : synth_cb_extent) {
-            h.Add(e);
-        }
-        h.Add(synth_cb_extent_mask);
-        comp[NumRegisterGroups + 2] = h.h | 1;
-    }
-    {
-        Hasher h;
-        h.Add(synth_db_extent);
-        comp[NumRegisterGroups + 3] = h.h | 1;
-    }
-    {
-        Hasher h;
-        h.Add(synth_rt_info);
-        comp[NumRegisterGroups + 4] = h.h | 1;
-    }
-    {
-        Hasher h;
-        h.Add(slot.vs_gnm);
-        h.Add(slot.ps_gnm);
-        comp[NumRegisterGroups + 5] = h.h | 1;
-    }
-    u64 key = 0xcbf29ce484222325ull;
-    for (u32 g = 0; g < NumGroups; ++g) {
-        if (g != Args && g != ConstantBuffers && g != ShaderResources && g != Samplers && g != VertexBuffers) {
-            key = (key ^ sig.group[g]) * 0x100000001b3ull;
-        }
-    }
-    key = (key ^ sig.pipeline_key ^ kind) * 0x100000001b3ull;
-    key = (key ^ Rd<u64>(synth_audit_ctx, 0x4440)) * 0x100000001b3ull;
-    key = (key ^ Rd<u32>(synth_audit_ctx, 0x4448)) * 0x100000001b3ull;
-    key = (key ^ Rd<u64>(synth_audit_ctx, 0x4450)) * 0x100000001b3ull;
-    // the engine's cached copies of what PrepareDraw last wrote (the registers are only emitted when the cached copy differs) and the objects the registers come from
-    for (const u32 offset : {0x46d0u, 0x4710u, 0x4714u, 0x130c8u}) {
-        key = (key ^ Rd<u32>(synth_audit_ctx, offset)) * 0x100000001b3ull;
-    }
-    key = (key ^ Rd<u8>(synth_audit_ctx, 0x46d8)) * 0x100000001b3ull;
-    key = (key ^ Rd<u64>(synth_audit_ctx, 0x4680) ^ (Rd<u64>(synth_audit_ctx, 0x4688) << 1)) * 0x100000001b3ull;
-    if (const u64 vs = Rd<u64>(synth_audit_ctx, Ctx::VertexShader)) {
-        key = (key ^ Rd<u64>(vs, 0x420)) * 0x100000001b3ull;
-        if (const u64 fetch = Rd<u64>(vs + 0x30, 0xe0)) {
-            key = (key ^ Rd<u64>(fetch, 0x30)) * 0x100000001b3ull;
-            for (const u32 offset : {0x40u, 0x48u, 0x4cu}) {
-                key = (key ^ Rd<u32>(fetch, offset)) * 0x100000001b3ull;
-            }
-        }
-    }
-    for (const u32 e : synth_cb_extent) {
-        key = (key ^ e) * 0x100000001b3ull;
-    }
-    key = (key ^ synth_cb_extent_mask ^ (u64{synth_db_extent} << 32)) * 0x100000001b3ull;
-    key |= 1;
-    synth_audit_records.fetch_add(1, std::memory_order_relaxed);
-    {
-        static std::once_flag once;
-        std::call_once(once, [] { synth_audit_regs = new std::vector<SynthAuditRegs>(1u << 14); });
-        auto& r = (*synth_audit_regs)[static_cast<u32>(key >> 50)];
-        u64 expected = 0;
-        if (r.key.load(std::memory_order_acquire) == key) {
-            if (r.count != std::min<u32>(slot.count, 400)) {
-                synth_audit_count_differs.fetch_add(1, std::memory_order_relaxed);
-                std::bitset<65536> a, b;
-                for (u32 i = 0; i < r.count; ++i) {
-                    a.set(r.regs[i].index & 0xffff);
-                }
-                for (u32 i = 0; i < slot.count && i < 400; ++i) {
-                    b.set(slot.regs[i].index & 0xffff);
-                }
-                const auto only = a ^ b;
-                for (u32 i = 0; i < 65536; ++i) {
-                    if (only[i]) {
-                        synth_audit_reg_presence[i].fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
-            } else {
-                for (u32 i = 0; i < slot.count; ++i) {
-                    if (r.regs[i].index != slot.regs[i].index) {
-                        synth_audit_order_differs.fetch_add(1, std::memory_order_relaxed);
-                        break;
-                    }
-                }
-            }
-            for (u32 i = 0; i < slot.count && i < r.count; ++i) {
-                if (r.regs[i].index == slot.regs[i].index && r.regs[i].value != slot.regs[i].value) {
-                    synth_audit_reg_diffs[slot.regs[i].index & 0xffff].fetch_add(1, std::memory_order_relaxed);
-                    synth_audit_reg_example[slot.regs[i].index & 0xffff].store(slot.regs[i].value, std::memory_order_relaxed);
-                }
-            }
-        } else if (r.key.compare_exchange_strong(expected, ~0ull)) {
-            r.count = std::min<u32>(slot.count, 400);
-            for (u32 i = 0; i < r.count; ++i) {
-                r.regs[i] = {slot.regs[i].index, slot.regs[i].value};
-            }
-            r.key.store(key, std::memory_order_release);
-        }
-    }
-    u32 index = static_cast<u32>(key >> 46);
-    for (u32 probe = 0; probe < 16; ++probe, index = (index + 1) & (synth_audit_table.size() - 1)) {
-        auto& e = synth_audit_table[index];
-        u64 current = e.key.load(std::memory_order_acquire);
-        if (current == 0) {
-            u64 expected = 0;
-            if (e.key.compare_exchange_strong(expected, key, std::memory_order_acq_rel)) {
-                e.comp = comp;
-                e.ready.store(1, std::memory_order_release);
-                return;
-            }
-            current = expected;
-        }
-        if (current != key) {
-            continue;
-        }
-        if (e.ready.load(std::memory_order_acquire) == 0) {
-            return;
-        }
-        synth_audit_seen_before.fetch_add(1, std::memory_order_relaxed);
-        bool violated = false;
-        for (u32 c = 0; c < SynthComponents; ++c) {
-            if (e.comp[c] != comp[c]) {
-                violated = true;
-                synth_audit_component_violations[c].fetch_add(1, std::memory_order_relaxed);
-                if (synth_audit_logged.fetch_add(1) < 12) {
-                    LOG_ERROR(Core, "synth audit: signature {:#x} component {} differs ({:#x} / {:#x}) kind {}", key, c, e.comp[c], comp[c], kind);
-                }
-            }
-        }
-        if (violated) {
-            synth_audit_violating_records.fetch_add(1, std::memory_order_relaxed);
-        }
-        return;
-    }
-    synth_audit_no_slot.fetch_add(1, std::memory_order_relaxed);
-}
 
 // ---- A5.2: the state half of a record by key ---------------------------------------------------------------------------------------------------
 // Synthesize (the register groups of the targets, the fixed function state, the vertex and pixel program, the extents and flags of a record) is a function of the engine's state: the
@@ -2965,10 +2759,6 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
             }
         }
     }
-    if (kind <= 2 && record_sig != nullptr && SynthAuditOn()) {
-        synth_audit_ctx = ctx;
-        SynthAuditNote(*record_sig, kind, slot);
-    }
     if (kind <= 2 && Core::NativeTargetDesc::Enabled()) {
         Core::NativeTargetDesc::Observe(ctx); // E7 Task 2: shadow only, compares the target blocks with the engine's objects
     }
@@ -2978,8 +2768,8 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     }
     mr.Mark(1);
     slot.fixed = nullptr;
-    if (kind <= 2 && Fixed::Enabled()) {
-        slot.fixed = Fixed::Build(ctx, ResolveDevice(), slot.fixed_stale);
+    if (kind <= 2) {
+        slot.fixed = Fixed::Build(ctx, ResolveDevice());
     }
     mr.Mark(2);
     slot.cb_extent = synth_cb_extent;
@@ -4172,7 +3962,7 @@ void VerifyRecordImpl(u64 seq, const u32* reg_array, const AmdGpu::DrawRegs* map
         s.flag_counts[bit] += (flags >> bit) & 1;
     }
     s.draws_clean_mismatch += any && flags == 0;
-    if (any || true) {
+    {
         // the first draws of each distinct vertex/pixel shader pair: input table and the actual user data
         static std::unordered_map<u64, u32> dumped;
         const u64 pair = vs_gnm * 31 + ps_gnm;
@@ -4703,7 +4493,6 @@ static bool TakeExecDrawImpl(u64 seq, ExecDraw& out, bool typed, bool allow_lazy
     out.vs_gnm = slot.vs_gnm;
     out.ps_gnm = slot.ps_gnm;
     out.fetch_object = slot.dbg_fetch;
-    out.fixed_stale = slot.fixed_stale;
     out.dst_usage = slot.kind == 9 || slot.kind == 10 ? slot.dst_usage : ~0u;
     return slot.seq.load(std::memory_order_acquire) == seq;
 }
@@ -4954,15 +4743,15 @@ bool EmitFastClearEliminate(u64 ctx, u64 resource) {
 /// Native replacement of the game's per-resource tracking for the common cases: usage flags are cleared (the cache
 /// flush has no host effect) and a render target in state 1 / 2 that was cleared with a fast clear gets its clear
 /// eliminated, then state 3. Resources with depth transitions or the second resource (+0x138) keep the game's function.
-void TrackResource(u64 ctx, u64 resource, bool native, void(PS4_SYSV_ABI* game_track)(u64, u64)) {
-    if (native && Rd<u64>(resource, 0x138) != 0) {
+void TrackResource(u64 ctx, u64 resource, void(PS4_SYSV_ABI* game_track)(u64, u64)) {
+    if (Rd<u64>(resource, 0x138) != 0) {
         track_game_second.fetch_add(1, std::memory_order_relaxed);
         Live().track_game_second.fetch_add(1, std::memory_order_relaxed);
-    } else if (native && (Rd<u32>(resource, 0x144) - 1u) < 2) {
+    } else if ((Rd<u32>(resource, 0x144) - 1u) < 2) {
         track_game_depth.fetch_add(1, std::memory_order_relaxed);
         Live().track_game_depth.fetch_add(1, std::memory_order_relaxed);
     }
-    if (!native || Rd<u64>(resource, 0x138) != 0 || (Rd<u32>(resource, 0x144) - 1u) < 2) {
+    if (Rd<u64>(resource, 0x138) != 0 || (Rd<u32>(resource, 0x144) - 1u) < 2) {
         game_track(ctx, resource);
         return;
     }
@@ -4990,7 +4779,6 @@ void TrackResource(u64 ctx, u64 resource, bool native, void(PS4_SYSV_ABI* game_t
 /// use, the game's own tracking function runs (it may write barrier packets or draw internal full-screen quads).
 void RunResourceTracking(u64 ctx) {
     const VAddr base = image_base.load(std::memory_order_relaxed);
-    const bool native = true;
     const auto track = GameTrackFunction();
     // engine objects live in the game's heap; anything else is a stale table entry (the game would fault on it too)
     const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
@@ -5013,7 +4801,7 @@ void RunResourceTracking(u64 ctx) {
                 }
                 continue;
             }
-            TrackResource(ctx, resource, native, track);
+            TrackResource(ctx, resource, track);
         }
     };
     if (const u64 vs = Rd<u64>(ctx, Ctx::VertexShader); valid(vs) && Rd<u8>(vs + 0x30, 0xd6) == 0) {
@@ -5027,14 +4815,13 @@ void RunResourceTracking(u64 ctx) {
 /// The resource tracking of PrepareDispatch (0x2479b70) for the compute shader's views, done natively.
 void RunComputeTracking(u64 ctx) {
     const VAddr base = image_base.load(std::memory_order_relaxed);
-    const bool native = true;
     const auto track = GameTrackFunction();
     const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     const u64 cs = Rd<u64>(ctx, 0x4670);
     const auto track_view = [&](u64 view) {
         if (view != 0 && valid(view)) {
             if (const u64 resource = Rd<u64>(view, 0x30); valid(resource)) {
-                TrackResource(ctx, resource, native, track);
+                TrackResource(ctx, resource, track);
             }
         }
     };
@@ -5243,16 +5030,6 @@ void PrepareDrawSideEffects(u64 ctx) {
     }
 }
 
-/// `native_sdk_strip` bit 2147483648: the first draw of a vertex shader that takes a fetch shader runs the game's own draw
-/// function (it creates the fetch object inside PrepareDraw); its record is built again afterwards (bit 262144 executes it).
-bool FetchRebuildEnabled() {
-    return true;
-}
-
-bool FetchRebuildExecutes() {
-    return true;
-}
-
 using GuestDraw6 = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
 
 /// The record of a draw was flagged only because the fetch object of its vertex shader did not exist yet, and the tag is written. The game's
@@ -5299,7 +5076,7 @@ u64 RebuildAfterGame(u64 ctx, u64 tag_address, u64 a1, u64 a2, u64 a3, u64 a4, u
     if (seq == 0 || Slot(seq).flags != 0) {
         return refused(seq == 0 ? "no record" : "the new record is still flagged", seq);
     }
-    const bool exec = FetchRebuildExecutes() && ExecEligible(snapshot_ctx, seq, caller);
+    const bool exec = ExecEligible(snapshot_ctx, seq, caller);
     u32 words[TagDwords];
     std::memcpy(words, reinterpret_cast<const void*>(tag_address), sizeof(words));
     std::memcpy(&words[9], &seq, sizeof(u64));
@@ -5355,7 +5132,7 @@ bool RecordsEqual(const NativeRecord& a, const NativeRecord& b, bool bindings_to
     if (registers_only) {
         return true;
     }
-    if (a.fixed != b.fixed || a.fixed_stale != b.fixed_stale || a.flags != b.flags || a.vs_gnm != b.vs_gnm || a.ps_gnm != b.ps_gnm) {
+    if (a.fixed != b.fixed || a.flags != b.flags || a.vs_gnm != b.vs_gnm || a.ps_gnm != b.ps_gnm) {
         return false;
     }
     if (!bindings_too) {
@@ -5605,9 +5382,7 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
     }
     // The game's resource tracking runs first (as it does at the start of PrepareDraw): it may update view descriptors
     // and write barrier packets or draw internal quads, which then come before the tag.
-    if (true) {
-        RefreshTargets(ctx);
-    }
+    RefreshTargets(ctx);
     if (track) {
         const u64 vertex_shader = Rd<u64>(ctx, Ctx::VertexShader);
         if (vertex_shader != 0 && Rd<u64>(vertex_shader, 0x420) == 0 && Rd<u64>(ctx, 0x4680) == 0 &&
@@ -5714,7 +5489,7 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
     std::memcpy(&words[7], &k3, sizeof(u64));
     v2_collect = v2;
     record_sig = &sig;
-    const u64 seq = true ? Guarded([&] { return MakeRecord(ctx, kind, a1, a2, a3, ret); }) : 0;
+    const u64 seq = Guarded([&] { return MakeRecord(ctx, kind, a1, a2, a3, ret); });
     record_sig = nullptr;
     v2_collect = nullptr;
     if (seq != 0 && NativeZPass::Enabled()) {
@@ -5784,7 +5559,7 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
             ExecSideEffects(ctx, kind, a1, a2, a3);
             return 1;
         }
-        if (seq != 0 && kind <= 1 && !inline_draw && FetchRebuildEnabled() &&
+        if (seq != 0 && kind <= 1 && !inline_draw &&
             Slot(seq).flags == (NoFetchObject | SpecialPipeline) && Slot(seq).reason == (ReasonNoFetchObject | ReasonUnsupportedInput)) {
             const u64 cursor = Rd<u64>(ctx + 0x47c0, 0x10);
             if (const u64 result = RebuildAfterGame(ctx, cursor - (2 + VideoCore::NativeTagPayloadDwords - 1) * sizeof(u32), a1, a2, a3,
@@ -6594,8 +6369,8 @@ u64 PS4_SYSV_ABI TagCopyResource(u64 ctx, u64 destination, u64 destination_sub, 
         return 0;
     }
     const auto game_track = GameTrackFunction();
-    TrackResource(ctx, destination, true, game_track);
-    TrackResource(ctx, source, true, game_track);
+    TrackResource(ctx, destination, game_track);
+    TrackResource(ctx, source, game_track);
     if (Rd<u32>(ctx, 0x278) != 0x8000) {
         Wr<u32>(ctx, 0x4acc, 0x8000);
         Wr<u8>(ctx, 0x47b4, 1);
@@ -7446,7 +7221,7 @@ u64 PS4_SYSV_ABI TagTrackResource(u64 ctx, u64 resource, u64 a2, u64 a3, u64 a4,
     if (reinterpret_cast<u64>(game) == image_base.load(std::memory_order_relaxed) + 0x2479db0 - 0x1000000) {
         return 0; // the original entry is not available
     }
-    TrackResource(ctx, resource, true, game);
+    TrackResource(ctx, resource, game);
     return 1;
 }
 u64 PS4_SYSV_ABI MeasureTargetEliminate(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
@@ -7832,7 +7607,7 @@ u64 PS4_SYSV_ABI ResourceBufferDestroyed(u64 object, u64 a1, u64 a2, u64 a3, u64
 
 /// FUN_0247e510(device context): the scratch barrier unit as a function (see SweepSyncPackets): nothing to write.
 u64 PS4_SYSV_ABI SkipWaitComputeDone(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    if (ctx == 0 || !SweepEnabled()) {
+    if (ctx == 0) {
         return 0;
     }
     Live().barrier_calls_skipped.fetch_add(1, std::memory_order_relaxed);
@@ -8938,45 +8713,6 @@ void DrawSiteCensusRead(nlohmann::json& out) {
                         {"packet_path", r.packet_path}, {"kinds_bitmask", r.kinds}});
     }
     out["sites"] = std::move(list);
-}
-
-void SynthAuditRead(nlohmann::json& out) {
-    out["records"] = synth_audit_records.load();
-    out["records_whose_signature_was_seen_before"] = synth_audit_seen_before.load();
-    out["records_with_a_difference"] = synth_audit_violating_records.load();
-    out["no_table_slot"] = synth_audit_no_slot.load();
-    nlohmann::json comps = nlohmann::json::object();
-    static constexpr const char* names[SynthComponents] = {"group 0", "group 1", "group 2", "group 3", "group 4", "group 5", "group 6", "group 7", "flags", "reason", "color_extents", "depth_extent", "target_info", "shader_pointers"};
-    for (u32 c = 0; c < SynthComponents; ++c) {
-        comps[names[c]] = synth_audit_component_violations[c].load();
-    }
-    out["differences_by_component"] = comps;
-    std::vector<std::pair<u64, u32>> top;
-    for (u32 i = 0; i < synth_audit_reg_diffs.size(); ++i) {
-        if (const u64 n = synth_audit_reg_diffs[i].load()) {
-            top.emplace_back(n, i);
-        }
-    }
-    std::sort(top.rbegin(), top.rend());
-    nlohmann::json regs = nlohmann::json::object();
-    for (size_t i = 0; i < top.size() && i < 24; ++i) {
-        regs[fmt::format("{:#x}", top[i].second)] = {{"differing_draws", top[i].first}, {"last_value", fmt::format("{:#x}", synth_audit_reg_example[top[i].second].load())}};
-    }
-    out["registers_that_differ_within_a_signature"] = regs;
-    out["records_with_another_register_count"] = synth_audit_count_differs.load();
-    out["records_with_the_same_count_and_another_order"] = synth_audit_order_differs.load();
-    std::vector<std::pair<u64, u32>> presence;
-    for (u32 i = 0; i < synth_audit_reg_presence.size(); ++i) {
-        if (const u64 n = synth_audit_reg_presence[i].load()) {
-            presence.emplace_back(n, i);
-        }
-    }
-    std::sort(presence.rbegin(), presence.rend());
-    nlohmann::json pj = nlohmann::json::object();
-    for (size_t i = 0; i < presence.size() && i < 24; ++i) {
-        pj[fmt::format("{:#x}", presence[i].second)] = presence[i].first;
-    }
-    out["registers_present_in_only_one_of_two_records"] = pj;
 }
 
 void NativeListRead(nlohmann::json& out) {

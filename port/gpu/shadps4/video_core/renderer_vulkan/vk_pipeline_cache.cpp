@@ -171,44 +171,6 @@ static void ApplyShaderEnv(Shader::RuntimeInfo& info, const Core::NativeShaderEn
     }
 }
 
-/// The names of the environment fields in which two translator inputs of a stage differ (separated by spaces; empty when equal).
-static std::string DiffShaderEnvFields(const Shader::RuntimeInfo& a, const Shader::RuntimeInfo& b, HwStage stage) {
-    std::string diff;
-    const auto note = [&](bool equal, const char* name) {
-        if (!equal) {
-            diff += name;
-            diff += ' ';
-        }
-    };
-    note(a.props == b.props, "props");
-    if (stage == HwStage::Vertex) {
-        note(a.hw.vs.num_outputs == b.hw.vs.num_outputs, "vs.num_outputs");
-        note(a.hw.vs.outputs == b.hw.vs.outputs, "vs.outputs");
-        if (a.sw_stage == SwStage::Vertex) {
-            note(a.sw.vs.step_rate_0 == b.sw.vs.step_rate_0, "vs.step_rate_0");
-            note(a.sw.vs.step_rate_1 == b.sw.vs.step_rate_1, "vs.step_rate_1");
-        }
-        return diff;
-    }
-    const auto& x = a.hw.fs;
-    const auto& y = b.hw.fs;
-    note(x.en_flags == y.en_flags, "fs.en_flags");
-    note(x.addr_flags == y.addr_flags, "fs.addr_flags");
-    note(x.num_inputs == y.num_inputs, "fs.num_inputs");
-    note(x.front_face_all_bits == y.front_face_all_bits, "fs.front_face_all_bits");
-    note(x.depth_before_shader == y.depth_before_shader, "fs.depth_before_shader");
-    note(x.z_export_format == y.z_export_format, "fs.z_export_format");
-    note(x.mrtz_mask == y.mrtz_mask, "fs.mrtz_mask");
-    note(x.num_samples == y.num_samples, "fs.num_samples");
-    note(std::ranges::equal(x.inputs.begin(), x.inputs.begin() + std::min<u32>(x.num_inputs, 32), y.inputs.begin(), y.inputs.begin() + std::min<u32>(y.num_inputs, 32)), "fs.inputs");
-    bool export_equal = true;
-    for (u32 i = 0; i < Shader::MaxColorBuffers; ++i) {
-        export_equal &= x.color_buffers[i].export_format == y.color_buffers[i].export_format;
-    }
-    note(export_equal, "fs.color_export_format");
-    return diff;
-}
-
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
     auto& info = runtime_infos[u32(l_stage)];
     const auto& regs = *lookup_regs;
@@ -377,17 +339,12 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         break;
     }
     if ((stage == HwStage::Vertex || stage == HwStage::Fragment) && (l_stage == SwStage::Vertex || l_stage == SwStage::Fragment)) {
-        // E1c: the shader's own words also come from the shader objects of the draw. The two are compared; with `TLG_SHADER_ENV=1` the objects decide.
+        // E1c: the shader's own words come from the shader objects of the draw.
         Core::NativeShaderEnv::DrawEnv env;
         if (!Core::NativeShaderEnv::Current(env) || (stage == HwStage::Vertex ? !env.has_vertex : !env.has_pixel)) {
             Core::NativeShaderEnv::NoteUnavailable();
         } else {
-            Shader::RuntimeInfo derived = info;
-            ApplyShaderEnv(derived, env, stage, regs);
-            Core::NativeShaderEnv::NoteCompared(stage == HwStage::Vertex ? 0 : 1, DiffShaderEnvFields(info, derived, stage));
-            if (Core::NativeShaderEnv::Decides()) {
-                info = derived;
-            }
+            ApplyShaderEnv(info, env, stage, regs);
         }
     }
     return info;

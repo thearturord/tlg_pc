@@ -17,7 +17,6 @@
 #include "native/native_light_recorder.h"
 #include "native/native_untracked_ring.h"
 #include "native/native_target_desc.h"
-#include "native/native_audit.h"
 #include "native/native_readbacks.h"
 #include "native/native_device.h"
 #include "native/native_resources.h"
@@ -334,25 +333,12 @@ void Rasterizer::EngineObjectDeleted(u64 id, VAddr address, u64 bytes, u32 what)
     }
 }
 
-std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u32 native_stale, u64 exec_key, u64 inputs_key,
+std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64 exec_key, u64 inputs_key,
                                                    std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data,
                                                    const Core::NativeDraw::ExecDraw& draw, u32 index_count, u32 draw_class) {
-    const auto strip = Core::NativeConfig::SdkStrip;
-    if ((strip & 1073741824) != 0) {
-        native_stale |= StaleClear;
-    }
-    if ((strip & 268435456) == 0) {
-        native_stale &= ~StaleSurface;
-    }
-    if ((strip & 536870912) == 0) {
-        native_stale &= ~StaleClip;
-    }
-    if ((strip & 1073741824) == 0) {
-        native_stale &= ~StaleClear;
-    }
     const auto cached = exec_inputs.find(inputs_key);
-    if (native_stale != 0 || cached == exec_inputs.end()) {
-        Core::NativeDraw::Live().plan_null[native_stale != 0 ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+    if (cached == exec_inputs.end()) {
+        Core::NativeDraw::Live().plan_null[1].fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
     std::unique_ptr<DrawPlan> plan;
@@ -457,70 +443,6 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecOperation(const Core::NativeDraw::
     ApplyExecRegisters(plan->inputs, draw, 0, draw.count);
     Core::NativeTargetDesc::ApplyEliminate(plan->inputs, draw.native_targets); // E7 (TLG_TARGET_DESC_USE)
     return plan;
-}
-
-std::string Rasterizer::DiffExecPlans(const DrawPlan& typed, const DrawPlan& reference, u16 vertex_mask, u16 pixel_mask, u32 draw_kind) {
-    std::string out;
-    if (typed.op_class != 0xff || reference.op_class != 0xff) {
-        if (typed.op_class != reference.op_class) {
-            out += fmt::format("op_class({} vs {}) ", typed.op_class, reference.op_class);
-        }
-        if (std::memcmp(&typed.inputs.color_buffers[0], &reference.inputs.color_buffers[0], sizeof(AmdGpu::ColorBuffer)) != 0) {
-            out += "color_buffer0 ";
-        }
-        return out;
-    }
-    if (typed.pipeline != reference.pipeline) {
-        out += "pipeline ";
-    }
-    // what the draw does not use may differ: colour targets the pixel shader does not write, the depth target when none is bound, the index buffer of a draw without one
-    DrawInputs used = typed.inputs;
-    const u32 mrt_mask = reference.pipeline ? reference.pipeline->GetGraphicsKey().mrt_mask : 0;
-    for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
-        if (((mrt_mask >> i) & 1) == 0 || reference.fixed.target_write_mask[i] == 0) {
-            used.color_buffers[i] = reference.inputs.color_buffers[i];
-        }
-    }
-    if (!reference.fixed.depth_target && !reference.fixed.stencil_target) {
-        used.depth_buffer = reference.inputs.depth_buffer;
-        used.depth_view = reference.inputs.depth_view;
-        used.depth_control = reference.inputs.depth_control;
-        used.depth_htile_data_base = reference.inputs.depth_htile_data_base;
-        used.depth_render_control = reference.inputs.depth_render_control;
-        used.depth_clear = reference.inputs.depth_clear;
-        used.stencil_clear = reference.inputs.stencil_clear;
-    }
-    if (draw_kind == 2) {
-        used.num_indices = reference.inputs.num_indices; // an indirect draw reads the count from its argument buffer
-    }
-    if (draw_kind == 1) {
-        used.index_base_address = reference.inputs.index_base_address;
-        used.index_buffer_type = reference.inputs.index_buffer_type;
-        used.max_index_size = reference.inputs.max_index_size;
-        used.index_offset = reference.inputs.index_offset;
-    }
-    out += DiffDrawInputs(used, reference.inputs);
-    out += DiffFixedState(typed.fixed, reference.fixed);
-    for (u32 s = 0; s < MaxShaderStages; ++s) {
-        const auto& a = typed.stages[s];
-        const auto& b = reference.stages[s];
-        if (a.info != b.info || a.pgm_base != b.pgm_base || (!a.flat_skipped && a.flat.size() != b.flat.size()) || a.user_data_count != b.user_data_count) {
-            out += fmt::format("stage{} ", s);
-            continue;
-        }
-        const u16 mask = s == static_cast<u32>(Shader::SwStage::Fragment) ? pixel_mask : vertex_mask;
-        bool differs = false;
-        for (u32 i = 0; i < a.user_data_count; ++i) {
-            differs |= ((mask >> i) & 1) != 0 && a.user_data[i] != b.user_data[i];
-        }
-        for (size_t i = 0; i < a.flat.size(); ++i) { // a skipped stage has none: its descriptors are the record's
-            differs |= (i >= 16 || ((mask >> i) & 1) != 0) && a.flat[i] != b.flat[i];
-        }
-        if (differs) {
-            out += fmt::format("stage{}_data ", s);
-        }
-    }
-    return out;
 }
 
 u64 Rasterizer::PlanDigest(const DrawPlan& plan) {

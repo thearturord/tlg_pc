@@ -36,7 +36,6 @@
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
 #include "native/native_entry_dump.h"
-#include "native/native_audit.h"
 #include "video_core/renderdoc.h"
 #include "native/native_readbacks.h"
 #include "native/native_raycast_cpu.h"
@@ -196,25 +195,16 @@ nlohmann::json Native(const Params&) {
         j["overlay_changed_top"] = list;
     }
     j["map_native"] = {{"tried", live.map_tried.load()}, {"patched", live.map_patched.load()}, {"refused", live.map_refused.load()}, {"executed", live.map_exec.load()}};
-    {
-        nlohmann::json by_group = nlohmann::json::array();
-        for (const auto& violations : live.group_sig_violations_by_group) {
-            by_group.push_back(violations.load());
-        }
-        j["group_sig"] = {{"skipped", live.group_sig_skipped.load()}, {"applied", live.group_sig_applied.load()}, {"audited", live.group_sig_audited.load()},
-                          {"violations", live.group_sig_violations.load()}, {"violations_by_group", by_group}};
-    }
     j["stage_key"] = {{"hits", live.stage_key_hits.load()}, {"misses", live.stage_key_misses.load()}, {"uncached", live.stage_key_uncached.load()},
                       {"audits", live.stage_key_audits.load()}, {"violations", live.stage_key_violations.load()}};
     j["draw_args"] = {{"draws_with_typed_arguments", live.draw_args_typed.load()}};
-    j["exec_inputs"] = {{"typed", live.exec_typed.load()}, {"fallback", live.exec_fallback.load()}, {"audits", live.exec_audits.load()}, {"violations", live.exec_violations.load()},
+    j["exec_inputs"] = {{"typed", live.exec_typed.load()}, {"fallback", live.exec_fallback.load()}, 
                         {"fast_clear", live.exec_fast_clear.load()}, {"inline", live.exec_inline.load()}, {"inline_seen", live.exec_inline_seen.load()},
                         {"reasons", {live.exec_reason[0].load(), live.exec_reason[1].load(), live.exec_reason[2].load(), live.exec_reason[3].load(),
                                      live.exec_reason[4].load(), live.exec_reason[5].load(), live.exec_reason[6].load(), live.exec_reason[7].load()}},
                         {"fixed_null_by_exit", [&live] { nlohmann::json a = nlohmann::json::array(); for (const auto& c : live.fixed_null) { a.push_back(c.load()); } return a; }()},
                         {"plan_null_stale_inputs_pipeline", {live.plan_null[0].load(), live.plan_null[1].load(), live.plan_null[2].load()}}};
-    j["exec_state"] = {{"planned", live.state_planned.load()}, {"audits", live.state_audits.load()}, {"violations", live.state_violations.load()},
-                       {"group_violations", live.state_group_violations.load()}};
+    j["exec_state"] = {{"planned", live.state_planned.load()}, {"group_violations", live.state_group_violations.load()}};
     j["fetch_rebuild"] = {{"tried", live.fetch_rebuild_tried.load()}, {"rebuilt", live.fetch_rebuilt.load()}, {"refused", live.fetch_rebuild_refused.load()}, {"executed", live.fetch_rebuild_exec.load()}};
     j["sync_converted_hook"] = live.sync_converted_hook.load();
     j["sync_converted_sweep"] = live.sync_converted_sweep.load();
@@ -233,8 +223,6 @@ nlohmann::json Native(const Params&) {
     j["direct_executed"] = live.direct_executed.load();
     j["direct_executed_asc"] = live.direct_executed_asc.load();
     j["fixed_native"] = live.fixed_native.load();
-    j["fixed_checked"] = live.fixed_checked.load();
-    j["fixed_diff"] = live.fixed_diff.load();
     j["track_native"] = live.track_native.load();
     j["track_fce"] = live.track_fce.load();
     j["track_game"] = live.track_game_second.load() + live.track_game_depth.load();
@@ -581,8 +569,6 @@ void RegisterBuiltins() {
                  }
                  return nlohmann::json{{"remaining", VideoCore::FrameSequenceRemaining()}};
              });
-    Register("/audit", "tracker audit: how often the buffer cache called a page clean that the CPU had changed (native_sdk_strip bit 67108864)",
-             [](const Params&) { return Core::NativeAudit::Report(); });
     Register("/readbacks", "explicit readbacks, step 1: destinations of the engine's copy / counter read-back records, AsyncMap ranges, CPU read faults",
              [](const Params&) { return Core::NativeReadbacks::Report(); });
     Register("/raycast", "CPU port of the ray against triangle shader (0xe15f3156), shadow compare against the GPU result (TLG_RAYCAST_SHADOW=1)",

@@ -217,9 +217,7 @@ bool ExecuteEnabled() {
 }
 
 bool Enabled() {
-    const auto& policy = VideoCore::ReadbackPolicy::Get();
-    const u32 bits = Core::NativeConfig::SdkStrip;
-    return (bits & 2097152) != 0 && (bits & 4194304) != 0;
+    return true;
 }
 
 std::shared_ptr<Buffer> Build(u32 queue, const u32* dcb, u32 dwords, bool has_constant_buffer, bool markers) {

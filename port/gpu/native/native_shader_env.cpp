@@ -23,10 +23,7 @@ thread_local u64 g_pixel_gnm = 0;
 thread_local u64 g_fetch_object = 0;
 thread_local bool g_active = false;
 
-std::atomic<u64> g_compared[2]{}, g_differing[2]{}, g_unavailable{};
-std::mutex g_mutex;
-std::array<std::atomic<u64>, 24> g_field_counts{};
-std::array<std::string, 24> g_field_names;
+std::atomic<u64> g_unavailable{};
 std::atomic<u32> g_samples{};
 
 template <typename T>
@@ -158,61 +155,13 @@ bool Current(DrawEnv& out) {
     return true;
 }
 
-void NoteCompared(u32 stage, const std::string& differing) {
-    stage &= 1;
-    g_compared[stage].fetch_add(1, std::memory_order_relaxed);
-    if (differing.empty()) {
-        return;
-    }
-    g_differing[stage].fetch_add(1, std::memory_order_relaxed);
-    {
-        std::scoped_lock lock{g_mutex};
-        // count by field name (the names are separated by spaces)
-        size_t at = 0;
-        while (at < differing.size()) {
-            const size_t end = differing.find(' ', at);
-            const std::string name = differing.substr(at, end == std::string::npos ? std::string::npos : end - at);
-            at = end == std::string::npos ? differing.size() : end + 1;
-            if (name.empty()) {
-                continue;
-            }
-            for (size_t i = 0; i < g_field_names.size(); ++i) {
-                if (g_field_names[i] == name || g_field_names[i].empty()) {
-                    g_field_names[i] = name;
-                    g_field_counts[i].fetch_add(1, std::memory_order_relaxed);
-                    break;
-                }
-            }
-        }
-    }
-    if (g_samples.fetch_add(1, std::memory_order_relaxed) < 8) {
-        Core::RareEvents::Note("shader_env_differs_from_registers", fmt::format("{} stage: {}", stage == 0 ? "vertex" : "pixel", differing));
-    }
-}
-
-bool Decides() noexcept {
-    return true; // played by the owner 2026-10-31, no switch any more
-}
-
 void NoteUnavailable() {
     g_unavailable.fetch_add(1, std::memory_order_relaxed);
 }
 
 nlohmann::json Report() {
     nlohmann::json j;
-    j["shader_env_decides"] = Decides();
-    j["vertex_compared"] = g_compared[0].load();
-    j["vertex_differing"] = g_differing[0].load();
-    j["pixel_compared"] = g_compared[1].load();
-    j["pixel_differing"] = g_differing[1].load();
     j["runtime_info_built_without_a_native_draw"] = g_unavailable.load();
-    std::scoped_lock lock{g_mutex};
-    auto& fields = j["differing_fields"] = nlohmann::json::object();
-    for (size_t i = 0; i < g_field_names.size(); ++i) {
-        if (!g_field_names[i].empty()) {
-            fields[g_field_names[i]] = g_field_counts[i].load();
-        }
-    }
     return j;
 }
 

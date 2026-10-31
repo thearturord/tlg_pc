@@ -17,7 +17,6 @@
 #include "native/native_target_desc.h"
 #include "native/native_light_recorder.h"
 #include "native/native_untracked_ring.h"
-#include "native/native_audit.h"
 #include "native/native_readbacks.h"
 #include "native/native_device.h"
 #include "native/native_image_desc.h"
@@ -392,27 +391,22 @@ bool Rasterizer::FilterDraw(const DrawPlan* plan) {
 
 std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
                                                DrawIndirectParams params,
-                                               const FixedState* native, u32 native_stale,
-                                               bool verify, u64 exec_key, u64 inputs_key) {
+                                               const FixedState* native, u64 exec_key, u64 inputs_key) {
     // SkipShadow draws are still planned: the switch can change between the front and the raster
     // thread, and the raster thread must find a plan for every draw it does not drop.
     // An executed draw is a normal draw by construction (only the shadow skip switch looks at it, when the draw is
-    // recorded); the first draws and every 256th are classified from the registers as well.
-    bool executed = native && !verify;
+    // recorded).
+    bool executed = native != nullptr;
     DrawClassification operation{};
     bool is_operation = false;
     if (!executed) {
         const auto classified = ClassifyDraw(regs);
         const auto kind = classified.kind;
         if (kind != DrawClass::Normal && kind != DrawClass::SkipShadow) {
-            if (native) {
-                LOG_INFO(Render_Vulkan, "executed draw is classified {} by the registers", static_cast<u32>(kind));
-            }
             // one of the game's own transition operations: the plan carries what the raster thread needs to perform it
             is_operation = true;
             operation = classified;
         }
-        executed = native && kind == DrawClass::Normal;
     }
     std::unique_ptr<DrawPlan> plan;
     {
@@ -439,60 +433,11 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
         plan->inputs = MakeDrawInputs(regs);
         return plan;
     }
+    // The fixed-function state built from the engine's objects; a draw without one (a fast clear eliminate whose operation could not be planned)
+    // takes it from the register mirror.
     if (native) {
-        // The state built from the engine's objects replaces the one built from the registers. The first draws (and
-        // then every 256th, `verify`) are compared with the registers' state; a difference is counted and the registers win.
-        auto& live = Core::NativeDraw::Live();
-        live.fixed_native.fetch_add(1, std::memory_order_relaxed);
-        if (false) {
-            native_stale |= StaleClear;
-        }
-        // No group of the fixed-function state comes from the register mirror any more. The surface group (culling, front face, polygon
-        // mode) comes from the engine's rasterizer state object, also where the engine did not write the register for this draw: the mirror's
-        // value differed from the object's in nearly every such draw and changed with the frame (a period of three), which flickered tattoos,
-        // leaves and whole meshes (native-isolation.md). The clip group and the clear flags never differed from the objects' values in 27 million
-        // draws. Bits of native_sdk_strip restore the old behaviour for a comparison: 268435456 surface, 536870912 clip, 1073741824 clear flags.
-        const u32 strip = Core::NativeConfig::SdkStrip;
-        const bool surface_from_mirror = (strip & 268435456) != 0;
-        if (!surface_from_mirror) {
-            native_stale &= ~StaleSurface;
-        }
-        if ((strip & 536870912) == 0) {
-            native_stale &= ~StaleClip;
-        }
-        if ((strip & 1073741824) == 0) {
-            native_stale &= ~StaleClear;
-        }
-        FixedState merged = *native;
-        TakeFromRegisters(merged, regs, native_stale);
-        if (Core::NativeAudit::StaleEnabled()) {
-            const std::string stale_diff = DiffFixedState(*native, merged);
-            Core::NativeAudit::NoteStale(native_stale, !stale_diff.empty(), stale_diff, Core::NativeAudit::PlanCaller(),
-                                         Core::DebugServer::PresentCount());
-        }
-        const FixedState* use = &merged;
-        if (verify) {
-            plan->fixed = MakeFixedState(regs);
-            if (!surface_from_mirror) {
-                // the mirror's surface group is not the reference any more (see above): compare everything else
-                plan->fixed.cull_mode = merged.cull_mode;
-                plan->fixed.front_face = merged.front_face;
-                plan->fixed.polygon_mode = merged.polygon_mode;
-                plan->fixed.provoking_first = merged.provoking_first;
-            }
-            live.fixed_checked.fetch_add(1, std::memory_order_relaxed);
-            const std::string diff = DiffFixedState(*use, plan->fixed);
-            if (!diff.empty() && live.fixed_diff.load(std::memory_order_relaxed) < 8) {
-                // E1: the first differences go to the rare events file with the draw's caller (the engine call that made the draw)
-                Core::RareEvents::Note("fixed_state_differs_from_registers", fmt::format("fields: {}; caller {:#x}; draw {}", diff, Core::NativeAudit::PlanCaller(), live.fixed_checked.load(std::memory_order_relaxed)));
-            }
-            if (!diff.empty() && live.fixed_diff.fetch_add(1, std::memory_order_relaxed) < 60) {
-                LOG_INFO(Render_Vulkan, "native fixed-function state differs from the registers in: {} (caller {:#x}, draw number {}, objects depth_clip {}, registers {} clipper {:#x})", diff, Core::NativeAudit::PlanCaller(),
-                         live.fixed_checked.load(std::memory_order_relaxed), use->depth_clip, plan->fixed.depth_clip, std::bit_cast<u32>(regs.clipper_control));
-            }
-        } else {
-            plan->fixed = merged;
-        }
+        Core::NativeDraw::Live().fixed_native.fetch_add(1, std::memory_order_relaxed);
+        plan->fixed = *native;
     } else {
         plan->fixed = MakeFixedState(regs);
     }

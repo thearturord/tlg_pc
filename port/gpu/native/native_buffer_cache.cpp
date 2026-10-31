@@ -13,7 +13,6 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
-#include "native/native_audit.h"
 #include "native/native_device.h"
 #include "native/native_readbacks.h"
 #include "native/native_registry.h"

@@ -13,7 +13,6 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
-#include "native/native_audit.h"
 #include "native/native_config.h"
 #include "native/native_device.h"
 #include "native/native_readbacks.h"
@@ -503,11 +502,6 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
         std::unique_lock lock{gpu_ranges_mutex};
         gpu_modified_ranges.Add(device_addr, size);
         Core::NativeResources::NoteGpuWritten(device_addr, size); // R1b: copies of engine buffers with these bytes are stale
-        if (Core::NativeAudit::Enabled()) {
-            Core::NativeAudit::NoteGpuWrite(device_addr, size);
-        }
-    } else if (Core::NativeAudit::Enabled() && !is_texel_buffer && !IsRegionGpuModified(device_addr, size)) {
-        Core::NativeAudit::CheckClean(device_addr, size);
     }
     const u64 offset = arena->Offset(device_addr);
     if (memo) {
@@ -1020,11 +1014,6 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             copy.dstOffset -= arena->cpu_addr;
         }
         staging.Flush();
-        if (Core::NativeAudit::Enabled()) {
-            for (const auto& copy : copies) {
-                Core::NativeAudit::NoteUpload(copy.dstOffset + arena->cpu_addr, staging.mapped + (copy.srcOffset - staging.offset), copy.size);
-            }
-        }
         runtime.CopyBuffer(staging.buffer, arena, copies);
     }
     if (is_texel_buffer && !is_written) {
