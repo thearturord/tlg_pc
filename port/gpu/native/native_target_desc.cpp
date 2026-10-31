@@ -4,19 +4,24 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <compare>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "native/native_debug_server.h"
 #include "native/native_device.h"
 #include "native/native_image_desc.h"
@@ -38,6 +43,8 @@ constexpr u64 CtxRenderTargets = 0x4488;
 constexpr u64 CtxDepthStencilView = 0x44d0;
 constexpr u64 CtxRenderTarget7 = 0x130e0;
 constexpr u32 NumSlots = 9; // eight render targets and the depth target
+
+void StartCounterWriter(); ///< the cumulative counters of the whole session go to user/log/target_desc_counters.json (defined below)
 
 template <typename T>
 T Rd(u64 base, u64 offset) {
@@ -782,6 +789,7 @@ void Observe(u64 ctx) {
     if (!Enabled()) {
         return;
     }
+    StartCounterWriter();
     static thread_local std::array<SlotCache, NumSlots> cache{};
     const u32 count = Rd<u32>(ctx, CtxRenderTargetCount);
     for (u32 slot = 0; slot < NumSlots; ++slot) {
@@ -822,13 +830,15 @@ void Observe(u64 ctx) {
 
 namespace {
 
-/// The bits of one dword the engine's objects decide: `mask` says which bits, `value` what they hold; `prebuilt` / `call` mark the bits whose source is the resource's prebuilt block
-/// (resource +0xb0 colour, +0xf0 depth) or the colour of the engine's clear call (resource +0x150 / +0x154)
+/// The bits of one dword the engine's objects decide: `mask` says which bits, `value` what they hold; `prebuilt` / `view_block` mark the bits whose source is the resource's prebuilt
+/// block (resource +0xb0 colour, +0xf0 depth) or the render target view's own block (view +0x54). `shadow` bits have a value that is only compared with the register decode and counted,
+/// never applied (the registers keep those bits).
 struct WordOverride {
     u32 value{0};
     u32 mask{0};
     u32 prebuilt{0};
-    u32 call{0};
+    u32 view_block{0};
+    u32 shadow{0};
 };
 
 void SetBits(WordOverride& w, u32 mask, u32 value) {
@@ -841,9 +851,14 @@ void SetPrebuilt(WordOverride& w, u32 mask, u32 value) {
     w.prebuilt |= mask;
 }
 
-void SetCall(WordOverride& w, u32 mask, u32 value) {
+void SetViewBlock(WordOverride& w, u32 mask, u32 value) {
     SetBits(w, mask, value);
-    w.call |= mask;
+    w.view_block |= mask;
+}
+
+void SetShadow(WordOverride& w, u32 mask, u32 value) {
+    w.value = (w.value & ~mask) | (value & mask);
+    w.shadow |= mask;
 }
 
 constexpr u32 ColourWords = 15;
@@ -851,11 +866,25 @@ constexpr u32 DepthWords = 12; ///< 0-7 DepthBuffer, 8 DepthView, 9 DB_HTILE_DAT
 
 } // namespace
 
+/// What the resource said about its clear colour when the description was made (for the table of differing clear cases; the serial and the mip are not part of the set's identity)
+struct ClearFacts {
+    bool valid{false};
+    u32 state{0};      ///< resource +0x14c
+    u32 serial{0};     ///< resource +0x160 (the clear call's serial, as far as I know)
+    u32 call0{0}, call1{0};       ///< resource +0x150 / +0x154: the packed colour of the engine's clear call
+    u32 prebuilt0{0}, prebuilt1{0}; ///< resource +0xdc / +0xe0
+    u32 view0{0}, view1{0};        ///< the view's block words 11 and 12 (view +0x80 / +0x84)
+    u32 dxgi{0};
+    u32 mip{0};
+};
+
 struct TargetSet {
     std::array<bool, 8> colour_valid{};
     std::array<std::array<WordOverride, ColourWords>, 8> colour{};
+    std::array<ClearFacts, 8> colour_clear{};
     bool depth_valid{false};
     std::array<WordOverride, DepthWords> depth{};
+    ClearFacts depth_clear_facts{}; ///< call0 / call1 hold resource +0x158 and +0x15c; view0 the htile word; dxgi, mip
 };
 
 namespace {
@@ -930,8 +959,8 @@ constexpr FieldDef DepthFields[] = {
     {"view_slice_max", 8, 0x7ff << 13, FieldClass::Decided},
     {"view_read_only_bits", 8, ~(0x7ffu | (0x7ffu << 13)), FieldClass::NotNeeded},
     {"htile_base", 9, Full, FieldClass::Decided},
-    {"depth_clear", 10, Full, FieldClass::Decided},
-    {"stencil_clear", 11, Full, FieldClass::Decided},
+    {"depth_clear", 10, Full, FieldClass::NotDecidable},
+    {"stencil_clear", 11, Full, FieldClass::NotDecidable},
 };
 constexpr u32 NumDepthFields = sizeof(DepthFields) / sizeof(DepthFields[0]);
 
@@ -943,7 +972,9 @@ struct FieldCounters {
     std::atomic<u64> register_only{0}; ///< the register decode was the only source
     std::atomic<u64> differs{0};       ///< the description's value is not the register decode's
     std::atomic<u64> prebuilt{0};      ///< ... of `used`, the source was the resource's prebuilt block
-    std::atomic<u64> call_colour{0};   ///< ... of `used`, the source was the clear call's colour
+    std::atomic<u64> view_block{0};    ///< ... of `used`, the source was the render target view's own block
+    std::atomic<u64> shadow_compared{0}; ///< compare-only: the description has a value, the registers keep the field
+    std::atomic<u64> shadow_differs{0};  ///< ... and it is not the register decode's
 };
 
 struct PathCounters {
@@ -968,7 +999,7 @@ u32 Log2Samples(u32 samples, bool& ok) {
 }
 
 /// A colour target's description, from the view (null: the whole resource, mip 0) and its resource
-bool BuildColour(u64 view, u64 resource, std::array<WordOverride, ColourWords>& w) {
+bool BuildColour(u64 view, u64 resource, std::array<WordOverride, ColourWords>& w, ClearFacts& facts) {
     const u64 resource_id = resource != 0 ? Rd<u64>(resource, 0x10) : 0;
     NativeDevice::Object res;
     if (resource_id == 0 || !NativeDevice::Lookup(resource_id, res)) {
@@ -1001,14 +1032,27 @@ bool BuildColour(u64 view, u64 resource, std::array<WordOverride, ColourWords>& 
         }
         SetPrebuilt(w[2], 0x3fffff, Rd<u32>(resource, 0xb0 + 2 * 4)); // the tile aligned slice size: the engine's prebuilt value
         SetBits(w[7], Full, static_cast<u32>(cmask >> 8));
-        if (Rd<u32>(resource, 0x14c) != 0) {
-            SetCall(w[11], Full, Rd<u32>(resource, 0x150)); // the colour the engine's clear call packed
-            SetCall(w[12], Full, Rd<u32>(resource, 0x154));
-        } else {
-            SetPrebuilt(w[11], Full, Rd<u32>(resource, 0xdc));
-            SetPrebuilt(w[12], Full, Rd<u32>(resource, 0xe0));
-        }
     }
+    // The clear words: the registers hold the words of the block the engine keeps (the view's block for a view: view +0x80 / +0x84; the resource's prebuilt block for the eliminate, which has no
+    // view); the colour packed by the engine's clear call (resource +0x150 / +0x154) is NOT the source: it differs from them in some clears and the registers are the right ones (B11)
+    if (view != 0) {
+        SetViewBlock(w[11], Full, Rd<u32>(view + 0x54, 11 * 4));
+        SetViewBlock(w[12], Full, Rd<u32>(view + 0x54, 12 * 4));
+    } else {
+        SetPrebuilt(w[11], Full, Rd<u32>(resource, 0xdc));
+        SetPrebuilt(w[12], Full, Rd<u32>(resource, 0xe0));
+    }
+    facts.valid = true;
+    facts.state = Rd<u32>(resource, 0x14c);
+    facts.serial = Rd<u32>(resource, 0x160);
+    facts.call0 = Rd<u32>(resource, 0x150);
+    facts.call1 = Rd<u32>(resource, 0x154);
+    facts.prebuilt0 = Rd<u32>(resource, 0xdc);
+    facts.prebuilt1 = Rd<u32>(resource, 0xe0);
+    facts.view0 = view != 0 ? Rd<u32>(view + 0x54, 11 * 4) : facts.prebuilt0;
+    facts.view1 = view != 0 ? Rd<u32>(view + 0x54, 12 * 4) : facts.prebuilt1;
+    facts.dxgi = view != 0 ? Rd<u32>(view, 0x40) : res.format;
+    facts.mip = range.mip;
     if (range.known && range.first <= 0x7ff && range.first + std::max<u32>(range.count, 1) - 1 <= 0x7ff) {
         SetBits(w[3], 0x7ff, range.first);
         SetBits(w[3], 0x7ff << 13, (range.first + std::max<u32>(range.count, 1) - 1) << 13);
@@ -1059,7 +1103,7 @@ bool BuildColour(u64 view, u64 resource, std::array<WordOverride, ColourWords>& 
 }
 
 /// A depth target's description, from the view (null: the whole resource, mip 0) and its resource
-bool BuildDepth(u64 view, u64 resource, std::array<WordOverride, DepthWords>& w) {
+bool BuildDepth(u64 view, u64 resource, std::array<WordOverride, DepthWords>& w, ClearFacts& facts) {
     const u64 resource_id = resource != 0 ? Rd<u64>(resource, 0x10) : 0;
     NativeDevice::Object res;
     if (resource_id == 0 || !NativeDevice::Lookup(resource_id, res)) {
@@ -1129,9 +1173,19 @@ bool BuildDepth(u64 view, u64 resource, std::array<WordOverride, DepthWords>& w)
         g_view_unknown_range.fetch_add(1, std::memory_order_relaxed);
     }
     SetBits(w[9], Full, static_cast<u32>(htile >> 8));
+    // the clear values: the registers hold what the clear's setup wrote (the depth clear record: the prelude packets) or Synthesize's copy of the resource's values at the draw; the resource's
+    // +0x158 / +0x15c can differ (a few cases per long play), so they are compared and counted but the registers keep the field
+    facts.valid = true;
+    facts.state = Rd<u32>(resource, 0x14c);
+    facts.serial = Rd<u32>(resource, 0x160);
+    facts.call0 = Rd<u32>(resource, 0x158);
+    facts.call1 = static_cast<u32>(Rd<u8>(resource, 0x15c));
+    facts.view0 = static_cast<u32>(htile >> 8);
+    facts.dxgi = view != 0 ? Rd<u32>(view, 0x40) : res.format;
+    facts.mip = range.mip;
     if (htile != 0) {
-        SetBits(w[10], Full, Rd<u32>(resource, 0x158));
-        SetBits(w[11], Full, static_cast<u32>(Rd<u8>(resource, 0x15c)));
+        SetShadow(w[10], Full, facts.call0);
+        SetShadow(w[11], Full, facts.call1);
     }
     return true;
 }
@@ -1142,7 +1196,18 @@ u64 HashSet(const TargetSet& set) {
         h.Add(w.value);
         h.Add(w.mask);
         h.Add(w.prebuilt);
-        h.Add(w.call);
+        h.Add(w.view_block);
+        h.Add(w.shadow);
+    };
+    const auto add_facts = [&](const ClearFacts& f) {
+        h.Add(f.state);
+        h.Add(f.call0);
+        h.Add(f.call1);
+        h.Add(f.prebuilt0);
+        h.Add(f.prebuilt1);
+        h.Add(f.view0);
+        h.Add(f.view1);
+        h.Add(f.dxgi);
     };
     for (u32 i = 0; i < 8; ++i) {
         h.Add(set.colour_valid[i] ? 1 : 0);
@@ -1150,6 +1215,7 @@ u64 HashSet(const TargetSet& set) {
             for (const auto& w : set.colour[i]) {
                 add(w);
             }
+            add_facts(set.colour_clear[i]);
         }
     }
     h.Add(set.depth_valid ? 1 : 0);
@@ -1157,6 +1223,7 @@ u64 HashSet(const TargetSet& set) {
         for (const auto& w : set.depth) {
             add(w);
         }
+        add_facts(set.depth_clear_facts);
     }
     return h.h | 1;
 }
@@ -1180,7 +1247,59 @@ const TargetSet* Intern(const TargetSet& set) {
     return g_sets.emplace(hash, std::make_unique<TargetSet>(set)).first->second.get();
 }
 
-/// One dword group: the register decode `reg` (read and, when not verifying, written back) merged with the description `over`; counted per field of `fields`
+/// The differing clear cases (at most 64 distinct tuples each, with counts): who, what the resource said, what the registers hold, what the description holds
+using WideKey = std::array<u32, 16>;
+struct WideTable {
+    std::map<WideKey, Counter> cases;
+    std::atomic<u64> overflow{0};
+    std::atomic<u64> total{0};
+};
+WideTable g_clear_desc_cases;  ///< the description's clear value is not the register decode's (colour clear words, applied)
+WideTable g_clear_call_cases;  ///< the clear call's packed colour (resource +0x150/+0x154) is not the register decode's (diagnostic: why it is not a source)
+WideTable g_depth_clear_cases; ///< the resource's depth / stencil clear values (compare-only) are not the register decode's
+
+void NoteWide(WideTable& table, const WideKey& key) {
+    table.total.fetch_add(1, std::memory_order_relaxed);
+    std::scoped_lock lock{g_mutex};
+    auto it = table.cases.find(key);
+    if (it == table.cases.end()) {
+        if (table.cases.size() >= 64) {
+            table.overflow.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        it = table.cases.try_emplace(key).first;
+    }
+    it->second.n.fetch_add(1, std::memory_order_relaxed);
+}
+
+/// Slots: path, kind (0 colour clear words, 1 depth / stencil clear values), resource +0x14c, serial (+0x160), resource +0x150 (depth: +0x158), +0x154 (depth: +0x15c), prebuilt +0xdc, +0xe0,
+/// register word 11 (depth: depth clear bits), word 12 (stencil clear), description word 11, word 12, DXGI format of the view, mip, the view's block word 11, 12 (depth: the htile word, 0)
+WideKey ClearKey(Path path, u32 kind, const ClearFacts& f, u32 reg0, u32 reg1, u32 desc0, u32 desc1) {
+    return {static_cast<u32>(path), kind, f.state, f.serial, f.call0, f.call1, f.prebuilt0, f.prebuilt1, reg0, reg1, desc0, desc1, f.dxgi, f.mip, f.view0, f.view1};
+}
+
+nlohmann::json WideReport(WideTable& table) {
+    std::vector<std::pair<WideKey, u64>> rows;
+    {
+        std::scoped_lock lock{g_mutex};
+        for (const auto& [key, counter] : table.cases) {
+            rows.emplace_back(key, counter.n.load());
+        }
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    nlohmann::json list = nlohmann::json::array();
+    for (const auto& [k, n] : rows) {
+        const auto hex = [](u32 v) { return fmt::format("{:#x}", v); };
+        list.push_back({{"path", PathNames[k[0]]}, {"kind", k[1] == 0 ? "colour_clear_words" : "depth_stencil_clear_values"}, {"resource_14c", k[2]}, {"serial_160", hex(k[3])},
+                        {"resource_150_or_158", hex(k[4])}, {"resource_154_or_15c", hex(k[5])}, {"prebuilt_dc", hex(k[6])}, {"prebuilt_e0", hex(k[7])}, {"register_word0", hex(k[8])},
+                        {"register_word1", hex(k[9])}, {"description_word0", hex(k[10])}, {"description_word1", hex(k[11])}, {"dxgi_view", k[12]}, {"mip", k[13]},
+                        {"view_block_word11_or_htile", hex(k[14])}, {"view_block_word12", hex(k[15])}, {"count", n}});
+    }
+    return {{"total_cases", table.total.load()}, {"overflow_beyond_64_tuples", table.overflow.load()}, {"tuples", std::move(list)}};
+}
+
+/// One dword group: the register decode `reg` (read and, when not verifying, written back) merged with the description `over`; counted per field of `fields`. Bits in `over[i].shadow` have
+/// a description value that is only compared (the registers keep them).
 template <size_t N>
 bool Merge(u32* reg, const std::array<WordOverride, N>& over, const FieldDef* fields, u32 field_count, FieldCounters* counters, bool verify, const u32* linear_general_word) {
     bool differs = false;
@@ -1194,17 +1313,24 @@ bool Merge(u32* reg, const std::array<WordOverride, N>& over, const FieldDef* fi
     }
     for (u32 f = 0; f < field_count; ++f) {
         const FieldDef& def = fields[f];
-        const u32 covered = over[def.word].mask;
+        const WordOverride& o = over[def.word];
+        const u32 covered = o.mask;
         if ((def.mask & ~covered) != 0 || (def.word == 3 && linear_general_word != nullptr && (*linear_general_word & 0x80) != 0 && (def.mask & 0x7ff) != 0)) {
             counters[f].register_only.fetch_add(1, std::memory_order_relaxed);
+            if (o.shadow != 0 && (def.mask & ~o.shadow) == 0) {
+                counters[f].shadow_compared.fetch_add(1, std::memory_order_relaxed);
+                if (((reg[def.word] ^ o.value) & def.mask) != 0) {
+                    counters[f].shadow_differs.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             continue;
         }
         counters[f].used.fetch_add(1, std::memory_order_relaxed);
-        if ((over[def.word].prebuilt & def.mask) != 0) {
+        if ((o.prebuilt & def.mask) != 0) {
             counters[f].prebuilt.fetch_add(1, std::memory_order_relaxed);
         }
-        if ((over[def.word].call & def.mask) != 0) {
-            counters[f].call_colour.fetch_add(1, std::memory_order_relaxed);
+        if ((o.view_block & def.mask) != 0) {
+            counters[f].view_block.fetch_add(1, std::memory_order_relaxed);
         }
         if (((reg[def.word] ^ merged[def.word]) & def.mask) != 0) {
             counters[f].differs.fetch_add(1, std::memory_order_relaxed);
@@ -1240,9 +1366,24 @@ void ApplyColour(Vulkan::DrawInputs& inputs, const TargetSet& set, Path path, u3
         u32 words[ColourWords];
         std::memcpy(words, &cb, sizeof(words));
         const u32 info = words[4];
+        const u32 reg0 = words[11], reg1 = words[12];
         pc.applied_colour.fetch_add(1, std::memory_order_relaxed);
         if (Merge<ColourWords>(words, set.colour[slot], ColourFields, NumColourFields, pc.colour.data(), verify, &info)) {
             pc.targets_differing.fetch_add(1, std::memory_order_relaxed);
+        }
+        // the table of differing clear cases (the description's words, and the clear call's colour, against the registers')
+        const WordOverride& o11 = set.colour[slot][11];
+        const WordOverride& o12 = set.colour[slot][12];
+        const u32 desc0 = (reg0 & ~o11.mask) | (o11.value & o11.mask);
+        const u32 desc1 = (reg1 & ~o12.mask) | (o12.value & o12.mask);
+        const ClearFacts& facts = set.colour_clear[slot];
+        if (facts.valid) {
+            if (desc0 != reg0 || desc1 != reg1) {
+                NoteWide(g_clear_desc_cases, ClearKey(path, 0, facts, reg0, reg1, desc0, desc1));
+            }
+            if (facts.state != 0 && (facts.call0 != reg0 || facts.call1 != reg1)) {
+                NoteWide(g_clear_call_cases, ClearKey(path, 0, facts, reg0, reg1, facts.call0, facts.call1));
+            }
         }
         if (!verify) {
             std::memcpy(&cb, words, sizeof(words));
@@ -1270,9 +1411,16 @@ void ApplyDepth(Vulkan::DrawInputs& inputs, const TargetSet& set, Path path) {
     std::memcpy(&words[9], &inputs.depth_htile_data_base, sizeof(u32));
     std::memcpy(&words[10], &inputs.depth_clear, sizeof(u32));
     words[11] = inputs.stencil_clear;
+    const u32 reg0 = words[10], reg1 = words[11];
     pc.applied_depth.fetch_add(1, std::memory_order_relaxed);
     if (Merge<DepthWords>(words, set.depth, DepthFields, NumDepthFields, pc.depth.data(), verify, nullptr)) {
         pc.targets_differing.fetch_add(1, std::memory_order_relaxed);
+    }
+    // the compare-only clear values: the resource's against the register decode's
+    const WordOverride& d0 = set.depth[10];
+    const WordOverride& d1 = set.depth[11];
+    if (d0.shadow != 0 && d1.shadow != 0 && (d0.value != reg0 || d1.value != reg1)) {
+        NoteWide(g_depth_clear_cases, ClearKey(path, 1, set.depth_clear_facts, reg0, reg1, d0.value, d1.value));
     }
     if (!verify) {
         std::memcpy(&inputs.depth_buffer, words, 8 * sizeof(u32));
@@ -1317,6 +1465,7 @@ const TargetSet* PrepareDraw(u64 ctx) {
     if (!UseOn()) {
         return nullptr;
     }
+    StartCounterWriter();
     static thread_local u64 last_signature = 0;
     static thread_local const TargetSet* last_set = nullptr;
     const u32 count = Rd<u32>(ctx, CtxRenderTargetCount);
@@ -1346,13 +1495,13 @@ const TargetSet* PrepareDraw(u64 ctx) {
     for (u32 slot = 0; slot < 8; ++slot) {
         if (views[slot] != 0) {
             const u64 resource = Rd<u64>(views[slot], 0x30);
-            set.colour_valid[slot] = resource != 0 && Rd<u32>(views[slot] + 0x54, 0) != 0 && BuildColour(views[slot], resource, set.colour[slot]);
+            set.colour_valid[slot] = resource != 0 && Rd<u32>(views[slot] + 0x54, 0) != 0 && BuildColour(views[slot], resource, set.colour[slot], set.colour_clear[slot]);
         }
     }
     if (views[8] != 0) {
         const u64 block = views[8] + 0x58;
         const u64 resource = Rd<u64>(views[8], 0x30);
-        set.depth_valid = resource != 0 && (Rd<u32>(block, 8 * 4) != 0 || Rd<u32>(block, 12 * 4) != 0) && BuildDepth(views[8], resource, set.depth);
+        set.depth_valid = resource != 0 && (Rd<u32>(block, 8 * 4) != 0 || Rd<u32>(block, 12 * 4) != 0) && BuildDepth(views[8], resource, set.depth, set.depth_clear_facts);
     }
     last_set = Intern(set);
     last_signature = key;
@@ -1363,8 +1512,9 @@ const TargetSet* PrepareEliminate(u64 resource) {
     if (!UseOn()) {
         return nullptr;
     }
+    StartCounterWriter();
     TargetSet set{};
-    set.colour_valid[0] = BuildColour(0, resource, set.colour[0]);
+    set.colour_valid[0] = BuildColour(0, resource, set.colour[0], set.colour_clear[0]);
     if (!set.colour_valid[0]) {
         g_object_not_found[PathEliminate].fetch_add(1, std::memory_order_relaxed);
         return nullptr;
@@ -1376,9 +1526,10 @@ const TargetSet* PrepareDepthClear(u64 target) {
     if (!UseOn()) {
         return nullptr;
     }
+    StartCounterWriter();
     u64 view = 0, resource = 0;
     TargetSet set{};
-    if (!ResolveDepthTarget(target, view, resource) || resource == 0 || !BuildDepth(view, resource, set.depth)) {
+    if (!ResolveDepthTarget(target, view, resource) || resource == 0 || !BuildDepth(view, resource, set.depth, set.depth_clear_facts)) {
         g_object_not_found[PathDepthClear].fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
@@ -1441,6 +1592,9 @@ nlohmann::json UseReport() {
     j["targets_above_mip_0_with_register_geometry"] = g_mip_above_0_registers.load();
     j["pitch_not_representable"] = g_pitch_not_representable.load();
     j["view_range_unknown"] = g_view_unknown_range.load();
+    j["clear_cases_description_vs_registers"] = WideReport(g_clear_desc_cases);
+    j["clear_cases_clear_call_colour_vs_registers"] = WideReport(g_clear_call_cases);
+    j["clear_cases_depth_values_vs_registers"] = WideReport(g_depth_clear_cases);
     const auto fields_json = [](const auto& defs, u32 count, const auto& counters) {
         nlohmann::json out = nlohmann::json::object();
         for (u32 f = 0; f < count; ++f) {
@@ -1451,7 +1605,8 @@ nlohmann::json UseReport() {
             }
             const char* cls = defs[f].cls == FieldClass::Decided ? "decided" : defs[f].cls == FieldClass::NotNeeded ? "not_needed" : "not_decidable";
             out[defs[f].name] = {{"class", cls}, {"description_used", used}, {"register_only", only}, {"differs_from_registers", c.differs.load()},
-                                 {"source_prebuilt_block", c.prebuilt.load()}, {"source_clear_call_colour", c.call_colour.load()}};
+                                 {"source_prebuilt_block", c.prebuilt.load()}, {"source_view_block", c.view_block.load()}, {"compare_only", c.shadow_compared.load()},
+                                 {"compare_only_differs", c.shadow_differs.load()}};
         }
         return out;
     };
@@ -1574,5 +1729,45 @@ nlohmann::json Report() {
     }
     return j;
 }
+
+namespace {
+
+void WriteCounterFile() {
+    try {
+        nlohmann::json out;
+        out["written_unix_s"] = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        out["note"] = "cumulative since the process started (never reset); rewritten every 30 s and at a normal exit";
+        out["shadow_TLG_TARGET_DESC"] = Enabled();
+        out["use_TLG_TARGET_DESC_USE"] = UseOn();
+        out["verify_TLG_TARGET_DESC_USE_VERIFY"] = VerifyOn();
+        out["e2_targets"] = Report();
+        const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "target_desc_counters.json";
+        auto temp = path;
+        temp += ".tmp";
+        {
+            std::ofstream file{temp, std::ios::binary | std::ios::trunc};
+            file << out.dump(1);
+        }
+        std::error_code ec;
+        std::filesystem::rename(temp, path, ec);
+    } catch (...) {
+    }
+}
+
+void StartCounterWriter() {
+    static std::atomic<bool> started{false};
+    if (started.load(std::memory_order_relaxed) || started.exchange(true)) {
+        return;
+    }
+    std::atexit([] { WriteCounterFile(); });
+    std::thread([] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            WriteCounterFile();
+        }
+    }).detach();
+}
+
+} // namespace
 
 } // namespace Core::NativeTargetDesc

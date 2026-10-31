@@ -290,7 +290,7 @@ fixed value or a small table; **not decidable** = no engine field known (why); *
 | `cmask_base_address` (7) | decided at mip 0 | `resource + 0x58`, `cmask_address` 0 differences |
 | `cmask_slice.tile_max` (8) | not needed | no reader |
 | `fmask_base_address`, `fmask_slice` (9, 10) | not decidable | only the prebuilt block writes them (`FUN_02491a30` never does); no engine field named; no reader except the fmask address of `meta_info`; `prebuilt_block_cases` shows whether a view block ever differs from the prebuilt one |
-| `clear_word0/1` (11, 12) | decided as the prebuilt block's words | `resource + 0xdc/+0xe0` at mip 0, 0 above; they are not the clear call's colour (resource `+0x150/+0x154`, valid when `+0x14c != 0`); the consumer (`ColorBufferClearValue`) must take the clear call's colour from there or from the call |
+| `clear_word0/1` (11, 12) | decided (round 6): the block the engine keeps | the view's own block words (`view + 0x80/+0x84`, = what the register decode copies) for a view, the resource's prebuilt block (`+0xdc/+0xe0`) for the eliminate; NOT the clear call's colour (`resource + 0x150/+0x154`), which differs from the registers in some clears (round 5 long play: 5,378 of 62,065 eliminates) |
 | `pad1` (13, 14) | not needed | unused |
 | the extent word (15), `CbDbExtent` | decided | mip extent of the resource (equal in 100 % of cases) |
 
@@ -311,7 +311,7 @@ fixed value or a small table; **not decidable** = no engine field known (why); *
 | `depth_view.slice_start` / `slice_max` | decided | first and last slice of the view description; plain 2D views at mip 0 carry the whole resource's range (`last_slice` 0 differences) |
 | `depth_view.z_read_only`, `stencil_read_only` | not compared yet | no reader; the DSV flags (`+0x48` bits 0 and 1) are the likely source |
 | `depth_htile_data_base` | decided | `resource + 0x48 >> 8` (block word 9), `htile_base` 0 differences |
-| `depth_clear`, `stencil_clear` | decided (same data) | `resource + 0x158` / `+0x15c`, valid when `resource + 0x48 != 0`; the register image copies them from there |
+| `depth_clear`, `stencil_clear` | not decidable (round 6): registers keep it | `resource + 0x158` / `+0x15c` (valid when `resource + 0x48 != 0`) are compared and counted (`compare_only_differs`, table `clear_cases_depth_values_vs_registers`) but not applied: the long play had a few differing cases (1 in the depth clear path, 3 at the fill point) |
 | the depth extent word (12) | decided | mip extent of the resource |
 | `depth_control`, `depth_render_control` | out of scope here | draw state (`FixedState`) and the engine's own clear / copy / decompress operations (B11), not target description |
 
@@ -364,3 +364,38 @@ not_decidable), `description_used`, `register_only`, `differs_from_registers`, `
 Syntax check of this round (container with Vulkan, xxhash, abseil, robin-map headers added; spdlog and magic_enum are other versions or absent): `native_target_desc.cpp` and `native_draw.cpp` compile with no error on the new lines
 (the remaining errors are the container's spdlog `LOG_*` macros and Windows types); `native_liverpool.cpp`, `native_rasterizer.cpp` and `vk_rasterizer.cpp` stop at the missing magic_enum header, so their one-line
 edits are checked by reading only.
+
+## 11. Round 6: the clear words and the clear values (after the long play with `TLG_TARGET_DESC_USE=1`)
+
+Long-play counters of round 5: eliminate path, `clear_word0` differed from the registers in 5,378 of 62,065 targets (all 62,065 taken from the clear call's colour); fill point 353 of 536,331 (304,237 from the
+clear call, 232,094 from the prebuilt block); depth clear values: 1 case in the depth clear path, 3 at the fill point. The picture was fine (the cases are rare or harmless), but the rule was wrong in principle: B11 says
+that where the clear call's colour and the register words disagree, the registers are right.
+
+**What I did not have.** The round 5 build kept no table of the differing cases, so I did not see the tuples; the rule below follows from the facts known so far, and the new tables (below) will confirm or refute it
+on the next long run. The facts: (1) the register decode of a view copies the view's block words 11/12 (`Synthesize`: 14 words from `view + 0x54`), and the eliminate record's registers are the resource's prebuilt block
+(`EmitFastClearEliminate`: `resource + 0xb0 + k * 4`); (2) the clear call stores its packed colour at `resource + 0x150/+0x154` and sets `+0x14c` (a state: the eliminate is built when it is 1 or 2, so an eliminate always
+comes after a clear call), and the Ghidra reading says the view's words are overwritten by the prebuilt block's; (3) in 5,378 of 62,065 eliminates `+0x150` is not the prebuilt word.
+
+**The rule (applied).** The clear words come from the same block the registers copy, as an engine object field: `view + 0x54 + 11 * 4` and `12 * 4` for a view (fill point), the resource's `+0xdc/+0xe0` for the eliminate
+(no view). The clear call's colour is no longer a source; it is only recorded. By construction `differs_from_registers` is 0 for these two fields (same memory, same moment); what remains to see in the tables is how
+often the clear call's colour differs from them. Field class: decided (source: the engine's block, not a description derived from D3D11); for the next step (removing the register decode) the words must come from the view's
+block or the prebuilt block, which is the engine's console data, not a D3D11-derived value: there is no D3D11 source for a clear word.
+
+**Depth and stencil clear values.** The resource's `+0x158/+0x15c` do not always equal the register decode (the registers hold what the clear's setup wrote, or Synthesize's copy at the draw). They are no longer applied:
+class not decidable, registers keep the field, the resource's values are compared (`compare_only`, `compare_only_differs`) and every differing case goes to a table.
+
+**Tables** (/stats native_backend.device.e2_targets.feeds_the_draw; at most 64 distinct tuples each with counts, `overflow_beyond_64_tuples` and `total_cases` beside them):
+* `clear_cases_description_vs_registers`: the description's clear words are not the register decode's (applied fields; expected empty).
+* `clear_cases_clear_call_colour_vs_registers`: the clear call's packed colour (`+0x150/+0x154`) is not the register decode's, with `+0x14c`, the serial (`+0x160`, raw), the prebuilt words, the view block words, the register words, the DXGI format
+  and the mip: this is the table that explains the 5,378 and 353 cases. Whether the eliminate came before or after the clear call: the eliminate record is only built for `+0x14c` 1 or 2, so it is always after; the raw state
+  value is in `resource_14c`.
+* `clear_cases_depth_values_vs_registers`: the resource's depth and stencil clear values against the register decode, with the htile word and the format. The "packed value the clear call would write" is the resource's own field, which
+  is the packed value; I do not compute it separately.
+Each key: path (fill_point / depth_clear / eliminate), kind, `resource_14c`, `serial_160`, `resource_150_or_158`, `resource_154_or_15c`, `prebuilt_dc`, `prebuilt_e0`, `register_word0/1`, `description_word0/1`, `dxgi_view`, `mip`,
+`view_block_word11_or_htile`, `view_block_word12`, `count`. (The serial at `+0x160` is read as a raw dword; the first Ghidra reading also called `+0x160` a memory pointer, so treat it as unverified.)
+
+**Cumulative counters for the whole session.** Every counter here is process-lifetime and never reset. A thread writes the full report to `user/log/target_desc_counters.json` (written aside and renamed) every 30 s from the first
+time any of the three switches (`TLG_TARGET_DESC`, `TLG_TARGET_DESC_USE`, `TLG_TARGET_DESC_USE_VERIFY`) builds something, and once more at a normal exit (`atexit`); the debug server's own snapshot (`last_counters.json`, every 20 s) carries the same
+report under `/stats`. Verify mode behaves as before: it compares and keeps the register result.
+
+New counter columns per field: `source_view_block` (replaces `source_clear_call_colour`), `compare_only`, `compare_only_differs`.
