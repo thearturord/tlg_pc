@@ -499,6 +499,7 @@ struct SignalImpl : public PageManager::Impl {
             }
             perms = Core::MemoryPermission::None;
         }
+        Core::NativeUpdates::NoteB9(perms == Core::MemoryPermission::None ? Core::NativeUpdates::E4ProtectNone : perms == Core::MemoryPermission::Read ? Core::NativeUpdates::E4ProtectRead : Core::NativeUpdates::E4ProtectOther, size);
         impl.Protect(address, size, perms);
     }
 
@@ -507,6 +508,7 @@ struct SignalImpl : public PageManager::Impl {
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
+        Core::NativeUpdates::NoteB9(Common::IsWriteError(context) ? Core::NativeUpdates::E4WriteFaults : Core::NativeUpdates::E4ReadFaults);
         if (Common::IsWriteError(context)) {
 #ifdef ARCH_X86_64
             {
