@@ -86,6 +86,7 @@ public:
         ImageInfo info;
         ImageViewInfo view_info;
         BindingType type{BindingType::Texture};
+        u8 engine_site{}; ///< E3 census: which caller named it (1 color target, 2 depth target, 3 eliminate, 4 depth clear, 5/6 resolve, 7 depth copy read, 0 sampled)
         u64 engine_id{}; ///< E3: the engine resource / view the record binding names (0: none; targets, video out and copies)
 
         ImageDesc() = default;

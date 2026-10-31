@@ -548,7 +548,8 @@ private:
     AmdGpu::Liverpool* liverpool;
     const std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS>* current_cb_extent{}; ///< The extent hints of the targets of the draw being recorded.
     const AmdGpu::CbDbExtent* current_db_extent{};
-    const std::array<u64, 9>* current_target_resources{}; ///< E3: engine resource ids behind the draw's color views (0..7) and depth view (8).
+    static constexpr std::array<u64, 9> kNoTargetResources{};
+    const std::array<u64, 9>* current_target_resources{&kNoTargetResources}; ///< E3: engine resource ids behind the draw's color views (0..7) and depth view (8).
     const AmdGpu::BorderColorBuffer* current_bc_base{}; ///< The border colour table of the draw or dispatch being recorded.
     const AmdGpu::ComputeProgram* current_cs{}; ///< The compute program of the dispatch being recorded (its plan's, or the queue's without a plan).
     Core::MemoryManager* memory;

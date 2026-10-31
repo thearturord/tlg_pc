@@ -305,6 +305,7 @@ bool Rasterizer::FilterDraw(const DrawPlan* plan) {
     const DrawInputs& inputs = plan ? plan->inputs : (inputs_storage = MakeDrawInputs(liverpool->RasterRegs()), inputs_storage);
     const auto& cb_extents = plan ? plan->cb_extent : liverpool->RasterCbExtents();
     const AmdGpu::CbDbExtent& db_extent = plan ? plan->db_extent : liverpool->RasterDbExtent();
+    current_target_resources = plan ? &plan->target_resources : &liverpool->RasterTargetResources(); // E3: the game's own transition operations name their targets too
     DrawClassification classified;
     if (plan != nullptr) {
         classified = plan->op_class != 0xff ? DrawClassification{static_cast<DrawClass>(plan->op_class), plan->depth_copy, plan->stencil_copy}
@@ -627,6 +628,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const Fixe
         } else {
             std::construct_at(&desc, col_buf, hint);
             desc.engine_id = (*current_target_resources)[cb]; // E3: the resource the draw's bound render target view looks at
+            desc.engine_site = 1;
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
             if (RtReuseOn()) {
                 rt_cache[cb].valid = true;
@@ -651,6 +653,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const Fixe
             std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
                               htile_address, hint);
             desc.engine_id = (*current_target_resources)[8]; // E3: the resource the bound depth view looks at
+            desc.engine_site = 2;
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
             if (RtReuseOn()) {
                 cache.valid = true;
@@ -686,6 +689,8 @@ void Rasterizer::EliminateFastClear(const DrawInputs& inputs, const AmdGpu::CbDb
         return;
     }
     VideoCore::TextureCache::ImageDesc desc(col_buf, cb0);
+    desc.engine_id = (*current_target_resources)[0]; // E3
+    desc.engine_site = 3;
     const auto image_id = texture_cache.FindImage(desc);
     const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
     auto& image = texture_cache.GetImage(image_id);
@@ -719,6 +724,8 @@ void Rasterizer::ClearDepthTarget(const DrawInputs& regs, const AmdGpu::CbDbExte
     const auto htile_address = regs.depth_htile_data_base.GetAddress();
     VideoCore::TextureCache::ImageDesc desc(regs.depth_buffer, regs.depth_view, regs.depth_control, htile_address,
                                             db_extent);
+    desc.engine_id = (*current_target_resources)[8]; // E3
+    desc.engine_site = 4;
     const auto image_id = texture_cache.FindImage(desc);
     auto& image = texture_cache.GetImage(image_id);
     const bool clear_depth = regs.depth_render_control.depth_clear_enable && regs.depth_buffer.DepthValid();
@@ -3270,6 +3277,10 @@ bool Rasterizer::PendingGpuWriteOverlaps(VAddr address, u64 size, u64 done) {
 void Rasterizer::Resolve(const DrawInputs& inputs, const AmdGpu::CbDbExtent& mrt0_hint, const AmdGpu::CbDbExtent& mrt1_hint) {
     VideoCore::TextureCache::ImageDesc mrt0_desc{inputs.color_buffers[0], mrt0_hint};
     VideoCore::TextureCache::ImageDesc mrt1_desc{inputs.color_buffers[1], mrt1_hint};
+    mrt0_desc.engine_id = (*current_target_resources)[0]; // E3
+    mrt1_desc.engine_id = (*current_target_resources)[1];
+    mrt0_desc.engine_site = 5;
+    mrt1_desc.engine_site = 6;
     auto& mrt0_image = texture_cache.GetImage(texture_cache.FindImage(mrt0_desc, true));
     auto& mrt1_image = texture_cache.GetImage(texture_cache.FindImage(mrt1_desc, true));
 
@@ -3285,6 +3296,8 @@ void Rasterizer::DepthStencilCopy(const DrawInputs& regs, const AmdGpu::CbDbExte
     auto read_desc = VideoCore::TextureCache::ImageDesc(
         regs.depth_buffer, regs.depth_view, regs.depth_control,
         regs.depth_htile_data_base.GetAddress(), db_extent, false);
+    read_desc.engine_site = 7;
+    read_desc.engine_id =(*current_target_resources)[8]; // E3: the bound depth view's resource (the write side is another buffer: left unnamed)
     auto write_desc = VideoCore::TextureCache::ImageDesc(
         regs.depth_buffer, regs.depth_view, regs.depth_control,
         regs.depth_htile_data_base.GetAddress(), db_extent, true);

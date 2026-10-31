@@ -5026,6 +5026,8 @@ bool EmitFastClearEliminate(u64 ctx, u64 resource) {
     slot.cb_extent = {};
     slot.cb_extent[0] = Rd<u32>(resource, 0xec);
     slot.cb_extent_mask = 1;
+    slot.target_resources = {}; // E3: the eliminate's target is the resource itself (the ring slot may hold the ids of an earlier draw)
+    slot.target_resources[0] = Rd<u64>(resource, 0x10);
     slot.seq.store(seq, std::memory_order_release);
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
     words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8);

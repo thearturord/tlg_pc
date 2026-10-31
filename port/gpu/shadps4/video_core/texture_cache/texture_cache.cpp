@@ -767,6 +767,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                 Core::NativeUpdates::NoteB8(Core::NativeUpdates::E3NamedNoOwner);
             } else if (at.id != named_resource) {
                 Core::NativeUpdates::NoteB8(Core::NativeUpdates::E3NamedOtherOwner);
+                static std::array<std::atomic<u32>, 8> logged{};
+                if (logged[desc.engine_site & 7].fetch_add(1, std::memory_order_relaxed) < 3) {
+                    LOG_WARNING(Render_Vulkan, "E3 named differs: site {} named resource {} (kind {}, memory {:#x}) address {:#x} size {}x{} format {}; the address lookup finds resource {} (kind {}, memory {:#x})",
+                                desc.engine_site, named_resource, u32(named.kind), named.address, info.guest_address, info.size.width, info.size.height, vk::to_string(info.pixel_format), at.id,
+                                u32(at.kind), at.address);
+                }
             } else {
                 Core::NativeUpdates::NoteB8(at.address == info.guest_address ? Core::NativeUpdates::E3NamedSameOwner : Core::NativeUpdates::E3NamedInterior);
             }
