@@ -1113,6 +1113,7 @@ struct NativeRecord {
     std::array<u32, 8> cb_extent{};
     u32 cb_extent_mask{};
     u32 db_extent{};
+    std::array<u64, 9> target_resources{}; ///< E3: engine ids of the resources behind the bound render target views (0..7) and the depth view (8); 0: none
     u64 args_addr{};      ///< indirect draws: the argument buffer
     u64 extra_addr{};     ///< copy records: the source address
     u32 vertex_sgpr{};    ///< indirect draws: user data registers that receive the base vertex / start instance
@@ -3026,6 +3027,22 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     slot.cb_extent = synth_cb_extent;
     slot.cb_extent_mask = synth_cb_extent_mask;
     slot.db_extent = synth_db_extent;
+    {
+        // E3: the resources the bound views look at (the engine's ids), so the rasterizer names its targets without the register address
+        const auto resource_id = [&](u64 view) -> u64 {
+            if (!IsHeapPointer(view) || (view & 7) != 0) {
+                return 0;
+            }
+            const u64 resource = Rd<u64>(view, 0x30);
+            return IsHeapPointer(resource) && (resource & 7) == 0 ? Rd<u64>(resource, 0x10) : 0;
+        };
+        slot.target_resources = {};
+        const u32 targets = std::min<u32>(Rd<u32>(ctx, Ctx::RenderTargetCount), 7);
+        for (u32 i = 0; i < targets; ++i) {
+            slot.target_resources[i] = resource_id(Rd<u64>(ctx, Ctx::RenderTargets + i * 8));
+        }
+        slot.target_resources[8] = resource_id(Rd<u64>(ctx, Ctx::DepthStencilView));
+    }
     slot.flags = synth_flags | (table_overflow || bad_object_seen ? SpecialPipeline : 0u);
     slot.rt_info = synth_rt_info;
     slot.kind = kind;
@@ -4716,6 +4733,7 @@ static bool TakeExecDrawImpl(u64 seq, ExecDraw& out, bool typed, bool allow_lazy
     out.cb_extent = slot.cb_extent;
     out.cb_extent_mask = slot.cb_extent_mask;
     out.db_extent = slot.db_extent;
+    out.target_resources = slot.target_resources;
     out.has_extents = slot.kind != 3;
     out.cb_extents_only = slot.kind == 4;
     out.instance_sgpr = slot.instance_sgpr;

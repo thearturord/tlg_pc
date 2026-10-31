@@ -82,6 +82,7 @@ struct Liverpool {
     u32 index_buffer_num_indices{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
+    std::array<u64, 9> last_target_resources{}; ///< E3: engine resource ids behind the bound color views (0..7) and the depth view (8)
 
 public:
     explicit Liverpool();
@@ -123,6 +124,9 @@ public:
     }
     [[nodiscard]] CbDbExtent& RasterDbExtent() noexcept {
         return last_db_extent;
+    }
+    [[nodiscard]] std::array<u64, 9>& RasterTargetResources() noexcept {
+        return last_target_resources;
     }
     /// True while the raster thread runs the rasterizer (cp_split_mode): the pipeline lookup is
     /// then done by the command processor thread.

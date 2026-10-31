@@ -626,6 +626,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const Fixe
             texture_cache.TouchFoundImage(image_id);
         } else {
             std::construct_at(&desc, col_buf, hint);
+            desc.engine_id = (*current_target_resources)[cb]; // E3: the resource the draw's bound render target view looks at
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
             if (RtReuseOn()) {
                 rt_cache[cb].valid = true;
@@ -649,6 +650,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const Fixe
         } else {
             std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
                               htile_address, hint);
+            desc.engine_id = (*current_target_resources)[8]; // E3: the resource the bound depth view looks at
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
             if (RtReuseOn()) {
                 cache.valid = true;
@@ -777,6 +779,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     current_bc_base = &draw_inputs->ta_bc_base;
     current_cb_extent = plan ? &plan->cb_extent : &liverpool->RasterCbExtents();
     current_db_extent = plan ? &plan->db_extent : &liverpool->RasterDbExtent();
+    current_target_resources = plan ? &plan->target_resources : &liverpool->RasterTargetResources();
     const auto& regs = *draw_inputs;
     const bool same_cmdbuf = use_tag && last.valid && last.tick == scheduler.CurrentTick();
     const bool same_pipeline = same_cmdbuf && last.pipeline == pipeline;
@@ -879,6 +882,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     current_bc_base = &draw_inputs->ta_bc_base;
     current_cb_extent = plan ? &plan->cb_extent : &liverpool->RasterCbExtents();
     current_db_extent = plan ? &plan->db_extent : &liverpool->RasterDbExtent();
+    current_target_resources = plan ? &plan->target_resources : &liverpool->RasterTargetResources();
 
     PrepareRenderState(pipeline, fixed);
     binder_plan = NativeBinderFor(plan, 4);

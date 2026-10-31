@@ -203,6 +203,7 @@ struct DrawPlan {
     bool depth_copy{}, stencil_copy{};
     std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent{}; ///< the extent hints of the targets when the draw was recorded
     AmdGpu::CbDbExtent db_extent{};
+    std::array<u64, 9> target_resources{}; ///< E3: engine resource ids behind the bound color views and the depth view when the draw was recorded
     std::array<StagePlan, MaxShaderStages> stages{};
     u64 ring_end{}; ///< T1: the constant ring position after this plan's copies
     u64 native_seq{}; ///< the record the plan was made from (0: planned from the registers); diagnostics

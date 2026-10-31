@@ -415,6 +415,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     }
     // a fast clear eliminate takes the extent hint of its own target for this operation only
     const auto saved_cb_extent = last_cb_extent;
+    const auto saved_target_resources = last_target_resources;
     if (draw.cb_extents_only) {
         native_tag_pending.valid = false;
     }
@@ -428,6 +429,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         if (!draw.cb_extents_only) {
             last_db_extent.raw = draw.db_extent;
         }
+        last_target_resources = draw.target_resources;
     }
     // The record goes straight into the draw state (and the raster thread's deltas), not through the register file: the
     // next draw writes only what differs, and a draw of the packet path first gets back what its own packets wrote.
@@ -622,6 +624,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     if (draw.cb_extents_only) {
         // the fast clear eliminate registers (color control in eliminate mode) must not reach the next draw
         last_cb_extent = saved_cb_extent;
+        last_target_resources = saved_target_resources;
         ExecRestore();
     }
 }

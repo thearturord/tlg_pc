@@ -623,6 +623,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         if (op.draw_plan) {
             op.draw_plan->cb_extent = last_cb_extent;
             op.draw_plan->db_extent = last_db_extent;
+            op.draw_plan->target_resources = last_target_resources;
         }
     }
     if (rasterizer->ConstRingLevel() != 0) {
