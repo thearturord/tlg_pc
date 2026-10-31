@@ -10,7 +10,7 @@
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
-#include "native/native_raster_prof.h"
+#include "native/native_prof.h"
 #include "native/native_stall.h"
 #include "native/native_timeline.h"
 #include "sdl_window.h"
@@ -367,11 +367,11 @@ bool WindowSDL::PollEvents() {
         }();
         // tlg: F9 starts the frame profiler (a 10 s capture into user/log/timeline_f9_<time>.bin/.json, documents/tlg/frame-profiler.md) or stops a running one.
         if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F9 && !event.key.repeat) {
-            if ((event.key.mod & SDL_KMOD_SHIFT) != 0 || Core::RasterProf::Recording()) {
-                // tlg: Shift+F9 starts the raster thread profiler (a 10 s capture of what the raster thread's time goes to, inside each draw and dispatch; the report is user/log/raster_<time>.html,
-                // opened in the browser) or stops a running one.
-                if (!Core::RasterProf::Stop()) {
-                    Core::RasterProf::Start(10, true);
+            if ((event.key.mod & SDL_KMOD_SHIFT) != 0 || Core::Prof::Recording()) {
+                // tlg: Shift+F9 starts the profiler (a 10 s capture of the named probes in the code, by default on the raster thread; the report is user/log/prof_<time>.html, opened in the browser;
+                // TLG_PROF_LEVEL / _GROUPS / _THREADS / _SECONDS choose what is recorded, /prof does the same from the debug server) or stops a running one.
+                if (!Core::Prof::Stop()) {
+                    Core::Prof::Start(Core::Prof::DefaultConfig());
                 }
             } else if (!Core::FrameTimeline::StopCapture()) {
                 Core::FrameTimeline::StartCapture(10, "f9_" + std::to_string(static_cast<long long>(std::time(nullptr))));

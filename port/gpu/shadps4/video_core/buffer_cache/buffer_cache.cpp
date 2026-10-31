@@ -19,7 +19,7 @@
 #include "native/native_registry.h"
 #include "native/native_updates.h"
 #include "native/native_e3_census.h"
-#include "native/native_raster_prof.h"
+#include "native/native_prof.h"
 
 #include "native/native_resources.h"
 #include "native/native_resource_audit.h"
@@ -251,11 +251,18 @@ static bool BindMemoOn() {
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                         Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
-    const Core::RasterProf::Scope prof{Core::RasterProf::Phase::ObtainBuffer};
+    TLG_PROF_LEVEL("buffer.obtain", 2);
     if (is_written) {
         BindMemoErase(device_addr, size); // the GPU writes it: answers over this memory are stale
     }
     if (is_written || is_texel_buffer || size > BindMemoMax || !BindMemoOn()) {
+        if (is_written) {
+            TLG_PROF_COUNT("buffer.request.written");
+        } else if (is_texel_buffer) {
+            TLG_PROF_COUNT("buffer.request.texel");
+        } else {
+            TLG_PROF_COUNT("buffer.request.too_big_for_the_bind_memo");
+        }
         return ObtainBufferUncached(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
     }
     auto& memo = bind_memos[Vulkan::Scheduler::SideSelected() ? 1 : 0];
@@ -277,11 +284,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             if (e.size == size && e.epoch == epoch && e.range_epoch == ranges && e.placement_epoch == arenas &&
                 (e.buffer != &stream_buffer || e.wraps == stream_buffer.WrapCount())) {
                 bind_memo_counts[0].fetch_add(1, std::memory_order_relaxed);
+                TLG_PROF_COUNT("buffer.bind_memo.hit");
                 return {e.buffer, e.offset};
             }
         }
     }
     bind_memo_counts[1].fetch_add(1, std::memory_order_relaxed);
+    TLG_PROF_COUNT("buffer.bind_memo.miss");
     const auto result = ObtainBufferUncached(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
     if (memo.tick == tick) {
         auto& list = memo.entries[device_addr];
@@ -348,6 +357,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             if (const Buffer* copy = ObjectCopy(*immutable, device_addr, offset)) {
                 VerifyObjectCopy(*immutable);
                 Core::NativeResources::NoteResident(0);
+                TLG_PROF_COUNT("buffer.uncached.object_copy_reused");
                 return {copy, offset};
             }
             const u32 whole = static_cast<u32>(immutable->end - immutable->begin);
@@ -363,6 +373,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
                 immutable->copy_gpu_writes = gpu_writes;
                 Core::NativeResources::NoteResident(1);
                 Core::NativeResources::NoteBufferRequest(device_addr, size, false, Core::NativeResources::BufferPath::StreamCopy, whole);
+                TLG_PROF_ADD("buffer.uncached.object_copy_made (sum = bytes)", whole);
                 return {&stream_buffer, at + (device_addr - immutable->begin)};
             }
         }
@@ -411,6 +422,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
                         }
                     }
                 }
+                TLG_PROF_COUNT("buffer.uncached.immutable_resident");
                 return {arena, arena->Offset(device_addr)};
             }
             if (StreamWhilePassOpen(device_addr, size)) {
@@ -438,6 +450,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             if (immutable->usage != 1) {
                 Core::NativeResources::NoteResident(1);
             }
+            TLG_PROF_ADD("buffer.uncached.immutable_synced (sum = bytes uploaded)", last_upload_bytes);
             return {arena, arena->Offset(device_addr)};
         }
     }
@@ -460,6 +473,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             } else if (const auto it = reuse.map.find(reuse_key); it != reuse.map.end()) {
                 Core::NativeResources::NoteBufferRequest(device_addr, size, false,
                                                          Core::NativeResources::BufferPath::StreamReuse, 0);
+                TLG_PROF_COUNT("buffer.uncached.stream_reuse_hit");
                 return {&stream_buffer, it->second};
             }
         }
@@ -473,6 +487,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             reuse.min = std::min<VAddr>(reuse.min, device_addr);
             reuse.max = std::max<VAddr>(reuse.max, device_addr + size);
         }
+        TLG_PROF_ADD("buffer.uncached.stream_copy (sum = bytes)", size);
         return {&stream_buffer, offset};
     }
     const bool memoizable = !is_texel_buffer;
@@ -489,6 +504,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             memo->epoch == epoch_before && memo->tick == scheduler.CurrentTick()) {
             Core::NativeResources::NoteBufferRequest(device_addr, size, is_written,
                                                      Core::NativeResources::BufferPath::Memo, 0);
+            TLG_PROF_COUNT("buffer.uncached.obtain_memo_hit");
             return {memo->arena, memo->offset};
         }
 
@@ -508,6 +524,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
         Core::NativeE3Census::NoteGpuWritten(device_addr, size); // E7c Task 3 (TLG_E3_ANNOUNCED=1): which call site wrote it
         Core::NativeResources::NoteGpuWritten(device_addr, size); // R1b: copies of engine buffers with these bytes are stale
     }
+    TLG_PROF_ADD("buffer.uncached.arena_synchronized (sum = bytes uploaded)", last_upload_bytes);
     const u64 offset = arena->Offset(device_addr);
     if (memo) {
         // the epoch read before the work: an upload this call did makes the entry stale, as it should

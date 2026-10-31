@@ -7,7 +7,7 @@
 #include <xxhash.h>
 #include "native/native_census.h"
 #include "native/native_e3_census.h"
-#include "native/native_raster_prof.h"
+#include "native/native_prof.h"
 
 #include "native/native_image_marks.h"
 #include "native/native_untracked_ring.h"
@@ -672,7 +672,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id, Core:
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
-    const Core::RasterProf::Scope prof{Core::RasterProf::Phase::FindImage};
+    TLG_PROF_LEVEL("texture.find_image", 2);
     const auto& info = desc.info;
     Core::ResourceAudit::Note(Core::ResourceAudit::ImageUse, info.guest_address, info.guest_size, desc.type == BindingType::Storage || desc.type == BindingType::RenderTarget);
     ASSERT(info.guest_address != 0);
@@ -1081,7 +1081,7 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 }
 
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
-    const Core::RasterProf::Scope prof{Core::RasterProf::Phase::FindView};
+    TLG_PROF_LEVEL("texture.find_view", 3);
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
@@ -1121,7 +1121,7 @@ void TextureCache::UnregisterMeta(VAddr address, u64 owner_uid) {
 }
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
-    const Core::RasterProf::Scope prof{Core::RasterProf::Phase::FindView};
+    TLG_PROF_LEVEL("texture.find_view", 3);
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
@@ -1164,7 +1164,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 }
 
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
-    const Core::RasterProf::Scope prof{Core::RasterProf::Phase::FindView};
+    TLG_PROF_LEVEL("texture.find_view", 3);
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     image.usage.depth_target = 1u;
@@ -1220,7 +1220,7 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
 }
 
 void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller caller) {
-    const Core::RasterProf::Scope prof{Core::RasterProf::Phase::RefreshImage};
+    TLG_PROF_LEVEL("texture.refresh_image", 3);
     Core::NativeCensus::NoteImage(Core::NativeCensus::ImageRefresh, image.info.guest_size);
     Core::NativeE3Census::NoteCall(Core::NativeE3Census::Fn::RefreshImage, caller);
     // E3.3: the shared page edges of an image are no longer harvested here. The engine's announced writes tell when an image's content changed (E3.1 census: the harvest alone
@@ -1355,12 +1355,12 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
 
     scheduler.EndRendering();
 
-    Core::RasterProf::Scope prof_obtain{Core::RasterProf::Phase::ObtainForImage};
+    TLG_PROF_NAMED_LEVEL(prof_obtain, "texture.refresh.obtain_bytes", 2);
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
     prof_obtain.End();
     Core::NativeCensus::NoteImage(Core::NativeCensus::ImageDetile, image.info.guest_size);
-    Core::RasterProf::Scope prof_detile{Core::RasterProf::Phase::Detile};
+    TLG_PROF_NAMED_LEVEL(prof_detile, "texture.refresh.detile", 2);
     const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
     prof_detile.End();
     for (auto& copy : image_copies) {
@@ -1368,7 +1368,7 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
     }
 
     {
-        const Core::RasterProf::Scope prof_upload{Core::RasterProf::Phase::UploadImage};
+        TLG_PROF_NAMED_LEVEL(prof_upload, "texture.refresh.upload", 2);
         runtime.UploadImage(&image, buffer, image_copies);
     }
     Core::NativeResources::NoteImageUpload(image.info.guest_address, image.info.guest_size,
@@ -1393,7 +1393,7 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
                                      AmdGpu::BorderColorBuffer border_color_base,
                                      const bool is_depth) {
-    const Core::RasterProf::Scope prof{Core::RasterProf::Phase::GetSampler};
+    TLG_PROF_LEVEL("texture.get_sampler", 3);
     // Compare and plain uses of one S# need separate samplers.
     const u64 hash = HashCombine(XXH3_64bits(&sharp, sizeof(sharp)), is_depth);
     const auto [it, new_sampler] = samplers.try_emplace(hash);

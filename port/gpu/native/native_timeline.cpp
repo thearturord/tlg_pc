@@ -20,7 +20,7 @@
 
 #include "common/logging/log.h"
 #include "common/path_util.h"
-#include "native/native_raster_prof.h"
+#include "native/native_prof.h"
 #include "native/native_stall.h"
 #include "native/native_timeline.h"
 #include "video_core/thread_usage.h"
@@ -88,9 +88,9 @@ void SampleThreads(const std::stop_token& stop) {
 #endif
 
 void WriteCapture(const std::string& tag) {
-    if (RasterProf::ThisIsRasterCapture()) {
-        // the raster thread profiler (Shift+F9): the phases were accumulated on the raster thread, the events only give the frames
-        RasterProf::Analyze(capture_events, std::min<u64>(capture_count.load(), capture_capacity), capture_start_ns, capture_end_ns);
+    if (Prof::ThisIsProfCapture()) {
+        // the profiler (Shift+F9): the probes were accumulated on the threads that ran them, the events only give the frames
+        Prof::Analyze(capture_events, std::min<u64>(capture_count.load(), capture_capacity), capture_start_ns, capture_end_ns);
         return;
     }
     if (Stall::ThisIsStallCapture()) {
