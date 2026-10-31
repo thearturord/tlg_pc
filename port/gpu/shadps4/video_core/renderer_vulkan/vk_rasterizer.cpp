@@ -473,6 +473,28 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
             Core::NativePlanShadow::Compare(g, "depth.z_format", static_cast<u64>(in.depth_buffer.z_info.format), static_cast<u64>(regs.depth_buffer.z_info.format));
             Core::NativePlanShadow::Compare(g, "depth.num_samples", in.depth_buffer.NumSamples(), regs.depth_buffer.NumSamples());
         }
+        {
+            // the draw state words of DrawInputs (depth_control, depth_render_control) against the native fixed state of the plan (the fixed state decides the pipeline; DrawInputs feeds the render state)
+            const char* h = "inputs_vs_native_fixed";
+            Core::NativePlanShadow::Compare(h, "depth_control.depth_enable", plan->fixed.depth_test, in.depth_control.depth_enable);
+            Core::NativePlanShadow::Compare(h, "depth_control.depth_write_enable", plan->fixed.depth_write, in.depth_control.depth_write_enable);
+            Core::NativePlanShadow::Compare(h, "depth_control.stencil_enable", plan->fixed.stencil_test, in.depth_control.stencil_enable);
+            Core::NativePlanShadow::Compare(h, "depth_render_control.depth_clear_enable", plan->fixed.depth_clear, in.depth_render_control.depth_clear_enable);
+            Core::NativePlanShadow::Compare(h, "depth_render_control.stencil_clear_enable", plan->fixed.stencil_clear, in.depth_render_control.stencil_clear_enable);
+            // words with no native value: how often they are not at their default
+            const auto nonzero = [](const auto& value) {
+                const auto* bytes = reinterpret_cast<const unsigned char*>(&value);
+                for (size_t i = 0; i < sizeof(value); ++i) {
+                    if (bytes[i] != 0) {
+                        return u64{1};
+                    }
+                }
+                return u64{0};
+            };
+            Core::NativePlanShadow::RegisterOnly("inputs", "ta_bc_base", nonzero(in.ta_bc_base));
+            Core::NativePlanShadow::RegisterOnly("inputs", "clip_user_data", nonzero(in.clip_user_data));
+            Core::NativePlanShadow::RegisterOnly("inputs", "index_offset", in.index_offset);
+        }
         if (in.depth_buffer.StencilValid() || regs.depth_buffer.StencilValid()) {
             Core::NativePlanShadow::Compare(g, "stencil.valid", in.depth_buffer.StencilValid(), regs.depth_buffer.StencilValid());
             Core::NativePlanShadow::Compare(g, "stencil.format", static_cast<u64>(in.depth_buffer.stencil_info.format), static_cast<u64>(regs.depth_buffer.stencil_info.format));

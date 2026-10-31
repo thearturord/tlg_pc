@@ -2,6 +2,18 @@
 
 #include "native/native_sync.h"
 
+#include <array>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+
+#include <fmt/format.h>
+#include <nlohmann/json.hpp>
+
 #include "native/native_debug_server.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 
@@ -190,5 +202,228 @@ bool LabelWait::Test(std::span<const u32> regs) const {
     }
     return TestValue(regs[reg]);
 }
+
+
+namespace Typed {
+
+namespace {
+
+struct Pending {
+    Kind kind{KindEop};
+    Fence fence{};
+    LabelWait wait{};
+    LabelWrite write{};
+    std::array<u32, 4> write_data{};
+    DmaCopy dma{};
+};
+
+constexpr std::array<const char*, KindCount> KindNames{"eop", "release", "wait", "write", "dma"};
+
+struct KindCounters {
+    std::atomic<u64> evaluated{0}, differing{0}, without_typed_source{0};
+    std::map<std::string, u64> fields; ///< field -> evaluations in which it differed (under the mutex)
+};
+
+std::mutex g_mutex;
+std::unordered_map<u64, Pending> g_pending;
+std::array<KindCounters, KindCount> g_counters;
+std::atomic<u64> g_expected{0}, g_overwritten{0};
+std::array<std::string, 6> g_examples;
+u32 g_example_count = 0;
+
+void Add(Pending& p, const std::unordered_map<u64, Pending>::key_type key) {
+    std::scoped_lock lock{g_mutex};
+    if (!g_pending.emplace(key, p).second) {
+        g_pending[key] = p;
+        g_overwritten.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_expected.fetch_add(1, std::memory_order_relaxed);
+    if (g_pending.size() > 65536) {
+        g_pending.clear(); // packets that were never converted (a sweep that did not see them): forget, do not grow
+    }
+}
+
+struct Diff {
+    std::string fields;
+    void Check(const char* name, u64 typed, u64 decoded) {
+        if (typed != decoded) {
+            fields += fmt::format("{}(typed {:#x}, decoded {:#x}) ", name, typed, decoded);
+        }
+    }
+};
+
+} // namespace
+
+bool On() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_SYNC_TYPED");
+        return e != nullptr && *e == '1';
+    }();
+    return on;
+}
+
+void Expect(u64 packet_address, const Fence& fence, Kind kind) {
+    if (!On()) {
+        return;
+    }
+    Pending p;
+    p.kind = kind;
+    p.fence = fence;
+    Add(p, packet_address);
+}
+
+void Expect(u64 packet_address, const LabelWait& wait) {
+    if (!On()) {
+        return;
+    }
+    Pending p;
+    p.kind = KindWait;
+    p.wait = wait;
+    Add(p, packet_address);
+}
+
+void Expect(u64 packet_address, const LabelWrite& write) {
+    if (!On()) {
+        return;
+    }
+    Pending p;
+    p.kind = KindWrite;
+    p.write = write;
+    p.write.data = nullptr;
+    for (u32 i = 0; i < 4 && write.data != nullptr && i < write.bytes / 4; ++i) {
+        p.write_data[i] = write.data[i];
+    }
+    Add(p, packet_address);
+}
+
+void Expect(u64 packet_address, const DmaCopy& dma) {
+    if (!On()) {
+        return;
+    }
+    Pending p;
+    p.kind = KindDma;
+    p.dma = dma;
+    Add(p, packet_address);
+}
+
+void Met(u64 packet_address, Kind kind, const u32* packet) {
+    if (!On()) {
+        return;
+    }
+    Pending expected;
+    bool found = false;
+    {
+        std::scoped_lock lock{g_mutex};
+        if (const auto it = g_pending.find(packet_address); it != g_pending.end()) {
+            expected = it->second;
+            g_pending.erase(it);
+            found = true;
+        }
+    }
+    KindCounters& counters = g_counters[kind];
+    if (!found) {
+        counters.without_typed_source.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    counters.evaluated.fetch_add(1, std::memory_order_relaxed);
+    Diff diff;
+    switch (kind) {
+    case KindEop:
+    case KindRelease: {
+        const Fence decoded = kind == KindEop ? DecodeEop(packet) : DecodeRelease(packet);
+        const Fence& typed = expected.fence;
+        diff.Check("address", typed.address, decoded.address);
+        diff.Check("source", static_cast<u64>(typed.source), static_cast<u64>(decoded.source));
+        const u64 mask = typed.source == Source::Immediate32 ? 0xffffffffull : ~0ull;
+        if (typed.source == Source::Immediate32 || typed.source == Source::Immediate64) {
+            diff.Check("value", typed.value & mask, decoded.value & mask);
+        }
+        diff.Check("interrupt", typed.interrupt, decoded.interrupt);
+        diff.Check("valid", typed.valid, decoded.valid);
+        diff.Check("gds_index", typed.gds_index, decoded.gds_index);
+        diff.Check("gds_dwords", typed.gds_dwords, decoded.gds_dwords);
+        break;
+    }
+    case KindWait: {
+        const LabelWait decoded = DecodeWait(packet);
+        const LabelWait& typed = expected.wait;
+        diff.Check("memory", typed.memory, decoded.memory);
+        diff.Check("pfp", typed.pfp, decoded.pfp);
+        diff.Check("function", static_cast<u64>(typed.function), static_cast<u64>(decoded.function));
+        diff.Check("reg", typed.reg, decoded.reg);
+        diff.Check("address", typed.address, decoded.address);
+        diff.Check("ref", typed.ref, decoded.ref);
+        diff.Check("mask", typed.mask, decoded.mask);
+        diff.Check("poll_interval", typed.poll_interval, decoded.poll_interval);
+        break;
+    }
+    case KindWrite: {
+        const LabelWrite decoded = DecodeWrite(packet);
+        diff.Check("address", expected.write.address, decoded.address);
+        diff.Check("bytes", expected.write.bytes, decoded.bytes);
+        for (u32 i = 0; i < 4 && i < decoded.bytes / 4; ++i) {
+            diff.Check("data", expected.write_data[i], decoded.data[i]);
+        }
+        break;
+    }
+    case KindDma: {
+        const DmaCopy decoded = DecodeDma(packet);
+        diff.Check("kind", static_cast<u64>(expected.dma.kind), static_cast<u64>(decoded.kind));
+        diff.Check("destination", expected.dma.destination, decoded.destination);
+        diff.Check("source", expected.dma.source, decoded.source);
+        diff.Check("fill", expected.dma.fill, decoded.fill);
+        diff.Check("bytes", expected.dma.bytes, decoded.bytes);
+        break;
+    }
+    default:
+        break;
+    }
+    if (!diff.fields.empty()) {
+        counters.differing.fetch_add(1, std::memory_order_relaxed);
+        std::scoped_lock lock{g_mutex};
+        // the first words of each differing field name, counted once per evaluation
+        size_t from = 0;
+        while (from < diff.fields.size()) {
+            const size_t paren = diff.fields.find('(', from);
+            if (paren == std::string::npos) {
+                break;
+            }
+            ++counters.fields[diff.fields.substr(from, paren - from)];
+            const size_t end = diff.fields.find(") ", paren);
+            from = end == std::string::npos ? diff.fields.size() : end + 2;
+        }
+        if (g_example_count < g_examples.size()) {
+            g_examples[g_example_count++] = fmt::format("{} at {:#x}: {}", KindNames[kind], packet_address, diff.fields);
+        }
+    }
+}
+
+nlohmann::json Report() {
+    nlohmann::json j;
+    j["enabled"] = On();
+    j["note"] = "TLG_SYNC_TYPED=1: typed records built by the engine functions' hooks against the decoder's records from the packet words, per kind; without_typed_source: packets of that kind met "
+                "with no producer (the producers still to be hooked); expected_never_met: expectations left (their packet was not converted)";
+    std::scoped_lock lock{g_mutex};
+    auto& kinds = j["kinds"] = nlohmann::json::object();
+    for (u32 k = 0; k < KindCount; ++k) {
+        const KindCounters& c = g_counters[k];
+        nlohmann::json fields = nlohmann::json::object();
+        for (const auto& [name, n] : c.fields) {
+            fields[name] = n;
+        }
+        kinds[KindNames[k]] = {{"evaluated", c.evaluated.load()}, {"differing", c.differing.load()}, {"without_typed_source", c.without_typed_source.load()}, {"differing_fields", std::move(fields)}};
+    }
+    j["expected_total"] = g_expected.load();
+    j["expected_overwritten_before_met"] = g_overwritten.load();
+    j["expected_never_met"] = g_pending.size();
+    nlohmann::json examples = nlohmann::json::array();
+    for (u32 i = 0; i < g_example_count; ++i) {
+        examples.push_back(g_examples[i]);
+    }
+    j["first_differences"] = std::move(examples);
+    return j;
+}
+
+} // namespace Typed
 
 } // namespace Core::NativeSync

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
+#include <nlohmann/json_fwd.hpp>
 #include <span>
 
 #include "common/types.h"
@@ -123,5 +124,27 @@ struct DmaCopy {
 [[nodiscard]] DmaCopy DecodeDma(const u32* packet);
 /// The result address of an occlusion query dump (PIXEL_PIPE_STAT_DUMP): words 2 and 3 of the event write
 [[nodiscard]] u64 DecodeEventAddress(const u32* packet);
+
+/// E7b Task 1 (`TLG_SYNC_TYPED=1`, default off): the typed record an engine function builds from its own arguments, against the record the decoder makes from the packet words the function wrote.
+/// A producer (a hook on the function that writes the packet) calls `Expect` with the address of the packet it wrote and the record it believes it wrote; `ConvertSyncPacket` calls `Met` with the
+/// packet's words before it turns the packet into a tag. A packet met with no expectation is counted per kind (`without_typed_source`: how many packets of that kind still have no producer). Counting
+/// only; nothing decides from this. Report: /stats native_backend.device.sync_typed.
+namespace Typed {
+
+enum Kind : u32 { KindEop, KindRelease, KindWait, KindWrite, KindDma, KindCount };
+
+[[nodiscard]] bool On() noexcept;
+
+void Expect(u64 packet_address, const Fence& fence, Kind kind = KindEop);
+void Expect(u64 packet_address, const LabelWait& wait);
+void Expect(u64 packet_address, const LabelWrite& write);
+void Expect(u64 packet_address, const DmaCopy& dma);
+
+/// The packet at `packet_address` (`packet`: its words, header first) is about to be converted.
+void Met(u64 packet_address, Kind kind, const u32* packet);
+
+[[nodiscard]] nlohmann::json Report();
+
+} // namespace Typed
 
 } // namespace Core::NativeSync

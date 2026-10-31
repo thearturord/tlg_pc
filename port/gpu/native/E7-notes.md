@@ -399,3 +399,106 @@ time any of the three switches (`TLG_TARGET_DESC`, `TLG_TARGET_DESC_USE`, `TLG_T
 report under `/stats`. Verify mode behaves as before: it compares and keeps the register result.
 
 New counter columns per field: `source_view_block` (replaces `source_clear_call_colour`), `compare_only`, `compare_only_differs`.
+
+## 12. E7b (branch cloud-e7b, from native-v2 5fbaf71): the four tasks of the third prompt
+
+(The prompt called the Task 3 notes "section 10"; sections 10 and 11 were taken by rounds 5 and 6, so they are 12 to 16 here.) Everything below is shadow or census, off by default, nothing deleted.
+Not compiled in full: each edited file was syntax-checked in a container with the Vulkan, xxhash, abseil, robin-map headers installed and stubs for magic_enum; the only errors left are the container's
+spdlog version, an old Vulkan header (`eMesaKosmickrisp`) and Windows types; none is on a new line.
+
+| switch | where the counters are |
+|---|---|
+| `TLG_SYNC_TYPED=1` | /stats native_backend.device.sync_typed |
+| `TLG_TARGET_REGONLY=1` | /stats native_backend.device.e2_targets: `feeds_the_draw.<path>.colour_fields / depth_fields` (`compare_only`, `compare_only_differs`), `register_value_histograms`, `depth_clear_call` |
+| `TLG_PLAN_SHADOW=1` | /stats native_backend.device.plan_shadow |
+| `TLG_E3_CENSUS=1` | /stats native_backend.device.e3_census |
+`last_counters.json` carries /stats every 20 s; `user/log/target_desc_counters.json` carries the target description report every 30 s.
+
+## 13. Task 1: the sync producers (TLG_SYNC_TYPED=1)
+
+**Not possible from the cloud as asked: hooking the engine functions.** A hook is an entry in the owner's hooks file (a name, an address and the expected bytes at it, read from the binary); this container has neither
+the eboot nor a decompiler, so I cannot find the other writers, say which arguments carry their fields, or write a hook entry whose expect bytes are right. What is built, and what is left:
+
+* **How the packets get to the tags today** (read in native_draw.cpp): only `FenceEop` is hooked on the producer side (`TagFenceSignal`, hook name `FenceEop`, Ghidra 0x2480d60): after the game's function returns, the hook
+  converts the 6 dword end-of-pipe packet at the command buffer cursor it had before (`ctx + 0x47d0`). Every other sync packet (compute release memory 0x49, wait on label 0x3c, CPU write to a label 0x37, CP DMA 0x50, the
+  occlusion dump event) is found by `SweepSyncPackets` when the next tag is written or the command buffer is submitted, and converted by `ConvertSyncPacket`. No function that writes them is hooked in this tree
+  (`OriginalEntry` names in use: AppMemoryInit AscBegin AscDispatch AscDispatchFenced AsyncMap DeviceBegin DispatchIndirect Dispatch_02479810 Dispatch_0247e340 DrawDecalPass DrawForwardPass DrawGBufferPrimitives
+  DrawIndexedCommon DrawIndexedIndirect DrawZPass FenceEop InstanceLoop Map PrepareDraw ResTransition ResourceBufferCreate SkinWrites StagingWorker WetSim; the async copy `FUN_024717c0` is served through the
+  async dispatch hooks, not a packet hook).
+* **The shadow harness (`native_sync.{h,cpp}`, namespace `Typed`).** A producer calls `Typed::Expect(packet_address, record)` with the record it believes it wrote (`Fence`, `LabelWait`, `LabelWrite`, `DmaCopy`);
+  `ConvertSyncPacket` calls `Typed::Met(packet_address, kind, packet words)` right before it turns the packet into a tag; `Met` decodes the words with the existing decoder and compares field by field with the expectation.
+  Counters per kind (`eop`, `release`, `wait`, `write`, `dma`): `evaluated`, `differing`, `differing_fields`, `without_typed_source`; plus `expected_total`, `expected_overwritten_before_met`, `expected_never_met`
+  and the first differences with both values.
+* **The one producer wired: `FenceEop`.** The hook builds `Fence{address = the label the function returns, value = 0x10, source = Immediate32, interrupt = false}` (from the documented behaviour in native_sync.h: it
+  stores 0x11 in the label, the packet stores 0x10 there when the GPU has finished all earlier work) and expects it at the packet's address. Expectation: `eop.evaluated` > 0 and `eop.differing` 0.
+* **What the counters will tell you:** `without_typed_source` per kind is the number of packets that still have no producer, i.e. the size of the remaining work per kind; `eop.without_typed_source` counts the
+  end-of-pipe writes `FenceEop` did not write (for example the frame fence in `JsSwapChain_SubmitAndFlip`, 0x1c4dfa0).
+* **For the local session, per remaining writer** (Ghidra): which packet it writes (opcode, 6 / 7 dwords), which arguments carry address, value or data, whether it writes through the command buffer cursor at `ctx + 0x47d0`
+  (graphics, as `FenceEop`) or another cursor (the async queue); then a hook entry and a hook function after the pattern of `TagFenceSignal`: run the original, read the cursor before and after, build the typed record
+  from the arguments, `Typed::Expect(cursor_before, record)`. The writers named in the plan (section 9): `FUN_024717c0` (async copy), `FUN_024a4ab0`, `FUN_01c6e670`, `FUN_024a5e20`, `FUN_01c6e320`, `FUN_024a53e0`
+  (CP DMA, 17 per run in the default scene) and the label write / wait wrappers.
+  Gate: 0 differing per kind over a 25 s regression run and a longer run. No deletion.
+
+## 14. Task 2: the register-only target fields (TLG_TARGET_REGONLY=1)
+
+No new Ghidra reading was possible (no binary, no decompiler here). The candidates come from the structures and the earlier Ghidra answers (section 6); each is compared with the register value and counted, never applied.
+Where the objects cannot decide it, the report says so by the `compare_only_differs` count and the value histogram. A field is a constant of the game only when its histogram has one value; I cannot say that without a run, so no
+constant is named yet.
+
+| field | candidate from the engine's objects | evidence | counters |
+|---|---|---|---|
+| colour `info.linear_general` (bit 7) | the resource's T# tiling index is 31 (`DisplayLinearGeneral`) | `GetTileMode()` returns that mode exactly when the bit is set (regs_color.h); the three info words quoted from the local runs all have it 0 | `colour_fields.info_linear_general.compare_only(_differs)`, histogram `<path>/colour/info_linear_general` |
+| colour `info.compression` (bit 14) | the resource's prebuilt block has an fmask base (resource `+0xb0 + 9 * 4` != 0, mip 0) | the only reader is the fmask address in `ImageInfo.meta_info` (image_info.cpp:80); fmask exists for multisample targets; Ghidra Q9: `FUN_02491a30` never writes the fmask words | `info_compression` |
+| colour `info.alt_tile_mode` (bit 31) | the resource's T# `alt_tile_mode` bit (Neo mode) | `AmdGpu::Image::alt_tile_mode` is the Neo bit of the T#; `ImageInfo.alt_tile` reads the register bit only on Neo | `info_alt_tile_mode` |
+| colour fmask words (9, 10) | the prebuilt block's words (`+0xd4`, `+0xd8`) at mip 0, 0 above | Ghidra Q9: only the prebuilt block writes them; the view's block is a copy of it | `fmask_base`, `fmask_slice` |
+| depth stencil bases without a stencil (words 3, 5) | resource `+0x40 >> 8` | Ghidra Q8: both stencil bases are resource `+0x40 >> 8`; the question is what the registers hold when the stencil format is invalid | `stencil_read_base`, `stencil_write_base` (compare-only when no stencil) |
+| depth view read-only bits (24, 25) | the DSV description's flags at `+0x48` (bit 0 depth, bit 1 stencil: D3D11_DSV_READ_ONLY_*) | no reader of the bits in the port (grep); the flags are in the D3D11 description | `view_read_only` |
+| depth and stencil clear values (words 10, 11) | (a) resource `+0x158` / `+0x15c` (compare-only since round 6); (b) the arguments of the `ClearDepthStencilView` call: depth in `ymm0`, stencil in `rcx & 0xff`, flags in `rdx` (the existing hook, native_device.cpp `ClearDsvEnter`), against the values the clear's setup wrote into the clear registers | the registers of a depth clear record come from the clear function's setup packets (`TakeClearPrelude`: registers 0xa stencil, 0xb depth), i.e. from the call's arguments, not from an object; (a) differed in a few cases per long play | (a) `depth_clear`, `stencil_clear` compare-only; (b) `depth_clear_call`: `evaluated`, `depth_equal / differs / register_absent`, `stencil_equal / differs / register_absent`, histograms of the call's and the register's values and of the flags |
+
+Expected: `compare_only_differs` 0 for the fields whose candidate is right; where it is not 0 the histogram and the examples say what the register holds instead. Fields where I expect the objects NOT to decide: the clear
+values on the fill path (they are the clear call's, a call argument: (b) tests exactly that), and `alt_tile_mode` (Neo only; may be a constant 0 on this console model: the histogram will say).
+
+## 15. Task 3: what the register fallback reads (TLG_PLAN_SHADOW=1)
+
+**The fallback.** `PlanExecDraw` plans a draw from its record only when the render target inputs and the pipeline of its keys are cached (`exec_inputs`, `exec_pipelines`). The first sight of a key (`exec_reason` 4, about 480
+per 25 s; a few of 6 and 7) goes through `PlanDraw(exec_state, ...)` in the register image: `MakeDrawInputs(regs)`, `pipeline_cache.PlanGraphics(regs, ...)`, which runs `GetGraphicsPipeline` (the stage lookup by
+`ProgramForStage`), `RefreshGraphicsKey`, `RefreshGraphicsStages` and `BuildRuntimeInfo`. `ClassifyDraw(regs)` runs only for plans that are not `executed` (the packet path, verify). `MakeFixedState(regs)` runs only where the
+record has no native fixed state. The register image `exec_state` is written from the record (`Synthesize`'s output) by `ExecApplyRecord`; so for a field the record carries, the register value is the engine's word as the
+record builder read it, and the "native value" below is the typed value the record builder or the shader object gives for the same thing. The counters compare those two.
+
+The members of `DrawRegs` read by these functions (found by listing `regs.<member>` in vk_pipeline_cache.cpp, vk_fixed_state.cpp and vk_rasterizer.cpp, then reading each use) and where the native side has the value:
+
+| DrawRegs member | read by | native value | shadow counter group/field |
+|---|---|---|---|
+| `color_buffers[8]` | `MakeDrawInputs`; `RefreshGraphicsKey` (data / number format, conversion, swizzle, samples, blend_bypass); `PrepareRenderState`, `BeginRendering` through `DrawInputs` | the target description (default, played), applied to `DrawInputs` only: the pipeline key reads `regs.color_buffers` directly | `feeds_the_draw` (applied differs) and `pipeline_key_targets/color.*` (the key's fields, register vs native-applied inputs) |
+| `depth_buffer` | `MakeDrawInputs`; `RefreshGraphicsKey` (z / stencil format, samples, validity) | target description (same remark) | `pipeline_key_targets/depth.*`, `stencil.*` |
+| `depth_view`, `depth_htile_data_base` | `MakeDrawInputs` | target description | `feeds_the_draw` |
+| `depth_clear`, `stencil_clear` | `MakeDrawInputs` | none that decides: registers (section 14) | `feeds_the_draw` compare-only |
+| `depth_control` | `MakeDrawInputs` (`depth_enable`, `stencil_enable`, `depth_write_enable` gate the depth target and the depth image view) | `FixedState.depth_test`, `depth_write`, `stencil_test` | `inputs_vs_native_fixed/depth_control.*` |
+| `depth_render_control` | `MakeDrawInputs` (clear flags) | `FixedState.depth_clear`, `stencil_clear` (the engine's own clear operations also arrive as records) | `inputs_vs_native_fixed/depth_render_control.*` |
+| `num_indices`, `num_instances`, `index_base_address`, `index_buffer_type`, `max_index_size` | `MakeDrawInputs` | `DrawArgs` of the record (E1b, typed) | `draw_args/*` (only where the record sets the argument; `num_indices` only for non-inline draws) |
+| `index_offset` | `MakeDrawInputs` (`GetDrawOffsets`) | none (VGT_INDX_OFFSET; the base vertex also arrives as user data) | `inputs/index_offset` (register only) |
+| `vgt_instance_step_rate_0/1` | `MakeDrawInputs`, `BuildRuntimeInfo` | `ShaderEnv.rates` | `shader_env.vertex/step_rate_0, step_rate_1` |
+| `ta_bc_base` | `MakeDrawInputs` (border colour table of the samplers) | none | `inputs/ta_bc_base` (register only) |
+| `clip_user_data` | `MakeDrawInputs` | none (0 in the native path) | `inputs/clip_user_data` (register only) |
+| `vs_program`, `ps_program` | `GetGraphicsPipeline` / `RefreshGraphicsStages` (`ProgramForStage`, `GetParams`: address, user data, flat table), `BuildRuntimeInfo` (`BuildCommon`: float modes, vgprs, user data count, vgpr components, dx10 clamp) | `ShaderEnv.program`, `user_data` (shader objects; typed user data of the record) | `program/vs_address, ps_address`, `user_data/*`, `shader_env.vertex/*`, `shader_env.pixel/*` |
+| `vs_output_control` | `BuildRuntimeInfo` (`MapOutputs`), clip distance emulation | `ShaderEnv.exports.vs_out_control` (decides for the outputs; the clip distance emulation input still reads the register) | `shader_env.vertex/num_outputs, outputs`; `translator_input.fragment/clip_distance_emulation` (register only) |
+| `ps_input_ena`, `ps_input_addr`, `num_interp`, `ps_inputs[32]`, `barycentric_control`, `depth_shader_control`, `z_export_format` | `BuildRuntimeInfo` (fragment) | `ShaderEnv.fragment` | `shader_env.pixel/*` |
+| `color_export_format` | `RefreshGraphicsKey` | `ShaderEnv.fragment.color_export_format` | `shader_env.pixel/color_export_format` |
+| `aa_config` | `BuildRuntimeInfo` (`num_samples` when the shader reads sample coverage) | none (the render pass sample count is in the target description) | `translator_input.fragment/aa_config.NumSamples` (register only) |
+| `stage_enable` (`raw`, `IsStageEnabled`, `hs_en`) | `GetGraphicsPipeline` (exec cache entry), `RefreshGraphicsKey`, `RefreshGraphicsStages`, `BuildRuntimeInfo` | `ShaderEnv.stages` exists in the contract; the native draws are vertex + pixel only | `stages/stage_enable.raw` (register only: nonzero = a tessellation / geometry draw) |
+| `ls_program`, `hs_program`, `es_program`, `gs_program`, `ls_hs_config`, `tess_config`, `vgt_gs_mode`, `vgt_gs_instance_cnt`, `vgt_gs_max_vert_out`, `vgt_gs_out_prim_type`, `vgt_gs_vert_itemsize`, `vgt_esgs_ring_itemsize`, `vgt_strmout_config` | `BuildRuntimeInfo` (local, hull, export, geometry), `RefreshGraphicsStages` | `ShaderEnv.tessellation`, `geometry` exist in the contract; the default scene does not use these stages | `stages/ls_hs_config, tess_config, vgt_gs_mode.onchip, vgt_strmout_config.raw` and `translator_input.stage_built/*` (register only: how often a draw builds them) |
+| `clipper_control`, `color_control`, `polygon_control`, `viewport_control`, `viewports[]`, `viewport_scissors[]`, `screen_scissor`, `generic_scissor`, `window_*`, `stencil_*`, `blend_*`, `poly_offset`, `line_control`, `mode_control`, `primitive_*`, `color_target_mask`, `color_shader_mask`, `depth_bounds_*`, `depth_render_override` | `MakeFixedState(regs)` (only where the record has no native fixed state), `ClassifyDraw` (not executed draws) | the native fixed state (`Fixed::Build`, played), every `FixedState` field | `fixed_state/<field>` (every field of `FixedState`) |
+
+Each group compares at the point both values exist: the fixed state, draw arguments and user data in `native_liverpool.cpp` right after the fallback plan; the key's target fields at the end of `PlanDraw`; the translator input
+inside `BuildRuntimeInfo` (the register-built input before and after `ApplyShaderEnv`); the program addresses in `GetGraphicsPipeline` before the key is built. A field with `differs` 0 over a 25 s run and over a longer one is
+safe to drop first; a `register_only` field with `nonzero` 0 is a candidate to drop (or to turn into a constant) as well.
+
+## 16. Task 4: who still needs the address keyed image code (TLG_E3_CENSUS=1)
+
+`native_e3_census.{h,cpp}`. Counted per named caller: `RefreshImage` (callers: Presenter::PrepareFrame, Rasterizer::BindTexturesFromSet, Rasterizer::BeginRenderingFull, Rasterizer::TryCopyImages, Rasterizer::NativeClear,
+TextureCache::FindTexture / FindRenderTarget / FindDepthTarget through `UpdateImage`; and inside the cache FindImage (the rest of a texture before its engine clear), ExpandImage, ResolveDepthOverlap), `ExpandImage`
+(ResolveOverlap equal address: block view of an uncompressed image, 3D view of equal size, grow), `ResolveDepthOverlap`, `ResolveOverlap` (FindImage) and `exact_match` (FindImage: the engine texture's list, the remembered
+answer). Each with `count` and `per_25s` (scaled by the observed seconds). `refresh_uploads`: for each caller the uploads from guest memory, hashed (XXH3 of the source bytes) and compared with the previous upload of the same
+image: `first_upload_of_the_image`, `bytes_differ_from_last_upload`, `bytes_same_as_last_upload` (an upload that carried nothing new), `source_gpu_written_not_hashed`, megabytes hashed and megabytes in the same-bytes uploads.
+Read it as: a caller with `per_25s` 0 over the scenes you play does not need the function; a caller whose uploads are mostly `bytes_same_as_last_upload` is refreshing without a cause.

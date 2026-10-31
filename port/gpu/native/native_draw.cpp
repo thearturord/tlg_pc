@@ -49,6 +49,7 @@
 #include "native/native_resources.h"
 #include "native/native_target_desc.h"
 #include "native/native_updates.h"
+#include "native/native_sync.h"
 #include "native/native_zpass_audit.h"
 #include "native/native_zpass_gen.h"
 #include "native/native_gbuffer_audit.h"
@@ -861,11 +862,13 @@ u32 ConvertSyncPacket(u64 at) {
     const u32 opcode = (header >> 8) & 0xff;
     const u32 count = (header >> 16) & 0x3fff;
     if (opcode == 0x47 && header == 0xC0044700u) {
+        Core::NativeSync::Typed::Met(at, Core::NativeSync::Typed::KindEop, reinterpret_cast<const u32*>(at)); // E7b Task 1 (TLG_SYNC_TYPED=1)
         Wr<u32>(at, 4, VideoCore::NativeFenceMagic);
         Wr<u32>(at, 0, 0xC0041000u);
         return SyncEop;
     }
     if (opcode == 0x49 && count == 5) {
+        Core::NativeSync::Typed::Met(at, Core::NativeSync::Typed::KindRelease, reinterpret_cast<const u32*>(at));
         Wr<u32>(at, 4, ReleaseMagic);
         Wr<u32>(at, 0, 0xC0051000u);
         return SyncRelease;
@@ -873,6 +876,7 @@ u32 ConvertSyncPacket(u64 at) {
     if (opcode == 0x3c && count == 5) {
         const u32 control = Rd<u32>(at, 4);
         if ((control & ~0xffu) == 0 && (control & 0x10) != 0) {
+            Core::NativeSync::Typed::Met(at, Core::NativeSync::Typed::KindWait, reinterpret_cast<const u32*>(at));
             Wr<u32>(at, 4, WaitMagicBase | control);
             Wr<u32>(at, 0, 0xC0051000u);
             return SyncWait;
@@ -893,6 +897,7 @@ u32 ConvertSyncPacket(u64 at) {
     }
     if (opcode == 0x50 && count == 5 && Rd<u32>(at, 4) == 0x84004000u && E5TagsOn()) {
         // CP DMA with the control dword the game uses (memory to memory, 7 dwords): [header, control, source lo, hi, destination lo, hi, command]
+        Core::NativeSync::Typed::Met(at, Core::NativeSync::Typed::KindDma, reinterpret_cast<const u32*>(at));
         Wr<u32>(at, 4, DmaMagic);
         Wr<u32>(at, 0, 0xC0051000u);
         return SyncDma;
@@ -908,6 +913,7 @@ u32 ConvertSyncPacket(u64 at) {
         const u32 control = Rd<u32>(at, 4);
         const u32 destination = (control >> 8) & 0xf;
         if ((control & 0x10000) == 0 && (destination == 2 || destination == 5)) {
+            Core::NativeSync::Typed::Met(at, Core::NativeSync::Typed::KindWrite, reinterpret_cast<const u32*>(at));
             Wr<u32>(at, 4, WriteMagicBase | destination);
             Wr<u32>(at, 0, 0xC0001000u | count << 16);
             return SyncWrite;
@@ -6167,6 +6173,16 @@ u64 PS4_SYSV_ABI TagFenceSignal(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
     const u64 before = Rd<u64>(ctx, 0x47d0);
     const u64 label = reinterpret_cast<GuestFunction6>(original)(ctx, a1, a2, a3, a4, a5);
     const u64 after = Rd<u64>(ctx, 0x47d0);
+    if (Core::NativeSync::Typed::On() && after == before + 6 * sizeof(u32) && (before & 3) == 0) {
+        // E7b Task 1 (TLG_SYNC_TYPED=1): what FenceEop says it wrote, built from its own result and its documented behaviour (it stores 0x11 at the label, the packet stores 0x10 there when the GPU
+        // has finished all earlier work, no interrupt): an end-of-pipe write of a 32 bit immediate to the label it returns
+        Core::NativeSync::Fence typed;
+        typed.address = label;
+        typed.value = 0x10;
+        typed.source = Core::NativeSync::Source::Immediate32;
+        typed.interrupt = false;
+        Core::NativeSync::Typed::Expect(before, typed, Core::NativeSync::Typed::KindEop);
+    }
     if (after == before + 6 * sizeof(u32) && (before & 3) == 0 && ConvertSyncPacket(before) == SyncEop) {
         CountSyncConverted(SyncEop, Live().sync_converted_hook);
     } else {
