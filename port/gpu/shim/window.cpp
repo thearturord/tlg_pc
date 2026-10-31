@@ -10,6 +10,7 @@
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "native/native_raster_prof.h"
 #include "native/native_stall.h"
 #include "native/native_timeline.h"
 #include "sdl_window.h"
@@ -366,7 +367,13 @@ bool WindowSDL::PollEvents() {
         }();
         // tlg: F9 starts the frame profiler (a 10 s capture into user/log/timeline_f9_<time>.bin/.json, documents/tlg/frame-profiler.md) or stops a running one.
         if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F9 && !event.key.repeat) {
-            if (!Core::FrameTimeline::StopCapture()) {
+            if ((event.key.mod & SDL_KMOD_SHIFT) != 0 || Core::RasterProf::Recording()) {
+                // tlg: Shift+F9 starts the raster thread profiler (a 10 s capture of what the raster thread's time goes to, inside each draw and dispatch; the report is user/log/raster_<time>.html,
+                // opened in the browser) or stops a running one.
+                if (!Core::RasterProf::Stop()) {
+                    Core::RasterProf::Start(10, true);
+                }
+            } else if (!Core::FrameTimeline::StopCapture()) {
                 Core::FrameTimeline::StartCapture(10, "f9_" + std::to_string(static_cast<long long>(std::time(nullptr))));
             }
             continue;

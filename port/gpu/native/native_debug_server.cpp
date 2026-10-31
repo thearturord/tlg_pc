@@ -39,6 +39,7 @@
 #include "video_core/renderdoc.h"
 #include "native/native_readbacks.h"
 #include "native/native_raycast_cpu.h"
+#include "native/native_raster_prof.h"
 #include "native/native_stall.h"
 #include "native/shader_env.h"
 #include "native/native_frame_events.h"
@@ -579,6 +580,19 @@ void RegisterBuiltins() {
                      Core::Stall::Start(static_cast<u32>(std::min<u64>(ParseNumber(params, "seconds", 10), 60)), ParseNumber(params, "open", 0) != 0);
                  }
                  return nlohmann::json{{"recording", Core::Stall::Recording()}, {"report_age_s", Core::Stall::ReportAgeSeconds()}};
+             });
+    Register("/raster_profile", "?seconds=10 starts the raster thread profiler (the same as Shift+F9); without arguments it shows whether it runs and the last report (phases inside the raster thread's draws and dispatches)",
+             [](const Params& params) {
+                 if (params.contains("seconds")) {
+                     Core::RasterProf::Start(static_cast<u32>(std::min<u64>(ParseNumber(params, "seconds", 10), 60)), ParseNumber(params, "open", 0) != 0);
+                 }
+                 nlohmann::json j = nlohmann::json::parse(Core::RasterProf::ReportJson(), nullptr, false);
+                 if (j.is_discarded() || !j.is_object()) {
+                     j = nlohmann::json::object();
+                 }
+                 j["recording"] = Core::RasterProf::Recording();
+                 j["report_age_s"] = Core::RasterProf::ReportAgeSeconds();
+                 return j;
              });
     Register("/frame_events", "E6.2a: the console's frame events (end of pipe, compute releases, GPU idle, flip ready): signals and subscriber runs",
              [](const Params&) { auto j = Core::NativeFrameEvents::Report(); j["flip_request"] = Core::NativeFlip::Report(); j["display"] = Core::NativeDisplay::Report(); j["presenter"] = Core::NativePresenter::Report(); j["shader_env"] = Core::NativeShaderEnv::Report(); return j; });

@@ -573,3 +573,13 @@ a depth attachment or a storage usage, and whether an engine texture owns the me
 **What this can not decide.** Whether the engine's announcements cover everything the uploads read is answered for the pages hashed at announcement; a page announced by a range over 2 MB is counted as announced but is not compared
 (`pages_not_hashed_range_over_2mb`). A write after the announcement and before the upload looks the same as a write the announcement did not cover (`announced_differs`): `announcements_ago` and the example's engine texture show which
 it is; the answer needs the hook of the writer if the examples name one texture again and again.
+
+## 20. Shift+F9: the raster thread profiler
+
+`native_raster_prof.{h,cpp}`. Key Shift+F9 (or `/raster_profile?seconds=10&open=1`; Shift+F9 or F9 again stops it). F8 says which thread limits the frame, F9 times the game's jobs and the stage threads as a whole; neither looks inside `shadPS4:GpuRaster`. This does.
+
+How it works: a 10 s capture (the same machinery as F8, so the frames are counted from `SubmitFlip`) during which the raster thread times named phases (`Phase` in the header: operation, ring use, pop of pending operations, filter, pipeline lookup, fixed state and inputs, BindResources and inside it BindBuffers / ObtainBuffer / BindTextures / FindImage / FindView / RefreshImage (with ObtainBufferForImage, DetileImage, UploadImage) / BindSamplers / GetSampler, BeginRendering, vertex and index buffers, barriers, descriptor push, dynamic state, scheduler begin/end rendering, the record of the draw or dispatch, ResetBindings, the wait for the encoder queue) as nested scopes. Nothing is written per scope: the time is accumulated on the raster thread (timestamp counter, converted at the end), by phase and by path, so the report has inclusive and own (exclusive) time. Outside a profile a scope is one relaxed atomic load.
+
+Report (`user/log/raster_<time>.html` and `.txt`, also `raster_latest.*`): the cards (busy and idle ms per frame, operations per frame), the phases ranked by own time, the phase tree, the operations by engine caller (the Ghidra address `RecordCallerGhidra` gives, with the pass class), and the 12 slowest single operations with their three biggest phases. The report states how many scopes ran per frame and what that costs (an estimate of 20 to 40 ns each, not measured): compare shapes, not absolute numbers.
+
+Limits: only the raster thread of the split pipeline is measured (nothing is recorded if the split is off); the call into the Vulkan driver is inside `record` and the descriptor push, the draw and dispatch calls themselves are not split further; `DrawIndirect` / `DispatchIndirect` show their shared phases (BindResources and below) and the operation total only.
