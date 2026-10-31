@@ -59,7 +59,7 @@ struct LiveCounters {
     std::atomic<u64> stage_key_hits{}, stage_key_misses{}, stage_key_uncached{}, stage_key_audits{}, stage_key_violations{};
     /// cp_exec_inputs: draws planned from the record alone, draws that could not be (no cached inputs or pipeline yet), draws planned both ways and compared, and the ones that differed
     std::atomic<u64> exec_typed{}, exec_fallback{}, exec_audits{}, exec_violations{};
-    std::atomic<u64> draw_args_compared{}, draw_args_differing{}; ///< E1b: the typed draw arguments against the ones the argument registers give
+    std::atomic<u64> draw_args_typed{}; ///< E1b: draws whose arguments came from the record's typed values
     std::array<std::atomic<u64>, 12> fixed_null{}; ///< why Fixed::Build gave no fixed state (by exit point)
     std::array<std::atomic<u64>, 3> plan_null{};   ///< why PlanExecDraw gave no plan: 0 stale surface / clip, 1 inputs not learned yet, 2 pipeline plan failed
     /// why a draw was not planned from its record: 0 the switches are not all on, 1 the record has no key (not typed, no fixed state), 2 the command processor is not split,
@@ -171,7 +171,8 @@ struct ExecRegister {
 
 /// A draw the game's render layer did not write as command packets: the registers its objects describe and the
 /// draw arguments.
-/// E1b: the arguments of a draw as typed values, set by the record builder where it used to emit the argument registers (VGT_NUM_INDICES, VGT_NUM_INSTANCES,
+/// E1b (played 2026-10-31): the arguments of a draw as typed values, set by the record builder where it also emits the argument registers (still used by the draws that
+/// are not planned from their record) (VGT_NUM_INDICES, VGT_NUM_INSTANCES,
 /// the index buffer base, type and maximum size). `mask` says which of them the record set; the others keep what the plan's cached inputs hold.
 struct DrawArgs {
     static constexpr u32 NumIndices = 1, NumInstances = 2, IndexBase = 4, IndexType = 8, MaxIndexSize = 16;

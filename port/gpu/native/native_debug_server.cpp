@@ -206,7 +206,7 @@ nlohmann::json Native(const Params&) {
     }
     j["stage_key"] = {{"hits", live.stage_key_hits.load()}, {"misses", live.stage_key_misses.load()}, {"uncached", live.stage_key_uncached.load()},
                       {"audits", live.stage_key_audits.load()}, {"violations", live.stage_key_violations.load()}};
-    j["draw_args"] = {{"typed_against_registers_compared", live.draw_args_compared.load()}, {"differing", live.draw_args_differing.load()}};
+    j["draw_args"] = {{"draws_with_typed_arguments", live.draw_args_typed.load()}};
     j["exec_inputs"] = {{"typed", live.exec_typed.load()}, {"fallback", live.exec_fallback.load()}, {"audits", live.exec_audits.load()}, {"violations", live.exec_violations.load()},
                         {"fast_clear", live.exec_fast_clear.load()}, {"inline", live.exec_inline.load()}, {"inline_seen", live.exec_inline_seen.load()},
                         {"reasons", {live.exec_reason[0].load(), live.exec_reason[1].load(), live.exec_reason[2].load(), live.exec_reason[3].load(),
