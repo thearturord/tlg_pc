@@ -70,7 +70,7 @@ void BufferCache::NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool 
         } else if (block != 0) {
             Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9MemberLeft);
             if (auto* object = Core::NativeResources::FindImmutableById(id)) {
-                object->gpu_arena_epoch.store(~u64{0}, std::memory_order_release);
+                object->resident_epoch.store(~u64{0}, std::memory_order_release);
             }
         }
         place_refused.erase(id);
@@ -293,9 +293,9 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
         NoteResolutionUser(dst, id);
         if (auto* object = Core::NativeResources::FindImmutableById(id)) {
             // the resident object's binding resolution (R2) names the block's buffer from now on; the other objects' resolutions stay valid
-            object->gpu_arena.store(dst, std::memory_order_relaxed);
-            object->gpu_arena_base.store(dst->cpu_addr, std::memory_order_relaxed);
-            object->gpu_arena_epoch.store(ArenaEpoch(), std::memory_order_release);
+            object->resident_buffer.store(dst, std::memory_order_relaxed);
+            object->resident_base.store(dst->cpu_addr, std::memory_order_relaxed);
+            object->resident_epoch.store(PlacementEpoch(), std::memory_order_release);
         }
     }
     return dst;
@@ -337,7 +337,7 @@ void BufferCache::DropPlaced(VAddr begin) {
     range_epoch.fetch_add(1, std::memory_order_acq_rel);
     for (const u64 id : ids) {
         if (auto* object = Core::NativeResources::FindImmutableById(id)) {
-            object->gpu_arena_epoch.store(~u64{0}, std::memory_order_release); // its binding resolution is made again
+            object->resident_epoch.store(~u64{0}, std::memory_order_release); // its binding resolution is made again
         }
     }
     // freed once the GPU is done with the work recorded so far (its descriptor slots are dropped by the buffer's destructor)
@@ -402,9 +402,9 @@ void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, boo
                 }
                 b9_epoch.fetch_add(1, std::memory_order_acq_rel);
                 if (auto* object = Core::NativeResources::FindImmutableById(id)) {
-                    object->gpu_arena.store(entry.buffer.get(), std::memory_order_relaxed);
-                    object->gpu_arena_base.store(entry.buffer->cpu_addr, std::memory_order_relaxed);
-                    object->gpu_arena_epoch.store(ArenaEpoch(), std::memory_order_release);
+                    object->resident_buffer.store(entry.buffer.get(), std::memory_order_relaxed);
+                    object->resident_base.store(entry.buffer->cpu_addr, std::memory_order_relaxed);
+                    object->resident_epoch.store(PlacementEpoch(), std::memory_order_release);
                 }
                 return;
             }

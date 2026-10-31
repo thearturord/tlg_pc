@@ -146,8 +146,8 @@ public:
     /// parts no buffer holds (B9.3 step 2: what the page tracker still marks)
     void MarkBuffersChanged(VAddr address, u64 size, bool announced, std::vector<std::pair<VAddr, VAddr>>* gaps);
     /// R1: changes when an arena is replaced
-    [[nodiscard]] u64 ArenaEpoch() const noexcept {
-        return arena_epoch.load(std::memory_order_acquire);
+    [[nodiscard]] u64 PlacementEpoch() const noexcept {
+        return placement_epoch.load(std::memory_order_acquire);
     }
     /// R1b: the object's own copy in the stream ring for [device_addr, device_addr + size) when it is current (no copy is made); null when not
     [[nodiscard]] const Buffer* ObjectCopy(const Core::NativeResources::ImmutableBuffer& object, VAddr device_addr, u64& offset) const noexcept {
@@ -297,7 +297,7 @@ private:
         u32 size;
         const Buffer* buffer;
         u64 offset;
-        u64 range_epoch, arena_epoch, wraps, epoch;
+        u64 range_epoch, placement_epoch, wraps, epoch;
     };
     struct BindMemo {
         u64 tick{~u64{0}};
@@ -369,7 +369,7 @@ private:
     static constexpr u32 ObtainMemoSlots = 8192;
     std::unique_ptr<ObtainMemo[]> obtain_memo;
     std::atomic<u64> range_epoch{0}; ///< bumped when the GPU modified ranges shrink or the arenas move
-    std::atomic<u64> arena_epoch{0}; ///< R1: bumped when an arena is replaced (a binding resolved against the old one is stale)
+    std::atomic<u64> placement_epoch{0}; ///< R1: bumped when an arena is replaced (a binding resolved against the old one is stale)
     /// Guards gpu_modified_ranges.
     mutable std::shared_mutex gpu_ranges_mutex;
 

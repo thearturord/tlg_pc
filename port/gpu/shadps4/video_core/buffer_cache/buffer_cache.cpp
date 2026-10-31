@@ -681,10 +681,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }
     const u64 epoch = bind_memo_epoch.load(std::memory_order_acquire);
     const u64 ranges = range_epoch.load(std::memory_order_acquire);
-    const u64 arenas = ArenaEpoch();
+    const u64 arenas = PlacementEpoch();
     if (const auto it = memo.entries.find(device_addr); it != memo.entries.end()) {
         for (const auto& e : it->second) {
-            if (e.size == size && e.epoch == epoch && e.range_epoch == ranges && e.arena_epoch == arenas &&
+            if (e.size == size && e.epoch == epoch && e.range_epoch == ranges && e.placement_epoch == arenas &&
                 (e.buffer != &stream_buffer || e.wraps == stream_buffer.WrapCount())) {
                 bind_memo_counts[0].fetch_add(1, std::memory_order_relaxed);
                 return {e.buffer, e.offset};
@@ -788,13 +788,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             if (immutable->synced.load(std::memory_order_acquire) && !Core::NativeResources::ImmutableCheck(*immutable) &&
                 (immutable->usage == 1 || !IsRegionCpuModified(device_addr, size))) {
                 const auto* arena = BufferFor(device_addr, size); // B9.4: the object's own Vulkan buffer when it is placed
-                if (immutable->gpu_arena_epoch.load(std::memory_order_relaxed) != ArenaEpoch() && immutable->begin >= arena->cpu_addr &&
+                if (immutable->resident_epoch.load(std::memory_order_relaxed) != PlacementEpoch() && immutable->begin >= arena->cpu_addr &&
                     immutable->end <= arena->cpu_addr + arena->size_bytes) {
                     // R1: the arenas moved since the synchronization; the object is resident in this one now
                     NoteResolutionUser(arena, immutable->id);
-                    immutable->gpu_arena.store(arena, std::memory_order_relaxed);
-                    immutable->gpu_arena_base.store(arena->cpu_addr, std::memory_order_relaxed);
-                    immutable->gpu_arena_epoch.store(ArenaEpoch(), std::memory_order_release);
+                    immutable->resident_buffer.store(arena, std::memory_order_relaxed);
+                    immutable->resident_base.store(arena->cpu_addr, std::memory_order_relaxed);
+                    immutable->resident_epoch.store(PlacementEpoch(), std::memory_order_release);
                 }
                 Core::NativeResources::NoteImmutableHit();
                 if (immutable->usage != 1) {
@@ -841,9 +841,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             }
             // R1: the object keeps where it is resident (read by the command processor's binding resolution once `synced` is set)
             NoteResolutionUser(arena, immutable->id);
-            immutable->gpu_arena.store(arena, std::memory_order_relaxed);
-            immutable->gpu_arena_base.store(arena->cpu_addr, std::memory_order_relaxed);
-            immutable->gpu_arena_epoch.store(ArenaEpoch(), std::memory_order_relaxed);
+            immutable->resident_buffer.store(arena, std::memory_order_relaxed);
+            immutable->resident_base.store(arena->cpu_addr, std::memory_order_relaxed);
+            immutable->resident_epoch.store(PlacementEpoch(), std::memory_order_relaxed);
             Core::NativeResources::ImmutableSynced(*immutable, generation);
             Core::NativeResources::NoteImmutableSync();
             if (immutable->usage != 1) {

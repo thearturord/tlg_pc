@@ -58,9 +58,9 @@ struct ImmutableBuffer {
     std::atomic<u32> requests{0};
     /// R1 (native back end): where the object is resident on the GPU since its last synchronization, written by the raster thread before `synced` (release):
     /// the buffer cache's arena (a `VideoCore::Buffer`), its guest base address and the arena epoch it was found at
-    std::atomic<const void*> gpu_arena{nullptr};
-    std::atomic<u64> gpu_arena_base{0};
-    std::atomic<u64> gpu_arena_epoch{~u64{0}};
+    std::atomic<const void*> resident_buffer{nullptr};
+    std::atomic<u64> resident_base{0};
+    std::atomic<u64> resident_epoch{~u64{0}};
     std::atomic<u32> gpu_writes{0}; ///< R1b: bumped when a GPU write (a written storage buffer, a copy or fill) covers bytes of the object
     /// R1b (raster thread only): the object's own copy in the stream ring, made once per generation for a default / dynamic buffer: valid while the generation,
     /// `gpu_writes` and the ring's wrap count are the ones it was made at

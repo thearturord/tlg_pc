@@ -1919,11 +1919,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         goto buffer_bound;
                     }
                     const bool ready = object->alive.load(std::memory_order_acquire) && object->synced.load(std::memory_order_acquire); // the arena fields are stored before `synced`
-                    const auto* arena = ready ? static_cast<const VideoCore::Buffer*>(object->gpu_arena.load(std::memory_order_relaxed)) : nullptr;
+                    const auto* arena = ready ? static_cast<const VideoCore::Buffer*>(object->resident_buffer.load(std::memory_order_relaxed)) : nullptr;
                     if (ready && object->generation.load(std::memory_order_acquire) == r.generation && arena != nullptr &&
-                        object->gpu_arena_epoch.load(std::memory_order_acquire) == buffer_cache.ArenaEpoch() &&
+                        object->resident_epoch.load(std::memory_order_acquire) == buffer_cache.PlacementEpoch() &&
                         (object->usage == 1 || !buffer_cache.IsRegionCpuModified(r.address, r.size))) { // as ObtainBuffer: the tracker's dirty bit is the safety net of a resident buffer
-                        const u64 offset = r.address - object->gpu_arena_base.load(std::memory_order_relaxed);
+                        const u64 offset = r.address - object->resident_base.load(std::memory_order_relaxed);
                         const u64 offset_aligned = Common::AlignDown(offset, alignment);
                         const u64 adjust = offset - offset_aligned;
                         push_data.AddOffset(binding.buffer, adjust);
@@ -1939,7 +1939,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     // why: 0 epoch, 1 gone, 2 not synchronized, 3 generation moved, 4 arena, 5 tracker dirty
                     const u32 why = !object->alive.load(std::memory_order_relaxed) ? 1 : !object->synced.load(std::memory_order_relaxed) ? 2
                                     : object->generation.load(std::memory_order_relaxed) != r.generation                       ? 3
-                                    : arena == nullptr || object->gpu_arena_epoch.load(std::memory_order_relaxed) != buffer_cache.ArenaEpoch() ? 4 : 5;
+                                    : arena == nullptr || object->resident_epoch.load(std::memory_order_relaxed) != buffer_cache.PlacementEpoch() ? 4 : 5;
                     resolve_stats.stale_why[why].fetch_add(1, std::memory_order_relaxed);
                 } else {
                     resolve_stats.stale_why[0].fetch_add(1, std::memory_order_relaxed);
