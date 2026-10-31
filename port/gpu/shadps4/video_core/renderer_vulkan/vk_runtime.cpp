@@ -1241,7 +1241,7 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
     // without a barrier in between (thousands of tiny constant buffer ranges) made every insert shift the
     // vector; with the native draw path on, a list that holds many ranges is replaced by the one range that
     // covers them all, which can only add a barrier, never drop one.
-    const bool bounded = Core::NativeConfig::DrawMode >= 2;
+    const bool bounded = true;
     const auto add_range = [bounded](auto& list, const Interval& new_range) {
         if (!bounded) {
             list.Add(new_range);

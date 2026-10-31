@@ -444,7 +444,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
         // then every 256th, `verify`) are compared with the registers' state; a difference is counted and the registers win.
         auto& live = Core::NativeDraw::Live();
         live.fixed_native.fetch_add(1, std::memory_order_relaxed);
-        if ((Core::NativeConfig::SdkStrip & 1073741824) != 0) {
+        if (false) {
             native_stale |= StaleClear;
         }
         // No group of the fixed-function state comes from the register mirror any more. The surface group (culling, front face, polygon
@@ -758,8 +758,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     Core::NativeRegistry::SetDrawClass(tag.valid ? (tag.meta & 0xff) : 15);
     Core::NativeRegistry::SetCurrentDraw(plan != nullptr && plan->native_seq != 0 ? plan->native_seq : (tag.valid ? tag.seq : 0), plan != nullptr && plan->native_seq != 0);
     const bool use_tag =
-        tag.valid &&
-        Core::NativeConfig::DrawMode >= 2;
+        tag.valid;
     const NativeLast last = native_last;
     native_last.valid = false;
     if (tag.valid) {

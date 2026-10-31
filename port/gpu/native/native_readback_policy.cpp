@@ -33,20 +33,10 @@ void InitFromSettings() {
     s.stream_submit = EmulatorSettings.GetCpStreamSubmit();
     s.stream_hooks = EmulatorSettings.GetCpStreamHooks();
     s.cp_delay_ns = EmulatorSettings.GetCpDelayNs();
-    s.group_sig = EmulatorSettings.GetCpGroupSig();
-    s.stage_key = EmulatorSettings.GetCpStageKey();
-    s.exec_inputs = EmulatorSettings.GetCpExecInputs();
     s.stream_probe = EmulatorSettings.GetCpStreamProbe();
     s.raster_delay_ns = EmulatorSettings.GetRasterDelayNs();
     s.raster_core = EmulatorSettings.GetCpRasterCore();
-    s.native_draw_mode = EmulatorSettings.GetNativeDrawMode();
-    s.native_draw_classes = EmulatorSettings.GetNativeDrawClasses();
-    s.native_synth_verify = EmulatorSettings.IsNativeSynthVerify() ? 1 : 0;
-    s.native_draw_exec = EmulatorSettings.IsNativeDrawExec() ? 1 : 0;
-    s.native_audit_every = EmulatorSettings.GetNativeAuditEvery();
-    s.map_native = static_cast<s32>(EmulatorSettings.GetNativeMap());
     s.packet_path = static_cast<s32>(EmulatorSettings.GetNativePacketPath());
-    s.native_sdk_strip = EmulatorSettings.GetNativeSdkStrip();
 }
 
 bool Set(std::string_view name, s64 value) {
@@ -79,30 +69,12 @@ bool Set(std::string_view name, s64 value) {
         s.stream_hooks = static_cast<u32>(value);
     } else if (name == "cp_delay_ns") {
         s.cp_delay_ns = static_cast<u32>(value);
-    } else if (name == "group_sig") {
-        s.group_sig = static_cast<u32>(value);
-    } else if (name == "stage_key") {
-        s.stage_key = static_cast<u32>(value);
-    } else if (name == "exec_inputs") {
-        s.exec_inputs = static_cast<u32>(value);
     } else if (name == "stream_probe") {
         s.stream_probe = static_cast<u32>(value);
     } else if (name == "raster_delay_ns") {
         s.raster_delay_ns = static_cast<u32>(value);
     } else if (name == "raster_core") {
         s.raster_core = static_cast<s32>(value);
-    } else if (name == "native_draw_mode") {
-        s.native_draw_mode = static_cast<u32>(value);
-    } else if (name == "native_draw_classes") {
-        s.native_draw_classes = static_cast<u32>(value);
-    } else if (name == "native_synth_verify") {
-        s.native_synth_verify = static_cast<u32>(value);
-    } else if (name == "native_draw_exec") {
-        s.native_draw_exec = static_cast<u32>(value);
-    } else if (name == "native_audit_every") {
-        s.native_audit_every = static_cast<u32>(value);
-    } else if (name == "native_sdk_strip") {
-        s.native_sdk_strip = static_cast<u32>(value);
     } else if (name == "fence_shortcut") {
         s.fence_shortcut_override = static_cast<s32>(value);
     } else if (name == "stream_reuse") {
@@ -128,8 +100,6 @@ bool Set(std::string_view name, s64 value) {
         s.packet_path = static_cast<s32>(value);
     } else if (name == "cs_audit") {
         s.cs_audit = static_cast<s32>(value);
-    } else if (name == "map_native") {
-        s.map_native = static_cast<s32>(value);
     } else if (name == "register_packets") {
         s.register_packets = static_cast<s32>(value);
     } else {
@@ -161,25 +131,17 @@ nlohmann::json Dump() {
             {"flush_commands", s.flush_commands.load()},
             {"skip_fill_drain", s.skip_fill_drain.load()},
             {"cp_delay_ns", s.cp_delay_ns.load()},
-            {"group_sig", s.group_sig.load()},
-            {"stage_key", s.stage_key.load()},
-            {"exec_inputs", s.exec_inputs.load()},
             {"stream_probe", s.stream_probe.load()},
             {"raster_delay_ns", s.raster_delay_ns.load()},
             {"stream_submit", s.stream_submit.load()},
             {"stream_hooks", s.stream_hooks.load()},
             {"raster_core", s.raster_core.load()},
-            {"native_draw_mode", s.native_draw_mode.load()},
-            {"native_draw_classes", s.native_draw_classes.load()},
-            {"native_audit_every", s.native_audit_every.load()},
-            {"native_sdk_strip", s.native_sdk_strip.load()},
             {"fence_shortcut", s.fence_shortcut_override.load()},
             {"stream_reuse", s.stream_reuse_override.load()},
             {"rt_reuse", s.rt_reuse_override.load()},
             {"stage_reuse", s.stage_reuse_override.load()},
             {"packet_path", s.packet_path.load()},
             {"cs_audit", s.cs_audit.load()},
-            {"map_native", s.map_native.load()},
             {"register_packets", s.register_packets.load()},
             {"note", "fence kinds: 1 gfx EOP, 2 gfx EOS, 4 compute release, 8 held write, "
                      "16 submit end"}};

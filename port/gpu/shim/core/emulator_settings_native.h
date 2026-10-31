@@ -16,9 +16,6 @@
     u32 m_cp_encoder_queue_depth = static_cast<u32>(Number("TLG_CP_ENCODER_QUEUE_DEPTH", static_cast<long>(8)));
     u32 GetCpEncoderQueueDepth() const { return m_cp_encoder_queue_depth; }
     void SetCpEncoderQueueDepth(u32 v, bool = false) { m_cp_encoder_queue_depth = v; }
-    u32 m_cp_exec_inputs = static_cast<u32>(Number("TLG_CP_EXEC_INPUTS", static_cast<long>(1)));
-    u32 GetCpExecInputs() const { return m_cp_exec_inputs; }
-    void SetCpExecInputs(u32 v, bool = false) { m_cp_exec_inputs = v; }
     u32 m_cp_flush_commands = static_cast<u32>(Number("TLG_CP_FLUSH_COMMANDS", static_cast<long>(0)));
     u32 GetCpFlushCommands() const { return m_cp_flush_commands; }
     void SetCpFlushCommands(u32 v, bool = false) { m_cp_flush_commands = v; }
@@ -28,9 +25,6 @@
     u32 m_cp_full_fence_kinds = static_cast<u32>(Number("TLG_CP_FULL_FENCE_KINDS", static_cast<long>(31)));
     u32 GetCpFullFenceKinds() const { return m_cp_full_fence_kinds; }
     void SetCpFullFenceKinds(u32 v, bool = false) { m_cp_full_fence_kinds = v; }
-    u32 m_cp_group_sig = static_cast<u32>(Number("TLG_CP_GROUP_SIG", static_cast<long>(1)));
-    u32 GetCpGroupSig() const { return m_cp_group_sig; }
-    void SetCpGroupSig(u32 v, bool = false) { m_cp_group_sig = v; }
     s32 m_cp_raster_core = static_cast<s32>(Number("TLG_CP_RASTER_CORE", static_cast<long>(-1)));
     s32 GetCpRasterCore() const { return m_cp_raster_core; }
     void SetCpRasterCore(s32 v, bool = false) { m_cp_raster_core = v; }
@@ -40,9 +34,6 @@
     u32 m_cp_split_mode = static_cast<u32>(Number("TLG_CP_SPLIT_MODE", static_cast<long>(1)));
     u32 GetCpSplitMode() const { return m_cp_split_mode; }
     void SetCpSplitMode(u32 v, bool = false) { m_cp_split_mode = v; }
-    u32 m_cp_stage_key = static_cast<u32>(Number("TLG_CP_STAGE_KEY", static_cast<long>(1)));
-    u32 GetCpStageKey() const { return m_cp_stage_key; }
-    void SetCpStageKey(u32 v, bool = false) { m_cp_stage_key = v; }
     u32 m_cp_stream_hooks = static_cast<u32>(Number("TLG_CP_STREAM_HOOKS", static_cast<long>(64)));
     u32 GetCpStreamHooks() const { return m_cp_stream_hooks; }
     void SetCpStreamHooks(u32 v, bool = false) { m_cp_stream_hooks = v; }
@@ -88,33 +79,9 @@
     std::string m_type = EnvString("TLG_TYPE", "wincolor");
     std::string GetLogType() const { return m_type; }
     void SetLogType(const std::string& v, bool = false) { m_type = v; }
-    u32 m_native_audit_every = static_cast<u32>(Number("TLG_NATIVE_AUDIT_EVERY", static_cast<long>(0)));
-    u32 GetNativeAuditEvery() const { return m_native_audit_every; }
-    void SetNativeAuditEvery(u32 v, bool = false) { m_native_audit_every = v; }
-    u32 m_native_draw_classes = static_cast<u32>(Number("TLG_NATIVE_DRAW_CLASSES", static_cast<long>(3)));
-    u32 GetNativeDrawClasses() const { return m_native_draw_classes; }
-    void SetNativeDrawClasses(u32 v, bool = false) { m_native_draw_classes = v; }
-    bool m_native_draw_exec = Flag("TLG_NATIVE_DRAW_EXEC", false);
-    bool IsNativeDrawExec() const { return m_native_draw_exec; }
-    void SetNativeDrawExec(bool v, bool = false) { m_native_draw_exec = v; }
-    u32 m_native_draw_mode = static_cast<u32>(Number("TLG_NATIVE_DRAW_MODE", static_cast<long>(0)));
-    u32 GetNativeDrawMode() const { return m_native_draw_mode; }
-    void SetNativeDrawMode(u32 v, bool = false) { m_native_draw_mode = v; }
-    u32 m_native_legacy_registers = static_cast<u32>(Number("TLG_NATIVE_LEGACY_REGISTERS", static_cast<long>(0)));
-    u32 GetNativeLegacyRegisters() const { return m_native_legacy_registers; }
-    void SetNativeLegacyRegisters(u32 v, bool = false) { m_native_legacy_registers = v; }
-    u32 m_native_map = static_cast<u32>(Number("TLG_NATIVE_MAP", static_cast<long>(0)));
-    u32 GetNativeMap() const { return m_native_map; }
-    void SetNativeMap(u32 v, bool = false) { m_native_map = v; }
     u32 m_native_packet_path = static_cast<u32>(Number("TLG_NATIVE_PACKET_PATH", static_cast<long>(0)));
     u32 GetNativePacketPath() const { return m_native_packet_path; }
     void SetNativePacketPath(u32 v, bool = false) { m_native_packet_path = v; }
-    u32 m_native_sdk_strip = static_cast<u32>(Number("TLG_NATIVE_SDK_STRIP", static_cast<long>(0)));
-    u32 GetNativeSdkStrip() const { return m_native_sdk_strip; }
-    void SetNativeSdkStrip(u32 v, bool = false) { m_native_sdk_strip = v; }
-    bool m_native_synth_verify = Flag("TLG_NATIVE_SYNTH_VERIFY", false);
-    bool IsNativeSynthVerify() const { return m_native_synth_verify; }
-    void SetNativeSynthVerify(bool v, bool = false) { m_native_synth_verify = v; }
     u32 m_raster_delay_ns = static_cast<u32>(Number("TLG_RASTER_DELAY_NS", static_cast<long>(0)));
     u32 GetRasterDelayNs() const { return m_raster_delay_ns; }
     void SetRasterDelayNs(u32 v, bool = false) { m_raster_delay_ns = v; }

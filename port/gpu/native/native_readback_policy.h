@@ -61,24 +61,11 @@ struct State {
     std::atomic<u32> stream_hooks{64};
     /// cp_delay_ns / raster_delay_ns (diagnostics): a spin per draw on the command processor / the raster thread.
     std::atomic<u32> cp_delay_ns{0};
-    /// cp_group_sig: native records are applied by register group identity (see Liverpool::ExecApplyRecord).
-    std::atomic<u32> group_sig{0};
-    /// cp_stage_key: the pipeline lookup of native draws goes by the record's key (see PipelineCache::GetGraphicsPipeline).
-    std::atomic<u32> stage_key{0};
-    /// cp_exec_inputs: native draws are planned from the record without the register image (see Liverpool::ExecuteNativeDraw).
-    std::atomic<u32> exec_inputs{0};
     /// cp_stream_probe: the streaming study's probe runs on every draw hook (development part).
     std::atomic<u32> stream_probe{0};
     std::atomic<u32> raster_delay_ns{0};
     /// cp_raster_core: logical processor of the raster thread, -1 = not pinned. Applied live.
     std::atomic<s32> raster_core{-1};
-    /// native_draw_mode / native_draw_classes (see emulator_settings.h). Applied live.
-    std::atomic<u32> native_draw_mode{0};
-    std::atomic<u32> native_draw_classes{3};
-    std::atomic<u32> native_synth_verify{0};
-    std::atomic<u32> native_audit_every{64}; ///< see emulator_settings.h
-    std::atomic<u32> native_sdk_strip{0};    ///< see emulator_settings.h
-    std::atomic<u32> native_draw_exec{0};
     /// Ablation switches (documents/tlg/native-isolation.md): -1 = the setting, otherwise the value. Applied live.
     std::atomic<s32> fence_shortcut_override{-1}; ///< readback_fence_wait_shortcut 0..3
     std::atomic<s32> stream_reuse_override{-1};   ///< readback_stream_reuse_enabled 0/1
@@ -87,7 +74,6 @@ struct State {
     std::array<std::atomic<u32>, 32> exclude_callers{};
     std::atomic<s32> packet_path{0};              ///< 0: the packet walk is off: a command buffer runs from its entries only, the packets that are not entries are not executed (logged as errors)
     std::atomic<s32> cs_audit{0};                 ///< audit: a record dispatch's compute program against the record alone on a zeroed program (counters in /native)
-    std::atomic<s32> map_native{0};               ///< the texture map helper's upload dispatch as a record: 0 off, 1 verify (tag + game packets), 2 execute
     std::atomic<s32> register_packets{1};         ///< SET_SH_REG, DISPATCH_DIRECT and WRITE_DATA of the graphics queue are entries of a direct buffer (0: they make it mixed)
     std::atomic<s32> stage_reuse_override{-1};    ///< stage_lookup_reuse 0..2
 };

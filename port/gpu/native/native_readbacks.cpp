@@ -147,8 +147,7 @@ void NoteReadFault(VAddr address, u64 size) {
 
 bool ExplicitEnabled() {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    return Core::NativeConfig::DrawExec != 0 && policy.dma_async.load(std::memory_order_relaxed) &&
-           (Core::NativeConfig::SdkStrip & 33554432) != 0;
+    return policy.dma_async.load(std::memory_order_relaxed);
 }
 
 void NoteExplicit(bool done, u64 bytes, u32 reason) {

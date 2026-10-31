@@ -472,7 +472,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
         }
         return {&stream_buffer, offset};
     }
-    const bool memoizable = !is_texel_buffer && Core::NativeConfig::DrawMode >= 2;
+    const bool memoizable = !is_texel_buffer;
     ObtainMemo* memo = nullptr;
     u64 epoch_before = 0;
     if (memoizable) {

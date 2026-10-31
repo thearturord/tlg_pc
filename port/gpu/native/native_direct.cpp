@@ -121,8 +121,7 @@ bool Plausible(const IndirectTarget& target) {
 
 bool StateTemplatesOn() {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    return Core::NativeConfig::DrawExec != 0 &&
-           (Core::NativeConfig::SdkStrip & 8192) != 0;
+    return true;
 }
 
 void AddEntry(Buffer& buffer, EntryKind kind, const u32* packet, u32 dwords, u64 address, u32 opcode) {
@@ -214,13 +213,13 @@ bool PacketPathOff() {
 }
 
 bool ExecuteEnabled() {
-    return Enabled() && (Core::NativeConfig::SdkStrip & 8388608) != 0;
+    return Enabled();
 }
 
 bool Enabled() {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     const u32 bits = Core::NativeConfig::SdkStrip;
-    return Core::NativeConfig::DrawExec != 0 && (bits & 2097152) != 0 && (bits & 4194304) != 0;
+    return (bits & 2097152) != 0 && (bits & 4194304) != 0;
 }
 
 std::shared_ptr<Buffer> Build(u32 queue, const u32* dcb, u32 dwords, bool has_constant_buffer, bool markers) {

@@ -100,7 +100,7 @@ thread_local u64 plan_caller;
 } // namespace
 
 bool StaleEnabled() {
-    return (Core::NativeConfig::SdkStrip & 134217728) != 0;
+    return false;
 }
 
 void SetPlanCaller(u64 caller) {
@@ -147,7 +147,7 @@ void NoteStale(u32 groups, bool differs, const std::string& diff, u64 caller, u6
 
 bool Enabled() {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
-    return (Core::NativeConfig::SdkStrip & 67108864) != 0;
+    return false;
 }
 
 void NoteUpload(VAddr address, const u8* data, u64 size) {

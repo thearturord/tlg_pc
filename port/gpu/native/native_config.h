@@ -16,7 +16,6 @@ inline constexpr u32 DrawMode = 3;
 inline constexpr u32 DrawClasses = 15;
 inline constexpr u32 SynthVerify = 1;
 inline constexpr u32 DrawExec = 1;
-inline constexpr u32 AuditEvery = 32;
 inline constexpr u32 ExecInputs = 1;
 inline constexpr u32 StageKey = 1;
 inline constexpr u32 GroupSig = 1;

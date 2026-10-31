@@ -785,11 +785,11 @@ void NoteImageClear(bool done, u32 reason) {
 }
 
 bool ImageCopyEnabled() {
-    return (Core::NativeConfig::SdkStrip & 131072) != 0;
+    return true;
 }
 
 bool ImmutableResidencyEnabled() {
-    return (Core::NativeConfig::SdkStrip & 65536) != 0;
+    return true;
 }
 
 ImmutableBuffer* FindImmutable(VAddr address, u32 size) {

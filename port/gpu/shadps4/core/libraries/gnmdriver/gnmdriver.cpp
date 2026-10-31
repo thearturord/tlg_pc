@@ -505,8 +505,7 @@ u32 PS4_SYSV_ABI sceGnmDispatchInitDefaultHardwareState(u32* cmdbuf, u32 size) {
     }
 
     if (const auto& policy = VideoCore::ReadbackPolicy::Get();
-        Core::NativeConfig::DrawExec != 0 &&
-        (Core::NativeConfig::SdkStrip & 128) != 0) {
+        true) {
         // the thread management and resource limit registers and the cache acquire have no host effect
         cmdbuf = WriteHeader<PM4ItOpcode::Nop>(cmdbuf, HwInitPacketSize - 1);
         *cmdbuf = 0;
@@ -785,8 +784,7 @@ static bool WriteNativeInitState(u32* cmdbuf, const u32* sequence, u32 sequence_
                      Core::NativeConfig::SdkStrip, sequence_dwords);
         }
     }
-    if (Core::NativeConfig::DrawExec == 0 ||
-        (Core::NativeConfig::SdkStrip & 8192) == 0) {
+    if (false) {
         return false;
     }
     static constexpr std::array ClearStateSequence{
@@ -807,7 +805,6 @@ static bool WriteNativeInitState(u32* cmdbuf, const u32* sequence, u32 sequence_
     const u64 pointer = reinterpret_cast<u64>(state);
     std::memcpy(&cmdbuf[3], &pointer, sizeof(pointer));
     WriteNop(cmdbuf + TagDwords, HwInitPacketSize - TagDwords - 1);
-    Core::NativeDraw::NoteAnchor(reinterpret_cast<u64>(cmdbuf), 0, 12);
     return true;
 }
 
