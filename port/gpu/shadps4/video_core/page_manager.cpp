@@ -552,9 +552,8 @@ struct SignalImpl : public PageManager::Impl {
             Core::GuestHooks::SetFaultRip(0);
 #endif
             return handled;
-        } else {
-            return rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }
+        // a read fault: no page is ever made unreadable (E4), so this is not ours
         return false;
     }
 };

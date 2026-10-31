@@ -26,8 +26,7 @@ using LockType = std::mutex;
 class RegionManager {
 public:
     explicit RegionManager(PageManager* tracker_, VAddr cpu_addr_)
-        : tracker{tracker_}, cpu_addr{cpu_addr_},
-          readbacks_mode{EmulatorSettings.GetReadbacksMode()} {
+        : tracker{tracker_}, cpu_addr{cpu_addr_} {
         cpu.Fill(true);
         gpu.Fill(false);
     }
@@ -309,13 +308,8 @@ private:
             } else if (state_op == StateOp::Clear) {
                 return PageOp::Track;
             }
-        } else if (type == Type::GPU && readbacks_mode == GpuReadbacksMode::Precise) {
-            if (state_op == StateOp::Set) {
-                return PageOp::Track;
-            } else if (state_op == StateOp::Clear) {
-                return PageOp::Untrack;
-            }
         }
+        // E4: the GPU side never watches pages (no read watch: nothing is made unreadable, so a CPU read of GPU written memory is not caught here)
         return PageOp::None;
     }
 
@@ -331,7 +325,6 @@ private:
 
     PageManager* tracker;
     VAddr cpu_addr{};
-    u32 readbacks_mode;
     RegionBits cpu;
     RegionBits gpu;
     LockType mutex;

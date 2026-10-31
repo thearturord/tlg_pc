@@ -263,7 +263,6 @@ public:
     NativeStats TakeNativeStats() {
         return std::exchange(native_stats, {});
     }
-    bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
     /// N5h: see BufferCache::SupersedeGpuWritten.
     /// B8.2: the engine deleted a texture or view (raster thread, in order with the GPU work)

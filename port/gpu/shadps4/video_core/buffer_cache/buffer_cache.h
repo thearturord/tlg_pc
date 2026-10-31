@@ -92,9 +92,6 @@ public:
     [[nodiscard]] bool StreamWhilePassOpen(VAddr device_addr, u32 size);
     std::pair<const Buffer*, u64> StreamCopy(VAddr device_addr, u32 size);
 
-    /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
-    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
-
     /// N5c: uploads the CPU-changed pages of a range the engine announced (before the draw that uses it), outside any render pass. Returns the bytes copied.
     u64 PreSynchronize(VAddr device_addr, u64 size);
 
@@ -196,59 +193,7 @@ public:
     /// Waits until the explicit downloads (RecordDmaDownload with `tracked`) over the range have landed; 0 nothing in flight, 1 waited, 2 timed out.
     u32 WaitForExplicitDownloads(VAddr device_addr, u64 size, u32 timeout_ms);
 
-    /// Unprotects ranges whose asynchronous readback has landed. Must run on the GPU thread.
-    void ApplyPendingUnmarks();
-
-    /// Returns true if an asynchronous download of part of the range has not landed yet.
-    bool IsDownloadInFlight(VAddr device_addr, u64 size);
-
-    /// Waits until asynchronous downloads of the range have landed in guest memory.
-    void WaitForDownloads(VAddr device_addr, u64 size);
-
 private:
-    struct DownloadResult {
-        u64 bytes{};
-    };
-
-    using DownloadCopies = boost::container::small_vector<vk::BufferCopy, 1>;
-
-    DownloadResult DownloadMemory(VAddr device_addr, u64 size);
-
-    /// Gathers GPU modified ranges to download and clears them from the modified range set.
-    u64 CollectDownloadCopies(const Buffer* arena, VAddr device_addr, u64 size,
-                              DownloadCopies& copies);
-
-    /// Records the copy into download memory. The returned function writes the data back to
-    /// guest memory and must only run once the GPU has executed the copy. With deferred_unmark
-    /// the download memory is held until then and the protection of the range is lifted on the
-    /// GPU thread (see ApplyPendingUnmarks).
-    Common::UniqueFunction<void> RecordDownloadCopies(const Buffer* arena, VAddr device_addr,
-                                                      u64 size, DownloadCopies&& copies,
-                                                      u64 total_size_bytes, bool deferred_unmark);
-
-    /// Window around a readback request: GPU-modified ranges come as many small scattered
-    /// islands, so a download is widened to the 512 KB block around the request.
-    std::pair<VAddr, VAddr> ReadbackWindow(VAddr device_addr, u64 size) const;
-    /// E4: the placed buffers that hold [addr, addr + size), each with the part of the range it holds (the arena used to be the one buffer of every range)
-    struct DownloadSource {
-        const Buffer* buffer;
-        VAddr begin, end;
-    };
-    boost::container::small_vector<DownloadSource, 4> DownloadSourcesIn(VAddr addr, u64 size);
-
-    /// Readback for a guest thread: the command processor records and submits the downloads and
-    /// goes on while the faulting thread waits for them to land.
-    void ReadMemoryForGuest(VAddr device_addr, u64 size, bool is_write);
-
-    /// End of a fault readback, on the GPU thread: drops GPU marks with nothing left behind them,
-    /// downloads what the GPU wrote to the page in the meantime (waiting), and marks the CPU write.
-    void FinishFaultReadback(VAddr device_addr, u64 size, bool is_write, VAddr window_start,
-                             u64 window_size, u64& bytes);
-
-    /// Unprotects the pages in the range that the GPU didn't write again since their data was
-    /// downloaded. Must run on the GPU thread.
-    void UnmarkSettledPages(VAddr device_addr, u64 size);
-
     /// Drops the reusable stream copies if a guest memory write overlaps them.
     void InvalidateStreamReuse(VAddr device_addr, u64 size);
 
@@ -380,8 +325,6 @@ private:
         const s32 override_mode = VideoCore::ReadbackPolicy::Get().stream_reuse_override.load(std::memory_order_relaxed);
         return override_mode >= 0 ? override_mode != 0 : stream_reuse_enabled;
     }
-    /// readback_async_guest_faults: guest threads wait for their readbacks themselves.
-    const bool async_guest_faults;
     /// One set per command stream (0 graphics, 1 asynchronous): a window of the other stream must not drop the copies of this one.
     struct StreamReuseSet {
         tsl::robin_map<u64, u64, Common::U64Hash> map;
@@ -394,17 +337,6 @@ private:
     /// Asynchronous stream: the untracked ring is uploaded once per epoch (one frame's window of work of queue 1, which the graphics stream
     /// covers with one tick), not once per tick of that stream.
     u64 side_upload_epoch{1};
-
-    /// Asynchronous downloads recorded but not landed in guest memory yet.
-    struct InflightDownload {
-        VAddr addr;
-        u64 size;
-        u64 id;
-    };
-    std::mutex pending_unmarks_mutex;
-    std::vector<std::pair<VAddr, u64>> pending_unmarks;
-    std::vector<InflightDownload> inflight_downloads; // guarded by pending_unmarks_mutex
-    u64 next_inflight_id{};
 
     std::mutex dma_mutex;
     std::vector<std::unique_ptr<Buffer>> dma_pool;

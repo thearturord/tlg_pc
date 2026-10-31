@@ -282,7 +282,6 @@ enum B9Count : u32 {
     E4PseudoPlaced,        ///< E4: placements of a pseudo resource (memory no engine buffer owns)
     E4PseudoRing,          ///< ... of those, the frame allocator's ring
     E4DemoteKept,          ///< E4: a move back to the arena that was not made (the block stays)
-    E4ReadbackWindows,     ///< E4: fault readback windows downloaded from placed buffers
     E4FreedWithForeignGpu, ///< E4: a block's last engine buffer was deleted while the GPU had written bytes of the block outside that buffer
     E4FreedForeignGpuBytes, ///< E4: those bytes
     E4GpuBytesLost,        ///< E4: GPU written bytes a new placement found in no placed buffer
