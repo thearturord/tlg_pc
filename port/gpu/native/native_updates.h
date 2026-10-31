@@ -286,6 +286,13 @@ enum B9Count : u32 {
     E4FreedWithForeignGpu, ///< E4: a block's last engine buffer was deleted while the GPU had written bytes of the block outside that buffer
     E4FreedForeignGpuBytes, ///< E4: those bytes
     E4GpuBytesLost,        ///< E4: GPU written bytes a new placement found in no placed buffer
+    E4CensusRequests,      ///< E4 census (TLG_E4_CENSUS=1): requests over memory no engine buffer holds that the page tracker answered
+    E4CensusTrackerPages,  ///< E4 census: pages the tracker uploaded for them
+    E4CensusPagesNoAnnouncement, ///< E4 census: of those, pages on which no announced byte exists
+    E4CensusFirstPages,    ///< E4 census: tracker pages uploaded for the first time (the tracker starts with every page marked changed; a placement already copied memory)
+    E4CensusRepeatNoAnnouncement, ///< E4 census: tracker pages uploaded again with no announced byte on them (a CPU write only the tracker saw)
+    E4CensusAnnouncedBytes, ///< E4 census: announced bytes in such requests
+    E4CensusAnnouncedNotUploaded, ///< E4 census: of those, bytes the tracker did not upload
     B9Counts,
 };
 void NoteB9(B9Count what, u64 n = 1) noexcept;

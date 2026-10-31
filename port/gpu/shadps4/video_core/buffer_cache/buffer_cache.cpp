@@ -1314,8 +1314,49 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9TrackerUploadsSkipped);
     }
     boost::container::small_vector<bool, 8> b9_piece_seen(b9_pieces.size(), false);
+    // E4 census (TLG_E4_CENSUS=1): over memory no engine buffer holds the page tracker still picks the uploads; this compares its ranges with the announced bytes
+    static const bool e4_census = [] {
+        const char* e = std::getenv("TLG_E4_CENSUS");
+        return e != nullptr && *e == '1';
+    }();
+    boost::container::small_vector<std::pair<u64, u64>, 8> e4_announced, e4_tracked;
+    const bool e4_counting = e4_census && b9_object == 0 && !(UntrackedRing::Get().Active() && [&] {
+        const auto [lo, hi] = UntrackedRing::Get().Clip(device_addr, size);
+        return lo < hi;
+    }());
+    if (e4_counting) {
+        std::scoped_lock lock{object_dirty_mutex};
+        all_object_dirty.ForEachInRange(held_lo, held_hi - held_lo, [&](u64 a, u64 e) { e4_announced.emplace_back(a, e - a); });
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4CensusRequests);
+    }
+    const auto e4_note_tracker = [&](u64 x, u64 xn) {
+        if (!e4_counting) {
+            return;
+        }
+        e4_tracked.emplace_back(x, xn);
+        std::scoped_lock lock{object_dirty_mutex};
+        for (u64 page = x & ~u64{4095}; page < x + xn; page += 4096) {
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4CensusTrackerPages);
+            static std::unordered_set<u64> seen;
+            const bool first = seen.insert(page).second;
+            if (!all_object_dirty.Intersects(page, 4096)) {
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4CensusPagesNoAnnouncement);
+                if (first) {
+                    Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4CensusFirstPages);
+                    continue;
+                }
+                Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4CensusRepeatNoAnnouncement);
+                static std::atomic<u32> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    LOG_WARNING(Render_Vulkan, "E4 census: tracker page {:#x} (request {:#x}+{:#x}{}) has no announced byte ({})", page, device_addr, size, is_written ? ", written" : "",
+                                Core::NativeDevice::OwnerName(page));
+                }
+            }
+        }
+    };
     // a page tracker range (the copies of the tracker): compared with the announced bytes; native mode leaves the copy to the announcements
     const auto tracker_copy = [&](u64 addr, u64 copy_size) {
+        e4_note_tracker(addr, copy_size);
         if (b9_object != 0) {
             Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9BytesByTracker, copy_size);
             bool any = false;
@@ -1391,6 +1432,17 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
     } else {
         tracker_ranges(device_addr, size);
+    }
+    if (e4_counting) {
+        RangeSet left;
+        for (const auto& [a, n] : e4_announced) {
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4CensusAnnouncedBytes, n);
+            left.Add(a, n);
+        }
+        for (const auto& [a, n] : e4_tracked) {
+            left.Subtract(a, n);
+        }
+        left.ForEachInRange(held_lo, held_hi - held_lo, [&](u64 a, u64 e) { Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4CensusAnnouncedNotUploaded, e - a); });
     }
     if (b9_object != 0) {
         for (size_t i = 0; i < b9_pieces.size(); ++i) {
