@@ -445,6 +445,11 @@ void Liverpool::RasterRun(Common::UniqueFunction<void>&& func, bool wait, bool w
     op.writes_memory = writes_memory;
     op.write_line = site.line();
     op.write_file = site.file_name();
+    for (const char* p = site.file_name(); *p != 0; ++p) { // the file name without the directories
+        if (*p == '/' || *p == '\\') {
+            op.write_file = p + 1;
+        }
+    }
     RasterPush(std::move(op), wait);
 }
 
