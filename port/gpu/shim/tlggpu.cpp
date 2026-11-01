@@ -3,6 +3,7 @@
 #include "native/native_debug_server.h"
 #include "native/native_hooks.h"
 #include "native/native_timeline.h"
+#include "native/native_prof.h"
 #include "core/guest_heap.h"
 #include "native/native_draw.h"
 #include "native/native_updates.h"
@@ -26,6 +27,7 @@
 #include "video_core/renderdoc.h"
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <string>
 #include <chrono>
 #include <thread>
@@ -362,6 +364,27 @@ extern "C" void tlggpu_timeline_wait_end(const char* kind, const void* object, c
 extern "C" void tlggpu_timeline_signal(int kind, const void* object) {
     if (Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
         Core::FrameTimeline::Signal(static_cast<u64>(kind), object);
+    }
+}
+
+/// Profiler probes for the runtime's C code (src/runtime_prof.h): a site per name (probes with one name are one probe), entered and left like Core::Prof::Scope.
+extern "C" void* tlggpu_prof_site(const char* name, int level) {
+    static std::mutex mutex;
+    static std::unordered_map<std::string, Core::Prof::Site*> sites;
+    std::scoped_lock lock{mutex};
+    auto [it, fresh] = sites.try_emplace(name, nullptr);
+    if (fresh) {
+        it->second = new Core::Prof::Site(it->first.c_str(), static_cast<u8>(level)); // lives as long as the process (the key's text too)
+    }
+    return it->second;
+}
+extern "C" void* tlggpu_prof_enter(void* site) {
+    auto* s = static_cast<Core::Prof::Site*>(site);
+    return s != nullptr && s->enabled.load(std::memory_order_relaxed) ? Core::Prof::EnterSlow(*s) : nullptr;
+}
+extern "C" void tlggpu_prof_leave(void* token) {
+    if (token != nullptr) {
+        Core::Prof::Leave(static_cast<Core::Prof::ThreadData*>(token));
     }
 }
 
