@@ -638,3 +638,8 @@ To use: run mode 1 first in the default scene and a cutscene and read `compared_
 | `sync` | `BufferCache::SynchronizeMemory` uploads | `buffer_cache.cpp` |
 
 Closures always run (EOP signals and write fences). A critical log line says when the switch is on. Run order: `draws,dispatches` first (the ceiling of everything upstream), then `announce`, then `sync`, each against a baseline of the same scene.
+
+## 24. Phase 1 of the pipeline design: queue depth switch and front thread probes
+
+- `TLG_RASTER_QUEUE=<n>` (16 to 65536, default 256, read once; logged at start): how many operations the command processor queues before it waits (`wait.front_queue_full`). Before: a constant 256 in `RasterSplit`. Nothing else changes: the order of the operations is the same, only the length of the line.
+- Front thread probes (group `front.`, level 1 or 2, no behaviour change): `front.execute_native_draw` (the whole per draw handler), `front.lookup_drain`, `front.plan_exec_draw`, `front.plan_draw_registers`, `front.plan_dispatch`, `front.resolve_ahead`. With `wait.front_queue_full` they split the front thread's ~7 ms per frame. Capture: Shift+F9 with `TLG_PROF_THREADS=all`, or `/prof?threads=GpuCommandProcessor`.

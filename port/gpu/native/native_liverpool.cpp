@@ -7,6 +7,7 @@
 #include "native/native_config.h"
 #include "native/native_stream_probe.h"
 #include "native/native_timeline.h"
+#include "native/native_prof.h"
 #include "native/native_registry.h"
 #include "native/native_resource_audit.h"
 #include "common/arch.h"
@@ -271,6 +272,7 @@ void Liverpool::StartNativeTag(const u32* tag) {
 }
 
 void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_count) {
+    TLG_PROF_LEVEL("front.execute_native_draw", 1);
     native_exec_calls++;
     Core::NativeDraw::ExecDraw draw;
     if (!rasterizer || !Core::NativeDraw::TakeExecDraw(native_tag_pending.seq, draw, true)) {
@@ -489,15 +491,23 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             } else {
                 // an inline draw has its count with the draw packet (index_count), anything else carries it in the record
                 native_inputs_key = draw.inputs_key;
-                const u32 verify = LookupDrain(1);
+                u32 verify;
+                {
+                    TLG_PROF_LEVEL("front.lookup_drain", 2);
+                    verify = LookupDrain(1);
+                }
                 const auto make_plan = [&] {
                     return rasterizer->PlanExecDraw(*draw.fixed, draw.stage_key, native_inputs_key, exec_vertex_user_data,
                                                     exec_pixel_user_data, draw, index_count,
                                                     native_tag_pending.valid ? (native_tag_pending.meta & 0xff) : 15u);
                 };
-                auto plan = make_plan();
-                if (verify == 2) {
-                    plan = ReplanAfterDrain(std::move(plan), 1, make_plan);
+                std::unique_ptr<Vulkan::DrawPlan> plan;
+                {
+                    TLG_PROF_LEVEL("front.plan_exec_draw", 2);
+                    plan = make_plan();
+                    if (verify == 2) {
+                        plan = ReplanAfterDrain(std::move(plan), 1, make_plan);
+                    }
                 }
                 if (plan) {
                     take(std::move(plan));
@@ -549,16 +559,24 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         if (call.kind == RasterCall::Kind::DrawIndirect) {
             params = Vulkan::DrawIndirectParams{.vertex_sgpr_offset = call.vertex_sgpr_offset, .instance_sgpr_offset = call.instance_sgpr_offset, .is_indirect = true};
         }
-        const u32 verify = LookupDrain(2);
+        u32 verify;
+        {
+            TLG_PROF_LEVEL("front.lookup_drain", 2);
+            verify = LookupDrain(2);
+        }
         const auto make_candidate = [&] {
             // E1c: the shader objects of the draw, for the comparison of the translator's input with the one derived from them
             Core::NativeShaderEnv::Scope shader_env{draw.vs_gnm, draw.ps_gnm, draw.fetch_object};
             Core::NativeTargetDesc::Scope target_desc{draw.native_targets}; // E7 (TLG_TARGET_DESC_USE): PlanDraw applies the record's target description to the inputs it makes
             return rasterizer->PlanDraw(exec_state, params, native_fixed, native_exec_key, native_inputs_key);
         };
-        auto candidate = make_candidate();
-        if (verify == 2) {
-            candidate = ReplanAfterDrain(std::move(candidate), 2, make_candidate);
+        std::unique_ptr<Vulkan::DrawPlan> candidate;
+        {
+            TLG_PROF_LEVEL("front.plan_draw_registers", 2);
+            candidate = make_candidate();
+            if (verify == 2) {
+                candidate = ReplanAfterDrain(std::move(candidate), 2, make_candidate);
+            }
         }
         if (Core::NativePlanShadow::On() && candidate != nullptr) {
             // E7b Task 3: the register fallback against the native side (the record's typed values, the native fixed state)

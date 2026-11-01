@@ -393,6 +393,18 @@ void Liverpool::DrainRaster() {
     sp.done_cv.wait(lk, [&] { return sp.done.load(std::memory_order_acquire) >= target; });
 }
 
+size_t Liverpool::RasterSplit::MaxQueued() {
+    static const size_t limit = [] {
+        size_t n = 256;
+        if (const char* e = std::getenv("TLG_RASTER_QUEUE"); e != nullptr && *e != 0) {
+            n = static_cast<size_t>(std::clamp(std::atoi(e), 16, 65536));
+        }
+        LOG_INFO(Render, "raster queue: the command processor queues up to {} operations (TLG_RASTER_QUEUE)", n);
+        return n;
+    }();
+    return limit;
+}
+
 void Liverpool::RasterPush(RasterOp&& op, bool wait) {
     auto& sp = *split;
     op.audit_class = Core::ResourceAudit::front_class;
@@ -412,16 +424,16 @@ void Liverpool::RasterPush(RasterOp&& op, bool wait) {
     u64 target;
     {
         std::unique_lock lk{sp.mutex};
-        if (sp.queue.size() >= RasterSplit::MaxQueued) {
+        if (sp.queue.size() >= RasterSplit::MaxQueued()) {
             sp.stat_front_blocked.fetch_add(1, std::memory_order_relaxed);
         }
-        if (sp.queue.size() >= RasterSplit::MaxQueued) {
+        if (sp.queue.size() >= RasterSplit::MaxQueued()) {
             sp.front_state.store(3, std::memory_order_relaxed);
         }
         {
             Core::FrameTimeline::StageScope queue_full{Core::FrameTimeline::StageFrontQueueFull};
             TLG_PROF_LEVEL("wait.front_queue_full (front: the raster queue has no room)", 1);
-            sp.done_cv.wait(lk, [&] { return sp.queue.size() < RasterSplit::MaxQueued; });
+            sp.done_cv.wait(lk, [&] { return sp.queue.size() < RasterSplit::MaxQueued(); });
         }
         sp.front_state.store(0, std::memory_order_relaxed);
         op.position = sp.pushed.load(std::memory_order_relaxed) + 1;
@@ -574,10 +586,13 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
     // The lookup below reads descriptor tables and shader code from guest memory: closures that
     // write guest memory (constant engine dumps, WriteData, DMA) must have run first. (A draw planned from its record has had this at its own planning.)
     u32 verify = 0;
-    if (!Core::DrainAudit::LazyEnabled()) {
-        DrainRasterWrites(0);
-    } else if (native_exec_plan == nullptr) {
-        verify = LookupDrain(0);
+    {
+        TLG_PROF_LEVEL("front.lookup_drain", 2);
+        if (!Core::DrainAudit::LazyEnabled()) {
+            DrainRasterWrites(0);
+        } else if (native_exec_plan == nullptr) {
+            verify = LookupDrain(0);
+        }
     }
     ++sp.stat_calls;
     if (call.kind == RasterCall::Kind::Draw || call.kind == RasterCall::Kind::DrawIndirect) {
@@ -590,6 +605,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         call.kind == RasterCall::Kind::DispatchIndirect) {
         op.cs = call.cs_override ? *call.cs_override : GetCsRegs();
         // The pipeline lookup runs here, on the command processor thread (stage 2 of the split).
+        TLG_PROF_NAMED_LEVEL(prof_plan_dispatch, "front.plan_dispatch", 2);
         op.dispatch_plan = rasterizer->PlanDispatch(op.cs, front_state.ta_bc_base);
         if (verify == 2) {
             op.dispatch_plan = ReplanAfterDrain(std::move(op.dispatch_plan), 0, [&] { return rasterizer->PlanDispatch(op.cs, front_state.ta_bc_base); });
@@ -629,7 +645,10 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
                                  sp.done.load(std::memory_order_acquire), call.tag.valid ? call.tag.seq : (op.draw_plan ? op.draw_plan->native_seq : 0),
                                  call.indexed, call.index_offset);
     }
-    rasterizer->ResolveAhead(op.draw_plan.get(), op.dispatch_plan.get()); // R2
+    {
+        TLG_PROF_LEVEL("front.resolve_ahead", 2);
+        rasterizer->ResolveAhead(op.draw_plan.get(), op.dispatch_plan.get()); // R2
+    }
     RasterPush(std::move(op), false);
 }
 
