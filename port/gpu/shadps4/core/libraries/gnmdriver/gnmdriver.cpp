@@ -5,6 +5,7 @@
 #include <map>
 #include <mutex>
 #include "native/native_stream_probe.h"
+#include "native/native_prof.h"
 #include "native/native_config.h"
 #include "native/native_stream_submit.h"
 #include "native/native_timeline.h"
@@ -103,6 +104,7 @@ static void ResetSubmissionLock(u32 irq) {
 static void WaitGpuIdle() {
     HLE_TRACE;
     TlgFreeze::WaitScope wait{"GPU idle (submit done)"}; // tlg: freeze report
+    TLG_PROF_LEVEL("wait.gnm_submit_lock (game thread: GPU idle before the next submit)", 1);
     std::unique_lock lock{m_wait_idle};
     cv_lock.wait(lock, [] { return submission_lock == 0; });
 }

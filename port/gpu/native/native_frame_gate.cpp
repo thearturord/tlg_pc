@@ -16,6 +16,7 @@
 #include "native/native_debug_server.h"
 #include "native/native_draw.h"
 #include "native/native_frame_gate.h"
+#include "native/native_prof.h"
 
 namespace Core::FrameGate {
 
@@ -193,6 +194,7 @@ void WaitForSlot() {
     if (depth < 2) {
         return;
     }
+    TLG_PROF_LEVEL("wait.frame_gate_slot (game thread, depth 2: fewer than 2 unfinished frames)", 1);
     WaitFor([depth] { return submitted <= ended || submitted - ended < static_cast<u64>(depth); }, slot_waits, slot_wait_ns, "wait for a frame slot");
 }
 
@@ -210,9 +212,11 @@ void WaitOwnFrame() {
         return;
     }
     if (mode == 2) {
+        TLG_PROF_LEVEL("wait.frame_gate_own_frame_raster (game thread, mode 2: raster thread reached the frame end)", 1);
         WaitFor([] { return raster_reached >= submitted; }, own_frame_waits, own_frame_wait_ns, "wait for the raster thread to reach the frame end");
         return;
     }
+    TLG_PROF_LEVEL("wait.frame_gate_own_frame_eop (game thread, depth 0: end of pipe of its own frame)", 1);
     WaitFor([] { return ended >= submitted; }, own_frame_waits, own_frame_wait_ns, "wait for the own frame");
 }
 

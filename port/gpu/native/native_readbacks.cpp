@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 #include <fmt/format.h>
 #include "native/native_readbacks.h"
+#include "native/native_prof.h"
 #include "native/native_config.h"
 #include "native/native_readback_policy.h"
 
@@ -176,6 +177,7 @@ void GateMap(VAddr address, u64 size) {
     }
     gate_checks.fetch_add(1, std::memory_order_relaxed);
     const u64 start = NowNs();
+    TLG_PROF_LEVEL("wait.readback_gate_map (game thread: an explicit download lands before the map)", 1);
     const u32 result = gate(address, size, 20);
     if (result != 0) {
         gate_waits.fetch_add(1, std::memory_order_relaxed);
