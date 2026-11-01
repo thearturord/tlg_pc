@@ -24,6 +24,7 @@
 #include "core/cpu_patches.h"
 #include "native/native_debug_server.h"
 #include "native/native_timeline.h"
+#include "native/native_prof.h"
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
 #include "core/memory.h"
@@ -58,6 +59,8 @@ struct Hook {
     u64 entry_size{RingEntrySize};
     u64 handler{}; ///< Mode Call: address of the host function (PS4_SYSV_ABI).
     u64 original_call{}; ///< Mode Call: entry that runs the guest function itself (displaced instructions, then the body).
+    std::string prof_name; ///< TLG_HOOK_PROF: "hook.<name>", the profiler probe around the handler
+    std::unique_ptr<Core::Prof::Site> prof_site;
     u64 offset{};
     Mode mode{Mode::Count};
     u8* entry{};
@@ -208,12 +211,40 @@ void EmitArgsStub(Xbyak::CodeGenerator& c, const Hook& hook) {
     c.popfq();
 }
 
+/// TLG_HOOK_PROF=1 (default 0, read once): every call and mid hook runs its handler inside a profiler probe named "hook.<name>" (group `hook`), so a
+/// Shift+F9 capture with TLG_PROF_THREADS=all shows what our handlers cost on each game thread. A handler that runs the game's function itself (through
+/// its original entry) has that game code inside its probe too.
+bool HookProfOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_HOOK_PROF");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+
+using CallHandler = u64 PS4_SYSV_ABI (*)(u64, u64, u64, u64, u64, u64, u64, u64);
+using MidHandler = u64 PS4_SYSV_ABI (*)(Core::GuestHooks::MidContext*);
+
+u64 PS4_SYSV_ABI ProfiledCall(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f, u64 ret, u64 caller_rsp, Hook* hook) {
+    const Core::Prof::Scope scope{*hook->prof_site};
+    return reinterpret_cast<CallHandler>(hook->handler)(a, b, c, d, e, f, ret, caller_rsp);
+}
+
+u64 PS4_SYSV_ABI ProfiledMid(Core::GuestHooks::MidContext* context, Hook* hook) {
+    const Core::Prof::Scope scope{*hook->prof_site};
+    return reinterpret_cast<MidHandler>(hook->handler)(context);
+}
+
 /// Stub for a hook that calls a host function: saves the caller-saved registers and the argument registers, calls
 /// handler(rdi, rsi, rdx, rcx, r8, r9, return address, rsp of the caller). A non-zero result skips the hooked function (the stub
 /// returns to its caller; with bit 63 set the rest of the result is returned as its value); zero runs the displaced instructions and continues in the function.
 void EmitCallStub(Xbyak::CodeGenerator& c, Hook& hook, const u8* original, size_t displaced,
                   const u8* resume) {
     Xbyak::Label handled;
+    // TLG_HOOK_PROF: 16 more bytes for a ninth argument (the hook) at [rsp + 16]; the xmm registers move up by 16 (rsp stays 16-byte aligned at the call)
+    const bool prof = HookProfOn() && hook.prof_site != nullptr;
+    const int frame = prof ? 168 : 152;
+    const int xmm_at = prof ? 32 : 16;
     const auto save = [&] {
         c.pushfq();
         c.push(rax);
@@ -227,16 +258,16 @@ void EmitCallStub(Xbyak::CodeGenerator& c, Hook& hook, const u8* original, size_
         c.push(r11);
         // 16 bytes for the seventh and eighth argument, 128 bytes for xmm0-7; with the 80 bytes above and the
         // return address, rsp is 16-byte aligned at the call.
-        c.sub(rsp, 152);
+        c.sub(rsp, frame);
         for (int i = 0; i < 8; ++i) {
-            c.movdqu(ptr[rsp + 16 + 16 * i], Xbyak::Xmm(i));
+            c.movdqu(ptr[rsp + xmm_at + 16 * i], Xbyak::Xmm(i));
         }
     };
     const auto restore = [&] {
         for (int i = 0; i < 8; ++i) {
-            c.movdqu(Xbyak::Xmm(i), ptr[rsp + 16 + 16 * i]);
+            c.movdqu(Xbyak::Xmm(i), ptr[rsp + xmm_at + 16 * i]);
         }
-        c.add(rsp, 152);
+        c.add(rsp, frame);
         c.pop(r11);
         c.pop(r10);
         c.pop(r9);
@@ -249,11 +280,17 @@ void EmitCallStub(Xbyak::CodeGenerator& c, Hook& hook, const u8* original, size_
         c.popfq();
     };
     save();
-    c.mov(rax, ptr[rsp + 152 + 80]); // return address of the hooked function
+    c.mov(rax, ptr[rsp + frame + 80]); // return address of the hooked function
     c.mov(ptr[rsp], rax);
-    c.lea(rax, ptr[rsp + 152 + 80 + 8]); // rsp of the caller (after the return)
+    c.lea(rax, ptr[rsp + frame + 80 + 8]); // rsp of the caller (after the return)
     c.mov(ptr[rsp + 8], rax);
-    c.mov(rax, hook.handler);
+    if (prof) {
+        c.mov(rax, reinterpret_cast<u64>(&hook));
+        c.mov(ptr[rsp + 16], rax);
+        c.mov(rax, reinterpret_cast<u64>(&ProfiledCall));
+    } else {
+        c.mov(rax, hook.handler);
+    }
     c.call(rax);
     c.test(rax, rax);
     c.jnz(handled, Xbyak::CodeGenerator::T_NEAR);
@@ -267,7 +304,7 @@ void EmitCallStub(Xbyak::CodeGenerator& c, Hook& hook, const u8* original, size_
     c.test(rax, r10);
     c.jz(plain);
     c.btr(rax, 63);
-    c.mov(ptr[rsp + 152 + 64], rax);
+    c.mov(ptr[rsp + frame + 64], rax);
     c.L(plain);
     restore();
     c.ret();
@@ -339,7 +376,12 @@ void EmitMidStub(Xbyak::CodeGenerator& c, Hook& hook, const u8* original, size_t
     c.mov(r12, rsp); // the context; r12 is callee saved
     c.mov(rdi, rsp);
     c.and_(rsp, -16);
-    c.mov(rax, hook.handler);
+    if (HookProfOn() && hook.prof_site != nullptr) {
+        c.mov(rsi, reinterpret_cast<u64>(&hook)); // the live rsi only: the context keeps the interrupted code's value
+        c.mov(rax, reinterpret_cast<u64>(&ProfiledMid));
+    } else {
+        c.mov(rax, hook.handler);
+    }
     c.call(rax);
     c.mov(rsp, r12);
     c.test(rax, rax);
@@ -668,6 +710,10 @@ void InstallForEboot(VAddr base, u64 image_size) {
                               item.value("handler", std::string()));
                     ++failed;
                     continue;
+                }
+                if (HookProfOn()) {
+                    hook->prof_name = "hook." + hook->name;
+                    hook->prof_site = std::make_unique<Core::Prof::Site>(hook->prof_name.c_str(), u8{1});
                 }
             }
             if (hook->mode == Mode::Snap && item.contains("snap")) {

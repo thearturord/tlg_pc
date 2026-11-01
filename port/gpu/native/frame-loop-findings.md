@@ -80,5 +80,8 @@ The frame chain (148 frames; `port/tools/timeline/frame_chain.py`), ms from the 
 
 1. The same spot on the build from before the native renderer: the frame time there (and the frame chain, if that build has the timeline
    capture) against 13.6 ms.
-2. In this build: the time our hooks take inside the game's threads (a probe around the call hook handlers, by hook name), and our threads'
-   share of the CPU next to the game's workers.
+2. In this build: the time our hooks take inside the game's threads. `TLG_HOOK_PROF=1` (default 0) runs every call and mid hook's handler
+   inside a profiler probe `hook.<name>` (group `hook`); capture with Shift+F9 and `TLG_PROF_THREADS=all`. A handler that runs the game's
+   function itself through its original entry has that game code inside its probe too. The generated stub was tested on Linux with xbyak
+   (arguments, return address, caller stack pointer, both return paths) with the switch on and off.
+3. Our threads' share of the CPU next to the game's workers.
