@@ -6579,26 +6579,40 @@ u64 PS4_SYSV_ABI FlipInterrupt(Core::GuestHooks::MidContext* c) {
 /// is right after the release packet's address is known (rax = the packet, r14 = the label), the second where the three packets are done (rax = the cursor): when the cursor moved by
 /// exactly the three packets, the wait and the write are typed too. TLG_SYNC_TYPED=1 compares the records with the packets.
 thread_local u64 t_csub_packet = 0, t_csub_label = 0;
-u64 PS4_SYSV_ABI ComputeSubmitRelease(Core::GuestHooks::MidContext* c) {
+void TypedUnitRelease(u64 ctx, u64 packet, u64 label, u64 value, bool unit) {
     t_csub_packet = 0;
-    if (!Core::NativeSync::Typed::On() || !IsHeapPointer(c->rbx) || !IsHeapPointer(c->rbx + 0x1ce8) || c->rax != Rd<u64>(c->rbx, 0x70) || (c->rax & 3) != 0) {
-        return 0;
+    if (!Core::NativeSync::Typed::On() || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x1ce8) || packet != Rd<u64>(ctx, 0x70) || (packet & 3) != 0) {
+        return;
     }
-    t_csub_packet = c->rax;
-    t_csub_label = c->r14;
+    if (unit) {
+        t_csub_packet = packet;
+        t_csub_label = label;
+    }
     Core::NativeSync::Fence typed;
-    typed.address = (c->r14 & 0xfffffffcull) | ((c->r14 >> 32) & 0xffffull) << 32;
-    typed.value = 1;
+    typed.address = (label & 0xfffffffcull) | ((label >> 32) & 0xffffull) << 32;
+    typed.value = value;
     typed.source = Core::NativeSync::Source::Immediate64;
     typed.interrupt = true; // dw2 0x43000000: data 64 bit, interrupt when the write is confirmed
-    Core::NativeSync::Typed::Expect(c->rax, typed, Core::NativeSync::Typed::KindRelease);
+    Core::NativeSync::Typed::Expect(packet, typed, Core::NativeSync::Typed::KindRelease);
+}
+u64 PS4_SYSV_ABI ComputeSubmitRelease(Core::GuestHooks::MidContext* c) {
+    TypedUnitRelease(c->rbx, c->rax, c->r14, 1, true);
     return 0;
 }
-u64 PS4_SYSV_ABI ComputeSubmitEnd(Core::GuestHooks::MidContext* c) {
+/// FUN_024712d0 (the same unit, label in r12) and FUN_02471f40 (the fence signal: label NOP + the release alone, value 0x10, label in r15; AscWaitFence waits for it)
+u64 PS4_SYSV_ABI FenceUnitRelease(Core::GuestHooks::MidContext* c) {
+    TypedUnitRelease(c->rbx, c->rax, c->r12, 1, true);
+    return 0;
+}
+u64 PS4_SYSV_ABI FenceSignalRelease(Core::GuestHooks::MidContext* c) {
+    TypedUnitRelease(c->rbx, c->rax, c->r15, 0x10, false);
+    return 0;
+}
+void ComputeUnitEnd(u64 cursor) {
     const u64 packet = t_csub_packet, label = t_csub_label;
     t_csub_packet = 0;
-    if (packet == 0 || c->rax != packet + (7 + 7 + 6) * sizeof(u32)) {
-        return 0; // the buffer was switched in between: only the release is typed
+    if (packet == 0 || cursor != packet + (7 + 7 + 6) * sizeof(u32)) {
+        return; // the buffer was switched in between: only the release is typed
     }
     const u64 address = (label & 0xfffffffcull) | ((label >> 32) & 0xffffull) << 32;
     Core::NativeSync::LabelWait wait;
@@ -6616,6 +6630,16 @@ u64 PS4_SYSV_ABI ComputeSubmitEnd(Core::GuestHooks::MidContext* c) {
     write.data = data;
     write.bytes = 8;
     Core::NativeSync::Typed::Expect(packet + 14 * sizeof(u32), write);
+}
+/// Same unit, as the game's compute context writes it for a fenced async dispatch (FUN_0246f5f0, unit label NOP + release + wait + write; rbx = context). The release hook is ComputeSubmitRelease.
+u64 PS4_SYSV_ABI ComputeSubmitEnd(Core::GuestHooks::MidContext* c) {
+    ComputeUnitEnd(c->rax);
+    return 0;
+}
+u64 PS4_SYSV_ABI AscFencedEnd(Core::GuestHooks::MidContext* c) {
+    if (IsHeapPointer(c->rbx) && IsHeapPointer(c->rbx + 0x88)) {
+        ComputeUnitEnd(Rd<u64>(c->rbx, 0x70));
+    }
     return 0;
 }
 
@@ -8880,6 +8904,15 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "tag_fence") {
         return reinterpret_cast<u64>(&TagFenceSignal);
+    }
+    if (name == "fence_unit_release") {
+        return reinterpret_cast<u64>(&FenceUnitRelease);
+    }
+    if (name == "fence_signal_release") {
+        return reinterpret_cast<u64>(&FenceSignalRelease);
+    }
+    if (name == "asc_fenced_end") {
+        return reinterpret_cast<u64>(&AscFencedEnd);
     }
     if (name == "compute_submit_release") {
         return reinterpret_cast<u64>(&ComputeSubmitRelease);
