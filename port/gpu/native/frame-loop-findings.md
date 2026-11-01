@@ -115,3 +115,15 @@ The frame chain (148 frames; `port/tools/timeline/frame_chain.py`), ms from the 
 - `runtime_sema.c` has had this design since before the native renderer (last real change 2026-10-14). A single lock gets worse when the CPU
   is busier, because a thread holding it can lose its core while others queue behind it; the native renderer added about two busy host
   threads. That link to the "100 fps ten days ago" is plausible, not measured.
+
+### The fix: `TLG_SEMA_FAST=1` (default 0)
+
+`port/src/runtime_sema.c`: each semaphore has its own lock; it is found by its ID in a table read without a lock (pages of 1024 IDs made
+on demand; IDs above about a million fall back to the list); a blocking wait uses its thread's condition variable, made once per thread;
+the trace switch is read once instead of `getenv` on every blocking wait. A deleted semaphore's memory is kept (a thread that found it just
+before the delete still locks it and sees it deleted). The old path is unchanged and used without the switch.
+
+Tested in the container (Linux, glibc): `tests/test_sema.c` (contracts, concurrency, cancel/delete, priority) passes in both modes; a stress
+test (8 threads passing 3 tokens around a ring of semaphores 200,000 times each, with 300 other semaphores, delete while 4 threads wait,
+timeouts) passes in both modes; 8 threads signalling and polling their own semaphores: 10.5 us per call with one lock, 0.46 us with the fix
+(the game's measured mean wait for the lock was 9.8 us). Windows (winpthreads) not measured here.
