@@ -777,6 +777,9 @@ bool BufferCache::IsRangeGpuWritten(VAddr addr, size_t size) {
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
     TLG_PROF("buffer.synchronize");
+    if ((Core::NativeDiag::ablate & Core::NativeDiag::AblateSync) != 0) {
+        return false; // TLG_ABLATE=sync: nothing is uploaded (bisection tool)
+    }
     // B9.4: a placed buffer holds [begin, end) of its block; a read into its slack must not take (and lose) the bytes of the memory after it
     VAddr held_lo = device_addr, held_hi = device_addr + size;
     {

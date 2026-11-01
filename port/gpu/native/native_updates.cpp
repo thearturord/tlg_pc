@@ -380,7 +380,10 @@ void ApplyBatch(const Batch& batch) {
             Core::NativeE3Census::NoteAnnounced(address, size, true);
         }
     }
-    {
+    if ((Core::NativeDiag::ablate & Core::NativeDiag::AblateAnnounce) != 0) {
+        return; // TLG_ABLATE=announce: nothing is applied (bisection tool)
+    }
+    if ((Core::NativeDiag::ablate & Core::NativeDiag::AblateAgain) == 0) {
         TLG_PROF_LEVEL("updates.apply_again", 2);
         for (const auto& [address, size] : again_list) {
             apply_fn(apply_context, address, size, false);
