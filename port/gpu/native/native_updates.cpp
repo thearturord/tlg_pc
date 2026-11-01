@@ -24,6 +24,7 @@
 #include "native/native_device.h"
 #include "native/native_updates.h"
 #include "native/native_e3_census.h"
+#include "native/native_diag.h"
 #include "native/native_prof.h"
 
 namespace Core::NativeUpdates {
@@ -257,6 +258,7 @@ void* delete_context = nullptr;
 void (*apply_fn)(void*, u64, u64, bool) = nullptr;
 void* apply_context = nullptr;
 std::atomic<u64> b2_applied_ranges{0}, b2_applied_bytes{0}, b2_reapplied_ranges{0};
+std::atomic<u64> b2_coalesce_in{0}, b2_coalesce_out{0}; ///< TLG_COALESCE_ANNOUNCE: ranges before and after merging
 } // namespace
 
 
@@ -312,6 +314,31 @@ void NoteEngineDelete(u64 id, u64 address, u64 bytes, u32 what) {
     pending_deleted.push_back({id, address, bytes, what});
 }
 
+namespace {
+/// The ranges merged where they overlap or touch (a gap is never bridged); zero size ranges apply nothing and are dropped. Sorted by address.
+std::vector<std::pair<u64, u64>> MergeRanges(const std::vector<std::pair<u64, u64>>& in) {
+    std::vector<std::pair<u64, u64>> sorted;
+    sorted.reserve(in.size());
+    for (const auto& r : in) {
+        if (r.second != 0) {
+            sorted.push_back(r);
+        }
+    }
+    std::sort(sorted.begin(), sorted.end());
+    std::vector<std::pair<u64, u64>> out;
+    out.reserve(sorted.size());
+    for (const auto& r : sorted) {
+        if (!out.empty() && r.first <= out.back().first + out.back().second) {
+            const u64 end = std::max(out.back().first + out.back().second, r.first + r.second);
+            out.back().second = end - out.back().first;
+        } else {
+            out.push_back(r);
+        }
+    }
+    return out;
+}
+} // namespace
+
 void ApplyBatch(const Batch& batch) {
     TLG_PROF_LEVEL("updates.apply_batch", 1);
     TLG_PROF_ADD("updates.ranges_first", batch.first.size());
@@ -333,16 +360,34 @@ void ApplyBatch(const Batch& batch) {
     if (apply_fn == nullptr) {
         return;
     }
+    // TLG_COALESCE_ANNOUNCE: the ranges of each list are merged where they overlap or touch, and each merged range is applied once. The two lists are not mixed (`newer` differs).
+    std::vector<std::pair<u64, u64>> merged_again, merged_first;
+    const bool coalesce = Core::NativeDiag::coalesce_announce;
+    if (coalesce) {
+        merged_again = MergeRanges(batch.again);
+        merged_first = MergeRanges(batch.first);
+        b2_coalesce_in.fetch_add(batch.again.size() + batch.first.size(), std::memory_order_relaxed);
+        b2_coalesce_out.fetch_add(merged_again.size() + merged_first.size(), std::memory_order_relaxed);
+        TLG_PROF_ADD("updates.ranges_after_merge", merged_again.size() + merged_first.size());
+    }
+    const auto& again_list = coalesce ? merged_again : batch.again;
+    const auto& first_list = coalesce ? merged_first : batch.first;
+    if (Core::NativeE3Census::AnnouncedOn()) {
+        for (const auto& [address, size] : batch.again) {
+            Core::NativeE3Census::NoteAnnounced(address, size, false); // E7c Task 3 (TLG_E3_ANNOUNCED=1), the ranges as announced
+        }
+        for (const auto& [address, size] : batch.first) {
+            Core::NativeE3Census::NoteAnnounced(address, size, true);
+        }
+    }
     {
         TLG_PROF_LEVEL("updates.apply_again", 2);
-        for (const auto& [address, size] : batch.again) {
-            Core::NativeE3Census::NoteAnnounced(address, size, false); // E7c Task 3 (TLG_E3_ANNOUNCED=1)
+        for (const auto& [address, size] : again_list) {
             apply_fn(apply_context, address, size, false);
         }
     }
     TLG_PROF_LEVEL("updates.apply_first", 2);
-    for (const auto& [address, size] : batch.first) {
-        Core::NativeE3Census::NoteAnnounced(address, size, true);
+    for (const auto& [address, size] : first_list) {
         TLG_PROF_ADD("updates.bytes_first", size);
         apply_fn(apply_context, address, size, true);
         b2_applied_bytes.fetch_add(size, std::memory_order_relaxed);
@@ -501,6 +546,7 @@ nlohmann::json B9Report() {
 nlohmann::json B2Report() {
     return {{"mode", B2NativeMode()}, {"announcements_applied", b2_applied_ranges.load()}, {"bytes_applied", b2_applied_bytes.load()},
             {"announcements_applied_again", b2_reapplied_ranges.load()},
+            {"coalesce", {{"on", Core::NativeDiag::coalesce_announce}, {"ranges_in", b2_coalesce_in.load()}, {"ranges_applied", b2_coalesce_out.load()}}},
             {"note", "B2, cumulative: the engine's announced CPU writes applied to the caches"}};
 }
 

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "native/native_diag.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "native/native_readback_policy.h"
 
@@ -364,6 +365,9 @@ private:
     void DescriptorNoteImage(u32 stage, u32 index, vk::ImageView view) noexcept;
     void DescriptorEndDraw() noexcept;
     void Census(u32 index, u64 n = 1) noexcept {
+        if (!Core::NativeDiag::counters) {
+            return;
+        }
         consumer_census[index & 63].fetch_add(n, std::memory_order_relaxed);
     }
     // Front thread only:

@@ -29,6 +29,7 @@
 #include "native/native_config.h"
 #include "native/native_registry.h"
 #include "native/native_resources.h"
+#include "native/native_diag.h"
 #include "native/native_readback_policy.h"
 
 namespace Core::NativeResources {
@@ -875,6 +876,9 @@ u32 ResidentVerifyInterval() {
 }
 
 void NoteResident(u32 what) {
+    if (!Core::NativeDiag::counters) {
+        return;
+    }
     resident_counters[what & 7].fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -932,6 +936,9 @@ void NoteGpuWritten(VAddr address, u64 size) {
 }
 
 void NoteHandle(u32 what) {
+    if (!Core::NativeDiag::counters) {
+        return;
+    }
     immutable_handle_counters[what & 15].fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -995,10 +1002,16 @@ bool ImmutableCheck(ImmutableBuffer& buffer) {
 }
 
 void NoteImmutableHit() {
+    if (!Core::NativeDiag::counters) {
+        return;
+    }
     immutable_hits.fetch_add(1, std::memory_order_relaxed);
 }
 
 void NoteImmutableSync() {
+    if (!Core::NativeDiag::counters) {
+        return;
+    }
     immutable_syncs.fetch_add(1, std::memory_order_relaxed);
 }
 

@@ -20,6 +20,7 @@
 #include "native/native_updates.h"
 #include "native/native_e3_census.h"
 #include "native/native_prof.h"
+#include "native/native_diag.h"
 
 #include "native/native_resources.h"
 #include "native/native_resource_audit.h"
@@ -283,13 +284,17 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         for (const auto& e : it->second) {
             if (e.size == size && e.epoch == epoch && e.range_epoch == ranges && e.placement_epoch == arenas &&
                 (e.buffer != &stream_buffer || e.wraps == stream_buffer.WrapCount())) {
-                bind_memo_counts[0].fetch_add(1, std::memory_order_relaxed);
+                if (Core::NativeDiag::counters) {
+                    bind_memo_counts[0].fetch_add(1, std::memory_order_relaxed);
+                }
                 TLG_PROF_COUNT("buffer.bind_memo.hit");
                 return {e.buffer, e.offset};
             }
         }
     }
-    bind_memo_counts[1].fetch_add(1, std::memory_order_relaxed);
+    if (Core::NativeDiag::counters) {
+        bind_memo_counts[1].fetch_add(1, std::memory_order_relaxed);
+    }
     TLG_PROF_COUNT("buffer.bind_memo.miss");
     const auto result = ObtainBufferUncached(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
     if (memo.tick == tick) {
