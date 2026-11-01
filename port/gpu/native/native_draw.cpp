@@ -6541,6 +6541,39 @@ u64 PS4_SYSV_ABI RenderFrameFenceB(Core::GuestHooks::MidContext* c) {
     return 0;
 }
 
+/// JsSwapChain_SubmitAndFlip (0x1c4dfa0) writes two end-of-pipe packets: the frame's fence value (64 bit, to the label of the frame record; r15 = label masked to 40 bits and
+/// 8 byte aligned, r14 = the value, rbx = the draw context, the cursor `ctx + 0x47d0` is still at the packet) and, after the compute queue marker, an interrupt only (no data) on the
+/// graphics context in r13. The mid hooks sit at the cursor update of each packet; the typed records are what the function says it wrote (TLG_SYNC_TYPED=1 compares them).
+u64 PS4_SYSV_ABI FlipFrameFence(Core::GuestHooks::MidContext* c) {
+    if (!Core::NativeSync::Typed::On() || !IsHeapPointer(c->rbx) || !IsHeapPointer(c->rbx + 0x4800)) {
+        return 0;
+    }
+    const u64 packet = Rd<u64>(c->rbx, 0x47d0);
+    if ((packet & 3) != 0 || packet == 0) {
+        return 0;
+    }
+    Core::NativeSync::Fence typed;
+    typed.address = c->r15;
+    typed.value = c->r14;
+    typed.source = Core::NativeSync::Source::Immediate64;
+    Core::NativeSync::Typed::Expect(packet, typed, Core::NativeSync::Typed::KindEop);
+    return 0;
+}
+u64 PS4_SYSV_ABI FlipInterrupt(Core::GuestHooks::MidContext* c) {
+    if (!Core::NativeSync::Typed::On() || !IsHeapPointer(c->r13) || !IsHeapPointer(c->r13 + 0x4800)) {
+        return 0;
+    }
+    const u64 packet = Rd<u64>(c->r13, 0x47d0);
+    if ((packet & 3) != 0 || packet == 0) {
+        return 0;
+    }
+    Core::NativeSync::Fence typed;
+    typed.source = Core::NativeSync::Source::None;
+    typed.interrupt = true;
+    Core::NativeSync::Typed::Expect(packet, typed, Core::NativeSync::Typed::KindEop);
+    return 0;
+}
+
 /// JsComputeContext::AsyncMap (FUN_02473600): the engine hands out the CPU address of a resource the async queue computed. The game's
 /// function runs; the range it returns is noted (explicit readbacks, step 1: measurement only).
 u64 PS4_SYSV_ABI NoteAsyncMap(u64 resource, u64 out, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
@@ -8803,6 +8836,12 @@ u64 FindHandler(const std::string& name) {
     if (name == "tag_fence") {
         return reinterpret_cast<u64>(&TagFenceSignal);
     }
+    if (name == "flip_frame_fence") {
+        return reinterpret_cast<u64>(&FlipFrameFence);
+    }
+    if (name == "flip_interrupt") {
+        return reinterpret_cast<u64>(&FlipInterrupt);
+    }
     if (name == "render_frame_fence_a") {
         return reinterpret_cast<u64>(&RenderFrameFenceA);
     }
@@ -9337,6 +9376,7 @@ VAddr ImageBase() {
 
 void SetImageBase(VAddr base) {
     image_base.store(base, std::memory_order_relaxed);
+    Core::NativeSync::Typed::SetImage(base, 0x3000000);
 }
 
 u64 NextSeq() {

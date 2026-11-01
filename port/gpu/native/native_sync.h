@@ -145,6 +145,8 @@ void Met(u64 packet_address, Kind kind, const u32* packet);
 
 /// True when a typed record is waiting for the packet at `packet_address` (census use)
 [[nodiscard]] bool Expected(u64 packet_address);
+/// Diagnostic (TLG_SYNC_STACKS=1): the loaded eboot image, so packets without a typed source can be tallied by the game return addresses on the stack
+void SetImage(u64 base, u64 size);
 
 [[nodiscard]] nlohmann::json Report();
 

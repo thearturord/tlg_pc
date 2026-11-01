@@ -8,7 +8,9 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <intrin.h>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 #include <fmt/format.h>
@@ -311,6 +313,47 @@ void Expect(u64 packet_address, const DmaCopy& dma) {
     Add(p, packet_address);
 }
 
+std::atomic<u64> g_image_base{0}, g_image_size{0};
+std::mutex g_stack_mutex;
+std::map<std::string, u64> g_stack_tally;
+
+void SetImage(u64 base, u64 size) {
+    g_image_base.store(base);
+    g_image_size.store(size);
+}
+
+/// The first game return addresses (a call instruction right before them) found on the stack of the thread, as Ghidra offsets
+void TallyStack(Kind kind, const u32* packet) {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_SYNC_STACKS");
+        return e != nullptr && *e == '1';
+    }();
+    const u64 base = g_image_base.load();
+    if (!on || base == 0) {
+        return;
+    }
+    const u64 size = g_image_size.load();
+    u64 probe = 0;
+    const u64* sp = &probe;
+    std::string key = fmt::format("{} {:08x} ", KindNames[kind], packet[0]);
+    int found = 0;
+    const u64* stack_top = reinterpret_cast<const u64*>(__readgsqword(8));
+    for (const u64* q = sp; q < stack_top && found < 3; ++q) {
+        const u64 v = *q;
+        if (v > base + 8 && v < base + size) {
+            const u8* code = reinterpret_cast<const u8*>(v);
+            if (code[-5] == 0xe8 || code[-2] == 0xff || code[-3] == 0xff || code[-6] == 0xff) {
+                key += fmt::format(" {:x}", v - base + 0x1000000);
+                ++found;
+            }
+        }
+    }
+    std::scoped_lock lock{g_stack_mutex};
+    if (g_stack_tally.size() < 600 || g_stack_tally.contains(key)) {
+        ++g_stack_tally[key];
+    }
+}
+
 void Met(u64 packet_address, Kind kind, const u32* packet) {
     if (!On()) {
         return;
@@ -328,6 +371,7 @@ void Met(u64 packet_address, Kind kind, const u32* packet) {
     KindCounters& counters = g_counters[kind];
     if (!found) {
         counters.without_typed_source.fetch_add(1, std::memory_order_relaxed);
+        TallyStack(kind, packet);
         return;
     }
     counters.evaluated.fetch_add(1, std::memory_order_relaxed);
@@ -419,6 +463,12 @@ nlohmann::json Report() {
             fields[name] = n;
         }
         kinds[KindNames[k]] = {{"evaluated", c.evaluated.load()}, {"differing", c.differing.load()}, {"without_typed_source", c.without_typed_source.load()}, {"differing_fields", std::move(fields)}};
+    }
+    {
+        std::scoped_lock stack_lock{g_stack_mutex};
+        if (!g_stack_tally.empty()) {
+            j["untyped_stacks"] = g_stack_tally;
+        }
     }
     j["expected_total"] = g_expected.load();
     j["expected_overwritten_before_met"] = g_overwritten.load();
