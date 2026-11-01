@@ -685,3 +685,10 @@ draws in a long play, the native plan's last steps done).
 
 See `pgo-plan.md`: Clang profile-guided optimization for the Windows build (record a profile by playing an instrumented build, then
 build with it), from tabnul/tlg_pc `376f8ed`; the profile is recorded on this fork's build, not taken from theirs.
+
+## 30. Runtime blind spots plan
+
+See `runtime-blind-spots-plan.md`: after the semaphore fix, a review of the runtime the game calls found five candidates of the same kind
+(the engine's 100 us lock backoff sleeps are busy spins in the event queue, 1,647 call sites; a shared counter on every memcpy/memset;
+the reader-writer locks with the old semaphore design; the audio mixer's lock held for the whole mix; shared mutex counters). Phase 0
+measures all of them with probes; fixes only on evidence. Tool: `port/tools/eboot/import_sites.py` (import stubs and call sites of the eboot).
