@@ -660,3 +660,35 @@ Closures always run (EOP signals and write fences). A critical log line says whe
 See `frame-loop-findings.md`: in the real game the raster thread (about 37 ms per frame); behind it the game's own CPU frame (about 13.6 ms at
 the default spot). The vblank tick, the raster queue depth, the frame gate and the GPU were each tested and are not the limit. Tool:
 `port/tools/timeline/frame_chain.py` on a `/timeline_capture?seconds=2&tag=wf` capture.
+
+## 26. Raster thread optimization plan
+
+See `raster-optimization-plan.md`: measure inside `bind_textures` and `buffer.obtain` first, then the apply (re-apply, audit work, one
+pass per batch), a cache of each draw's whole binding, the ordered and unordered halves of the apply split, and only then preparation on
+worker threads.
+
+## 27. Memory ownership plan (frames in flight)
+
+See `memory-ownership-plan.md`: the gates exist because the game and the renderer share the game's memory; the renderer keeps its own
+copy of each frame's data (a frame data store filled when the game writes, read by every reader with the operation's record number), so
+the game may reuse its memory at once; only the CPU's reads of GPU results keep a gate, per result. Phases: census of late reads, the store
+in shadow, readers on the store, writes without an announcement, GPU results per result, the new gate, the old gates removed.
+
+## 28. DLAA / DLSS plan (parked until the renderer is 100 % native)
+
+See `dlss-plan.md`: DLAA and FSR 3.1 Native AA instead of the game's SMAA, built on the reference implementation in tabnul/tlg_pc
+(pipeline, motion vectors, reactive mask, the five jitter rules, the debugging kit, the MSVC DLSS DLL), wired from the native records
+instead of target shapes and shader hashes. It starts only when the renderer is 100 % native (checked: no register-planned or packet-path
+draws in a long play, the native plan's last steps done).
+
+## 29. PGO plan for the Windows build
+
+See `pgo-plan.md`: Clang profile-guided optimization for the Windows build (record a profile by playing an instrumented build, then
+build with it), from tabnul/tlg_pc `376f8ed`; the profile is recorded on this fork's build, not taken from theirs.
+
+## 30. Runtime blind spots plan
+
+See `runtime-blind-spots-plan.md`: after the semaphore fix, a review of the runtime the game calls found five candidates of the same kind
+(the engine's 100 us lock backoff sleeps are busy spins in the event queue, 1,647 call sites; a shared counter on every memcpy/memset;
+the reader-writer locks with the old semaphore design; the audio mixer's lock held for the whole mix; shared mutex counters). Phase 0
+measures all of them with probes; fixes only on evidence. Tool: `port/tools/eboot/import_sites.py` (import stubs and call sites of the eboot).
