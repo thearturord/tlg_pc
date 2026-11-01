@@ -2,6 +2,8 @@
 
 Scene: the default in-game spot, `cloud-e7c` build `3752058`, frames in flight 2, 120 fps patch mode. All numbers are per frame.
 
+The test switches named below (`TLG_ABLATE`, `TLG_RASTER_QUEUE`) were removed in the 2026-11-01 cleanup; their results are kept here. The semaphore fix at the end is permanent (it was `TLG_SEMA_FAST=1` while it was tested).
+
 ## Answer
 
 1. **In the real game (about 25 fps) the raster thread sets the frame time.** It is busy about 37 ms per frame: draws and dispatches about 27 ms
@@ -116,14 +118,19 @@ The frame chain (148 frames; `port/tools/timeline/frame_chain.py`), ms from the 
   is busier, because a thread holding it can lose its core while others queue behind it; the native renderer added about two busy host
   threads. That link to the "100 fps ten days ago" is plausible, not measured.
 
-### The fix: `TLG_SEMA_FAST=1` (default 0)
+### The fix (permanent since the cleanup; tested as `TLG_SEMA_FAST=1`)
 
 `port/src/runtime_sema.c`: each semaphore has its own lock; it is found by its ID in a table read without a lock (pages of 1024 IDs made
 on demand; IDs above about a million fall back to the list); a blocking wait uses its thread's condition variable, made once per thread;
 the trace switch is read once instead of `getenv` on every blocking wait. A deleted semaphore's memory is kept (a thread that found it just
-before the delete still locks it and sees it deleted). The old path is unchanged and used without the switch.
+before the delete still locks it and sees it deleted). The single lock path is gone. Probes now: `os.sem_lock (the semaphore's lock)`,
+`os.sem_signal`, `os.sem_wait`, `os.sem_poll`, `wait.os_sem_blocked`.
 
 Tested in the container (Linux, glibc): `tests/test_sema.c` (contracts, concurrency, cancel/delete, priority) passes in both modes; a stress
 test (8 threads passing 3 tokens around a ring of semaphores 200,000 times each, with 300 other semaphores, delete while 4 threads wait,
 timeouts) passes in both modes; 8 threads signalling and polling their own semaphores: 10.5 us per call with one lock, 0.46 us with the fix
 (the game's measured mean wait for the lock was 9.8 us). Windows (winpthreads) not measured here.
+
+Result in game (`TLG_SEMA_FAST=1`, draws and dispatches left out): 104 fps (9.6 ms per frame), against 65-70 before; the game threads' wait for
+semaphore locks fell from 25.5 to 2.6 ms per frame (summed). With the draws on, the raster thread is the limit (about 46 ms per frame at a
+heavier spot: buffer lookup 10.5, the apply 9.1, texture binding 8.7, buffer binding and synchronization 8.7, the draws themselves 2.9).

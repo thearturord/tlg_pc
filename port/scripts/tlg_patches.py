@@ -124,20 +124,6 @@ PATCHES['skip_worker_render_wait'] = [
      'job worker 0: do not wait for the render thread before every job pick'),
 ]
 
-# GPU particle emitter (FUN_01bcac40, the caller of the particle compute dispatches 0x1bcb5e..0x1bcc3fc): the number of particles an emitter makes in one update is
-# max(rate * STEP, 0) + the fraction carried from the update before, with STEP the float 1/30 at 0x24f109c (read at 0x1bcb5cd for the first pass and at 0x1bcbf30 for
-# the repeat pass; a third read at 0x1bcb78c feeds the emission speed). The simulation itself runs on the real frame time (max(dt, 0.001) goes into the compute
-# constants), only this count assumes 30 updates a second, so at 60 fps there are twice and at 120 fps four times as many particles per second as on the console.
-# Replacement: the two count loads read the dt snap target at 0x24f17fc instead (1/30 unpatched, 1/60 and 1/120 with dt_snap_*), so the count per update is rate / fps.
-# NOT in any mode yet: it needs a play test at 30 and 120 fps (TLG_FPS_PATCHES=...,particle_emit_step); the third read (0x1bcb78c, emission speed) is left alone.
-def _particle_count_load(disp_address):
-    end = disp_address + 4
-    return (disp_address - 4, bytes.fromhex('c5fa1005') + rip_disp(end, 0x24f109c), bytes.fromhex('c5fa1005') + rip_disp(end, 0x24f17fc),
-            'particle emitter: emission count per update uses the frame step, not the constant 1/30')
-
-
-PATCHES['particle_emit_step'] = [_particle_count_load(0x1bcb5cd), _particle_count_load(0x1bcbf30)]
-
 MODES = {
     '30': [],
     # max_fps_double/max_fps_off are left out: 60 and unlocked were reached without them

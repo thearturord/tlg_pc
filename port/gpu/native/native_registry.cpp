@@ -20,7 +20,6 @@
 
 #include "native/native_draw.h"
 #include "native/native_registry.h"
-#include "native/native_diag.h"
 #include "native/native_resources.h"
 
 namespace Core::NativeRegistry {
@@ -362,9 +361,6 @@ namespace {
 std::array<std::atomic<u64>, 16> binder_counters{};
 }
 void NoteBinder(u32 what) {
-    if (!Core::NativeDiag::counters) {
-        return;
-    }
     binder_counters[what & 15].fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -372,9 +368,6 @@ namespace {
 std::array<std::array<std::array<std::atomic<u64>, 12>, 3>, 16> binder_reasons{};
 }
 void NoteBinderReason(u32 draw_class, u32 record_stage, u32 reason) {
-    if (!Core::NativeDiag::counters) {
-        return;
-    }
     binder_reasons[draw_class & 15][std::min<u32>(record_stage, 2)][std::min<u32>(reason, 11)].fetch_add(1, std::memory_order_relaxed);
 }
 
