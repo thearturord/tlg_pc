@@ -660,3 +660,9 @@ Closures always run (EOP signals and write fences). A critical log line says whe
 See `frame-loop-findings.md`: in the real game the raster thread (about 37 ms per frame); behind it the game's own CPU frame (about 13.6 ms at
 the default spot). The vblank tick, the raster queue depth, the frame gate and the GPU were each tested and are not the limit. Tool:
 `port/tools/timeline/frame_chain.py` on a `/timeline_capture?seconds=2&tag=wf` capture.
+
+## 26. Raster thread optimization plan
+
+See `raster-optimization-plan.md`: measure inside `bind_textures` and `buffer.obtain` first, then the apply (re-apply, audit work, one
+pass per batch), a cache of each draw's whole binding, the ordered and unordered halves of the apply split, and only then preparation on
+worker threads.
