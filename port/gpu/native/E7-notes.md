@@ -667,8 +667,9 @@ See `raster-optimization-plan.md`: measure inside `bind_textures` and `buffer.ob
 pass per batch), a cache of each draw's whole binding, the ordered and unordered halves of the apply split, and only then preparation on
 worker threads.
 
-## 27. Frames in flight plan
+## 27. Memory ownership plan (frames in flight)
 
-See `frames-in-flight-plan.md`: a bisect with the existing switches (game wait mode, presenter wait, fence shortcut) to name the cause of the
-dark/bright frame at depth 1 and 2, detectors around an automatically caught bad frame, the fix of that cause, then depth 2 by default with
-the game's done count credited when the raster thread has read the frame, and the depth 0 waits removed.
+See `memory-ownership-plan.md`: the gates exist because the game and the renderer share the game's memory; the renderer keeps its own
+copy of each frame's data (a frame data store filled when the game writes, read by every reader with the operation's record number), so
+the game may reuse its memory at once; only the CPU's reads of GPU results keep a gate, per result. Phases: census of late reads, the store
+in shadow, readers on the store, writes without an announcement, GPU results per result, the new gate, the old gates removed.
