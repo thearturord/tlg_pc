@@ -624,3 +624,17 @@ What had to change for big entries: `BindMemoErase` looked back at most 64 KB fr
 Written requests are not in it: each one must mark its bytes GPU written, which is state, not a lookup.
 
 To use: run mode 1 first in the default scene and a cutscene and read `compared_and_different` (it must stay 0, with `compared` in the thousands), then mode 2. The profile shows the effect in `buffer.obtain` own time and the counter `buffer.bind_memo.wide_hit`.
+
+## 23. TLG_ABLATE: a bisection tool (the picture is wrong when it is on)
+
+`TLG_ABLATE=<comma list>`, read once at start, default empty (`native/native_diag.h`). It leaves work out on the raster thread to see what the frame rate does without it:
+
+| item | left out | where |
+|---|---|---|
+| `draws` | draw and indirect draw calls (binds, descriptors, the draw) | `liverpool.cpp`, before `ExecRasterCall` |
+| `dispatches` | compute calls | same |
+| `announce` | applying announced ranges (first and again); deletions still run | `NativeUpdates::ApplyBatch` |
+| `again` | only the re-apply of the previous batch | `NativeUpdates::ApplyBatch` |
+| `sync` | `BufferCache::SynchronizeMemory` uploads | `buffer_cache.cpp` |
+
+Closures always run (EOP signals and write fences). A critical log line says when the switch is on. Run order: `draws,dispatches` first (the ceiling of everything upstream), then `announce`, then `sync`, each against a baseline of the same scene.

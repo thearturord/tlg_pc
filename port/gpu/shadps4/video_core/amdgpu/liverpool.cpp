@@ -6,6 +6,7 @@
 #include "native/native_stream_probe.h"
 #include "native/native_timeline.h"
 #include "native/native_prof.h"
+#include "native/native_diag.h"
 
 #include "native/native_registry.h"
 #include "native/native_resource_audit.h"
@@ -1021,7 +1022,19 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                                                 : op.call.kind == RasterCall::Kind::DispatchDirect ? site_dispatch
                                                                                                    : site_dispatch_indirect;
                     const Core::Prof::Scope prof_op{op_site};
-                    ExecRasterCall(op.call, op.draw_plan.get(), op.dispatch_plan.get());
+                    const bool is_draw = op.call.kind == RasterCall::Kind::Draw || op.call.kind == RasterCall::Kind::DrawIndirect;
+                    // TLG_ABLATE (a bisection tool, the picture is wrong): the call is left out
+                    if (Core::NativeDiag::ablate != 0) {
+                        static const bool warned = [] {
+                            LOG_CRITICAL(Render, "TLG_ABLATE is on (mask {:#x}): work is left out on purpose, the picture will be wrong", Core::NativeDiag::ablate);
+                            return true;
+                        }();
+                        (void)warned;
+                    }
+                    if (!((Core::NativeDiag::ablate & Core::NativeDiag::AblateDraws) != 0 && is_draw) &&
+                        !((Core::NativeDiag::ablate & Core::NativeDiag::AblateDispatches) != 0 && !is_draw)) {
+                        ExecRasterCall(op.call, op.draw_plan.get(), op.dispatch_plan.get());
+                    }
                 }
                 const u64 op_ns = VideoCore::ReadbackStats::NowNs() - op_start;
                 if (op.call.kind == RasterCall::Kind::Draw ||
