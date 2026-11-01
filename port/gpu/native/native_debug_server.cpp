@@ -164,6 +164,7 @@ nlohmann::json Native(const Params&) {
     j["device_begin_stripped"] = live.device_begin_stripped.load();
     j["sync_units_stripped"] = live.sync_units_stripped.load();
     j["sync_unit_shapes"] = Core::NativeDraw::SyncUnitCensusReport();
+    j["writer_census"] = Core::NativeDraw::WriterCensusReport();
     j["sync_acquires_stripped"] = live.sync_acquires_stripped.load();
     j["sync_events_stripped"] = live.sync_events_stripped.load();
     j["barrier_calls_skipped"] = live.barrier_calls_skipped.load();

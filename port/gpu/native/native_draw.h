@@ -304,5 +304,7 @@ const StateTemplate* IndirectStateTemplate(const u32* packets, u32 dwords);
 
 /// F1 census (TLG_SYNC_UNITS=1): the opcode shapes around the sync packets the sweep met, with counts
 nlohmann::json SyncUnitCensusReport();
+/// F1 writer attribution (TLG_WRITER_CENSUS=1): raw sync packets per writer function
+nlohmann::json WriterCensusReport();
 
 } // namespace Core::NativeDraw

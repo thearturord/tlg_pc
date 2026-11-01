@@ -937,6 +937,9 @@ void CountSyncConverted(u32 kind, std::atomic<u64>& place) {
 /// Fences with game visible labels, waits on them, CPU writes and flips stay. Returns the number of packets taken out.
 /// F1 census (`TLG_SYNC_UNITS=1`): the opcode shape around every sync packet the sweep meets (three packets before, the packet, three after), and whether the packet
 /// writes or waits on a label inside the scratch label no-op just before it. Counts only; the shapes say which barrier idioms the game writes.
+/// The tags on both sides of the range the sweep walks (words[2] of the tag: class | record kind << 8), set by WriteDwordsAt for the census
+thread_local u32 t_sweep_prev_tag = 0, t_sweep_next_tag = 0;
+
 struct SyncUnitCensus {
     std::mutex mutex;
     std::map<std::string, u64> shapes;
@@ -981,7 +984,7 @@ void NoteSyncUnitShape(u64 begin, u64 end, u64 at, const std::array<u32, 3>& bef
             ++g_sync_units.shapes[far_key];
         }
     }
-    std::string key;
+    std::string key = fmt::format("[{:04x} -> {:04x}] ", t_sweep_prev_tag & 0xffff, t_sweep_next_tag & 0xffff);
     for (const u32 op : before) {
         key += fmt::format("{:02x} ", op);
     }
@@ -1119,6 +1122,7 @@ bool WriteDwordsAt(u64 writer, const u32* words, u32 count) {
         u64 writer{};
         u64 base{};
         u64 last{};
+        u32 last_tag{};
     };
     static thread_local std::array<Sweep, 6> sweeps;
     {
@@ -1132,13 +1136,16 @@ bool WriteDwordsAt(u64 writer, const u32* words, u32 count) {
         }
         if (entry == nullptr) {
             entry = &sweeps[(writer >> 4) % sweeps.size()];
-            *entry = {writer, base, 0};
+            *entry = {writer, base, 0, 0};
         }
         if (entry->base == base && entry->last != 0 && entry->last < cursor && cursor - entry->last < (1u << 16)) {
+            t_sweep_prev_tag = entry->last_tag;
+            t_sweep_next_tag = count > 2 ? words[2] : 0;
             SweepSyncPackets(entry->last, cursor);
         }
         entry->base = base;
         entry->last = cursor + count * sizeof(u32);
+        entry->last_tag = count > 2 ? words[2] : 0;
     }
     u64 cur = Rd<u64>(writer, 0x10);
     const u64 end = Rd<u64>(writer, 0x08);
@@ -6290,6 +6297,152 @@ u64 PS4_SYSV_ABI TagFenceSignal(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
     return label | (1ull << 63);
 }
 
+/// F1 writer attribution (diagnostic, `TLG_WRITER_CENSUS=1`, hooks named WriterCensus_<n> in the hooks file): who writes the sync packets that reach the sweep. The hook runs the
+/// game's function and tallies the raw sync packets it left in the draw context's command buffer (cursor before and after, `ctx + 0x47d0`). The context is the first of the
+/// arguments (or `*(arg0 + 0x2d8)`) that looks like one. Calls into other hooked functions are inclusive: their raw packets count for the outer function too.
+struct WriterCensusSlot {
+    const char* name;
+    std::atomic<u64> calls{}, no_context{}, buffer_switched{}, too_big{}, empty{}, not_framed{}, with_sync{};
+    std::mutex mutex;
+    std::map<std::string, u64> kinds;
+};
+WriterCensusSlot g_writer_census[6] = {{"01c6e670 render scene barrier"}, {"02472050"}, {"01c804a0"}, {"02480e20"}, {"01c55690 RenderFrame"}, {"01c4dfa0 SubmitAndFlip"}};
+
+bool WriterCensusOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_WRITER_CENSUS");
+        return e != nullptr && *e == '1';
+    }();
+    return on;
+}
+
+bool LooksLikeContext(u64 p) {
+    if (!IsHeapPointer(p) || !IsHeapPointer(p + 0x4800) || (p & 7) != 0) { // the whole context must lie in the heap, or the reads below fault
+        return false;
+    }
+    const u64 base = Rd<u64>(p, 0x47c0), end = Rd<u64>(p, 0x47c8), cursor = Rd<u64>(p, 0x47d0);
+    return base != 0 && base <= cursor && cursor <= end && end - base < (1ull << 28) && (cursor & 3) == 0;
+}
+
+void TallyWriterRange(WriterCensusSlot& slot, u64 begin, u64 end) {
+    u64 label_lo = 0, label_hi = 0;
+    bool any = false;
+    for (u64 at = begin; at < end;) {
+        const u32 header = Rd<u32>(at, 0);
+        const u64 size = (((header >> 16) & 0x3fff) + 2) * 4ull;
+        if ((header >> 30) != 3 || at + size > end) {
+            slot.not_framed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        const u32 opcode = (header >> 8) & 0xff;
+        const u32 dwords = static_cast<u32>(size / 4);
+        std::string key;
+        u64 address = 0;
+        if (opcode == 0x10 && Rd<u32>(at, 4) == 0x68753000u) {
+            label_lo = at + 8;
+            label_hi = at + size;
+        } else if (opcode == 0x47 && dwords == 6) {
+            const auto f = Core::NativeSync::DecodeEop(reinterpret_cast<const u32*>(at));
+            address = f.address;
+            key = fmt::format("EOP value {:#x} src {} irq {}", f.value, static_cast<int>(f.source), f.interrupt);
+        } else if (opcode == 0x49 && dwords == 7) {
+            address = Core::NativeSync::DecodeRelease(reinterpret_cast<const u32*>(at)).address;
+            key = "RELEASE";
+        } else if (opcode == 0x3c && dwords == 7) {
+            const auto w = Core::NativeSync::DecodeWait(reinterpret_cast<const u32*>(at));
+            address = w.address;
+            key = fmt::format("WAIT fn {} ref {:#x}", static_cast<int>(w.function), w.ref);
+        } else if (opcode == 0x48 && dwords == 5) {
+            address = static_cast<u64>(Rd<u32>(at, 8) & 0xfffffffcu) | static_cast<u64>(Rd<u32>(at, 12) & 0xff) << 32;
+            key = "EOS";
+        } else if (opcode == 0x37 && dwords >= 5 && dwords <= 8) {
+            key = "WRITE_DATA";
+        } else if (opcode == 0x50 && dwords == 7) {
+            key = fmt::format("CP_DMA control {:#x}", Rd<u32>(at, 4));
+        }
+        if (!key.empty()) {
+            if (address != 0) {
+                key += address >= label_lo && address < label_hi ? " scratch" : " external";
+            }
+            any = true;
+            std::scoped_lock lock{slot.mutex};
+            if (slot.kinds.size() < 60 || slot.kinds.contains(key)) {
+                ++slot.kinds[key];
+            }
+        }
+        at += size;
+    }
+    if (any) {
+        slot.with_sync.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+template <int N>
+u64 PS4_SYSV_ABI WriterCensusHook(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    static std::atomic<u64> original_entry{0};
+    auto& slot = g_writer_census[N];
+    if (!WriterCensusOn()) {
+        return 0;
+    }
+    u64 original = original_entry.load(std::memory_order_relaxed);
+    if (original == 0) {
+        original = Core::GuestHooks::OriginalEntry((std::string("WriterCensus_") + std::to_string(N)).c_str());
+        original_entry.store(original, std::memory_order_relaxed);
+    }
+    if (original == 0) {
+        return 0;
+    }
+    u64 ctx = 0;
+    for (const u64 candidate : {a0, a1, a2}) {
+        if (LooksLikeContext(candidate)) {
+            ctx = candidate;
+            break;
+        }
+    }
+    if (ctx == 0 && IsHeapPointer(a0) && IsHeapPointer(a0 + 0x2e0) && (a0 & 7) == 0 && LooksLikeContext(Rd<u64>(a0, 0x2d8))) {
+        ctx = Rd<u64>(a0, 0x2d8);
+    }
+    const u64 before = ctx != 0 ? Rd<u64>(ctx, 0x47d0) : 0;
+    const u64 limit = ctx != 0 ? Rd<u64>(ctx, 0x47c8) : 0;
+    const u64 result = reinterpret_cast<GuestFunction6>(original)(a0, a1, a2, a3, a4, a5);
+    slot.calls.fetch_add(1, std::memory_order_relaxed);
+    if (ctx == 0) {
+        slot.no_context.fetch_add(1, std::memory_order_relaxed);
+        return result | (1ull << 63);
+    }
+    const u64 after = Rd<u64>(ctx, 0x47d0);
+    if (after == before) {
+        slot.empty.fetch_add(1, std::memory_order_relaxed);
+    } else if (Rd<u64>(ctx, 0x47c8) != limit || after < before) {
+        slot.buffer_switched.fetch_add(1, std::memory_order_relaxed);
+    } else if (after - before > (1u << 20)) {
+        slot.too_big.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        TallyWriterRange(slot, before, after);
+    }
+    return result | (1ull << 63);
+}
+
+nlohmann::json WriterCensusJson() {
+    nlohmann::json j = nlohmann::json::object();
+    for (auto& slot : g_writer_census) {
+        nlohmann::json e = nlohmann::json::object();
+        e["calls"] = slot.calls.load();
+        e["no_context"] = slot.no_context.load();
+        e["empty"] = slot.empty.load();
+        e["buffer_switched"] = slot.buffer_switched.load();
+        e["too_big"] = slot.too_big.load();
+        e["not_framed"] = slot.not_framed.load();
+        e["calls_with_sync_packets"] = slot.with_sync.load();
+        std::scoped_lock lock{slot.mutex};
+        for (const auto& [kind, count] : slot.kinds) {
+            e["packets"][kind] = count;
+        }
+        j[slot.name] = e;
+    }
+    return j;
+}
+
 /// JsComputeContext::AsyncMap (FUN_02473600): the engine hands out the CPU address of a resource the async queue computed. The game's
 /// function runs; the range it returns is noted (explicit readbacks, step 1: measurement only).
 u64 PS4_SYSV_ABI NoteAsyncMap(u64 resource, u64 out, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
@@ -8549,6 +8702,12 @@ u64 FindHandler(const std::string& name) {
     if (name == "tag_fence") {
         return reinterpret_cast<u64>(&TagFenceSignal);
     }
+    if (name == "writer_census_0") return reinterpret_cast<u64>(&WriterCensusHook<0>);
+    if (name == "writer_census_1") return reinterpret_cast<u64>(&WriterCensusHook<1>);
+    if (name == "writer_census_2") return reinterpret_cast<u64>(&WriterCensusHook<2>);
+    if (name == "writer_census_3") return reinterpret_cast<u64>(&WriterCensusHook<3>);
+    if (name == "writer_census_4") return reinterpret_cast<u64>(&WriterCensusHook<4>);
+    if (name == "writer_census_5") return reinterpret_cast<u64>(&WriterCensusHook<5>);
     return 0;
 }
 
@@ -9076,6 +9235,10 @@ u64 NextSeq() {
 
 nlohmann::json SyncUnitCensusReport() {
     return SyncUnitCensusJson();
+}
+
+nlohmann::json WriterCensusReport() {
+    return WriterCensusJson();
 }
 
 } // namespace Core::NativeDraw
