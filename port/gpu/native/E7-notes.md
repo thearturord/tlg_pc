@@ -666,3 +666,9 @@ the default spot). The vblank tick, the raster queue depth, the frame gate and t
 See `raster-optimization-plan.md`: measure inside `bind_textures` and `buffer.obtain` first, then the apply (re-apply, audit work, one
 pass per batch), a cache of each draw's whole binding, the ordered and unordered halves of the apply split, and only then preparation on
 worker threads.
+
+## 27. Frames in flight plan
+
+See `frames-in-flight-plan.md`: a bisect with the existing switches (game wait mode, presenter wait, fence shortcut) to name the cause of the
+dark/bright frame at depth 1 and 2, detectors around an automatically caught bad frame, the fix of that cause, then depth 2 by default with
+the game's done count credited when the raster thread has read the frame, and the depth 0 waits removed.
