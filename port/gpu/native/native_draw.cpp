@@ -935,8 +935,82 @@ void CountSyncConverted(u32 kind, std::atomic<u64>& place) {
 ///  - a cache acquire is ignored by the command processor;
 ///  - an event write other than the stream out flush and the Z pass dump is ignored by it.
 /// Fences with game visible labels, waits on them, CPU writes and flips stay. Returns the number of packets taken out.
+/// F1 census (`TLG_SYNC_UNITS=1`): the opcode shape around every sync packet the sweep meets (three packets before, the packet, three after), and whether the packet
+/// writes or waits on a label inside the scratch label no-op just before it. Counts only; the shapes say which barrier idioms the game writes.
+struct SyncUnitCensus {
+    std::mutex mutex;
+    std::map<std::string, u64> shapes;
+    u64 overflow{};
+};
+SyncUnitCensus g_sync_units;
+
+bool SyncUnitCensusOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_SYNC_UNITS");
+        return e != nullptr && *e == '1';
+    }();
+    return on;
+}
+
+void NoteSyncUnitShape(u64 begin, u64 end, u64 at, const std::array<u32, 3>& before, u64 label_lo, u64 label_hi) {
+    const u32 header = Rd<u32>(at, 0);
+    const u32 opcode = (header >> 8) & 0xff;
+    const u32 dwords = ((header >> 16) & 0x3fff) + 2;
+    u64 address = 0;
+    if (opcode == 0x47 && dwords == 6) {
+        address = Core::NativeSync::DecodeEop(reinterpret_cast<const u32*>(at)).address;
+    } else if (opcode == 0x49 && dwords == 7) {
+        address = Core::NativeSync::DecodeRelease(reinterpret_cast<const u32*>(at)).address;
+    } else if (opcode == 0x3c && dwords == 7) {
+        address = Core::NativeSync::DecodeWait(reinterpret_cast<const u32*>(at)).address;
+    } else if (opcode == 0x48 && dwords == 5) {
+        address = static_cast<u64>(Rd<u32>(at, 8) & 0xfffffffcu) | static_cast<u64>(Rd<u32>(at, 12) & 0xff) << 32;
+    }
+    const bool in_label = address != 0 && address >= label_lo && address < label_hi;
+    if (address != 0 && !in_label && (opcode == 0x47 || opcode == 0x3c)) {
+        std::string far_key;
+        if (opcode == 0x47) {
+            const auto f = Core::NativeSync::DecodeEop(reinterpret_cast<const u32*>(at));
+            far_key = fmt::format("FAR EOP src {} irq {} value {:#x} first-dwords {:08x} {:08x}", static_cast<int>(f.source), f.interrupt, f.value, Rd<u32>(at, 4), Rd<u32>(at, 16));
+        } else {
+            const auto w = Core::NativeSync::DecodeWait(reinterpret_cast<const u32*>(at));
+            far_key = fmt::format("FAR WAIT fn {} ref {:#x} mask {:#x} control {:08x}", static_cast<int>(w.function), w.ref, w.mask, Rd<u32>(at, 4));
+        }
+        std::scoped_lock lock{g_sync_units.mutex};
+        if (g_sync_units.shapes.size() < 400 || g_sync_units.shapes.contains(far_key)) {
+            ++g_sync_units.shapes[far_key];
+        }
+    }
+    std::string key;
+    for (const u32 op : before) {
+        key += fmt::format("{:02x} ", op);
+    }
+    key += fmt::format("[{:02x}/{}{}] ", opcode, dwords, in_label ? " L" : "");
+    u64 next = at + dwords * 4ull;
+    for (int i = 0; i < 3 && next < end; ++i) {
+        const u32 h = Rd<u32>(next, 0);
+        if ((h >> 30) != 3) {
+            break;
+        }
+        key += fmt::format("{:02x} ", (h >> 8) & 0xff);
+        next += (((h >> 16) & 0x3fff) + 2) * 4ull;
+    }
+    {
+        std::scoped_lock lock{g_sync_units.mutex};
+        ++g_sync_units.shapes[fmt::format("TOTAL {:02x} {}", opcode, address == 0 ? "no address" : in_label ? "label" : (address > at ? address - at : at - address) < (1ull << 20) ? "near (same buffer)" : "FAR")];
+    }
+    std::scoped_lock lock{g_sync_units.mutex};
+    if (g_sync_units.shapes.size() >= 400 && !g_sync_units.shapes.contains(key)) {
+        ++g_sync_units.overflow;
+        return;
+    }
+    ++g_sync_units.shapes[key];
+}
+
 u32 SweepSyncPackets(u64 begin, u64 end) {
     u32 removed = 0;
+    std::array<u32, 3> recent{};
+    static thread_local u64 label_lo = 0, label_hi = 0; // survives the sweep calls: a unit's label NOP and its signal can lie in different sweep ranges
     const u32 policy_bits = Core::NativeConfig::SdkStrip;
     for (u64 at = begin; at < end;) {
         const u32 header = Rd<u32>(at, 0);
@@ -947,6 +1021,16 @@ u32 SweepSyncPackets(u64 begin, u64 end) {
         const u64 size = (((header >> 16) & 0x3fff) + 2) * 4ull;
         if (at + size > end) {
             break;
+        }
+        if (SyncUnitCensusOn()) {
+            if (opcode == 0x47 || opcode == 0x49 || opcode == 0x3c || opcode == 0x37 || opcode == 0x50 || opcode == 0x48) {
+                NoteSyncUnitShape(begin, end, at, recent, label_lo, label_hi);
+            }
+            if (opcode == 0x10 && Rd<u32>(at, 4) == 0x68753000u) {
+                label_lo = at + 8;
+                label_hi = at + size;
+            }
+            recent = {recent[1], recent[2], opcode};
         }
         const auto next_at = [&](u64 from) {
             const u32 h = Rd<u32>(from, 0);
@@ -1012,6 +1096,21 @@ u32 SweepSyncPackets(u64 begin, u64 end) {
         at += size;
     }
     return removed;
+}
+
+nlohmann::json SyncUnitCensusJson() {
+    nlohmann::json j = nlohmann::json::object();
+    std::scoped_lock lock{g_sync_units.mutex};
+    std::vector<std::pair<u64, std::string>> sorted;
+    for (const auto& [shape, count] : g_sync_units.shapes) {
+        sorted.emplace_back(count, shape);
+    }
+    std::sort(sorted.begin(), sorted.end(), std::greater<>());
+    for (const auto& [count, shape] : sorted) {
+        j[shape] = count;
+    }
+    j["overflow"] = g_sync_units.overflow;
+    return j;
 }
 
 bool WriteDwordsAt(u64 writer, const u32* words, u32 count) {
@@ -8973,6 +9072,10 @@ void SetImageBase(VAddr base) {
 
 u64 NextSeq() {
     return next_seq.load(std::memory_order_acquire);
+}
+
+nlohmann::json SyncUnitCensusReport() {
+    return SyncUnitCensusJson();
 }
 
 } // namespace Core::NativeDraw

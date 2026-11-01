@@ -302,4 +302,7 @@ const StateTemplate* HardwareStateTemplate(const u32* prefix, u32 prefix_dwords,
 /// default state once and submits it every frame). Cached by the content; null for anything else.
 const StateTemplate* IndirectStateTemplate(const u32* packets, u32 dwords);
 
+/// F1 census (TLG_SYNC_UNITS=1): the opcode shapes around the sync packets the sweep met, with counts
+nlohmann::json SyncUnitCensusReport();
+
 } // namespace Core::NativeDraw
