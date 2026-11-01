@@ -673,3 +673,10 @@ See `memory-ownership-plan.md`: the gates exist because the game and the rendere
 copy of each frame's data (a frame data store filled when the game writes, read by every reader with the operation's record number), so
 the game may reuse its memory at once; only the CPU's reads of GPU results keep a gate, per result. Phases: census of late reads, the store
 in shadow, readers on the store, writes without an announcement, GPU results per result, the new gate, the old gates removed.
+
+## 28. DLAA / DLSS plan (parked until the renderer is 100 % native)
+
+See `dlss-plan.md`: DLAA and FSR 3.1 Native AA instead of the game's SMAA, built on the reference implementation in tabnul/tlg_pc
+(pipeline, motion vectors, reactive mask, the five jitter rules, the debugging kit, the MSVC DLSS DLL), wired from the native records
+instead of target shapes and shader hashes. It starts only when the renderer is 100 % native (checked: no register-planned or packet-path
+draws in a long play, the native plan's last steps done).
