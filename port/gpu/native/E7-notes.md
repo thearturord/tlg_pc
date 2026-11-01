@@ -692,3 +692,9 @@ See `runtime-blind-spots-plan.md`: after the semaphore fix, a review of the runt
 (the engine's 100 us lock backoff sleeps are busy spins in the event queue, 1,647 call sites; a shared counter on every memcpy/memset;
 the reader-writer locks with the old semaphore design; the audio mixer's lock held for the whole mix; shared mutex counters). Phase 0
 measures all of them with probes; fixes only on evidence. Tool: `port/tools/eboot/import_sites.py` (import stubs and call sites of the eboot).
+
+## 31. Native completion plan (updated)
+
+See `native-completion-plan.md`: the plan to finish the native renderer (phases F0 to F7), updated 2026-11-01 against the code: the dead
+packet walk and the leftover "arena" names are now F5 deletions, the probe profiler stays through F6, F2's announced-content source is one
+shared piece, and F7's gate is the definition of "100 % native". Only the native renderer; performance and add-ons are parked.
