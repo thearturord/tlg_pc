@@ -85,3 +85,15 @@ The frame chain (148 frames; `port/tools/timeline/frame_chain.py`), ms from the 
    function itself through its original entry has that game code inside its probe too. The generated stub was tested on Linux with xbyak
    (arguments, return address, caller stack pointer, both return paths) with the switch on and off.
 3. Our threads' share of the CPU next to the game's workers.
+
+## Our hooks and our OS layer on the game's threads (follow-up)
+
+- `TLG_HOOK_PROF=1` capture (70.6 fps, draws and dispatches left out): our hook handlers cost 0.10-0.13 ms per frame on each worker thread
+  (about 0.8 ms over all seven) and 5.2 ms on the game's render thread (draw pass hooks; that thread waits about 8 ms per frame for the game,
+  so it is not in the chain). The hooks do not explain a game frame that is 3-4 ms longer.
+- The game's kernel semaphores (`port/src/runtime_sema.c`) are served under one lock for all semaphores, with a linear search of every
+  semaphore for each call, and a blocking wait calls `getenv` and creates a condition variable while it holds that lock. The game posts about
+  1,760 semaphore signals per frame (timeline: about 260,000 in 2 s), mostly its job system. Probes (group `os`, always compiled in, one load
+  while no capture runs): `os.sem_signal`, `os.sem_wait`, `os.sem_poll`, `os.sem_lock (the one lock of all kernel semaphores)`,
+  `os.sem_wait_setup`, `wait.os_sem_blocked`, `os.mutex_lock`, `wait.os_mutex_blocked`, `os.cond_signal`, `os.cond_broadcast`
+  (`src/runtime_prof.h`, C entry points `tlggpu_prof_site/enter/leave` in `shim/tlggpu.cpp`).

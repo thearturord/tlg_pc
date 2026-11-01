@@ -1,6 +1,7 @@
 /* Linux pthread-backed opaque PS4 mutex handles. No guest threads yet. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "runtime_prof.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,17 +92,21 @@ static void releasing(GuestMutex *m) {
 /* A contended lock marks the wait (the uncontended path only adds the trylock). An error-check
  * mutex the caller holds fails the trylock with EBUSY and the lock with EDEADLK, as before. */
 static int32_t lock_mutex(GuestMutex **mutex, uintptr_t frame) {
+    OS_PROF(p_call, "os.mutex_lock");
     int32_t e = ensure_mutex(mutex);
-    if (e) return e;
+    if (e) { tlggpu_prof_leave(p_call); return e; }
     GuestMutex *m = *mutex;
     int r = pthread_mutex_trylock(&m->native);
     if (r == EBUSY) {
         runtime_wait_begin("mutex", m, m->name, (const void *const *)&m->owner, frame);
+        OS_PROF(p_blocked, "wait.os_mutex_blocked (game thread: a mutex is held)");
         r = pthread_mutex_lock(&m->native);
+        tlggpu_prof_leave(p_blocked);
         runtime_wait_end();
     }
     e = orbis_error(r);
     if (!e) { ++locks; took(m); }
+    tlggpu_prof_leave(p_call);
     return e;
 }
 static ABI int32_t mutex_lock(GuestMutex **mutex) { return lock_mutex(mutex, RUNTIME_GUEST_FRAME()); }
@@ -222,14 +227,20 @@ extern void tlggpu_timeline_signal(int kind,const void *object);
 static ABI int32_t cond_signal(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
+    OS_PROF(p_call, "os.cond_signal");
     tlggpu_timeline_signal(5,*cond);
-    ++wakeups; return orbis_error(pthread_cond_signal(&(*cond)->native));
+    ++wakeups; int r = pthread_cond_signal(&(*cond)->native);
+    tlggpu_prof_leave(p_call);
+    return orbis_error(r);
 }
 static ABI int32_t cond_broadcast(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
+    OS_PROF(p_call, "os.cond_broadcast");
     tlggpu_timeline_signal(6,*cond);
-    ++wakeups; return orbis_error(pthread_cond_broadcast(&(*cond)->native));
+    ++wakeups; int r = pthread_cond_broadcast(&(*cond)->native);
+    tlggpu_prof_leave(p_call);
+    return orbis_error(r);
 }
 /* PS4 struct timespec is {int64 sec, int64 nsec}, identical to Linux x86-64. */
 typedef struct { int64_t sec, nsec; } GuestTimespec;

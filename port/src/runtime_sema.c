@@ -2,6 +2,7 @@
  * Priority-ordered semaphores are approximated by FIFO order. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "runtime_prof.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,7 +64,13 @@ static ABI int32_t sem_create(uint32_t *out,const char *name,uint32_t attr,
     return 0;
 }
 static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block,uintptr_t frame) {
+    /* profiler probes (Shift+F9, group os): the call, the wait for the one lock of all semaphores, the setup of a blocking wait; the blocked time is a wait probe */
+    static void *wait_site,*poll_site;
+    if (!wait_site) { poll_site=tlggpu_prof_site("os.sem_poll",1); wait_site=tlggpu_prof_site("os.sem_wait",1); }
+    void *p_call=tlggpu_prof_enter(block ? wait_site : poll_site);
+    OS_PROF(p_lock,"os.sem_lock (the one lock of all kernel semaphores)");
     pthread_mutex_lock(&lock);
+    tlggpu_prof_leave(p_lock);
     Sema *s=find(id);
     int32_t result=0;
     if (!s) result=ERR(3);
@@ -74,6 +81,7 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block,u
     else {
         /* Priority-ordered semaphores (attr 2) are served FIFO: there is no
            PS4 priority scheduler, host threads run at equal priority. */
+        OS_PROF(p_setup,"os.sem_wait_setup (getenv, condition variable init)");
         if (getenv("TLG_TRACE_SEMA")) fprintf(stderr,"Runtime: blocking wait on semaphore %u (need %d, count %d)\n",id,need,s->count); /* deadlock diagnosis */
         Waiter w={.need=need};
         pthread_condattr_t attr;
@@ -81,12 +89,14 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block,u
         host_check(pthread_condattr_setclock(&attr,WAIT_CLOCK));
         host_check(pthread_cond_init(&w.event,&attr));
         host_check(pthread_condattr_destroy(&attr));
+        tlggpu_prof_leave(p_setup);
         Waiter **tail=&s->first;
         while (*tail) tail=&(*tail)->next;
         *tail=&w; ++s->active;
         uint64_t deadline=timeout ? now_ns()+(uint64_t)*timeout*1000 : 0;
         struct timespec end={.tv_sec=(time_t)(deadline/1000000000),.tv_nsec=(long)(deadline%1000000000)};
         runtime_wait_begin(timeout ? "semaphore (timed)" : "semaphore",(const void *)(uintptr_t)id,s->name,NULL,frame);
+        OS_PROF(p_blocked,"wait.os_sem_blocked (game thread: a kernel semaphore has no count)");
         while (!w.done) {
             int e=timeout ? pthread_cond_timedwait(&w.event,&lock,&end) : pthread_cond_wait(&w.event,&lock);
             if (e==ETIMEDOUT && !w.done) {
@@ -95,6 +105,7 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block,u
                 *p=w.next; w.result=ERR(60); w.done=1; ++timed_out;
             } else if (e!=ETIMEDOUT) host_check(e);
         }
+        tlggpu_prof_leave(p_blocked);
         runtime_wait_end();
         result=w.result;
         if (!result) ++acquired;
@@ -106,14 +117,18 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block,u
         if (!--s->active && s->deleted) free(s);
     }
     pthread_mutex_unlock(&lock);
+    tlggpu_prof_leave(p_call);
     return result;
 }
 static ABI int32_t sem_wait(uint32_t id,int32_t need,uint32_t *timeout) { return wait_count(id,need,timeout,1,RUNTIME_GUEST_FRAME()); }
 static ABI int32_t sem_poll(uint32_t id,int32_t need) { return wait_count(id,need,NULL,0,0); }
 extern void tlggpu_timeline_signal(int kind,const void *object);
 static ABI int32_t sem_signal(uint32_t id,int32_t count) {
+    OS_PROF(p_call,"os.sem_signal");
     tlggpu_timeline_signal(7,(const void *)(uintptr_t)id);
+    OS_PROF(p_lock,"os.sem_lock (the one lock of all kernel semaphores)");
     pthread_mutex_lock(&lock);
+    tlggpu_prof_leave(p_lock);
     Sema *s=find(id);
     int32_t result=0;
     if (!s) result=ERR(3);
@@ -129,6 +144,7 @@ static ABI int32_t sem_signal(uint32_t id,int32_t count) {
         }
     }
     pthread_mutex_unlock(&lock);
+    tlggpu_prof_leave(p_call);
     return result;
 }
 static int32_t wake_all(Sema *s,int32_t result) {
