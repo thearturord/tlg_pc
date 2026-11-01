@@ -1035,7 +1035,11 @@ bool RegFreeVerifyEnv() {
 }
 
 bool RegFreeEnv() {
-    static const bool on = ReadUseSwitch("TLG_TARGET_REGFREE") || ReadUseSwitch("TLG_TARGET_REGFREE_VERIFY");
+    // On by default since the owner's play of 2026-11-01 (default scene and a cutscene: 0 guard trips); TLG_TARGET_REGFREE=0 turns it off
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_TARGET_REGFREE");
+        return e == nullptr || *e != '0' || ReadUseSwitch("TLG_TARGET_REGFREE_VERIFY");
+    }();
     return on;
 }
 
