@@ -600,3 +600,27 @@ The name before the first `.` is the group. Nothing else needs a change: the rep
 **What is probed now.** group `raster` (operations, binding, render targets, barriers, descriptor push, the record calls), `buffer` (ObtainBuffer and counters for each path it takes), `texture` (image lookup, refresh and its upload steps, views, samplers), `sched` (the wait for the encoder). Tags: `caller`, `pass_class` on draws and dispatches, `closure_site` (file:line of the `RasterRun` call) on closures.
 
 **Limits.** Host threads only (the game's own threads are timed by the F9 guest spans); a thread created after the capture started is not selected by name; the draw and dispatch calls into the driver are inside the `record` probes and not split further.
+
+## 21. Raster thread work reduction, switches A and B (2026-11-01, not played)
+
+`native/native_diag.h`, both read once from the environment.
+
+- **A, `TLG_COALESCE_ANNOUNCE=1` (default off):** `NativeUpdates::ApplyBatch` merges the ranges of each list (`first`, the replay `again`) where they overlap or touch before it applies them, and applies each merged range once. A gap between two ranges is never bridged, so no byte is applied that was not announced; zero size ranges are dropped; the two lists are not mixed (`newer` differs). The E3 announced census still sees the ranges as announced. Counters: `/stats` b2 report `coalesce` {on, ranges_in, ranges_applied} and the profile counter `updates.ranges_after_merge` next to `updates.ranges_first / again`. The B9 / B8 classification counters (`AnnouncedOnBuffer`, `AnnouncedClipped`, ...) count merged ranges when it is on, so they change; the dirty sets and epochs the caches read are the same. How much it merges is not known until a run: read `ranges_in` against `ranges_applied`, then `updates.apply_first / apply_again` in the profile.
+- **B, `TLG_DIAG_COUNTERS=0` (default 1, no change):** the always-on pure counters of the bind path do nothing: `Rasterizer::Census`, `NativeRegistry::NoteBinder / NoteBinderReason`, `NativeResources::NoteResident / NoteHandle / NoteImmutableHit / NoteImmutableSync`, the bind memo's hit and miss counts. The numbers they feed in `/stats` (`consumer_census`, `native_binder`, resident and handle counters, `bind_memo`) stand still. Nothing that changes behaviour is behind it (`NoteGpuWritten`, `NoteCpuWrite` stay).
+
+To measure: capture the same scene with the switches off and on (`/prof_baseline?set=1` after the first run) and read the change of `updates.apply_*`, `raster.bind_buffers`, `raster.bind_textures`, `buffer.obtain`.
+
+## 22. Item C: the bind memo for texel buffers and bigger requests (TLG_BIND_MEMO_WIDE, 2026-11-01, not played)
+
+The bind memo (`BufferCache::ObtainBuffer`) answered only read-only requests of at most 64 KB. In the profile of the default scene about 4 in 10 requests skipped it: about 1,300 written, 1,760 texel and 970 over 64 KB per frame. The memo's rules for staleness are unchanged: an answer is dropped by a write over its range (`BindMemoErase`, from announced writes and from written requests), a bump of the memo epoch (GPU written bytes change hands, the command processor's writes), the range epoch, the placement epoch, and a wrapped stream buffer; all answers that name the stream buffer are dropped at a new command buffer.
+
+`TLG_BIND_MEMO_WIDE` (read once):
+- **0 (default):** as before.
+- **1:** read-only texel buffers and read-only requests from 64 KB up to 16 MB are also memoized, but the uncached answer is used and the memo's answer is compared with it (counter `bind_memo.wide`: `compared`, `compared_and_different`, `compared_stream_answers`; a difference is logged, the first 8). A stream copy is a new copy each time, so for those only the buffer (the stream buffer) is compared.
+- **2:** the memo's answer is used for that class (`answers_used`).
+
+What had to change for big entries: `BindMemoErase` looked back at most 64 KB from a write for an entry that covers it; it now looks back by the largest size ever stored (`BindMemo::max_size`). Entries carry a `texel` flag, so a texel request and another request at the same address and size do not share an answer.
+
+Written requests are not in it: each one must mark its bytes GPU written, which is state, not a lookup.
+
+To use: run mode 1 first in the default scene and a cutscene and read `compared_and_different` (it must stay 0, with `compared` in the thousands), then mode 2. The profile shows the effect in `buffer.obtain` own time and the counter `buffer.bind_memo.wide_hit`.
