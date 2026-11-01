@@ -6443,6 +6443,39 @@ nlohmann::json WriterCensusJson() {
     return j;
 }
 
+/// FUN_02472050(async compute context, label address): the engine's fence wait on the async queue, the wait half of the fence API (FenceEop is the signal half). One WAIT_REG_MEM
+/// (7 dwords at the buffer cursor `ctx + 0x70`): continue when the 32 bit value at the label equals 0x10. The game's function runs; the typed record is built from the argument
+/// (TLG_SYNC_TYPED=1 compares it with what the decoder reads from the packet). An address that fits 16 bits is a register wait in the packet and is not typed here.
+u64 PS4_SYSV_ABI TagAscWaitFence(u64 ctx, u64 label, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (ctx == 0 || !Core::NativeSync::Typed::On()) {
+        return 0; // the game's function runs as it is
+    }
+    static std::atomic<u64> original_entry{0};
+    u64 original = original_entry.load(std::memory_order_relaxed);
+    if (original == 0) {
+        original = Core::GuestHooks::OriginalEntry("AscWaitFence");
+        original_entry.store(original, std::memory_order_relaxed);
+    }
+    if (original == 0 || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x88)) {
+        return 0;
+    }
+    const u64 before = Rd<u64>(ctx, 0x70);
+    reinterpret_cast<GuestFunction6>(original)(ctx, label, a2, a3, a4, a5);
+    const u64 after = Rd<u64>(ctx, 0x70);
+    if (after == before + 7 * sizeof(u32) && (before & 3) == 0 && label > 0xffff) {
+        Core::NativeSync::LabelWait typed;
+        typed.memory = true;
+        typed.pfp = false;
+        typed.function = Core::NativeSync::LabelWait::Function::Equal;
+        typed.address = (label & 0xfffffffcull) | ((label >> 32) & 0xffffull) << 32;
+        typed.ref = 0x10;
+        typed.mask = 0xffffffffu;
+        typed.poll_interval = 10;
+        Core::NativeSync::Typed::Expect(before, typed);
+    }
+    return 1;
+}
+
 /// JsComputeContext::AsyncMap (FUN_02473600): the engine hands out the CPU address of a resource the async queue computed. The game's
 /// function runs; the range it returns is noted (explicit readbacks, step 1: measurement only).
 u64 PS4_SYSV_ABI NoteAsyncMap(u64 resource, u64 out, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
@@ -8701,6 +8734,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "tag_fence") {
         return reinterpret_cast<u64>(&TagFenceSignal);
+    }
+    if (name == "tag_asc_wait") {
+        return reinterpret_cast<u64>(&TagAscWaitFence);
     }
     if (name == "writer_census_0") return reinterpret_cast<u64>(&WriterCensusHook<0>);
     if (name == "writer_census_1") return reinterpret_cast<u64>(&WriterCensusHook<1>);

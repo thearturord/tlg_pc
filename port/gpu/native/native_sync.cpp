@@ -350,7 +350,9 @@ void Met(u64 packet_address, Kind kind, const u32* packet) {
         diff.Check("memory", typed.memory, decoded.memory);
         diff.Check("pfp", typed.pfp, decoded.pfp);
         diff.Check("function", static_cast<u64>(typed.function), static_cast<u64>(decoded.function));
-        diff.Check("reg", typed.reg, decoded.reg);
+        if (!decoded.memory) { // the register of a memory wait is address bits of the packet, read by nothing
+            diff.Check("reg", typed.reg, decoded.reg);
+        }
         diff.Check("address", typed.address, decoded.address);
         diff.Check("ref", typed.ref, decoded.ref);
         diff.Check("mask", typed.mask, decoded.mask);
