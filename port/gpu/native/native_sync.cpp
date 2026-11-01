@@ -272,6 +272,11 @@ void Expect(u64 packet_address, const Fence& fence, Kind kind) {
     Add(p, packet_address);
 }
 
+bool Expected(u64 packet_address) {
+    std::scoped_lock lock{g_mutex};
+    return g_pending.contains(packet_address);
+}
+
 void Expect(u64 packet_address, const LabelWait& wait) {
     if (!On()) {
         return;

@@ -143,6 +143,9 @@ void Expect(u64 packet_address, const DmaCopy& dma);
 /// The packet at `packet_address` (`packet`: its words, header first) is about to be converted.
 void Met(u64 packet_address, Kind kind, const u32* packet);
 
+/// True when a typed record is waiting for the packet at `packet_address` (census use)
+[[nodiscard]] bool Expected(u64 packet_address);
+
 [[nodiscard]] nlohmann::json Report();
 
 } // namespace Typed

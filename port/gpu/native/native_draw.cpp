@@ -988,7 +988,7 @@ void NoteSyncUnitShape(u64 begin, u64 end, u64 at, const std::array<u32, 3>& bef
     for (const u32 op : before) {
         key += fmt::format("{:02x} ", op);
     }
-    key += fmt::format("[{:02x}/{}{}] ", opcode, dwords, in_label ? " L" : "");
+    key += fmt::format("[{:02x}/{}{}{}] ", opcode, dwords, in_label ? " L" : "", Core::NativeSync::Typed::On() && Core::NativeSync::Typed::Expected(at) ? " TYPED" : "");
     u64 next = at + dwords * 4ull;
     for (int i = 0; i < 3 && next < end; ++i) {
         const u32 h = Rd<u32>(next, 0);
@@ -4855,6 +4855,19 @@ bool EmitFastClearEliminate(u64 ctx, u64 resource) {
 /// Native replacement of the game's per-resource tracking for the common cases: usage flags are cleared (the cache
 /// flush has no host effect) and a render target in state 1 / 2 that was cleared with a fast clear gets its clear
 /// eliminated, then state 3. Resources with depth transitions or the second resource (+0x138) keep the game's function.
+bool WriterCensusOn();
+void TallyMeasured(u32 index, u64 begin, u64 end, u64 limit_before, u64 limit_after);
+
+void MeasuredGameTrack(u64 ctx, u64 resource, void(PS4_SYSV_ABI* game)(u64, u64)) {
+    if (!WriterCensusOn()) {
+        game(ctx, resource);
+        return;
+    }
+    const u64 before = Rd<u64>(ctx, 0x47d0), limit = Rd<u64>(ctx, 0x47c8);
+    game(ctx, resource);
+    TallyMeasured(6, before, Rd<u64>(ctx, 0x47d0), limit, Rd<u64>(ctx, 0x47c8));
+}
+
 void TrackResource(u64 ctx, u64 resource, void(PS4_SYSV_ABI* game_track)(u64, u64)) {
     if (Rd<u64>(resource, 0x138) != 0) {
         track_game_second.fetch_add(1, std::memory_order_relaxed);
@@ -4864,7 +4877,7 @@ void TrackResource(u64 ctx, u64 resource, void(PS4_SYSV_ABI* game_track)(u64, u6
         Live().track_game_depth.fetch_add(1, std::memory_order_relaxed);
     }
     if (Rd<u64>(resource, 0x138) != 0 || (Rd<u32>(resource, 0x144) - 1u) < 2) {
-        game_track(ctx, resource);
+        MeasuredGameTrack(ctx, resource, game_track);
         return;
     }
     track_native.fetch_add(1, std::memory_order_relaxed);
@@ -4878,7 +4891,7 @@ void TrackResource(u64 ctx, u64 resource, void(PS4_SYSV_ABI* game_track)(u64, u6
     const u32 state = Rd<u32>(resource, 0x14c);
     if (state == 1 || state == 2) {
         if ((Rd<u8>(resource, 0xc1) & 0x20) != 0 && Rd<u32>(resource, 0xcc) != 0 && !EmitFastClearEliminate(ctx, resource)) {
-            game_track(ctx, resource);
+            MeasuredGameTrack(ctx, resource, game_track);
             return;
         }
         track_eliminated.fetch_add(1, std::memory_order_relaxed);
@@ -6423,9 +6436,27 @@ u64 PS4_SYSV_ABI WriterCensusHook(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5
     return result | (1ull << 63);
 }
 
+/// The game functions the hooks of the SDK helpers run themselves (RunAndMeasure, the resource tracking): the raw sync packets they leave, same tally as the writer census.
+WriterCensusSlot g_measure_census[7] = {{"measured: ResTransition"}, {"measured: RenderTargetEliminate Fn247c680"}, {"measured: ClearQuad"}, {"measured: CopyResource"},
+                                        {"measured: ExCsDepthCopy"}, {"measured: HtileClear"}, {"measured: game track function 02479db0"}};
+
+void TallyMeasured(u32 index, u64 begin, u64 end, u64 limit_before, u64 limit_after) {
+    auto& slot = g_measure_census[index];
+    slot.calls.fetch_add(1, std::memory_order_relaxed);
+    if (end == begin) {
+        slot.empty.fetch_add(1, std::memory_order_relaxed);
+    } else if (limit_before != limit_after || end < begin) {
+        slot.buffer_switched.fetch_add(1, std::memory_order_relaxed);
+    } else if (end - begin > (1u << 20)) {
+        slot.too_big.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        TallyWriterRange(slot, begin, end);
+    }
+}
+
 nlohmann::json WriterCensusJson() {
     nlohmann::json j = nlohmann::json::object();
-    for (auto& slot : g_writer_census) {
+    const auto emit = [&](WriterCensusSlot& slot) {
         nlohmann::json e = nlohmann::json::object();
         e["calls"] = slot.calls.load();
         e["no_context"] = slot.no_context.load();
@@ -6439,6 +6470,12 @@ nlohmann::json WriterCensusJson() {
             e["packets"][kind] = count;
         }
         j[slot.name] = e;
+    };
+    for (auto& slot : g_writer_census) {
+        emit(slot);
+    }
+    for (auto& slot : g_measure_census) {
+        emit(slot);
     }
     return j;
 }
@@ -6474,6 +6511,34 @@ u64 PS4_SYSV_ABI TagAscWaitFence(u64 ctx, u64 label, u64 a2, u64 a3, u64 a4, u64
         Core::NativeSync::Typed::Expect(before, typed);
     }
     return 1;
+}
+
+/// RenderDev_vfn28_RenderFrame (0x1c55690) writes the FenceEop idiom inline at two places (0x1c57329, 0x1c57790): a label of 8 bytes from the frame ring that holds 0x11, an
+/// end-of-pipe packet that stores 0x10 there, and then `(*vtable[0xb0])(fence tracker, label)`: the label is handed to a CPU side object, so these fences are read by the CPU.
+/// The mid hooks sit right after the packet is written (cursor `ctx + 0x47d0` advanced, `rbx` = the draw context) and before that call; the label is in r12 (first site) or r15
+/// (second site). The typed record is what the idiom says it wrote; TLG_SYNC_TYPED=1 compares it with the packet.
+void NoteRenderFrameFence(u64 ctx, u64 label) {
+    if (!Core::NativeSync::Typed::On() || ctx == 0 || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x4800)) {
+        return;
+    }
+    const u64 cursor = Rd<u64>(ctx, 0x47d0);
+    if (cursor < 6 * sizeof(u32) || (cursor & 3) != 0) {
+        return;
+    }
+    Core::NativeSync::Fence typed;
+    typed.address = label;
+    typed.value = 0x10;
+    typed.source = Core::NativeSync::Source::Immediate64;
+    typed.interrupt = false;
+    Core::NativeSync::Typed::Expect(cursor - 6 * sizeof(u32), typed, Core::NativeSync::Typed::KindEop);
+}
+u64 PS4_SYSV_ABI RenderFrameFenceA(Core::GuestHooks::MidContext* c) {
+    NoteRenderFrameFence(c->rbx, c->r12);
+    return 0;
+}
+u64 PS4_SYSV_ABI RenderFrameFenceB(Core::GuestHooks::MidContext* c) {
+    NoteRenderFrameFence(c->rbx, c->r15);
+    return 0;
 }
 
 /// JsComputeContext::AsyncMap (FUN_02473600): the engine hands out the CPU address of a resource the async queue computed. The game's
@@ -7488,6 +7553,9 @@ u64 RunAndMeasure(EmitStat& stat, const char* hook_name, u64 dcb, u64 a0, u64 a1
         stat.split.fetch_add(1, std::memory_order_relaxed);
     } else {
         stat.dwords.fetch_add((cursor_after - cursor_before) / 4, std::memory_order_relaxed);
+        if (WriterCensusOn()) {
+            TallyMeasured(static_cast<u32>(index), cursor_before, cursor_after, end_before, end_after);
+        }
         u64 draws = 0, packets = 0, at = cursor_before;
         while (at < cursor_after) {
             const u32 header = Rd<u32>(at, 0);
@@ -8734,6 +8802,12 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "tag_fence") {
         return reinterpret_cast<u64>(&TagFenceSignal);
+    }
+    if (name == "render_frame_fence_a") {
+        return reinterpret_cast<u64>(&RenderFrameFenceA);
+    }
+    if (name == "render_frame_fence_b") {
+        return reinterpret_cast<u64>(&RenderFrameFenceB);
     }
     if (name == "tag_asc_wait") {
         return reinterpret_cast<u64>(&TagAscWaitFence);
