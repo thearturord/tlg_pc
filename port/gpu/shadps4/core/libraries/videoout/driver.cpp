@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include "native/native_prof.h"
 #include <cmath>
 #include <vector>
 #include <chrono>
@@ -632,6 +633,7 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 }
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+    TLG_PROF_LEVEL("present.submit_flip", 1);
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -642,6 +644,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
 
+    TLG_PROF("present.push_request");
     Core::NativePresenter::Push({.frame = frame, .port = port, .flip_arg = flip_arg, .index = index, .eop = is_eop});
 }
 

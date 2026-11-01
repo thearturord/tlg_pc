@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "native/native_display.h"
+#include "native/native_prof.h"
 
 #include <array>
 #include <atomic>
@@ -59,6 +60,7 @@ void WaitFree(u32 buffer) {
     if (g_locked[buffer]) {
         g_blocked_waits.fetch_add(1, std::memory_order_relaxed);
     }
+    TLG_PROF_LEVEL("wait.display_buffer_free (command processor: the display buffer is still shown)", 1);
     g_cv.wait(lock, [&] { return !g_locked[buffer]; });
 }
 

@@ -3,6 +3,7 @@
 
 #include "native/native_debug_server.h"
 #include "native/native_e3_census.h"
+#include "native/native_prof.h"
 #include "native/native_timeline.h"
 #include "native/native_hooks.h"
 #include "native/native_frame_gate.h"
@@ -362,6 +363,7 @@ static void DumpRaw(const Instance& instance, Scheduler& scheduler, vk::CommandB
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
+    TLG_PROF_LEVEL("present.prepare_frame", 1);
     // tlg: TLG_FRAME_DUMP_TRIGGER=<file>: when the file exists it is removed and this frame's
     // guest display buffer and presented image are written to TLG_DUMP_DIR (default out/dump)
     // as raw 32-bit pixels (menus and movies included; the upscaler dumps scene frames only).
@@ -373,12 +375,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     const bool upscaled = false; // tlg-native M1: the temporal upscaler is left out (pc-port-plan.md section 10)
     VideoCore::ImageId image_id{};
     if (!upscaled) {
+        TLG_PROF("present.find_image");
         auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
         image_id = texture_cache.FindImage(desc);
         texture_cache.UpdateImage(image_id, Core::NativeE3Census::Caller::PresenterPrepareFrame);
     }
 
+    TLG_PROF_NAMED(prof_render_frame, "present.get_render_frame");
     Frame* frame = GetRenderFrame();
+    prof_render_frame.End();
 
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -399,8 +404,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         .subresourceRange{frame_subresources},
     };
 
+    TLG_PROF_NAMED(prof_synced, "present.synced_command_buffer");
     draw_scheduler.EndRendering();
     const auto cmdbuf = draw_scheduler.SyncedCommandBuffer();
+    prof_synced.End();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = 1,
         .pImageMemoryBarriers = &pre_barrier,
@@ -455,6 +462,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     }
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
 
+    TLG_PROF_NAMED(prof_post, "present.postfx_passes");
     // tlg: FSR 1, RCAS and its strength come from the in-game menu, every frame.
     TlgSettings::ReloadIfRequested();
     const auto& graphics = TlgSettings::Get();
@@ -539,6 +547,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         postfx_timer.Stamp(cmdbuf, HostPasses::PostFxTimer::Cas);
     }
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    prof_post.End();
     if (timed) {
         postfx_timer.Stamp(cmdbuf, HostPasses::PostFxTimer::PostProcess);
         postfx_timer.End(graphics.smaa, use_cas, graphics.color_adjust);
@@ -559,7 +568,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
-    draw_scheduler.Flush(info);
+    {
+        TLG_PROF("present.flush");
+        draw_scheduler.Flush(info);
+    }
 
     // tlg: the GPU command thread runs at most TLG_FRAMES_AHEAD (default 1) guest frames
     // ahead of the GPU: it waits here for the frame that many flips back. When the GPU is the
@@ -571,6 +583,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     const u32 frames_ahead = Core::FrameGate::PresenterAhead(u32(std::max(0, TlgSettings::Get().frames_queued.load())));
     if (Core::FrameGate::PresenterWaitsOwnFrame()) {
         recent_frame_ticks.clear();
+        TLG_PROF("present.wait_own_frame (TLG_FRAMES_IN_FLIGHT=0)");
         draw_scheduler.Wait(frame->ready_tick);
     } else if (!frames_ahead) {
         recent_frame_ticks.clear();
@@ -580,6 +593,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             const u64 tick = recent_frame_ticks.front();
             recent_frame_ticks.pop_front();
             if (recent_frame_ticks.size() == frames_ahead) {
+                TLG_PROF("present.wait_frames_ahead");
                 draw_scheduler.Wait(tick);
             }
         }
@@ -905,6 +919,7 @@ Frame* Presenter::GetRenderFrame() {
     // Wait for free presentation frames
     Frame* frame;
     {
+        TLG_PROF("present.wait_free_frame");
         std::unique_lock lock{free_mutex};
         free_cv.wait(lock, [this] { return !free_queue.empty(); });
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
@@ -923,17 +938,21 @@ Frame* Presenter::GetRenderFrame() {
     };
 
     // Wait for the presentation to be finished so all frame resources are free
-    while (wait() != vk::Result::eSuccess) {
-        ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
-                   "Device lost during waiting for a frame");
-        // Retry if the waiting times out
-        if (result == vk::Result::eTimeout) {
-            continue;
+    {
+        TLG_PROF("present.wait_present_done");
+        while (wait() != vk::Result::eSuccess) {
+            ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
+                       "Device lost during waiting for a frame");
+            // Retry if the waiting times out
+            if (result == vk::Result::eTimeout) {
+                continue;
+            }
         }
     }
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {
+        TLG_PROF("present.recreate_frame");
         RecreateFrame(frame, expected_frame_width, expected_frame_height);
     }
 

@@ -174,6 +174,7 @@ void Liverpool::StartRasterSplit() {
         sp.front_state.store(2, std::memory_order_relaxed);
         {
             Core::FrameTimeline::StageScope drain{Core::FrameTimeline::StageFrontDrain};
+            TLG_PROF_LEVEL("wait.front_drain_position (front: queued memory writes executed up to a position)", 1);
             std::unique_lock lk{sp.mutex};
             sp.done_cv.wait(lk, [&] { return sp.done.load(std::memory_order_acquire) >= position || sp.write_done.load(std::memory_order_acquire) >= position; });
         }
@@ -418,6 +419,7 @@ void Liverpool::RasterPush(RasterOp&& op, bool wait) {
         }
         {
             Core::FrameTimeline::StageScope queue_full{Core::FrameTimeline::StageFrontQueueFull};
+            TLG_PROF_LEVEL("wait.front_queue_full (front: the raster queue has no room)", 1);
             sp.done_cv.wait(lk, [&] { return sp.queue.size() < RasterSplit::MaxQueued; });
         }
         sp.front_state.store(0, std::memory_order_relaxed);
@@ -465,6 +467,7 @@ void Liverpool::DrainRasterWrites(u32 caller) {
     const u64 wait_start = VideoCore::ReadbackStats::NowNs();
     {
         Core::FrameTimeline::StageScope drain{Core::FrameTimeline::StageFrontDrain};
+        TLG_PROF_LEVEL("wait.front_drain_writes (front: all queued memory writing closures executed)", 1);
         std::unique_lock lk{sp.mutex};
         sp.done_cv.wait(lk,
                         [&] { return sp.pending_writes.load(std::memory_order_acquire) == 0; });
@@ -938,6 +941,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
         {
             const u64 idle_start = VideoCore::ReadbackStats::NowNs();
             const u8 front_state_at_idle = sp.front_state.load(std::memory_order_relaxed);
+            TLG_PROF_LEVEL("wait.raster_idle (raster: no work queued)", 1);
             std::unique_lock lk{sp.mutex};
             Common::CondvarWait(sp.work_cv, lk, stoken,
                                 [&] { return !sp.queue.empty() || num_commands != 0; });

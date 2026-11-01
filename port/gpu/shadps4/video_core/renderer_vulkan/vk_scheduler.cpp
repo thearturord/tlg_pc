@@ -208,6 +208,7 @@ void SchedulerCore::Wait(u64 tick) {
         SubmitInfo info{};
         Flush(info);
     }
+    TLG_PROF_LEVEL("wait.gpu_tick (a thread waits for the GPU to reach a tick)", 1);
     work_semaphore.Wait(tick);
 }
 
