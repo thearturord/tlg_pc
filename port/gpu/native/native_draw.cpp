@@ -6574,6 +6574,51 @@ u64 PS4_SYSV_ABI FlipInterrupt(Core::GuestHooks::MidContext* c) {
     return 0;
 }
 
+/// FUN_02472ed0(compute context, label address): the unit the engine writes into the async compute buffer (`ctx + 0x70`) before it submits that buffer: the label dword pair is set to
+/// 0x11 by the CPU, then a release memory stores 1 (64 bit) there (7 dwords), a wait for 1 (7 dwords, poll interval 10) and a CPU style write of 0x10 (64 bit, 6 dwords). The first mid hook
+/// is right after the release packet's address is known (rax = the packet, r14 = the label), the second where the three packets are done (rax = the cursor): when the cursor moved by
+/// exactly the three packets, the wait and the write are typed too. TLG_SYNC_TYPED=1 compares the records with the packets.
+thread_local u64 t_csub_packet = 0, t_csub_label = 0;
+u64 PS4_SYSV_ABI ComputeSubmitRelease(Core::GuestHooks::MidContext* c) {
+    t_csub_packet = 0;
+    if (!Core::NativeSync::Typed::On() || !IsHeapPointer(c->rbx) || !IsHeapPointer(c->rbx + 0x1ce8) || c->rax != Rd<u64>(c->rbx, 0x70) || (c->rax & 3) != 0) {
+        return 0;
+    }
+    t_csub_packet = c->rax;
+    t_csub_label = c->r14;
+    Core::NativeSync::Fence typed;
+    typed.address = (c->r14 & 0xfffffffcull) | ((c->r14 >> 32) & 0xffffull) << 32;
+    typed.value = 1;
+    typed.source = Core::NativeSync::Source::Immediate64;
+    typed.interrupt = true; // dw2 0x43000000: data 64 bit, interrupt when the write is confirmed
+    Core::NativeSync::Typed::Expect(c->rax, typed, Core::NativeSync::Typed::KindRelease);
+    return 0;
+}
+u64 PS4_SYSV_ABI ComputeSubmitEnd(Core::GuestHooks::MidContext* c) {
+    const u64 packet = t_csub_packet, label = t_csub_label;
+    t_csub_packet = 0;
+    if (packet == 0 || c->rax != packet + (7 + 7 + 6) * sizeof(u32)) {
+        return 0; // the buffer was switched in between: only the release is typed
+    }
+    const u64 address = (label & 0xfffffffcull) | ((label >> 32) & 0xffffull) << 32;
+    Core::NativeSync::LabelWait wait;
+    wait.memory = label > 0xffff;
+    wait.pfp = false;
+    wait.function = Core::NativeSync::LabelWait::Function::Equal;
+    wait.address = address;
+    wait.ref = 1;
+    wait.mask = 0xffffffffu;
+    wait.poll_interval = 10;
+    Core::NativeSync::Typed::Expect(packet + 7 * sizeof(u32), wait);
+    static const u32 data[2] = {0x10, 0};
+    Core::NativeSync::LabelWrite write;
+    write.address = address;
+    write.data = data;
+    write.bytes = 8;
+    Core::NativeSync::Typed::Expect(packet + 14 * sizeof(u32), write);
+    return 0;
+}
+
 /// JsComputeContext::AsyncMap (FUN_02473600): the engine hands out the CPU address of a resource the async queue computed. The game's
 /// function runs; the range it returns is noted (explicit readbacks, step 1: measurement only).
 u64 PS4_SYSV_ABI NoteAsyncMap(u64 resource, u64 out, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
@@ -8835,6 +8880,12 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "tag_fence") {
         return reinterpret_cast<u64>(&TagFenceSignal);
+    }
+    if (name == "compute_submit_release") {
+        return reinterpret_cast<u64>(&ComputeSubmitRelease);
+    }
+    if (name == "compute_submit_end") {
+        return reinterpret_cast<u64>(&ComputeSubmitEnd);
     }
     if (name == "flip_frame_fence") {
         return reinterpret_cast<u64>(&FlipFrameFence);
