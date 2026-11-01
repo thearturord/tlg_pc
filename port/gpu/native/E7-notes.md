@@ -680,3 +680,8 @@ See `dlss-plan.md`: DLAA and FSR 3.1 Native AA instead of the game's SMAA, built
 (pipeline, motion vectors, reactive mask, the five jitter rules, the debugging kit, the MSVC DLSS DLL), wired from the native records
 instead of target shapes and shader hashes. It starts only when the renderer is 100 % native (checked: no register-planned or packet-path
 draws in a long play, the native plan's last steps done).
+
+## 29. PGO plan for the Windows build
+
+See `pgo-plan.md`: Clang profile-guided optimization for the Windows build (record a profile by playing an instrumented build, then
+build with it), from tabnul/tlg_pc `376f8ed`; the profile is recorded on this fork's build, not taken from theirs.
