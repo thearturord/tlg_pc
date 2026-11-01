@@ -60,8 +60,7 @@ struct Liverpool::RasterOp {
 };
 
 struct Liverpool::RasterSplit {
-    /// Operations the command processor may queue before it waits (TLG_RASTER_QUEUE, 16 to 65536, default 256; read once)
-    static size_t MaxQueued();
+    static constexpr size_t MaxQueued = 256;
 
     std::jthread thread;
     std::jthread housekeeping; ///< Slow periodic work that must not stall the raster thread.

@@ -603,6 +603,9 @@ The name before the first `.` is the group. Nothing else needs a change: the rep
 
 ## 21. Raster thread work reduction, switches A and B (2026-11-01, not played)
 
+> **Removed in the 2026-11-01 cleanup.** The code and the switch are gone; this section is kept as the record of what was tried and what it showed.
+> Result: A merged 3,134 announced ranges per frame into 3,065 (2 %); the cost of the apply is per range, and the ranges (about 2 KB each) rarely touch.
+
 `native/native_diag.h`, both read once from the environment.
 
 - **A, `TLG_COALESCE_ANNOUNCE=1` (default off):** `NativeUpdates::ApplyBatch` merges the ranges of each list (`first`, the replay `again`) where they overlap or touch before it applies them, and applies each merged range once. A gap between two ranges is never bridged, so no byte is applied that was not announced; zero size ranges are dropped; the two lists are not mixed (`newer` differs). The E3 announced census still sees the ranges as announced. Counters: `/stats` b2 report `coalesce` {on, ranges_in, ranges_applied} and the profile counter `updates.ranges_after_merge` next to `updates.ranges_first / again`. The B9 / B8 classification counters (`AnnouncedOnBuffer`, `AnnouncedClipped`, ...) count merged ranges when it is on, so they change; the dirty sets and epochs the caches read are the same. How much it merges is not known until a run: read `ranges_in` against `ranges_applied`, then `updates.apply_first / apply_again` in the profile.
@@ -611,6 +614,9 @@ The name before the first `.` is the group. Nothing else needs a change: the rep
 To measure: capture the same scene with the switches off and on (`/prof_baseline?set=1` after the first run) and read the change of `updates.apply_*`, `raster.bind_buffers`, `raster.bind_textures`, `buffer.obtain`.
 
 ## 22. Item C: the bind memo for texel buffers and bigger requests (TLG_BIND_MEMO_WIDE, 2026-11-01, not played)
+
+> **Removed in the 2026-11-01 cleanup.** The code and the switch are gone; this section is kept as the record of what was tried and what it showed.
+> Result: only mode 1 (verify) was run: 1,954 of about 3,600 misses per frame would have been wide hits; mode 2 was never measured.
 
 The bind memo (`BufferCache::ObtainBuffer`) answered only read-only requests of at most 64 KB. In the profile of the default scene about 4 in 10 requests skipped it: about 1,300 written, 1,760 texel and 970 over 64 KB per frame. The memo's rules for staleness are unchanged: an answer is dropped by a write over its range (`BindMemoErase`, from announced writes and from written requests), a bump of the memo epoch (GPU written bytes change hands, the command processor's writes), the range epoch, the placement epoch, and a wrapped stream buffer; all answers that name the stream buffer are dropped at a new command buffer.
 
@@ -627,6 +633,9 @@ To use: run mode 1 first in the default scene and a cutscene and read `compared_
 
 ## 23. TLG_ABLATE: a bisection tool (the picture is wrong when it is on)
 
+> **Removed in the 2026-11-01 cleanup.** The code and the switch are gone; this section is kept as the record of what was tried and what it showed.
+> Results: `frame-loop-findings.md` (leaving the draws and dispatches out took the default spot from 25 to about 70 fps).
+
 `TLG_ABLATE=<comma list>`, read once at start, default empty (`native/native_diag.h`). It leaves work out on the raster thread to see what the frame rate does without it:
 
 | item | left out | where |
@@ -640,6 +649,8 @@ To use: run mode 1 first in the default scene and a cutscene and read `compared_
 Closures always run (EOP signals and write fences). A critical log line says when the switch is on. Run order: `draws,dispatches` first (the ceiling of everything upstream), then `announce`, then `sync`, each against a baseline of the same scene.
 
 ## 24. Phase 1 of the pipeline design: queue depth switch and front thread probes
+
+> **The queue switch was removed in the 2026-11-01 cleanup** (`MaxQueued` is 256 again; a queue of 2048 removed the front thread's wait but did not change the frame rate). The front thread probes are kept.
 
 - `TLG_RASTER_QUEUE=<n>` (16 to 65536, default 256, read once; logged at start): how many operations the command processor queues before it waits (`wait.front_queue_full`). Before: a constant 256 in `RasterSplit`. Nothing else changes: the order of the operations is the same, only the length of the line.
 - Front thread probes (group `front.`, level 1 or 2, no behaviour change): `front.execute_native_draw` (the whole per draw handler), `front.lookup_drain`, `front.plan_exec_draw`, `front.plan_draw_registers`, `front.plan_dispatch`, `front.resolve_ahead`. With `wait.front_queue_full` they split the front thread's ~7 ms per frame. Capture: Shift+F9 with `TLG_PROF_THREADS=all`, or `/prof?threads=GpuCommandProcessor`.

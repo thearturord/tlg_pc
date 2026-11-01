@@ -99,8 +99,6 @@ public:
     /// Binding memo (raster thread): a read-only request of at most BindMemoMax bytes asked again in the same command buffer, with nothing written to its memory
     /// since and nothing moved, gets the same answer without the lookups and synchronization (TLG_BIND_MEMO, default on; =0 off)
     static constexpr u64 BindMemoMax = 65536;
-    /// TLG_BIND_MEMO_WIDE: read-only texel buffers and read-only requests up to this size use the memo too (see BindMemoWideMode in the .cpp)
-    static constexpr u64 BindMemoWideMax = u64{1} << 24;
     void BindMemoErase(VAddr address, u64 size);
     void BindMemoBump() noexcept {
         bind_memo_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -241,14 +239,11 @@ private:
         const Buffer* buffer;
         u64 offset;
         u64 range_epoch, placement_epoch, wraps, epoch;
-        bool texel{false};
     };
     struct BindMemo {
         u64 tick{~u64{0}};
-        u64 max_size{BindMemoMax}; ///< the largest request that was ever stored: a write erases the entries that start up to this far before it
         std::map<VAddr, boost::container::small_vector<BindMemoEntry, 2>> entries;
     };
-    std::array<std::atomic<u64>, 4> bind_memo_wide_counts{}; ///< widened class: answers used, answers compared (mode 1), compared and different, compared stream answers
     std::array<BindMemo, 2> bind_memos; ///< by stream (graphics, side)
     std::atomic<u64> bind_memo_epoch{0}; ///< bumped by writes the raster thread does not see by range (faults, the command processor)
     std::array<std::atomic<u64>, 4> bind_memo_counts{}; ///< hits, misses, entries erased by writes, memo cleared

@@ -20,7 +20,6 @@
 #include "native/native_updates.h"
 #include "native/native_e3_census.h"
 #include "native/native_prof.h"
-#include "native/native_diag.h"
 
 #include "native/native_resources.h"
 #include "native/native_resource_audit.h"
@@ -250,25 +249,13 @@ static bool BindMemoOn() {
     return on;
 }
 
-/// TLG_BIND_MEMO_WIDE (default 0): 1 the memo also answers read-only texel buffers and read-only requests over BindMemoMax (up to BindMemoWideMax) but the uncached answer is
-/// used and the two are compared (counted); 2 the memo answer is used. Written requests never use the memo: they mark the bytes GPU written.
-static u32 BindMemoWideMode() {
-    static const u32 mode = [] {
-        const char* e = std::getenv("TLG_BIND_MEMO_WIDE");
-        return e != nullptr && *e >= '0' && *e <= '2' ? static_cast<u32>(*e - '0') : 0u;
-    }();
-    return mode;
-}
-
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                         Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
     TLG_PROF_LEVEL("buffer.obtain", 2);
     if (is_written) {
         BindMemoErase(device_addr, size); // the GPU writes it: answers over this memory are stale
     }
-    const u32 wide_mode = BindMemoWideMode();
-    const bool wide_class = wide_mode != 0 && !is_written && (is_texel_buffer || size > BindMemoMax) && size <= BindMemoWideMax;
-    if (is_written || ((is_texel_buffer || size > BindMemoMax) && !wide_class) || !BindMemoOn()) {
+    if (is_written || is_texel_buffer || size > BindMemoMax || !BindMemoOn()) {
         if (is_written) {
             TLG_PROF_COUNT("buffer.request.written");
         } else if (is_texel_buffer) {
@@ -294,49 +281,22 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const u64 arenas = PlacementEpoch();
     if (const auto it = memo.entries.find(device_addr); it != memo.entries.end()) {
         for (const auto& e : it->second) {
-            if (e.size == size && e.texel == is_texel_buffer && e.epoch == epoch && e.range_epoch == ranges && e.placement_epoch == arenas &&
+            if (e.size == size && e.epoch == epoch && e.range_epoch == ranges && e.placement_epoch == arenas &&
                 (e.buffer != &stream_buffer || e.wraps == stream_buffer.WrapCount())) {
-                if (wide_class) {
-                    TLG_PROF_COUNT("buffer.bind_memo.wide_hit");
-                    if (wide_mode == 1) {
-                        // verify: the uncached answer decides, the memo's is compared (a stream copy is a new copy each time: only the buffer is compared)
-                        const auto answer = ObtainBufferUncached(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
-                        bind_memo_wide_counts[1].fetch_add(1, std::memory_order_relaxed);
-                        const bool stream = e.buffer == &stream_buffer;
-                        if (stream) {
-                            bind_memo_wide_counts[3].fetch_add(1, std::memory_order_relaxed);
-                        }
-                        if (answer.first != e.buffer || (!stream && answer.second != e.offset)) {
-                            bind_memo_wide_counts[2].fetch_add(1, std::memory_order_relaxed);
-                            static std::atomic<u32> logged{0};
-                            if (logged.fetch_add(1) < 8) {
-                                LOG_ERROR(Render, "bind memo (wide) answered {:p}+{:#x}, the uncached answer is {:p}+{:#x} for {:#x}+{:#x} (texel {})", static_cast<const void*>(e.buffer), e.offset,
-                                          static_cast<const void*>(answer.first), answer.second, device_addr, size, is_texel_buffer);
-                            }
-                        }
-                        return answer;
-                    }
-                    bind_memo_wide_counts[0].fetch_add(1, std::memory_order_relaxed);
-                }
-                if (Core::NativeDiag::counters) {
-                    bind_memo_counts[0].fetch_add(1, std::memory_order_relaxed);
-                }
+                bind_memo_counts[0].fetch_add(1, std::memory_order_relaxed);
                 TLG_PROF_COUNT("buffer.bind_memo.hit");
                 return {e.buffer, e.offset};
             }
         }
     }
-    if (Core::NativeDiag::counters) {
-        bind_memo_counts[1].fetch_add(1, std::memory_order_relaxed);
-    }
+    bind_memo_counts[1].fetch_add(1, std::memory_order_relaxed);
     TLG_PROF_COUNT("buffer.bind_memo.miss");
     const auto result = ObtainBufferUncached(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
     if (memo.tick == tick) {
         auto& list = memo.entries[device_addr];
-        list.erase(std::remove_if(list.begin(), list.end(), [&](const BindMemoEntry& e) { return e.size == size && e.texel == is_texel_buffer; }), list.end());
+        list.erase(std::remove_if(list.begin(), list.end(), [&](const BindMemoEntry& e) { return e.size == size; }), list.end());
         // the epochs as they were before the request: anything the request itself changed makes the next one ask again
-        list.push_back({size, result.first, result.second, ranges, arenas, result.first == &stream_buffer ? stream_buffer.WrapCount() : 0, epoch, is_texel_buffer});
-        memo.max_size = std::max<u64>(memo.max_size, size);
+        list.push_back({size, result.first, result.second, ranges, arenas, result.first == &stream_buffer ? stream_buffer.WrapCount() : 0, epoch});
     }
     return result;
 }
@@ -346,7 +306,7 @@ void BufferCache::BindMemoErase(VAddr address, u64 size) {
         if (memo.entries.empty()) {
             continue;
         }
-        auto it = memo.entries.lower_bound(address >= memo.max_size ? address - memo.max_size : 0);
+        auto it = memo.entries.lower_bound(address >= BindMemoMax ? address - BindMemoMax : 0);
         while (it != memo.entries.end() && it->first < address + size) {
             it->second.erase(std::remove_if(it->second.begin(), it->second.end(), [&](const BindMemoEntry& e) { return it->first + e.size > address; }), it->second.end());
             if (it->second.empty()) {
@@ -360,9 +320,7 @@ void BufferCache::BindMemoErase(VAddr address, u64 size) {
 }
 
 nlohmann::json BufferCache::BindMemoReport() const {
-    return {{"on", BindMemoOn()}, {"hits", bind_memo_counts[0].load()}, {"misses", bind_memo_counts[1].load()}, {"addresses_erased_by_writes", bind_memo_counts[2].load()},
-            {"wide", {{"mode", BindMemoWideMode()}, {"answers_used", bind_memo_wide_counts[0].load()}, {"compared", bind_memo_wide_counts[1].load()}, {"compared_and_different", bind_memo_wide_counts[2].load()},
-                      {"compared_stream_answers", bind_memo_wide_counts[3].load()}}}};
+    return {{"on", BindMemoOn()}, {"hits", bind_memo_counts[0].load()}, {"misses", bind_memo_counts[1].load()}, {"addresses_erased_by_writes", bind_memo_counts[2].load()}};
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
@@ -777,9 +735,6 @@ bool BufferCache::IsRangeGpuWritten(VAddr addr, size_t size) {
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
     TLG_PROF("buffer.synchronize");
-    if ((Core::NativeDiag::ablate & Core::NativeDiag::AblateSync) != 0) {
-        return false; // TLG_ABLATE=sync: nothing is uploaded (bisection tool)
-    }
     // B9.4: a placed buffer holds [begin, end) of its block; a read into its slack must not take (and lose) the bytes of the memory after it
     VAddr held_lo = device_addr, held_hi = device_addr + size;
     {
