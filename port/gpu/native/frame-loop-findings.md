@@ -97,3 +97,21 @@ The frame chain (148 frames; `port/tools/timeline/frame_chain.py`), ms from the 
   while no capture runs): `os.sem_signal`, `os.sem_wait`, `os.sem_poll`, `os.sem_lock (the one lock of all kernel semaphores)`,
   `os.sem_wait_setup`, `wait.os_sem_blocked`, `os.mutex_lock`, `wait.os_mutex_blocked`, `os.cond_signal`, `os.cond_broadcast`
   (`src/runtime_prof.h`, C entry points `tlggpu_prof_site/enter/leave` in `shim/tlggpu.cpp`).
+
+### Result of the OS layer probes (65 fps capture, draws and dispatches left out, all threads)
+
+| probe (summed over all game threads) | ms per frame | calls per frame |
+|---|---|---|
+| `os.sem_lock`: waiting for the one lock of all kernel semaphores | 25.5 | 2,812 (mean about 9 us) |
+| `os.sem_signal` (own) | 3.2 | 1,669 |
+| `os.sem_wait_setup` (`getenv`, condition variable init) | 3.1 | 382 |
+| `os.sem_wait` (own) | 2.5 | 1,143 |
+| `os.mutex_lock` (18,343 calls) | 0.1 | |
+
+- Each worker loses about 3.4 ms per frame waiting for that lock (plus about 0.9 ms in the calls themselves).
+- The game's task scheduler thread (the unnamed `tid…` that wakes the workers, 92 % in the semaphore layer) loses 2.7 ms waiting for the lock
+  and 1.5 ms in the wait setup per frame. It hands every task to a worker, so this time sits in the game's frame chain.
+- The game's own mutexes (per object) cost almost nothing (0.1 ms for 18,343 locks).
+- `runtime_sema.c` has had this design since before the native renderer (last real change 2026-10-14). A single lock gets worse when the CPU
+  is busier, because a thread holding it can lose its core while others queue behind it; the native renderer added about two busy host
+  threads. That link to the "100 fps ten days ago" is plausible, not measured.
