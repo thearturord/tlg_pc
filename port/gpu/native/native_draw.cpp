@@ -6559,6 +6559,100 @@ u64 PS4_SYSV_ABI FlipFrameFence(Core::GuestHooks::MidContext* c) {
     Core::NativeSync::Typed::Expect(packet, typed, Core::NativeSync::Typed::KindEop);
     return 0;
 }
+/// The same fence idiom (label 0x11 from FUN_02476350, end-of-pipe store of 0x10, then the label is handed to a CPU side callback) written inline in three big render functions
+/// (0x1c5fd91, 0x1c626a0, 0x1c649de). The mid hooks sit at `add [rbx+0x47d0], 0x18` (rbx = the draw context, the cursor still at the packet). The label address the packet carries is
+/// the label masked to 40 bits: r15 & r12 (first site, r12 is the mask), r15 & 0xfffffffff8 (second), rsi (third, already masked).
+void NoteInlineFence(u64 ctx, u64 address) {
+    if (!Core::NativeSync::Typed::On() || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x4800)) {
+        return;
+    }
+    const u64 packet = Rd<u64>(ctx, 0x47d0);
+    if ((packet & 3) != 0 || packet == 0) {
+        return;
+    }
+    Core::NativeSync::Fence typed;
+    typed.address = address;
+    typed.value = 0x10;
+    typed.source = Core::NativeSync::Source::Immediate64;
+    typed.interrupt = false;
+    Core::NativeSync::Typed::Expect(packet, typed, Core::NativeSync::Typed::KindEop);
+}
+u64 PS4_SYSV_ABI InlineFenceA(Core::GuestHooks::MidContext* c) {
+    NoteInlineFence(c->rbx, c->r15 & c->r12);
+    return 0;
+}
+u64 PS4_SYSV_ABI InlineFenceB(Core::GuestHooks::MidContext* c) {
+    NoteInlineFence(c->rbx, c->r15 & 0xfffffffff8ull);
+    return 0;
+}
+u64 PS4_SYSV_ABI InlineFenceC(Core::GuestHooks::MidContext* c) {
+    NoteInlineFence(c->rbx, c->rsi);
+    return 0;
+}
+/// The engine's inline label wait (WAIT_REG_MEM, 7 dwords, function equal, mask all ones, poll 10) written by hand in many render functions: the label address is split into a masked low
+/// dword and a 16 bit high part that sit in registers when the mid hook runs (right after the packet's stores, before the cursor moves); the reference value is a constant of the site.
+/// Template arguments: draw context, low part and high part registers, reference.
+template <u64 Core::GuestHooks::MidContext::*Ctx, u64 Core::GuestHooks::MidContext::*Lo, u64 Core::GuestHooks::MidContext::*Hi, u32 Ref>
+u64 PS4_SYSV_ABI InlineWait(Core::GuestHooks::MidContext* c) {
+    const u64 ctx = c->*Ctx;
+    if (!Core::NativeSync::Typed::On() || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x4800)) {
+        return 0;
+    }
+    const u64 packet = Rd<u64>(ctx, 0x47d0);
+    if ((packet & 3) != 0 || packet == 0) {
+        return 0;
+    }
+    const u64 low = (c->*Lo) & 0xffffffffull;
+    const u64 high = (c->*Hi) & 0xffffull;
+    Core::NativeSync::LabelWait typed;
+    typed.memory = high != 0 || low > 0xffff;
+    typed.pfp = false;
+    typed.function = Core::NativeSync::LabelWait::Function::Equal;
+    typed.address = low | high << 32;
+    typed.ref = Ref;
+    typed.mask = 0xffffffffu;
+    typed.poll_interval = 10;
+    Core::NativeSync::Typed::Expect(packet, typed);
+    return 0;
+}
+/// FUN_024a5e20(dcb, destination, source, bytes): the Gnm copyData helper. One CP DMA packet (7 dwords at the dcb cursor `dcb + 0x10`) per chunk of 0x1ffffc bytes, memory to memory. The
+/// game's function runs; when the cursor moved by exactly the packets the arguments call for, each is typed from the arguments (TLG_SYNC_TYPED=1 compares them with the decoder).
+u64 PS4_SYSV_ABI TagDmaCopy(u64 dcb, u64 destination, u64 source, u64 bytes, u64 a4, u64 a5, u64 ret) {
+    if (!Core::NativeSync::Typed::On() || !IsHeapPointer(dcb) || !IsHeapPointer(dcb + 0x28)) {
+        return 0;
+    }
+    static std::atomic<u64> original_entry{0};
+    u64 original = original_entry.load(std::memory_order_relaxed);
+    if (original == 0) {
+        original = Core::GuestHooks::OriginalEntry("DmaCopy");
+        original_entry.store(original, std::memory_order_relaxed);
+    }
+    if (original == 0) {
+        return 0;
+    }
+    constexpr u32 chunk = 0x1ffffc;
+    const u64 before = Rd<u64>(dcb, 0x10);
+    reinterpret_cast<GuestFunction6>(original)(dcb, destination, source, bytes, a4, a5);
+    const u64 after = Rd<u64>(dcb, 0x10);
+    const u32 size = static_cast<u32>(bytes);
+    if (size != 0 && (before & 3) == 0) {
+        const u32 rest = size % chunk;
+        const u32 last = rest != 0 ? rest : chunk;
+        const u32 full = size / chunk - (rest == 0 ? 1 : 0);
+        if (after == before + (full + 1) * 7 * sizeof(u32)) {
+            for (u32 i = 0; i <= full; ++i) {
+                Core::NativeSync::DmaCopy typed;
+                typed.kind = Core::NativeSync::DmaCopy::Kind::MemoryToMemory;
+                typed.destination = destination + static_cast<u64>(i) * chunk;
+                typed.source = source + static_cast<u64>(i) * chunk;
+                typed.fill = static_cast<u32>(typed.source);
+                typed.bytes = i < full ? chunk : last;
+                Core::NativeSync::Typed::Expect(before + i * 7 * sizeof(u32), typed);
+            }
+        }
+    }
+    return 1;
+}
 u64 PS4_SYSV_ABI FlipInterrupt(Core::GuestHooks::MidContext* c) {
     if (!Core::NativeSync::Typed::On() || !IsHeapPointer(c->r13) || !IsHeapPointer(c->r13 + 0x4800)) {
         return 0;
@@ -8931,6 +9025,24 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "render_frame_fence_b") {
         return reinterpret_cast<u64>(&RenderFrameFenceB);
+    }
+    {
+        using C = Core::GuestHooks::MidContext;
+        if (name == "inline_wait_r14_10") {
+            return reinterpret_cast<u64>(&InlineWait<&C::r14, &C::rsi, &C::rdx, 0x10>);
+        }
+    }
+    if (name == "tag_dma_copy") {
+        return reinterpret_cast<u64>(&TagDmaCopy);
+    }
+    if (name == "inline_fence_a") {
+        return reinterpret_cast<u64>(&InlineFenceA);
+    }
+    if (name == "inline_fence_b") {
+        return reinterpret_cast<u64>(&InlineFenceB);
+    }
+    if (name == "inline_fence_c") {
+        return reinterpret_cast<u64>(&InlineFenceC);
     }
     if (name == "tag_asc_wait") {
         return reinterpret_cast<u64>(&TagAscWaitFence);
