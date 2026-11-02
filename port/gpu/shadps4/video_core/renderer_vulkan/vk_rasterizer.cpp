@@ -2766,6 +2766,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 finish_desc(desc);
 
                 Census(census_base + CImageFind);
+                if (image_engine_id == 0) {
+                    Core::NativeUpdates::NoteE3UnnamedReason(image_from_record ? 1u : binder_plan == nullptr ? 2u : 3u);
+                }
                 image_id = texture_cache.FindImage(desc);
                 if (native_reuse) {
                     cached.valid = true;

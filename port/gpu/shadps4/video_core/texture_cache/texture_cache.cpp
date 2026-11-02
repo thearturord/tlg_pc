@@ -686,6 +686,20 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     ImageId by_id{};
     if (desc.engine_id == 0) {
         Core::NativeUpdates::NoteB8(Core::NativeUpdates::E3FindUnnamed);
+        {
+            Core::NativeDevice::Object at;
+            const bool found = Core::NativeDevice::ResourceAt(info.guest_address, at);
+            const u32 owner_state = !found ? 0u : at.kind == Core::NativeDevice::Kind::Buffer ? 3u : at.address == info.guest_address ? 1u : 2u;
+            Core::NativeUpdates::NoteE3Unnamed(static_cast<u32>(desc.type), desc.engine_site, owner_state);
+            if (owner_state == 0 || owner_state == 3) {
+                static std::atomic<u32> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+                    LOG_WARNING(Render_Vulkan, "F2.3 census: FindImage with no engine texture: type {} address {:#x} size {:#x} {}x{}x{} format {} tile {} layers {} levels {} (owner state {})", static_cast<u32>(desc.type),
+                                info.guest_address, info.guest_size, info.size.width, info.size.height, info.size.depth, vk::to_string(info.pixel_format), static_cast<u32>(info.tile_mode),
+                                info.resources.layers, info.resources.levels, owner_state);
+                }
+            }
+        }
     } else {
         // E3 census: the resource the record names against the texture the address lookup finds
         Core::NativeUpdates::NoteB8(Core::NativeUpdates::E3FindNamed);

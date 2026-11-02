@@ -429,6 +429,14 @@ void NoteB8Unannounced(u64 address, u64 size, bool by_fault) noexcept {
 namespace {
 std::array<std::atomic<u64>, 4 * 16> e3_overlaps{};
 } // namespace
+std::array<std::atomic<u64>, 5 * 8 * 4> e3_unnamed{};
+std::array<std::atomic<u64>, 4> e3_unnamed_reason{};
+void NoteE3UnnamedReason(u32 reason) noexcept {
+    e3_unnamed_reason[reason & 3].fetch_add(1, std::memory_order_relaxed);
+}
+void NoteE3Unnamed(u32 type, u32 site, u32 owner) noexcept {
+    e3_unnamed[((type < 5 ? type : 4) * 8 + (site & 7)) * 4 + (owner & 3)].fetch_add(1, std::memory_order_relaxed);
+}
 void NoteE3Overlap(u32 cls, u32 outcome) noexcept {
     e3_overlaps[(cls & 3) * 16 + (outcome & 15)].fetch_add(1, std::memory_order_relaxed);
 }
@@ -472,6 +480,22 @@ nlohmann::json B8Report() {
                      for (u32 o = 0; o < 16; ++o) {
                          if (const u64 n = e3_overlaps[k * 16 + o].load(std::memory_order_relaxed); n != 0) {
                              out[classes[k]][outcomes[o]] = n;
+                         }
+                     }
+                 }
+                 return out;
+             }()},
+            {"e3_unnamed_sampled_reason", {{"record_names_binding_with_id_0", e3_unnamed_reason[1].load()}, {"not_from_record_no_plan", e3_unnamed_reason[2].load()}, {"not_from_record_plan_present", e3_unnamed_reason[3].load()}}},
+            {"e3_unnamed", [] {
+                 static constexpr const char* types[5] = {"texture", "storage", "render_target", "depth_target", "video_out"};
+                 static constexpr const char* owners[4] = {"no_engine_resource", "texture_starts_here", "inside_a_texture", "buffer_memory"};
+                 nlohmann::json out = nlohmann::json::object();
+                 for (u32 t = 0; t < 5; ++t) {
+                     for (u32 s = 0; s < 8; ++s) {
+                         for (u32 o = 0; o < 4; ++o) {
+                             if (const u64 n = e3_unnamed[(t * 8 + s) * 4 + o].load(std::memory_order_relaxed); n != 0) {
+                                 out[std::string(types[t]) + " site " + std::to_string(s)][owners[o]] = n;
+                             }
                          }
                      }
                  }

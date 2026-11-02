@@ -182,6 +182,11 @@ void NoteB8(B8Count what) noexcept;
 /// 6 expand grow, 7 tile free, 8 assert free, 9 right subresource, 10 right chance freed, 11 right chance kept, 12 left rebind, 13 left copy mip, 14 left nothing, 15 left none)
 /// for a candidate of class `cls` (0 the requested texture's own image, 1 another engine texture's, 2 unlisted, 3 the request names no engine texture)
 void NoteE3Overlap(u32 cls, u32 outcome) noexcept;
+/// F2.3 census: a `FindImage` call that names no engine object. `type` is the BindingType (0 texture, 1 storage, 2 render target, 3 depth target, 4 video out), `site` the engine site
+/// (0 none), `owner` what the address lookup finds (0 no engine resource, 1 a texture starts at the address, 2 a texture contains it, 3 a buffer's memory).
+void NoteE3Unnamed(u32 type, u32 site, u32 owner) noexcept;
+/// F2.3 census: why a sampled or stored image lookup carries no engine id (1 the record names a binding with id 0, 2 not from the record and no plan, 3 not from the record with a plan).
+void NoteE3UnnamedReason(u32 reason) noexcept;
 /// An image a CPU change reached without an announcement (first few logged with the owner)
 void NoteB8Unannounced(u64 address, u64 size, bool by_fault) noexcept;
 [[nodiscard]] nlohmann::json B8Report();
