@@ -299,8 +299,8 @@ bool ShadowOn() noexcept {
 
 bool RingSwapOn() noexcept {
     static const bool on = [] {
-        const char* e = std::getenv("TLG_F2_RING_STORE");
-        return e != nullptr && *e == '1';
+        const char* e = std::getenv("TLG_F2_RING_STORE"); // default on since 2026-11-03 (owner play, 0 bytes differ); =0 turns it off
+        return e == nullptr || *e != '0';
     }();
     return on;
 }
@@ -613,7 +613,7 @@ nlohmann::json Report() {
     out["ring_swap"] = {{"on", RingSwapOn()}, {"images_overlaid", c_ov_images.load()}, {"bytes_from_store", c_ov_bytes.load()}, {"bytes_not_covered_left_to_memory", c_ov_uncovered_bytes.load()},
                         {"images_where_store_differs_from_memory", c_ov_images_changed.load()}, {"bytes_where_store_differs_from_memory", c_ov_changed_bytes.load()},
                         {"calls", c_ov_calls.load()}, {"not_in_ring", c_ov_not_ring.load()}, {"skipped_open_map", c_ov_skipped_open_map.load()}, {"skipped_no_record", c_ov_skipped_no_seq.load()},
-                        {"switch", "TLG_F2_RING_STORE=1"}};
+                        {"switch", "TLG_F2_RING_STORE=0 turns it off"}};
     if (!ShadowOn()) {
         std::scoped_lock lock{g_mutex};
         out["store"] = {{"entries", g_entries.size()}, {"bytes", g_stored_bytes}, {"announced", c_announced.load()}, {"evicted", c_evicted.load()}};

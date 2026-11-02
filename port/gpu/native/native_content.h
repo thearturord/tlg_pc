@@ -17,10 +17,10 @@
 /// compares with the memory the upload read. Cap: `TLG_F2_STORE_MB` (default 1024); the oldest entries are dropped first (counted). Report: /stats native_backend.device.f2_store.
 namespace Core::NativeContent {
 
-/// The store is active: the shadow (`TLG_F2_STORE=1`, keeps every announcement, compares uploads) and/or the ring swap (`TLG_F2_RING_STORE=1`).
+/// The store is active: the shadow (`TLG_F2_STORE=1`, keeps every announcement, compares uploads) and/or the ring swap (`TLG_F2_RING_STORE`).
 [[nodiscard]] bool On() noexcept;
 [[nodiscard]] bool ShadowOn() noexcept;
-/// F2.2 swap (`TLG_F2_RING_STORE=1`, default off, read once): the store keeps the announcements inside the frame ring (up to `TLG_F2_RING_STORE_KB`, default 256 KB, `TLG_F2_RING_STORE_MB` of
+/// F2.2 swap (`TLG_F2_RING_STORE`, default on since 2026-11-03, `=0` turns it off, read once): the store keeps the announcements inside the frame ring (up to `TLG_F2_RING_STORE_KB`, default 256 KB, `TLG_F2_RING_STORE_MB` of
 /// them, default 256), each stamped with the record number it was made at, and `RefreshImage` reads a ring image's bytes from the newest entry stamped at or before the draw's record instead of
 /// from the ring's memory, which a later allocation may have reused by the time the raster thread uploads. Bytes no entry covers still come from memory.
 [[nodiscard]] bool RingSwapOn() noexcept;
