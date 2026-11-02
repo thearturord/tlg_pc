@@ -224,15 +224,15 @@ Liverpool::Task Liverpool::ProcessDirectAsc(std::shared_ptr<Core::NativeDirect::
         case EntryKind::StateBuffer:
             break;
         case EntryKind::Sync: {
-            std::array<u32, 8> restored;
-            const u32 opcode = Core::NativeDraw::RestoreSyncTag(entry.words.data(), restored);
+            Core::NativeSync::SyncRecord record;
+            const u32 opcode = Core::NativeDraw::ReadSyncTag(entry.words.data(), record);
             if (opcode == 0x49) {
-                SignalComputeRelease(Core::NativeSync::DecodeRelease(restored.data()), vqid, queue.pipe_id);
+                SignalComputeRelease(record.fence, vqid, queue.pipe_id);
             } else if (opcode == 0x37) {
-                const auto write = Core::NativeSync::DecodeWrite(restored.data());
+                const auto& write = record.write;
                 CpWriteData(reinterpret_cast<void*>(write.address), write.data, write.bytes, vqid + 1);
             } else if (opcode == 0x3c) {
-                auto task = DirectWaitAsc(Core::NativeSync::DecodeWait(restored.data()), vqid);
+                auto task = DirectWaitAsc(record.wait, vqid);
                 RESUME_ASC(task, vqid);
                 while (!task.handle.done()) {
                     YIELD_ASC(vqid);
@@ -793,16 +793,17 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
             break;
         }
         case EntryKind::Sync: {
-            std::array<u32, 8> restored;
-            const u32 opcode = Core::NativeDraw::RestoreSyncTag(entry.words.data(), restored);
+            Core::NativeSync::SyncRecord record;
+            const auto& restored = record.words;
+            const u32 opcode = Core::NativeDraw::ReadSyncTag(entry.words.data(), record);
             if (opcode == 0x47) {
-                SignalGraphicsEop(Core::NativeSync::DecodeEop(restored.data()));
+                SignalGraphicsEop(record.fence);
             } else if (opcode == 0x37) {
-                const auto write = Core::NativeSync::DecodeWrite(restored.data());
+                const auto& write = record.write;
                 CpWriteData(reinterpret_cast<u64*>(write.address), write.data, write.bytes, GfxQueueId);
             } else if (opcode == 0x50) {
                 // a CP DMA copy (E5: it travels as a sync tag, not as a raw packet)
-                ExecuteDma(Core::NativeSync::DecodeDma(restored.data()));
+                ExecuteDma(record.dma);
             } else if (opcode == 0x46) {
                 // the occlusion query's Z pass dump (E5: it travels as a sync tag, not as a raw packet). With real queries it only names the result block
                 // (the begin dumps to the block, the end to the block + 8); the answer is written when the graphics card has counted
@@ -823,7 +824,7 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
                     }
                 }
             } else if (opcode == 0x3c) {
-                auto task = DirectWait(Core::NativeSync::DecodeWait(restored.data()));
+                auto task = DirectWait(record.wait);
                 RESUME_GFX(task);
                 while (!task.handle.done()) {
                     YIELD_GFX();

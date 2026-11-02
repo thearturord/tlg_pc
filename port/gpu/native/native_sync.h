@@ -2,6 +2,7 @@
 #pragma once
 
 #include <nlohmann/json_fwd.hpp>
+#include <array>
 #include <span>
 
 #include "common/types.h"
@@ -116,6 +117,20 @@ struct DmaCopy {
     u32 bytes{};
 };
 
+/// A synchronization record read back from a sync tag (`ReadSyncTag`): `opcode` says which member is valid (0x47 end-of-pipe, 0x49 release, 0x3c wait, 0x37 write, 0x50 dma; 0x46 and 0x69 only
+/// carry their raw words in `words`).
+struct SyncRecord {
+    u32 opcode{};
+    Fence fence;
+    LabelWait wait;
+    LabelWrite write;
+    DmaCopy dma;
+    std::array<u32, 4> data{}; ///< the words `write.data` points to
+    std::array<u32, 8> words{}; ///< event and query tags: the packet they stand for
+};
+/// Second dword of a typed sync tag: `TypedTagMagic | kind` (Typed::Kind)
+constexpr u32 TypedTagMagic = 0x4E445400u; // "NDT" + kind
+
 /// The decoders: `packet` holds the words of the PM4 packet the tag restores (RestoreSyncTag).
 [[nodiscard]] Fence DecodeEop(const u32* packet);
 [[nodiscard]] Fence DecodeRelease(const u32* packet);
@@ -133,7 +148,21 @@ namespace Typed {
 
 enum Kind : u32 { KindEop, KindRelease, KindWait, KindWrite, KindDma, KindCount };
 
+/// `TLG_SYNC_TYPED=1`: compare every typed record with what the decoder reads from the packet (the shadow). Default off.
 [[nodiscard]] bool On() noexcept;
+/// F1.2 (`TLG_SYNC_DECIDE=0` turns it off, default on): the typed record decides: `Convert` turns the packet into a tag that carries the record, the decoder is not asked.
+[[nodiscard]] bool Decides() noexcept;
+/// The producers run when either switch is on
+[[nodiscard]] inline bool Active() noexcept {
+    return On() || Decides();
+}
+
+/// F1.2: the packet at `packet_address` has the shape of `kind` (opcode and size from its header) and a typed record waits for it: the packet is rewritten in place as a typed sync tag
+/// (header = a no-op of the same size, magic `TypedTagMagic | kind`, the record's words). With `TLG_SYNC_TYPED=1` the record is compared with the decoder first. False: no record, or another
+/// shape; the packet is left as it is.
+[[nodiscard]] bool Convert(u64 packet_address, Kind kind);
+/// Reads a typed sync tag (`TypedTagMagic`) into `out`; returns its opcode-like code (0x47, 0x49, 0x3c, 0x37, 0x50) or 0 when `tag` is not one.
+[[nodiscard]] u32 ReadTypedTag(const u32* tag, SyncRecord& out);
 
 void Expect(u64 packet_address, const Fence& fence, Kind kind = KindEop);
 void Expect(u64 packet_address, const LabelWait& wait);

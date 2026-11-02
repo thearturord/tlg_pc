@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "native/native_sync.h"
+
 #include <vector>
 #include <nlohmann/json_fwd.hpp>
 
@@ -253,6 +255,8 @@ void PrepareSubmittedBuffer(const u32* dcb, u32 dwords);
 /// Command processor: when the no-op `tag` stands for a synchronization packet, writes that packet into `packet` and returns its
 /// opcode (0x47, 0x49, 0x3c, 0x37); 0 for any other no-op.
 u32 RestoreSyncTag(const u32* tag, std::array<u32, 8>& packet, bool count_execution = true);
+/// F1.2: reads a sync tag (typed, or the older packet-words kind) into a record; returns the opcode-like code (0x47, 0x49, 0x3c, 0x37, 0x50, 0x46, 0x69) or 0
+u32 ReadSyncTag(const u32* tag, Core::NativeSync::SyncRecord& record, bool count_execution = true);
 /// The Ghidra address of the call that made record `seq` (0 when the record is gone).
 u64 RecordCaller(u64 seq);
 /// Diagnostics: the index of the first register of the record with this value (0xffffffff none) and the number of registers the record carries in `count`.

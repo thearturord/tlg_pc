@@ -88,8 +88,8 @@ Classified Classify(const u32* packet, bool markers, u32 queue) {
         }
         return {Class::Other, OtherGameTag, dwords};
     }
-    std::array<u32, 8> restored;
-    if (const u32 sync = Core::NativeDraw::RestoreSyncTag(packet, restored, false)) {
+    Core::NativeSync::SyncRecord record;
+    if (const u32 sync = Core::NativeDraw::ReadSyncTag(packet, record, false)) {
         if ((queue == 0 && sync == 0x49) || (queue != 0 && (sync == 0x47 || sync == 0x46 || sync == 0x50 || sync == 0x69))) {
             return {Class::Other, sync, dwords}; // release memory belongs to the async queues, end-of-pipe to the graphics queue
         }

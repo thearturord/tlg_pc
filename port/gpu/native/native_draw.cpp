@@ -862,18 +862,27 @@ u32 ConvertSyncPacket(u64 at) {
     const u32 opcode = (header >> 8) & 0xff;
     const u32 count = (header >> 16) & 0x3fff;
     if (opcode == 0x47 && header == 0xC0044700u) {
+        if (Core::NativeSync::Typed::Convert(at, Core::NativeSync::Typed::KindEop)) {
+            return SyncEop;
+        }
         Core::NativeSync::Typed::Met(at, Core::NativeSync::Typed::KindEop, reinterpret_cast<const u32*>(at)); // E7b Task 1 (TLG_SYNC_TYPED=1)
         Wr<u32>(at, 4, VideoCore::NativeFenceMagic);
         Wr<u32>(at, 0, 0xC0041000u);
         return SyncEop;
     }
     if (opcode == 0x49 && count == 5) {
+        if (Core::NativeSync::Typed::Convert(at, Core::NativeSync::Typed::KindRelease)) {
+            return SyncRelease;
+        }
         Core::NativeSync::Typed::Met(at, Core::NativeSync::Typed::KindRelease, reinterpret_cast<const u32*>(at));
         Wr<u32>(at, 4, ReleaseMagic);
         Wr<u32>(at, 0, 0xC0051000u);
         return SyncRelease;
     }
     if (opcode == 0x3c && count == 5) {
+        if (Core::NativeSync::Typed::Convert(at, Core::NativeSync::Typed::KindWait)) {
+            return SyncWait;
+        }
         const u32 control = Rd<u32>(at, 4);
         if ((control & ~0xffu) == 0 && (control & 0x10) != 0) {
             Core::NativeSync::Typed::Met(at, Core::NativeSync::Typed::KindWait, reinterpret_cast<const u32*>(at));
@@ -895,6 +904,9 @@ u32 ConvertSyncPacket(u64 at) {
             return SyncInert;
         }
     }
+    if (opcode == 0x50 && count == 5 && E5TagsOn() && Core::NativeSync::Typed::Convert(at, Core::NativeSync::Typed::KindDma)) {
+        return SyncDma;
+    }
     if (opcode == 0x50 && count == 5 && Rd<u32>(at, 4) == 0x84004000u && E5TagsOn()) {
         // CP DMA with the control dword the game uses (memory to memory, 7 dwords): [header, control, source lo, hi, destination lo, hi, command]
         Core::NativeSync::Typed::Met(at, Core::NativeSync::Typed::KindDma, reinterpret_cast<const u32*>(at));
@@ -910,6 +922,9 @@ u32 ConvertSyncPacket(u64 at) {
         return SyncQuery;
     }
     if (opcode == 0x37 && count >= 3 && count <= 6) {
+        if (Core::NativeSync::Typed::Convert(at, Core::NativeSync::Typed::KindWrite)) {
+            return SyncWrite;
+        }
         const u32 control = Rd<u32>(at, 4);
         const u32 destination = (control >> 8) & 0xf;
         if ((control & 0x10000) == 0 && (destination == 2 || destination == 5)) {
@@ -988,7 +1003,7 @@ void NoteSyncUnitShape(u64 begin, u64 end, u64 at, const std::array<u32, 3>& bef
     for (const u32 op : before) {
         key += fmt::format("{:02x} ", op);
     }
-    key += fmt::format("[{:02x}/{}{}{}] ", opcode, dwords, in_label ? " L" : "", Core::NativeSync::Typed::On() && Core::NativeSync::Typed::Expected(at) ? " TYPED" : "");
+    key += fmt::format("[{:02x}/{}{}{}] ", opcode, dwords, in_label ? " L" : "", Core::NativeSync::Typed::Active() && Core::NativeSync::Typed::Expected(at) ? " TYPED" : "");
     u64 next = at + dwords * 4ull;
     for (int i = 0; i < 3 && next < end; ++i) {
         const u32 h = Rd<u32>(next, 0);
@@ -6292,7 +6307,7 @@ u64 PS4_SYSV_ABI TagFenceSignal(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
     const u64 before = Rd<u64>(ctx, 0x47d0);
     const u64 label = reinterpret_cast<GuestFunction6>(original)(ctx, a1, a2, a3, a4, a5);
     const u64 after = Rd<u64>(ctx, 0x47d0);
-    if (Core::NativeSync::Typed::On() && after == before + 6 * sizeof(u32) && (before & 3) == 0) {
+    if (Core::NativeSync::Typed::Active() && after == before + 6 * sizeof(u32) && (before & 3) == 0) {
         // E7b Task 1 (TLG_SYNC_TYPED=1): what FenceEop says it wrote, built from its own result and its documented behaviour (it stores 0x11 at the label, the packet stores 0x10 there when the GPU
         // has finished all earlier work, no interrupt): an end-of-pipe write of a 64 bit immediate (data_sel 2 in dword 3 of the packet, Ghidra FUN_02480d60) to the label it returns
         Core::NativeSync::Fence typed;
@@ -6484,7 +6499,7 @@ nlohmann::json WriterCensusJson() {
 /// (7 dwords at the buffer cursor `ctx + 0x70`): continue when the 32 bit value at the label equals 0x10. The game's function runs; the typed record is built from the argument
 /// (TLG_SYNC_TYPED=1 compares it with what the decoder reads from the packet). An address that fits 16 bits is a register wait in the packet and is not typed here.
 u64 PS4_SYSV_ABI TagAscWaitFence(u64 ctx, u64 label, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    if (ctx == 0 || !Core::NativeSync::Typed::On()) {
+    if (ctx == 0 || !Core::NativeSync::Typed::Active()) {
         return 0; // the game's function runs as it is
     }
     static std::atomic<u64> original_entry{0};
@@ -6518,7 +6533,7 @@ u64 PS4_SYSV_ABI TagAscWaitFence(u64 ctx, u64 label, u64 a2, u64 a3, u64 a4, u64
 /// The mid hooks sit right after the packet is written (cursor `ctx + 0x47d0` advanced, `rbx` = the draw context) and before that call; the label is in r12 (first site) or r15
 /// (second site). The typed record is what the idiom says it wrote; TLG_SYNC_TYPED=1 compares it with the packet.
 void NoteRenderFrameFence(u64 ctx, u64 label) {
-    if (!Core::NativeSync::Typed::On() || ctx == 0 || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x4800)) {
+    if (!Core::NativeSync::Typed::Active() || ctx == 0 || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x4800)) {
         return;
     }
     const u64 cursor = Rd<u64>(ctx, 0x47d0);
@@ -6545,7 +6560,7 @@ u64 PS4_SYSV_ABI RenderFrameFenceB(Core::GuestHooks::MidContext* c) {
 /// 8 byte aligned, r14 = the value, rbx = the draw context, the cursor `ctx + 0x47d0` is still at the packet) and, after the compute queue marker, an interrupt only (no data) on the
 /// graphics context in r13. The mid hooks sit at the cursor update of each packet; the typed records are what the function says it wrote (TLG_SYNC_TYPED=1 compares them).
 u64 PS4_SYSV_ABI FlipFrameFence(Core::GuestHooks::MidContext* c) {
-    if (!Core::NativeSync::Typed::On() || !IsHeapPointer(c->rbx) || !IsHeapPointer(c->rbx + 0x4800)) {
+    if (!Core::NativeSync::Typed::Active() || !IsHeapPointer(c->rbx) || !IsHeapPointer(c->rbx + 0x4800)) {
         return 0;
     }
     const u64 packet = Rd<u64>(c->rbx, 0x47d0);
@@ -6563,7 +6578,7 @@ u64 PS4_SYSV_ABI FlipFrameFence(Core::GuestHooks::MidContext* c) {
 /// (0x1c5fd91, 0x1c626a0, 0x1c649de). The mid hooks sit at `add [rbx+0x47d0], 0x18` (rbx = the draw context, the cursor still at the packet). The label address the packet carries is
 /// the label masked to 40 bits: r15 & r12 (first site, r12 is the mask), r15 & 0xfffffffff8 (second), rsi (third, already masked).
 void NoteInlineFence(u64 ctx, u64 address) {
-    if (!Core::NativeSync::Typed::On() || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x4800)) {
+    if (!Core::NativeSync::Typed::Active() || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x4800)) {
         return;
     }
     const u64 packet = Rd<u64>(ctx, 0x47d0);
@@ -6595,7 +6610,7 @@ u64 PS4_SYSV_ABI InlineFenceC(Core::GuestHooks::MidContext* c) {
 template <u64 Core::GuestHooks::MidContext::*Ctx, u64 Core::GuestHooks::MidContext::*Lo, u64 Core::GuestHooks::MidContext::*Hi, u32 Ref>
 u64 PS4_SYSV_ABI InlineWait(Core::GuestHooks::MidContext* c) {
     const u64 ctx = c->*Ctx;
-    if (!Core::NativeSync::Typed::On() || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x4800)) {
+    if (!Core::NativeSync::Typed::Active() || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x4800)) {
         return 0;
     }
     const u64 packet = Rd<u64>(ctx, 0x47d0);
@@ -6609,6 +6624,7 @@ u64 PS4_SYSV_ABI InlineWait(Core::GuestHooks::MidContext* c) {
     typed.pfp = false;
     typed.function = Core::NativeSync::LabelWait::Function::Equal;
     typed.address = low | high << 32;
+    typed.reg = typed.memory ? 0u : static_cast<u32>(low);
     typed.ref = Ref;
     typed.mask = 0xffffffffu;
     typed.poll_interval = 10;
@@ -6618,7 +6634,7 @@ u64 PS4_SYSV_ABI InlineWait(Core::GuestHooks::MidContext* c) {
 /// FUN_024a5e20(dcb, destination, source, bytes): the Gnm copyData helper. One CP DMA packet (7 dwords at the dcb cursor `dcb + 0x10`) per chunk of 0x1ffffc bytes, memory to memory. The
 /// game's function runs; when the cursor moved by exactly the packets the arguments call for, each is typed from the arguments (TLG_SYNC_TYPED=1 compares them with the decoder).
 u64 PS4_SYSV_ABI TagDmaCopy(u64 dcb, u64 destination, u64 source, u64 bytes, u64 a4, u64 a5, u64 ret) {
-    if (!Core::NativeSync::Typed::On() || !IsHeapPointer(dcb) || !IsHeapPointer(dcb + 0x28)) {
+    if (!Core::NativeSync::Typed::Active() || !IsHeapPointer(dcb) || !IsHeapPointer(dcb + 0x28)) {
         return 0;
     }
     static std::atomic<u64> original_entry{0};
@@ -6654,7 +6670,7 @@ u64 PS4_SYSV_ABI TagDmaCopy(u64 dcb, u64 destination, u64 source, u64 bytes, u64
     return 1;
 }
 u64 PS4_SYSV_ABI FlipInterrupt(Core::GuestHooks::MidContext* c) {
-    if (!Core::NativeSync::Typed::On() || !IsHeapPointer(c->r13) || !IsHeapPointer(c->r13 + 0x4800)) {
+    if (!Core::NativeSync::Typed::Active() || !IsHeapPointer(c->r13) || !IsHeapPointer(c->r13 + 0x4800)) {
         return 0;
     }
     const u64 packet = Rd<u64>(c->r13, 0x47d0);
@@ -6675,7 +6691,7 @@ u64 PS4_SYSV_ABI FlipInterrupt(Core::GuestHooks::MidContext* c) {
 thread_local u64 t_csub_packet = 0, t_csub_label = 0;
 void TypedUnitRelease(u64 ctx, u64 packet, u64 label, u64 value, bool unit) {
     t_csub_packet = 0;
-    if (!Core::NativeSync::Typed::On() || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x1ce8) || packet != Rd<u64>(ctx, 0x70) || (packet & 3) != 0) {
+    if (!Core::NativeSync::Typed::Active() || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x1ce8) || packet != Rd<u64>(ctx, 0x70) || (packet & 3) != 0) {
         return;
     }
     if (unit) {
@@ -9141,6 +9157,39 @@ u32 RestoreSyncTag(const u32* tag, std::array<u32, 8>& packet, bool count_execut
     }
     if (kind != SyncNone && count_execution) {
         Live().sync_exec[kind].fetch_add(1, std::memory_order_relaxed);
+    }
+    return opcode;
+}
+
+u32 ReadSyncTag(const u32* tag, Core::NativeSync::SyncRecord& record, bool count_execution) {
+    if (const u32 opcode = Core::NativeSync::Typed::ReadTypedTag(tag, record)) {
+        if (count_execution) {
+            const u32 kind = opcode == 0x47 ? SyncEop : opcode == 0x49 ? SyncRelease : opcode == 0x3c ? SyncWait : opcode == 0x37 ? SyncWrite : SyncDma;
+            Live().sync_exec[kind].fetch_add(1, std::memory_order_relaxed);
+        }
+        return opcode;
+    }
+    const u32 opcode = RestoreSyncTag(tag, record.words, count_execution);
+    record.opcode = opcode;
+    const u32* w = record.words.data();
+    switch (opcode) {
+    case 0x47:
+        record.fence = Core::NativeSync::DecodeEop(w);
+        break;
+    case 0x49:
+        record.fence = Core::NativeSync::DecodeRelease(w);
+        break;
+    case 0x3c:
+        record.wait = Core::NativeSync::DecodeWait(w);
+        break;
+    case 0x37:
+        record.write = Core::NativeSync::DecodeWrite(w);
+        break;
+    case 0x50:
+        record.dma = Core::NativeSync::DecodeDma(w);
+        break;
+    default:
+        break;
     }
     return opcode;
 }

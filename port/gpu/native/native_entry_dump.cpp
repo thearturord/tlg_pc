@@ -65,6 +65,30 @@ const char* FunctionName(PM4CmdWaitRegMem::Function function) {
     }
 }
 
+std::string DescribePacket(const PM4Header* header, PM4ItOpcode opcode, u32 dwords);
+
+/// A sync tag (typed record, or the packet an older tag stands for)
+std::string DescribeSync(const Core::NativeSync::SyncRecord& record) {
+    switch (record.opcode) {
+    case 0x47:
+    case 0x49:
+        return fmt::format("{} address={:#x} value={:#x} source={} interrupt={}", record.opcode == 0x47 ? "END_OF_PIPE" : "RELEASE_MEM", record.fence.address, record.fence.value,
+                           static_cast<int>(record.fence.source), record.fence.interrupt);
+    case 0x3c:
+        if (record.wait.memory) {
+            return fmt::format("WAIT_REG_MEM address={:#x} {} {:#x} mask={:#x}", record.wait.address, FunctionName(static_cast<PM4CmdWaitRegMem::Function>(record.wait.function)), record.wait.ref,
+                               record.wait.mask);
+        }
+        return fmt::format("WAIT_REG_MEM register={:#x} {} {:#x}", record.wait.reg, FunctionName(static_cast<PM4CmdWaitRegMem::Function>(record.wait.function)), record.wait.ref);
+    case 0x37:
+        return fmt::format("WRITE_DATA address={:#x} bytes={} first={:#x}", record.write.address, record.write.bytes, record.write.bytes >= 4 ? record.write.data[0] : 0u);
+    case 0x50:
+        return fmt::format("DMA_DATA destination={:#x} source={:#x} bytes={}", record.dma.destination, record.dma.source, record.dma.bytes);
+    default:
+        return DescribePacket(reinterpret_cast<const PM4Header*>(record.words.data()), static_cast<PM4ItOpcode>((record.words[0] >> 8) & 0xff), (record.words[0] >> 16 & 0x3fff) + 2);
+    }
+}
+
 std::string DescribePacket(const PM4Header* header, PM4ItOpcode opcode, u32 dwords) {
     switch (opcode) {
     case PM4ItOpcode::EventWriteEop: {
@@ -217,12 +241,11 @@ void Span::Packet(const void* packet, u64 address, bool show) {
                 return;
             }
             text = Core::NativeDraw::DescribeEntry(header);
-        } else if (std::array<u32, 8> restored; Core::NativeDraw::RestoreSyncTag(reinterpret_cast<const u32*>(header), restored, false) != 0) {
+        } else if (Core::NativeSync::SyncRecord record; Core::NativeDraw::ReadSyncTag(reinterpret_cast<const u32*>(header), record, false) != 0) {
             if (state.load(std::memory_order_acquire) == Armed) {
                 return;
             }
-            text = "ENTRY " + DescribePacket(reinterpret_cast<const PM4Header*>(restored.data()), static_cast<PM4ItOpcode>((restored[0] >> 8) & 0xff),
-                                             (restored[0] >> 16 & 0x3fff) + 2);
+            text = "ENTRY " + DescribeSync(record);
         } else if (nop->data_block[0] == Core::NativeFlip::TagMagic) {
             flip = true;
             text = fmt::format("FLIP patched flip request");
