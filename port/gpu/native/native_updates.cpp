@@ -149,9 +149,11 @@ u64 ThreadKey() {
 namespace {
 struct OpenMap {
     u64 address{}, size{};
+    u64 serial{}; ///< order in which Maps were made (FlushOpenMapsSince)
     u64 stamp{}; ///< the number the next record got when the Map was made (F2.2: a draw of an earlier record cannot depend on the write)
 };
 std::mutex open_map_mutex;
+u64 open_map_serial = 0;
 std::map<std::pair<u64, u64>, OpenMap> open_maps; ///< (thread, resource id) -> the window of the Map that has not been unmapped yet
 } // namespace
 
@@ -224,6 +226,30 @@ void NoteUnmap(u64 resource_id) {
     NoteWriterRange(0, map.address, map.size);
 }
 
+u64 OpenMapSerial() {
+    std::scoped_lock lock{open_map_mutex};
+    return open_map_serial;
+}
+
+void FlushOpenMapsSince(u64 serial) {
+    const u64 thread = ThreadKey();
+    std::vector<OpenMap> done;
+    {
+        std::scoped_lock lock{open_map_mutex};
+        for (auto it = open_maps.begin(); it != open_maps.end();) {
+            if (it->first.first == thread && it->second.serial > serial) {
+                done.push_back(it->second);
+                it = open_maps.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (const OpenMap& map : done) {
+        NoteWriterRangeOf(0, map.address, map.size, thread, map.stamp);
+    }
+}
+
 bool OpenMapOverlaps(u64 address, u64 size) {
     std::scoped_lock lock{open_map_mutex};
     for (const auto& [key, map] : open_maps) {
@@ -250,7 +276,7 @@ void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u6
     // the written part: the requested size when the caller gave one, else everything the Map handed out; it is announced when the thread unmaps the resource
     const u64 written = requested_size != 0 && requested_size < size ? requested_size : size;
     std::scoped_lock lock{open_map_mutex};
-    open_maps[{ThreadKey(), resource_id}] = {address, written, NativeDraw::NextSeq()};
+    open_maps[{ThreadKey(), resource_id}] = {address, written, ++open_map_serial, NativeDraw::NextSeq()};
     (void)usage, (void)in_ring;
 }
 

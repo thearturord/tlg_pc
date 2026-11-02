@@ -5727,6 +5727,20 @@ u64 PS4_SYSV_ABI SchedDispatch(u64 node, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
     return 0;
 }
 
+/// F2.2: `FUN_01c98930(texture holder, rows)` maps a dynamic texture for writing (Map discard), `memcpy`s its rows into the mapped window and returns without an Unmap (an empty function
+/// in the engine). The window is announced here, when the copy is done, not at the next frame start: until then an upload of the image sees the window's announcement lag behind its bytes.
+u64 PS4_SYSV_ABI DynTextureFill(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    (void)ret;
+    const u64 original = Core::GuestHooks::OriginalEntry("DynTextureFill");
+    if (original == 0 || !Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
+        return 0;
+    }
+    const u64 serial = Core::NativeUpdates::OpenMapSerial();
+    const u64 result = reinterpret_cast<GuestDraw6>(original)(a0, a1, a2, a3, a4, a5);
+    Core::NativeUpdates::FlushOpenMapsSince(serial);
+    return 0x8000000000000000ull | (result & 0x7fffffffffffffffull);
+}
+
 u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     // F2.2 shadow (TLG_F2_STORE=1): every allocation of the frame ring is remembered as a mark (writer 6): whatever the caller writes there, the bytes of an older entry over the same
     // addresses are not the memory's any more. The function (allocator, size, alignment) runs here and its result is returned.
@@ -8720,6 +8734,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "draw_probe_indirect") {
         return reinterpret_cast<u64>(&ProbeIndirect);
+    }
+    if (name == "dyn_texture_fill") {
+        return reinterpret_cast<u64>(&DynTextureFill);
     }
     if (name == "ring_discover") {
         return reinterpret_cast<u64>(&RingDiscover);
