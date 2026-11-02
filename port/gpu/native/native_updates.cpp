@@ -24,6 +24,7 @@
 #include "native/native_device.h"
 #include "native/native_updates.h"
 #include "native/native_e3_census.h"
+#include "native/native_content.h"
 #include "native/native_prof.h"
 
 namespace Core::NativeUpdates {
@@ -517,6 +518,7 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread) {
         NoteAnnouncerThread(writer);
     }
     NativeUploads::Announce(writer, address, size, thread == render_thread.load(std::memory_order_relaxed), NativeDraw::NextSeq());
+    NativeContent::Announce(writer, address, size); // F2.2 (TLG_F2_STORE=1): the bytes now, on the writing thread
     if (supersede_fn != nullptr && SupersedeEnabled() && (writer == 5 || writer == 6 || (writer == 0 && thread == render_thread.load(std::memory_order_relaxed)))) {
         supersede_fn(address, size);
         superseded_ranges.fetch_add(1, std::memory_order_relaxed);

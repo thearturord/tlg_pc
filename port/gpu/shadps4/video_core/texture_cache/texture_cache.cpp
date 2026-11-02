@@ -7,6 +7,7 @@
 #include <xxhash.h>
 #include "native/native_census.h"
 #include "native/native_e3_census.h"
+#include "native/native_content.h"
 #include "native/native_prof.h"
 
 #include "native/native_image_marks.h"
@@ -1380,6 +1381,13 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
                                                    .width = image.info.size.width, .height = image.info.size.height, .format = static_cast<u32>(image.info.pixel_format),
                                                    .gpu_source = BufferCache::last_image_source_gpu, .gpu_modified_flag = is_gpu_modified,
                                                    .usage_bits = static_cast<u32>(image.usage_flags)});
+    }
+    if (Core::NativeContent::On()) {
+        // F2.2 shadow (TLG_F2_STORE=1): the announced content store against the memory this upload read
+        Core::NativeContent::CompareImage({.image_uid = image.image_uid, .address = image.info.guest_address, .size = image.info.guest_size, .width = image.info.size.width,
+                                           .height = image.info.size.height, .format = static_cast<u32>(image.info.pixel_format),
+                                           .group_hint = BufferCache::last_image_source_gpu ? Core::NativeContent::Group::GpuSource : Core::NativeContent::Group::FirstUpload,
+                                           .caller = static_cast<u32>(caller)});
     }
     if (Core::NativeE3Census::On()) {
         // E7 Task 4 (TLG_E3_CENSUS=1): does the upload carry bytes the image's last upload did not?

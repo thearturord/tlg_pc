@@ -11,6 +11,7 @@
 #include "common/debug.h"
 #include "native/native_debug_server.h"
 #include "native/native_e3_census.h"
+#include "native/native_content.h"
 #include "native/native_prof.h"
 #include "native/native_config.h"
 #include "video_core/renderer_vulkan/vk_identity_audit.h"
@@ -3597,6 +3598,9 @@ bool Rasterizer::TryCopyImages(VAddr dst, VAddr src, u32 num_bytes) {
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds, bool staging_readback) {
     Core::ResourceAudit::Note(dst_gds ? Core::ResourceAudit::GdsFill : Core::ResourceAudit::MemoryCopyDst, dst, num_bytes, true);
     Core::ResourceAudit::Note(src_gds ? Core::ResourceAudit::GdsFill : Core::ResourceAudit::MemoryCopySrc, src, num_bytes, false);
+    if (!dst_gds && !src_gds) {
+        Core::NativeContent::NoteCopy(dst, src, num_bytes); // F2.2 shadow: the destination's content is the source's, resolved from the store
+    }
     if (!dst_gds && !src_gds && Core::NativeResources::ImageCopyEnabled() && TryCopyImages(dst, src, num_bytes)) {
         return;
     }

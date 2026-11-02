@@ -8077,7 +8077,16 @@ u64 PS4_SYSV_ABI SceneSlotWritesMatrices(u64 frame, u64 kind, u64 a1, u64 a2, u6
 /// not 1) is tiled and copied into its own memory (`[resource + 0x30]`, `[resource + 0x38]` bytes) with no Map and no other announcement. The whole texture memory is announced (writer 6)
 /// and the calls are counted (`/stats` key `texture_updates`: calls, bytes, the call sites by return address, the sizes).
 u64 PS4_SYSV_ABI TextureUpdateSubresource(u64 context, u64 resource, u64 subresource, u64 box, u64 data, u64 a5, u64 ret) {
-    (void)context, (void)box, (void)data, (void)a5;
+    (void)a5;
+    // F2.2: the function copies `data` into the texture memory after this hook point; the announcement has to come after the copy (the announced content store takes the bytes
+    // when it is announced), so with the announcements on the original runs here (5 arguments, no result) and the guest function is skipped
+    u64 ran = 0;
+    if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && IsHeapPointer(resource)) {
+        if (const u64 original = Core::GuestHooks::OriginalEntry("TextureUpdateSubresource"); original != 0) {
+            reinterpret_cast<GuestFunction6>(original)(context, resource, subresource, box, data, 0);
+            ran = 1ull << 63;
+        }
+    }
     static std::atomic<u64> calls{0}, bytes{0}, announced{0};
     static std::mutex mutex;
     static std::map<u64, u64> sites;       // return address (ghidra) -> calls
@@ -8126,7 +8135,7 @@ u64 PS4_SYSV_ABI TextureUpdateSubresource(u64 context, u64 resource, u64 subreso
         }
         return 0;
     });
-    return 0;
+    return ran;
 }
 
 /// C4: the engine's GPU memory allocators (`FUN_02475f90` AllocateGarlicMemory(device, size, alignment, type), `FUN_02476730` AllocateOnionMemory(device, size, alignment), JsDevice.cpp):
