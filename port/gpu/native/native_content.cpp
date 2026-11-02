@@ -490,6 +490,7 @@ void CompareImage(const ImageUpload& upload) {
     u64 bytes_by_writer[16]{}, nonzero_by_writer[16]{};
     u32 differing_writer = 0;
     bool unreadable = false;
+    std::vector<std::pair<u64, std::pair<u32, u32>>> diff_samples; ///< (offset, memory dword, store dword) of the first differing dwords, small images only
     for (const Piece& p : pieces) {
         u64 diff_at = ~0ull;
         if (!GuardedCompare(reinterpret_cast<const void*>(p.begin), p.entry->Bytes() + (p.begin - p.entry_begin), p.end - p.begin, diff_at)) {
@@ -504,10 +505,17 @@ void CompareImage(const ImageUpload& upload) {
             equal += p.end - p.begin;
         } else {
             u64 d = 0; // count the differing bytes of this piece
+            const bool want_samples = g_examples_differs.size() < 12 && upload.size <= (64u << 10) && diff_samples.size() < 8;
             const u8* m = reinterpret_cast<const u8*>(p.begin);
             const u8* s = p.entry->Bytes() + (p.begin - p.entry_begin);
             for (u64 i = diff_at; i < p.end - p.begin; ++i) {
                 d += m[i] != s[i];
+                if (want_samples && m[i] != s[i] && diff_samples.size() < 8 && (diff_samples.empty() || p.begin + i - upload.address >= diff_samples.back().first + 4)) {
+                    u32 mv = 0, sv = 0;
+                    std::memcpy(&mv, m + (i & ~3ull), 4);
+                    std::memcpy(&sv, s + (i & ~3ull), 4);
+                    diff_samples.emplace_back(p.begin + (i & ~3ull) - upload.address, std::pair<u32, u32>{mv, sv});
+                }
             }
             differing += d;
             equal += (p.end - p.begin) - d;
@@ -596,6 +604,9 @@ void CompareImage(const ImageUpload& upload) {
             e["newest_differing_writer"] = differing_writer;
             e["announcements_ago"] = g_seq_atomic.load() - newest_differing_seq;
             e["later_mark_writer"] = explained_by;
+            for (const auto& [offset, values] : diff_samples) {
+                e["diff_dwords"].push_back(fmt::format("+{:#x}: memory {:#010x} store {:#010x}", offset, values.first, values.second));
+            }
             if (Core::NativeDevice::Object owner; Core::NativeDevice::ResourceAt(upload.address, owner)) {
                 e["owner"] = fmt::format("kind {} id {} usage {} cpu_access {:#x} bind {:#x} {}x{} fmt {} at {:#x}+{:#x}", static_cast<u32>(owner.kind), owner.id, owner.usage, owner.cpu_access,
                                          owner.bind, owner.width, owner.height, owner.format, static_cast<u64>(owner.address), owner.bytes);

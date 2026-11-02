@@ -7906,6 +7906,13 @@ u64 PS4_SYSV_ABI ResourceTextureInit(u64 object, u64 a1, u64 a2, u64 a3, u64 a4,
     return 0;
 }
 
+namespace {
+/// F2.2: the last engine GPU memory allocation (`AllocGarlicMemory`) of this thread: address and size. The 1D and 3D texture creation functions allocate their memory with one call and
+/// then fill it from the initial data, so the size of the announcement after the creation is the size of that allocation.
+thread_local u64 t_last_garlic_address = 0;
+thread_local u64 t_last_garlic_size = 0;
+} // namespace
+
 /// N5b: the same, but with the update audit on the function runs here and the memory it cleared or filled (initial data, or a memset to zero) is announced after it
 /// returns: the texture memory pointer is at object + 0x30 and its size at object + 0x38 (set by the allocation inside the initialization).
 template <u32 Kind>
@@ -7919,6 +7926,20 @@ u64 PS4_SYSV_ABI ResourceTextureInitAnnounced(u64 object, u64 a1, u64 a2, u64 a3
     const u64 original = Core::GuestHooks::OriginalEntry(Names[Kind]);
     if (original == 0) {
         return 0;
+    }
+    if constexpr (Kind != 1) {
+        // the 1D and 3D hooks sit on the creation functions (device, description, initial data, out), not on the object's initialization: the texture is `*out` after the call
+        t_last_garlic_address = 0;
+        const u64 created_result = reinterpret_cast<GuestFunction6>(original)(object, a1, a2, a3, a4, a5);
+        Guarded([&]() -> u64 {
+            const u64 texture = a3 != 0 ? Rd<u64>(a3, 0) : 0;
+            const u64 memory = texture != 0 ? Rd<u64>(texture, 0x30) : 0;
+            if (memory != 0 && memory == t_last_garlic_address && t_last_garlic_size != 0) {
+                NativeUpdates::NoteWriterRange(6, memory, t_last_garlic_size);
+            }
+            return 0;
+        });
+        return 0x8000000000000000ull | (created_result & 0x7fffffffffffffffull);
     }
     const u64 result = reinterpret_cast<GuestFunction6>(original)(object, a1, a2, a3, a4, a5);
     Guarded([&]() -> u64 {
@@ -8208,6 +8229,10 @@ u64 PS4_SYSV_ABI GpuAlloc(u64 device, u64 size, u64 alignment, u64 type, u64 a4,
         if (const u64 bytes = size & 0xffffffffull; bytes != 0) {
             Core::NativeUpdates::NoteWriterRange(5, result, bytes);
         }
+    }
+    if constexpr (Which == 0) {
+        t_last_garlic_address = result;
+        t_last_garlic_size = size & 0xffffffffull;
     }
     return (1ull << 63) | result; // skip the guest function (it ran), return its result
 }
