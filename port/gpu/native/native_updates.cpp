@@ -149,12 +149,13 @@ u64 ThreadKey() {
 namespace {
 struct OpenMap {
     u64 address{}, size{};
+    u64 stamp{}; ///< the number the next record got when the Map was made (F2.2: a draw of an earlier record cannot depend on the write)
 };
 std::mutex open_map_mutex;
 std::map<std::pair<u64, u64>, OpenMap> open_maps; ///< (thread, resource id) -> the window of the Map that has not been unmapped yet
 } // namespace
 
-void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread);
+void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp = 0);
 
 void NoteRenderThread() {
     render_thread.store(std::hash<std::thread::id>{}(std::this_thread::get_id()), std::memory_order_relaxed);
@@ -169,7 +170,7 @@ void NoteRenderThread() {
         open_maps.clear();
     }
     for (const auto& [thread, map] : stale) {
-        NoteWriterRangeOf(0, map.address, map.size, thread);
+        NoteWriterRangeOf(0, map.address, map.size, thread, map.stamp);
     }
     NativeUploads::PublishPending(NativeDraw::NextSeq());
 }
@@ -223,6 +224,16 @@ void NoteUnmap(u64 resource_id) {
     NoteWriterRange(0, map.address, map.size);
 }
 
+bool OpenMapOverlaps(u64 address, u64 size) {
+    std::scoped_lock lock{open_map_mutex};
+    for (const auto& [key, map] : open_maps) {
+        if (address < map.address + map.size && map.address < address + size) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u64 memory, u64 caller, u64 requested_size) {
     (void)caller;
     if (AuditFaults()) {
@@ -239,7 +250,7 @@ void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u6
     // the written part: the requested size when the caller gave one, else everything the Map handed out; it is announced when the thread unmaps the resource
     const u64 written = requested_size != 0 && requested_size < size ? requested_size : size;
     std::scoped_lock lock{open_map_mutex};
-    open_maps[{ThreadKey(), resource_id}] = {address, written};
+    open_maps[{ThreadKey(), resource_id}] = {address, written, NativeDraw::NextSeq()};
     (void)usage, (void)in_ring;
 }
 
@@ -505,7 +516,7 @@ nlohmann::json B2Report() {
             {"note", "B2, cumulative: the engine's announced CPU writes applied to the caches"}};
 }
 
-void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread) {
+void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp) {
     if (address == 0 || size == 0) {
         return;
     }
@@ -518,7 +529,7 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread) {
         NoteAnnouncerThread(writer);
     }
     NativeUploads::Announce(writer, address, size, thread == render_thread.load(std::memory_order_relaxed), NativeDraw::NextSeq());
-    NativeContent::Announce(writer, address, size); // F2.2 (TLG_F2_STORE=1): the bytes now, on the writing thread
+    NativeContent::Announce(writer, address, size, stamp != 0 ? stamp : NativeDraw::NextSeq()); // F2.2: the bytes now, on the writing thread
     if (supersede_fn != nullptr && SupersedeEnabled() && (writer == 5 || writer == 6 || (writer == 0 && thread == render_thread.load(std::memory_order_relaxed)))) {
         supersede_fn(address, size);
         superseded_ranges.fetch_add(1, std::memory_order_relaxed);

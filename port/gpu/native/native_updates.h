@@ -31,6 +31,8 @@ void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u6
 /// JsDeviceContext::Unmap(context, resource, subresource) (an empty function of the engine, hooked): the writes into the memory the thread's Map of this resource handed
 /// out are finished; that range (the requested size or the whole mapped size) is announced.
 void NoteUnmap(u64 resource_id);
+/// F2.2: a Map of memory overlapping [address, address + size) is open (mapped, not yet unmapped or flushed at the frame start): its writer may still be writing
+bool OpenMapOverlaps(u64 address, u64 size);
 /// A hooked engine function announces the memory it is about to write (`writer` names the function: 1 skinning matrices, 2 light constants, 3 a memory copy of the command stream, 4 the BeginRecording stores, 5 buffer creation with initial data, 6 texture initialization).
 void NoteWriterRange(u32 writer, u64 address, u64 size);
 /// The game wrote tracked memory (called from the fault handler, on the writing thread).

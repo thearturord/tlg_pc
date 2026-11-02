@@ -31,6 +31,7 @@
 #include "native/native_readback_policy.h"
 #include "native/native_uploads.h"
 #include "native/native_untracked_ring.h"
+#include "native/native_content.h"
 #include <nlohmann/json.hpp>
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -570,6 +571,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
                                               instance.StorageMinAlignment());
     memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
+    Core::NativeContent::OverlayImage(device_addr, size, staging.mapped); // F2.2 swap (TLG_F2_RING_STORE=1): ring bytes as announced, not as the ring holds them now
     staging.Flush();
     return {staging.buffer, staging.offset};
 }

@@ -22,6 +22,8 @@
 #endif
 #include "native/native_content.h"
 #include "native/native_device.h"
+#include "native/native_registry.h"
+#include "native/native_updates.h"
 
 namespace Core::NativeContent {
 
@@ -41,6 +43,7 @@ u64 MaxBytesOther() {
 struct Entry {
     u64 size{};
     u64 seq{};
+    u64 stamp{}; ///< the record number the write was announced at (the number the next record got): a draw of record S may see the entries stamped at most S
     u32 writer{};
     std::shared_ptr<const u8[]> block; ///< the bytes live in a block that a copy's entries share with the entry they were copied from
     u64 offset{};                      ///< where this entry's first byte is in the block
@@ -71,6 +74,17 @@ u64 g_marks_max_size = 0;
 constexpr size_t MaxMarks = 4u << 20;
 
 std::atomic<u64> c_announced{0}, c_announced_bytes{0}, c_skip_writer{0}, c_skip_big{0}, c_skip_unreadable{0}, c_evicted{0}, c_evicted_bytes{0}, c_replaced{0};
+std::atomic<u64> g_ring_begin{0}, g_ring_end{0};
+u64 RingStoreMaxBytes() {
+    static const u64 limit = [] {
+        const char* e = std::getenv("TLG_F2_RING_STORE_KB");
+        const u64 kb = e != nullptr ? std::strtoull(e, nullptr, 10) : 0;
+        return (kb != 0 ? kb : 256ull) << 10;
+    }();
+    return limit;
+}
+std::atomic<u64> c_ov_calls{0}, c_ov_images{0}, c_ov_bytes{0}, c_ov_changed_bytes{0}, c_ov_images_changed{0}, c_ov_uncovered_bytes{0}, c_ov_skipped_open_map{0}, c_ov_skipped_no_seq{0}, c_ov_not_ring{0};
+std::atomic<u64> c_cmp_open{0}, c_cmp_open_differs{0}, c_cmp_closed{0}, c_cmp_closed_differs{0};
 std::atomic<u64> c_copies{0}, c_copy_bytes_covered{0}, c_copy_bytes_uncovered{0}, c_copy_skipped_big{0}, c_deleted{0}, c_deleted_bytes{0};
 std::atomic<u64> c_announced_by_writer[8]{};
 std::atomic<u64> c_skipped_big_by_writer[8]{}, c_skipped_big_by_log2[40]{};
@@ -183,9 +197,10 @@ bool GuardedNonZero(const void* memory, u64 size, u64& nonzero) {
 
 u64 CapBytes() {
     static const u64 cap = [] {
-        const char* e = std::getenv("TLG_F2_STORE_MB");
+        const bool swap_only = !ShadowOn();
+        const char* e = std::getenv(swap_only ? "TLG_F2_RING_STORE_MB" : "TLG_F2_STORE_MB");
         const u64 mb = e != nullptr ? std::strtoull(e, nullptr, 10) : 0;
-        return (mb != 0 ? mb : 1024ull) << 20;
+        return (mb != 0 ? mb : swap_only ? 256ull : 1024ull) << 20;
     }();
     return cap;
 }
@@ -194,7 +209,7 @@ u64 CapBytes() {
 void InsertLocked(u64 begin, Entry&& entry) {
     const u64 end = begin + entry.size;
     for (auto it = g_entries.lower_bound(begin); it != g_entries.end() && it->first < end;) {
-        if (it->first + it->second.size <= end) {
+        if (!RingSwapOn() && it->first + it->second.size <= end) { // the swap reads the store as of an older record: nothing is dropped because a newer entry covers it
             g_stored_bytes -= it->second.writer == WriterCopy ? 0 : it->second.size;
             c_replaced.fetch_add(1, std::memory_order_relaxed);
             it = g_entries.erase(it);
@@ -232,15 +247,21 @@ struct Piece {
 };
 
 /// The newest entry per byte of [begin, end): pieces (disjoint, entry known) and the segments no entry covers. Under the lock.
-void ResolveLocked(u64 begin, u64 end, std::vector<Piece>& pieces, std::vector<std::pair<u64, u64>>& uncovered) {
+void ResolveLocked(u64 begin, u64 end, std::vector<Piece>& pieces, std::vector<std::pair<u64, u64>>& uncovered, u64 max_stamp = ~0ull) {
     std::vector<Piece> candidates;
     const u64 from = begin > g_max_size ? begin - g_max_size : 0;
     for (auto it = g_entries.lower_bound(from); it != g_entries.end() && it->first < end; ++it) {
-        if (it->first + it->second.size > begin) {
+        if (it->first + it->second.size > begin && it->second.stamp <= max_stamp) {
             candidates.push_back({std::max(begin, it->first), std::min(end, it->first + it->second.size), &it->second, it->first});
         }
     }
-    std::sort(candidates.begin(), candidates.end(), [](const Piece& a, const Piece& b) { return a.entry->seq > b.entry->seq; });
+    const bool by_stamp = max_stamp != ~0ull;
+    std::sort(candidates.begin(), candidates.end(), [by_stamp](const Piece& a, const Piece& b) {
+        if (by_stamp && a.entry->stamp != b.entry->stamp) {
+            return a.entry->stamp > b.entry->stamp;
+        }
+        return a.entry->seq > b.entry->seq;
+    });
     uncovered.assign(1, {begin, end});
     for (const Piece& c : candidates) {
         std::vector<std::pair<u64, u64>> next;
@@ -268,7 +289,7 @@ void ResolveLocked(u64 begin, u64 end, std::vector<Piece>& pieces, std::vector<s
 
 } // namespace
 
-bool On() noexcept {
+bool ShadowOn() noexcept {
     static const bool on = [] {
         const char* e = std::getenv("TLG_F2_STORE");
         return e != nullptr && *e == '1';
@@ -276,8 +297,20 @@ bool On() noexcept {
     return on;
 }
 
+bool RingSwapOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_F2_RING_STORE");
+        return e != nullptr && *e == '1';
+    }();
+    return on;
+}
+
+bool On() noexcept {
+    return ShadowOn() || RingSwapOn();
+}
+
 void NoteMark(u32 writer, u64 address, u64 size) {
-    if (!On() || address == 0 || size == 0) {
+    if (!ShadowOn() || address == 0 || size == 0) {
         return;
     }
     std::scoped_lock lock{g_marks_mutex};
@@ -293,9 +326,21 @@ void NoteMark(u32 writer, u64 address, u64 size) {
     }
 }
 
-void Announce(u32 writer, u64 address, u64 size) {
+void SetRing(u64 begin, u64 end) {
+    g_ring_begin.store(begin, std::memory_order_relaxed);
+    g_ring_end.store(end, std::memory_order_relaxed);
+}
+
+void Announce(u32 writer, u64 address, u64 size, u64 stamp) {
     if (!On() || address == 0 || size == 0) {
         return;
+    }
+    if (!ShadowOn()) {
+        // the swap alone keeps the ring's announcements only
+        const u64 begin = g_ring_begin.load(std::memory_order_relaxed);
+        if (begin == 0 || address < begin || address + size > g_ring_end.load(std::memory_order_relaxed) || size > RingStoreMaxBytes()) {
+            return;
+        }
     }
     if (writer == 1 || writer == 2 || writer == 4) {
         c_skip_writer.fetch_add(1, std::memory_order_relaxed); // announced before the write: no content yet, and buffers only; kept as a mark
@@ -311,6 +356,7 @@ void Announce(u32 writer, u64 address, u64 size) {
     Entry entry;
     entry.size = size;
     entry.writer = writer;
+    entry.stamp = stamp;
     std::shared_ptr<u8[]> block{new u8[size]};
     if (!GuardedCopy(block.get(), reinterpret_cast<const void*>(address), size)) {
         c_skip_unreadable.fetch_add(1, std::memory_order_relaxed);
@@ -325,7 +371,7 @@ void Announce(u32 writer, u64 address, u64 size) {
 }
 
 void NoteCopy(u64 destination, u64 source, u64 size) {
-    if (!On() || size == 0) {
+    if (!ShadowOn() || size == 0) {
         return;
     }
     if (size > MaxBytesWriter6) {
@@ -357,7 +403,7 @@ void NoteCopy(u64 destination, u64 source, u64 size) {
 }
 
 void CountMap(u32 kind, u32 type, u32 path) {
-    if (On()) {
+    if (ShadowOn()) {
         c_maps[kind < 7 ? kind : 7][type < 8 ? type : 7][path & 3].fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -370,8 +416,54 @@ void NoteDeleted(u64, u64 size) {
     c_deleted_bytes.fetch_add(size, std::memory_order_relaxed);
 }
 
+void OverlayImage(u64 address, u64 size, u8* staged) {
+    if (!RingSwapOn() || size == 0) {
+        return;
+    }
+    const u64 begin = g_ring_begin.load(std::memory_order_relaxed);
+    if (begin == 0 || address < begin || address + size > g_ring_end.load(std::memory_order_relaxed)) {
+        c_ov_not_ring.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    c_ov_calls.fetch_add(1, std::memory_order_relaxed);
+    const u64 seq = Core::NativeRegistry::CurrentDrawSeq();
+    if (seq == 0) {
+        c_ov_skipped_no_seq.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (Core::NativeUpdates::OpenMapOverlaps(address, size)) {
+        // a Map of this memory has not been announced yet (its writer has not finished or has not unmapped): the newest entry may be an older one, the memory is what is left
+        c_ov_skipped_open_map.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    std::scoped_lock lock{g_mutex};
+    std::vector<Piece> pieces;
+    std::vector<std::pair<u64, u64>> uncovered;
+    ResolveLocked(address, address + size, pieces, uncovered, seq);
+    u64 covered = 0, changed = 0;
+    for (const Piece& p : pieces) {
+        u8* destination = staged + (p.begin - address);
+        const u8* source = p.entry->Bytes() + (p.begin - p.entry_begin);
+        const u64 n = p.end - p.begin;
+        if (std::memcmp(destination, source, n) != 0) {
+            for (u64 i = 0; i < n; ++i) {
+                changed += destination[i] != source[i];
+            }
+            std::memcpy(destination, source, n);
+        }
+        covered += n;
+    }
+    c_ov_images.fetch_add(1, std::memory_order_relaxed);
+    c_ov_bytes.fetch_add(covered, std::memory_order_relaxed);
+    c_ov_uncovered_bytes.fetch_add(size - covered, std::memory_order_relaxed);
+    if (changed != 0) {
+        c_ov_changed_bytes.fetch_add(changed, std::memory_order_relaxed);
+        c_ov_images_changed.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void CompareImage(const ImageUpload& upload) {
-    if (!On() || upload.size == 0) {
+    if (!ShadowOn() || upload.size == 0) {
         return;
     }
     std::scoped_lock lock{g_mutex};
@@ -471,6 +563,12 @@ void CompareImage(const ImageUpload& upload) {
             ++g_uploads_by_main_writer[main];
         }
     }
+    // a Map of this memory still open (not unmapped, not yet flushed at a frame start): its writer's announcement has not been made, so a differing upload there only says the store lags
+    const bool map_open = Core::NativeUpdates::OpenMapOverlaps(upload.address, upload.size);
+    (map_open ? c_cmp_open : c_cmp_closed).fetch_add(1, std::memory_order_relaxed);
+    if (differing != 0) {
+        (map_open ? c_cmp_open_differs : c_cmp_closed_differs).fetch_add(1, std::memory_order_relaxed);
+    }
     const Class cls = differing != 0 ? ClassDiffers : hole != 0 ? ClassHole : covered == 0 ? ClassEmptyEqual : ClassEqual;
     const u32 g = static_cast<u32>(group);
     ++g_class_uploads[g][cls];
@@ -510,8 +608,18 @@ void CompareImage(const ImageUpload& upload) {
 nlohmann::json Report() {
     nlohmann::json out;
     out["enabled"] = On();
-    if (!On()) {
-        out["switch"] = "TLG_F2_STORE=1";
+    out["shadow"] = ShadowOn();
+    out["compare_by_open_map"] = {{"open_map_uploads", c_cmp_open.load()}, {"open_map_differs", c_cmp_open_differs.load()}, {"no_open_map_uploads", c_cmp_closed.load()}, {"no_open_map_differs", c_cmp_closed_differs.load()}};
+    out["ring_swap"] = {{"on", RingSwapOn()}, {"images_overlaid", c_ov_images.load()}, {"bytes_from_store", c_ov_bytes.load()}, {"bytes_not_covered_left_to_memory", c_ov_uncovered_bytes.load()},
+                        {"images_where_store_differs_from_memory", c_ov_images_changed.load()}, {"bytes_where_store_differs_from_memory", c_ov_changed_bytes.load()},
+                        {"calls", c_ov_calls.load()}, {"not_in_ring", c_ov_not_ring.load()}, {"skipped_open_map", c_ov_skipped_open_map.load()}, {"skipped_no_record", c_ov_skipped_no_seq.load()},
+                        {"switch", "TLG_F2_RING_STORE=1"}};
+    if (!ShadowOn()) {
+        std::scoped_lock lock{g_mutex};
+        out["store"] = {{"entries", g_entries.size()}, {"bytes", g_stored_bytes}, {"announced", c_announced.load()}, {"evicted", c_evicted.load()}};
+        if (!On()) {
+            out["switch"] = "TLG_F2_STORE=1 or TLG_F2_RING_STORE=1";
+        }
         return out;
     }
     out["announced"] = {{"entries", c_announced.load()}, {"bytes", c_announced_bytes.load()}, {"skipped_writer_1_2_4", c_skip_writer.load()}, {"skipped_too_big", c_skip_big.load()},

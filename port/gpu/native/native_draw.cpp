@@ -5732,7 +5732,7 @@ u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64
     // addresses are not the memory's any more. The function (allocator, size, alignment) runs here and its result is returned.
     u64 allocated = 0;
     bool ran = false;
-    if (Core::NativeContent::On() && allocator != 0) {
+    if (Core::NativeContent::ShadowOn() && allocator != 0) {
         if (const u64 original = Core::GuestHooks::OriginalEntry("AllocFrameGarlic"); original != 0) {
             allocated = reinterpret_cast<GuestDraw6>(original)(allocator, a1, a2, a3, a4, a5);
             ran = true;
@@ -5759,6 +5759,7 @@ u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64
         return finish();
     }
     VideoCore::UntrackedRing::Get().Set(base, size);
+    Core::NativeContent::SetRing(base, base + size); // F2.2 swap: the store keeps what is announced inside the ring
     // Pages the tracker already protected become writable; nothing protects them again.
     Core::Memory::Instance()->GetAddressSpace().Protect(base, size, Core::MemoryPermission::ReadWrite);
     LOG_INFO(Core, "native draw: upload ring {:#x} + {:#x} is no longer page tracked", base, size);
@@ -6918,7 +6919,7 @@ void InstallUnmapSlot() {
 u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4, u64 size, u64 ret, u64 caller_rsp) {
     // F2.2 (TLG_F2_STORE=1): which Maps are announced: by resource kind, map type and the path taken (0 buffer, announced at Unmap; 1 texture, native upload record; 2 texture, record refused;
     // 3 not handled here: the guest function runs and nothing is announced)
-    const u32 map_kind = Core::NativeContent::On() && IsHeapPointer(resource) && (resource & 7) == 0 ? Guarded([&]() -> u64 { return Rd<u32>(resource, 0x124); }) : 0xffu;
+    const u32 map_kind = Core::NativeContent::ShadowOn() && IsHeapPointer(resource) && (resource & 7) == 0 ? Guarded([&]() -> u64 { return Rd<u32>(resource, 0x124); }) : 0xffu;
     const auto count_map = [&](u32 path) { Core::NativeContent::CountMap(map_kind, static_cast<u32>(type), path); };
     if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && ctx != 0 && IsHeapPointer(resource) && (resource & 7) == 0 && Rd<u32>(resource, 0x124) == 1) {
         // N5a: a Map of a buffer is announced to the update audit; the game's function runs here and its result is returned

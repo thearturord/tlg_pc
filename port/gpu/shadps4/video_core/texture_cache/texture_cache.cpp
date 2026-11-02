@@ -1382,7 +1382,7 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
                                                    .gpu_source = BufferCache::last_image_source_gpu, .gpu_modified_flag = is_gpu_modified,
                                                    .usage_bits = static_cast<u32>(image.usage_flags)});
     }
-    if (Core::NativeContent::On()) {
+    if (Core::NativeContent::ShadowOn()) {
         // F2.2 shadow (TLG_F2_STORE=1): the announced content store against the memory this upload read
         Core::NativeContent::CompareImage({.image_uid = image.image_uid, .address = image.info.guest_address, .size = image.info.guest_size, .width = image.info.size.width,
                                            .height = image.info.size.height, .format = static_cast<u32>(image.info.pixel_format),

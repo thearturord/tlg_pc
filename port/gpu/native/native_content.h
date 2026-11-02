@@ -17,10 +17,20 @@
 /// compares with the memory the upload read. Cap: `TLG_F2_STORE_MB` (default 1024); the oldest entries are dropped first (counted). Report: /stats native_backend.device.f2_store.
 namespace Core::NativeContent {
 
+/// The store is active: the shadow (`TLG_F2_STORE=1`, keeps every announcement, compares uploads) and/or the ring swap (`TLG_F2_RING_STORE=1`).
 [[nodiscard]] bool On() noexcept;
+[[nodiscard]] bool ShadowOn() noexcept;
+/// F2.2 swap (`TLG_F2_RING_STORE=1`, default off, read once): the store keeps the announcements inside the frame ring (up to `TLG_F2_RING_STORE_KB`, default 256 KB, `TLG_F2_RING_STORE_MB` of
+/// them, default 256), each stamped with the record number it was made at, and `RefreshImage` reads a ring image's bytes from the newest entry stamped at or before the draw's record instead of
+/// from the ring's memory, which a later allocation may have reused by the time the raster thread uploads. Bytes no entry covers still come from memory.
+[[nodiscard]] bool RingSwapOn() noexcept;
+/// The frame allocator's ring (found by the engine's allocator hook).
+void SetRing(u64 begin, u64 end);
+/// `staged` holds the guest memory bytes of [address, address + size) (what the upload would read): if the range lies in the ring, the bytes of the entries the current draw may see replace them.
+void OverlayImage(u64 address, u64 size, u8* staged);
 
 /// The engine wrote [address, address + size) and has finished (any thread). `writer` is the number NativeUpdates::NoteWriterRange gets.
-void Announce(u32 writer, u64 address, u64 size);
+void Announce(u32 writer, u64 address, u64 size, u64 stamp = 0);
 /// The raster thread runs a GPU copy of guest memory to guest memory.
 void NoteCopy(u64 destination, u64 source, u64 size);
 /// The engine deleted the memory's owner or reused it: nothing is dropped in the shadow stage, this only counts (so the report can say how much content outlived its owner).
