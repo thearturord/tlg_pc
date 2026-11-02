@@ -18,7 +18,6 @@
 #include "native/native_debug_server.h"
 #include "native/native_census.h"
 #include "native/native_draw.h"
-#include "video_core/amdgpu/pm4_cmds.h"
 #include "native/native_draw_tag.h"
 #include "native/native_readback_policy.h"
 
@@ -26,7 +25,10 @@ namespace Core::NativeDirect {
 
 namespace {
 
-using AmdGpu::PM4CmdNop;
+/// The payload words of the game's own debug marker no-ops (second dword of a NOP packet)
+constexpr u32 DebugMarkerPush = 0x68750001u;
+constexpr u32 DebugMarkerPop = 0x68750002u;
+constexpr u32 DebugColorMarkerPush = 0x6875000eu;
 
 enum class Class : u8 { Inert, Tag, Sync, Flip, Indirect, Other };
 
@@ -98,8 +100,8 @@ Classified Classify(const u32* packet, bool markers, u32 queue) {
     if (magic == Core::NativeFlip::TagMagic || magic == Core::NativeDisplay::WaitTagMagic) {
         return {queue == 0 ? Class::Flip : Class::Inert, 0, dwords};
     }
-    if (markers && (magic == PM4CmdNop::PayloadType::DebugMarkerPush || magic == PM4CmdNop::PayloadType::DebugColorMarkerPush ||
-                    magic == PM4CmdNop::PayloadType::DebugMarkerPop)) {
+    if (markers && (magic == DebugMarkerPush || magic == DebugColorMarkerPush ||
+                    magic == DebugMarkerPop)) {
         return {Class::Other, OtherMarker, dwords};
     }
     return {Class::Inert, 0, dwords};

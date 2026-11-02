@@ -13,14 +13,11 @@
 #include "native/native_flip.h"
 #include "native/native_draw.h"
 #include "native/native_entry_dump.h"
-#include "video_core/amdgpu/pm4_cmds.h"
 #include "native/native_draw_tag.h"
 
 namespace Core::EntryDump {
 
 namespace {
-
-using namespace AmdGpu;
 
 enum State : u32 { Idle, Armed, Capturing };
 
@@ -40,32 +37,45 @@ std::string last_file;
 size_t last_lines{};
 u64 last_dumps{};
 
-const char* DataSelectName(DataSelect select) {
-    switch (select) {
-    case DataSelect::None: return "none";
-    case DataSelect::Data32Low: return "data32";
-    case DataSelect::Data64: return "data64";
-    case DataSelect::GpuClock64: return "clock";
-    case DataSelect::PerfCounter: return "perf";
-    case DataSelect::GdsMemStore: return "gds";
+const char* OpcodeName(u32 opcode) {
+    switch (opcode) {
+    case 0x10: return "NOP";
+    case 0x15: return "DISPATCH_DIRECT";
+    case 0x37: return "WRITE_DATA";
+    case 0x3c: return "WAIT_REG_MEM";
+    case 0x3f: return "INDIRECT_BUFFER";
+    case 0x46: return "EVENT_WRITE";
+    case 0x47: return "EVENT_WRITE_EOP";
+    case 0x49: return "RELEASE_MEM";
+    case 0x50: return "DMA_DATA";
+    case 0x69: return "SET_CONTEXT_REG";
+    case 0x76: return "SET_SH_REG";
+    default: return "PACKET";
+    }
+}
+
+/// A raw packet: its opcode and the first words
+std::string DescribePacket(const u32* words, u32 opcode, u32 dwords) {
+    std::string text = fmt::format("{} opcode={:#x} dwords={}:", OpcodeName(opcode), opcode, dwords);
+    for (u32 i = 1; i < dwords && i < 8; ++i) {
+        text += fmt::format(" {:08x}", words[i]);
+    }
+    return text;
+}
+
+const char* FunctionName(Core::NativeSync::LabelWait::Function function) {
+    using F = Core::NativeSync::LabelWait::Function;
+    switch (function) {
+    case F::Always: return "always";
+    case F::LessThan: return "<";
+    case F::LessThanEqual: return "<=";
+    case F::Equal: return "==";
+    case F::NotEqual: return "!=";
+    case F::GreaterThanEqual: return ">=";
+    case F::GreaterThan: return ">";
     }
     return "?";
 }
-
-const char* FunctionName(PM4CmdWaitRegMem::Function function) {
-    switch (function) {
-    case PM4CmdWaitRegMem::Function::Always: return "always";
-    case PM4CmdWaitRegMem::Function::LessThan: return "<";
-    case PM4CmdWaitRegMem::Function::LessThanEqual: return "<=";
-    case PM4CmdWaitRegMem::Function::Equal: return "==";
-    case PM4CmdWaitRegMem::Function::NotEqual: return "!=";
-    case PM4CmdWaitRegMem::Function::GreaterThanEqual: return ">=";
-    case PM4CmdWaitRegMem::Function::GreaterThan: return ">";
-    default: return "?";
-    }
-}
-
-std::string DescribePacket(const PM4Header* header, PM4ItOpcode opcode, u32 dwords);
 
 /// A sync tag (typed record, or the packet an older tag stands for)
 std::string DescribeSync(const Core::NativeSync::SyncRecord& record) {
@@ -76,71 +86,15 @@ std::string DescribeSync(const Core::NativeSync::SyncRecord& record) {
                            static_cast<int>(record.fence.source), record.fence.interrupt);
     case 0x3c:
         if (record.wait.memory) {
-            return fmt::format("WAIT_REG_MEM address={:#x} {} {:#x} mask={:#x}", record.wait.address, FunctionName(static_cast<PM4CmdWaitRegMem::Function>(record.wait.function)), record.wait.ref,
-                               record.wait.mask);
+            return fmt::format("WAIT_REG_MEM address={:#x} {} {:#x} mask={:#x}", record.wait.address, FunctionName(record.wait.function), record.wait.ref, record.wait.mask);
         }
-        return fmt::format("WAIT_REG_MEM register={:#x} {} {:#x}", record.wait.reg, FunctionName(static_cast<PM4CmdWaitRegMem::Function>(record.wait.function)), record.wait.ref);
+        return fmt::format("WAIT_REG_MEM register={:#x} {} {:#x}", record.wait.reg, FunctionName(record.wait.function), record.wait.ref);
     case 0x37:
         return fmt::format("WRITE_DATA address={:#x} bytes={} first={:#x}", record.write.address, record.write.bytes, record.write.bytes >= 4 ? record.write.data[0] : 0u);
     case 0x50:
         return fmt::format("DMA_DATA destination={:#x} source={:#x} bytes={}", record.dma.destination, record.dma.source, record.dma.bytes);
     default:
-        return DescribePacket(reinterpret_cast<const PM4Header*>(record.words.data()), static_cast<PM4ItOpcode>((record.words[0] >> 8) & 0xff), (record.words[0] >> 16 & 0x3fff) + 2);
-    }
-}
-
-std::string DescribePacket(const PM4Header* header, PM4ItOpcode opcode, u32 dwords) {
-    switch (opcode) {
-    case PM4ItOpcode::EventWriteEop: {
-        const auto* eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
-        return fmt::format("SIGNAL end-of-pipe label={:#x} value={:#x} data={} irq={}", reinterpret_cast<u64>(eop->Address<u8>()), eop->DataQWord(),
-                           DataSelectName(eop->data_sel.Value()), static_cast<u32>(eop->int_sel.Value()));
-    }
-    case PM4ItOpcode::ReleaseMem: {
-        const auto* release = reinterpret_cast<const PM4CmdReleaseMem*>(header);
-        return fmt::format("SIGNAL release-mem label={:#x} value={:#x} data={} irq={}", release->Address<u64>(), release->DataQWord(),
-                           DataSelectName(release->data_sel.Value()), static_cast<u32>(release->int_sel.Value()));
-    }
-    case PM4ItOpcode::WriteData: {
-        const auto* write = reinterpret_cast<const PM4CmdWriteData*>(header);
-        const u32 count = dwords >= 4 ? dwords - 3 : 0;
-        std::string text = fmt::format("WRITE label={:#x} dst_sel={} dwords={}", write->Address<u64>(), write->dst_sel.Value(), count);
-        for (u32 i = 0; i < count && i < 64; ++i) {
-            text += fmt::format(" {:x}", write->data[i]);
-        }
-        return text;
-    }
-    case PM4ItOpcode::SetShReg: {
-        const auto* set = reinterpret_cast<const AmdGpu::PM4CmdSetData*>(header);
-        std::string text = fmt::format("SET_SH reg={:#x} n={}:", set->reg_offset.Value(), dwords - 1);
-        for (u32 i = 0; i + 1 < dwords && i < 16; ++i) {
-            text += fmt::format(" {:x}", set->data[i]);
-        }
-        return text;
-    }
-    case PM4ItOpcode::DispatchDirect: {
-        const auto* dispatch = reinterpret_cast<const AmdGpu::PM4CmdDispatchDirect*>(header);
-        return fmt::format("DISPATCH {}x{}x{} initiator {:#x}", dispatch->dim_x, dispatch->dim_y, dispatch->dim_z, dispatch->dispatch_initiator);
-    }
-    case PM4ItOpcode::WaitRegMem: {
-        const auto* wait = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
-        if (wait->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
-            return fmt::format("WAIT label={:#x} {} {:#x} mask={:#x}", reinterpret_cast<u64>(wait->Address()), FunctionName(wait->function.Value()),
-                               wait->ref, wait->mask);
-        }
-        return fmt::format("WAIT register={:#x} {} {:#x} mask={:#x}", wait->Reg(), FunctionName(wait->function.Value()), wait->ref, wait->mask);
-    }
-    case PM4ItOpcode::IndirectBuffer: {
-        const auto* indirect = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-        return fmt::format("INDIRECT address={:#x} dwords={}", reinterpret_cast<u64>(indirect->Address<u8>()), indirect->ib_size.Value());
-    }
-    case PM4ItOpcode::DmaData: {
-        const auto* dma = reinterpret_cast<const PM4DmaData*>(header);
-        return fmt::format("DMA src_sel={} dst_sel={} src={:#x} dst={:#x} bytes={}", static_cast<u32>(dma->src_sel), static_cast<u32>(dma->dst_sel),
-                           dma->SrcAddress<u64>(), dma->DstAddress<u64>(), dma->NumBytes());
-    }
-    default:
-        return fmt::format("PACKET opcode={:#x} dwords={}", static_cast<u32>(opcode), dwords);
+        return DescribePacket(record.words.data(), (record.words[0] >> 8) & 0xff, (record.words[0] >> 16 & 0x3fff) + 2);
     }
 }
 
@@ -226,27 +180,27 @@ void Span::Packet(const void* packet, u64 address, bool show) {
         tracked = false;
         return;
     }
-    const auto* header = static_cast<const PM4Header*>(packet);
-    const PM4ItOpcode opcode = header->type3.opcode;
-    const u32 packet_dwords = header->type3.NumWords();
+    const u32* header = static_cast<const u32*>(packet);
+    const u32 opcode = (header[0] >> 8) & 0xff;
+    const u32 packet_dwords = ((header[0] >> 16) & 0x3fff) + 2;
     std::string text;
     bool flip = false;
-    if (opcode == PM4ItOpcode::Nop) {
-        const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
-        if (nop->header.count.Value() == 0) {
+    if (opcode == 0x10) {
+        const u32 count = (header[0] >> 16) & 0x3fff;
+        if (count == 0) {
             return;
         }
-        if (nop->data_block[0] == PM4CmdNop::PayloadType::NativeDrawTag && nop->header.count.Value() + 1 >= VideoCore::NativeTagPayloadDwords) {
+        if (header[1] == VideoCore::NativeTagMagic && count + 1 >= VideoCore::NativeTagPayloadDwords) {
             if (state.load(std::memory_order_acquire) == Armed) {
                 return;
             }
             text = Core::NativeDraw::DescribeEntry(header);
-        } else if (Core::NativeSync::SyncRecord record; Core::NativeDraw::ReadSyncTag(reinterpret_cast<const u32*>(header), record, false) != 0) {
+        } else if (Core::NativeSync::SyncRecord record; Core::NativeDraw::ReadSyncTag(header, record, false) != 0) {
             if (state.load(std::memory_order_acquire) == Armed) {
                 return;
             }
             text = "ENTRY " + DescribeSync(record);
-        } else if (nop->data_block[0] == Core::NativeFlip::TagMagic) {
+        } else if (header[1] == Core::NativeFlip::TagMagic) {
             flip = true;
             text = fmt::format("FLIP patched flip request");
         } else {
