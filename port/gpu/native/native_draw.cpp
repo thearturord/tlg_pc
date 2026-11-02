@@ -6170,7 +6170,7 @@ u64 PS4_SYSV_ABI TagFenceSignal(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
     const u64 label = reinterpret_cast<GuestFunction6>(original)(ctx, a1, a2, a3, a4, a5);
     const u64 after = Rd<u64>(ctx, 0x47d0);
     if (after == before + 6 * sizeof(u32) && (before & 3) == 0) {
-        // E7b Task 1 (TLG_SYNC_TYPED=1): what FenceEop says it wrote, built from its own result and its documented behaviour (it stores 0x11 at the label, the packet stores 0x10 there when the GPU
+        // E7b Task 1: what FenceEop says it wrote, built from its own result and its documented behaviour (it stores 0x11 at the label, the packet stores 0x10 there when the GPU
         // has finished all earlier work, no interrupt): an end-of-pipe write of a 64 bit immediate (data_sel 2 in dword 3 of the packet, Ghidra FUN_02480d60) to the label it returns
         Core::NativeSync::Fence typed;
         typed.address = label;
@@ -6189,7 +6189,7 @@ u64 PS4_SYSV_ABI TagFenceSignal(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
 
 /// FUN_02472050(async compute context, label address): the engine's fence wait on the async queue, the wait half of the fence API (FenceEop is the signal half). One WAIT_REG_MEM
 /// (7 dwords at the buffer cursor `ctx + 0x70`): continue when the 32 bit value at the label equals 0x10. The game's function runs; the typed record is built from the argument
-/// (TLG_SYNC_TYPED=1 compares it with what the decoder reads from the packet). An address that fits 16 bits is a register wait in the packet and is not typed here.
+///. An address that fits 16 bits is a register wait in the packet and is not typed here.
 u64 PS4_SYSV_ABI TagAscWaitFence(u64 ctx, u64 label, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     if (ctx == 0) {
         return 0; // the game's function runs as it is
@@ -6223,7 +6223,7 @@ u64 PS4_SYSV_ABI TagAscWaitFence(u64 ctx, u64 label, u64 a2, u64 a3, u64 a4, u64
 /// RenderDev_vfn28_RenderFrame (0x1c55690) writes the FenceEop idiom inline at two places (0x1c57329, 0x1c57790): a label of 8 bytes from the frame ring that holds 0x11, an
 /// end-of-pipe packet that stores 0x10 there, and then `(*vtable[0xb0])(fence tracker, label)`: the label is handed to a CPU side object, so these fences are read by the CPU.
 /// The mid hooks sit right after the packet is written (cursor `ctx + 0x47d0` advanced, `rbx` = the draw context) and before that call; the label is in r12 (first site) or r15
-/// (second site). The typed record is what the idiom says it wrote; TLG_SYNC_TYPED=1 compares it with the packet.
+/// (second site). The typed record is what the idiom says it wrote;
 void NoteRenderFrameFence(u64 ctx, u64 label) {
     if (ctx == 0 || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x4800)) {
         return;
@@ -6250,7 +6250,7 @@ u64 PS4_SYSV_ABI RenderFrameFenceB(Core::GuestHooks::MidContext* c) {
 
 /// JsSwapChain_SubmitAndFlip (0x1c4dfa0) writes two end-of-pipe packets: the frame's fence value (64 bit, to the label of the frame record; r15 = label masked to 40 bits and
 /// 8 byte aligned, r14 = the value, rbx = the draw context, the cursor `ctx + 0x47d0` is still at the packet) and, after the compute queue marker, an interrupt only (no data) on the
-/// graphics context in r13. The mid hooks sit at the cursor update of each packet; the typed records are what the function says it wrote (TLG_SYNC_TYPED=1 compares them).
+/// graphics context in r13. The mid hooks sit at the cursor update of each packet; the typed records are what the function says it wrote.
 u64 PS4_SYSV_ABI FlipFrameFence(Core::GuestHooks::MidContext* c) {
     if (!IsHeapPointer(c->rbx) || !IsHeapPointer(c->rbx + 0x4800)) {
         return 0;
@@ -6324,7 +6324,7 @@ u64 PS4_SYSV_ABI InlineWait(Core::GuestHooks::MidContext* c) {
     return 0;
 }
 /// FUN_024a5e20(dcb, destination, source, bytes): the Gnm copyData helper. One CP DMA packet (7 dwords at the dcb cursor `dcb + 0x10`) per chunk of 0x1ffffc bytes, memory to memory. The
-/// game's function runs; when the cursor moved by exactly the packets the arguments call for, each is typed from the arguments (TLG_SYNC_TYPED=1 compares them with the decoder).
+/// game's function runs; when the cursor moved by exactly the packets the arguments call for, each is typed from the arguments.
 u64 PS4_SYSV_ABI TagDmaCopy(u64 dcb, u64 destination, u64 source, u64 bytes, u64 a4, u64 a5, u64 ret) {
     if (!IsHeapPointer(dcb) || !IsHeapPointer(dcb + 0x28)) {
         return 0;
@@ -6379,7 +6379,7 @@ u64 PS4_SYSV_ABI FlipInterrupt(Core::GuestHooks::MidContext* c) {
 /// FUN_02472ed0(compute context, label address): the unit the engine writes into the async compute buffer (`ctx + 0x70`) before it submits that buffer: the label dword pair is set to
 /// 0x11 by the CPU, then a release memory stores 1 (64 bit) there (7 dwords), a wait for 1 (7 dwords, poll interval 10) and a CPU style write of 0x10 (64 bit, 6 dwords). The first mid hook
 /// is right after the release packet's address is known (rax = the packet, r14 = the label), the second where the three packets are done (rax = the cursor): when the cursor moved by
-/// exactly the three packets, the wait and the write are typed too. TLG_SYNC_TYPED=1 compares the records with the packets.
+/// exactly the three packets, the wait and the write are typed too.
 thread_local u64 t_csub_packet = 0, t_csub_label = 0;
 void TypedUnitRelease(u64 ctx, u64 packet, u64 label, u64 value, bool unit) {
     t_csub_packet = 0;

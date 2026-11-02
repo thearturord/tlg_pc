@@ -21,6 +21,7 @@ ALLOWED_PS4 = {
     "video_core/renderer_vulkan/vk_indexed_data.h": "F4 (descriptors)",
     "video_core/renderer_vulkan/vk_identity_audit.h": "F6 (audits)",
     "core/libraries/gnmdriver/gnmdriver.h": "F1/F5 (Gnm submission HLE)",
+    "core/libraries/kernel/time.h": "F1/F5 (GPU perf counter source: TSC)",
 }
 # plain emulator infrastructure the native code shares (not GPU emulation); reviewed once, kept short
 ALLOWED_SHARED = {
