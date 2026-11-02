@@ -8,6 +8,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <string>
 #include <mutex>
 #include <unordered_set>
 #include <vector>
@@ -20,6 +21,7 @@
 #include "tlg_toggles.h" // sigjmp_buf, tlg_setjmp, runtime_fault_recover
 #endif
 #include "native/native_content.h"
+#include "native/native_device.h"
 
 namespace Core::NativeContent {
 
@@ -52,8 +54,21 @@ std::multimap<u64, Entry> g_entries; ///< by begin address
 std::deque<std::pair<u64, u64>> g_fifo; ///< (begin, seq) in insertion order, for the cap
 u64 g_stored_bytes = 0;
 u64 g_max_size = 0;
-u64 g_seq = 0;
+std::atomic<u64> g_seq_atomic{0};
+u64 g_mark_serial = 0;
 std::unordered_set<u64> g_uploaded_images;
+
+/// Writers 1, 2 and 4 announce before they write, so their bytes are not kept, but the range and the order are: a mark says "something wrote here after the entries older than `seq`".
+struct Mark {
+    u64 size;
+    u64 seq;
+    u32 writer;
+};
+std::mutex g_marks_mutex;
+std::multimap<u64, Mark> g_marks;
+std::deque<std::pair<u64, u64>> g_marks_fifo;
+u64 g_marks_max_size = 0;
+constexpr size_t MaxMarks = 4u << 20;
 
 std::atomic<u64> c_announced{0}, c_announced_bytes{0}, c_skip_writer{0}, c_skip_big{0}, c_skip_unreadable{0}, c_evicted{0}, c_evicted_bytes{0}, c_replaced{0};
 std::atomic<u64> c_copies{0}, c_copy_bytes_covered{0}, c_copy_bytes_uncovered{0}, c_copy_skipped_big{0}, c_deleted{0}, c_deleted_bytes{0};
@@ -71,6 +86,8 @@ u64 g_class_hole_bytes[3]{};
 u64 g_gpu_covered_bytes = 0, g_gpu_total_bytes = 0, g_gpu_uploads = 0, g_gpu_fully_covered = 0, g_gpu_unreadable = 0;
 u64 g_unreadable = 0;
 u64 g_differs_by_writer[16]{};
+u64 g_differs_explained[8]{};
+std::map<std::string, u64> g_differs_by_owner; ///< "kind usage cpu_access" of the engine resource that owns the memory, for the differing uploads ///< differing uploads by the writer of a later mark over the image (0: no mark: unexplained)
 u64 g_equal_bytes_by_writer[16]{};
 u64 g_equal_nonzero_by_writer[16]{};  ///< bytes of CPU sourced uploads that equal the store, by the writer of the entry (15: a copy)
 u64 g_uploads_by_main_writer[16]{}; ///< uploads by the writer that supplies most of their covered bytes
@@ -184,7 +201,7 @@ void InsertLocked(u64 begin, Entry&& entry) {
             ++it;
         }
     }
-    entry.seq = ++g_seq;
+    entry.seq = g_seq_atomic.fetch_add(1, std::memory_order_relaxed) + 1;
     g_stored_bytes += entry.writer == WriterCopy ? 0 : entry.size; // a copy's entries share the bytes of the entry they came from
     g_max_size = std::max(g_max_size, entry.size);
     g_fifo.emplace_back(begin, entry.seq);
@@ -263,7 +280,18 @@ void Announce(u32 writer, u64 address, u64 size) {
         return;
     }
     if (writer == 1 || writer == 2 || writer == 4) {
-        c_skip_writer.fetch_add(1, std::memory_order_relaxed); // announced before the write: no content yet, and buffers only
+        c_skip_writer.fetch_add(1, std::memory_order_relaxed); // announced before the write: no content yet, and buffers only; kept as a mark
+        std::scoped_lock lock{g_marks_mutex};
+        const u64 seq = g_seq_atomic.load(std::memory_order_relaxed);
+        g_marks.emplace(address, Mark{size, seq, writer});
+        g_marks_max_size = std::max(g_marks_max_size, size);
+        g_marks_fifo.emplace_back(address, ++g_mark_serial);
+        if (g_marks.size() > MaxMarks) {
+            const auto [b, serial] = g_marks_fifo.front();
+            g_marks_fifo.pop_front();
+            (void)serial;
+            g_marks.erase(g_marks.find(b)); // the oldest mark at that address
+        }
         return;
     }
     if (size > (writer == 6 ? MaxBytesWriter6 : MaxBytesOther())) {
@@ -352,7 +380,7 @@ void CompareImage(const ImageUpload& upload) {
         g_gpu_fully_covered += covered == upload.size;
         return;
     }
-    u64 equal = 0, differing = 0, first_diff = ~0ull, newest_differing_seq = 0;
+    u64 equal = 0, differing = 0, first_diff = ~0ull, newest_differing_seq = 0, oldest_differing_seq = ~0ull;
     u64 bytes_by_writer[16]{}, nonzero_by_writer[16]{};
     u32 differing_writer = 0;
     bool unreadable = false;
@@ -380,6 +408,7 @@ void CompareImage(const ImageUpload& upload) {
             if (p.begin + diff_at - upload.address < first_diff) {
                 first_diff = p.begin + diff_at - upload.address;
             }
+            oldest_differing_seq = std::min(oldest_differing_seq, p.entry->seq);
             if (p.entry->seq >= newest_differing_seq) {
                 newest_differing_seq = p.entry->seq;
                 differing_writer = p.entry->writer;
@@ -397,6 +426,23 @@ void CompareImage(const ImageUpload& upload) {
     }
     if (unreadable) {
         ++g_unreadable;
+    }
+    u32 explained_by = 0; // the writer (1, 2, 4) of a mark newer than the oldest differing entry that overlaps the image, 0 when none
+    if (differing != 0) {
+        std::scoped_lock marks_lock{g_marks_mutex};
+        const u64 from = upload.address > g_marks_max_size ? upload.address - g_marks_max_size : 0;
+        for (auto it = g_marks.lower_bound(from); it != g_marks.end() && it->first < upload.address + upload.size; ++it) {
+            if (it->first + it->second.size > upload.address && it->second.seq >= oldest_differing_seq) {
+                explained_by = it->second.writer;
+            }
+        }
+        ++g_differs_explained[explained_by & 7];
+        Core::NativeDevice::Object owner;
+        if (Core::NativeDevice::ResourceAt(upload.address, owner)) {
+            ++g_differs_by_owner[fmt::format("kind {} usage {} cpu_access {:#x} bind {:#x}", static_cast<u32>(owner.kind), owner.usage, owner.cpu_access, owner.bind)];
+        } else {
+            ++g_differs_by_owner["no engine resource owns the memory"];
+        }
     }
     if (differing == 0) {
         u32 main = 0;
@@ -436,7 +482,12 @@ void CompareImage(const ImageUpload& upload) {
         if (differing != 0) {
             e["first_differing_offset"] = first_diff;
             e["newest_differing_writer"] = differing_writer;
-            e["announcements_ago"] = g_seq - newest_differing_seq;
+            e["announcements_ago"] = g_seq_atomic.load() - newest_differing_seq;
+            e["later_mark_writer"] = explained_by;
+            if (Core::NativeDevice::Object owner; Core::NativeDevice::ResourceAt(upload.address, owner)) {
+                e["owner"] = fmt::format("kind {} id {} usage {} cpu_access {:#x} bind {:#x} {}x{} fmt {} at {:#x}+{:#x}", static_cast<u32>(owner.kind), owner.id, owner.usage, owner.cpu_access,
+                                         owner.bind, owner.width, owner.height, owner.format, static_cast<u64>(owner.address), owner.bytes);
+            }
         }
         (cls == ClassDiffers ? g_examples_differs : g_examples_hole).push_back(std::move(e));
     }
@@ -496,6 +547,14 @@ nlohmann::json Report() {
         }
     }
     out["equal_uploads_supplied_by_writer"] = supplied;
+    nlohmann::json explained;
+    for (u32 w = 0; w < 8; ++w) {
+        if (g_differs_explained[w] != 0) {
+            explained[w == 0 ? "no_later_mark_unexplained" : "later_mark_of_writer_" + std::to_string(w)] = g_differs_explained[w];
+        }
+    }
+    out["differing_uploads_explained_by"] = explained;
+    out["differing_uploads_by_owner"] = g_differs_by_owner;
     out["uploads_with_unreadable_memory"] = g_unreadable;
     out["examples_differs"] = g_examples_differs;
     out["examples_hole"] = g_examples_hole;
