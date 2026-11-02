@@ -48,6 +48,7 @@
 #include "native/native_registry.h"
 #include "native/native_resources.h"
 #include "native/native_target_desc.h"
+#include "native/native_content.h"
 #include "native/native_updates.h"
 #include "native/native_sync.h"
 #include "native/native_zpass_audit.h"
@@ -6864,7 +6865,7 @@ u64 PS4_SYSV_ABI UnmapSlot(u64 ctx, u64 resource, u64 subresource) {
     (void)ctx, (void)subresource;
     if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && IsHeapPointer(resource) && (resource & 7) == 0) {
         Guarded([&]() -> u64 {
-            if (Rd<u32>(resource, 0x124) == 1) {
+            if (const u32 kind = Rd<u32>(resource, 0x124); kind == 1 || kind == 3) { // F2.2: textures too (dynamic texture maps, see TagMap)
                 Core::NativeUpdates::NoteUnmap(Rd<u64>(resource, 0x10));
             }
             return 0;
@@ -6903,6 +6904,10 @@ void InstallUnmapSlot() {
 }
 
 u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4, u64 size, u64 ret, u64 caller_rsp) {
+    // F2.2 (TLG_F2_STORE=1): which Maps are announced: by resource kind, map type and the path taken (0 buffer, announced at Unmap; 1 texture, native upload record; 2 texture, record refused;
+    // 3 not handled here: the guest function runs and nothing is announced)
+    const u32 map_kind = Core::NativeContent::On() && IsHeapPointer(resource) && (resource & 7) == 0 ? Guarded([&]() -> u64 { return Rd<u32>(resource, 0x124); }) : 0xffu;
+    const auto count_map = [&](u32 path) { Core::NativeContent::CountMap(map_kind, static_cast<u32>(type), path); };
     if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && ctx != 0 && IsHeapPointer(resource) && (resource & 7) == 0 && Rd<u32>(resource, 0x124) == 1) {
         // N5a: a Map of a buffer is announced to the update audit; the game's function runs here and its result is returned
         const u64 original_map = Core::GuestHooks::OriginalEntry("Map");
@@ -6912,6 +6917,7 @@ u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4
             Core::NativeUpdates::NoteMap(Rd<u64>(resource, 0x10), Core::NativeResources::ResourceUsage(resource), static_cast<u32>(type), Rd<u64>(out_map, 0),
                                          Rd<u32>(out_map, 8), Rd<u64>(resource, 0x30), ret, size);
             Core::NativeDevice::NoteMapped(Rd<u64>(resource, 0x10), Rd<u64>(out_map, 0), Rd<u32>(out_map, 8), static_cast<u32>(type));
+            count_map(0);
             return 0x8000000000000000ull | (result & 0x7fffffffffffffffull);
         }
     }
@@ -6920,11 +6926,13 @@ u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4
     const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     if (mode == 0 || ctx == 0 || !valid(resource) || subresource != 0 || (type != 2 && type != 3 && type != 4) ||
         Rd<u32>(resource, 0x124) != 3) {
+        count_map(3);
         return 0;
     }
     const u64 original = Core::GuestHooks::OriginalEntry("Map");
     const u64 out = Rd<u64>(caller_rsp, 0);
     if (original == 0 || out == 0 || (out & 7) != 0) {
+        count_map(3);
         return 0;
     }
     auto& live = Live();
@@ -6958,19 +6966,35 @@ u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4
     const u64 base_before = Rd<u64>(writer, 0x0);
     const u64 value = 0x8000000000000000ull | (reinterpret_cast<GuestMap7>(original)(ctx, resource, subresource, type, a4, size, out) & 0x7fffffffffffffffull);
     live.map_tried.fetch_add(1, std::memory_order_relaxed);
+    if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && type != 1) {
+        // F2.2: a texture mapped for writing (dynamic textures: Map discard hands out a new version in the frame ring and the T# follows) is written by the caller after this
+        // returns; the Unmap announces the window like a buffer's (the 2026-11-02 shadow found 6.7k such uploads per 100 s of the default scene whose bytes nothing announced)
+        Guarded([&]() -> u64 {
+            const u64 pointer = Rd<u64>(out, 0);
+            const u64 bytes = Rd<u64>(resource, 0x38);
+            if (pointer != 0 && bytes != 0 && bytes <= (1ull << 28)) {
+                Core::NativeUpdates::NoteMap(Rd<u64>(resource, 0x10), Core::NativeResources::ResourceUsage(resource), static_cast<u32>(type), pointer, static_cast<u32>(bytes),
+                                             Rd<u64>(resource, 0x30), ret, 0);
+            }
+            return 0;
+        });
+    }
     const u64 span_begin = tag_address + TagDwords * sizeof(u32);
     const u64 span_end = Rd<u64>(writer, 0x10);
     const u64 scratch = Rd<u64>(out, 0);
     if (Rd<u64>(writer, 0x0) != base_before || span_end < span_begin + 2 * sizeof(u32) || span_end > Rd<u64>(writer, 0x8) ||
         scratch == 0 || scratch != Rd<u64>(resource, 0x170)) {
         live.map_refused.fetch_add(1, std::memory_order_relaxed);
+        count_map(2);
         return value;
     }
     const u64 seq = Guarded([&] { return MakeMapUploadRecord(ctx, resource, scratch, ret); });
     if (seq == 0 || Slot(seq).flags != 0) {
         live.map_refused.fetch_add(1, std::memory_order_relaxed);
+        count_map(2);
         return value;
     }
+    count_map(1);
     const bool exec = mode >= 2 && ExecEligibleCompute(ctx, seq, ret);
     std::memcpy(&words[9], &seq, sizeof(u64));
     if (exec) {

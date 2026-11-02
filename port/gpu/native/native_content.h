@@ -25,6 +25,8 @@ void Announce(u32 writer, u64 address, u64 size);
 void NoteCopy(u64 destination, u64 source, u64 size);
 /// The engine deleted the memory's owner or reused it: nothing is dropped in the shadow stage, this only counts (so the report can say how much content outlived its owner).
 void NoteDeleted(u64 address, u64 size);
+/// A Map the hook saw (counted by resource kind, map type and the path taken, see Report "maps_note").
+void CountMap(u32 kind, u32 type, u32 path);
 
 enum class Group : u8 { FirstUpload, RepeatUpload, GpuSource };
 struct ImageUpload {

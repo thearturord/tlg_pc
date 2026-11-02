@@ -93,6 +93,7 @@ u64 g_equal_nonzero_by_writer[16]{};  ///< bytes of CPU sourced uploads that equ
 u64 g_uploads_by_main_writer[16]{}; ///< uploads by the writer that supplies most of their covered bytes
 std::vector<nlohmann::json> g_examples_differs, g_examples_hole;
 
+std::atomic<u64> c_maps[8][8][4]{}; ///< [resource kind (0xff: unknown -> 7)][map type][path]
 const char* GroupName(Group g) {
     return g == Group::FirstUpload ? "first_upload" : g == Group::RepeatUpload ? "repeat_upload" : "gpu_source";
 }
@@ -348,6 +349,12 @@ void NoteCopy(u64 destination, u64 source, u64 size) {
     }
 }
 
+void CountMap(u32 kind, u32 type, u32 path) {
+    if (On()) {
+        c_maps[kind < 7 ? kind : 7][type < 8 ? type : 7][path & 3].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void NoteDeleted(u64, u64 size) {
     if (!On()) {
         return;
@@ -518,6 +525,18 @@ nlohmann::json Report() {
     }
     out["skipped_too_big_detail"] = skipped;
     out["copies"] = {{"copies", c_copies.load()}, {"bytes_resolved_from_store", c_copy_bytes_covered.load()}, {"bytes_source_unknown", c_copy_bytes_uncovered.load()}, {"skipped_too_big", c_copy_skipped_big.load()}};
+    nlohmann::json maps;
+    for (u32 k = 0; k < 8; ++k) {
+        for (u32 t = 0; t < 8; ++t) {
+            for (u32 path = 0; path < 4; ++path) {
+                if (const u64 n = c_maps[k][t][path].load(); n != 0) {
+                    maps[fmt::format("resource_kind {} map_type {} path {}", k == 7 ? "unknown" : std::to_string(k), t, path)] = n;
+                }
+            }
+        }
+    }
+    out["maps"] = maps;
+    out["maps_note"] = "path 0 = buffer, announced at Unmap; 1 = texture, native upload record; 2 = texture, record refused; 3 = not handled by the hook (nothing announced)";
     out["deleted_owner_notes"] = {{"count", c_deleted.load()}, {"bytes", c_deleted_bytes.load()}};
     std::scoped_lock lock{g_mutex};
     out["store"] = {{"entries", g_entries.size()}, {"bytes", g_stored_bytes}, {"cap_bytes", CapBytes()}};
