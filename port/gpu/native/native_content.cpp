@@ -276,23 +276,30 @@ bool On() noexcept {
     return on;
 }
 
+void NoteMark(u32 writer, u64 address, u64 size) {
+    if (!On() || address == 0 || size == 0) {
+        return;
+    }
+    std::scoped_lock lock{g_marks_mutex};
+    const u64 seq = g_seq_atomic.load(std::memory_order_relaxed);
+    g_marks.emplace(address, Mark{size, seq, writer});
+    g_marks_max_size = std::max(g_marks_max_size, size);
+    g_marks_fifo.emplace_back(address, ++g_mark_serial);
+    if (g_marks.size() > MaxMarks) {
+        const auto [b, serial] = g_marks_fifo.front();
+        g_marks_fifo.pop_front();
+        (void)serial;
+        g_marks.erase(g_marks.find(b)); // the oldest mark at that address
+    }
+}
+
 void Announce(u32 writer, u64 address, u64 size) {
     if (!On() || address == 0 || size == 0) {
         return;
     }
     if (writer == 1 || writer == 2 || writer == 4) {
         c_skip_writer.fetch_add(1, std::memory_order_relaxed); // announced before the write: no content yet, and buffers only; kept as a mark
-        std::scoped_lock lock{g_marks_mutex};
-        const u64 seq = g_seq_atomic.load(std::memory_order_relaxed);
-        g_marks.emplace(address, Mark{size, seq, writer});
-        g_marks_max_size = std::max(g_marks_max_size, size);
-        g_marks_fifo.emplace_back(address, ++g_mark_serial);
-        if (g_marks.size() > MaxMarks) {
-            const auto [b, serial] = g_marks_fifo.front();
-            g_marks_fifo.pop_front();
-            (void)serial;
-            g_marks.erase(g_marks.find(b)); // the oldest mark at that address
-        }
+        NoteMark(writer, address, size);
         return;
     }
     if (size > (writer == 6 ? MaxBytesWriter6 : MaxBytesOther())) {

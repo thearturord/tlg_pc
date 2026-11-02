@@ -5728,15 +5728,27 @@ u64 PS4_SYSV_ABI SchedDispatch(u64 node, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
 }
 
 u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    // F2.2 shadow (TLG_F2_STORE=1): every allocation of the frame ring is remembered as a mark (writer 6): whatever the caller writes there, the bytes of an older entry over the same
+    // addresses are not the memory's any more. The function (allocator, size, alignment) runs here and its result is returned.
+    u64 allocated = 0;
+    bool ran = false;
+    if (Core::NativeContent::On() && allocator != 0) {
+        if (const u64 original = Core::GuestHooks::OriginalEntry("AllocFrameGarlic"); original != 0) {
+            allocated = reinterpret_cast<GuestDraw6>(original)(allocator, a1, a2, a3, a4, a5);
+            ran = true;
+            Core::NativeContent::NoteMark(6, allocated, a1 & 0xffffffffull);
+        }
+    }
+    const auto finish = [&]() -> u64 { return ran ? (0x8000000000000000ull | (allocated & 0x7fffffffffffffffull)) : 0; };
     if (ring_checked.load(std::memory_order_relaxed)) {
-        return 0;
+        return finish();
     }
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     if (VideoCore::ReadbackPolicy::ReadbacksMode() != 0 || allocator == 0) {
-        return 0;
+        return finish();
     }
     if (ring_checked.exchange(true)) {
-        return 0;
+        return finish();
     }
     const u64 base = Rd<u64>(allocator, 0x18);
     const u64 size = Rd<u64>(allocator, 0x0) & 0xffffffffull;
@@ -5744,13 +5756,13 @@ u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64
         size > (1ull << 30)) {
         LOG_WARNING(Core, "native draw: frame allocator ring not recognised (base {:#x}, size {:#x})",
                     base, size);
-        return 0;
+        return finish();
     }
     VideoCore::UntrackedRing::Get().Set(base, size);
     // Pages the tracker already protected become writable; nothing protects them again.
     Core::Memory::Instance()->GetAddressSpace().Protect(base, size, Core::MemoryPermission::ReadWrite);
     LOG_INFO(Core, "native draw: upload ring {:#x} + {:#x} is no longer page tracked", base, size);
-    return 0;
+    return finish();
 }
 
 /// The game's memory setup (FUN_01dd39d0) makes its Onion and Garlic pools and sizes the Garlic pool by sceKernelIsNeoMode (2816 MB, 3328 MB on a PS4 Pro). It asks six
@@ -8125,6 +8137,10 @@ u64 PS4_SYSV_ABI TextureUpdateSubresource(u64 context, u64 resource, u64 subreso
             const u64 memory = Rd<u64>(resource, 0x30);
             const u32 width = Rd<u32>(resource, 0x180);
             const u32 bind = Rd<u32>(resource, 0x188);
+            if ((bind & 0x4) != 0 && ran != 0 && width != 0 && width < (1u << 20)) {
+                // F2.2: the new version of a constant buffer is copied into the frame ring (V# base at +0x60 and +0x64); nothing announces it, the shadow remembers the range as a mark
+                Core::NativeContent::NoteMark(3, static_cast<u64>(Rd<u32>(resource, 0x60)) | (static_cast<u64>(Rd<u32>(resource, 0x64) & 0xfffu) << 32), width);
+            }
             if ((bind & 0x4) == 0 && Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && memory != 0 && width != 0 && width < (1u << 30)) {
                 Core::NativeUpdates::NoteWriterRange(5, memory, width);
             }

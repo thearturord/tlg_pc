@@ -27,6 +27,9 @@ void NoteCopy(u64 destination, u64 source, u64 size);
 void NoteDeleted(u64 address, u64 size);
 /// A Map the hook saw (counted by resource kind, map type and the path taken, see Report "maps_note").
 void CountMap(u32 kind, u32 type, u32 path);
+/// A write whose bytes are not kept (it announces nothing or before it writes): only the range and the order are remembered, so a differing upload can be attributed (writers: 1 skin, 2 lights,
+/// 3 constant buffer version in the frame ring written by UpdateSubresource, 4 recording stores).
+void NoteMark(u32 writer, u64 address, u64 size);
 
 enum class Group : u8 { FirstUpload, RepeatUpload, GpuSource };
 struct ImageUpload {
