@@ -12,7 +12,6 @@ import os, re, sys
 NATIVE = os.path.dirname(os.path.abspath(__file__))
 
 ALLOWED_PS4 = {
-    "video_core/amdgpu/pm4_cmds.h": "F1 (PM4 sync decoding)",
     "video_core/amdgpu/pixel_format.h": "F4 (PS4 resource types)",
     "video_core/amdgpu/resource.h": "F4 (the image descriptor layout the derivation fills)",
     "video_core/amdgpu/draw_state.h": "F3 (register image)",

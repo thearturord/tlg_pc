@@ -7,8 +7,7 @@
 
 #include "common/types.h"
 
-/// E6.1 (documents/tlg/native plan/no-emulation-plan.md): typed synchronization records. The command processor runs the game's synchronization from these, not from
-/// PM4 packet structures. The only code that knows the PM4 layout is the decoder (native_sync.cpp), which reads the words a sync tag carries (RestoreSyncTag).
+/// Synchronization records: what a fence, a wait, a label write and a CP DMA copy do, built by the hooks of the engine functions that write them (typed producers).
 ///
 /// What the engine does with them (read in Ghidra, 2026-10-30):
 ///  - `FenceEop` (0x2480d60): takes 8 bytes of the frame ring, stores 0x11 there, writes an end-of-pipe packet that stores 0x10 there when the GPU has finished all earlier
@@ -131,34 +130,18 @@ struct SyncRecord {
 /// Second dword of a typed sync tag: `TypedTagMagic | kind` (Typed::Kind)
 constexpr u32 TypedTagMagic = 0x4E445400u; // "NDT" + kind
 
-/// The decoders: `packet` holds the words of the PM4 packet the tag restores (RestoreSyncTag).
-[[nodiscard]] Fence DecodeEop(const u32* packet);
-[[nodiscard]] Fence DecodeRelease(const u32* packet);
-[[nodiscard]] LabelWait DecodeWait(const u32* packet);
-[[nodiscard]] LabelWrite DecodeWrite(const u32* packet);
-[[nodiscard]] DmaCopy DecodeDma(const u32* packet);
 /// The result address of an occlusion query dump (PIXEL_PIPE_STAT_DUMP): words 2 and 3 of the event write
 [[nodiscard]] u64 DecodeEventAddress(const u32* packet);
 
-/// E7b Task 1 (`TLG_SYNC_TYPED=1`, default off): the typed record an engine function builds from its own arguments, against the record the decoder makes from the packet words the function wrote.
-/// A producer (a hook on the function that writes the packet) calls `Expect` with the address of the packet it wrote and the record it believes it wrote; `ConvertSyncPacket` calls `Met` with the
-/// packet's words before it turns the packet into a tag. A packet met with no expectation is counted per kind (`without_typed_source`: how many packets of that kind still have no producer). Counting
-/// only; nothing decides from this. Report: /stats native_backend.device.sync_typed.
+/// F1.2 typed sync records: a producer (a hook on the function that writes the packet) calls `Expect` with the address of the packet it wrote and the record it built from the engine's own
+/// arguments; `ConvertSyncPacket` calls `Convert`, which rewrites the packet in place as a typed sync tag that carries the record. A packet with no record is left raw and counted (`NoteUntyped`).
+/// Report: /stats native_backend.device.sync_typed.
 namespace Typed {
 
 enum Kind : u32 { KindEop, KindRelease, KindWait, KindWrite, KindDma, KindCount };
 
-/// `TLG_SYNC_TYPED=1`: compare every typed record with what the decoder reads from the packet (the shadow). Default off.
-[[nodiscard]] bool On() noexcept;
-/// F1.2 (`TLG_SYNC_DECIDE=0` turns it off, default on): the typed record decides: `Convert` turns the packet into a tag that carries the record, the decoder is not asked.
-[[nodiscard]] bool Decides() noexcept;
-/// The producers run when either switch is on
-[[nodiscard]] inline bool Active() noexcept {
-    return On() || Decides();
-}
-
 /// F1.2: the packet at `packet_address` has the shape of `kind` (opcode and size from its header) and a typed record waits for it: the packet is rewritten in place as a typed sync tag
-/// (header = a no-op of the same size, magic `TypedTagMagic | kind`, the record's words). With `TLG_SYNC_TYPED=1` the record is compared with the decoder first. False: no record, or another
+/// (header = a no-op of the same size, magic `TypedTagMagic | kind`, the record's words). False: no record, or another
 /// shape; the packet is left as it is.
 [[nodiscard]] bool Convert(u64 packet_address, Kind kind);
 /// Reads a typed sync tag (`TypedTagMagic`) into `out`; returns its opcode-like code (0x47, 0x49, 0x3c, 0x37, 0x50) or 0 when `tag` is not one.
@@ -169,13 +152,10 @@ void Expect(u64 packet_address, const LabelWait& wait);
 void Expect(u64 packet_address, const LabelWrite& write);
 void Expect(u64 packet_address, const DmaCopy& dma);
 
-/// The packet at `packet_address` (`packet`: its words, header first) is about to be converted.
-void Met(u64 packet_address, Kind kind, const u32* packet);
-
 /// True when a typed record is waiting for the packet at `packet_address` (census use)
 [[nodiscard]] bool Expected(u64 packet_address);
-/// Diagnostic (TLG_SYNC_STACKS=1): the loaded eboot image, so packets without a typed source can be tallied by the game return addresses on the stack
-void SetImage(u64 base, u64 size);
+/// A packet of `kind` reached the converter with no typed record: counted and noted as a rare event (it stays raw)
+void NoteUntyped(Kind kind, u64 packet_address);
 
 [[nodiscard]] nlohmann::json Report();
 

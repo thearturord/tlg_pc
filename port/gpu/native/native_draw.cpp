@@ -825,23 +825,15 @@ bool StripPackets(u64 begin, u64 end);
 
 /// Synchronization packets that connect the GPU to the CPU or to another queue become tags of the same size, in place: a no-op
 /// whose second dword is a magic and whose other dwords are the packet's. The command processor rebuilds the packet from the tag
-/// (RestoreSyncTag) and runs the same code, at the same place of the stream, so the timeline and the fence kinds do not change.
-///  - graphics end-of-pipe write (6 dwords: fence, frame counter, frame interrupt): magic NativeFenceMagic; the event control
-///    dword is not used by anything and is dropped;
-///  - release memory (7 dwords, async compute labels): ReleaseMagic; the same;
-///  - wait on a memory label (7 dwords): WaitMagicBase + the control dword (function, memory space, engine; only when it fits a byte);
-///  - CPU style write of one to four dwords to a label (WRITE_DATA, destination select 2 or 5): WriteMagicBase + the destination select;
-///  - CP DMA, memory to memory (E5): DmaMagic; the control dword (0x84004000) is implied;
+/// (ReadSyncTag) and runs the same code, at the same place of the stream, so the timeline and the fence kinds do not change.
+///  - graphics end-of-pipe write, release memory, wait on a memory label, CPU style write of one to four dwords to a label (WRITE_DATA, destination select 2 or 5)
+///    and CP DMA (memory to memory): typed sync tags that carry the record the producer built from the engine function's own arguments (F1.2, native_sync);
 ///  - the occlusion query pair (E5): the PIXEL_PIPE_STAT_DUMP event write (4 dwords: control, result address) becomes EventMagic and is run by the
 ///    command processor (it names the result block); the PIXEL_PIPE_STAT_CONTROL event write is read by nothing and becomes an inert no-op (InertMagic); the
 ///    DB_COUNT_CONTROL register write that goes with it keeps its value as QueryMagic (it says whether the query begins or ends).
 /// Returns the kind (SyncEop, SyncRelease, SyncWait) or 0 when the packet is not one of them.
-constexpr u32 ReleaseMagic = 0x4E44524Cu;  // "NDRL"
-constexpr u32 WaitMagicBase = 0x4E445700u; // "NDW" + control byte
-constexpr u32 WriteMagicBase = 0x4E445800u; // "NDX" + destination select
 constexpr u32 EventMagic = 0x4E445645u;       // "NDVE": a PIXEL_PIPE_STAT_DUMP event write (the Z pass counters of an occlusion query) in place
 constexpr u32 QueryMagic = 0x4E445651u;       // "NDVQ": the DB_COUNT_CONTROL write that begins (bit 1 set) or ends the counting of an occlusion query
-constexpr u32 DmaMagic = 0x4E44444Du;         // "NDDM": a CP DMA packet (memory to memory copy) in place
 constexpr u32 InertMagic = 0x4E44564Eu;       // "NDVN": a packet nothing reads (the occlusion query's PIXEL_PIPE_STAT_CONTROL event, the DB_COUNT_CONTROL write)
 enum SyncKind : u32 { SyncNone, SyncEop, SyncRelease, SyncWait, SyncWrite, SyncEvent, SyncInert, SyncDma, SyncQuery };
 
@@ -861,35 +853,30 @@ u32 ConvertSyncPacket(u64 at) {
     }
     const u32 opcode = (header >> 8) & 0xff;
     const u32 count = (header >> 16) & 0x3fff;
+    using Core::NativeSync::Typed::Convert;
+    using Core::NativeSync::Typed::NoteUntyped;
+    // the sync packets the game's own functions write (graphics end-of-pipe write, release memory, wait on a label, CPU style write, CP DMA copy) become typed tags
+    // when the producer that wrote them left its record (F1.2); a packet without a record stays raw and is counted (it must not happen)
     if (opcode == 0x47 && header == 0xC0044700u) {
-        if (Core::NativeSync::Typed::Convert(at, Core::NativeSync::Typed::KindEop)) {
+        if (Convert(at, Core::NativeSync::Typed::KindEop)) {
             return SyncEop;
         }
-        Core::NativeSync::Typed::Met(at, Core::NativeSync::Typed::KindEop, reinterpret_cast<const u32*>(at)); // E7b Task 1 (TLG_SYNC_TYPED=1)
-        Wr<u32>(at, 4, VideoCore::NativeFenceMagic);
-        Wr<u32>(at, 0, 0xC0041000u);
-        return SyncEop;
+        NoteUntyped(Core::NativeSync::Typed::KindEop, at);
+        return SyncNone;
     }
     if (opcode == 0x49 && count == 5) {
-        if (Core::NativeSync::Typed::Convert(at, Core::NativeSync::Typed::KindRelease)) {
+        if (Convert(at, Core::NativeSync::Typed::KindRelease)) {
             return SyncRelease;
         }
-        Core::NativeSync::Typed::Met(at, Core::NativeSync::Typed::KindRelease, reinterpret_cast<const u32*>(at));
-        Wr<u32>(at, 4, ReleaseMagic);
-        Wr<u32>(at, 0, 0xC0051000u);
-        return SyncRelease;
+        NoteUntyped(Core::NativeSync::Typed::KindRelease, at);
+        return SyncNone;
     }
     if (opcode == 0x3c && count == 5) {
-        if (Core::NativeSync::Typed::Convert(at, Core::NativeSync::Typed::KindWait)) {
+        if (Convert(at, Core::NativeSync::Typed::KindWait)) {
             return SyncWait;
         }
-        const u32 control = Rd<u32>(at, 4);
-        if ((control & ~0xffu) == 0 && (control & 0x10) != 0) {
-            Core::NativeSync::Typed::Met(at, Core::NativeSync::Typed::KindWait, reinterpret_cast<const u32*>(at));
-            Wr<u32>(at, 4, WaitMagicBase | control);
-            Wr<u32>(at, 0, 0xC0051000u);
-            return SyncWait;
-        }
+        NoteUntyped(Core::NativeSync::Typed::KindWait, at);
+        return SyncNone;
     }
     if (opcode == 0x46 && count == 2 && E5TagsOn()) {
         const u32 control = Rd<u32>(at, 4);
@@ -904,15 +891,12 @@ u32 ConvertSyncPacket(u64 at) {
             return SyncInert;
         }
     }
-    if (opcode == 0x50 && count == 5 && E5TagsOn() && Core::NativeSync::Typed::Convert(at, Core::NativeSync::Typed::KindDma)) {
-        return SyncDma;
-    }
-    if (opcode == 0x50 && count == 5 && Rd<u32>(at, 4) == 0x84004000u && E5TagsOn()) {
-        // CP DMA with the control dword the game uses (memory to memory, 7 dwords): [header, control, source lo, hi, destination lo, hi, command]
-        Core::NativeSync::Typed::Met(at, Core::NativeSync::Typed::KindDma, reinterpret_cast<const u32*>(at));
-        Wr<u32>(at, 4, DmaMagic);
-        Wr<u32>(at, 0, 0xC0051000u);
-        return SyncDma;
+    if (opcode == 0x50 && count == 5 && E5TagsOn()) {
+        if (Convert(at, Core::NativeSync::Typed::KindDma)) {
+            return SyncDma;
+        }
+        NoteUntyped(Core::NativeSync::Typed::KindDma, at);
+        return SyncNone;
     }
     if (opcode == 0x69 && count == 1 && Rd<u32>(at, 4) == 1 && E5TagsOn()) {
         // SET_CONTEXT_REG of context register 1 (DB_COUNT_CONTROL), one value: [header, offset, value] -> a 3 dword no-op that keeps the value
@@ -922,17 +906,14 @@ u32 ConvertSyncPacket(u64 at) {
         return SyncQuery;
     }
     if (opcode == 0x37 && count >= 3 && count <= 6) {
-        if (Core::NativeSync::Typed::Convert(at, Core::NativeSync::Typed::KindWrite)) {
+        if (Convert(at, Core::NativeSync::Typed::KindWrite)) {
             return SyncWrite;
         }
-        const u32 control = Rd<u32>(at, 4);
-        const u32 destination = (control >> 8) & 0xf;
-        if ((control & 0x10000) == 0 && (destination == 2 || destination == 5)) {
-            Core::NativeSync::Typed::Met(at, Core::NativeSync::Typed::KindWrite, reinterpret_cast<const u32*>(at));
-            Wr<u32>(at, 4, WriteMagicBase | destination);
-            Wr<u32>(at, 0, 0xC0001000u | count << 16);
-            return SyncWrite;
+        const u32 destination = (Rd<u32>(at, 4) >> 8) & 0xf;
+        if ((Rd<u32>(at, 4) & 0x10000) == 0 && (destination == 2 || destination == 5)) {
+            NoteUntyped(Core::NativeSync::Typed::KindWrite, at);
         }
+        return SyncNone;
     }
     return SyncNone;
 }
@@ -950,85 +931,8 @@ void CountSyncConverted(u32 kind, std::atomic<u64>& place) {
 ///  - a cache acquire is ignored by the command processor;
 ///  - an event write other than the stream out flush and the Z pass dump is ignored by it.
 /// Fences with game visible labels, waits on them, CPU writes and flips stay. Returns the number of packets taken out.
-/// F1 census (`TLG_SYNC_UNITS=1`): the opcode shape around every sync packet the sweep meets (three packets before, the packet, three after), and whether the packet
-/// writes or waits on a label inside the scratch label no-op just before it. Counts only; the shapes say which barrier idioms the game writes.
-/// The tags on both sides of the range the sweep walks (words[2] of the tag: class | record kind << 8), set by WriteDwordsAt for the census
-thread_local u32 t_sweep_prev_tag = 0, t_sweep_next_tag = 0;
-
-struct SyncUnitCensus {
-    std::mutex mutex;
-    std::map<std::string, u64> shapes;
-    u64 overflow{};
-};
-SyncUnitCensus g_sync_units;
-
-bool SyncUnitCensusOn() {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_SYNC_UNITS");
-        return e != nullptr && *e == '1';
-    }();
-    return on;
-}
-
-void NoteSyncUnitShape(u64 begin, u64 end, u64 at, const std::array<u32, 3>& before, u64 label_lo, u64 label_hi) {
-    const u32 header = Rd<u32>(at, 0);
-    const u32 opcode = (header >> 8) & 0xff;
-    const u32 dwords = ((header >> 16) & 0x3fff) + 2;
-    u64 address = 0;
-    if (opcode == 0x47 && dwords == 6) {
-        address = Core::NativeSync::DecodeEop(reinterpret_cast<const u32*>(at)).address;
-    } else if (opcode == 0x49 && dwords == 7) {
-        address = Core::NativeSync::DecodeRelease(reinterpret_cast<const u32*>(at)).address;
-    } else if (opcode == 0x3c && dwords == 7) {
-        address = Core::NativeSync::DecodeWait(reinterpret_cast<const u32*>(at)).address;
-    } else if (opcode == 0x48 && dwords == 5) {
-        address = static_cast<u64>(Rd<u32>(at, 8) & 0xfffffffcu) | static_cast<u64>(Rd<u32>(at, 12) & 0xff) << 32;
-    }
-    const bool in_label = address != 0 && address >= label_lo && address < label_hi;
-    if (address != 0 && !in_label && (opcode == 0x47 || opcode == 0x3c)) {
-        std::string far_key;
-        if (opcode == 0x47) {
-            const auto f = Core::NativeSync::DecodeEop(reinterpret_cast<const u32*>(at));
-            far_key = fmt::format("FAR EOP src {} irq {} value {:#x} first-dwords {:08x} {:08x}", static_cast<int>(f.source), f.interrupt, f.value, Rd<u32>(at, 4), Rd<u32>(at, 16));
-        } else {
-            const auto w = Core::NativeSync::DecodeWait(reinterpret_cast<const u32*>(at));
-            far_key = fmt::format("FAR WAIT fn {} ref {:#x} mask {:#x} control {:08x}", static_cast<int>(w.function), w.ref, w.mask, Rd<u32>(at, 4));
-        }
-        std::scoped_lock lock{g_sync_units.mutex};
-        if (g_sync_units.shapes.size() < 400 || g_sync_units.shapes.contains(far_key)) {
-            ++g_sync_units.shapes[far_key];
-        }
-    }
-    std::string key = fmt::format("[{:04x} -> {:04x}] ", t_sweep_prev_tag & 0xffff, t_sweep_next_tag & 0xffff);
-    for (const u32 op : before) {
-        key += fmt::format("{:02x} ", op);
-    }
-    key += fmt::format("[{:02x}/{}{}{}] ", opcode, dwords, in_label ? " L" : "", Core::NativeSync::Typed::Active() && Core::NativeSync::Typed::Expected(at) ? " TYPED" : "");
-    u64 next = at + dwords * 4ull;
-    for (int i = 0; i < 3 && next < end; ++i) {
-        const u32 h = Rd<u32>(next, 0);
-        if ((h >> 30) != 3) {
-            break;
-        }
-        key += fmt::format("{:02x} ", (h >> 8) & 0xff);
-        next += (((h >> 16) & 0x3fff) + 2) * 4ull;
-    }
-    {
-        std::scoped_lock lock{g_sync_units.mutex};
-        ++g_sync_units.shapes[fmt::format("TOTAL {:02x} {}", opcode, address == 0 ? "no address" : in_label ? "label" : (address > at ? address - at : at - address) < (1ull << 20) ? "near (same buffer)" : "FAR")];
-    }
-    std::scoped_lock lock{g_sync_units.mutex};
-    if (g_sync_units.shapes.size() >= 400 && !g_sync_units.shapes.contains(key)) {
-        ++g_sync_units.overflow;
-        return;
-    }
-    ++g_sync_units.shapes[key];
-}
-
 u32 SweepSyncPackets(u64 begin, u64 end) {
     u32 removed = 0;
-    std::array<u32, 3> recent{};
-    static thread_local u64 label_lo = 0, label_hi = 0; // survives the sweep calls: a unit's label NOP and its signal can lie in different sweep ranges
     const u32 policy_bits = Core::NativeConfig::SdkStrip;
     for (u64 at = begin; at < end;) {
         const u32 header = Rd<u32>(at, 0);
@@ -1039,16 +943,6 @@ u32 SweepSyncPackets(u64 begin, u64 end) {
         const u64 size = (((header >> 16) & 0x3fff) + 2) * 4ull;
         if (at + size > end) {
             break;
-        }
-        if (SyncUnitCensusOn()) {
-            if (opcode == 0x47 || opcode == 0x49 || opcode == 0x3c || opcode == 0x37 || opcode == 0x50 || opcode == 0x48) {
-                NoteSyncUnitShape(begin, end, at, recent, label_lo, label_hi);
-            }
-            if (opcode == 0x10 && Rd<u32>(at, 4) == 0x68753000u) {
-                label_lo = at + 8;
-                label_hi = at + size;
-            }
-            recent = {recent[1], recent[2], opcode};
         }
         const auto next_at = [&](u64 from) {
             const u32 h = Rd<u32>(from, 0);
@@ -1116,28 +1010,12 @@ u32 SweepSyncPackets(u64 begin, u64 end) {
     return removed;
 }
 
-nlohmann::json SyncUnitCensusJson() {
-    nlohmann::json j = nlohmann::json::object();
-    std::scoped_lock lock{g_sync_units.mutex};
-    std::vector<std::pair<u64, std::string>> sorted;
-    for (const auto& [shape, count] : g_sync_units.shapes) {
-        sorted.emplace_back(count, shape);
-    }
-    std::sort(sorted.begin(), sorted.end(), std::greater<>());
-    for (const auto& [count, shape] : sorted) {
-        j[shape] = count;
-    }
-    j["overflow"] = g_sync_units.overflow;
-    return j;
-}
-
 bool WriteDwordsAt(u64 writer, const u32* words, u32 count) {
     // the game's own synchronization between the last tag written to this command buffer and this one
     struct Sweep {
         u64 writer{};
         u64 base{};
         u64 last{};
-        u32 last_tag{};
     };
     static thread_local std::array<Sweep, 6> sweeps;
     {
@@ -1151,16 +1029,13 @@ bool WriteDwordsAt(u64 writer, const u32* words, u32 count) {
         }
         if (entry == nullptr) {
             entry = &sweeps[(writer >> 4) % sweeps.size()];
-            *entry = {writer, base, 0, 0};
+            *entry = {writer, base, 0};
         }
         if (entry->base == base && entry->last != 0 && entry->last < cursor && cursor - entry->last < (1u << 16)) {
-            t_sweep_prev_tag = entry->last_tag;
-            t_sweep_next_tag = count > 2 ? words[2] : 0;
             SweepSyncPackets(entry->last, cursor);
         }
         entry->base = base;
         entry->last = cursor + count * sizeof(u32);
-        entry->last_tag = count > 2 ? words[2] : 0;
     }
     u64 cur = Rd<u64>(writer, 0x10);
     const u64 end = Rd<u64>(writer, 0x08);
@@ -4870,19 +4745,6 @@ bool EmitFastClearEliminate(u64 ctx, u64 resource) {
 /// Native replacement of the game's per-resource tracking for the common cases: usage flags are cleared (the cache
 /// flush has no host effect) and a render target in state 1 / 2 that was cleared with a fast clear gets its clear
 /// eliminated, then state 3. Resources with depth transitions or the second resource (+0x138) keep the game's function.
-bool WriterCensusOn();
-void TallyMeasured(u32 index, u64 begin, u64 end, u64 limit_before, u64 limit_after);
-
-void MeasuredGameTrack(u64 ctx, u64 resource, void(PS4_SYSV_ABI* game)(u64, u64)) {
-    if (!WriterCensusOn()) {
-        game(ctx, resource);
-        return;
-    }
-    const u64 before = Rd<u64>(ctx, 0x47d0), limit = Rd<u64>(ctx, 0x47c8);
-    game(ctx, resource);
-    TallyMeasured(6, before, Rd<u64>(ctx, 0x47d0), limit, Rd<u64>(ctx, 0x47c8));
-}
-
 void TrackResource(u64 ctx, u64 resource, void(PS4_SYSV_ABI* game_track)(u64, u64)) {
     if (Rd<u64>(resource, 0x138) != 0) {
         track_game_second.fetch_add(1, std::memory_order_relaxed);
@@ -4892,7 +4754,7 @@ void TrackResource(u64 ctx, u64 resource, void(PS4_SYSV_ABI* game_track)(u64, u6
         Live().track_game_depth.fetch_add(1, std::memory_order_relaxed);
     }
     if (Rd<u64>(resource, 0x138) != 0 || (Rd<u32>(resource, 0x144) - 1u) < 2) {
-        MeasuredGameTrack(ctx, resource, game_track);
+        game_track(ctx, resource);
         return;
     }
     track_native.fetch_add(1, std::memory_order_relaxed);
@@ -4906,7 +4768,7 @@ void TrackResource(u64 ctx, u64 resource, void(PS4_SYSV_ABI* game_track)(u64, u6
     const u32 state = Rd<u32>(resource, 0x14c);
     if (state == 1 || state == 2) {
         if ((Rd<u8>(resource, 0xc1) & 0x20) != 0 && Rd<u32>(resource, 0xcc) != 0 && !EmitFastClearEliminate(ctx, resource)) {
-            MeasuredGameTrack(ctx, resource, game_track);
+            game_track(ctx, resource);
             return;
         }
         track_eliminated.fetch_add(1, std::memory_order_relaxed);
@@ -6307,7 +6169,7 @@ u64 PS4_SYSV_ABI TagFenceSignal(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
     const u64 before = Rd<u64>(ctx, 0x47d0);
     const u64 label = reinterpret_cast<GuestFunction6>(original)(ctx, a1, a2, a3, a4, a5);
     const u64 after = Rd<u64>(ctx, 0x47d0);
-    if (Core::NativeSync::Typed::Active() && after == before + 6 * sizeof(u32) && (before & 3) == 0) {
+    if (after == before + 6 * sizeof(u32) && (before & 3) == 0) {
         // E7b Task 1 (TLG_SYNC_TYPED=1): what FenceEop says it wrote, built from its own result and its documented behaviour (it stores 0x11 at the label, the packet stores 0x10 there when the GPU
         // has finished all earlier work, no interrupt): an end-of-pipe write of a 64 bit immediate (data_sel 2 in dword 3 of the packet, Ghidra FUN_02480d60) to the label it returns
         Core::NativeSync::Fence typed;
@@ -6325,181 +6187,11 @@ u64 PS4_SYSV_ABI TagFenceSignal(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
     return label | (1ull << 63);
 }
 
-/// F1 writer attribution (diagnostic, `TLG_WRITER_CENSUS=1`, hooks named WriterCensus_<n> in the hooks file): who writes the sync packets that reach the sweep. The hook runs the
-/// game's function and tallies the raw sync packets it left in the draw context's command buffer (cursor before and after, `ctx + 0x47d0`). The context is the first of the
-/// arguments (or `*(arg0 + 0x2d8)`) that looks like one. Calls into other hooked functions are inclusive: their raw packets count for the outer function too.
-struct WriterCensusSlot {
-    const char* name;
-    std::atomic<u64> calls{}, no_context{}, buffer_switched{}, too_big{}, empty{}, not_framed{}, with_sync{};
-    std::mutex mutex;
-    std::map<std::string, u64> kinds;
-};
-WriterCensusSlot g_writer_census[6] = {{"01c6e670 render scene barrier"}, {"02472050"}, {"01c804a0"}, {"02480e20"}, {"01c55690 RenderFrame"}, {"01c4dfa0 SubmitAndFlip"}};
-
-bool WriterCensusOn() {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_WRITER_CENSUS");
-        return e != nullptr && *e == '1';
-    }();
-    return on;
-}
-
-bool LooksLikeContext(u64 p) {
-    if (!IsHeapPointer(p) || !IsHeapPointer(p + 0x4800) || (p & 7) != 0) { // the whole context must lie in the heap, or the reads below fault
-        return false;
-    }
-    const u64 base = Rd<u64>(p, 0x47c0), end = Rd<u64>(p, 0x47c8), cursor = Rd<u64>(p, 0x47d0);
-    return base != 0 && base <= cursor && cursor <= end && end - base < (1ull << 28) && (cursor & 3) == 0;
-}
-
-void TallyWriterRange(WriterCensusSlot& slot, u64 begin, u64 end) {
-    u64 label_lo = 0, label_hi = 0;
-    bool any = false;
-    for (u64 at = begin; at < end;) {
-        const u32 header = Rd<u32>(at, 0);
-        const u64 size = (((header >> 16) & 0x3fff) + 2) * 4ull;
-        if ((header >> 30) != 3 || at + size > end) {
-            slot.not_framed.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
-        const u32 opcode = (header >> 8) & 0xff;
-        const u32 dwords = static_cast<u32>(size / 4);
-        std::string key;
-        u64 address = 0;
-        if (opcode == 0x10 && Rd<u32>(at, 4) == 0x68753000u) {
-            label_lo = at + 8;
-            label_hi = at + size;
-        } else if (opcode == 0x47 && dwords == 6) {
-            const auto f = Core::NativeSync::DecodeEop(reinterpret_cast<const u32*>(at));
-            address = f.address;
-            key = fmt::format("EOP value {:#x} src {} irq {}", f.value, static_cast<int>(f.source), f.interrupt);
-        } else if (opcode == 0x49 && dwords == 7) {
-            address = Core::NativeSync::DecodeRelease(reinterpret_cast<const u32*>(at)).address;
-            key = "RELEASE";
-        } else if (opcode == 0x3c && dwords == 7) {
-            const auto w = Core::NativeSync::DecodeWait(reinterpret_cast<const u32*>(at));
-            address = w.address;
-            key = fmt::format("WAIT fn {} ref {:#x}", static_cast<int>(w.function), w.ref);
-        } else if (opcode == 0x48 && dwords == 5) {
-            address = static_cast<u64>(Rd<u32>(at, 8) & 0xfffffffcu) | static_cast<u64>(Rd<u32>(at, 12) & 0xff) << 32;
-            key = "EOS";
-        } else if (opcode == 0x37 && dwords >= 5 && dwords <= 8) {
-            key = "WRITE_DATA";
-        } else if (opcode == 0x50 && dwords == 7) {
-            key = fmt::format("CP_DMA control {:#x}", Rd<u32>(at, 4));
-        }
-        if (!key.empty()) {
-            if (address != 0) {
-                key += address >= label_lo && address < label_hi ? " scratch" : " external";
-            }
-            any = true;
-            std::scoped_lock lock{slot.mutex};
-            if (slot.kinds.size() < 60 || slot.kinds.contains(key)) {
-                ++slot.kinds[key];
-            }
-        }
-        at += size;
-    }
-    if (any) {
-        slot.with_sync.fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
-template <int N>
-u64 PS4_SYSV_ABI WriterCensusHook(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    static std::atomic<u64> original_entry{0};
-    auto& slot = g_writer_census[N];
-    if (!WriterCensusOn()) {
-        return 0;
-    }
-    u64 original = original_entry.load(std::memory_order_relaxed);
-    if (original == 0) {
-        original = Core::GuestHooks::OriginalEntry((std::string("WriterCensus_") + std::to_string(N)).c_str());
-        original_entry.store(original, std::memory_order_relaxed);
-    }
-    if (original == 0) {
-        return 0;
-    }
-    u64 ctx = 0;
-    for (const u64 candidate : {a0, a1, a2}) {
-        if (LooksLikeContext(candidate)) {
-            ctx = candidate;
-            break;
-        }
-    }
-    if (ctx == 0 && IsHeapPointer(a0) && IsHeapPointer(a0 + 0x2e0) && (a0 & 7) == 0 && LooksLikeContext(Rd<u64>(a0, 0x2d8))) {
-        ctx = Rd<u64>(a0, 0x2d8);
-    }
-    const u64 before = ctx != 0 ? Rd<u64>(ctx, 0x47d0) : 0;
-    const u64 limit = ctx != 0 ? Rd<u64>(ctx, 0x47c8) : 0;
-    const u64 result = reinterpret_cast<GuestFunction6>(original)(a0, a1, a2, a3, a4, a5);
-    slot.calls.fetch_add(1, std::memory_order_relaxed);
-    if (ctx == 0) {
-        slot.no_context.fetch_add(1, std::memory_order_relaxed);
-        return result | (1ull << 63);
-    }
-    const u64 after = Rd<u64>(ctx, 0x47d0);
-    if (after == before) {
-        slot.empty.fetch_add(1, std::memory_order_relaxed);
-    } else if (Rd<u64>(ctx, 0x47c8) != limit || after < before) {
-        slot.buffer_switched.fetch_add(1, std::memory_order_relaxed);
-    } else if (after - before > (1u << 20)) {
-        slot.too_big.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        TallyWriterRange(slot, before, after);
-    }
-    return result | (1ull << 63);
-}
-
-/// The game functions the hooks of the SDK helpers run themselves (RunAndMeasure, the resource tracking): the raw sync packets they leave, same tally as the writer census.
-WriterCensusSlot g_measure_census[7] = {{"measured: ResTransition"}, {"measured: RenderTargetEliminate Fn247c680"}, {"measured: ClearQuad"}, {"measured: CopyResource"},
-                                        {"measured: ExCsDepthCopy"}, {"measured: HtileClear"}, {"measured: game track function 02479db0"}};
-
-void TallyMeasured(u32 index, u64 begin, u64 end, u64 limit_before, u64 limit_after) {
-    auto& slot = g_measure_census[index];
-    slot.calls.fetch_add(1, std::memory_order_relaxed);
-    if (end == begin) {
-        slot.empty.fetch_add(1, std::memory_order_relaxed);
-    } else if (limit_before != limit_after || end < begin) {
-        slot.buffer_switched.fetch_add(1, std::memory_order_relaxed);
-    } else if (end - begin > (1u << 20)) {
-        slot.too_big.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        TallyWriterRange(slot, begin, end);
-    }
-}
-
-nlohmann::json WriterCensusJson() {
-    nlohmann::json j = nlohmann::json::object();
-    const auto emit = [&](WriterCensusSlot& slot) {
-        nlohmann::json e = nlohmann::json::object();
-        e["calls"] = slot.calls.load();
-        e["no_context"] = slot.no_context.load();
-        e["empty"] = slot.empty.load();
-        e["buffer_switched"] = slot.buffer_switched.load();
-        e["too_big"] = slot.too_big.load();
-        e["not_framed"] = slot.not_framed.load();
-        e["calls_with_sync_packets"] = slot.with_sync.load();
-        std::scoped_lock lock{slot.mutex};
-        for (const auto& [kind, count] : slot.kinds) {
-            e["packets"][kind] = count;
-        }
-        j[slot.name] = e;
-    };
-    for (auto& slot : g_writer_census) {
-        emit(slot);
-    }
-    for (auto& slot : g_measure_census) {
-        emit(slot);
-    }
-    return j;
-}
-
 /// FUN_02472050(async compute context, label address): the engine's fence wait on the async queue, the wait half of the fence API (FenceEop is the signal half). One WAIT_REG_MEM
 /// (7 dwords at the buffer cursor `ctx + 0x70`): continue when the 32 bit value at the label equals 0x10. The game's function runs; the typed record is built from the argument
 /// (TLG_SYNC_TYPED=1 compares it with what the decoder reads from the packet). An address that fits 16 bits is a register wait in the packet and is not typed here.
 u64 PS4_SYSV_ABI TagAscWaitFence(u64 ctx, u64 label, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    if (ctx == 0 || !Core::NativeSync::Typed::Active()) {
+    if (ctx == 0) {
         return 0; // the game's function runs as it is
     }
     static std::atomic<u64> original_entry{0};
@@ -6533,7 +6225,7 @@ u64 PS4_SYSV_ABI TagAscWaitFence(u64 ctx, u64 label, u64 a2, u64 a3, u64 a4, u64
 /// The mid hooks sit right after the packet is written (cursor `ctx + 0x47d0` advanced, `rbx` = the draw context) and before that call; the label is in r12 (first site) or r15
 /// (second site). The typed record is what the idiom says it wrote; TLG_SYNC_TYPED=1 compares it with the packet.
 void NoteRenderFrameFence(u64 ctx, u64 label) {
-    if (!Core::NativeSync::Typed::Active() || ctx == 0 || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x4800)) {
+    if (ctx == 0 || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x4800)) {
         return;
     }
     const u64 cursor = Rd<u64>(ctx, 0x47d0);
@@ -6560,7 +6252,7 @@ u64 PS4_SYSV_ABI RenderFrameFenceB(Core::GuestHooks::MidContext* c) {
 /// 8 byte aligned, r14 = the value, rbx = the draw context, the cursor `ctx + 0x47d0` is still at the packet) and, after the compute queue marker, an interrupt only (no data) on the
 /// graphics context in r13. The mid hooks sit at the cursor update of each packet; the typed records are what the function says it wrote (TLG_SYNC_TYPED=1 compares them).
 u64 PS4_SYSV_ABI FlipFrameFence(Core::GuestHooks::MidContext* c) {
-    if (!Core::NativeSync::Typed::Active() || !IsHeapPointer(c->rbx) || !IsHeapPointer(c->rbx + 0x4800)) {
+    if (!IsHeapPointer(c->rbx) || !IsHeapPointer(c->rbx + 0x4800)) {
         return 0;
     }
     const u64 packet = Rd<u64>(c->rbx, 0x47d0);
@@ -6578,7 +6270,7 @@ u64 PS4_SYSV_ABI FlipFrameFence(Core::GuestHooks::MidContext* c) {
 /// (0x1c5fd91, 0x1c626a0, 0x1c649de). The mid hooks sit at `add [rbx+0x47d0], 0x18` (rbx = the draw context, the cursor still at the packet). The label address the packet carries is
 /// the label masked to 40 bits: r15 & r12 (first site, r12 is the mask), r15 & 0xfffffffff8 (second), rsi (third, already masked).
 void NoteInlineFence(u64 ctx, u64 address) {
-    if (!Core::NativeSync::Typed::Active() || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x4800)) {
+    if (!IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x4800)) {
         return;
     }
     const u64 packet = Rd<u64>(ctx, 0x47d0);
@@ -6610,7 +6302,7 @@ u64 PS4_SYSV_ABI InlineFenceC(Core::GuestHooks::MidContext* c) {
 template <u64 Core::GuestHooks::MidContext::*Ctx, u64 Core::GuestHooks::MidContext::*Lo, u64 Core::GuestHooks::MidContext::*Hi, u32 Ref>
 u64 PS4_SYSV_ABI InlineWait(Core::GuestHooks::MidContext* c) {
     const u64 ctx = c->*Ctx;
-    if (!Core::NativeSync::Typed::Active() || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x4800)) {
+    if (!IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x4800)) {
         return 0;
     }
     const u64 packet = Rd<u64>(ctx, 0x47d0);
@@ -6634,7 +6326,7 @@ u64 PS4_SYSV_ABI InlineWait(Core::GuestHooks::MidContext* c) {
 /// FUN_024a5e20(dcb, destination, source, bytes): the Gnm copyData helper. One CP DMA packet (7 dwords at the dcb cursor `dcb + 0x10`) per chunk of 0x1ffffc bytes, memory to memory. The
 /// game's function runs; when the cursor moved by exactly the packets the arguments call for, each is typed from the arguments (TLG_SYNC_TYPED=1 compares them with the decoder).
 u64 PS4_SYSV_ABI TagDmaCopy(u64 dcb, u64 destination, u64 source, u64 bytes, u64 a4, u64 a5, u64 ret) {
-    if (!Core::NativeSync::Typed::Active() || !IsHeapPointer(dcb) || !IsHeapPointer(dcb + 0x28)) {
+    if (!IsHeapPointer(dcb) || !IsHeapPointer(dcb + 0x28)) {
         return 0;
     }
     static std::atomic<u64> original_entry{0};
@@ -6670,7 +6362,7 @@ u64 PS4_SYSV_ABI TagDmaCopy(u64 dcb, u64 destination, u64 source, u64 bytes, u64
     return 1;
 }
 u64 PS4_SYSV_ABI FlipInterrupt(Core::GuestHooks::MidContext* c) {
-    if (!Core::NativeSync::Typed::Active() || !IsHeapPointer(c->r13) || !IsHeapPointer(c->r13 + 0x4800)) {
+    if (!IsHeapPointer(c->r13) || !IsHeapPointer(c->r13 + 0x4800)) {
         return 0;
     }
     const u64 packet = Rd<u64>(c->r13, 0x47d0);
@@ -6691,7 +6383,7 @@ u64 PS4_SYSV_ABI FlipInterrupt(Core::GuestHooks::MidContext* c) {
 thread_local u64 t_csub_packet = 0, t_csub_label = 0;
 void TypedUnitRelease(u64 ctx, u64 packet, u64 label, u64 value, bool unit) {
     t_csub_packet = 0;
-    if (!Core::NativeSync::Typed::Active() || !IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x1ce8) || packet != Rd<u64>(ctx, 0x70) || (packet & 3) != 0) {
+    if (!IsHeapPointer(ctx) || !IsHeapPointer(ctx + 0x1ce8) || packet != Rd<u64>(ctx, 0x70) || (packet & 3) != 0) {
         return;
     }
     if (unit) {
@@ -7765,9 +7457,6 @@ u64 RunAndMeasure(EmitStat& stat, const char* hook_name, u64 dcb, u64 a0, u64 a1
         stat.split.fetch_add(1, std::memory_order_relaxed);
     } else {
         stat.dwords.fetch_add((cursor_after - cursor_before) / 4, std::memory_order_relaxed);
-        if (WriterCensusOn()) {
-            TallyMeasured(static_cast<u32>(index), cursor_before, cursor_after, end_before, end_after);
-        }
         u64 draws = 0, packets = 0, at = cursor_before;
         while (at < cursor_after) {
             const u32 header = Rd<u32>(at, 0);
@@ -9063,12 +8752,6 @@ u64 FindHandler(const std::string& name) {
     if (name == "tag_asc_wait") {
         return reinterpret_cast<u64>(&TagAscWaitFence);
     }
-    if (name == "writer_census_0") return reinterpret_cast<u64>(&WriterCensusHook<0>);
-    if (name == "writer_census_1") return reinterpret_cast<u64>(&WriterCensusHook<1>);
-    if (name == "writer_census_2") return reinterpret_cast<u64>(&WriterCensusHook<2>);
-    if (name == "writer_census_3") return reinterpret_cast<u64>(&WriterCensusHook<3>);
-    if (name == "writer_census_4") return reinterpret_cast<u64>(&WriterCensusHook<4>);
-    if (name == "writer_census_5") return reinterpret_cast<u64>(&WriterCensusHook<5>);
     return 0;
 }
 
@@ -9119,41 +8802,14 @@ u32 RestoreSyncTag(const u32* tag, std::array<u32, 8>& packet, bool count_execut
     const u32 magic = tag[1];
     u32 kind = SyncNone;
     u32 opcode = 0;
-    if (magic == VideoCore::NativeFenceMagic && count == 4) {
-        packet = {0xC0044700u, 0, tag[2], tag[3], tag[4], tag[5]};
-        kind = SyncEop;
-        opcode = 0x47;
-    } else if (magic == ReleaseMagic && count == 5) {
-        packet = {0xC0054902u, 0, tag[2], tag[3], tag[4], tag[5], tag[6]};
-        kind = SyncRelease;
-        opcode = 0x49;
-    } else if ((magic & ~0xffu) == WaitMagicBase && count == 5) {
-        packet = {0xC0053C00u, magic & 0xff, tag[2], tag[3], tag[4], tag[5], tag[6]};
-        kind = SyncWait;
-        opcode = 0x3c;
-    }
-    if (kind == SyncNone && magic == QueryMagic && count == 1) {
+    if (magic == QueryMagic && count == 1) {
         packet = {0xC0016900u, 1u, tag[2]};
         kind = SyncQuery;
         opcode = 0x69;
-    }
-    if (kind == SyncNone && magic == DmaMagic && count == 5) {
-        packet = {0xC0055000u, 0x84004000u, tag[2], tag[3], tag[4], tag[5], tag[6]};
-        kind = SyncDma;
-        opcode = 0x50;
-    }
-    if (kind == SyncNone && magic == EventMagic && count == 2) {
+    } else if (magic == EventMagic && count == 2) {
         packet = {0xC0024600u, 0x139u, tag[2], tag[3]};
         kind = SyncEvent;
         opcode = 0x46;
-    }
-    if (kind == SyncNone && (magic & ~0xffu) == WriteMagicBase && count >= 3 && count <= 6) {
-        packet = {0xC0003700u | count << 16, (magic & 0xf) << 8};
-        for (u32 i = 2; i < count + 2; ++i) {
-            packet[i] = tag[i];
-        }
-        kind = SyncWrite;
-        opcode = 0x37;
     }
     if (kind != SyncNone && count_execution) {
         Live().sync_exec[kind].fetch_add(1, std::memory_order_relaxed);
@@ -9169,29 +8825,9 @@ u32 ReadSyncTag(const u32* tag, Core::NativeSync::SyncRecord& record, bool count
         }
         return opcode;
     }
-    const u32 opcode = RestoreSyncTag(tag, record.words, count_execution);
-    record.opcode = opcode;
-    const u32* w = record.words.data();
-    switch (opcode) {
-    case 0x47:
-        record.fence = Core::NativeSync::DecodeEop(w);
-        break;
-    case 0x49:
-        record.fence = Core::NativeSync::DecodeRelease(w);
-        break;
-    case 0x3c:
-        record.wait = Core::NativeSync::DecodeWait(w);
-        break;
-    case 0x37:
-        record.write = Core::NativeSync::DecodeWrite(w);
-        break;
-    case 0x50:
-        record.dma = Core::NativeSync::DecodeDma(w);
-        break;
-    default:
-        break;
-    }
-    return opcode;
+    // the occlusion query event and register tags: the words of the packet they stand for
+    record.opcode = RestoreSyncTag(tag, record.words, count_execution);
+    return record.opcode;
 }
 
 std::string DescribeEntry(const void* header) {
@@ -9621,19 +9257,10 @@ VAddr ImageBase() {
 
 void SetImageBase(VAddr base) {
     image_base.store(base, std::memory_order_relaxed);
-    Core::NativeSync::Typed::SetImage(base, 0x3000000);
 }
 
 u64 NextSeq() {
     return next_seq.load(std::memory_order_acquire);
-}
-
-nlohmann::json SyncUnitCensusReport() {
-    return SyncUnitCensusJson();
-}
-
-nlohmann::json WriterCensusReport() {
-    return WriterCensusJson();
 }
 
 } // namespace Core::NativeDraw
