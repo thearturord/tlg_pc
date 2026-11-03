@@ -23,6 +23,7 @@
 #include "native/native_field_use.h"
 #include "native/native_plan_shadow.h"
 #include "native/native_sync.h"
+#include "native/native_tsharp_watch.h"
 
 namespace Core::NativeDevice {
 
@@ -228,6 +229,9 @@ void NoteView(Kind kind, u64 view_object, u64 desc) {
     if ((kind == Kind::ShaderResourceView || kind == Kind::UnorderedAccessView) && resource.kind >= Kind::Texture1D && resource.kind <= Kind::Texture3D) {
         view.has_tsharp = true;
         std::memcpy(view.tsharp, reinterpret_cast<const void*>(view_object + (kind == Kind::ShaderResourceView ? 0x58 : 0x54)), sizeof(view.tsharp));
+        if (kind == Kind::ShaderResourceView && NativeTsharpWatch::On()) {
+            NativeTsharpWatch::Arm(view_object, view_object + 0x60, resource.width, resource.height); // the T# height dword (diagnostic, F4 question a)
+        }
     }
     view.address = resource.address;
     view.bytes = resource.bytes;
