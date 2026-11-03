@@ -12,6 +12,7 @@
 #include "native/native_debug_server.h"
 #include "native/native_e3_census.h"
 #include "native/native_content.h"
+#include "native/native_field_use.h"
 #include "native/native_prof.h"
 #include "native/native_config.h"
 #include "video_core/renderer_vulkan/vk_identity_audit.h"
@@ -2122,6 +2123,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
             }
             const AmdGpu::Buffer vsharp = chosen_sharp;
+            if (Core::NativeFieldUse::On()) { // F4.0b
+                Core::NativeFieldUse::NoteBuffer(reinterpret_cast<const u32*>(&vsharp));
+            }
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
                 Census(census_base + CBufferNull);
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);

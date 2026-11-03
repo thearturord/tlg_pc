@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include "native/native_field_use.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_indexed_data.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -12,6 +13,9 @@ namespace VideoCore {
 Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sampler,
                  const AmdGpu::BorderColorBuffer border_color_base, const bool is_depth, float extra_lod_bias) {
     using namespace Vulkan;
+    if (Core::NativeFieldUse::On()) { // F4.0b
+        Core::NativeFieldUse::NoteSampler(reinterpret_cast<const u32*>(&sampler));
+    }
     const bool anisotropy_enable = instance.IsAnisotropicFilteringSupported() &&
                                    (AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) ||
                                     AmdGpu::IsAnisoFilter(sampler.xy_min_filter));
