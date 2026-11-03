@@ -570,6 +570,17 @@ void NoteDeleted(u64, u64 size) {
     c_deleted_bytes.fetch_add(size, std::memory_order_relaxed);
 }
 
+namespace {
+/// F2.4 research (ring swap differences): why does the store's copy of a ring image differ from the bytes memory holds now? Per differing byte: does a NEWER entry (announced after the draw's
+/// record, stamp above it) hold the byte memory has (the raster thread drew late, memory was overwritten by a later frame: the store is right), or no entry does (an unannounced write, or
+/// a writer whose bytes are not kept: the store may be wrong).
+std::atomic<u64> c_dif_images{0}, c_dif_images_all_newer{0}, c_dif_images_unexplained{0}, c_dif_images_unexplained_mark{0};
+std::atomic<u64> c_dif_bytes_newer{0}, c_dif_bytes_unexplained{0}, c_dif_images_with_uncovered{0}, c_dif_images_uncovered_only{0};
+std::atomic<u64> c_dif_writer[16]{}; ///< differing bytes by the writer of the store's (older) entry
+std::mutex g_dif_mutex;
+std::vector<nlohmann::json> g_dif_examples;
+} // namespace
+
 void OverlayImage(u64 address, u64 size, u8* staged) {
     if (!RingSwapOn() || size == 0) {
         return;
@@ -595,17 +606,86 @@ void OverlayImage(u64 address, u64 size, u8* staged) {
     std::vector<std::pair<u64, u64>> uncovered;
     ResolveLocked(address, address + size, pieces, uncovered, seq);
     u64 covered = 0, changed = 0;
+    u64 image_newer = 0, image_unexplained = 0, image_first_diff = ~0ull, image_newest_stamp = 0, image_chosen_stamp = 0;
+    u32 image_writer = 0, image_writer_unexplained = 0;
+    u64 image_unexplained_seq = ~0ull; // the oldest entry (by seq) with an unexplained byte
     for (const Piece& p : pieces) {
         u8* destination = staged + (p.begin - address);
         const u8* source = p.entry->Bytes() + (p.begin - p.entry_begin);
         const u64 n = p.end - p.begin;
         if (std::memcmp(destination, source, n) != 0) {
-            for (u64 i = 0; i < n; ++i) {
-                changed += destination[i] != source[i];
+            // the entries announced after this draw's record that overlap the piece (they hold what memory may have been overwritten with)
+            std::vector<const Entry*> newer;
+            std::vector<u64> newer_begin;
+            const u64 from = p.begin > g_max_size ? p.begin - g_max_size : 0;
+            for (auto it = g_entries.lower_bound(from); it != g_entries.end() && it->first < p.end; ++it) {
+                if (it->first + it->second.size > p.begin && it->second.stamp > seq) {
+                    newer.push_back(&it->second);
+                    newer_begin.push_back(it->first);
+                    image_newest_stamp = std::max(image_newest_stamp, it->second.stamp);
+                }
             }
+            for (u64 i = 0; i < n; ++i) {
+                if (destination[i] == source[i]) {
+                    continue;
+                }
+                ++changed;
+                image_first_diff = std::min(image_first_diff, p.begin + i - address);
+                bool explained = false;
+                for (size_t k = 0; k < newer.size() && !explained; ++k) {
+                    const u64 at = p.begin + i;
+                    explained = at >= newer_begin[k] && at < newer_begin[k] + newer[k]->size && newer[k]->Bytes()[at - newer_begin[k]] == destination[i];
+                }
+                const u32 w = std::min<u32>(p.entry->writer == WriterCopy ? 15u : p.entry->writer, 15u);
+                c_dif_writer[w].fetch_add(1, std::memory_order_relaxed);
+                if (explained) {
+                    ++image_newer;
+                } else {
+                    ++image_unexplained;
+                    image_writer_unexplained = w;
+                    image_unexplained_seq = std::min(image_unexplained_seq, p.entry->seq);
+                }
+                image_writer = w;
+            }
+            image_chosen_stamp = std::max(image_chosen_stamp, p.entry->stamp);
             std::memcpy(destination, source, n);
         }
         covered += n;
+    }
+    if (changed != 0) {
+        c_dif_images.fetch_add(1, std::memory_order_relaxed);
+        c_dif_bytes_newer.fetch_add(image_newer, std::memory_order_relaxed);
+        c_dif_bytes_unexplained.fetch_add(image_unexplained, std::memory_order_relaxed);
+        u32 mark_writer = 0;
+        if (image_unexplained == 0) {
+            c_dif_images_all_newer.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            c_dif_images_unexplained.fetch_add(1, std::memory_order_relaxed);
+            if (ShadowOn()) {
+                // a writer whose bytes are not kept (1, 2, 4) announced a write over this memory after the oldest unexplained entry
+                std::scoped_lock marks_lock{g_marks_mutex};
+                const u64 mfrom = address > g_marks_max_size ? address - g_marks_max_size : 0;
+                for (auto it = g_marks.lower_bound(mfrom); it != g_marks.end() && it->first < address + size; ++it) {
+                    if (it->first + it->second.size > address && it->second.seq >= image_unexplained_seq) {
+                        mark_writer = it->second.writer;
+                    }
+                }
+                c_dif_images_unexplained_mark.fetch_add(mark_writer != 0, std::memory_order_relaxed);
+            }
+        }
+        if (!uncovered.empty()) {
+            c_dif_images_with_uncovered.fetch_add(1, std::memory_order_relaxed);
+        }
+        std::scoped_lock dif_lock{g_dif_mutex};
+        if (g_dif_examples.size() < 24 && (image_unexplained != 0 || g_dif_examples.size() < 8)) {
+            Core::NativeDevice::Object owner;
+            const bool owned = Core::NativeDevice::ResourceAt(address, owner);
+            g_dif_examples.push_back({{"address", fmt::format("{:#x}", address)}, {"size", size}, {"draw_record", seq}, {"image_bytes_differing", changed},
+                                      {"bytes_matching_a_newer_entry", image_newer}, {"bytes_matching_nothing", image_unexplained}, {"first_diff_offset", image_first_diff},
+                                      {"chosen_entry_stamp", image_chosen_stamp}, {"newest_overlapping_stamp", image_newest_stamp}, {"writer_of_last_differing_entry", image_writer},
+                                      {"writer_of_last_unexplained_entry", image_writer_unexplained}, {"mark_writer_after", mark_writer}, {"uncovered_segments", uncovered.size()},
+                                      {"engine_resource", owned ? fmt::format("kind {} usage {} cpu_access {:#x}", static_cast<u32>(owner.kind), owner.usage, owner.cpu_access) : "none"}});
+        }
     }
     c_ov_images.fetch_add(1, std::memory_order_relaxed);
     c_ov_bytes.fetch_add(covered, std::memory_order_relaxed);
@@ -822,6 +902,20 @@ nlohmann::json Report() {
                         {"images_where_store_differs_from_memory", c_ov_images_changed.load()}, {"bytes_where_store_differs_from_memory", c_ov_changed_bytes.load()},
                         {"calls", c_ov_calls.load()}, {"not_in_ring", c_ov_not_ring.load()}, {"skipped_open_map", c_ov_skipped_open_map.load()}, {"skipped_no_record", c_ov_skipped_no_seq.load()},
                         {"switch", "TLG_F2_RING_STORE=0 turns it off"}};
+    {
+        nlohmann::json writers = nlohmann::json::object();
+        for (u32 w = 0; w < 16; ++w) {
+            if (const u64 n = c_dif_writer[w].load(); n != 0) {
+                writers[w == 15 ? "copy" : std::to_string(w)] = n;
+            }
+        }
+        std::scoped_lock dif_lock{g_dif_mutex};
+        out["ring_swap_differences"] = {{"images", c_dif_images.load()}, {"images_every_byte_matches_a_newer_entry", c_dif_images_all_newer.load()},
+                                        {"images_with_bytes_matching_nothing", c_dif_images_unexplained.load()}, {"of_those_a_kept_less_writer_marked_after", c_dif_images_unexplained_mark.load()},
+                                        {"bytes_matching_a_newer_entry", c_dif_bytes_newer.load()}, {"bytes_matching_nothing", c_dif_bytes_unexplained.load()},
+                                        {"images_that_also_had_uncovered_bytes", c_dif_images_with_uncovered.load()}, {"differing_bytes_by_writer_of_the_stores_entry", writers},
+                                        {"examples", g_dif_examples}};
+    }
     if (!ShadowOn()) {
         std::scoped_lock lock{g_mutex};
         out["store"] = {{"entries", g_entries.size()}, {"bytes", g_stored_bytes}, {"announced", c_announced.load()}, {"evicted", c_evicted.load()}};
