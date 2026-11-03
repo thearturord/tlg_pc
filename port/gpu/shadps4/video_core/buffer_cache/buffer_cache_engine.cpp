@@ -145,25 +145,6 @@ bool BufferCache::ObjectCopiesOn() {
     return on;
 }
 
-void BufferCache::VerifyObjectCopy(const Core::NativeResources::ImmutableBuffer& object) {
-    static const u32 every = [] {
-        const char* e = std::getenv("TLG_OBJECT_COPY_VERIFY");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 0u;
-    }();
-    static u64 counter = 0;
-    if (every == 0 || ++counter % every != 0) {
-        return;
-    }
-    object_copy_checks.fetch_add(1, std::memory_order_relaxed);
-    const u64 whole = object.end - object.begin;
-    if (std::memcmp(stream_buffer.mapped_data.data() + object.copy_offset, reinterpret_cast<const void*>(object.begin), whole) != 0) {
-        if (object_copy_stale.fetch_add(1, std::memory_order_relaxed) < 12) {
-            TLG_LOG(BUFFER, Error, "R1b: the copy of engine buffer {:#x}+{:#x} (usage {}) differs from guest memory at generation {}", object.begin, whole, object.usage,
-                      object.copy_generation);
-        }
-    }
-}
-
 bool BufferCache::StreamWhilePassOpen(VAddr device_addr, u32 size) {
     // a page the GPU wrote somewhere is no reason to cut the pass: only bytes the GPU wrote (the precise ranges) must come from the arena
     static const bool on = [] {
@@ -461,62 +442,6 @@ bool BufferCache::ZeroCopyOn() const noexcept {
     return on && !zero_copy_unavailable.load(std::memory_order_relaxed);
 }
 
-void BufferCache::ZeroCopyVerifyNote(const Buffer* buffer, std::span<const vk::BufferCopy> copies) {
-    // TLG_ZERO_COPY_VERIFY=N: every Nth direct write keeps the bytes it wrote; once the submission recording now has finished, the buffer must still hold
-    // them unless the GPU wrote it since (a GPU copy recorded before the write but executed after it would show up here)
-    static const u32 every = [] {
-        const char* e = std::getenv("TLG_ZERO_COPY_VERIFY");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 0u;
-    }();
-    if (every == 0) {
-        return;
-    }
-    static u64 n = 0;
-    if (++n % every != 0 || zero_copy_checks.size() >= 64) {
-        return;
-    }
-    for (const auto& copy : copies) {
-        if (copy.size > 65536) {
-            continue;
-        }
-        ZeroCopyCheck check{buffer, copy.dstOffset - buffer->cpu_addr, scheduler.CurrentTick(), buffer->gpu_write_generation, {}};
-        check.bytes.assign(buffer->mapped_data.data() + check.offset, buffer->mapped_data.data() + check.offset + copy.size);
-        zero_copy_checks.push_back(std::move(check));
-        break;
-    }
-}
-
-void BufferCache::ZeroCopyVerifyPoll() {
-    for (auto it = zero_copy_checks.begin(); it != zero_copy_checks.end();) {
-        if (!scheduler.IsFree(it->tick)) {
-            ++it;
-            continue;
-        }
-        bool alive = false;
-        {
-            std::scoped_lock lock{placed_mutex};
-            for (const auto& [b, entry] : placed) {
-                if (entry.buffer.get() == it->buffer) {
-                    alive = true;
-                    break;
-                }
-            }
-        }
-        if (alive && it->buffer->gpu_write_generation == it->generation) {
-            zero_copy_counts[5].fetch_add(1, std::memory_order_relaxed);
-            if (std::memcmp(it->buffer->mapped_data.data() + it->offset, it->bytes.data(), it->bytes.size()) != 0) {
-                zero_copy_counts[6].fetch_add(1, std::memory_order_relaxed);
-                static std::atomic<u32> logged{0};
-                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                    TLG_LOG(BUFFER, Warn, "zero copy verify: buffer {:#x}+{:#x} ({} bytes) changed after its direct write with no GPU write planned", it->buffer->cpu_addr,
-                                it->offset, it->bytes.size());
-                }
-            }
-        }
-        it = zero_copy_checks.erase(it);
-    }
-}
-
 nlohmann::json BufferCache::ZeroCopyReport() const {
     return {{"on", ZeroCopyOn()},
             {"direct_writes", zero_copy_counts[0].load()},
@@ -524,10 +449,8 @@ nlohmann::json BufferCache::ZeroCopyReport() const {
             {"direct_write_bytes", zero_copy_counts[2].load()},
             {"uploads_copied_gpu_still_using_the_buffer", zero_copy_counts[3].load()},
             {"bytes_copied_gpu_still_using_the_buffer", zero_copy_counts[4].load()},
-            {"verify_checked", zero_copy_counts[5].load()},
             {"uploads_into_placed_device_local", zero_copy_counts[8].load()},
-            {"uploads_into_placed_cpu_writable", zero_copy_counts[9].load()},
-            {"VERIFY_CHANGED", zero_copy_counts[6].load()}};
+            {"uploads_into_placed_cpu_writable", zero_copy_counts[9].load()}};
 }
 
 } // namespace VideoCore

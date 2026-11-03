@@ -153,10 +153,6 @@ public:
     }
     /// R1b switch (`TLG_OBJECT_COPIES=0` turns it off)
     static bool ObjectCopiesOn();
-    /// R1b verify (`TLG_OBJECT_COPY_VERIFY=N`, one answer from a copy in N): the copy must still equal the object's guest memory; counted in
-    /// `object_copy_checks` / `object_copy_stale` (/stats resident_buffers)
-    void VerifyObjectCopy(const Core::NativeResources::ImmutableBuffer& object);
-    std::atomic<u64> object_copy_checks{0}, object_copy_stale{0};
     /// N5e: byte precise. True when a shader or a GPU copy wrote bytes of [addr, addr + size) that were not downloaded since (the set `gpu_modified_ranges`), as against
     /// `IsRegionGpuModified`, which answers per 4 KB page and keeps the answer for as long as the page lives.
     [[nodiscard]] bool IsRangeGpuWritten(VAddr addr, size_t size);
@@ -247,23 +243,12 @@ private:
     std::array<std::atomic<u64>, 4> bind_memo_counts{}; ///< hits, misses, entries erased by writes, memo cleared
     std::pair<const Buffer*, u64> ObtainBufferUncached(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                        Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object);
-    // zero copy (TLG_ZERO_COPY=1, zero-copy-dynamic-buffers.md): counters, the verify's pending checks
+    // zero copy (TLG_ZERO_COPY=1, zero-copy-dynamic-buffers.md): counters
     std::array<std::atomic<u64>, 10> zero_copy_counts{};
     std::atomic<bool> zero_copy_unavailable{false};
-    struct ZeroCopyCheck {
-        const Buffer* buffer{};
-        u64 offset{};
-        u64 tick{};
-        u64 generation{};
-        std::vector<u8> bytes;
-    };
-    std::vector<ZeroCopyCheck> zero_copy_checks;
-    void ZeroCopyVerifyNote(const Buffer* buffer, std::span<const vk::BufferCopy> copies);
 
 public:
     [[nodiscard]] bool ZeroCopyOn() const noexcept;
-    /// raster thread, once per submission: the verify's checks whose submission finished
-    void ZeroCopyVerifyPoll();
     [[nodiscard]] nlohmann::json ZeroCopyReport() const;
 
 private:

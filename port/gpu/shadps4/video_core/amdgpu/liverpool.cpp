@@ -972,7 +972,6 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                                                               {"b9_buffers", Core::NativeUpdates::B9Report()}, {"zero_copy", rasterizer->GetBufferCache().ZeroCopyReport()}, {"bind_memo", rasterizer->GetBufferCache().BindMemoReport()},
                                                               {"b11_clears", Core::NativeDevice::ClearReport()},
                                                               {"b9_raw_address_shaders", {{"binds_reading_memory_by_address", rasterizer->b9_dma_binds.exchange(0)}, {"all_binds", rasterizer->b9_all_binds.exchange(0)}}},
-                                                              {"object_copy_verify", {{"checked", rasterizer->ObjectCopyVerify().first}, {"DIFFERENT", rasterizer->ObjectCopyVerify().second}}},
                                                               {"stale_why", {{"epoch", r[12]}, {"gone", r[13]}, {"not_synchronized", r[14]}, {"generation_moved", r[15]}, {"arena", r[16]}, {"tracker_dirty", r[17]}}},
                                                               {"not_resolved", {{"no_record_entry", r[3]}, {"null_or_huge", r[4]}, {"no_engine_object", r[5]}, {"not_immutable", r[6]},
                                                                                 {"outside_the_object", r[7]}, {"not_synchronized", r[8]}, {"no_arena_yet", r[9]}, {"arena_moved", r[10]}, {"clamped", r[11]}}},

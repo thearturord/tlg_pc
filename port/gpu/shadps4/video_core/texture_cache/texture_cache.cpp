@@ -6,7 +6,7 @@
 #include <limits>
 #include <xxhash.h>
 #include "native/native_census.h"
-#include "native/native_e3_census.h"
+#include "native/native_image_caller.h"
 #include "native/native_content.h"
 #include "native/native_debug_server.h"
 #include "native/native_flight.h"
@@ -308,7 +308,6 @@ void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, BindingType binding,
                                           ImageId cache_image_id) {
     Core::NativeCensus::NoteImage(Core::NativeCensus::ImageDepthOverlap);
-    Core::NativeE3Census::NoteCall(Core::NativeE3Census::Fn::ResolveDepthOverlap, Core::NativeE3Census::Caller::OverlapDepth);
     auto& cache_image = slot_images[cache_image_id];
 
     if (!cache_image.info.props.is_depth && !requested_info.props.is_depth) {
@@ -366,7 +365,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         if (new_info.num_samples == 1 &&
             (new_info.resources.layers > cache_image.info.resources.layers ||
              new_info.resources.levels > cache_image.info.resources.levels)) {
-            RefreshImage(new_image, Core::NativeE3Census::Caller::ResolveDepthOverlapNewImage);
+            RefreshImage(new_image, Core::ImageCaller::ResolveDepthOverlapNewImage);
         }
         new_image.flags &= ~ImageFlagBits::Dirty;
         runtime.CopyColorAndDepth(&cache_image, &new_image);
@@ -385,7 +384,6 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                                                            ImageId cache_image_id,
                                                            ImageId merged_image_id) {
     Core::NativeCensus::NoteImage(Core::NativeCensus::ImageOverlap);
-    Core::NativeE3Census::NoteCall(Core::NativeE3Census::Fn::ResolveOverlap, Core::NativeE3Census::Caller::FindImageOverlap);
     static constexpr u64 NUM_FRAMES_BEFORE_REMOVAL = 32;
 
     auto& cache_image = slot_images[cache_image_id];
@@ -415,14 +413,14 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         // Compressed view of uncompressed image with same block size.
         if (image_info.props.is_block && !cache_image.info.props.is_block) {
             Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 2);
-            return {ExpandImage(image_info, cache_image_id, Core::NativeE3Census::Caller::OverlapBlockView), -1, -1};
+            return {ExpandImage(image_info, cache_image_id, Core::ImageCaller::OverlapBlockView), -1, -1};
         }
 
         if (image_info.guest_size == cache_image.info.guest_size &&
             (image_info.type == AmdGpu::ImageType::Color3D ||
              cache_image.info.type == AmdGpu::ImageType::Color3D)) {
             Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 3);
-            return {ExpandImage(image_info, cache_image_id, Core::NativeE3Census::Caller::OverlapVolume), -1, -1};
+            return {ExpandImage(image_info, cache_image_id, Core::ImageCaller::OverlapVolume), -1, -1};
         }
 
         const bool pow2_padding_only =
@@ -448,7 +446,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         if (image_info.type == cache_image.info.type &&
             image_info.resources > cache_image.info.resources) {
             Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 6);
-            return {ExpandImage(image_info, cache_image_id, Core::NativeE3Census::Caller::OverlapGrow), -1, -1};
+            return {ExpandImage(image_info, cache_image_id, Core::ImageCaller::OverlapGrow), -1, -1};
         }
 
         // Size is greater but resources are not, because the tiling mode is different.
@@ -593,9 +591,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     return {merged_image_id, -1, -1};
 }
 
-ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id, Core::NativeE3Census::Caller caller) {
+ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id, Core::ImageCaller caller) {
     Core::NativeCensus::NoteImage(Core::NativeCensus::ImageExpand);
-    Core::NativeE3Census::NoteCall(Core::NativeE3Census::Fn::ExpandImage, caller);
     NoteImageCreated(SiteExpand, info);
     const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
     RegisterImage(new_image_id);
@@ -603,7 +600,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id, Core:
     auto& src_image = slot_images[image_id];
     auto& new_image = slot_images[new_image_id];
 
-    RefreshImage(new_image, Core::NativeE3Census::Caller::ExpandImageCopy);
+    RefreshImage(new_image, Core::ImageCaller::ExpandImageCopy);
     runtime.CopyImage(&src_image, &new_image);
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
@@ -678,8 +675,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                !(cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1}) && !(exact_fmt && info.pixel_format != cache_image.info.pixel_format) &&
                !(cache_image.info.resources < info.resources);
     };
-    const auto counted_exact_match = [&](const Image& cache_image, Core::NativeE3Census::Caller caller) {
-        Core::NativeE3Census::NoteCall(Core::NativeE3Census::Fn::ExactMatch, caller);
+    const auto counted_exact_match = [&](const Image& cache_image, Core::ImageCaller caller) {
         return exact_match(cache_image);
     };
     if (b8_find != 0) {
@@ -704,7 +700,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                     if (!slot_images.IsAllocated(cache_id) || slot_images[cache_id].image_uid != uid) {
                         continue;
                     }
-                    if (!counted_exact_match(slot_images[cache_id], Core::NativeE3Census::Caller::FindImageExactById)) {
+                    if (!counted_exact_match(slot_images[cache_id], Core::ImageCaller::FindImageExactById)) {
                         continue;
                     }
                     by_id = cache_id;
@@ -801,7 +797,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                     const SubresourceRange range{.base = {static_cast<u16>(clear.mip), static_cast<u16>(clear.first_layer)}, .extent = {1, static_cast<u16>(layers)}};
                     const bool whole = target.info.resources.levels == 1 && clear.first_layer == 0 && layers == target.info.resources.layers;
                     if (!whole && True(target.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty))) {
-                        RefreshImage(target, Core::NativeE3Census::Caller::FindImageClearRest); // the rest of the image from memory first
+                        RefreshImage(target, Core::ImageCaller::FindImageClearRest); // the rest of the image from memory first
                     }
                     if (clear.fast && whole) {
                         target.pending_fast_clear = EngineColorValue(target.info.pixel_format, clear.value);
@@ -957,7 +953,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                             info.guest_address, answer->image_id.index, answer->mip, answer->slice, image_id.index, view_mip, view_slice);
             }
         }
-        if (!owned || !counted_exact_match(found, Core::NativeE3Census::Caller::FindImageViewReuse) || view_mip > 0 || view_slice > 0) {
+        if (!owned || !counted_exact_match(found, Core::ImageCaller::FindImageViewReuse) || view_mip > 0 || view_slice > 0) {
             // remembered (every answer the texture's own list does not give): the next lookup of this request is answered by the engine texture's id
             auto& list = engine_answers[owner_id];
             EngineAnswer fresh{answer_key, image_id, found.image_uid, ImageGeneration(), view_mip, view_slice};
@@ -1074,7 +1070,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
             download_images.emplace(image_id);
         }
     }
-    UpdateImage(image_id, Core::NativeE3Census::Caller::FindTexture);
+    UpdateImage(image_id, Core::ImageCaller::FindTexture);
     return image.FindView(desc.view_info);
 }
 
@@ -1112,7 +1108,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
         download_images.emplace(image_id);
     }
     image.usage.render_target = 1u;
-    UpdateImage(image_id, Core::NativeE3Census::Caller::FindRenderTarget);
+    UpdateImage(image_id, Core::ImageCaller::FindRenderTarget);
 
     // Register meta data for this color buffer
     const VAddr cmask_addr = desc.info.meta_info.cmask_addr;
@@ -1151,7 +1147,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     image.usage.depth_target = 1u;
-    UpdateImage(image_id, Core::NativeE3Census::Caller::FindDepthTarget);
+    UpdateImage(image_id, Core::ImageCaller::FindDepthTarget);
 
     // Register meta data for this depth buffer
     const VAddr htile_addr = desc.info.meta_info.htile_addr;
@@ -1202,10 +1198,9 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
     stencil_image.AssociateDepth(depth_id, slot_images[depth_id].image_uid);
 }
 
-void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller caller) {
+void TextureCache::RefreshImage(Image& image, Core::ImageCaller caller) {
     TLG_PROF_LEVEL("texture.refresh_image", 3);
     Core::NativeCensus::NoteImage(Core::NativeCensus::ImageRefresh, image.info.guest_size);
-    Core::NativeE3Census::NoteCall(Core::NativeE3Census::Fn::RefreshImage, caller);
     // E3.3: the shared page edges of an image are no longer harvested here. The engine's announced writes tell when an image's content changed (E3.1 census: the harvest alone
     // found a change in 0 of 8.7 million refreshes); the sampled hash check below still counts a change nothing announced.
     if ((image.b8_marks & B8Deleted) != 0) {
@@ -1225,11 +1220,9 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
     // F2.4: the B8.1 verify (a hash of the guest bytes after each refresh, off by default) and the accounting of what dirtied the image are gone: an image is refreshed by the announcements and
     // the engine's own writes (E3.1: the address route found a change in 0 of 8.7 million refreshes), and the write ledger (F2.5) says whether the memory moved after the draw that reads it.
     if (False(image.flags & ImageFlagBits::Dirty)) {
-        Core::NativeE3Census::NoteOutcome(caller, Core::NativeE3Census::Outcome::NotDirty);
         return;
     }
     if (image.info.num_samples > 1) {
-        Core::NativeE3Census::NoteOutcome(caller, Core::NativeE3Census::Outcome::Multisample);
         return;
     }
 
@@ -1267,7 +1260,6 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
 
     if (image_copies.empty()) {
         image.flags &= ~ImageFlagBits::Dirty;
-        Core::NativeE3Census::NoteOutcome(caller, Core::NativeE3Census::Outcome::NoCopies);
         return;
     }
 
@@ -1292,26 +1284,14 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
     Core::Flight::Add(Core::Flight::ImageRefresh, 0, image.info.guest_address, image.info.guest_size, static_cast<u8>(caller)); // L1
     Core::NativeResources::NoteImageUpload(image.info.guest_address, image.info.guest_size,
                                            BufferCache::last_image_source_gpu);
-    Core::NativeE3Census::NoteOutcome(caller, Core::NativeE3Census::Outcome::Uploaded);
     Core::NativeContent::NoteRingImageShape(image.info.guest_address, image.info.guest_size, image.info.size.width, image.info.size.height, image.info.size.depth,
                                             static_cast<u32>(image.info.pixel_format), num_mips, num_layers, image.info.pitch, static_cast<u32>(image.info.tile_mode));
-    if (Core::NativeE3Census::AnnouncedOn()) {
-        // E7c Task 3 (TLG_E3_ANNOUNCED=1): what did the engine announce for the memory this upload reads?
-        Core::NativeE3Census::NoteAnnouncedUpload({.caller = caller, .image_uid = image.image_uid, .address = image.info.guest_address, .size = image.info.guest_size,
-                                                   .width = image.info.size.width, .height = image.info.size.height, .format = static_cast<u32>(image.info.pixel_format),
-                                                   .gpu_source = BufferCache::last_image_source_gpu, .gpu_modified_flag = is_gpu_modified,
-                                                   .usage_bits = static_cast<u32>(image.usage_flags)});
-    }
     if (Core::NativeContent::ShadowOn()) {
         // F2.2 shadow (TLG_F2_STORE=1): the announced content store against the memory this upload read
         Core::NativeContent::CompareImage({.image_uid = image.image_uid, .address = image.info.guest_address, .size = image.info.guest_size, .width = image.info.size.width,
                                            .height = image.info.size.height, .format = static_cast<u32>(image.info.pixel_format),
                                            .group_hint = BufferCache::last_image_source_gpu ? Core::NativeContent::Group::GpuSource : Core::NativeContent::Group::FirstUpload,
                                            .caller = static_cast<u32>(caller)});
-    }
-    if (Core::NativeE3Census::On()) {
-        // E7 Task 4 (TLG_E3_CENSUS=1): does the upload carry bytes the image's last upload did not?
-        Core::NativeE3Census::NoteUpload(caller, image.image_uid, BufferCache::last_image_source_gpu ? nullptr : std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size);
     }
 }
 

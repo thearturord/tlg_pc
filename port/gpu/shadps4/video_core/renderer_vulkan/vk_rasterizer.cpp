@@ -10,7 +10,7 @@
 #endif
 #include "common/debug.h"
 #include "native/native_debug_server.h"
-#include "native/native_e3_census.h"
+#include "native/native_image_caller.h"
 #include "native/native_content.h"
 #include "native/native_prof.h"
 #include "native/native_marker.h"
@@ -1125,7 +1125,6 @@ void Rasterizer::OnSubmit() {
     if (occlusion) {
         occlusion->Poll();
     }
-    buffer_cache.ZeroCopyVerifyPoll();
     if (encoder_debug & 2) {
         scheduler.SyncEncoder();
     }
@@ -1651,7 +1650,6 @@ bool Rasterizer::HazardAuditOn() const noexcept {
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     TLG_PROF_LEVEL("raster.bind_buffers", 2);
-    const Core::NativeE3Census::WriteSiteScope e3_site{stage.sw_stage == Shader::SwStage::Compute ? Core::NativeE3Census::WriteSite::ShaderCompute : Core::NativeE3Census::WriteSite::ShaderGraphics};
     const u64 alignment = instance.StorageMinAlignment();
     const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
@@ -1758,7 +1756,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                                ? buffer_cache.ObjectCopy(*object, r.address, copy_offset)
                                                : nullptr) {
                         // R1b: the object's own copy of this generation in the stream ring
-                        buffer_cache.VerifyObjectCopy(*object);
                         const u64 offset_aligned = Common::AlignDown(copy_offset, alignment);
                         const u64 adjust = copy_offset - offset_aligned;
                         push_data.AddOffset(binding.buffer, adjust);
@@ -2090,7 +2087,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set,
             continue;
         }
         texture_cache.TouchFoundImage(entry.found);
-        texture_cache.UpdateImage(entry.id, Core::NativeE3Census::Caller::RasterizerBindTextures);
+        texture_cache.UpdateImage(entry.id, Core::ImageCaller::RasterizerBindTextures);
     }
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];
@@ -2801,7 +2798,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
             image = &texture_cache.GetImage(image_id);
         }
-        texture_cache.UpdateImage(image_id, Core::NativeE3Census::Caller::RasterizerBeginRendering);
+        texture_cache.UpdateImage(image_id, Core::ImageCaller::RasterizerBeginRendering);
         runtime.SetBackingSamples(image, key.color_samples[cb]);
         Core::NativeDevice::CheckTarget(false, image->info.guest_address, image->info.size.width, image->info.size.height); // B4 census
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
@@ -3029,7 +3026,6 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         if (is_gds) {
             return {buffer_cache.GetGdsBuffer(), address};
         }
-        const Core::NativeE3Census::WriteSiteScope e3_site{Core::NativeE3Census::WriteSite::FillBuffer};
         return buffer_cache.ObtainBuffer(address, num_bytes, true);
     }();
     runtime.FillBuffer(buffer, offset, num_bytes, value);
@@ -3202,7 +3198,7 @@ bool Rasterizer::TryCopyImages(VAddr dst, VAddr src, u32 num_bytes) {
     }
     // images at the destination's address in other formats are stale afterwards
     texture_cache.InvalidateMemoryFromGPU(dst, num_bytes, "an image copy");
-    texture_cache.UpdateImage(src_id, Core::NativeE3Census::Caller::RasterizerTryCopyImages);
+    texture_cache.UpdateImage(src_id, Core::ImageCaller::RasterizerTryCopyImages);
     runtime.CopyImage(&source, &destination);
     destination.flags |= VideoCore::ImageFlagBits::GpuModified;
     destination.flags &= ~VideoCore::ImageFlagBits::Dirty;
@@ -3263,7 +3259,6 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         if (explicit_readback) {
             return buffer_cache.ObtainBufferForDownload(dst, num_bytes);
         }
-        const Core::NativeE3Census::WriteSiteScope e3_site{Core::NativeE3Census::WriteSite::CopyBuffer};
         return buffer_cache.ObtainBuffer(dst, num_bytes, true, true);
     }();
     const vk::BufferCopy copy = {

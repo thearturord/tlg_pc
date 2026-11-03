@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "native/native_debug_server.h"
-#include "native/native_e3_census.h"
+#include "native/native_image_caller.h"
 #include "native/native_prof.h"
 #include "native/native_timeline.h"
 #include "native/native_hooks.h"
@@ -378,7 +378,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         TLG_PROF("present.find_image");
         auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
         image_id = texture_cache.FindImage(desc);
-        texture_cache.UpdateImage(image_id, Core::NativeE3Census::Caller::PresenterPrepareFrame);
+        texture_cache.UpdateImage(image_id, Core::ImageCaller::PresenterPrepareFrame);
     }
 
     TLG_PROF_NAMED(prof_render_frame, "present.get_render_frame");

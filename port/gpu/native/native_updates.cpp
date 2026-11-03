@@ -23,7 +23,7 @@
 #include "native/native_uploads.h"
 #include "native/native_device.h"
 #include "native/native_updates.h"
-#include "native/native_e3_census.h"
+#include "native/native_image_caller.h"
 #include "native/native_content.h"
 #include "native/native_prof.h"
 
@@ -374,13 +374,11 @@ void ApplyBatch(const Batch& batch) {
     {
         TLG_PROF_LEVEL("updates.apply_again", 2);
         for (const auto& [address, size] : batch.again) {
-            Core::NativeE3Census::NoteAnnounced(address, size, false); // E7c Task 3 (TLG_E3_ANNOUNCED=1)
             apply_fn(apply_context, address, size, false);
         }
     }
     TLG_PROF_LEVEL("updates.apply_first", 2);
     for (const auto& [address, size] : batch.first) {
-        Core::NativeE3Census::NoteAnnounced(address, size, true);
         TLG_PROF_ADD("updates.bytes_first", size);
         apply_fn(apply_context, address, size, true);
         b2_applied_bytes.fetch_add(size, std::memory_order_relaxed);

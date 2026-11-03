@@ -18,7 +18,7 @@
 #include "native/native_readbacks.h"
 #include "native/native_registry.h"
 #include "native/native_updates.h"
-#include "native/native_e3_census.h"
+#include "native/native_image_caller.h"
 #include "native/native_flight.h"
 #include "native/native_prof.h"
 
@@ -350,7 +350,6 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             // (no page of a neighbour is uploaded with it, so a page the GPU wrote elsewhere does not matter); bytes of the object the GPU wrote keep it in the arena
             u64 offset = 0;
             if (const Buffer* copy = ObjectCopy(*immutable, device_addr, offset)) {
-                VerifyObjectCopy(*immutable);
                 Core::NativeResources::NoteResident(0);
                 TLG_PROF_COUNT("buffer.uncached.object_copy_reused");
                 return {copy, offset};
@@ -486,7 +485,6 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
     if (is_written) {
         std::unique_lock lock{gpu_ranges_mutex};
         gpu_modified_ranges.Add(device_addr, size);
-        Core::NativeE3Census::NoteGpuWritten(device_addr, size); // E7c Task 3 (TLG_E3_ANNOUNCED=1): which call site wrote it
         Core::NativeResources::NoteGpuWritten(device_addr, size); // R1b: copies of engine buffers with these bytes are stale
     }
     TLG_PROF_ADD("buffer.uncached.arena_synchronized (sum = bytes uploaded)", last_upload_bytes);
@@ -909,7 +907,6 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             zero_copy_counts[0].fetch_add(1, std::memory_order_relaxed);
             zero_copy_counts[1].fetch_add(copies.size(), std::memory_order_relaxed);
             zero_copy_counts[2].fetch_add(total_size_bytes, std::memory_order_relaxed);
-            ZeroCopyVerifyNote(arena, copies);
             copies.clear();
         } else {
             zero_copy_counts[3].fetch_add(1, std::memory_order_relaxed);

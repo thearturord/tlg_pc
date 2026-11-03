@@ -147,9 +147,6 @@ public:
     [[nodiscard]] u64 UploadsKeptForGpu() const noexcept {
         return buffer_cache.upload_bytes_kept_for_gpu.load(std::memory_order_relaxed);
     }
-    [[nodiscard]] std::pair<u64, u64> ObjectCopyVerify() const noexcept {
-        return {buffer_cache.object_copy_checks.load(std::memory_order_relaxed), buffer_cache.object_copy_stale.load(std::memory_order_relaxed)};
-    }
     [[nodiscard]] bool LivePlannerOn() const noexcept {
         return runtime.LivePlannerOn();
     }

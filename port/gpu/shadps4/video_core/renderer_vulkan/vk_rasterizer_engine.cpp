@@ -11,7 +11,7 @@
 #include "common/debug.h"
 #include "native/native_debug_server.h"
 #include "native/native_log.h"
-#include "native/native_e3_census.h"
+#include "native/native_image_caller.h"
 #include "native/native_config.h"
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
@@ -243,7 +243,7 @@ bool Rasterizer::NativeClear(const Core::NativeDevice::ClearRecord& record) {
         const bool whole = image.info.resources.levels == 1 && range.base.layer == 0 && range.extent.layers == image.info.resources.layers;
         if (!whole && True(image.flags & (VideoCore::ImageFlagBits::CpuDirty | VideoCore::ImageFlagBits::MaybeCpuDirty))) {
             // the rest of the image takes its CPU changes first (the upload covers the whole image)
-            texture_cache.UpdateImage(image_id, Core::NativeE3Census::Caller::RasterizerNativeClear);
+            texture_cache.UpdateImage(image_id, Core::ImageCaller::RasterizerNativeClear);
         }
         if (record.kind == 0) {
             const vk::ClearValue value = VideoCore::TextureCache::EngineColorValue(image.info.pixel_format, record.value);

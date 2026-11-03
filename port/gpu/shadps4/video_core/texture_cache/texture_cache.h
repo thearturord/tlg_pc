@@ -19,7 +19,7 @@
 #include "common/multi_level_page_table.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "common/slot_vector.h"
-#include "native/native_e3_census.h"
+#include "native/native_image_caller.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
@@ -217,7 +217,7 @@ public:
     void AssociateStencil(ImageId depth_id, const ImageInfo& depth_info);
 
     /// Updates image contents if it was modified by CPU.
-    void UpdateImage(ImageId image_id, Core::NativeE3Census::Caller caller = Core::NativeE3Census::Caller::Unknown) {
+    void UpdateImage(ImageId image_id, Core::ImageCaller caller = Core::ImageCaller::Unknown) {
         Image& image = slot_images[image_id];
         TouchImage(image);
         TrackImage(image_id);
@@ -235,11 +235,11 @@ public:
                                               ImageId cache_img_id);
 
     /// Creates a new image with provided image info and copies subresources from image_id
-    [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id, Core::NativeE3Census::Caller caller);
+    [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id, Core::ImageCaller caller);
     u32 e3_overlap_class{}; ///< E3 census: whose image the overlap candidate being resolved is (0 the requested texture's own, 1 another engine texture's, 2 unlisted, 3 the request has no engine texture)
 
     /// Reuploads image contents.
-    void RefreshImage(Image& image, Core::NativeE3Census::Caller caller = Core::NativeE3Census::Caller::Unknown);
+    void RefreshImage(Image& image, Core::ImageCaller caller = Core::ImageCaller::Unknown);
 
     /// Retrieves the sampler that matches the provided S# descriptor.
     [[nodiscard]] vk::Sampler GetSampler(const Core::NativeDesc::SamplerDesc& sampler,
