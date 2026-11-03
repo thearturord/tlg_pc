@@ -26,7 +26,7 @@
 #include "native/native_config.h"
 #include "native/native_device.h"
 #include "native/native_image_desc.h"
-#include "video_core/amdgpu/draw_state.h"
+#include "video_core/amdgpu/regs.h"
 #include "video_core/renderer_vulkan/vk_fixed_state.h"
 
 namespace Core::NativeTargetDesc {

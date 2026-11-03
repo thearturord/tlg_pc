@@ -5,7 +5,7 @@
 
 #include <array>
 #include <string>
-#include "video_core/amdgpu/draw_state.h"
+#include "video_core/amdgpu/regs.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
@@ -24,8 +24,7 @@ struct BlendTarget {
 };
 
 /// The fixed-function state of a draw as Vulkan wants it: viewports, scissors, depth, stencil, culling, blend constants.
-/// Nothing in it is an AMD register field. It is built either from the register state of a draw
-/// (`MakeFixedState`, the packet path) or by the native path straight from the game's state objects; the rasterizer reads
+/// Nothing in it is an AMD register field. The native path builds it straight from the game's state objects; the rasterizer reads
 /// only this. Values that depend on the device (depth range limits, primitive restart support) are applied where the
 /// state is committed.
 struct FixedState {
@@ -138,10 +137,7 @@ struct DrawInputs {
     std::array<AmdGpu::ClipUserData, AmdGpu::NUM_CLIP_PLANES> clip_user_data;
 };
 
-/// The fixed-function state of the draw described by `regs` (F3.5: only `DefaultFixedState` still builds one this way, from the register defaults).
-FixedState MakeFixedState(const AmdGpu::DrawRegs& regs);
-
-/// The state of a draw whose registers hold their defaults (the base the native path starts from).
+/// The state of a draw whose registers hold their defaults (the base the native path starts from; F3.6: written out, no register image behind it).
 const FixedState& DefaultFixedState();
 
 /// Sets the topology dependent fields: list / patch classification and culling (only primitives that have faces are

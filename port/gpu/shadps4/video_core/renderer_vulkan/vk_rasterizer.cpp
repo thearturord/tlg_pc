@@ -19,7 +19,6 @@
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
 #include "native/native_target_desc.h"
-#include "native/native_plan_shadow.h"
 #include "native/native_light_recorder.h"
 #include "native/native_untracked_ring.h"
 #include "native/native_readbacks.h"

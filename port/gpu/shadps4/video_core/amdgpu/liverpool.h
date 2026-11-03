@@ -30,7 +30,7 @@
 #include "common/types.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
-#include "video_core/amdgpu/draw_state.h"
+#include "video_core/amdgpu/regs.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/readback_stats.h"
 

@@ -39,7 +39,6 @@
 #include "native/native_flip.h"
 #include "native/native_shader_env.h"
 #include "native/native_target_desc.h"
-#include "native/native_plan_shadow.h"
 #include "native/native_display.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/liverpool_internal.h"

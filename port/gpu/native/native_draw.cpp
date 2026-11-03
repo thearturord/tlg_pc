@@ -3704,22 +3704,7 @@ struct VerifyStats {
 
 }  // namespace
 
-void VerifyRecordImpl(u64 seq, const u32* reg_array, const AmdGpu::DrawRegs* mapping);
-
-void VerifyRecord(u64 seq, const AmdGpu::DrawRegs& state) {
-    static thread_local std::unique_ptr<u32[]> dump;
-    if (!dump) {
-        dump = std::make_unique<u32[]>(AmdGpu::Regs::NumRegs);
-    }
-    state.Dump(dump.get());
-    VerifyRecordImpl(seq, dump.get(), &state);
-}
-
 void VerifyRecord(u64 seq, const u32* reg_array) {
-    VerifyRecordImpl(seq, reg_array, nullptr);
-}
-
-void VerifyRecordImpl(u64 seq, const u32* reg_array, const AmdGpu::DrawRegs* mapping) {
     NoteConsumed(seq);
     auto& slot = Slot(seq);
     if (slot.seq.load(std::memory_order_acquire) != seq) {
@@ -3745,23 +3730,6 @@ void VerifyRecordImpl(u64 seq, const u32* reg_array, const AmdGpu::DrawRegs* map
     auto checks = slot.checks;
     const u32 unsupported = slot.unsupported_inputs;
     const u32 unsupported_mask = slot.unsupported_mask;
-    if (mapping != nullptr) {
-        // the draw state holds only what the backend reads: the other registers cannot be compared
-        u32 kept = 0;
-        for (u32 i = 0; i < count; ++i) {
-            if (AmdGpu::DrawRegs::IsMapped(regs[i].index)) {
-                regs[kept++] = regs[i];
-            }
-        }
-        count = kept;
-        kept = 0;
-        for (u32 i = 0; i < check_count; ++i) {
-            if (AmdGpu::DrawRegs::IsMapped(checks[i].reg) && AmdGpu::DrawRegs::IsMapped(checks[i].reg + 1)) {
-                checks[kept++] = checks[i];
-            }
-        }
-        check_count = kept;
-    }
     if (slot.seq.load(std::memory_order_acquire) != seq) {
         std::scoped_lock lk{verify_stats.mutex};
         ++verify_stats.draws_missing;

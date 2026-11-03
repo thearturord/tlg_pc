@@ -6,7 +6,7 @@
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "native/native_readback_policy.h"
 
-#include "video_core/amdgpu/draw_state.h"
+#include "video_core/amdgpu/regs.h"
 #include <deque>
 #include <mutex>
 #include <vector>

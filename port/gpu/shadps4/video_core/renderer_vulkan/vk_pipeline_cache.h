@@ -6,7 +6,7 @@
 #include "native/native_binding.h"
 #include "native/native_draw.h"
 #include "native/native_resources.h"
-#include "video_core/amdgpu/draw_state.h"
+#include "video_core/amdgpu/regs.h"
 #include <functional>
 #include <memory>
 #include <variant>

@@ -5,13 +5,14 @@
 
 #include "native/native_sync.h"
 
+#include <atomic>
+#include <cstring>
 #include <vector>
 #include <nlohmann/json_fwd.hpp>
 
 #include <array>
 #include <string>
 #include "common/types.h"
-#include "video_core/amdgpu/draw_state.h"
 #include "native/native_binding.h"
 
 // Host functions called from the guest at chosen game functions (hook mode "call", see guest_hooks.h).
@@ -161,8 +162,6 @@ u32 CompareRecords(u64 seq_a, u64 seq_b, std::vector<std::string>& differences);
 /// Raster thread: compares the register state recorded for tagged draw `seq` with the raster thread's register file
 /// (`reg_array`, index = register dword offset) and counts the differences (shadow mode).
 void VerifyRecord(u64 seq, const u32* reg_array);
-/// The same for the raster thread's draw state: only the registers that belong to the state are compared.
-void VerifyRecord(u64 seq, const AmdGpu::DrawRegs& state);
 
 /// Index base of the compute program registers in a record: dword `d` of the compute program is index `ComputeRegisterBase + d`.
 constexpr u32 ComputeRegisterBase = 0xE000;

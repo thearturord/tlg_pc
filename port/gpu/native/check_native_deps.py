@@ -14,9 +14,9 @@ NATIVE = os.path.dirname(os.path.abspath(__file__))
 ALLOWED_PS4 = {
     "video_core/amdgpu/pixel_format.h": "F4 (PS4 resource types)",
     "video_core/amdgpu/resource.h": "F4 (the image descriptor layout the derivation fills)",
-    "video_core/amdgpu/draw_state.h": "F3 (register image)",
+    "video_core/amdgpu/regs.h": "F4 (colour/depth register types: ColorBuffer, DepthBuffer, DepthView; the currency of ImageInfo)",
     "video_core/amdgpu/liverpool.h": "F3/F5 (register file, command processor)",
-    "video_core/renderer_vulkan/vk_fixed_state.h": "F3 (fixed state from the register image)",
+    "video_core/renderer_vulkan/vk_fixed_state.h": "F3 (the Vulkan fixed state type; no register image behind it any more)",
     "video_core/renderer_vulkan/liverpool_to_vk.h": "F3/F4 (format maps)",
     "video_core/renderer_vulkan/vk_indexed_data.h": "F4 (descriptors)",
     "video_core/renderer_vulkan/vk_identity_audit.h": "F6 (audits)",

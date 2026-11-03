@@ -22,7 +22,6 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "native/native_shader_env.h"
-#include "native/native_plan_shadow.h"
 #include "native/native_debug_server.h"
 #include "video_core/cache_storage.h"
 #include "native/native_readback_policy.h"

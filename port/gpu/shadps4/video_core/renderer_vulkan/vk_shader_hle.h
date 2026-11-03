@@ -6,7 +6,6 @@
 namespace AmdGpu {
 struct ComputeProgram;
 union Regs;
-struct DrawRegs;
 } // namespace AmdGpu
 
 namespace Shader {

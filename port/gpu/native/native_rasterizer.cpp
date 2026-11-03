@@ -58,45 +58,50 @@
 namespace Vulkan {
 
 namespace {
-/// Writes register pairs of a record (entries `begin` to `end`) into the draw inputs, where the draw state would hold them.
+/// Register index -> where a record's register word goes in the draw inputs: 1 + the word index inside `DrawInputs` (0: the draw inputs have no member for the register). F3.6: the
+/// table is made from the register file's own layout (`Regs`) and `DrawInputs`; no draw state struct stands between them.
+const std::array<u32, AmdGpu::Regs::NumRegs>& InputWordMap() {
+    static const auto map = [] {
+        std::array<u32, AmdGpu::Regs::NumRegs> table{};
+        const auto add = [&table](size_t reg_byte_offset, size_t input_byte_offset, size_t size) {
+            for (size_t w = 0; w < size / sizeof(u32); ++w) {
+                table[reg_byte_offset / sizeof(u32) + w] = static_cast<u32>(input_byte_offset / sizeof(u32) + w + 1);
+            }
+        };
+#define TLG_INPUT_MEMBER(name) add(offsetof(AmdGpu::Regs, name), offsetof(DrawInputs, name), sizeof(DrawInputs::name))
+        TLG_INPUT_MEMBER(color_buffers);
+        TLG_INPUT_MEMBER(depth_buffer);
+        TLG_INPUT_MEMBER(depth_view);
+        TLG_INPUT_MEMBER(depth_control);
+        TLG_INPUT_MEMBER(depth_htile_data_base);
+        TLG_INPUT_MEMBER(depth_render_control);
+        TLG_INPUT_MEMBER(depth_clear);
+        TLG_INPUT_MEMBER(stencil_clear);
+        TLG_INPUT_MEMBER(ta_bc_base);
+        TLG_INPUT_MEMBER(clip_user_data);
+        TLG_INPUT_MEMBER(num_indices);
+        TLG_INPUT_MEMBER(num_instances);
+        TLG_INPUT_MEMBER(index_offset);
+        TLG_INPUT_MEMBER(vgt_instance_step_rate_0);
+        TLG_INPUT_MEMBER(vgt_instance_step_rate_1);
+        TLG_INPUT_MEMBER(index_base_address);
+        TLG_INPUT_MEMBER(index_buffer_type);
+        TLG_INPUT_MEMBER(max_index_size);
+#undef TLG_INPUT_MEMBER
+        return table;
+    }();
+    return map;
+}
+
+/// Writes register pairs of a record (entries `begin` to `end`) into the draw inputs.
 void ApplyExecRegisters(DrawInputs& in, const Core::NativeDraw::ExecDraw& draw, u32 begin, u32 end) {
-    static AmdGpu::DrawRegs layout{};
-    struct Member {
-        const void* in_regs;
-        void* in_inputs;
-        size_t size;
-    };
-    const std::array<Member, 18> members{{
-        {&layout.color_buffers[0], &in.color_buffers[0], sizeof(in.color_buffers)},
-        {&layout.depth_buffer, &in.depth_buffer, sizeof(in.depth_buffer)},
-        {&layout.depth_view, &in.depth_view, sizeof(in.depth_view)},
-        {&layout.depth_control, &in.depth_control, sizeof(in.depth_control)},
-        {&layout.depth_htile_data_base, &in.depth_htile_data_base, sizeof(in.depth_htile_data_base)},
-        {&layout.depth_render_control, &in.depth_render_control, sizeof(in.depth_render_control)},
-        {&layout.depth_clear, &in.depth_clear, sizeof(in.depth_clear)},
-        {&layout.stencil_clear, &in.stencil_clear, sizeof(in.stencil_clear)},
-        {&layout.ta_bc_base, &in.ta_bc_base, sizeof(in.ta_bc_base)},
-        {&layout.clip_user_data, &in.clip_user_data, sizeof(in.clip_user_data)},
-        {&layout.num_indices, &in.num_indices, sizeof(in.num_indices)},
-        {&layout.num_instances, &in.num_instances, sizeof(in.num_instances)},
-        {&layout.index_offset, &in.index_offset, sizeof(in.index_offset)},
-        {&layout.vgt_instance_step_rate_0, &in.vgt_instance_step_rate_0, sizeof(in.vgt_instance_step_rate_0)},
-        {&layout.vgt_instance_step_rate_1, &in.vgt_instance_step_rate_1, sizeof(in.vgt_instance_step_rate_1)},
-        {&layout.index_base_address, &in.index_base_address, sizeof(in.index_base_address)},
-        {&layout.index_buffer_type, &in.index_buffer_type, sizeof(in.index_buffer_type)},
-        {&layout.max_index_size, &in.max_index_size, sizeof(in.max_index_size)},
-    }};
+    const auto& map = InputWordMap();
     for (u32 i = begin; i < end; ++i) {
-        const auto* word = reinterpret_cast<const u8*>(layout.Word(draw.regs[i].index));
-        if (!word) {
+        const u32 index = draw.regs[i].index;
+        if (index >= map.size() || map[index] == 0) {
             continue;
         }
-        for (const auto& member : members) {
-            const auto* base = static_cast<const u8*>(member.in_regs);
-            if (word >= base && word < base + member.size) {
-                std::memcpy(static_cast<u8*>(member.in_inputs) + (word - base), &draw.regs[i].value, sizeof(u32));
-            }
-        }
+        std::memcpy(reinterpret_cast<u8*>(&in) + (map[index] - 1) * sizeof(u32), &draw.regs[i].value, sizeof(u32));
     }
 }
 } // namespace

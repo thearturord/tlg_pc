@@ -21,7 +21,6 @@
 #include "native/native_e3_census.h"
 #include "native/native_content.h"
 #include "native/native_field_use.h"
-#include "native/native_plan_shadow.h"
 #include "native/native_sync.h"
 #include "native/native_tsharp_watch.h"
 
@@ -952,7 +951,6 @@ nlohmann::json Report() {
     out["e3_census"] = Core::NativeE3Census::Report();
     out["f2_store"] = Core::NativeContent::Report();
     out["f4_field_use"] = Core::NativeFieldUse::Report();
-    out["plan_shadow"] = Core::NativePlanShadow::Report();
     out["sync_typed"] = Core::NativeSync::Typed::Report();
     out["note"] = "B1 native device table (cumulative); bindings: the texture cache's / buffer cache's answer against the engine object the record names";
     return out;
