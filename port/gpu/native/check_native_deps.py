@@ -12,20 +12,18 @@ import os, re, sys
 NATIVE = os.path.dirname(os.path.abspath(__file__))
 
 ALLOWED_PS4 = {
-    "video_core/amdgpu/resource.h": "F5 (by design until the recompiler interface changes: Derive writes the T# words the shader reads; pixel_format.h comes with it)",
-    "video_core/amdgpu/regs.h": "F4 (colour/depth register types: ColorBuffer, DepthBuffer, DepthView; the currency of ImageInfo)",
-    "video_core/amdgpu/liverpool.h": "F3/F5 (register file, command processor)",
-    "video_core/renderer_vulkan/vk_fixed_state.h": "F3 (the Vulkan fixed state type; no register image behind it any more)",
-    "video_core/renderer_vulkan/liverpool_to_vk.h": "F3/F4 (format maps)",
-    "video_core/renderer_vulkan/vk_indexed_data.h": "F4 (descriptors)",
+    "video_core/amdgpu/resource.h": "by design: the shader recompiler reads T# words, so Derive writes them in the PS4 layout (pixel_format.h comes with it); goes when the recompiler interface changes",
+    "video_core/amdgpu/regs.h": "by design: bit layouts of the colour/depth target words the shader and the host format code take (ColorBuffer, DepthBuffer, DepthView, DataFormat tables); native_target_desc.cpp only",
+    "video_core/amdgpu/liverpool.h": "by design: the record format is a list of register pairs; native_draw.cpp uses the register group map and the register word types (DepthShaderControl, ShaderProgram) of the record, native_shader_env.cpp the same words",
+    "video_core/renderer_vulkan/vk_fixed_state.h": "by design: the Vulkan fixed state struct (Vulkan terms; it includes regs.h only for NUM_VIEWPORTS and PrimitiveType)",
+    "video_core/renderer_vulkan/vk_indexed_data.h": "by design: the Vulkan host class of the indexed data path (C9); native_draw.cpp only reads its counters",
     "video_core/renderer_vulkan/vk_identity_audit.h": "F6 (audits)",
-    "core/libraries/gnmdriver/gnmdriver.h": "F1/F5 (Gnm submission HLE)",
-    "core/libraries/kernel/time.h": "F1/F5 (GPU perf counter source: TSC)",
 }
 # plain emulator infrastructure the native code shares (not GPU emulation); reviewed once, kept short
 ALLOWED_SHARED = {
     "core/memory.h", "core/guest_heap.h", "core/platform.h", "core/emulator_settings.h",  # settings and the CPU's view of PS4 memory (by design)
     "core/address_space.h", "core/cpu_patches.h", "core/libraries/kernel/process.h",     # PS4 OS / CPU side (out of scope of the plan)
+    "core/libraries/kernel/time.h",      # the OS time stamp counter (GPU perf counter source), a clock, not GPU state
     "video_core/renderdoc.h", "video_core/thread_profiler.h", "video_core/thread_usage.h",  # profiling and capture tools, not GPU state
     "video_core/renderer_vulkan/vk_common.h", "video_core/renderer_vulkan/vk_instance.h", "video_core/renderer_vulkan/vk_scheduler.h",  # the Vulkan host layer (device, command recording), not PS4 state
 }

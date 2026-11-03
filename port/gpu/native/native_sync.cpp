@@ -17,7 +17,6 @@
 
 #include "native/native_debug_server.h"
 #include "common/uint128.h"
-#include "core/libraries/gnmdriver/gnmdriver.h"
 #include "core/libraries/kernel/time.h"
 
 namespace Core::NativeSync {
@@ -28,7 +27,7 @@ u64 Fence::GpuClock64() {
 
 u64 Fence::GpuPerfCounter() {
     const auto cpu_freq = Libraries::Kernel::sceKernelGetTscFrequency();
-    const auto gpu_freq = Libraries::GnmDriver::sceGnmGetGpuCoreClockFrequency();
+    constexpr u64 gpu_freq = 800'000'000; // the GPU core clock of a base PS4 (the port never reports Neo mode)
     return Common::MultiplyAndDivide64(Libraries::Kernel::sceKernelReadTsc(), gpu_freq, cpu_freq);
 }
 

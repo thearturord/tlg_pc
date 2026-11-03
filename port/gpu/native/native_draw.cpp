@@ -37,7 +37,6 @@
 #include "core/emulator_settings.h"
 #include "native/native_hooks.h"
 #include "core/libraries/kernel/process.h"
-#include "core/libraries/gnmdriver/gnmdriver.h"
 #include "native/native_timeline.h"
 #include "native/native_device.h"
 #include "native/native_image_desc.h"
@@ -59,7 +58,6 @@
 #include "native/native_gbuffer_audit.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "native/native_draw_tag.h"
-#include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_fixed_state.h"
 #include "native/native_readback_policy.h"
 #include "native/native_untracked_ring.h"
@@ -2349,8 +2347,8 @@ const Vulkan::FixedState* Build(u64 ctx, const DeviceAddresses& dev) {
             if (dev.depth_stencil_table == 0) {
                 { Live().fixed_null[4].fetch_add(1, std::memory_order_relaxed); return nullptr; }
             }
-            s.depth_compare = Vulkan::LiverpoolToVK::CompareOp(
-                static_cast<AmdGpu::CompareFunc>(Rd<u32>(dev.depth_stencil_table, index * 4) & 7));
+            // the 3 bit compare function of the depth state table: 0 never, 1 less, 2 equal, 3 less equal, 4 greater, 5 not equal, 6 greater equal, 7 always (the order of vk::CompareOp)
+            s.depth_compare = static_cast<vk::CompareOp>(Rd<u32>(dev.depth_stencil_table, index * 4) & 7);
         } else if (!Pick(CompareOps, Rd<u32>(d, 8), s.depth_compare, s.depth_test ? 1u : 0u)) {
             // a zeroed description (depth test off, function 0) reads as "never", which the disabled test ignores
             { Live().fixed_null[5].fetch_add(1, std::memory_order_relaxed); return nullptr; }
@@ -9315,9 +9313,15 @@ void InlineAutoDrawTail(u64 ctx, u32 count, u32 instances) {
         }
     }
     if (ok) {
-        if (Libraries::GnmDriver::sceGnmDrawIndexAuto(reinterpret_cast<u32*>(cursor), 7, count, Rd<u32>(ctx, 0x47e8) & 1) == 0) {
-            Wr<u64>(ctx, 0x47d0, Rd<u64>(ctx, 0x47d0) + 0x1c);
-        }
+        // What sceGnmDrawIndexAuto(cmdbuf, 7, count, flags) writes on a base PS4 (flags & 0x1ffffffe is 0 here): a DrawIndexAuto
+        // packet (type 3, opcode 0x2d, two body dwords: index count, draw initiator 2) and a 3 dword NOP that fills the 7 dwords.
+        u32* packet = reinterpret_cast<u32*>(cursor);
+        packet[0] = 0xc0012d00u;
+        packet[1] = count;
+        packet[2] = 2u;
+        packet[3] = 0xc0021000u;
+        packet[4] = 0u;
+        Wr<u64>(ctx, 0x47d0, Rd<u64>(ctx, 0x47d0) + 0x1c);
     }
     if ((Rd<u8>(ctx, 0x13009) & 1) != 0) {
         const u64 buffer = Rd<u64>(ctx, 0x4aa8);
