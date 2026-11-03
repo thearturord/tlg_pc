@@ -322,6 +322,8 @@ private:
     /// Registers the current lookup reads: the raster mirror normally, the command processor's
     /// own registers (and the compute state of the dispatching queue) when planning.
     const AmdGpu::DrawRegs* lookup_regs{};
+    /// F3.1: the plan's inputs while `PlanGraphics` looks the pipeline up; the key's render targets are read from them (null: from `lookup_regs`)
+    const DrawInputs* lookup_inputs{};
     const FixedState* lookup_fixed{};
     FixedState lookup_fixed_storage{};
     const AmdGpu::ComputeProgram* lookup_cs{};

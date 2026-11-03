@@ -204,7 +204,9 @@ nlohmann::json Native(const Params&) {
                         {"reasons", {live.exec_reason[0].load(), live.exec_reason[1].load(), live.exec_reason[2].load(), live.exec_reason[3].load(),
                                      live.exec_reason[4].load(), live.exec_reason[5].load(), live.exec_reason[6].load(), live.exec_reason[7].load()}},
                         {"fixed_null_by_exit", [&live] { nlohmann::json a = nlohmann::json::array(); for (const auto& c : live.fixed_null) { a.push_back(c.load()); } return a; }()},
-                        {"plan_null_stale_inputs_pipeline", {live.plan_null[0].load(), live.plan_null[1].load(), live.plan_null[2].load()}}};
+                        {"plan_null_stale_inputs_pipeline", {live.plan_null[0].load(), live.plan_null[1].load(), live.plan_null[2].load()}},
+                        {"f3_1_key_targets", {{"switch", "TLG_KEY_TARGETS_FROM_INPUTS=0 turns it off"}, {"key_from_plan_inputs", live.key_targets[0].load()}, {"key_from_register_image", live.key_targets[1].load()},
+                                              {"export_format_from_shader_environment", live.key_targets[2].load()}, {"export_format_from_register_image", live.key_targets[3].load()}}}};
     j["exec_state"] = {{"planned", live.state_planned.load()}, {"group_violations", live.state_group_violations.load()}};
     j["fetch_rebuild"] = {{"tried", live.fetch_rebuild_tried.load()}, {"rebuilt", live.fetch_rebuilt.load()}, {"refused", live.fetch_rebuild_refused.load()}, {"executed", live.fetch_rebuild_exec.load()}};
     j["sync_converted_hook"] = live.sync_converted_hook.load();

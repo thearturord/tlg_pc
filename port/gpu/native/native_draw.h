@@ -71,6 +71,9 @@ struct LiveCounters {
     std::array<std::atomic<u64>, 8> exec_reason{};
     /// of the typed ones: fast clear eliminates and inline draws (the count came with the draw packet)
     std::atomic<u64> exec_fast_clear{}, exec_inline{}, exec_inline_seen{};
+    /// F3.1: where the pipeline key took the render targets from: 0 the plan's inputs (the native target description), 1 the register image (no inputs: the packet path), and the
+    /// colour export formats: 2 from the pixel shader's environment, 3 from the register image (no environment)
+    std::array<std::atomic<u64>, 4> key_targets{};
     /// the native path's private register block: draws and clears planned from it, plans compared with the shared register image (legacy switch on), differences
     std::atomic<u64> state_planned{}, state_group_violations{};
     std::atomic<u64> overlay_offered{}, overlay_unmapped{}, overlay_same{}, overlay_changed{}, overlay_records{};

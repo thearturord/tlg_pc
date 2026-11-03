@@ -481,6 +481,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
         for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
             const auto& native_cb = in.color_buffers[i];
             const auto& reg_cb = regs.color_buffers[i];
+            Core::NativePlanShadow::Compare(g, "color.present", native_cb ? 1 : 0, reg_cb ? 1 : 0);
             if (!native_cb || !reg_cb) {
                 continue;
             }

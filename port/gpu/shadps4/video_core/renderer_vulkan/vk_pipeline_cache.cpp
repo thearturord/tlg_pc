@@ -845,12 +845,14 @@ bool PipelineCache::PlanGraphicsTyped(u64 exec_key, const FixedState& fixed, std
 void PipelineCache::PlanGraphics(const AmdGpu::DrawRegs& regs, const FixedState& fixed,
                                  DrawIndirectParams params, DrawPlan& plan, u64 exec_key) {
     lookup_regs = &regs;
+    lookup_inputs = &plan.inputs;
     lookup_fixed = &fixed;
     lookup_regs_pinned = true;
     lookup_exec_key = exec_key != 0 ? ExecKeyOf(exec_key, fixed) : 0;
     const GraphicsPipeline* pipeline = GetGraphicsPipeline(params);
     lookup_exec_key = 0;
     lookup_regs_pinned = false;
+    lookup_inputs = nullptr;
     plan.pipeline = pipeline;
     if (!pipeline) {
         return;
@@ -937,18 +939,37 @@ void PipelineCache::ApplyPlan(const DispatchPlan& plan) {
     stage.info->pgm_base = stage.pgm_base;
 }
 
+/// F3.1 (`TLG_KEY_TARGETS_FROM_INPUTS`, default on, `=0` turns it off, read once): the render targets of the pipeline key are read from the plan's inputs, which hold the native target
+/// description (E7), not from the register image.
+static bool KeyTargetsFromInputsOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_KEY_TARGETS_FROM_INPUTS");
+        return e == nullptr || *e != '0';
+    }();
+    return on;
+}
+
 bool PipelineCache::RefreshGraphicsKey() {
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
     const auto& regs = *lookup_regs;
     const auto& fixed = *lookup_fixed;
     auto& key = graphics_key;
 
-    const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
+    auto& live = Core::NativeDraw::Live();
+    const bool from_inputs = lookup_inputs != nullptr && KeyTargetsFromInputsOn();
+    live.key_targets[from_inputs ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+    const AmdGpu::DepthBuffer& depth_buffer = from_inputs ? lookup_inputs->depth_buffer : regs.depth_buffer;
+    const AmdGpu::ColorBuffer* color_buffers = from_inputs ? lookup_inputs->color_buffers : regs.color_buffers;
+    // the export format of each target is the pixel shader's (SPI_SHADER_COL_FORMAT): from its environment when there is one
+    Core::NativeShaderEnv::DrawEnv shader_env;
+    const bool export_from_env = from_inputs && Core::NativeShaderEnv::Current(shader_env) && shader_env.has_pixel;
 
-    key.z_format = regs.depth_buffer.DepthValid() ? regs.depth_buffer.z_info.format
-                                                  : AmdGpu::DepthBuffer::ZFormat::Invalid;
-    key.stencil_format = regs.depth_buffer.StencilValid()
-                             ? regs.depth_buffer.stencil_info.format
+    const bool db_enabled = depth_buffer.DepthValid() || depth_buffer.StencilValid();
+
+    key.z_format = depth_buffer.DepthValid() ? depth_buffer.z_info.format
+                                             : AmdGpu::DepthBuffer::ZFormat::Invalid;
+    key.stencil_format = depth_buffer.StencilValid()
+                             ? depth_buffer.stencil_info.format
                              : AmdGpu::DepthBuffer::StencilFormat::Invalid;
     key.depth_clamp_enable = fixed.depth_clamp;
     key.depth_clip_enable = fixed.depth_clip;
@@ -960,7 +981,7 @@ bool PipelineCache::RefreshGraphicsKey() {
         regs.stage_enable.hs_en ? regs.ls_hs_config.hs_input_control_points : 0;
     key.logic_op = fixed.logic_op;
     key.logic_op_enable = fixed.logic_op_enabled;
-    key.depth_samples = db_enabled ? regs.depth_buffer.NumSamples() : 1;
+    key.depth_samples = db_enabled ? depth_buffer.NumSamples() : 1;
     key.num_samples = key.depth_samples;
     key.alpha_not_exported = fixed.alpha_not_exported;
 
@@ -968,7 +989,7 @@ bool PipelineCache::RefreshGraphicsKey() {
 
     // First pass to fill render target information needed by shader recompiler
     for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS && !skip_cb_binding; ++cb) {
-        const auto& col_buf = regs.color_buffers[cb];
+        const auto& col_buf = color_buffers[cb];
         if (!col_buf || !fixed.target_write_mask[cb]) {
             // No attachment bound or writing to it is disabled.
             continue;
@@ -979,7 +1000,13 @@ bool PipelineCache::RefreshGraphicsKey() {
         color_buffer.data_format = col_buf.GetDataFmt();
         color_buffer.num_format = col_buf.GetNumberFmt();
         color_buffer.num_conversion = col_buf.GetNumberConversion();
-        color_buffer.export_format = regs.color_export_format.GetFormat(cb);
+        if (export_from_env) {
+            color_buffer.export_format = static_cast<AmdGpu::ShaderExportFormat>(shader_env.pixel.fragment.color_export_format[cb]);
+            live.key_targets[2].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            color_buffer.export_format = regs.color_export_format.GetFormat(cb);
+            live.key_targets[3].fetch_add(1, std::memory_order_relaxed);
+        }
         color_buffer.swizzle = col_buf.Swizzle();
 
         const auto& bc = fixed.blend[cb];
@@ -1003,7 +1030,7 @@ bool PipelineCache::RefreshGraphicsKey() {
     u8 color_samples = 0;
     bool all_color_samples_same = true;
     for (s32 cb = 0; cb < key.num_color_attachments && !skip_cb_binding; ++cb) {
-        const auto& col_buf = regs.color_buffers[cb];
+        const auto& col_buf = color_buffers[cb];
         const u32 target_mask = fixed.target_write_mask[cb];
         if (!col_buf || !target_mask) {
             continue;
