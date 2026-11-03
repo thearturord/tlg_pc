@@ -8,6 +8,7 @@
 #include "native/native_census.h"
 #include "native/native_e3_census.h"
 #include "native/native_content.h"
+#include "native/native_debug_server.h"
 #include "native/native_prof.h"
 
 #include "native/native_image_marks.h"
@@ -632,21 +633,11 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         return {merged_image_id, -1, -1};
     }
 
-    // Right overlap: the image requested is a subresource (a mip or a layer) of the image from cache. This is the only overlap left besides the equal address one above:
-    // E3.3 removed the chance overlap frees and the left overlap (a cached image that is a part of the requested one: copy into the bigger image / rebind), which the
-    // E3.1 census never saw for a named lookup; stale images are left to the lifetime freeing and the garbage collection.
-    if (image_info.guest_address > cache_image.info.guest_address) {
-        if (auto mip = image_info.MipOf(cache_image.info); mip >= 0) {
-            if (auto slice = image_info.SliceOf(cache_image.info, mip); slice >= 0) {
-                Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 9);
-                return {cache_image_id, mip, slice};
-            }
-        }
-        Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 11);
-        return {{}, -1, -1};
-    }
-
+    // F2.3: the right / left overlaps (a requested mip or layer of a cached image at another address, a cached image inside the requested one) are gone. A named lookup only lists images at
+    // its own address and an owner-less one inside the ring is answered by the ring index, so no caller reaches here with another address (3 play censuses 2026-11-03, 0 of them).
     Core::NativeUpdates::NoteE3Overlap(e3_overlap_class, 15);
+    Core::RareEvents::Note("f23_overlap_at_other_address", fmt::format("requested {:#x} size {:#x}, cached {:#x} size {:#x}", image_info.guest_address, image_info.guest_size,
+                                                                       cache_image.info.guest_address, cache_image.info.guest_size));
     return {merged_image_id, -1, -1};
 }
 
@@ -884,7 +875,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     };
 
     SmallVector<ImageId, 8> image_ids;
-    const bool ring_lookup = owner_id == 0 && Core::NativeContent::RingIndexMode() != 0 && RingIndexed(info.guest_address, info.guest_size);
+    const bool ring_lookup = owner_id == 0 && RingIndexed(info.guest_address, info.guest_size);
     if (owner_id != 0) {
         // E3.3: an engine texture's candidates are its own images, nothing else (E3.1 census: a named lookup never overlapped another engine texture's image)
         if (const auto it = engine_images.find(owner_id); it != engine_images.end()) {
@@ -907,19 +898,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             }
         }
     } else {
-        // no engine texture starts at the memory (video out, copies, views into the middle of a texture): the images registered over the range
-        Core::NativeContent::NoteRingIndex(Core::NativeContent::RingIndexEvent::PageTableFallback);
-        {
-            static std::atomic<u32> logged{0};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
-                Core::NativeDevice::Object at;
-                const bool found = Core::NativeDevice::ResourceAt(info.guest_address, at);
-                LOG_WARNING(Render_Vulkan, "F2.3 census: owner-less lookup on the page table: type {} named {} address {:#x} size {:#x} {}x{}x{} format {} engine resource {} (kind {}, memory {:#x})",
-                            static_cast<u32>(desc.type), desc.engine_id != 0, info.guest_address, info.guest_size, info.size.width, info.size.height, info.size.depth, vk::to_string(info.pixel_format),
-                            found ? at.id : 0, found ? static_cast<u32>(at.kind) : 0u, found ? static_cast<u64>(at.address) : 0ull);
-            }
-        }
-        ForEachImageInRegion(info.guest_address, info.guest_size, [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+        // F2.3: no engine texture owns the memory and it is neither in the frame ring nor in an engine GPU allocation (the 3 play censuses of 2026-11-03 never reached this): refused, counted and
+        // written down; the image is made new, no page table scan for candidates
+        Core::NativeContent::NoteRingIndex(Core::NativeContent::RingIndexEvent::RefusedNoOwner);
+        Core::RareEvents::Note("f23_owner_less_lookup_outside_ring",
+                               fmt::format("type {} named {} address {:#x} size {:#x} {}x{}x{} format {}", static_cast<u32>(desc.type), desc.engine_id != 0, info.guest_address, info.guest_size,
+                                           info.size.width, info.size.height, info.size.depth, vk::to_string(info.pixel_format)));
     }
 
     ImageId image_id{};
@@ -933,20 +917,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     for (const auto& cache_id : image_ids) {
         if (perfect(slot_images[cache_id])) {
             image_id = cache_id;
-        }
-    }
-    if (ring_lookup && Core::NativeContent::RingIndexMode() == 2) {
-        // audit: the page table's perfect match (the last one, as the old loop picked it) is the index's
-        ImageId page_table_pick{};
-        ForEachImageInRegion(info.guest_address, info.guest_size, [&](ImageId candidate_id, Image& candidate) {
-            if (perfect(candidate)) {
-                page_table_pick = candidate_id;
-            }
-        });
-        if (page_table_pick == image_id) {
-            Core::NativeContent::NoteRingIndex(Core::NativeContent::RingIndexEvent::AuditSame);
-        } else {
-            Core::NativeContent::NoteRingIndex(Core::NativeContent::RingIndexEvent::AuditOtherExactMatch);
         }
     }
 
@@ -1514,7 +1484,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
             }
         }
     }
-    if (Core::NativeContent::RingIndexMode() != 0 && RingIndexed(info.guest_address, info.guest_size)) {
+    if (RingIndexed(info.guest_address, info.guest_size)) {
         ring_images.emplace(info.guest_address, image_id);
         ring_max_size = std::max<u64>(ring_max_size, info.guest_size);
     }

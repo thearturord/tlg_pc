@@ -474,7 +474,7 @@ private:
     Common::SlotVector<Image> slot_images;
     /// B8.3: the images of each engine texture (by its id; slot and uid, a stale entry is skipped), raster thread
     std::unordered_map<u64, SmallVector<std::pair<ImageId, u64>, 2>> engine_images;
-    /// F2.3 (`TLG_F2_RING_INDEX`): the registered images that lie inside the frame ring, by address; `ring_max_size` is the largest guest size seen (bounds the scan for an overlap from the left)
+    /// F2.3 : the registered images that lie inside the frame ring, by address; `ring_max_size` is the largest guest size seen (bounds the scan for an overlap from the left)
     std::multimap<VAddr, ImageId> ring_images;
     u64 ring_max_size{};
     std::unordered_map<u64, EngineClear> engine_pending_clears; ///< B11 step 6, by engine texture id
