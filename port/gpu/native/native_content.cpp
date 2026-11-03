@@ -587,6 +587,22 @@ std::atomic<u64> c_unc_segments[UncClassCount]{}, c_unc_bytes[UncClassCount]{}, 
 std::vector<nlohmann::json> g_unc_examples;
 } // namespace
 
+namespace {
+std::mutex g_shape_mutex;
+std::map<std::string, u64> g_shapes;
+} // namespace
+
+void NoteRingImageShape(u64 address, u64 size, u32 width, u32 height, u32 depth, u32 format, u32 mips, u32 layers, u32 pitch, u32 tile_mode) {
+    if (!RingSwapOn() || !InRing(address, size)) {
+        return;
+    }
+    const std::string key = fmt::format("size {} : {}x{}x{} format {} mips {} layers {} pitch {} tile {}", size, width, height, depth, format, mips, layers, pitch, tile_mode);
+    std::scoped_lock lock{g_shape_mutex};
+    if (g_shapes.size() < 64 || g_shapes.count(key) != 0) {
+        ++g_shapes[key];
+    }
+}
+
 void OverlayImage(u64 address, u64 size, u8* staged) {
     if (!RingSwapOn() || size == 0) {
         return;
@@ -974,6 +990,12 @@ nlohmann::json Report() {
         }
         unc["examples"] = g_unc_examples;
         out["ring_swap_uncovered"] = std::move(unc);
+        {
+            std::scoped_lock shape_lock{g_shape_mutex};
+            for (const auto& [key, n] : g_shapes) {
+                out["ring_image_shapes"][key] = n;
+            }
+        }
         out["ring_swap_differences"] = {{"images", c_dif_images.load()}, {"images_every_byte_matches_a_newer_entry", c_dif_images_all_newer.load()},
                                         {"images_with_bytes_matching_nothing", c_dif_images_unexplained.load()}, {"of_those_a_kept_less_writer_marked_after", c_dif_images_unexplained_mark.load()},
                                         {"bytes_matching_a_newer_entry", c_dif_bytes_newer.load()}, {"bytes_matching_nothing", c_dif_bytes_unexplained.load()},

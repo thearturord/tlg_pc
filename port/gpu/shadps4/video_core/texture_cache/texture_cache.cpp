@@ -1310,6 +1310,8 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
     Core::NativeResources::NoteImageUpload(image.info.guest_address, image.info.guest_size,
                                            BufferCache::last_image_source_gpu);
     Core::NativeE3Census::NoteOutcome(caller, Core::NativeE3Census::Outcome::Uploaded);
+    Core::NativeContent::NoteRingImageShape(image.info.guest_address, image.info.guest_size, image.info.size.width, image.info.size.height, image.info.size.depth,
+                                            static_cast<u32>(image.info.pixel_format), num_mips, num_layers, image.info.pitch, static_cast<u32>(image.info.tile_mode));
     if (Core::NativeE3Census::AnnouncedOn()) {
         // E7c Task 3 (TLG_E3_ANNOUNCED=1): what did the engine announce for the memory this upload reads?
         Core::NativeE3Census::NoteAnnouncedUpload({.caller = caller, .image_uid = image.image_uid, .address = image.info.guest_address, .size = image.info.guest_size,

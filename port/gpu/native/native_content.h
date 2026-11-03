@@ -73,6 +73,9 @@ struct ImageUpload {
 /// `RefreshImage` (raster thread) uploaded the image from the memory [address, address + size): compare the store with that memory.
 void CompareImage(const ImageUpload& upload);
 
+/// F2.4 research: the shape of an image `RefreshImage` uploaded from the frame ring (counted per shape, up to 64 shapes, reported under `ring_image_shapes`).
+void NoteRingImageShape(u64 address, u64 size, u32 width, u32 height, u32 depth, u32 format, u32 mips, u32 layers, u32 pitch, u32 tile_mode);
+
 [[nodiscard]] nlohmann::json Report();
 
 } // namespace Core::NativeContent
