@@ -104,65 +104,11 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     memory_barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
     memory_barrier.dstAccessMask =
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-    if (const char* e = std::getenv("TLG_HAZARD_AUDIT"); e != nullptr && *e != 0 && *e != '0') {
-        hazard_audit_on = true;
-    }
     // C8 (2026-10-28): the planner always decides; the tracker runs next to it and is only compared
     live_plan_on = true;
     live_plan_decides = true;
     // B10: buffer hazards by object (no switch since the cleanup of 2026-10-30)
     b10_mode = 2;
-    // P1 (2026-10-28): the tracker and the exact list next to the planner are a comparison only (0 differences over the owner's plays): off by default
-    if (const char* e = std::getenv("TLG_BARRIER_TRACKER"); (e != nullptr && *e == '1') || hazard_audit_on) {
-        tracker_on = true;
-    }
-    live_plan_exact = tracker_on;
-}
-
-namespace {
-struct HazardScope {
-    u32& slot;
-    u32 saved;
-    HazardScope(u32& s, bool on, u32 value) : slot{s}, saved{s} {
-        if (on) {
-            slot = value;
-        }
-    }
-    ~HazardScope() {
-        slot = saved;
-    }
-};
-
-u32 HazardLayoutIndex(vk::ImageLayout layout) {
-    switch (layout) {
-    case vk::ImageLayout::eUndefined:
-        return 0;
-    case vk::ImageLayout::eGeneral:
-        return 1;
-    case vk::ImageLayout::eColorAttachmentOptimal:
-        return 2;
-    case vk::ImageLayout::eDepthStencilAttachmentOptimal:
-        return 3;
-    case vk::ImageLayout::eDepthStencilReadOnlyOptimal:
-        return 4;
-    case vk::ImageLayout::eShaderReadOnlyOptimal:
-        return 5;
-    case vk::ImageLayout::eTransferSrcOptimal:
-        return 6;
-    case vk::ImageLayout::eTransferDstOptimal:
-        return 7;
-    default:
-        return 8;
-    }
-}
-} // namespace
-
-u32 Runtime::HazardSource() const {
-    if (hazard_override != ~0u) {
-        return hazard_override;
-    }
-    const u32 draw_class = Core::NativeRegistry::CurrentDrawClass();
-    return draw_class <= 4 ? draw_class : 5;
 }
 
 namespace {
@@ -327,139 +273,12 @@ u64 Runtime::LivePlanSpace(const VideoCore::Buffer* handle, u64 offset, u64& beg
     return base != 0 ? 0 : reinterpret_cast<u64>(handle);
 }
 
-void Runtime::ReplayPlan() {
-    constexpr size_t MaxIntervals = 64;
-    const auto add_range = [&](Planner::List& list, const Interval& range) {
-        if (!planner.bounded) {
-            list.Add(range);
-            return;
-        }
-        if (list.Contains(range.start, range.end)) {
-            return;
-        }
-        if (list.Size() >= MaxIntervals) {
-            u64 lo = range.start, hi = range.end;
-            for (const auto& interval : list) {
-                lo = std::min(lo, interval.start);
-                hi = std::max(hi, interval.end);
-            }
-            list.Clear();
-            list.Add({.start = lo, .end = hi});
-            return;
-        }
-        list.Add(range);
-    };
-    for (const PlanEvent& e : plan_log) {
-        ++hazard.plan_events;
-        switch (e.kind) {
-        case PlanEvent::Query: {
-            auto& state = planner.buffers[e.handle];
-            bool answer = state.write.Overlaps(e.offset, e.offset + e.size);
-            if (e.check_read && !answer) {
-                answer = state.read.Overlaps(e.offset, e.offset + e.size);
-            }
-            ++hazard.plan_queries;
-            hazard.plan_query_mismatches += answer != e.answer ? 1 : 0;
-            {
-                // the same plan keyed by guest address (one list for all guest memory) instead of by buffer: what the command processor thread could plan before any buffer exists
-                auto& space = planner_by_address.buffers[e.address != 0 ? 0 : e.handle];
-                const u64 begin = e.address != 0 ? e.address : e.offset;
-                bool by_address = space.write.Overlaps(begin, begin + e.size);
-                if (e.check_read && !by_address) {
-                    by_address = space.read.Overlaps(begin, begin + e.size);
-                }
-                hazard.addr_true_tracker_false += by_address && !e.answer ? 1 : 0;
-                hazard.addr_false_tracker_true += !by_address && e.answer ? 1 : 0;
-                if (!by_address && e.answer) {
-                    static u32 logged = 0;
-                    if (logged++ < 24) {
-                        LOG_ERROR(Render_Vulkan, "C5 planner by address missed a barrier: handle {:#x} offset {:#x} size {:#x} address {:#x} check_read {}", e.handle, e.offset, e.size, e.address, e.check_read);
-                    }
-                }
-            }
-            break;
-        }
-        case PlanEvent::Access: {
-            auto& state = planner.buffers[e.handle];
-            const Interval range{.start = e.offset, .end = e.offset + e.size};
-            if (e.write) {
-                add_range(state.write, range);
-            }
-            if (e.read) {
-                add_range(state.read, range);
-            }
-            planner.memory_pending |= e.staged;
-            {
-                auto& space = planner_by_address.buffers[e.address != 0 ? 0 : e.handle];
-                const u64 begin = e.address != 0 ? e.address : e.offset;
-                const Interval range2{.start = begin, .end = begin + e.size};
-                if (e.write) {
-                    add_range(space.write, range2);
-                }
-                if (e.read) {
-                    add_range(space.read, range2);
-                }
-                planner_by_address.memory_pending |= e.staged;
-            }
-            break;
-        }
-        case PlanEvent::Flush: {
-            const bool effective = planner.memory_pending || e.image_pending;
-            ++hazard.plan_flushes;
-            hazard.plan_flush_mismatches += effective != e.answer ? 1 : 0;
-            if (effective) {
-                planner.buffers.clear();
-                planner.memory_pending = false;
-                planner_by_address.buffers.clear();
-                planner_by_address.memory_pending = false;
-            }
-            break;
-        }
-        }
-    }
-    plan_log.clear();
-}
-
-void Runtime::EndAuditUnit() {
-    if (hazard_audit_on) {
-        ReplayPlan();
-    }
-    if (!hazard_audit_on || unit_bits.empty()) {
-        return;
-    }
-    ++hazard.units;
-    const auto compare = [&](std::unordered_map<u64, std::vector<u8>>& seen, u64 shape, u64& repeated, u64& identical, u64& bits_differing, u64& bits) {
-        auto [it, is_new] = seen.try_emplace(shape);
-        if (!is_new) {
-            ++repeated;
-            bits += unit_bits.size();
-            u64 differing = 0;
-            for (size_t i = 0; i < unit_bits.size() && i < it->second.size(); ++i) {
-                differing += unit_bits[i] != it->second[i] ? 1 : 0;
-            }
-            bits_differing += differing;
-            identical += differing == 0 ? 1 : 0;
-        }
-        it->second = unit_bits;
-    };
-    compare(unit_loose_seen, unit_loose, hazard.loose_repeated, hazard.loose_identical, hazard.loose_bits_differing, hazard.loose_bits);
-    compare(unit_strict_seen, unit_strict, hazard.strict_repeated, hazard.strict_identical, hazard.strict_bits_differing, hazard.strict_bits);
-    unit_bits.clear();
-    unit_loose = unit_strict = 0xcbf29ce484222325ull;
-}
-
-Runtime::HazardAudit Runtime::TakeHazardAudit() {
-    return std::exchange(hazard, HazardAudit{});
-}
-
 void Runtime::TickFrame() {
-    EndAuditUnit();
     staging_pool.TickFrame();
 }
 
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                          std::span<const vk::BufferCopy> copies) {
-    const HazardScope hazard_scope{hazard_override, hazard_audit_on, 6};
     scheduler.EndRendering();
 
     bool needs_flush{};
@@ -483,7 +302,6 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
 }
 
 void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32 value) {
-    const HazardScope hazard_scope{hazard_override, hazard_audit_on, 7};
     scheduler.EndRendering();
 
     if (IsBufferAccessed(dst, offset, size, true)) {
@@ -498,7 +316,6 @@ void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32
 }
 
 void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
-    const HazardScope hazard_scope{hazard_override, hazard_audit_on, 7};
     scheduler.EndRendering();
 
     if (IsBufferAccessed(dst, offset, sizeof(value), true)) {
@@ -516,54 +333,19 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
-    const u32 layout_before = hazard_audit_on && image->backing ? HazardLayoutIndex(image->backing->state.layout) : 0;
-    if (tracker_on || !live_plan_on) {
-        // R5 step 2 (2026-10-29): the image's own state only next to the planner as a comparison (`TLG_BARRIER_TRACKER=1`), as P1 did for buffers
-        image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
+    // L4, images: the planner's barriers (the image's own state is not consulted)
+    VideoCore::Image::Barriers planned;
+    PlanImageBarriers(image, planned, dst_layout, dst_access, dst_stage, subres_range);
+    ++live_stats.image_transits;
+    live_stats.image_barriers += planned.size();
+    for (const auto& barrier : planned) {
+        image_barriers.push_back(barrier);
     }
-    if (live_plan_on) {
-        // L4, images: the planner's barriers next to the image's own; mode 3 takes the planner's
-        VideoCore::Image::Barriers planned;
-        PlanImageBarriers(image, planned, dst_layout, dst_access, dst_stage, subres_range);
-        ++live_stats.image_transits;
-        live_stats.image_barriers += planned.size();
-        bool same = !tracker_on || planned.size() == image_barriers.size() - prev_num_barriers;
-        for (size_t i = 0; tracker_on && same && i < planned.size(); ++i) {
-            const auto& a = planned[i];
-            const auto& b = image_barriers[prev_num_barriers + i];
-            same = a.srcStageMask == b.srcStageMask && a.srcAccessMask == b.srcAccessMask && a.dstStageMask == b.dstStageMask &&
-                   a.dstAccessMask == b.dstAccessMask && a.oldLayout == b.oldLayout && a.newLayout == b.newLayout && a.image == b.image &&
-                   a.subresourceRange == b.subresourceRange;
-        }
-        if (!same && tracker_on) {
-            ++live_stats.image_differences;
-            static u32 logged = 0;
-            if (logged++ < 24) {
-                LOG_ERROR(Render_Vulkan, "L4 image planner differs: image {:#x} uid {} samples {}: planner {} barriers, image state {}", image->info.guest_address,
-                          image->image_uid, image->backing ? image->backing->num_samples : 0u, planned.size(), image_barriers.size() - prev_num_barriers);
-            }
-        }
-        if (live_plan_decides) {
-            image_barriers.resize(prev_num_barriers);
-            for (const auto& barrier : planned) {
-                image_barriers.push_back(barrier);
-            }
-        }
-    }
-    const bool result = image_barriers.size() != prev_num_barriers;
-    if (hazard_audit_on) {
-        ++hazard.image_calls;
-        if (result) {
-            ++hazard.image_true;
-            ++hazard.image_true_by_layouts[layout_before][HazardLayoutIndex(dst_layout)][HazardSource()];
-        }
-    }
-    return result;
+    return image_barriers.size() != prev_num_barriers;
 }
 
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                           std::span<const vk::BufferImageCopy> upload_copies) {
-    const HazardScope hazard_scope{hazard_override, hazard_audit_on, 8};
     SetBackingSamples(dst, dst->info.num_samples, false);
     scheduler.EndRendering();
 
@@ -593,7 +375,6 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
 
 void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                             std::span<const vk::BufferImageCopy> download_copies) {
-    const HazardScope hazard_scope{hazard_override, hazard_audit_on, 8};
     SetBackingSamples(src, src->info.num_samples);
     scheduler.EndRendering();
 
@@ -1116,113 +897,18 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
-    if (!tracker_on) {
-        // P1: the planner alone (B10: the planner by object answers in mode 2, is compared in mode 1)
-        u64 begin = 0;
-        bool by_address = false, by_object = false;
-        if (b10_mode != 2) {
-            auto& space = live_plan.buffers[LivePlanSpace(handle, offset, begin)];
-            by_address = space.write.Overlaps(begin, begin + size) || (check_read_access && space.read.Overlaps(begin, begin + size));
-        }
-        if (b10_mode != 0) {
-            auto& space = live_object.buffers[LiveObjectSpace(handle, offset, begin)];
-            by_object = space.write.Overlaps(begin, begin + size) || (check_read_access && space.read.Overlaps(begin, begin + size));
-            ++live_stats.object_queries;
-            if (b10_mode == 1) {
-                live_stats.object_same += by_object == by_address ? 1 : 0;
-                live_stats.object_no_address_yes += !by_object && by_address ? 1 : 0;
-                live_stats.object_yes_address_no += by_object && !by_address ? 1 : 0;
-            }
-        }
-        const bool planned = b10_mode == 2 ? by_object : by_address;
-        ++live_stats.queries;
-        live_stats.answered_true += planned ? 1 : 0;
-        return planned;
-    }
-    MakeCurrent(handle);
-    bool has_access = resource->write_ranges.Overlaps(offset, offset + size);
-    const bool plan_logged_has_write = has_access;
-    (void)plan_logged_has_write;
-    bool by_read = false;
-    if (check_read_access && !has_access) {
-        has_access |= resource->read_ranges.Overlaps(offset, offset + size);
-        by_read = has_access;
-    }
-    if (hazard_audit_on) {
-        plan_log.push_back({PlanEvent::Query, check_read_access, false, false, false, false, has_access, reinterpret_cast<u64>(handle), offset, size, handle->CpuAddr() != 0 ? handle->CpuAddr() + offset : 0});
-        ++hazard.buffer_queries;
-        {
-            auto& ask = hazard.ask_keys[{HazardSource(), hazard_program, reinterpret_cast<u64>(handle)}];
-            ++ask.first;
-            ask.second += has_access ? 1 : 0;
-            unit_bits.push_back(has_access ? 1 : 0);
-            const u64 loose = (u64{HazardSource()} << 56) ^ hazard_program;
-            unit_loose = (unit_loose ^ loose) * 0x100000001b3ull;
-            unit_strict = (unit_strict ^ loose ^ (reinterpret_cast<u64>(handle) * 0x9E3779B97F4A7C15ull)) * 0x100000001b3ull;
-        }
-        if (has_access) {
-            ++hazard.buffer_true;
-            u32 writer = HazardAudit::Sources - 1; // unknown unless a record is found
-            u64 writer_program = 0;
-            for (auto it = resource->audit.rbegin(); it != resource->audit.rend(); ++it) {
-                if (it->write == !by_read && it->start < offset + size && offset < it->end) {
-                    writer = it->source;
-                    writer_program = it->program;
-                    break;
-                }
-            }
-            ++hazard.buffer_true_by_writer_reader[writer][HazardSource()][check_read_access ? 1 : 0];
-            if (writer == 3 && HazardSource() == 3) {
-                ++hazard.compute_pairs[{writer_program, hazard_program}];
-            }
-        }
-    }
-    if (live_plan_on) {
-        u64 begin = 0;
-        auto& space = live_plan.buffers[LivePlanSpace(handle, offset, begin)];
-        bool planned = space.write.Overlaps(begin, begin + size);
-        if (check_read_access && !planned) {
-            planned = space.read.Overlaps(begin, begin + size);
-        }
-        ++live_stats.queries;
-        live_stats.answered_true += planned ? 1 : 0;
-        live_stats.planner_extra += planned && !has_access ? 1 : 0;
-        if (!planned && has_access) {
-            // TLG_BARRIER_PLANNER=2 keeps an exact list (no collapse above 64 intervals) next to the planner: if it also says "no hazard" the tracker's answer came from its own
-            // collapse (a covering range over the gaps of one big buffer), not from an access the planner lacks
-            bool exact_true = true;
-            if (live_plan_exact) {
-                auto& exact = live_exact.buffers[LivePlanSpace(handle, offset, begin)];
-                exact_true = exact.write.Overlaps(begin, begin + size) || (check_read_access && exact.read.Overlaps(begin, begin + size));
-            }
-            if (exact_true) {
-                ++live_stats.planner_missed;
-                static u32 logged = 0;
-                if (logged++ < 24) {
-                    LOG_ERROR(Render_Vulkan, "L4 planner missed a barrier: handle {:#x} offset {:#x} size {:#x} base {:#x} check_read {}", reinterpret_cast<u64>(handle), offset, size,
-                              u64{handle->CpuAddr()}, check_read_access);
-                }
-            } else {
-                ++live_stats.tracker_collapse_only;
-            }
-        }
-        // mode 1 and 2: the tracker corrects a miss (union); mode 3: the planner alone decides, the tracker is only compared (a miss is counted and logged, no barrier is made for it)
-        has_access = live_plan_decides ? planned : has_access || planned;
-    }
-    return has_access;
+    // B10: the planner by object answers (a placed engine buffer in its own offset space, the arena by guest address)
+    u64 begin = 0;
+    auto& space = live_object.buffers[LiveObjectSpace(handle, offset, begin)];
+    const bool planned = space.write.Overlaps(begin, begin + size) || (check_read_access && space.read.Overlaps(begin, begin + size));
+    ++live_stats.object_queries;
+    ++live_stats.queries;
+    live_stats.answered_true += planned ? 1 : 0;
+    return planned;
 }
 
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
-    if (tracker_on) {
-        MakeCurrent(handle);
-    }
-
-    const Interval range = {
-        .start = offset,
-        .end = offset + size,
-    };
-
     constexpr static vk::AccessFlags2 READ_MASK =
         vk::AccessFlagBits2::eIndexRead | vk::AccessFlagBits2::eVertexAttributeRead |
         vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eShaderRead |
@@ -1235,58 +921,7 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
-    // The lists are only consulted to decide whether a later access needs a barrier. A list that grows
-    // without a barrier in between (thousands of tiny constant buffer ranges) made every insert shift the
-    // vector; with the native draw path on, a list that holds many ranges is replaced by the one range that
-    // covers them all, which can only add a barrier, never drop one.
-    const bool bounded = true;
-    const auto add_range = [bounded](auto& list, const Interval& new_range) {
-        if (!bounded) {
-            list.Add(new_range);
-            return;
-        }
-        if (list.Contains(new_range.start, new_range.end)) {
-            return;
-        }
-        constexpr size_t MaxIntervals = 64;
-        if (list.Size() >= MaxIntervals) {
-            u64 lo = new_range.start;
-            u64 hi = new_range.end;
-            for (const auto& interval : list) {
-                lo = std::min(lo, interval.start);
-                hi = std::max(hi, interval.end);
-            }
-            list.Clear();
-            list.Add({.start = lo, .end = hi});
-            return;
-        }
-        list.Add(new_range);
-    };
-    if (tracker_on && (src_access & WRITE_MASK)) {
-        add_range(resource->write_ranges, range);
-    }
-    if (tracker_on && (src_access & READ_MASK)) {
-        add_range(resource->read_ranges, range);
-    }
-    if (hazard_audit_on) {
-        auto& audit = resource->audit;
-        if (audit.size() >= 512) {
-            audit.erase(audit.begin(), audit.begin() + 256);
-        }
-        const u8 source = static_cast<u8>(HazardSource());
-        if (src_access & WRITE_MASK) {
-            audit.push_back({offset, offset + size, source, true, hazard_program});
-        }
-        if (src_access & READ_MASK) {
-            audit.push_back({offset, offset + size, source, false, hazard_program});
-        }
-    }
-
-    if (hazard_audit_on) {
-        plan_log.push_back({PlanEvent::Access, false, (src_access & WRITE_MASK) != vk::AccessFlags2{}, (src_access & READ_MASK) != vk::AccessFlags2{}, src_stage != vk::PipelineStageFlags2{}, false, false,
-                            reinterpret_cast<u64>(handle), offset, size, handle->CpuAddr() != 0 ? handle->CpuAddr() + offset : 0});
-    }
-    if (live_plan_on && b10_mode != 0) {
+    {
         u64 begin = 0;
         auto& space = live_object.buffers[LiveObjectSpace(handle, offset, begin)];
         if (src_access & WRITE_MASK) {
@@ -1298,34 +933,11 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         }
         live_object.memory_pending |= src_stage != vk::PipelineStageFlags2{};
     }
-    if (live_plan_on) {
-        u64 begin = 0;
-        auto& space = live_plan.buffers[b10_mode == 2 ? 0 : LivePlanSpace(handle, offset, begin)];
-        if (b10_mode == 2) {
-            // B10 native: the address planner is not kept (only its write count, which R2 asks)
-            if (src_access & WRITE_MASK) {
-                ++live_plan_writes;
-            }
-        } else {
-        if (src_access & WRITE_MASK) {
-            LivePlanAdd(space.write, begin, begin + size);
-            ++live_plan_writes;
-        }
-        if (src_access & READ_MASK) {
-            LivePlanAdd(space.read, begin, begin + size);
-        }
-        }
-        live_plan.memory_pending |= src_stage != vk::PipelineStageFlags2{};
-        if (live_plan_exact) {
-            auto& exact = live_exact.buffers[LivePlanSpace(handle, offset, begin)];
-            if (src_access & WRITE_MASK) {
-                exact.write.Add({.start = begin, .end = begin + size});
-            }
-            if (src_access & READ_MASK) {
-                exact.read.Add({.start = begin, .end = begin + size});
-            }
-        }
+    // B10 native: the address planner is not kept (only its write count, which R2 asks)
+    if (src_access & WRITE_MASK) {
+        ++live_plan_writes;
     }
+    live_plan.memory_pending |= src_stage != vk::PipelineStageFlags2{};
     memory_barrier.srcStageMask |= src_stage;
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
 }
@@ -1342,9 +954,6 @@ void Runtime::FlushBarriers() {
         dep_info.imageMemoryBarrierCount = static_cast<u32>(image_barriers.size());
     }
 
-    if (hazard_audit_on) {
-        plan_log.push_back({PlanEvent::Flush, false, false, false, false, !image_barriers.empty(), dep_info.memoryBarrierCount != 0 || dep_info.imageMemoryBarrierCount != 0, 0, 0, 0, 0});
-    }
     if (live_plan_on) {
         const bool actual = dep_info.memoryBarrierCount != 0 || dep_info.imageMemoryBarrierCount != 0;
         const bool planned = live_plan.memory_pending || !image_barriers.empty();
@@ -1354,7 +963,6 @@ void Runtime::FlushBarriers() {
             live_plan.buffers.clear();
             live_plan_writes = 0;
             live_plan.memory_pending = false;
-            live_exact.buffers.clear();
             live_object.buffers.clear();
             live_object.memory_pending = false;
         }
@@ -1375,24 +983,6 @@ void Runtime::FlushBarriers() {
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
 
     image_barriers.clear();
-    for (auto& resource : resources) {
-        resource.read_ranges.Clear();
-        resource.write_ranges.Clear();
-    }
-    resources.clear();
-    resource = nullptr;
-}
-
-void Runtime::MakeCurrent(const VideoCore::Buffer* handle) {
-    if (resource && resource->handle == handle) {
-        return;
-    }
-    auto it = std::ranges::find(resources, handle, &BufferBarriers::handle);
-    if (it != resources.end()) {
-        resource = std::addressof(*it);
-        return;
-    }
-    resource = &resources.emplace_back(handle);
 }
 
 } // namespace Vulkan

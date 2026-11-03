@@ -130,8 +130,6 @@ public:
     /// C0 census (read only, counts per ~5 s interval): how every buffer and image binding, and every vertex / index buffer, of the draws and dispatches was resolved
     /// by the consumer. Index = (compute ? 32 : 0) + kind for the shader bindings, 24 + kind for the geometry (graphics only); see `CensusKind` in vk_rasterizer.cpp.
     std::array<u64, 64> TakeConsumerCensus() noexcept;
-    [[nodiscard]] bool HazardAuditOn() const noexcept;
-    Runtime::HazardAudit TakeHazardAudit();
     /// R2 (command processor thread): resolves the shader buffer bindings of a planned draw or dispatch whose record names a resident immutable engine buffer
     /// (`TLG_RESOLVE_AHEAD=0` turns it off); the raster thread binds them after a stamp check
     void ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan);

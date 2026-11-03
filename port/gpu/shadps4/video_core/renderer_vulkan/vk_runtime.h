@@ -89,33 +89,6 @@ public:
 
     void FlushBarriers();
 
-    /// C5, the hazard audit (`TLG_HAZARD_AUDIT=1`, read only): which access made which later access need a barrier. Sources: 0 z / shadow draws, 1 g-buffer, 2 forward, 3 compute,
-    /// 4 indirect draws, 5 untagged draws, 6 buffer copies (the buffer cache's uploads), 7 fills and inline data, 8 image copies and uploads, 9 unknown (ranges merged by the bound).
-    /// Layouts: 0 undefined, 1 general, 2 color attachment, 3 depth stencil attachment, 4 depth stencil read only, 5 shader read only, 6 transfer src, 7 transfer dst, 8 other.
-    struct HazardAudit {
-        static constexpr u32 Sources = 10, Layouts = 9;
-        u64 buffer_queries{}, buffer_true{};
-        u64 buffer_true_by_writer_reader[Sources][Sources][2]{}; ///< [the access that left the range][the access that asked][the asker writes]
-        u64 image_calls{}, image_true{};
-        u64 image_true_by_layouts[Layouts][Layouts][Sources]{}; ///< [layout before][layout asked][the source asking]
-        /// C5, compute half: the true buffer hazards between two compute dispatches, by (program address of the dispatch that left the range, program address of the one that asked)
-        std::map<std::pair<u64, u64>, u64> compute_pairs;
-        /// C5 recipe holdout: per asking access (source, compute program address or 0) the buffer queries and how many of them were true
-        std::map<std::tuple<u32, u64, u64>, std::pair<u64, u64>> ask_keys; ///< key: (source, program, the buffer asked about)
-        /// C5 frame recipe test, per submission ("unit"): the sequence of the tracker's answers as a bit vector, compared with the last unit that had the same shape (the sequence of
-        /// askers, loose = (source, program), strict = also the buffer): units seen, units whose shape was seen before, of those the bit identical ones, the differing bits, the bits compared
-        u64 plan_queries{}, plan_query_mismatches{}, plan_flushes{}, plan_flush_mismatches{}, plan_events{}, addr_true_tracker_false{}, addr_false_tracker_true{};
-        u64 units{}, loose_repeated{}, loose_identical{}, loose_bits_differing{}, loose_bits{}, strict_repeated{}, strict_identical{}, strict_bits_differing{}, strict_bits{};
-    };
-    /// The compute program whose dispatch is being bound (the hazard audit attributes its accesses to it).
-    void SetHazardProgram(u64 address) noexcept {
-        hazard_program = address;
-    }
-    [[nodiscard]] bool HazardAuditOn() const noexcept {
-        return hazard_audit_on;
-    }
-    HazardAudit TakeHazardAudit();
-
     /// L4: `TLG_BARRIER_PLANNER=1` makes the planner (a state machine over the access list keyed by guest address, see `Planner`) answer the buffer hazard queries; the tracker still runs
     /// next to it and corrects it (a barrier the planner lacks and the tracker has is counted as a miss and the barrier is made). 0 misses over a long run is the exit of L4.
     struct LivePlanStats {
@@ -139,41 +112,10 @@ public:
     [[nodiscard]] vk::ImageLayout CurrentLayout(const VideoCore::Image& image) const;
 
 private:
-    void MakeCurrent(const VideoCore::Buffer* handle);
-
-private:
     const Instance& instance;
     Scheduler& scheduler;
     std::unique_ptr<VideoCore::BlitHelper> blit_helper;
     StagingBufferPool staging_pool;
-    struct HazardRecord {
-        u64 start, end;
-        u8 source;
-        bool write;
-        u64 program;
-    };
-    u64 hazard_program{0};
-    struct BufferBarriers {
-        const VideoCore::Buffer* handle;
-        using AccessList = IntervalList<Interval>;
-        AccessList read_ranges;
-        AccessList write_ranges;
-        std::vector<HazardRecord> audit; ///< hazard audit only
-    };
-    BufferBarriers* resource{};
-    bool hazard_audit_on{};
-    std::vector<u8> unit_bits;
-    u64 unit_loose{0xcbf29ce484222325ull}, unit_strict{0xcbf29ce484222325ull};
-    std::unordered_map<u64, std::vector<u8>> unit_loose_seen, unit_strict_seen;
-    void EndAuditUnit();
-    /// C5 planner (audit only): the buffer tracker as a pure state machine over a log of events (query, access, flush). The log is the "frame recipe as data"; replaying it through the
-    /// planner must give the live tracker's answer to every query and the live flush's effect: 0 mismatches means the barrier plan is a deterministic function of the access list.
-    struct PlanEvent {
-        enum Kind : u8 { Query, Access, Flush } kind;
-        bool check_read{}, write{}, read{}, staged{}, image_pending{}, answer{}; ///< query: check_read, answer; access: write, read, staged (src stage non zero); flush: image_pending, answer = effective
-        u64 handle{}, offset{}, size{};
-        u64 address{}; ///< the guest address of the range (the buffer's CPU address + offset), 0 for a buffer that is not guest memory
-    };
     struct Planner {
         using List = IntervalList<Interval>;
         struct State {
@@ -181,18 +123,11 @@ private:
         };
         absl::node_hash_map<u64, State> buffers; // R5 step 1: node map (stable references, faster lookups than std)
         bool memory_pending{false};
-        bool bounded{true};
     };
-    std::vector<PlanEvent> plan_log;
-    Planner planner, planner_by_address;
-    void ReplayPlan();
-    bool live_plan_on{}, live_plan_exact{}, live_plan_decides{};
-    /// P1: the old buffer tracker runs next to the planner only as a comparison (`TLG_BARRIER_TRACKER=1`, or the hazard audit); off, the planner alone answers
-    bool tracker_on{};
+    bool live_plan_on{}, live_plan_decides{};
     u64 live_plan_writes{}; ///< R2: write ranges added to the live plan since its last clear
     const VideoCore::Buffer* plan_last_handle{}; ///< LivePlanSpace: the buffer of the last call and the range it had (no map lookup when it is the same)
     u64 plan_last_base{}, plan_last_size{};
-    Planner live_exact; ///< TLG_BARRIER_PLANNER=2: the same lists without the collapse, the oracle for a miss
     Planner live_plan; ///< L4: updated by every access, consulted by every query, cleared by every effective flush
     /// B10 (`TLG_B10_OBJECTS`): 0 off, 1 audit (the object planner runs next to the address planner, which answers), 2 native (the object planner answers alone)
     u32 b10_mode{};
@@ -217,10 +152,6 @@ private:
     }
     void PlanImageBarriers(VideoCore::Image* image, VideoCore::Image::Barriers& out, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                            vk::PipelineStageFlags2 dst_stage, std::optional<VideoCore::SubresourceRange> subres_range);
-    u32 hazard_override{~0u}; ///< set inside the runtime's own copies, fills and image transfers
-    HazardAudit hazard{};
-    u32 HazardSource() const;
-    std::vector<BufferBarriers> resources;
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
 };

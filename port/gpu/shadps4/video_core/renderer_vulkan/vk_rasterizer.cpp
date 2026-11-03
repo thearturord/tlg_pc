@@ -914,7 +914,6 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     if (!pipeline) {
         return;
     }
-    runtime.SetHazardProgram(cs_program.address);
     if (Core::LightRecorder::On()) {
         Core::LightRecorder::FrameOp(Core::DebugServer::PresentCount(), 0, cs_program.address, texture_cache.ImageGeneration());
     }
@@ -1643,9 +1642,6 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     return true;
 }
 
-bool Rasterizer::HazardAuditOn() const noexcept {
-    return runtime.HazardAuditOn();
-}
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
