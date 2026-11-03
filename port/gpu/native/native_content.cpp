@@ -107,6 +107,21 @@ u64 g_equal_nonzero_by_writer[16]{};  ///< bytes of CPU sourced uploads that equ
 u64 g_uploads_by_main_writer[16]{}; ///< uploads by the writer that supplies most of their covered bytes
 std::vector<nlohmann::json> g_examples_differs, g_examples_hole;
 
+// ---- F2.3 ring windows (shadow) ---------------------------------------------------------------------------------------------------------------------------------------
+struct RingWindow {
+    u64 size;
+    u64 serial;
+};
+std::mutex g_windows_mutex;
+std::map<u64, RingWindow> g_windows;
+u64 g_window_serial = 0;
+std::atomic<u64> c_win_noted{0}, c_win_dropped{0};
+enum RingClass : u32 { RingExact, RingExactTooSmall, RingInterior, RingSpans, RingNone, RingNotInRing, RingClassCount };
+constexpr const char* RingClassNames[RingClassCount] = {"exact_start_and_fits", "start_but_window_too_small", "inside_a_window", "spans_windows", "no_window", "not_in_ring"};
+std::atomic<u64> c_ring_lookups[5][RingClassCount]{};   ///< [binding type][class]
+std::atomic<u64> c_ring_age_log2[RingClassCount][24]{}; ///< windows older than 2^n allocations, by class
+std::vector<nlohmann::json> g_ring_examples;
+
 std::atomic<u64> c_maps[8][8][4]{}; ///< [resource kind (0xff: unknown -> 7)][map type][path]
 const char* GroupName(Group g) {
     return g == Group::FirstUpload ? "first_upload" : g == Group::RepeatUpload ? "repeat_upload" : "gpu_source";
@@ -323,6 +338,81 @@ void NoteMark(u32 writer, u64 address, u64 size) {
         g_marks_fifo.pop_front();
         (void)serial;
         g_marks.erase(g_marks.find(b)); // the oldest mark at that address
+    }
+}
+
+bool RingWindowsOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_F2_RING_WINDOWS");
+        return e != nullptr && *e == '1';
+    }();
+    return on;
+}
+
+void NoteRingWindow(u64 address, u64 size) {
+    if (!RingWindowsOn() || address == 0 || size == 0) {
+        return;
+    }
+    std::scoped_lock lock{g_windows_mutex};
+    const u64 end = address + size;
+    auto it = g_windows.lower_bound(address);
+    if (it != g_windows.begin()) {
+        const auto before = std::prev(it);
+        if (before->first + before->second.size > address) {
+            it = before;
+        }
+    }
+    while (it != g_windows.end() && it->first < end) {
+        if (it->first + it->second.size > address) {
+            it = g_windows.erase(it);
+            c_win_dropped.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            ++it;
+        }
+    }
+    g_windows.emplace(address, RingWindow{size, ++g_window_serial});
+    c_win_noted.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ClassifyRingLookup(u64 address, u64 size, u32 binding_type) {
+    if (!RingWindowsOn() || size == 0) {
+        return;
+    }
+    const u64 type = binding_type < 5 ? binding_type : 4;
+    const u64 ring_begin = g_ring_begin.load(std::memory_order_relaxed);
+    if (ring_begin == 0 || address < ring_begin || address >= g_ring_end.load(std::memory_order_relaxed)) {
+        c_ring_lookups[type][RingNotInRing].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    RingClass cls = RingNone;
+    u64 age = 0;
+    u64 window_begin = 0, window_size = 0;
+    {
+        std::scoped_lock lock{g_windows_mutex};
+        auto it = g_windows.upper_bound(address);
+        if (it != g_windows.begin()) {
+            const auto before = std::prev(it);
+            if (before->first == address) {
+                cls = before->second.size >= size ? RingExact : RingExactTooSmall;
+                window_begin = before->first, window_size = before->second.size, age = g_window_serial - before->second.serial;
+            } else if (before->first + before->second.size > address) {
+                cls = RingInterior;
+                window_begin = before->first, window_size = before->second.size, age = g_window_serial - before->second.serial;
+            }
+        }
+        if (cls == RingNone && it != g_windows.end() && it->first < address + size) {
+            cls = RingSpans;
+            window_begin = it->first, window_size = it->second.size, age = g_window_serial - it->second.serial;
+        }
+    }
+    c_ring_lookups[type][cls].fetch_add(1, std::memory_order_relaxed);
+    c_ring_age_log2[cls][std::min<u32>(23u, static_cast<u32>(std::bit_width(age)))].fetch_add(1, std::memory_order_relaxed);
+    if (cls != RingExact) {
+        std::scoped_lock lock{g_windows_mutex};
+        if (g_ring_examples.size() < 16) {
+            g_ring_examples.push_back({{"class", RingClassNames[cls]}, {"binding_type", type}, {"image_address", fmt::format("{:#x}", address)}, {"image_size", size}, {"window_address", fmt::format("{:#x}", window_begin)},
+                                       {"window_size", window_size}, {"window_age_allocations", age}});
+        }
     }
 }
 
@@ -618,6 +708,32 @@ void CompareImage(const ImageUpload& upload) {
 
 nlohmann::json Report() {
     nlohmann::json out;
+    if (RingWindowsOn()) {
+        nlohmann::json w;
+        w["windows_noted"] = c_win_noted.load();
+        w["older_windows_dropped"] = c_win_dropped.load();
+        static constexpr const char* types[5] = {"texture", "storage", "render_target", "depth_target", "video_out"};
+        for (u32 t = 0; t < 5; ++t) {
+            for (u32 c = 0; c < RingClassCount; ++c) {
+                if (const u64 n = c_ring_lookups[t][c].load(); n != 0) {
+                    w["lookups"][types[t]][RingClassNames[c]] = n;
+                }
+            }
+        }
+        for (u32 c = 0; c < RingClassCount; ++c) {
+            for (u32 b = 0; b < 24; ++b) {
+                if (const u64 n = c_ring_age_log2[c][b].load(); n != 0) {
+                    w["window_age_below_allocations"][RingClassNames[c]][std::to_string(1ull << b)] = n;
+                }
+            }
+        }
+        {
+            std::scoped_lock lock{g_windows_mutex};
+            w["windows_now"] = g_windows.size();
+            w["examples_not_exact"] = g_ring_examples;
+        }
+        out["ring_windows"] = std::move(w);
+    }
     out["enabled"] = On();
     out["shadow"] = ShadowOn();
     out["compare_by_open_map"] = {{"open_map_uploads", c_cmp_open.load()}, {"open_map_differs", c_cmp_open_differs.load()}, {"no_open_map_uploads", c_cmp_closed.load()}, {"no_open_map_differs", c_cmp_closed_differs.load()}};

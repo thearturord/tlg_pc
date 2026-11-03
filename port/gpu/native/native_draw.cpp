@@ -5746,11 +5746,12 @@ u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64
     // addresses are not the memory's any more. The function (allocator, size, alignment) runs here and its result is returned.
     u64 allocated = 0;
     bool ran = false;
-    if (Core::NativeContent::ShadowOn() && allocator != 0) {
+    if ((Core::NativeContent::ShadowOn() || Core::NativeContent::RingWindowsOn()) && allocator != 0) {
         if (const u64 original = Core::GuestHooks::OriginalEntry("AllocFrameGarlic"); original != 0) {
             allocated = reinterpret_cast<GuestDraw6>(original)(allocator, a1, a2, a3, a4, a5);
             ran = true;
             Core::NativeContent::NoteMark(6, allocated, a1 & 0xffffffffull);
+            Core::NativeContent::NoteRingWindow(allocated, a1 & 0xffffffffull);
         }
     }
     const auto finish = [&]() -> u64 { return ran ? (0x8000000000000000ull | (allocated & 0x7fffffffffffffffull)) : 0; };

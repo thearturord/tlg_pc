@@ -691,6 +691,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             const bool found = Core::NativeDevice::ResourceAt(info.guest_address, at);
             const u32 owner_state = !found ? 0u : at.kind == Core::NativeDevice::Kind::Buffer ? 3u : at.address == info.guest_address ? 1u : 2u;
             Core::NativeUpdates::NoteE3Unnamed(static_cast<u32>(desc.type), desc.engine_site, owner_state);
+            if (owner_state == 0) {
+                Core::NativeContent::ClassifyRingLookup(info.guest_address, info.guest_size, static_cast<u32>(desc.type));
+            }
             if (owner_state == 0 || owner_state == 3) {
                 static std::atomic<u32> logged{0};
                 if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {

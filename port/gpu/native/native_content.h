@@ -26,6 +26,12 @@ namespace Core::NativeContent {
 [[nodiscard]] bool RingSwapOn() noexcept;
 /// The frame allocator's ring (found by the engine's allocator hook).
 void SetRing(u64 begin, u64 end);
+/// F2.3 ring window shadow (`TLG_F2_RING_WINDOWS=1`, default off, read once): every allocation of the frame ring (`AllocFrameGarlic`) is a window; a newer window drops the older ones it overlaps,
+/// so the table is what the ring currently holds. `ClassifyRingLookup` is asked by `FindImage` for each lookup that no engine texture owns and says whether a window explains the image
+/// (exact start and fits, start but too small, inside a window, spans windows, none) and how old the window is. Nothing reads the answer for rendering.
+[[nodiscard]] bool RingWindowsOn() noexcept;
+void NoteRingWindow(u64 address, u64 size);
+void ClassifyRingLookup(u64 address, u64 size, u32 binding_type);
 /// `staged` holds the guest memory bytes of [address, address + size) (what the upload would read): if the range lies in the ring, the bytes of the entries the current draw may see replace them.
 void OverlayImage(u64 address, u64 size, u8* staged);
 
