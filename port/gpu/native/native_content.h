@@ -30,6 +30,14 @@ void SetRing(u64 begin, u64 end);
 /// so the table is what the ring currently holds. `ClassifyRingLookup` is asked by `FindImage` for each lookup that no engine texture owns and says whether a window explains the image
 /// (exact start and fits, start but too small, inside a window, spans windows, none) and how old the window is. Nothing reads the answer for rendering.
 [[nodiscard]] bool RingWindowsOn() noexcept;
+/// F2.3 ring image index (`TLG_F2_RING_INDEX`, read once: 0 off, 1 on, 2 on and audit against the page table): `FindImage` answers a lookup that no engine texture owns and that lies inside
+/// the frame ring from an index of the ring's images (address to image) instead of the page table and `ResolveOverlap`: an image that matches the description exactly is reused, every
+/// other image overlapping the window is stale (freed when old enough, as `ResolveOverlap` did for a pool reuse).
+[[nodiscard]] u32 RingIndexMode() noexcept;
+/// [address, address + size) lies inside the frame ring.
+[[nodiscard]] bool InRing(u64 address, u64 size) noexcept;
+enum class RingIndexEvent : u32 { ReusedExact, CreatedNew, StaleFreed, StaleKept, AuditSame, AuditOtherExactMatch, Count };
+void NoteRingIndex(RingIndexEvent event) noexcept;
 void NoteRingWindow(u64 address, u64 size);
 void ClassifyRingLookup(u64 address, u64 size, u32 binding_type);
 /// `staged` holds the guest memory bytes of [address, address + size) (what the upload would read): if the range lies in the ring, the bytes of the entries the current draw may see replace them.

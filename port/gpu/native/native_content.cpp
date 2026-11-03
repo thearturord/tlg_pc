@@ -341,6 +341,26 @@ void NoteMark(u32 writer, u64 address, u64 size) {
     }
 }
 
+u32 RingIndexMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_F2_RING_INDEX");
+        return e != nullptr ? static_cast<u32>(std::min(std::atoi(e), 2)) : 0u;
+    }();
+    return mode;
+}
+
+bool InRing(u64 address, u64 size) noexcept {
+    const u64 begin = g_ring_begin.load(std::memory_order_relaxed);
+    return begin != 0 && address >= begin && address + size <= g_ring_end.load(std::memory_order_relaxed);
+}
+
+namespace {
+std::atomic<u64> c_ring_index[static_cast<u32>(RingIndexEvent::Count)]{};
+}
+void NoteRingIndex(RingIndexEvent event) noexcept {
+    c_ring_index[static_cast<u32>(event)].fetch_add(1, std::memory_order_relaxed);
+}
+
 bool RingWindowsOn() noexcept {
     static const bool on = [] {
         const char* e = std::getenv("TLG_F2_RING_WINDOWS");
@@ -733,6 +753,16 @@ nlohmann::json Report() {
             w["examples_not_exact"] = g_ring_examples;
         }
         out["ring_windows"] = std::move(w);
+    }
+    if (RingIndexMode() != 0) {
+        out["ring_index"] = {{"mode", RingIndexMode()},
+                             {"reused_exact_match", c_ring_index[0].load()},
+                             {"created_new_image", c_ring_index[1].load()},
+                             {"stale_images_freed", c_ring_index[2].load()},
+                             {"stale_images_kept_not_old_enough", c_ring_index[3].load()},
+                             {"audit_page_table_same_exact_match", c_ring_index[4].load()},
+                             {"AUDIT_page_table_other_exact_match", c_ring_index[5].load()},
+                             {"switch", "TLG_F2_RING_INDEX=0 turns it off, 2 audits against the page table"}};
     }
     out["enabled"] = On();
     out["shadow"] = ShadowOn();

@@ -884,6 +884,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     };
 
     SmallVector<ImageId, 8> image_ids;
+    const bool ring_lookup = owner_id == 0 && Core::NativeContent::RingIndexMode() != 0 && Core::NativeContent::InRing(info.guest_address, info.guest_size);
     if (owner_id != 0) {
         // E3.3: an engine texture's candidates are its own images, nothing else (E3.1 census: a named lookup never overlapped another engine texture's image)
         if (const auto it = engine_images.find(owner_id); it != engine_images.end()) {
@@ -897,6 +898,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             std::sort(image_ids.begin(), image_ids.end(), [&](ImageId a, ImageId b) { return slot_images[a].image_uid < slot_images[b].image_uid; });
         }
         Core::NativeUpdates::NoteB8(image_ids.empty() ? Core::NativeUpdates::B8FirstNoOverlap : Core::NativeUpdates::B8FirstOverlap);
+    } else if (ring_lookup) {
+        // F2.3: the images of the frame ring over the window, from the ring index (no page table scan)
+        for (auto it = ring_images.lower_bound(info.guest_address > ring_max_size ? info.guest_address - ring_max_size : 0); it != ring_images.end() && it->first < info.guest_address + info.guest_size; ++it) {
+            const Image& candidate = slot_images[it->second];
+            if (it->first + candidate.info.guest_size > info.guest_address) {
+                image_ids.push_back(it->second);
+            }
+        }
     } else {
         // no engine texture starts at the memory (video out, copies, views into the middle of a texture): the images registered over the range
         ForEachImageInRegion(info.guest_address, info.guest_size, [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
@@ -905,31 +914,51 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     ImageId image_id{};
 
     // Check for a perfect match first
+    const auto perfect = [&](const Image& cache_image) {
+        return cache_image.info.guest_address == info.guest_address && cache_image.info.guest_size == info.guest_size && cache_image.info.size == info.size &&
+               IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) && !(cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1}) &&
+               !(exact_fmt && info.pixel_format != cache_image.info.pixel_format);
+    };
     for (const auto& cache_id : image_ids) {
-        auto& cache_image = slot_images[cache_id];
-        if (cache_image.info.guest_address != info.guest_address) {
-            continue;
+        if (perfect(slot_images[cache_id])) {
+            image_id = cache_id;
         }
-        if (cache_image.info.guest_size != info.guest_size) {
-            continue;
+    }
+    if (ring_lookup && Core::NativeContent::RingIndexMode() == 2) {
+        // audit: the page table's perfect match (the last one, as the old loop picked it) is the index's
+        ImageId page_table_pick{};
+        ForEachImageInRegion(info.guest_address, info.guest_size, [&](ImageId candidate_id, Image& candidate) {
+            if (perfect(candidate)) {
+                page_table_pick = candidate_id;
+            }
+        });
+        if (page_table_pick == image_id) {
+            Core::NativeContent::NoteRingIndex(Core::NativeContent::RingIndexEvent::AuditSame);
+        } else {
+            Core::NativeContent::NoteRingIndex(Core::NativeContent::RingIndexEvent::AuditOtherExactMatch);
         }
-        if (cache_image.info.size != info.size) {
-            continue;
-        }
-        if (!IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
-            (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1})) {
-            continue;
-        }
-        if (exact_fmt && info.pixel_format != cache_image.info.pixel_format) {
-            continue;
-        }
-        image_id = cache_id;
     }
 
     // Try to resolve overlaps (if any)
     int view_mip{-1};
     int view_slice{-1};
-    if (!image_id) {
+    if (ring_lookup) {
+        // F2.3 ring rule: the window is the image's; an exact image is reused, every other image over the window is stale (freed once old enough, as the pool reuse case of ResolveOverlap)
+        if (image_id) {
+            Core::NativeContent::NoteRingIndex(Core::NativeContent::RingIndexEvent::ReusedExact);
+        }
+        for (const auto& cache_id : image_ids) {
+            if (cache_id == image_id) {
+                continue;
+            }
+            if (gc_tick - slot_images[cache_id].tick_accessed_last > 32) {
+                Core::NativeContent::NoteRingIndex(Core::NativeContent::RingIndexEvent::StaleFreed);
+                FreeImage(cache_id);
+            } else {
+                Core::NativeContent::NoteRingIndex(Core::NativeContent::RingIndexEvent::StaleKept);
+            }
+        }
+    } else if (!image_id) {
         for (const auto& cache_id : image_ids) {
             view_mip = -1;
             view_slice = -1;
@@ -967,6 +996,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         NoteImageCreated(SiteFind, info);
         image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
+        if (ring_lookup) {
+            Core::NativeContent::NoteRingIndex(Core::NativeContent::RingIndexEvent::CreatedNew);
+        }
     }
 
     Image& image = slot_images[image_id];
@@ -1459,6 +1491,10 @@ void TextureCache::RegisterImage(ImageId image_id) {
             }
         }
     }
+    if (Core::NativeContent::RingIndexMode() != 0 && Core::NativeContent::InRing(info.guest_address, info.guest_size)) {
+        ring_images.emplace(info.guest_address, image_id);
+        ring_max_size = std::max<u64>(ring_max_size, info.guest_size);
+    }
     ForEachPage(info.guest_address, info.guest_size, [this, image_id, info](u64 page) {
         page_table[page].entries.emplace_back(BucketEntry{
             .key = u32(info.guest_address >> 8),
@@ -1476,6 +1512,15 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     NoteImageEvent(image.info, false);
     image_lru_cache.Free(image);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
+    if (!ring_images.empty()) {
+        const auto range = ring_images.equal_range(image.info.guest_address);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second == image_id) {
+                ring_images.erase(it);
+                break;
+            }
+        }
+    }
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         const auto page_it = page_table.find(page);
         ASSERT_MSG(page_it, "Unregistering unregistered page={:#x}", page << Traits::PAGE_BITS);
