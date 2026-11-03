@@ -55,7 +55,6 @@
 #include "native/native_zpass_gen.h"
 #include "native/native_gbuffer_audit.h"
 #include "video_core/amdgpu/liverpool.h"
-#include "video_core/amdgpu/pixel_format.h"
 #include "native/native_draw_tag.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_fixed_state.h"
@@ -6675,8 +6674,7 @@ u64 MakeMapUploadRecord(u64 ctx, u64 resource, u64 scratch, u64 caller) {
     ResourceTextureDescriptor(resource, 0, false, srv);
     const u32 width = Rd<u32>(resource, 0x180);
     const u32 height = Rd<u32>(resource, 0x184);
-    const auto data_format = static_cast<AmdGpu::DataFormat>((srv[1] >> 20) & 0x3f);
-    const u32 bits = AmdGpu::NumBitsPerElement(data_format);
+    const u32 bits = NativeDesc::BitsPerElementOfDataFormat((srv[1] >> 20) & 0x3f);
     if (bits == 0 || bits % 8 != 0 || (scratch & 0xff) != 0 || scratch >= (1ull << 48)) {
         return 0;
     }

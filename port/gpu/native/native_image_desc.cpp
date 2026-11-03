@@ -923,6 +923,17 @@ nlohmann::json Report() {
             }
         }
         j["f4_1_plain_description"] = std::move(plain);
+        {
+            // F4.6: the draw code's own bits-per-element table against the console header's (-1 entries count as 0), every code of the field
+            u32 differing = 0;
+            for (u32 code = 0; code < 42; ++code) {
+                const s32 reference = static_cast<s32>(AmdGpu::NumBitsPerElement(static_cast<AmdGpu::DataFormat>(code)));
+                if (NativeDesc::BitsPerElementOfDataFormat(code) != static_cast<u32>(std::max(reference, 0))) {
+                    ++differing;
+                }
+            }
+            j["f4_6_bits_per_element_table_differs"] = differing;
+        }
         nlohmann::json host = {{"compared", g_hi_compared.load()}, {"equal_info_and_view", g_hi_equal.load()}, {"engine_description_not_available", g_hi_unavailable.load()}};
         for (u32 i = 0; i < g_hi_info_differs.size(); ++i) {
             host["info_differs"][InfoFieldNames[i]] = g_hi_info_differs[i].load();

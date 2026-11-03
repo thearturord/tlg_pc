@@ -12,8 +12,7 @@ import os, re, sys
 NATIVE = os.path.dirname(os.path.abspath(__file__))
 
 ALLOWED_PS4 = {
-    "video_core/amdgpu/pixel_format.h": "F4 (PS4 resource types)",
-    "video_core/amdgpu/resource.h": "F4 (the image descriptor layout the derivation fills)",
+    "video_core/amdgpu/resource.h": "F5 (by design until the recompiler interface changes: Derive writes the T# words the shader reads; pixel_format.h comes with it)",
     "video_core/amdgpu/regs.h": "F4 (colour/depth register types: ColorBuffer, DepthBuffer, DepthView; the currency of ImageInfo)",
     "video_core/amdgpu/liverpool.h": "F3/F5 (register file, command processor)",
     "video_core/renderer_vulkan/vk_fixed_state.h": "F3 (the Vulkan fixed state type; no register image behind it any more)",

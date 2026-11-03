@@ -180,4 +180,18 @@ struct SamplerDesc {
 };
 static_assert(sizeof(SamplerDesc) == 64);
 
+/// Bits of one element of a texture of the console data format code (bits 20 to 25 of dword 1 of a T#, the numbers of the console's
+/// format list). 0 for a code that is not a plain colour format (and for any code above the list). F4.6: written out here so that
+/// the draw code does not include the console's pixel format header; `NativeImageDesc` compares it with the header's table once.
+inline u32 BitsPerElementOfDataFormat(u32 data_format) {
+    static constexpr u8 bits[42] = {
+        0,   8,   16,  16,  32,  32,  32,  32,  32,  32,  // 0 to 9
+        32,  64,  64,  96,  128, 0,   16,  16,  16,  16,  // 10 to 19
+        32,  32,  64,  0,   0,   0,   0,   0,   0,   0,   // 20 to 29
+        0,   0,   16,  16,  32,  4,   8,   8,   4,   8,   // 30 to 39
+        8,   8,                                            // 40 and 41
+    };
+    return data_format < 42 ? bits[data_format] : 0;
+}
+
 } // namespace Core::NativeDesc
