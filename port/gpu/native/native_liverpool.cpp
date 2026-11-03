@@ -363,7 +363,6 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     // F3.5: a draw is planned from its record and the engine objects, never from a register image. A draw that cannot be (no typed user data, no native fixed state, another shader
     // stage bound) is a counted refusal: it is not drawn.
     const bool plannable = draw.kind <= 2 && !draw.cb_extents_only && draw.typed && draw.fixed != nullptr && !draw.other_stage && split_active;
-    static const AmdGpu::DrawRegs no_registers{};
     if (draw.typed) {
         for (u32 mask = draw.vs_user_data_mask; mask != 0; mask &= mask - 1) {
             const u32 i = static_cast<u32>(std::countr_zero(mask));
@@ -500,7 +499,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             Core::NativeShaderEnv::Scope shader_env{draw.vs_gnm, draw.ps_gnm, draw.fetch_object, draw.other_stage, draw.typed ? exec_vertex_user_data.data() : nullptr,
                                                     draw.typed ? exec_pixel_user_data.data() : nullptr};
             Core::NativeTargetDesc::Scope target_desc{draw.native_targets}; // E7 (TLG_TARGET_DESC_USE): PlanDraw applies the record's target description to the inputs it makes
-            auto made = rasterizer->PlanDraw(no_registers, params, native_fixed, native_exec_key, native_inputs_key, &draw, index_count);
+            auto made = rasterizer->PlanDraw(params, *native_fixed, native_exec_key, native_inputs_key, draw, index_count);
             return made;
         };
         std::unique_ptr<Vulkan::DrawPlan> candidate;

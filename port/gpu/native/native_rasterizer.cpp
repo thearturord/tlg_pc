@@ -500,22 +500,6 @@ u64 Rasterizer::PlanDigest(const DispatchPlan& plan) {
     return DigestStage(Mix(0xcbf29ce484222325ull, reinterpret_cast<u64>(plan.pipeline)), plan.stage);
 }
 
-const DrawInputs& Rasterizer::InputsFor(const DrawPlan* plan, DrawInputs& storage) const {
-    if (plan == nullptr) {
-        storage = MakeDrawInputs(liverpool->RasterRegs());
-        return storage;
-    }
-    return plan->inputs;
-}
-
-const FixedState& Rasterizer::FixedFor(const DrawPlan* plan, FixedState& storage) const {
-    if (plan) {
-        return plan->fixed;
-    }
-    storage = MakeFixedState(liverpool->RasterRegs());
-    return storage;
-}
-
 void Rasterizer::RecyclePlan(std::unique_ptr<DrawPlan>&& plan) {
     if (!plan) {
         return;

@@ -174,16 +174,6 @@ static void ApplyShaderEnv(Shader::RuntimeInfo& info, const Core::NativeShaderEn
     }
 }
 
-/// F3.2 / F3.3 (`TLG_STAGES_FROM_ENV`, default on, `=0` turns it off, read once): for a native draw (the plan's inputs are known) the stage set is vertex plus pixel (a draw with a hull, domain
-/// or geometry shader bound is refused), and the translator input of both stages is built from the shader environment, the fixed state and the targets, not from the register image.
-static bool StagesFromEnvOn() {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_STAGES_FROM_ENV");
-        return e == nullptr || *e != '0';
-    }();
-    return on;
-}
-
 /// F3.3: the sample count the pixel shader's coverage input sees: that of the targets the draw has bound (the largest of the colour targets and the depth target; 1 without targets).
 static u32 TargetSampleCount(const DrawInputs& in) {
     u32 samples = 1;
@@ -221,159 +211,9 @@ static std::optional<Shader::ShaderParams> ParamsFromEnv(const Core::NativeShade
 
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
     auto& info = runtime_infos[u32(l_stage)];
-    const auto& regs = *lookup_regs;
-    const auto BuildCommon = [&](const auto& program) {
-        info.props.fp_denorm_mode32 = program.settings.fp_denorm_mode32;
-        info.props.fp_denorm_mode16_64 = program.settings.fp_denorm_mode64;
-        info.props.fp_round_mode32 = program.settings.fp_round_mode32;
-        info.props.fp_round_mode16_64 = program.settings.fp_round_mode64;
-        info.props.num_allocated_vgprs = program.NumVgprs();
-        info.props.num_user_data = program.settings.num_user_regs;
-        info.props.num_input_vgprs = program.settings.vgpr_comp_cnt;
-        info.props.dx10_clamp = program.settings.dx10_clamp;
-    };
     info.Initialize(stage, l_stage);
     auto& live = Core::NativeDraw::Live();
-    if (lookup_inputs != nullptr && StagesFromEnvOn() && !Core::NativePlanShadow::On() && (stage == HwStage::Vertex || stage == HwStage::Fragment) &&
-        (l_stage == SwStage::Vertex || l_stage == SwStage::Fragment)) {
-        Core::NativeShaderEnv::DrawEnv env;
-        if (Core::NativeShaderEnv::Current(env) && (stage == HwStage::Vertex ? env.has_vertex : env.has_pixel) && !env.other_stage) {
-            // F3.3: everything from the shader environment, the fixed state, the key's targets and the target sample count
-            const auto& fixed = *lookup_fixed;
-            if (stage == HwStage::Vertex) {
-                info.hw.vs.user_clip_plane_mask = fixed.user_clip_plane_mask;
-                info.hw.vs.emulate_depth_negative_one_to_one = !instance.IsDepthClipControlSupported() && fixed.negative_one_to_one;
-                info.hw.vs.clip_disable = fixed.clip_disabled;
-                info.sw.vs.vertex_sgpr_offset = draw_indirect_params.vertex_sgpr_offset;
-                info.sw.vs.instance_sgpr_offset = draw_indirect_params.instance_sgpr_offset;
-                info.sw.vs.is_indirect = draw_indirect_params.is_indirect;
-                info.sw.vs.tess_emulated_primitive = fixed.primitive_type == AmdGpu::PrimitiveType::RectList || fixed.primitive_type == AmdGpu::PrimitiveType::QuadList;
-            } else {
-                info.hw.fs.dual_source_blending = fixed.DualSourceBlending();
-                for (u32 i = 0; i < Shader::MaxColorBuffers; i++) {
-                    info.hw.fs.color_buffers[i] = graphics_key.color_buffers[i];
-                }
-                // lowered user clip planes and guest exported clip distances both arm the emulation; no geometry or local stage exists in this pipeline
-                const bool lowers_user_clip_planes = fixed.user_clip_plane_mask != 0;
-                const auto vs_out = std::bit_cast<AmdGpu::VsOutputControl>(env.vertex.exports.vs_out_control);
-                info.hw.fs.clip_distance_emulation = ((env.has_vertex && vs_out.clip_distance_enable) || lowers_user_clip_planes) && profile.needs_clip_distance_emulation;
-            }
-            ApplyShaderEnv(info, env, stage, TargetSampleCount(*lookup_inputs));
-            live.key_targets[6].fetch_add(1, std::memory_order_relaxed);
-            return info;
-        }
-    }
-    if (stage != HwStage::Compute) {
-        live.key_targets[7].fetch_add(1, std::memory_order_relaxed); // graphics stages only: compute dispatches build their input from the register image (outside F3)
-    }
-    switch (stage) {
-    case HwStage::Local: {
-        BuildCommon(regs.ls_program);
-        Shader::TessellationDataConstantBuffer tess_constants{};
-        const auto* hull_info = infos[u32(SwStage::TessellationControl)];
-        hull_info->ReadTessConstantBuffer(tess_constants);
-        info.hw.ls.ls_stride = tess_constants.ls_stride;
-        break;
-    }
-    case HwStage::Hull:
-        BuildCommon(regs.hs_program);
-        break;
-    case HwStage::Export:
-        BuildCommon(regs.es_program);
-        info.hw.es.vertex_data_size = regs.vgt_esgs_ring_itemsize;
-        break;
-    case HwStage::Geometry: {
-        BuildCommon(regs.gs_program);
-        info.hw.gs.num_outputs = MapOutputs(info.hw.gs.outputs, regs.vs_output_control);
-        info.hw.gs.output_vertices = regs.vgt_gs_max_vert_out;
-        info.hw.gs.num_invocations =
-            regs.vgt_gs_instance_cnt.IsEnabled() ? regs.vgt_gs_instance_cnt.count : 1;
-        if (regs.stage_enable.raw == AmdGpu::ShaderStageEnable::LsHsEsGs) {
-            info.hw.gs.in_primitive = [&]() {
-                switch (regs.tess_config.topology) {
-                case AmdGpu::TessellationTopology::Point:
-                    return AmdGpu::PrimitiveType::PointList;
-                case AmdGpu::TessellationTopology::Line:
-                    return AmdGpu::PrimitiveType::LineList;
-                case AmdGpu::TessellationTopology::TriangleCw:
-                case AmdGpu::TessellationTopology::TriangleCcw:
-                    return AmdGpu::PrimitiveType::TriangleList;
-                default:
-                    UNREACHABLE();
-                }
-            }();
-        } else {
-            info.hw.gs.in_primitive = lookup_fixed->primitive_type;
-        }
-        for (u32 stream_id = 0; stream_id < Shader::GsMaxOutputStreams; ++stream_id) {
-            info.hw.gs.out_primitive[stream_id] =
-                regs.vgt_gs_out_prim_type.GetPrimitiveType(stream_id);
-        }
-        info.hw.gs.in_vertex_data_size = regs.vgt_esgs_ring_itemsize;
-        info.hw.gs.out_vertex_data_size = regs.vgt_gs_vert_itemsize[0];
-        info.hw.gs.mode = regs.vgt_gs_mode.mode;
-        const auto params_vc = AmdGpu::GetParams(regs.vs_program);
-        info.hw.gs.vs_copy = params_vc.code;
-        info.hw.gs.vs_copy_hash = params_vc.hash;
-        DumpShader(info.hw.gs.vs_copy, info.hw.gs.vs_copy_hash, Shader::HwStage::Vertex, 0,
-                   "copy.bin");
-        break;
-    }
-    case HwStage::Vertex: {
-        BuildCommon(regs.vs_program);
-        info.hw.vs.user_clip_plane_mask = lookup_fixed->user_clip_plane_mask;
-        info.hw.vs.num_outputs = MapOutputs(info.hw.vs.outputs, regs.vs_output_control);
-        info.hw.vs.emulate_depth_negative_one_to_one =
-            !instance.IsDepthClipControlSupported() &&
-            lookup_fixed->negative_one_to_one;
-        info.hw.vs.clip_disable = lookup_fixed->clip_disabled;
-        break;
-    }
-    case HwStage::Fragment: {
-        BuildCommon(regs.ps_program);
-        info.hw.fs.en_flags = regs.ps_input_ena;
-        info.hw.fs.addr_flags = regs.ps_input_addr;
-        info.hw.fs.num_inputs = regs.num_interp;
-        info.hw.fs.front_face_all_bits = regs.barycentric_control.front_face_all_bits;
-        info.hw.fs.depth_before_shader = regs.depth_shader_control.depth_before_shader;
-        info.hw.fs.num_samples =
-            regs.ps_input_addr.sample_coverage_ena && regs.ps_input_ena.sample_coverage_ena
-                ? regs.aa_config.NumSamples()
-                : 1;
-        info.hw.fs.z_export_format = regs.z_export_format;
-        u8 stencil_ref_export_enable = regs.depth_shader_control.stencil_op_val_export_enable |
-                                       regs.depth_shader_control.stencil_test_val_export_enable;
-        info.hw.fs.mrtz_mask = regs.depth_shader_control.z_export_enable |
-                               (stencil_ref_export_enable << 1) |
-                               (regs.depth_shader_control.mask_export_enable << 2) |
-                               (regs.depth_shader_control.coverage_to_mask_enable << 3);
-        info.hw.fs.dual_source_blending = lookup_fixed->DualSourceBlending();
-        const auto& ps_inputs = regs.ps_inputs;
-        for (u32 i = 0; i < regs.num_interp; i++) {
-            info.hw.fs.inputs[i] = {
-                .param_index = u16(ps_inputs[i].input_offset),
-                .is_default = u16(ps_inputs[i].use_default),
-                .is_flat = u16(ps_inputs[i].flat_shade),
-                .default_value = u16(ps_inputs[i].default_value),
-            };
-        }
-        for (u32 i = 0; i < Shader::MaxColorBuffers; i++) {
-            info.hw.fs.color_buffers[i] = graphics_key.color_buffers[i];
-        }
-        // Lowered user clip planes ride the same emulation path as guest-exported distances, so
-        // the fragment side arms whenever the hardware vertex stage lowers them, keeping its input
-        // locations in sync with the shifted vertex outputs.
-        const bool lowers_user_clip_planes =
-            lookup_fixed->user_clip_plane_mask != 0 &&
-            !regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Geometry));
-        info.hw.fs.clip_distance_emulation =
-            ((regs.vs_output_control.clip_distance_enable &&
-              !regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Local))) ||
-             lowers_user_clip_planes) &&
-            profile.needs_clip_distance_emulation;
-        break;
-    }
-    case HwStage::Compute: {
+    if (stage == HwStage::Compute) {
         const auto& cs_pgm = *lookup_cs;
         info.props.num_user_data = cs_pgm.settings.num_user_regs;
         info.props.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
@@ -387,127 +227,37 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.hw.cs.tgid_enable = {cs_pgm.IsTgidEnabled(0), cs_pgm.IsTgidEnabled(1),
                                   cs_pgm.IsTgidEnabled(2)};
         info.hw.cs.shared_memory_size = cs_pgm.SharedMemSize();
-        break;
+        return info;
     }
-    default:
-        break;
+    // F3.5: a graphics stage is the vertex or the pixel shader of a native draw; its translator input is built from the shader environment, the fixed state, the key's targets and the
+    // target sample count. No register image exists any more; a draw without a shader environment gets no pipeline (the stage selection refuses it first).
+    Core::NativeShaderEnv::DrawEnv env;
+    if ((stage != HwStage::Vertex && stage != HwStage::Fragment) || lookup_inputs == nullptr || !Core::NativeShaderEnv::Current(env) ||
+        (stage == HwStage::Vertex ? !env.has_vertex : !env.has_pixel) || env.other_stage) {
+        Core::NativeShaderEnv::NoteUnavailable();
+        return info;
     }
-    switch (l_stage) {
-    case SwStage::Vertex:
-        info.sw.vs.step_rate_0 = regs.vgt_instance_step_rate_0;
-        info.sw.vs.step_rate_1 = regs.vgt_instance_step_rate_1;
+    const auto& fixed = *lookup_fixed;
+    if (stage == HwStage::Vertex) {
+        info.hw.vs.user_clip_plane_mask = fixed.user_clip_plane_mask;
+        info.hw.vs.emulate_depth_negative_one_to_one = !instance.IsDepthClipControlSupported() && fixed.negative_one_to_one;
+        info.hw.vs.clip_disable = fixed.clip_disabled;
         info.sw.vs.vertex_sgpr_offset = draw_indirect_params.vertex_sgpr_offset;
         info.sw.vs.instance_sgpr_offset = draw_indirect_params.instance_sgpr_offset;
         info.sw.vs.is_indirect = draw_indirect_params.is_indirect;
-        info.sw.vs.tess_emulated_primitive =
-            lookup_fixed->primitive_type == AmdGpu::PrimitiveType::RectList ||
-            lookup_fixed->primitive_type == AmdGpu::PrimitiveType::QuadList;
-        break;
-    case SwStage::TessellationControl: {
-        info.sw.tcs.num_input_control_points = regs.ls_hs_config.hs_input_control_points;
-        info.sw.tcs.num_threads = regs.ls_hs_config.hs_output_control_points;
-        info.sw.tcs.tess_type = regs.tess_config.type;
-        info.sw.tcs.offchip_lds_enable = regs.hs_program.settings.oc_lds_en;
-        break;
-    }
-    case SwStage::TessellationEval: {
-        info.sw.tes.tess_type = regs.tess_config.type;
-        info.sw.tes.tess_topology = regs.tess_config.topology;
-        info.sw.tes.tess_partitioning = regs.tess_config.partitioning;
-        break;
-    }
-    default:
-        break;
-    }
-    if ((stage == HwStage::Vertex || stage == HwStage::Fragment) && (l_stage == SwStage::Vertex || l_stage == SwStage::Fragment)) {
-        // E1c: the shader's own words come from the shader objects of the draw.
-        Core::NativeShaderEnv::DrawEnv env;
-        if (!Core::NativeShaderEnv::Current(env) || (stage == HwStage::Vertex ? !env.has_vertex : !env.has_pixel)) {
-            Core::NativeShaderEnv::NoteUnavailable();
-        } else if (!Core::NativePlanShadow::On()) {
-            ApplyShaderEnv(info, env, stage, regs.aa_config.NumSamples());
-        } else {
-            // E7b Task 3: the register built translator input against the one derived from the shader objects, field by field (the native one decides)
-            const Shader::RuntimeInfo from_registers = info;
-            ApplyShaderEnv(info, env, stage, regs.aa_config.NumSamples());
-            const char* g = stage == HwStage::Vertex ? "shader_env.vertex" : "shader_env.pixel";
-            namespace PS = Core::NativePlanShadow;
-            PS::Compare(g, "fp_denorm_mode32", static_cast<u64>(info.props.fp_denorm_mode32), static_cast<u64>(from_registers.props.fp_denorm_mode32));
-            PS::Compare(g, "fp_denorm_mode16_64", static_cast<u64>(info.props.fp_denorm_mode16_64), static_cast<u64>(from_registers.props.fp_denorm_mode16_64));
-            PS::Compare(g, "fp_round_mode32", static_cast<u64>(info.props.fp_round_mode32), static_cast<u64>(from_registers.props.fp_round_mode32));
-            PS::Compare(g, "fp_round_mode16_64", static_cast<u64>(info.props.fp_round_mode16_64), static_cast<u64>(from_registers.props.fp_round_mode16_64));
-            PS::Compare(g, "num_allocated_vgprs", info.props.num_allocated_vgprs, from_registers.props.num_allocated_vgprs);
-            PS::Compare(g, "num_user_data", info.props.num_user_data, from_registers.props.num_user_data);
-            PS::Compare(g, "num_input_vgprs", info.props.num_input_vgprs, from_registers.props.num_input_vgprs);
-            PS::Compare(g, "dx10_clamp", info.props.dx10_clamp, from_registers.props.dx10_clamp);
-            if (stage == HwStage::Vertex) {
-                PS::Compare(g, "num_outputs", info.hw.vs.num_outputs, from_registers.hw.vs.num_outputs);
-                PS::CompareBytes(g, "outputs", &info.hw.vs.outputs, &from_registers.hw.vs.outputs, sizeof(info.hw.vs.outputs));
-                if (info.sw_stage == SwStage::Vertex) {
-                    PS::Compare(g, "step_rate_0", info.sw.vs.step_rate_0, from_registers.sw.vs.step_rate_0);
-                    PS::Compare(g, "step_rate_1", info.sw.vs.step_rate_1, from_registers.sw.vs.step_rate_1);
-                }
-            } else {
-                PS::CompareBytes(g, "en_flags", &info.hw.fs.en_flags, &from_registers.hw.fs.en_flags, sizeof(info.hw.fs.en_flags));
-                PS::CompareBytes(g, "addr_flags", &info.hw.fs.addr_flags, &from_registers.hw.fs.addr_flags, sizeof(info.hw.fs.addr_flags));
-                PS::Compare(g, "num_inputs", info.hw.fs.num_inputs, from_registers.hw.fs.num_inputs);
-                PS::Compare(g, "front_face_all_bits", info.hw.fs.front_face_all_bits, from_registers.hw.fs.front_face_all_bits);
-                PS::Compare(g, "depth_before_shader", info.hw.fs.depth_before_shader, from_registers.hw.fs.depth_before_shader);
-                PS::Compare(g, "z_export_format", static_cast<u64>(info.hw.fs.z_export_format), static_cast<u64>(from_registers.hw.fs.z_export_format));
-                PS::Compare(g, "mrtz_mask", info.hw.fs.mrtz_mask, from_registers.hw.fs.mrtz_mask);
-                PS::Compare(g, "num_samples", info.hw.fs.num_samples, from_registers.hw.fs.num_samples);
-                for (u32 i = 0; i < info.hw.fs.num_inputs && i < 32; ++i) {
-                    // E7c Task 2: the 16 bit input word is five named fields (bits 0 to 8) and 7 unnamed bits (9 to 15) that nothing reads (`PsInput::operator==` ignores them); the two are counted apart
-                    u16 native_raw = 0, register_raw = 0;
-                    std::memcpy(&native_raw, &info.hw.fs.inputs[i], sizeof(native_raw));
-                    std::memcpy(&register_raw, &from_registers.hw.fs.inputs[i], sizeof(register_raw));
-                    PS::Compare(g, "inputs.named_bits", native_raw & 0x1ffu, register_raw & 0x1ffu);
-                    PS::Compare(g, "inputs.unnamed_bits", native_raw & 0xfe00u, register_raw & 0xfe00u);
-                    PS::Compare(g, "inputs.operator==", info.hw.fs.inputs[i] == from_registers.hw.fs.inputs[i] ? 0 : 1, 0);
-                    if (native_raw != register_raw && PS::DumpWanted("shader_env.pixel.inputs")) {
-                        u32 control = 0;
-                        std::memcpy(&control, &regs.ps_inputs[i], sizeof(control));
-                        const auto& want = env.pixel.fragment.interpolants[i];
-                        const auto& vs = runtime_infos[u32(SwStage::Vertex)];
-                        std::string outputs;
-                        for (u32 o = 0; o < vs.hw.vs.num_outputs && o < 16; ++o) {
-                            outputs += fmt::format(" [{},{},{},{}]", static_cast<u32>(vs.hw.vs.outputs[o][0]), static_cast<u32>(vs.hw.vs.outputs[o][1]), static_cast<u32>(vs.hw.vs.outputs[o][2]),
-                                                   static_cast<u32>(vs.hw.vs.outputs[o][3]));
-                        }
-                        PS::Dump("shader_env.pixel.inputs",
-                                 fmt::format("{}: pixel shader gnm/code {:#x} hash {:#x}, slot {} of {}; native word {:#06x} (offset {} default {} flat {} default_value {}), register image word {:#06x} "
-                                             "(offset {} default {} flat {} default_value {}); SPI_PS_INPUT_CNTL_{} = {:#010x}; shader environment interpolant offset {} use_default {} flat {} default {}; "
-                                             "vertex shader outputs ({}):{}",
-                                             (native_raw & 0x1ff) == (register_raw & 0x1ff) ? "unnamed bits only" : "NAMED FIELDS DIFFER", env.pixel.program.address, env.pixel.program.hash, i,
-                                             info.hw.fs.num_inputs, native_raw, native_raw & 31, (native_raw >> 5) & 1, (native_raw >> 6) & 1, (native_raw >> 7) & 3, register_raw, register_raw & 31,
-                                             (register_raw >> 5) & 1, (register_raw >> 6) & 1, (register_raw >> 7) & 3, i, control, static_cast<u32>(want.input_offset), want.use_default, want.flat_shade,
-                                             static_cast<u32>(want.default_value), vs.hw.vs.num_outputs, outputs));
-                    }
-                }
-                for (u32 i = 0; i < Shader::MaxColorBuffers; ++i) {
-                    if (info.hw.fs.color_buffers[i].data_format != AmdGpu::DataFormat::FormatInvalid) {
-                        PS::Compare(g, "color_export_format", static_cast<u64>(info.hw.fs.color_buffers[i].export_format), static_cast<u64>(from_registers.hw.fs.color_buffers[i].export_format));
-                    }
-                }
-            }
+        info.sw.vs.tess_emulated_primitive = fixed.primitive_type == AmdGpu::PrimitiveType::RectList || fixed.primitive_type == AmdGpu::PrimitiveType::QuadList;
+    } else {
+        info.hw.fs.dual_source_blending = fixed.DualSourceBlending();
+        for (u32 i = 0; i < Shader::MaxColorBuffers; i++) {
+            info.hw.fs.color_buffers[i] = graphics_key.color_buffers[i];
         }
+        // lowered user clip planes and guest exported clip distances both arm the emulation; no geometry or local stage exists in this pipeline
+        const bool lowers_user_clip_planes = fixed.user_clip_plane_mask != 0;
+        const auto vs_out = std::bit_cast<AmdGpu::VsOutputControl>(env.vertex.exports.vs_out_control);
+        info.hw.fs.clip_distance_emulation = ((env.has_vertex && vs_out.clip_distance_enable) || lowers_user_clip_planes) && profile.needs_clip_distance_emulation;
     }
-    if (Core::NativePlanShadow::On()) {
-        // E7b Task 3: register image fields the translator input still reads with no native value
-        namespace PS = Core::NativePlanShadow;
-        if (stage == HwStage::Fragment) {
-            // F3.3: the two register reads that had no native value, against the native ones (target sample count; export info of the vertex shader and the fixed state)
-            Core::NativeShaderEnv::DrawEnv shadow_env;
-            if (lookup_inputs != nullptr && Core::NativeShaderEnv::Current(shadow_env) && shadow_env.has_vertex) {
-                const auto vs_out = std::bit_cast<AmdGpu::VsOutputControl>(shadow_env.vertex.exports.vs_out_control);
-                const bool native_clip = (vs_out.clip_distance_enable || lookup_fixed->user_clip_plane_mask != 0) && profile.needs_clip_distance_emulation;
-                PS::Compare("translator_input.fragment", "clip_distance_emulation", native_clip ? 1 : 0, info.hw.fs.clip_distance_emulation ? 1 : 0);
-                PS::Compare("translator_input.fragment", "num_samples_targets_vs_aa_config", TargetSampleCount(*lookup_inputs), regs.aa_config.NumSamples());
-            }
-        } else if (stage != HwStage::Vertex && stage != HwStage::Compute) {
-            PS::RegisterOnly("translator_input.stage_built", stage == HwStage::Local ? "local" : stage == HwStage::Hull ? "hull" : stage == HwStage::Export ? "export" : "geometry", 1);
-        }
-    }
+    ApplyShaderEnv(info, env, stage, TargetSampleCount(*lookup_inputs));
+    live.key_targets[6].fetch_add(1, std::memory_order_relaxed);
     return info;
 }
 
@@ -516,7 +266,6 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes},
       stage_lookup_reuse{EmulatorSettings.GetStageLookupReuse()} {
-    lookup_regs = &liverpool->RasterRegs();
     lookup_fixed = &lookup_fixed_storage;
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
@@ -593,20 +342,15 @@ PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::PipelineLookup};
-    if (!lookup_regs_pinned) {
-        lookup_regs = &liverpool->RasterRegs();
-        lookup_fixed_storage = MakeFixedState(*lookup_regs);
-        lookup_fixed = &lookup_fixed_storage;
+    if (!lookup_pinned || lookup_inputs == nullptr) {
+        return nullptr; // F3.5: only a plan (inputs, fixed state, shader environment) looks a graphics pipeline up
     }
     draw_indirect_params = params;
     ExecEntry* exec_entry = nullptr;
     bool exec_audit = false;
     auto& live = Core::NativeDraw::Live();
-    // F3.4: a native draw's stage set is vertex only before the pixel shader (nothing of the register image decides it)
-    const u32 stage_enable_now = lookup_inputs != nullptr && StagesFromEnvOn() ? static_cast<u32>(AmdGpu::ShaderStageEnable::Vs) : static_cast<u32>(lookup_regs->stage_enable.raw);
-    if (lookup_exec_key != 0 && lookup_regs_pinned) {
-        if (const auto found = exec_pipelines.find(lookup_exec_key); found != exec_pipelines.end() && found->second.epoch == exec_epoch &&
-                                                                       found->second.stage_enable == stage_enable_now) {
+    if (lookup_exec_key != 0) {
+        if (const auto found = exec_pipelines.find(lookup_exec_key); found != exec_pipelines.end() && found->second.epoch == exec_epoch) {
             exec_entry = &found.value();
             exec_audit = (++exec_tick & 31) == 0;
         }
@@ -616,22 +360,18 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             fetch_shader = FetchOf(*exec_entry);
             bool resolved_all = true;
             Core::NativeShaderEnv::DrawEnv entry_env;
-            const bool entry_native = lookup_inputs != nullptr && StagesFromEnvOn() && Core::NativeShaderEnv::Current(entry_env);
+            const bool entry_native = Core::NativeShaderEnv::Current(entry_env);
             for (u32 s = 0; s < MaxShaderStages && resolved_all; ++s) {
                 if (!infos[s]) {
                     continue;
                 }
-                std::optional<Shader::ShaderParams> stage_params_env;
-                if (entry_native) {
-                    stage_params_env = ParamsFromEnv(entry_env, exec_entry->stage_hw[s]);
-                    live.key_targets[stage_params_env ? 8 : 9].fetch_add(1, std::memory_order_relaxed);
-                }
-                const auto* pgm = stage_params_env ? nullptr : lookup_regs->ProgramForStage(exec_entry->stage_hw[s]);
-                if (!stage_params_env && !pgm) {
+                const std::optional<Shader::ShaderParams> stage_params_env = entry_native ? ParamsFromEnv(entry_env, exec_entry->stage_hw[s]) : std::optional<Shader::ShaderParams>{};
+                live.key_targets[stage_params_env ? 8 : 9].fetch_add(1, std::memory_order_relaxed);
+                if (!stage_params_env) {
                     resolved_all = false;
                     break;
                 }
-                const auto stage_params = stage_params_env ? *stage_params_env : AmdGpu::GetParams(*pgm);
+                const auto& stage_params = *stage_params_env;
                 NoteCode(stage_params);
                 auto* info = const_cast<Shader::Info*>(infos[s]);
                 info->pgm_base = stage_params.Base();
@@ -645,20 +385,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             }
             exec_entry = nullptr;
         }
-    } else if (lookup_regs_pinned) {
+    } else {
         live.stage_key_uncached.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (Core::NativePlanShadow::On() && lookup_regs_pinned) {
-        // E7b Task 3: the programs the stages are looked up by, from the shader objects and from the register image
-        Core::NativeShaderEnv::DrawEnv env;
-        if (Core::NativeShaderEnv::Current(env)) {
-            if (env.has_vertex) {
-                Core::NativePlanShadow::Compare("program", "vs_address", env.vertex.program.address, AmdGpu::GetParams(lookup_regs->vs_program).Base());
-            }
-            if (env.has_pixel) {
-                Core::NativePlanShadow::Compare("program", "ps_address", env.pixel.program.address, AmdGpu::GetParams(lookup_regs->ps_program).Base());
-            }
-        }
     }
     if (!RefreshGraphicsKey()) {
         return nullptr;
@@ -692,7 +420,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             }
         }
     }
-    if (lookup_exec_key != 0 && lookup_regs_pinned) {
+    if (lookup_exec_key != 0) {
         const GraphicsPipeline* resolved = it->second.get();
         if (exec_entry) {
             live.stage_key_audits.fetch_add(1, std::memory_order_relaxed);
@@ -710,7 +438,6 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         entry.pgm_base = stage_base;
         entry.fetch_program = fetch_shader != nullptr ? fetch_program : nullptr;
         entry.fetch_perm = fetch_perm;
-        entry.stage_enable = stage_enable_now;
         entry.epoch = exec_epoch;
     }
     return it->second.get();
@@ -718,8 +445,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::PipelineLookup};
-    if (!lookup_regs_pinned) {
-        lookup_regs = &liverpool->RasterRegs();
+    if (!lookup_pinned) {
         lookup_cs = &liverpool->GetCsRegs();
     }
     if (!RefreshComputeKey()) {
@@ -937,16 +663,14 @@ bool PipelineCache::PlanGraphicsTyped(u64 exec_key, const FixedState& fixed, std
     return true;
 }
 
-void PipelineCache::PlanGraphics(const AmdGpu::DrawRegs& regs, const FixedState& fixed,
-                                 DrawIndirectParams params, DrawPlan& plan, u64 exec_key) {
-    lookup_regs = &regs;
+void PipelineCache::PlanGraphics(const FixedState& fixed, DrawIndirectParams params, DrawPlan& plan, u64 exec_key) {
     lookup_inputs = &plan.inputs;
     lookup_fixed = &fixed;
-    lookup_regs_pinned = true;
+    lookup_pinned = true;
     lookup_exec_key = exec_key != 0 ? ExecKeyOf(exec_key, fixed) : 0;
     const GraphicsPipeline* pipeline = GetGraphicsPipeline(params);
     lookup_exec_key = 0;
-    lookup_regs_pinned = false;
+    lookup_pinned = false;
     lookup_inputs = nullptr;
     plan.pipeline = pipeline;
     if (!pipeline) {
@@ -999,10 +723,10 @@ void PipelineCache::PlanGraphics(const AmdGpu::DrawRegs& regs, const FixedState&
 }
 
 void PipelineCache::PlanCompute(const AmdGpu::ComputeProgram& cs, DispatchPlan& plan) {
-    lookup_regs_pinned = true;
+    lookup_pinned = true;
     lookup_cs = &cs;
     const ComputePipeline* pipeline = GetComputePipeline();
-    lookup_regs_pinned = false;
+    lookup_pinned = false;
     plan.pipeline = pipeline;
     if (!pipeline) {
         return;
@@ -1034,30 +758,21 @@ void PipelineCache::ApplyPlan(const DispatchPlan& plan) {
     stage.info->pgm_base = stage.pgm_base;
 }
 
-/// F3.1 (`TLG_KEY_TARGETS_FROM_INPUTS`, default on, `=0` turns it off, read once): the render targets of the pipeline key are read from the plan's inputs, which hold the native target
-/// description (E7), not from the register image.
-static bool KeyTargetsFromInputsOn() {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_KEY_TARGETS_FROM_INPUTS");
-        return e == nullptr || *e != '0';
-    }();
-    return on;
-}
-
 bool PipelineCache::RefreshGraphicsKey() {
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
-    const auto& regs = *lookup_regs;
     const auto& fixed = *lookup_fixed;
     auto& key = graphics_key;
 
     auto& live = Core::NativeDraw::Live();
-    const bool from_inputs = lookup_inputs != nullptr && KeyTargetsFromInputsOn();
-    live.key_targets[from_inputs ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
-    const AmdGpu::DepthBuffer& depth_buffer = from_inputs ? lookup_inputs->depth_buffer : regs.depth_buffer;
-    const AmdGpu::ColorBuffer* color_buffers = from_inputs ? lookup_inputs->color_buffers : regs.color_buffers;
-    // the export format of each target is the pixel shader's (SPI_SHADER_COL_FORMAT): from its environment when there is one
+    if (lookup_inputs == nullptr) {
+        return false; // F3.5: the key's targets are the plan's inputs (the native target description)
+    }
+    live.key_targets[0].fetch_add(1, std::memory_order_relaxed);
+    const AmdGpu::DepthBuffer& depth_buffer = lookup_inputs->depth_buffer;
+    const AmdGpu::ColorBuffer* color_buffers = lookup_inputs->color_buffers;
+    // the export format of each target is the pixel shader's (SPI_SHADER_COL_FORMAT): from its environment
     Core::NativeShaderEnv::DrawEnv shader_env;
-    const bool have_env = from_inputs && Core::NativeShaderEnv::Current(shader_env);
+    const bool have_env = Core::NativeShaderEnv::Current(shader_env);
     const bool export_from_env = have_env && shader_env.has_pixel;
 
     const bool db_enabled = depth_buffer.DepthValid() || depth_buffer.StencilValid();
@@ -1073,10 +788,7 @@ bool PipelineCache::RefreshGraphicsKey() {
     key.provoking_first = fixed.provoking_first;
     key.prim_type = fixed.primitive_type;
     key.polygon_mode = fixed.polygon_mode;
-    // F3.2: no hull shader in a native draw's pipeline
-    key.patch_control_points = have_env && shader_env.has_vertex && !shader_env.other_stage && StagesFromEnvOn()
-                                   ? 0
-                                   : (regs.stage_enable.hs_en ? regs.ls_hs_config.hs_input_control_points : 0);
+    key.patch_control_points = 0; // F3.2: no hull shader in a native draw's pipeline
     key.logic_op = fixed.logic_op;
     key.logic_op_enable = fixed.logic_op_enabled;
     key.depth_samples = db_enabled ? depth_buffer.NumSamples() : 1;
@@ -1101,11 +813,8 @@ bool PipelineCache::RefreshGraphicsKey() {
         if (export_from_env) {
             color_buffer.export_format = static_cast<AmdGpu::ShaderExportFormat>(shader_env.pixel.fragment.color_export_format[cb]);
             live.key_targets[2].fetch_add(1, std::memory_order_relaxed);
-        } else if (have_env) {
-            color_buffer.export_format = AmdGpu::ShaderExportFormat::Zero; // no pixel shader: nothing is exported
         } else {
-            color_buffer.export_format = regs.color_export_format.GetFormat(cb);
-            live.key_targets[3].fetch_add(1, std::memory_order_relaxed);
+            color_buffer.export_format = AmdGpu::ShaderExportFormat::Zero; // no pixel shader: nothing is exported
         }
         color_buffer.swizzle = col_buf.Swizzle();
 
@@ -1170,69 +879,32 @@ bool PipelineCache::RefreshGraphicsKey() {
 }
 
 bool PipelineCache::RefreshGraphicsStages() {
-    const auto& regs = *lookup_regs;
     auto& key = graphics_key;
     fetch_shader = nullptr;
     fetch_program = nullptr;
 
-    // F3.2: for a native draw the stage set is the vertex shader plus the pixel shader when the record names one (the shader objects the record names); a hull, domain or geometry shader in the device context refuses the draw
+    // F3.5: the stage set of a native draw is the vertex shader plus the pixel shader when the record names one (the shader objects the record names); a hull, domain or geometry shader
+    // in the device context refuses the draw, and so does a draw without a shader environment
     Core::NativeShaderEnv::DrawEnv stage_env;
-    const bool native_stages = lookup_inputs != nullptr && StagesFromEnvOn() && Core::NativeShaderEnv::Current(stage_env) && stage_env.has_vertex;
-    auto& live = Core::NativeDraw::Live();
-    live.key_targets[native_stages ? 4 : 5].fetch_add(1, std::memory_order_relaxed);
-    if (native_stages && stage_env.other_stage) {
+    if (lookup_inputs == nullptr || !Core::NativeShaderEnv::Current(stage_env) || !stage_env.has_vertex || stage_env.other_stage) {
         return false;
     }
+    auto& live = Core::NativeDraw::Live();
+    live.key_targets[4].fetch_add(1, std::memory_order_relaxed);
 
     Shader::Backend::Bindings binding{};
     const auto bind_stage = [&](HwStage stage_in, SwStage stage_out) -> bool {
         const auto stage_in_idx = static_cast<u32>(stage_in);
         const auto stage_out_idx = static_cast<u32>(stage_out);
-        if (!native_stages && !regs.stage_enable.IsStageEnabled(stage_in_idx)) {
+        // F3.2b: the program and the user data words from the shader environment and the record
+        const auto env_params = ParamsFromEnv(stage_env, stage_in_idx);
+        live.key_targets[env_params ? 8 : 9].fetch_add(1, std::memory_order_relaxed);
+        if (!env_params) {
             key.stage_hashes[stage_out_idx] = 0;
             infos[stage_out_idx] = nullptr;
             return false;
         }
-
-        // F3.2b: the program and the user data words from the shader environment and the record, the register image otherwise
-        std::optional<Shader::ShaderParams> env_params;
-        if (native_stages) {
-            env_params = ParamsFromEnv(stage_env, stage_in_idx);
-            live.key_targets[env_params ? 8 : 9].fetch_add(1, std::memory_order_relaxed);
-        }
-        const auto* pgm = env_params ? nullptr : regs.ProgramForStage(stage_in_idx);
-        if (!env_params && (!pgm || !pgm->Address<u32*>())) {
-            key.stage_hashes[stage_out_idx] = 0;
-            infos[stage_out_idx] = nullptr;
-            return false;
-        }
-
-        const auto params = env_params ? *env_params : AmdGpu::GetParams(*pgm);
-        if (env_params && Core::NativePlanShadow::On()) {
-            // the register image's program and the words the shader reads (the first `num_user_regs` words of the stage) against the native ones
-            if (const auto* reg_pgm = regs.ProgramForStage(stage_in_idx); reg_pgm && reg_pgm->Address<u32*>()) {
-                const auto reg_params = AmdGpu::GetParams(*reg_pgm);
-                const bool is_vs = stage_in_idx == static_cast<u32>(HwStage::Vertex);
-                Core::NativePlanShadow::Compare("stage_program", is_vs ? "vs_code_address" : "ps_code_address", params.Base(), reg_params.Base());
-                Core::NativePlanShadow::Compare("stage_program", is_vs ? "vs_hash" : "ps_hash", params.hash, reg_params.hash);
-                Core::NativePlanShadow::Compare("stage_program", is_vs ? "vs_code_words" : "ps_code_words", params.code.size(), reg_params.code.size());
-                const u32 count = stage_in_idx == static_cast<u32>(HwStage::Vertex) ? stage_env.vertex.program.user_data_count : stage_env.pixel.program.user_data_count;
-                u32 differing = 0;
-                static constexpr const char* vs_names[16] = {"vs_user_word_0", "vs_user_word_1", "vs_user_word_2", "vs_user_word_3", "vs_user_word_4", "vs_user_word_5", "vs_user_word_6", "vs_user_word_7",
-                                                             "vs_user_word_8", "vs_user_word_9", "vs_user_word_10", "vs_user_word_11", "vs_user_word_12", "vs_user_word_13", "vs_user_word_14", "vs_user_word_15"};
-                for (u32 w = 0; w < count && w < params.user_data.size(); ++w) {
-                    differing += params.user_data[w] != reg_params.user_data[w] ? 1 : 0;
-                    if (is_vs) {
-                        Core::NativePlanShadow::Compare("stage_program", vs_names[w], params.user_data[w], reg_params.user_data[w]);
-                    }
-                }
-                if (is_vs && params.user_data[0] != reg_params.user_data[0]) {
-                    Core::RareEvents::Note("f3_2b_vs_user_word0", fmt::format("hash {:#x} user_data_count {} native words {:#x} {:#x} registers {:#x} {:#x}", params.hash, count, params.user_data[0],
-                                                                              params.user_data[1], reg_params.user_data[0], reg_params.user_data[1]));
-                }
-                Core::NativePlanShadow::Compare("stage_program", is_vs ? "vs_consumed_user_words_differing" : "ps_consumed_user_words_differing", differing, 0);
-            }
-        }
+        const auto& params = *env_params;
         NoteCode(params);
         stage_hw[stage_out_idx] = stage_in_idx;
         stage_base[stage_out_idx] = params.Base();
@@ -1244,7 +916,7 @@ bool PipelineCache::RefreshGraphicsStages() {
     infos.fill(nullptr);
     modules.fill(nullptr);
 
-    if (!native_stages || stage_env.has_pixel) { // a native draw without a pixel shader (depth only) has no fragment stage
+    if (stage_env.has_pixel) { // a draw without a pixel shader (depth only) has no fragment stage
         bind_stage(HwStage::Fragment, SwStage::Fragment);
     }
 
@@ -1252,71 +924,7 @@ bool PipelineCache::RefreshGraphicsStages() {
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
     key.num_color_attachments = std::bit_width(key.mrt_mask);
 
-    if (native_stages) {
-        bind_stage(HwStage::Vertex, SwStage::Vertex);
-    } else switch (regs.stage_enable.raw) {
-    case AmdGpu::ShaderStageEnable::VgtStages::EsGs:
-        if (!instance.IsGeometryStageSupported()) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
-            return false;
-        }
-        if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
-            return false;
-        }
-        if (!bind_stage(HwStage::Export, SwStage::Vertex)) {
-            return false;
-        }
-        if (!bind_stage(HwStage::Geometry, SwStage::Geometry)) {
-            return false;
-        }
-        break;
-    case AmdGpu::ShaderStageEnable::VgtStages::LsHs:
-        if (!instance.IsTessellationSupported()) {
-            return false;
-        }
-        if (!bind_stage(HwStage::Hull, SwStage::TessellationControl)) {
-            return false;
-        }
-        if (!bind_stage(HwStage::Vertex, SwStage::TessellationEval)) {
-            return false;
-        }
-        if (!bind_stage(HwStage::Local, SwStage::Vertex)) {
-            return false;
-        }
-        break;
-    case AmdGpu::ShaderStageEnable::VgtStages::LsHsEsGs:
-        if (!instance.IsTessellationSupported()) {
-            return false;
-        }
-        if (!instance.IsGeometryStageSupported()) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
-            return false;
-        }
-        if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
-            return false;
-        }
-        if (!bind_stage(HwStage::Hull, SwStage::TessellationControl)) {
-            return false;
-        }
-        if (!bind_stage(HwStage::Export, SwStage::TessellationEval)) {
-            return false;
-        }
-        if (!bind_stage(HwStage::Local, SwStage::Vertex)) {
-            return false;
-        }
-        if (!bind_stage(HwStage::Geometry, SwStage::Geometry)) {
-            return false;
-        }
-        break;
-    case AmdGpu::ShaderStageEnable::VgtStages::Vs:
-        bind_stage(HwStage::Vertex, SwStage::Vertex);
-        break;
-    default:
-        LOG_WARNING(Render_Vulkan, "unimplemented shader stage {}", (u32)regs.stage_enable.raw);
-        return false;
-    }
+    bind_stage(HwStage::Vertex, SwStage::Vertex);
 
     const auto* vs_info = infos[static_cast<u32>(SwStage::Vertex)];
     if (vs_info && fetch_shader && !instance.IsVertexInputDynamicState()) {

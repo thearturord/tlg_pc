@@ -80,13 +80,10 @@ public:
     void DispatchIndirect(VAddr address, u32 offset, u32 size,
                           const DispatchPlan* plan = nullptr);
 
-    /// Command processor thread: looks the pipeline up for `regs`. Returns null for draws that
-    /// FilterDraw handles without a pipeline (the raster thread repeats that decision).
-    /// `native` is the fixed-function state the native path built from the engine's objects (null: built from `regs`).
-    [[nodiscard]] std::unique_ptr<DrawPlan> PlanDraw(const AmdGpu::DrawRegs& regs,
-                                                     DrawIndirectParams params,
-                                                     const FixedState* native = nullptr,
-                                                     u64 exec_key = 0, u64 inputs_key = 0, const Core::NativeDraw::ExecDraw* record = nullptr, u32 index_count = ~0u);
+    /// Command processor thread (F3.5): plans a draw from its record: the pipeline is looked up from the record's keys, the shader and the target descriptions; `native` is the
+    /// fixed-function state the native path built from the engine's objects.
+    [[nodiscard]] std::unique_ptr<DrawPlan> PlanDraw(DrawIndirectParams params, const FixedState& native, u64 exec_key, u64 inputs_key, const Core::NativeDraw::ExecDraw& record,
+                                                     u32 index_count = ~0u);
     /// F3.4: the inputs of a draw made from its record (register pairs of the record, the target description, the typed draw arguments, the step rates of the vertex shader object)
     /// instead of from the register image.
     [[nodiscard]] static DrawInputs MakeInputsFromRecord(const Core::NativeDraw::ExecDraw& draw, u32 index_count);
@@ -431,9 +428,6 @@ private:
     /// Clears the bound depth / stencil target to the clear values of the registers (native replacement of the SDK's clear quad).
     void ClearDepthTarget(const DrawInputs& inputs, const AmdGpu::CbDbExtent& db_extent);
 
-    const FixedState& FixedFor(const DrawPlan* plan, FixedState& storage) const;
-    /// The draw inputs of the draw being recorded: the plan's, or built from the register mirror without a plan.
-    const DrawInputs& InputsFor(const DrawPlan* plan, DrawInputs& storage) const;
     void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed,
                             const FixedState& fixed) const;
     void UpdateViewportScissorState(const FixedState& fixed) const;
@@ -463,13 +457,6 @@ private:
         bool depth_copy{};
         bool stencil_copy{};
     };
-    /// What FilterDraw does with a draw, decided from the registers only. `executed` is the fixed-function state of a draw
-    /// the native path executed from its record: such a draw is a normal draw by construction, only the shadow skip
-    /// switch looks at it.
-    static DrawClassification ClassifyDraw(const AmdGpu::DrawRegs& regs,
-                                           const FixedState* executed = nullptr);
-    /// The part of ClassifyDraw that finds the game's own transition operations; true and `out` set when the draw is one.
-    static bool ClassifyOperation(const AmdGpu::DrawRegs& regs, DrawClassification& out);
     /// What is left for a draw that is not such an operation, from the plan only (the shadow skip switch).
     static DrawClassification ClassifyRemaining(const DrawInputs& inputs, const FixedState& fixed);
 

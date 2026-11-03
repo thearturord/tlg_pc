@@ -251,8 +251,7 @@ public:
     /// cp_split_mode: looks the pipeline up for the command processor's registers `regs` and
     /// captures the per-draw state of its stages. Runs on the command processor thread, the only
     /// thread that touches this cache then.
-    void PlanGraphics(const AmdGpu::DrawRegs& regs, const FixedState& fixed,
-                      DrawIndirectParams params, DrawPlan& plan, u64 exec_key = 0);
+    void PlanGraphics(const FixedState& fixed, DrawIndirectParams params, DrawPlan& plan, u64 exec_key = 0);
     /// cp_exec_inputs: the same for a draw whose pipeline was resolved before under `exec_key` (the record's key): the stages take the typed user data, nothing is read from
     /// registers. False when there is no entry (the caller plans the old way).
     /// skip_flat_for (N3b): the draw's record; a stage whose every descriptor it covers gets no flat user data.
@@ -319,17 +318,14 @@ private:
     Shader::Profile profile{};
     Shader::Pools pools;
     DrawIndirectParams draw_indirect_params{};
-    /// Registers the current lookup reads: the raster mirror normally, the command processor's
-    /// own registers (and the compute state of the dispatching queue) when planning.
-    const AmdGpu::DrawRegs* lookup_regs{};
-    /// F3.1: the plan's inputs while `PlanGraphics` looks the pipeline up; the key's render targets are read from them (null: from `lookup_regs`)
+    /// F3.5: the plan's inputs while `PlanGraphics` looks the pipeline up; the key's render targets are read from them
     const DrawInputs* lookup_inputs{};
     const FixedState* lookup_fixed{};
     FixedState lookup_fixed_storage{};
     const AmdGpu::ComputeProgram* lookup_cs{};
     PlanStats plan_stats{};
     std::array<u64, MaxShaderStages> last_stage_hash{};
-    bool lookup_regs_pinned{}; ///< The lookup reads lookup_regs/lookup_cs as set by the caller.
+    bool lookup_pinned{}; ///< The lookup reads lookup_inputs/lookup_fixed/lookup_cs as set by the caller.
     /// cp_split_mode: the raster thread's copy of each program's Info.
     tsl::robin_map<const Shader::Info*, std::unique_ptr<Shader::Info>> raster_infos;
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
@@ -345,7 +341,6 @@ private:
         /// the fetch shader as (program, variant): a pointer into the variant list would move when a variant is added
         Program* fetch_program{};
         size_t fetch_perm{};
-        u32 stage_enable{};
         u64 epoch{};
     };
     /// the fetch shader of an entry, resolved at use

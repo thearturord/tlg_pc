@@ -451,33 +451,8 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         // The tag belongs to the draw or dispatch the game called. The game's own tracking may issue internal draws
         // (full-screen quads) in between: a call that does not fit the tag (kind, count) leaves it pending.
         const u32 tag_kind = (native_tag_pending.meta >> 8) & 0xff;
-        bool match = false;
-        if (native_exec_plan) {
-            match = true;
-        } else switch (call.kind) {
-        case RasterCall::Kind::Draw:
-            // internal full-screen quads (resource transitions) run the emulator's embedded vertex shader, whose
-            // address has bits above the game's address space in SPI_SHADER_PGM_HI_VS
-            match = tag_kind <= 1 && (tag_kind == 0) == call.indexed &&
-                    (front_state.vs_program.address >> 32) == 0 &&
-                    (Core::NativeDraw::RecordDrawCount(native_tag_pending.seq) == front_state.num_indices ||
-                     Core::NativeDraw::RecordDrawCount(native_tag_pending.seq) == Core::NativeDraw::UnknownDrawCount);
-            break;
-        case RasterCall::Kind::DrawIndirect:
-            match = tag_kind == 2;
-            break;
-        default:
-            match = tag_kind == 3;
-            break;
-        }
-        if (!match && call.kind == RasterCall::Kind::Draw) {
-            static u32 unmatched_logs = 0;
-            if (unmatched_logs++ < 40) {
-                LOG_INFO(Render, "native tag not matched: seq {} tag kind {} record count {:#x} call indexed {} num_indices {} vs hi {:#x}",
-                         native_tag_pending.seq, tag_kind, Core::NativeDraw::RecordDrawCount(native_tag_pending.seq), call.indexed,
-                         front_state.num_indices, static_cast<u64>(front_state.vs_program.address >> 32));
-            }
-        }
+        // a draw always has its plan here (F3.5: a draw without one is refused before this call); a dispatch matches a dispatch tag
+        const bool match = native_exec_plan != nullptr || tag_kind == 3;
         if (match) {
             call.tag = native_tag_pending;
             native_tag_pending.valid = false;
@@ -502,8 +477,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         }
     }
     if (!split_active) {
-        direct_state = front_state;
-        ExecRasterCall(call, nullptr, nullptr);
+        Core::RareEvents::Note("f3_5_raster_call_without_split", "a native draw or dispatch with the command processor split off: not run");
         return;
     }
     auto& sp = *split;
@@ -547,15 +521,6 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
                 : Vulkan::DrawIndirectParams{};
         if (native_exec_plan) {
             op.draw_plan.reset(std::exchange(native_exec_plan, nullptr));
-        } else {
-            // a draw without a plan of its record (a fast clear eliminate whose operation could not be planned) is planned from the register mirror of the direct path
-            const auto make_plan = [&] {
-                return rasterizer->PlanDraw(front_state, params, native_fixed, native_exec_key, native_inputs_key);
-            };
-            op.draw_plan = make_plan();
-            if (verify == 2) {
-                op.draw_plan = ReplanAfterDrain(std::move(op.draw_plan), 0, make_plan);
-            }
         }
         if (op.draw_plan) {
             op.draw_plan->cb_extent = last_cb_extent;

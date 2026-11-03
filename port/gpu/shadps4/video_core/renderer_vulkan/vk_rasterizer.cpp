@@ -235,82 +235,6 @@ bool Rasterizer::CommandStreamBarrier(u64 producer_tick) {
     return true;
 }
 
-bool Rasterizer::ClassifyOperation(const AmdGpu::DrawRegs& regs, DrawClassification& out) {
-    if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
-        out = {DrawClass::EliminateFastClear};
-        return true;
-    }
-    if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::FmaskDecompress) {
-        out = {DrawClass::FmaskDecompress};
-        return true;
-    }
-    if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Resolve) {
-        out = {DrawClass::Resolve};
-        return true;
-    }
-    if (regs.primitive_type == AmdGpu::PrimitiveType::None) {
-        out = {DrawClass::PrimitiveNone};
-        return true;
-    }
-    // The SDK's clear: a full-screen triangle (embedded vertex shader, three vertices, no color target) with the depth /
-    // stencil clear bits of DB_RENDER_CONTROL set. Its pixels carry nothing; the render pass clear does the work.
-    if ((regs.depth_render_control.depth_clear_enable || regs.depth_render_control.stencil_clear_enable) &&
-        (regs.vs_program.address >> 32) != 0 && regs.num_indices == 3 &&
-        regs.color_target_mask.raw == 0 && regs.depth_buffer.DepthValid()) {
-        out = {DrawClass::DepthClear};
-        return true;
-    }
-    if ((regs.depth_render_control.decompress_enable || regs.depth_render_control.resummarize_enable ||
-         regs.depth_render_control.depth_compress_disable || regs.depth_render_control.stencil_compress_disable) &&
-        !regs.depth_render_control.depth_clear_enable && !regs.depth_render_control.stencil_clear_enable &&
-        !regs.depth_render_control.depth_copy && !regs.depth_render_control.stencil_copy &&
-        (regs.vs_program.address >> 32) != 0 && regs.num_indices == 3 &&
-        regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable) {
-        out = {DrawClass::DepthTransition};
-        return true;
-    }
-
-    const bool cb_disabled =
-        regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
-    const auto depth_copy =
-        regs.depth_render_override.force_z_dirty && regs.depth_render_override.force_z_valid &&
-        regs.depth_buffer.DepthValid() && regs.depth_buffer.DepthWriteValid() &&
-        regs.depth_buffer.DepthAddress() != regs.depth_buffer.DepthWriteAddress();
-    const auto stencil_copy =
-        regs.depth_render_override.force_stencil_dirty &&
-        regs.depth_render_override.force_stencil_valid && regs.depth_buffer.StencilValid() &&
-        regs.depth_buffer.StencilWriteValid() &&
-        regs.depth_buffer.StencilAddress() != regs.depth_buffer.StencilWriteAddress();
-    if (cb_disabled && (depth_copy || stencil_copy)) {
-        out = {DrawClass::DepthStencilCopy, depth_copy, stencil_copy};
-        return true;
-    }
-    return false;
-}
-
-Rasterizer::DrawClassification Rasterizer::ClassifyDraw(const AmdGpu::DrawRegs& regs,
-                                                        const FixedState* executed) {
-    if (executed == nullptr) {
-        DrawClassification operation;
-        if (ClassifyOperation(regs, operation)) {
-            return operation;
-        }
-    }
-    const bool cb_disabled = executed ? !executed->color_enabled
-                                      : regs.color_control.mode ==
-                                            AmdGpu::ColorControl::OperationMode::Disable;
-    const bool no_targets = executed ? executed->NoColorTargets() : regs.color_target_mask.raw == 0;
-    const u32 skip = VideoCore::ReadbackPolicy::Get().skip_shadows.load(std::memory_order_relaxed);
-    if (skip != 0 && (cb_disabled || no_targets) && regs.depth_buffer.DepthValid()) {
-        const u32 pitch = regs.depth_buffer.Pitch();
-        const u32 height = regs.depth_buffer.Height();
-        if (skip == 1 ? pitch == height : pitch == skip || height == skip) {
-            return {DrawClass::SkipShadow};
-        }
-    }
-    return {DrawClass::Normal};
-}
-
 Rasterizer::DrawClassification Rasterizer::ClassifyRemaining(const DrawInputs& inputs, const FixedState& fixed) {
     const u32 skip = VideoCore::ReadbackPolicy::Get().skip_shadows.load(std::memory_order_relaxed);
     if (skip != 0 && (!fixed.color_enabled || fixed.NoColorTargets()) && inputs.depth_buffer.DepthValid()) {
@@ -325,20 +249,16 @@ Rasterizer::DrawClassification Rasterizer::ClassifyRemaining(const DrawInputs& i
 
 bool Rasterizer::FilterDraw(const DrawPlan* plan) {
     TLG_PROF_LEVEL("raster.filter_draw", 3);
-    // With a plan everything comes from the plan (the command processor thread made it from its own state); without one (the
-    // unsplit path) from the register mirror.
-    DrawInputs inputs_storage;
-    const DrawInputs& inputs = plan ? plan->inputs : (inputs_storage = MakeDrawInputs(liverpool->RasterRegs()), inputs_storage);
-    const auto& cb_extents = plan ? plan->cb_extent : liverpool->RasterCbExtents();
-    const AmdGpu::CbDbExtent& db_extent = plan ? plan->db_extent : liverpool->RasterDbExtent();
-    current_target_resources = plan ? &plan->target_resources : &liverpool->RasterTargetResources(); // E3: the game's own transition operations name their targets too
-    DrawClassification classified;
-    if (plan != nullptr) {
-        classified = plan->op_class != 0xff ? DrawClassification{static_cast<DrawClass>(plan->op_class), plan->depth_copy, plan->stencil_copy}
-                                            : ClassifyRemaining(plan->inputs, plan->fixed);
-    } else {
-        classified = ClassifyDraw(liverpool->RasterRegs(), nullptr);
+    // F3.5: everything comes from the plan (the command processor thread made it from the record); a draw without a plan is not drawn
+    if (plan == nullptr) {
+        return false;
     }
+    const DrawInputs& inputs = plan->inputs;
+    const auto& cb_extents = plan->cb_extent;
+    const AmdGpu::CbDbExtent& db_extent = plan->db_extent;
+    current_target_resources = &plan->target_resources; // E3: the game's own transition operations name their targets too
+    const DrawClassification classified = plan->op_class != 0xff ? DrawClassification{static_cast<DrawClass>(plan->op_class), plan->depth_copy, plan->stencil_copy}
+                                                                  : ClassifyRemaining(plan->inputs, plan->fixed);
     {
         // how often the game's own transition draws (fast clear eliminate, fmask, resolve, depth copy) occur
         static std::array<u64, 12> class_counts{};
@@ -405,10 +325,7 @@ bool Rasterizer::FilterDraw(const DrawPlan* plan) {
     }
     {
         // Which depth targets do the depth-only draws go to? (debug server /policy)
-        const bool no_color =
-            plan ? (!plan->fixed.color_enabled || plan->fixed.NoColorTargets())
-                 : (liverpool->RasterRegs().color_control.mode == AmdGpu::ColorControl::OperationMode::Disable ||
-                    liverpool->RasterRegs().color_target_mask.raw == 0);
+        const bool no_color = !plan->fixed.color_enabled || plan->fixed.NoColorTargets();
         if (no_color && inputs.depth_buffer.DepthValid()) {
             VideoCore::ReadbackPolicy::Get().NoteDepthOnly(inputs.depth_buffer.Pitch(), inputs.depth_buffer.Height());
         }
@@ -416,25 +333,9 @@ bool Rasterizer::FilterDraw(const DrawPlan* plan) {
     return true;
 }
 
-std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
-                                               DrawIndirectParams params,
-                                               const FixedState* native, u64 exec_key, u64 inputs_key, const Core::NativeDraw::ExecDraw* record, u32 index_count) {
-    // SkipShadow draws are still planned: the switch can change between the front and the raster
-    // thread, and the raster thread must find a plan for every draw it does not drop.
-    // An executed draw is a normal draw by construction (only the shadow skip switch looks at it, when the draw is
-    // recorded).
-    bool executed = native != nullptr;
-    DrawClassification operation{};
-    bool is_operation = false;
-    if (!executed) {
-        const auto classified = ClassifyDraw(regs);
-        const auto kind = classified.kind;
-        if (kind != DrawClass::Normal && kind != DrawClass::SkipShadow) {
-            // one of the game's own transition operations: the plan carries what the raster thread needs to perform it
-            is_operation = true;
-            operation = classified;
-        }
-    }
+std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(DrawIndirectParams params, const FixedState& native, u64 exec_key, u64 inputs_key, const Core::NativeDraw::ExecDraw& record, u32 index_count) {
+    // F3.5: a draw is planned from its record, the fixed-function state built from the engine's objects, and the shader and target descriptions; no register image exists. SkipShadow draws are
+    // still planned: the switch can change between the front and the raster thread.
     std::unique_ptr<DrawPlan> plan;
     {
         std::scoped_lock lk{plan_pool_mutex};
@@ -446,42 +347,19 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
     if (!plan) {
         plan = std::make_unique<DrawPlan>();
     }
-    plan->executed = executed;
+    const DrawClassification no_operation{};
+    plan->executed = true;
     plan->native_seq = 0;
     plan->bindings_complete = false;
     plan->has_geometry_handles = false;
     plan->binding_count = 0;
-    plan->op_class = is_operation ? static_cast<u8>(operation.kind) : u8{0xff};
-    plan->depth_copy = operation.depth_copy;
-    plan->stencil_copy = operation.stencil_copy;
-    if (is_operation) {
-        plan->pipeline = nullptr;
-        plan->executed = false;
-        plan->inputs = MakeDrawInputs(regs);
-        return plan;
-    }
-    // The fixed-function state built from the engine's objects; a draw without one (a fast clear eliminate whose operation could not be planned)
-    // takes it from the register mirror.
-    if (native) {
-        Core::NativeDraw::Live().fixed_native.fetch_add(1, std::memory_order_relaxed);
-        plan->fixed = *native;
-    } else {
-        plan->fixed = MakeFixedState(regs);
-    }
-    // F3.4 (`TLG_INPUTS_FROM_RECORD`, default on, `=0` back to the register image, read once): the inputs of a draw with a record are made from the record (its register pairs, the target
-    // description, the typed draw arguments, the step rates of the vertex shader object), not from the register image.
-    static const bool inputs_from_record = [] {
-        const char* e = std::getenv("TLG_INPUTS_FROM_RECORD");
-        return e == nullptr || *e != '0';
-    }();
-    if (record != nullptr && inputs_from_record) {
-        plan->inputs = MakeInputsFromRecord(*record, index_count);
-        Core::NativeDraw::Live().key_targets[10].fetch_add(1, std::memory_order_relaxed);
-    } else {
-        plan->inputs = MakeDrawInputs(regs);
-        Core::NativeTargetDesc::ApplyAtFill(plan->inputs); // E7 (TLG_TARGET_DESC_USE): the engine's objects decide the target part, the registers keep the rest
-        Core::NativeDraw::Live().key_targets[11].fetch_add(1, std::memory_order_relaxed);
-    }
+    plan->op_class = 0xff;
+    plan->depth_copy = no_operation.depth_copy;
+    plan->stencil_copy = no_operation.stencil_copy;
+    Core::NativeDraw::Live().fixed_native.fetch_add(1, std::memory_order_relaxed);
+    plan->fixed = native;
+    plan->inputs = MakeInputsFromRecord(record, index_count);
+    Core::NativeDraw::Live().key_targets[10].fetch_add(1, std::memory_order_relaxed);
     {
         // F3.3: the words of the inputs that only the register image has (clip planes, border colour base, index offset) are checked: not zero would mean the native planning needs a value for them
         const auto not_zero = [](const auto& value) {
@@ -499,119 +377,10 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
             live.reg_only_nonzero.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    if (record != nullptr && Core::NativePlanShadow::On()) {
-        // F3.4 shadow: the inputs made from the record against the ones made from the register image, member by member
-        const DrawInputs made = MakeInputsFromRecord(*record, index_count);
-        const char* d = "draw_inputs";
-        DrawInputs register_made = MakeDrawInputs(regs);
-        Core::NativeTargetDesc::ApplyAtFill(register_made);
-        const auto& r = register_made;
-#define SHADOW_INPUT(name) Core::NativePlanShadow::CompareBytes(d, #name, &made.name, &r.name, sizeof(made.name))
-        for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
-            if (made.color_buffers[i] || r.color_buffers[i]) {
-                Core::NativePlanShadow::CompareBytes(d, "color_buffers", &made.color_buffers[i], &r.color_buffers[i], sizeof(made.color_buffers[i]));
-            }
-        }
-        // a depth target that is not bound leaves stale register words (clear value, htile base, format words): compared only when a depth or stencil target is bound on either side
-        const bool depth_bound = made.depth_buffer.DepthValid() || made.depth_buffer.StencilValid() || r.depth_buffer.DepthValid() || r.depth_buffer.StencilValid();
-        Core::NativePlanShadow::Compare(d, "depth_bound", made.depth_buffer.DepthValid() || made.depth_buffer.StencilValid(), r.depth_buffer.DepthValid() || r.depth_buffer.StencilValid());
-        if (depth_bound) {
-            SHADOW_INPUT(depth_buffer);
-            SHADOW_INPUT(depth_clear);
-            SHADOW_INPUT(stencil_clear);
-            SHADOW_INPUT(depth_htile_data_base);
-        }
-        SHADOW_INPUT(depth_view);
-        SHADOW_INPUT(depth_control);
-        SHADOW_INPUT(depth_render_control);
-        SHADOW_INPUT(index_offset);
-        SHADOW_INPUT(vgt_instance_step_rate_0);
-        SHADOW_INPUT(vgt_instance_step_rate_1);
-        SHADOW_INPUT(index_buffer_type);
-        SHADOW_INPUT(ta_bc_base);
-        SHADOW_INPUT(clip_user_data);
-        // the draw arguments: compared where the record sets them; where it does not, the register value is counted by the kind of the draw (0 indexed, 1 auto, 2 indirect)
-        static const char* const unset_group[3] = {"draw_inputs_unset_kind0", "draw_inputs_unset_kind1", "draw_inputs_unset_kind2"};
-        const char* u = unset_group[std::min<u32>(record->kind, 2)];
-        const auto& m = record->args.mask;
-        if ((m & Core::NativeDraw::DrawArgs::NumIndices) != 0 || index_count != ~0u) {
-            SHADOW_INPUT(num_indices);
-        } else {
-            Core::NativePlanShadow::RegisterOnly(u, "num_indices", r.num_indices);
-        }
-        if ((m & Core::NativeDraw::DrawArgs::NumInstances) != 0) {
-            SHADOW_INPUT(num_instances);
-        } else {
-            Core::NativePlanShadow::RegisterOnly(u, "num_instances", r.num_instances.NumInstances());
-        }
-        if ((m & Core::NativeDraw::DrawArgs::IndexBase) != 0) {
-            SHADOW_INPUT(index_base_address);
-        } else {
-            Core::NativePlanShadow::RegisterOnly(u, "index_base_address", r.index_base_address.base_addr_lo | r.index_base_address.base_addr_hi);
-        }
-        if ((m & Core::NativeDraw::DrawArgs::MaxIndexSize) != 0) {
-            SHADOW_INPUT(max_index_size);
-        } else {
-            Core::NativePlanShadow::RegisterOnly(u, "max_index_size", r.max_index_size);
-        }
-#undef SHADOW_INPUT
-    }
     if (inputs_key != 0 && plan->executed) {
         exec_inputs.insert_or_assign(inputs_key, plan->inputs);
     }
-    pipeline_cache.PlanGraphics(regs, plan->fixed, params, *plan, plan->executed ? exec_key : 0);
-    if (Core::NativePlanShadow::On()) {
-        // E7b Task 3: what RefreshGraphicsKey reads of the targets comes from the register image (`regs`); the inputs of the plan hold the native description. The key's fields, both ways.
-        const char* g = "pipeline_key_targets";
-        const auto& in = plan->inputs;
-        for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
-            const auto& native_cb = in.color_buffers[i];
-            const auto& reg_cb = regs.color_buffers[i];
-            Core::NativePlanShadow::Compare(g, "color.present", native_cb ? 1 : 0, reg_cb ? 1 : 0);
-            if (!native_cb || !reg_cb) {
-                continue;
-            }
-            Core::NativePlanShadow::Compare(g, "color.data_format", static_cast<u64>(native_cb.GetDataFmt()), static_cast<u64>(reg_cb.GetDataFmt()));
-            Core::NativePlanShadow::Compare(g, "color.num_format", static_cast<u64>(native_cb.GetNumberFmt()), static_cast<u64>(reg_cb.GetNumberFmt()));
-            Core::NativePlanShadow::Compare(g, "color.num_conversion", static_cast<u64>(native_cb.GetNumberConversion()), static_cast<u64>(reg_cb.GetNumberConversion()));
-            const auto native_swizzle = native_cb.Swizzle();
-            const auto reg_swizzle = reg_cb.Swizzle();
-            Core::NativePlanShadow::CompareBytes(g, "color.swizzle", &native_swizzle, &reg_swizzle, sizeof(native_swizzle));
-            Core::NativePlanShadow::Compare(g, "color.num_samples", native_cb.NumSamples(), reg_cb.NumSamples());
-            Core::NativePlanShadow::Compare(g, "color.blend_bypass", native_cb.info.blend_bypass, reg_cb.info.blend_bypass);
-        }
-        if (in.depth_buffer.DepthValid() || regs.depth_buffer.DepthValid()) {
-            Core::NativePlanShadow::Compare(g, "depth.valid", in.depth_buffer.DepthValid(), regs.depth_buffer.DepthValid());
-            Core::NativePlanShadow::Compare(g, "depth.z_format", static_cast<u64>(in.depth_buffer.z_info.format), static_cast<u64>(regs.depth_buffer.z_info.format));
-            Core::NativePlanShadow::Compare(g, "depth.num_samples", in.depth_buffer.NumSamples(), regs.depth_buffer.NumSamples());
-        }
-        {
-            // the draw state words of DrawInputs (depth_control, depth_render_control) against the native fixed state of the plan (the fixed state decides the pipeline; DrawInputs feeds the render state)
-            const char* h = "inputs_vs_native_fixed";
-            Core::NativePlanShadow::Compare(h, "depth_control.depth_enable", plan->fixed.depth_test, in.depth_control.depth_enable);
-            Core::NativePlanShadow::Compare(h, "depth_control.depth_write_enable", plan->fixed.depth_write, in.depth_control.depth_write_enable);
-            Core::NativePlanShadow::Compare(h, "depth_control.stencil_enable", plan->fixed.stencil_test, in.depth_control.stencil_enable);
-            Core::NativePlanShadow::Compare(h, "depth_render_control.depth_clear_enable", plan->fixed.depth_clear, in.depth_render_control.depth_clear_enable);
-            Core::NativePlanShadow::Compare(h, "depth_render_control.stencil_clear_enable", plan->fixed.stencil_clear, in.depth_render_control.stencil_clear_enable);
-            // words with no native value: how often they are not at their default
-            const auto nonzero = [](const auto& value) {
-                const auto* bytes = reinterpret_cast<const unsigned char*>(&value);
-                for (size_t i = 0; i < sizeof(value); ++i) {
-                    if (bytes[i] != 0) {
-                        return u64{1};
-                    }
-                }
-                return u64{0};
-            };
-            Core::NativePlanShadow::RegisterOnly("inputs", "ta_bc_base", nonzero(in.ta_bc_base));
-            Core::NativePlanShadow::RegisterOnly("inputs", "clip_user_data", nonzero(in.clip_user_data));
-            Core::NativePlanShadow::RegisterOnly("inputs", "index_offset", in.index_offset);
-        }
-        if (in.depth_buffer.StencilValid() || regs.depth_buffer.StencilValid()) {
-            Core::NativePlanShadow::Compare(g, "stencil.valid", in.depth_buffer.StencilValid(), regs.depth_buffer.StencilValid());
-            Core::NativePlanShadow::Compare(g, "stencil.format", static_cast<u64>(in.depth_buffer.stencil_info.format), static_cast<u64>(regs.depth_buffer.stencil_info.format));
-        }
-    }
+    pipeline_cache.PlanGraphics(plan->fixed, params, *plan, exec_key);
     return plan;
 }
 
@@ -667,6 +436,8 @@ std::unique_ptr<DispatchPlan> Rasterizer::PlanDispatch(const AmdGpu::ComputeProg
     return plan;
 }
 
+static const AmdGpu::BorderColorBuffer no_border_colors{}; // a dispatch always has a plan; the default stands for none
+
 const GraphicsPipeline* Rasterizer::ResolveDrawPipeline(const DrawPlan* plan,
                                                         DrawIndirectParams params) {
     TLG_PROF_LEVEL("raster.pipeline_lookup", 2);
@@ -674,13 +445,8 @@ const GraphicsPipeline* Rasterizer::ResolveDrawPipeline(const DrawPlan* plan,
         PipelineCache::ApplyPlan(*plan);
         return plan->pipeline;
     }
-    if (liverpool->SplitActive()) {
-        // The command processor filtered this draw but the raster thread did not: the register
-        // mirror is out of sync. Skip it rather than touch the command processor's state.
-        LOG_ERROR(Render_Vulkan, "CP split: draw without a pipeline plan skipped");
-        return nullptr;
-    }
-    return pipeline_cache.GetGraphicsPipeline(params);
+    LOG_ERROR(Render_Vulkan, "draw without a pipeline plan skipped"); // F3.5: no plan, no register image to plan from
+    return nullptr;
 }
 
 const ComputePipeline* Rasterizer::ResolveDispatchPipeline(const DispatchPlan* plan) {
@@ -901,10 +667,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         Core::LightRecorder::FrameOp(Core::DebugServer::PresentCount(), draw_class < 5 ? draw_class + 1 : 6, reinterpret_cast<u64>(pipeline), texture_cache.ImageGeneration());
     }
     TLG_PROF_NAMED_LEVEL(prof_inputs, "raster.plan_inputs", 3);
-    FixedState fixed_storage;
-    const FixedState& fixed = FixedFor(plan, fixed_storage);
-    DrawInputs inputs_storage;
-    draw_inputs = &InputsFor(plan, inputs_storage);
+    const FixedState& fixed = plan->fixed;
+    draw_inputs = &plan->inputs;
     prof_inputs.End();
     current_bc_base = &draw_inputs->ta_bc_base;
     current_cb_extent = plan ? &plan->cb_extent : &liverpool->RasterCbExtents();
@@ -1016,10 +780,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!pipeline) {
         return;
     }
-    FixedState fixed_storage;
-    const FixedState& fixed = FixedFor(plan, fixed_storage);
-    DrawInputs inputs_storage;
-    draw_inputs = &InputsFor(plan, inputs_storage);
+    const FixedState& fixed = plan->fixed;
+    draw_inputs = &plan->inputs;
     current_bc_base = &draw_inputs->ta_bc_base;
     current_cb_extent = plan ? &plan->cb_extent : &liverpool->RasterCbExtents();
     current_db_extent = plan ? &plan->db_extent : &liverpool->RasterDbExtent();
@@ -1143,7 +905,7 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     }
 
     current_cs = plan ? &plan->cs : &liverpool->GetCsRegs();
-    current_bc_base = plan ? &plan->ta_bc_base : &liverpool->RasterRegs().ta_bc_base;
+    current_bc_base = plan ? &plan->ta_bc_base : &no_border_colors;
     const auto& cs_program = *current_cs;
     const ComputePipeline* pipeline = ResolveDispatchPipeline(plan);
     if (!pipeline) {
@@ -1273,7 +1035,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Dis
     }
 
     current_cs = plan ? &plan->cs : &liverpool->GetCsRegs();
-    current_bc_base = plan ? &plan->ta_bc_base : &liverpool->RasterRegs().ta_bc_base;
+    current_bc_base = plan ? &plan->ta_bc_base : &no_border_colors;
     const ComputePipeline* pipeline = ResolveDispatchPipeline(plan);
     if (!pipeline) {
         return;
