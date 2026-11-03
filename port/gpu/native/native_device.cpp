@@ -225,6 +225,10 @@ void NoteView(Kind kind, u64 view_object, u64 desc) {
         view.has_desc = true;
         std::memcpy(view.desc, reinterpret_cast<const void*>(desc), sizeof(view.desc));
     }
+    if ((kind == Kind::ShaderResourceView || kind == Kind::UnorderedAccessView) && resource.kind >= Kind::Texture1D && resource.kind <= Kind::Texture3D) {
+        view.has_tsharp = true;
+        std::memcpy(view.tsharp, reinterpret_cast<const void*>(view_object + (kind == Kind::ShaderResourceView ? 0x58 : 0x54)), sizeof(view.tsharp));
+    }
     view.address = resource.address;
     view.bytes = resource.bytes;
     view.width = resource.width, view.height = resource.height, view.depth = resource.depth, view.mips = resource.mips, view.layers = resource.layers;

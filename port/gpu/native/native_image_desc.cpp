@@ -120,7 +120,8 @@ constexpr const char* FieldNames[FieldCount] = {"base_address", "data_format", "
 
 std::atomic<u64> g_sampler_derived{}, g_sampler_unknown{}, g_sampler_differing{};
 std::atomic<u32> g_sampler_unknown_logged{};
-std::atomic<u64> g_held_equal{}, g_held_differ{}, g_held_none{};
+std::atomic<u64> g_held_equal{}, g_held_differ{}, g_held_none{}, g_snap_equal{}, g_snap_differ{};
+std::array<std::atomic<u64>, 8> g_snap_word_differs{};
 std::array<std::atomic<u64>, 8> g_held_word_differs{};
 std::atomic<u64> g_no_view{}, g_view_unknown{}, g_view_without_desc{}, g_view_with_desc{}, g_compared{}, g_equal{}, g_unknown_object{}, g_unknown_format{};
 std::array<std::atomic<u64>, FieldCount> g_differing{};
@@ -170,6 +171,11 @@ void DescValues(const NativeDesc::ImageDesc& d, u64 (&v)[DescFieldCount]) {
 }
 
 } // namespace
+
+/// Where a view object keeps its T#: shader resource view +0x58, unordered access view +0x54
+constexpr u64 HeldOffset(NativeDevice::Kind kind) noexcept {
+    return kind == NativeDevice::Kind::UnorderedAccessView ? 0x54 : 0x58;
+}
 
 Result Derive(u64 resource_id, u64 view_id, AmdGpu::Image& out) {
     using NativeDevice::Kind;
@@ -256,11 +262,13 @@ Result Derive(u64 resource_id, u64 view_id, AmdGpu::Image& out) {
     out.base_array = base_array;
     out.last_array = last_array;
     // The engine builds the descriptor it hands to the shaders when it creates the view (a copy of the one inside the texture object, with the view's own size and level
-    // fields) and keeps it in the view object. The Direct3D description has two numbers it cannot say: a texture the engine allocated with padded rows (1088 for 1080) and a
+    // fields) and keeps it in the view object (shader resource view +0x58, unordered access view +0x54: the creation functions `FUN_02493620` / `FUN_024999e0`).
+    // Something changes it after the creation (the height of a 1088 row texture reads 1080 later; the writer is not identified), so the live object is read, not the table's
+    // creation time copy (`tsharp`, kept only for the snapshot counter). The Direct3D description has two numbers it cannot say: a texture the engine allocated with padded rows (1088 for 1080) and a
     // level count it limits (7 of 8 for a block compressed cube). Where the view's copy still names this texture (same memory and format) those fields come from it.
     if (view_known && view.object != 0) {
         AmdGpu::Image held;
-        std::memcpy(&held, reinterpret_cast<const void*>(view.object + 0x58), 32);
+        std::memcpy(&held, reinterpret_cast<const void*>(view.object + HeldOffset(view.kind)), 32);
         if (held.base_address == out.base_address && held.data_format == out.data_format && held.num_format == out.num_format) {
             out.width = held.width;
             out.height = held.height;
@@ -349,10 +357,10 @@ bool DeriveDesc(u64 resource_id, u64 view_id, NativeDesc::ImageDesc& out) {
     out.last_level = last_level;
     out.base_array = base_array;
     out.last_array = last_array;
-    // the descriptor the engine keeps inside the view object (+0x58): the padded rows and the limited level count (see Derive)
+    // the descriptor the engine keeps inside the view object: the padded rows and the limited level count (see Derive)
     if (view_known && view.object != 0) {
         u64 q[2];
-        std::memcpy(q, reinterpret_cast<const void*>(view.object + 0x58), sizeof(q));
+        std::memcpy(q, reinterpret_cast<const void*>(view.object + HeldOffset(view.kind)), sizeof(q));
         const u64 held_address = q[0] & ((1ull << 38) - 1), held_dfmt = (q[0] >> 52) & 0x3f, held_nfmt = (q[0] >> 58) & 0xf;
         if (held_address == res.address >> 8 && held_dfmt == format->data_format && held_nfmt == format->num_format) {
             out.width = static_cast<u32>(q[1] & 0x3fff) + 1;
@@ -381,20 +389,28 @@ void Compare(u64 resource_id, u64 view_id, const AmdGpu::Image& actual) {
         return;
     }
     {
-        // the descriptor the engine keeps inside the view object (+0x58, eight dwords): is it the one the record holds?
+        // the descriptor the engine keeps inside the view object (eight dwords; shader resource view +0x58, unordered access view +0x54): is it the one the record holds?
+        // `live` is read now (the raster thread, later than the record), `snapshot` is what the table kept when the creation returned
         NativeDevice::Object v;
-        if (view_id != 0 && NativeDevice::Lookup(view_id, v) && v.object != 0) {
+        if (view_id != 0 && NativeDevice::Lookup(view_id, v) && v.object != 0 && v.has_tsharp) {
             u32 held[8], now[8];
-            std::memcpy(held, reinterpret_cast<const void*>(v.object + 0x58), sizeof(held));
+            std::memcpy(held, reinterpret_cast<const void*>(v.object + HeldOffset(v.kind)), sizeof(held));
             std::memcpy(now, &actual, sizeof(now));
-            bool same = true;
+            bool same = true, snapshot_same = true;
             for (u32 w = 0; w < 8; ++w) {
                 if (held[w] != now[w]) {
                     same = false;
                     g_held_word_differs[w].fetch_add(1, std::memory_order_relaxed);
                 }
+                // the address refresh edits dword 0 and the high address bits of dword 1: those two are compared without them
+                const u32 mask = w == 0 ? 0u : w == 1 ? ~0x3fu : ~0u;
+                if (((v.tsharp[w] ^ now[w]) & mask) != 0) {
+                    snapshot_same = false;
+                    g_snap_word_differs[w].fetch_add(1, std::memory_order_relaxed);
+                }
             }
             (same ? g_held_equal : g_held_differ).fetch_add(1, std::memory_order_relaxed);
+            (snapshot_same ? g_snap_equal : g_snap_differ).fetch_add(1, std::memory_order_relaxed);
         } else {
             g_held_none.fetch_add(1, std::memory_order_relaxed);
         }
@@ -872,6 +888,10 @@ void StudySampler(u64 object, const u32* words) {
 nlohmann::json Report() {
     nlohmann::json j;
     j["view_holds_the_record_descriptor"] = {{"equal", g_held_equal.load()}, {"differ", g_held_differ.load()}, {"binding_has_no_view", g_held_none.load()}};
+    j["view_creation_snapshot_vs_record"] = {{"equal", g_snap_equal.load()}, {"differ", g_snap_differ.load()}};
+    for (u32 w = 0; w < 8; ++w) {
+        j["view_creation_snapshot_vs_record"]["dword_differs"].push_back(g_snap_word_differs[w].load());
+    }
     for (u32 w = 0; w < 8; ++w) {
         j["view_holds_the_record_descriptor"]["dword_differs"].push_back(g_held_word_differs[w].load());
     }

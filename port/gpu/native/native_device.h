@@ -43,6 +43,8 @@ struct Object {
     u64 resource_id{};    ///< views: the id of the resource they look at
     Kind resource_kind{}; ///< views: the kind of that resource
     u32 stride{};         ///< buffers: StructureByteStride
+    bool has_tsharp{};    ///< texture views: `tsharp` is the T# the engine made for the view when it created it (shader resource view: object +0x58, unordered access view: +0x54)
+    u32 tsharp[8]{};      ///< (the view creation copies the texture's T# and edits only the mip levels and the array range; later only the address refresh changes it: F4 notes, question a)
     bool has_desc{};      ///< views: `desc` holds the first dwords of the description the view was created with (D3D11 layout: format, dimension, then the range)
     u32 desc[8]{};
 };
