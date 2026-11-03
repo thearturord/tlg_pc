@@ -25,7 +25,6 @@
 #include "native/native_device.h"
 #include "native/native_image_desc.h"
 #include "native/native_resources.h"
-#include "native/native_pass.h"
 #include "native/native_updates.h"
 #include "native/native_drain_audit.h"
 #include "native/native_uploads.h"
@@ -746,7 +745,6 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     }
     DebugState.IncDrawCall();
     scheduler.NoteDraw();
-    Core::NativePass::NoteDraw(tag.valid ? (tag.meta & 0xff) : 15u, false, pass_barrier, pipeline);
     ++recorded_work;
 
     ResetBindings(false);
@@ -830,7 +828,6 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed, fixed);
     scheduler.BeginRendering(state);
-    Core::NativePass::NoteDraw(4, true, pass_barrier, pipeline);
 
     NoteMarkerRow(1, 4, pipeline, plan != nullptr ? plan->native_seq : 0, draw_inputs, max_count, 0);
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -1299,7 +1296,6 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
 
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     TLG_PROF_LEVEL("raster.bind_vertex_buffers", 2);
-    Core::NativeUploads::SetCaller(3);
     const auto& regs = *draw_inputs;
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
@@ -1420,7 +1416,6 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 
 void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
     TLG_PROF_LEVEL("raster.bind_index_buffer", 2);
-    Core::NativeUploads::SetCaller(4);
     const auto& regs = *draw_inputs;
 
     // Figure out index type and size.
@@ -1490,7 +1485,6 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
 
 void Rasterizer::ResetBindings(bool is_compute) {
     TLG_PROF_LEVEL("raster.reset_bindings", 2);
-    Core::NativeUploads::SetCaller(0);
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
@@ -1657,7 +1651,6 @@ bool Rasterizer::HazardAuditOn() const noexcept {
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     TLG_PROF_LEVEL("raster.bind_buffers", 2);
-    Core::NativeUploads::SetCaller(stage.sw_stage == Shader::SwStage::Compute ? 2 : 1);
     const Core::NativeE3Census::WriteSiteScope e3_site{stage.sw_stage == Shader::SwStage::Compute ? Core::NativeE3Census::WriteSite::ShaderCompute : Core::NativeE3Census::WriteSite::ShaderGraphics};
     const u64 alignment = instance.StorageMinAlignment();
     const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
@@ -1667,9 +1660,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         const auto src_access =
             vk::AccessFlagBits2::eShaderRead |
             (desc.is_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eNone);
-        if (desc.is_written) {
-            Core::NativePass::NoteWrite(false);
-        }
         const RingBinding* ring =
             const_ring_level >= 4 && (ring_draw || ring_dispatch) ? FindRingBinding(stage, buffer_index) : nullptr;
         if (ring != nullptr && ring->formatted) {
@@ -1896,14 +1886,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 } else {
                     Census(census_base + CBufferAddrRead);
                     Census(census_base + (size <= 256 ? CBufferAddrReadLe256 : size <= 4096 ? CBufferAddrReadLe4k : size <= 65536 ? CBufferAddrReadLe64k : CBufferAddrReadBig));
-                }
-                Core::NativeUploads::SetDetail((desc.is_written ? 1u : 0u) | (desc.is_formatted ? 2u : 0u) | (size > VideoCore::BufferCache::StreamThreshold() ? 4u : 0u) |
-                                               ((ring_draw || ring_dispatch) ? 16u : 0u) |
-                                               (Core::NativeUploads::OnDemandAudit() && buffer_cache.IsRegionGpuModified(vsharp.address, size) ? 32u : 0u) |
-                                               (Core::NativeUploads::OnDemandAudit() && buffer_cache.IsRangeGpuWritten(vsharp.address, size) ? 64u : 0u) |
-                                               (Core::NativeUploads::OnDemandAudit() && texture_cache.FindImageFromRange(vsharp.address, size) ? 128u : 0u));
-                if (Core::NativeUploads::OnDemandAudit()) {
-                    Core::NativeUploads::SetWriter(Core::NativeUpdates::WhoWrote(vsharp.address, size));
                 }
                 if (record_binding != ~0u && binder_plan != nullptr) {
                     Core::NativeDevice::CheckBuffer(binder_plan->bindings[record_binding].id, vsharp.address, size); // B1 shadow check
@@ -2223,9 +2205,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     u32 num_images{};
     std::array<u32, Shader::NUM_IMAGES> image_keys{}; // tlg C9: the descriptor array of each image of the stage
     for (const auto& image_desc : stage.images) {
-        if (image_desc.is_written) {
-            Core::NativePass::NoteWrite(true);
-        }
         AmdGpu::Image chosen_tsharp;
         bool image_from_record = false;
         u64 image_view_id = 0;   // E2: the engine's id of the view object the descriptor was built from
@@ -3318,9 +3297,6 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     Core::NativeResources::NoteCpuWrite(addr, size);
     if (Core::NativeUpdates::AuditFaults()) {
         Core::NativeUpdates::NoteFault(addr, size);
-        if (Core::NativeUploads::OnDemandAudit() && buffer_cache.IsRangeGpuWritten(addr, size)) {
-            Core::NativeUpdates::NoteGpuWrittenDirtied(addr, size);
-        }
     }
 #ifdef ARCH_X86_64
     Core::GuestHooks::NoteWriteFault(addr, size);

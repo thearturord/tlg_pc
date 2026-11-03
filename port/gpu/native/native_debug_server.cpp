@@ -27,7 +27,6 @@
 #include "native/native_invariant.h"
 #include "native/native_log.h"
 #include "native/native_timeline.h"
-#include "native/native_pass.h"
 #include "native/native_registry.h"
 #include "native/native_census.h"
 #include "native/native_frame_gate.h"
@@ -656,13 +655,6 @@ void RegisterBuiltins() {
                      Core::NativeRegistry::Start();
                  }
                  return Core::NativeRegistry::Report();
-             });
-    Register("/passes", "?start=1 turns the pass audit on (N4a): rendering instances of the scheduler, their draws, what ends them and whether they are plain runs of draws",
-             [](const Params& params) {
-                 if (ParseNumber(params, "start", 0) != 0) {
-                     Core::NativePass::Start();
-                 }
-                 return Core::NativePass::Report();
              });
     Register("/updates", "?start=1 turns the update audit on (N5a): buffer Maps the engine announces, and which CPU write faults they cover",
              [](const Params& params) {

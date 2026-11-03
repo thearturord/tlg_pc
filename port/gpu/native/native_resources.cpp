@@ -619,9 +619,6 @@ std::array<std::atomic<u64>, 5> lift_census_faults{};
 std::array<std::atomic<u64>, 8> lift_census_by_usage_size{};
 
 void NoteCpuWrite(VAddr address, u64 size) {
-    if (static const bool census = [] { const char* e = std::getenv("TLG_LIFT_CENSUS"); return e != nullptr && *e == '1'; }(); census && Core::NativeRegistry::enabled.load(std::memory_order_relaxed)) {
-        Core::NativeRegistry::NoteFaultBuffer(address);
-    }
     {
         std::shared_lock lock{immutable_mutex};
         if (!immutables.empty()) {
@@ -865,14 +862,6 @@ u32 ResidentCap() {
         return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 16)) : 262144u;
     }();
     return cap;
-}
-
-u32 ResidentVerifyInterval() {
-    static const u32 interval = [] {
-        const char* e = std::getenv("TLG_RESIDENT_VERIFY"); // P1: 1 in 1024 by default (64 until 2026-10-28; the regression sets its own)
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 0u; // off by default since 2026-10-30
-    }();
-    return interval;
 }
 
 void NoteResident(u32 what) {

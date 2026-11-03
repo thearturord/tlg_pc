@@ -312,7 +312,6 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
         std::scoped_lock lock{placed_mutex};
         placed.emplace(begin, PlacedBuffer{ids, {}, begin, end, std::move(buffer)});
     }
-    ForgetShadows(begin, end);
     Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9Placed);
     Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedBytes, end - begin);
     if (ids.size() > 1 || !inside.empty()) {

@@ -221,8 +221,6 @@ private:
     /// B9.1: the bytes of each engine buffer (by its id) the engine announced since their last upload
     std::unordered_map<u64, RangeSet> object_dirty;
     RangeSet all_object_dirty; ///< B9.1 audit: the same bytes of all buffers by address
-    std::unordered_map<u64, std::unique_ptr<std::array<u8, 4096>>> b9_shadow; ///< B9.1 verify: what the GPU copy of a sampled page holds (raster thread)
-    RangeSet b9_owed; ///< B9.1 verify: differences found, waiting for an announcement
     /// B9.4: the Vulkan buffer of [address, address + size): a placed engine buffer's own when the range is inside one (placing it at its first use), else the arena
     /// (resident). `demote_spanning`: a range over a placed buffer's edge moves that buffer back into the arena first; false: such a range gets nullptr
     const Buffer* BufferFor(VAddr address, u64 size, bool demote_spanning = true, bool written = false);
@@ -276,7 +274,6 @@ private:
     const Buffer* Place(std::vector<u64> ids, VAddr begin, VAddr end);
     void Demote(VAddr begin, bool by_request);
     void DropPlaced(VAddr begin);
-    void ForgetShadows(VAddr begin, VAddr end);
     /// B9.4: a resident object's binding resolution names `buffer` from now on (a placed buffer remembers it, so freeing the buffer resets it)
     void NoteResolutionUser(const Buffer* buffer, u64 id);
     std::atomic<u64> b9_epoch{0}; ///< B9.3 step 2: bumped when an engine buffer gets changed bytes (the upload memo's answers are stale)

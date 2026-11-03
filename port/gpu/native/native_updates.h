@@ -186,9 +186,6 @@ void NoteE3UnnamedReason(u32 reason) noexcept;
 [[nodiscard]] constexpr u32 B9BufferMode() noexcept {
     return 2u; // native, no switch since the cleanup of 2026-10-30
 }
-/// B9.1 verify (`TLG_B9_VERIFY=N`, native mode): every Nth page keeps a CPU copy of what the GPU copy holds; after a native upload the request's bytes on the page must
-/// equal memory (a byte the engine wrote and did not announce shows up here)
-[[nodiscard]] u32 B9VerifyEvery() noexcept;
 /// B9.2 (`TLG_B9_LIFETIME`): 0 off, 1 audit (an engine buffer's deletion is carried out in order and counted: its announced bytes go, what it leaves behind is
 /// counted), 2 native (also the GPU written bytes and stream copies of its memory go, unless another live buffer shares the memory)
 [[nodiscard]] constexpr u32 B9LifetimeMode() noexcept {
@@ -227,9 +224,6 @@ enum B9Count : u32 {
     B9ObjectOnlyRanges,    ///< announced bytes no page tracker range covered
     B9BytesByTracker,      ///< bytes the page tracker would upload
     B9BytesByObject,       ///< bytes the announcements upload
-    B9VerifyChecked,       ///< verify: request pages compared
-    B9VerifyMiss,          ///< ... differing from memory after the upload (fixed by a page upload)
-    B9VerifyLate,          ///< ... of those, announced afterwards (the game wrote ahead of the raster thread: the page tracker had the same timing)
     B9CpuQueries,          ///< B9.3: CPU changed? for a range inside one engine buffer
     B9CpuAgree,
     B9CpuTrackerNeighbor,  ///< ... tracker yes, buffer no: the page's announced bytes are another buffer's (page granularity)

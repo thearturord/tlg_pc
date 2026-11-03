@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "native/native_pass.h"
 #include "native/native_config.h"
 #include "native/native_registry.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -461,7 +460,6 @@ void Runtime::TickFrame() {
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                          std::span<const vk::BufferCopy> copies) {
     const HazardScope hazard_scope{hazard_override, hazard_audit_on, 6};
-    Core::NativePass::SetEndSite(__builtin_return_address(0));
     scheduler.EndRendering();
 
     bool needs_flush{};
@@ -1369,7 +1367,6 @@ void Runtime::FlushBarriers() {
     live_stats.barriers_memory_only += dep_info.imageMemoryBarrierCount == 0 ? 1 : 0;
     live_stats.barriers_ending_a_pass += scheduler.IsRendering() ? 1 : 0;
     live_stats.barriers_from_compute_writes += (memory_barrier.srcStageMask & vk::PipelineStageFlagBits2::eComputeShader) ? 1 : 0;
-    Core::NativePass::SetEndCause(Core::NativePass::EndCause::Barrier);
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.pipelineBarrier2(dep_info);

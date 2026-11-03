@@ -485,14 +485,6 @@ std::array<std::atomic<u64>, B9Counts> b9_counts{};
 
 
 
-u32 B9VerifyEvery() noexcept {
-    static const u32 n = [] {
-        const char* e = std::getenv("TLG_B9_VERIFY");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 0u;
-    }();
-    return B9BufferMode() == 2 ? n : 0u;
-}
-
 void NoteB9(B9Count what, u64 n) noexcept {
     b9_counts[what].fetch_add(n, std::memory_order_relaxed);
 }
@@ -523,8 +515,6 @@ nlohmann::json B9Report() {
                           {"with_gpu_written_bytes", c(B9DeletedGpuWritten)}, {"memory_shared_with_a_live_buffer", c(B9DeletedAlias)},
                           {"gpu_written_bytes_dropped", c(B9DeletedGpuDropped)}}},
             {"e4_no_arena", {{"announced_uploads_bytes", c(E4AnnouncedUploads)}, {"blocks_freed_with_foreign_gpu_bytes", c(E4FreedWithForeignGpu)}, {"foreign_gpu_bytes", c(E4FreedForeignGpuBytes)}, {"gpu_bytes_lost_at_placement", c(E4GpuBytesLost)}, {"pseudo_placements", c(E4PseudoPlaced)}, {"pseudo_ring", c(E4PseudoRing)}, {"demotes_kept", c(E4DemoteKept)}}},
-            {"verify", {{"every_nth_page", B9VerifyEvery()}, {"pages_checked", c(B9VerifyChecked)}, {"differing", c(B9VerifyMiss)},
-                        {"of_those_announced_later", c(B9VerifyLate)}, {"MISSES_never_announced", c(B9VerifyMiss) - std::min(c(B9VerifyMiss), c(B9VerifyLate))}}},
             {"note", "B9.1, cumulative: engine buffers uploaded by their announced bytes instead of the page tracker's pages"}};
 }
 

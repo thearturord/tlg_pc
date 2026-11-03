@@ -78,7 +78,6 @@ struct ImmutableBuffer {
 /// `TLG_RESIDENT_VERIFY=N` (default 64): every Nth answer without a synchronization is checked with one (nothing may have to be uploaded: else the answer would have been stale).
 bool ResidentBuffersEnabled();
 u32 ResidentCap();
-u32 ResidentVerifyInterval();
 /// An engine writer announced a write of [address, address + size): the resident buffers on those pages are not synchronized any more.
 void NoteAnnouncedWrite(VAddr address, u64 size);
 /// R1b: the GPU writes [address, address + size) (byte exact): the copies of the engine buffers it touches are stale.

@@ -134,10 +134,6 @@ void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, st
     Core::NativeDevice::BuffersIn(address, size, parts);
     std::scoped_lock lock{object_dirty_mutex};
     all_object_dirty.Add(address, size); // audit: every changed byte, by address
-    if (announced && b9_owed.Intersects(address, size)) {
-        Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9VerifyLate);
-        b9_owed.Subtract(address, size);
-    }
     if (announced) {
         Core::NativeUpdates::NoteB9(parts.empty() ? Core::NativeUpdates::B9AnnouncedNoBuffer
                                     : parts.size() == 1 && parts[0].begin == address && parts[0].end == address + size ? Core::NativeUpdates::B9AnnouncedOnBuffer
@@ -328,9 +324,6 @@ nlohmann::json BufferCache::BindMemoReport() const {
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                                 Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
     Core::ResourceAudit::Note(Core::ResourceAudit::BufferUse, device_addr, size, is_written);
-    if (static const bool census = [] { const char* e = std::getenv("TLG_LIFT_CENSUS"); return e != nullptr && *e == '1'; }(); census && Core::NativeRegistry::enabled.load(std::memory_order_relaxed)) {
-        Core::NativeRegistry::NoteRequestBuffer(device_addr, size, is_written);
-    }
     // An immutable engine buffer (see NativeResources::ImmutableBuffer): after one synchronization of the whole buffer it is
     // read straight from the arena.
     // known_no_object (R2): the command processor's lookup by address found no engine object and none was registered since
@@ -401,28 +394,6 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
                 Core::NativeResources::NoteImmutableHit();
                 if (immutable->usage != 1) {
                     Core::NativeResources::NoteResident(0);
-                    const u32 interval = Core::NativeResources::ResidentVerifyInterval();
-                    static std::atomic<u64> resident_hits{0};
-                    if (interval != 0 && resident_hits.fetch_add(1, std::memory_order_relaxed) % interval == 0) {
-                        // verify: one synchronization of the request; anything it has to upload means the answer without it would have been stale
-                        last_upload_bytes = 0;
-                        SynchronizeMemory(arena, device_addr, size, false, false);
-                        Core::NativeResources::NoteResident(2);
-                        if (last_upload_bytes != 0) {
-                            Core::NativeResources::NoteResident(3);
-                            immutable->synced.store(false, std::memory_order_release);
-                            static std::atomic<u32> logged{0};
-                            if (logged.fetch_add(1) < 12) {
-                                // who announced the last write that covers it (needs TLG_UPDATE_AUDIT=1; ~0: no announcement window covers it), the engine id and the bytes now in guest memory
-                                const u32 who = Core::NativeUpdates::WhoWrote(device_addr, size);
-                                u32 words[16] = {};
-                                std::memcpy(words, reinterpret_cast<const void*>(device_addr), std::min<u32>(size, 64));
-                                LOG_ERROR(Render, "resident buffer {:#x}+{} (engine buffer {:#x}..{:#x}, usage {}, engine id {}) was stale: {} bytes had to be uploaded; last announcer {} (0 Map 1 skin 2 light 3 stream copy 4 recording / scene slots 5 creation 6 texture 7 instance group, bit 8 render thread, age ms {}); words {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-                                          device_addr, size, immutable->begin, immutable->end, immutable->usage, immutable->id, last_upload_bytes, who == ~0u ? 99u : (who & 0xff), who == ~0u ? 0u : (who >> 8) & 1, who == ~0u ? 0u : who >> 16,
-                                          words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
-                            }
-                        }
-                    }
                 }
                 TLG_PROF_COUNT("buffer.uncached.immutable_resident");
                 return {arena, arena->Offset(device_addr)};
@@ -437,11 +408,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             const u32 whole = static_cast<u32>(immutable->end - immutable->begin);
             const auto* arena = BufferFor(immutable->begin, immutable->end - immutable->begin);
             last_upload_bytes = 0;
-            const bool immutable_pass_open = Core::NativeUploads::OnDemandAudit() && scheduler.IsRendering();
             SynchronizeMemory(arena, immutable->begin, whole, false, false);
-            if (last_upload_bytes != 0 && Core::NativeUploads::OnDemandAudit()) {
-                Core::NativeUploads::NoteOnDemand(immutable_pass_open, whole, last_upload_bytes, immutable->begin, true);
-            }
             // R1: the object keeps where it is resident (read by the command processor's binding resolution once `synced` is set)
             NoteResolutionUser(arena, immutable->id);
             immutable->resident_buffer.store(arena, std::memory_order_relaxed);
@@ -513,11 +480,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
     }
     const auto* arena = BufferFor(device_addr, size, true, is_written); // B9.4: a placed engine buffer's own Vulkan buffer, or the arena
     last_upload_bytes = 0;
-    const bool pass_open_before = Core::NativeUploads::OnDemandAudit() && scheduler.IsRendering(); // the upload itself ends the pass
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
-    if (last_upload_bytes != 0 && Core::NativeUploads::OnDemandAudit()) {
-        Core::NativeUploads::NoteOnDemand(pass_open_before, size, last_upload_bytes, device_addr, false);
-    }
     Core::NativeResources::NoteBufferRequest(device_addr, size, is_written,
                                              Core::NativeResources::BufferPath::Arena, last_upload_bytes);
     if (is_written) {
@@ -576,16 +539,6 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     Core::NativeContent::OverlayImage(device_addr, size, staging.mapped); // F2.2 swap (TLG_F2_RING_STORE=1): ring bytes as announced, not as the ring holds them now
     staging.Flush();
     return {staging.buffer, staging.offset};
-}
-
-void BufferCache::ForgetShadows(VAddr begin, VAddr end) {
-    // B9.1 verify: the CPU copies of the pages are rebuilt (a placement or a move fills a Vulkan buffer outside the uploads the copies follow)
-    if (b9_shadow.empty()) {
-        return;
-    }
-    for (VAddr page = begin & ~VAddr{4095}; page < end; page += 4096) {
-        b9_shadow.erase(page);
-    }
 }
 
 const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanning, bool written) {
@@ -798,7 +751,6 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     // the bytes between them, which no buffer holds, keep the tracker)
     const u32 b9 = Core::NativeUpdates::B9BufferMode();
     u64 b9_object = 0; // the first engine buffer the request meets (0: none)
-    bool b9_cpu_read = false; // a buffer the CPU reads (staging, CPU read access): its memory also takes downloads, which the verify's copy does not see
     boost::container::small_vector<std::pair<u64, u64>, 8> b9_pieces;
     boost::container::small_vector<std::pair<u64, u64>, 4> b9_gaps; // the request's bytes no engine buffer holds
     if (b9 != 0) {
@@ -818,7 +770,6 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             b9_object = parts.front().id;
             VAddr at = held_lo;
             for (const auto& part : parts) {
-                b9_cpu_read |= part.usage == 3 || (part.cpu_access & 0x20000) != 0;
                 if (part.begin > at) {
                     b9_gaps.emplace_back(at, part.begin - at);
                 }
@@ -929,75 +880,6 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 continue;
             }
             add_copy(a, n);
-        }
-    }
-    if (b9_native && !b9_cpu_read && Core::NativeUpdates::B9VerifyEvery() != 0) {
-        // B9.1 verify: the sampled pages of the request; their CPU copy takes what this upload copies, then the request's bytes must equal memory
-        const u32 every = Core::NativeUpdates::B9VerifyEvery();
-        const auto sampled = [&](u64 page) { return (page >> 12) % every == 0; };
-        // guest bytes are read as the upload reads them (memory that is not mapped for the CPU reads as zeros)
-        std::array<u8, 4096> now{};
-        const size_t num_copies = copies.size();
-        for (size_t i = 0; i < num_copies; ++i) {
-            const u64 a = copies[i].dstOffset, e = a + copies[i].size;
-            for (u64 page = a & ~u64{4095}; page < e; page += 4096) {
-                if (!sampled(page)) {
-                    continue;
-                }
-                if (const auto it = b9_shadow.find(page); it != b9_shadow.end()) {
-                    const u64 lo = std::max(a, page), hi = std::min(e, page + 4096);
-                    memory->CopySparseMemory(lo, it->second->data() + (lo - page), hi - lo);
-                }
-            }
-        }
-        const u64 req_end = held_hi; // the bytes the destination holds (a placed buffer's slack is not memory's)
-        for (u64 page = held_lo & ~u64{4095}; page < req_end; page += 4096) {
-            if (!sampled(page)) {
-                continue;
-            }
-            const u64 lo = std::max<u64>(held_lo, page), hi = std::min<u64>(req_end, page + 4096);
-            bool gpu_written;
-            {
-                std::shared_lock lock{gpu_ranges_mutex};
-                gpu_written = gpu_modified_ranges.Intersects(lo, hi - lo);
-            }
-            auto it = b9_shadow.find(page);
-            if (gpu_written) {
-                if (it != b9_shadow.end()) {
-                    b9_shadow.erase(it);
-                }
-                continue;
-            }
-            if (it == b9_shadow.end()) {
-                if (b9_shadow.size() >= 8192) {
-                    continue;
-                }
-                // a new sampled page: memory as it is now. The check only reads: a change later that no upload took is a write nobody announced (it must not change what the
-                // GPU sees: uploading here put memory's bytes over a buffer's own, garbling the picture of a new game)
-                auto copy = std::make_unique<std::array<u8, 4096>>();
-                memory->CopySparseMemory(lo, copy->data() + (lo - page), hi - lo);
-                b9_shadow.emplace(page, std::move(copy));
-                continue;
-            }
-            Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9VerifyChecked);
-            memory->CopySparseMemory(lo, now.data() + (lo - page), hi - lo);
-            if (std::memcmp(it->second->data() + (lo - page), now.data() + (lo - page), hi - lo) != 0) {
-                Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9VerifyMiss);
-                {
-                    std::scoped_lock lock{object_dirty_mutex};
-                    b9_owed.Add(lo, hi - lo);
-                }
-                static std::atomic<u32> logged{0};
-                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                    u64 first = lo;
-                    while (first < hi && it->second->at(first - page) == now[first - page]) {
-                        ++first;
-                    }
-                    LOG_WARNING(Render_Vulkan, "B9.1 verify: engine buffer {} request {:#x}+{:#x}: byte {:#x} differs from memory after the upload ({})", b9_object, device_addr,
-                                size, first, Core::NativeDevice::OwnerName(first));
-                }
-                std::memcpy(it->second->data() + (lo - page), now.data() + (lo - page), hi - lo);
-            }
         }
     }
     last_upload_bytes += total_size_bytes;

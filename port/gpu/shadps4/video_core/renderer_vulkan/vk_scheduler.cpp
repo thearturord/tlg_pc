@@ -5,7 +5,6 @@
 #include <thread>
 #include "native/native_flight.h"
 #include "native/native_timeline.h"
-#include "native/native_pass.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
@@ -49,14 +48,10 @@ void SchedulerCore::BeginRendering(const RenderState& new_state) {
     if (is_rendering && render_state == new_state) {
         return;
     }
-    if (is_rendering && stream_id == 0) {
-        Core::NativePass::SetEndCause(Core::NativePass::EndCause::NewState);
-    }
     EndRendering();
     is_rendering = true;
     render_state = new_state;
     if (stream_id == 0) {
-        Core::NativePass::PassBegin(render_state.num_color_attachments, render_state.width, render_state.height);
         Core::Flight::Add(Core::Flight::PassBegin, 0, render_state.num_color_attachments, render_state.width | (u64{render_state.height} << 16)); // L1
     }
 
@@ -123,7 +118,6 @@ void SchedulerCore::EndRendering() {
     }
     is_rendering = false;
     if (stream_id == 0) {
-        Core::NativePass::PassEnd(__builtin_return_address(0));
         Core::Flight::Add(Core::Flight::PassEnd, 0, render_state.num_color_attachments, render_state.width | (u64{render_state.height} << 16)); // L1
     }
     if (const auto* list = CommandBuffer().List(); list != nullptr && stream_id == 0 && list->Size() >= segment_begin_commands) {
@@ -291,7 +285,6 @@ void SchedulerCore::EndSession() {
         Check(session.upload.end());
     }
 
-    Core::NativePass::SetEndCause(Core::NativePass::EndCause::Submit);
     EndRendering();
     if (session.primary) {
         Check(session.primary.end());
@@ -463,7 +456,6 @@ void SchedulerCore::SubmitExecution(SubmitInfo& info) {
         }
     }
     // Recorded commands go into the command buffer before anything written directly at the end.
-    Core::NativePass::SetEndCause(Core::NativePass::EndCause::Submit);
     EndRendering();
 
     if (use_encoder && !direct_active) {
