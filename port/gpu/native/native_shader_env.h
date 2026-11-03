@@ -24,11 +24,14 @@ struct DrawEnv {
     bool has_pixel{};
     /// F3.2: a hull, domain or geometry shader is bound in the device context (the native pipeline is vertex plus pixel only; such a draw is a counted refusal)
     bool other_stage{};
+    /// F3.2b: the 16 user data words of each stage as the record's draws left them (persistent storage of the command processor); null when the draw has no typed user data
+    const u32* vertex_user_words{};
+    const u32* pixel_user_words{};
 };
 
 /// The shader objects of the draw that is being planned (set by the command processor around `PlanDraw`; nothing is read until `Current` asks).
 struct Scope {
-    Scope(u64 vertex_gnm, u64 pixel_gnm, u64 fetch_object, bool other_stage = false);
+    Scope(u64 vertex_gnm, u64 pixel_gnm, u64 fetch_object, bool other_stage = false, const u32* vertex_user_words = nullptr, const u32* pixel_user_words = nullptr);
     ~Scope();
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;

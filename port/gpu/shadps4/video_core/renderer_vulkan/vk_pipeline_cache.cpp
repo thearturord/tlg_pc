@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <set>
 #include <tuple>
@@ -195,6 +196,27 @@ static u32 TargetSampleCount(const DrawInputs& in) {
         samples = std::max(samples, in.depth_buffer.NumSamples());
     }
     return samples;
+}
+
+/// F3.2b: the parameters that locate a stage's program (code, hash, user data words) of a native draw from the shader environment (the program address of the shader object) and
+/// the user data words the record's draws left; none for another stage than vertex and pixel or a draw without typed user data (the register image then decides).
+static std::optional<Shader::ShaderParams> ParamsFromEnv(const Core::NativeShaderEnv::DrawEnv& env, u32 hw_stage) {
+    const bool vertex = hw_stage == static_cast<u32>(HwStage::Vertex);
+    if (!vertex && hw_stage != static_cast<u32>(HwStage::Fragment)) {
+        return std::nullopt;
+    }
+    const u32* words = vertex ? env.vertex_user_words : env.pixel_user_words;
+    const u64 address = vertex ? env.vertex.program.address : env.pixel.program.address;
+    if (words == nullptr || address == 0 || !(vertex ? env.has_vertex : env.has_pixel)) {
+        return std::nullopt;
+    }
+    const auto* code = reinterpret_cast<const u32*>(address);
+    const auto& bininfo = AmdGpu::SearchBinaryInfo(code);
+    return Shader::ShaderParams{
+        .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{words, Shader::ShaderParams::NumShaderUserData},
+        .code = std::span{code, bininfo.length / sizeof(u32)},
+        .hash = bininfo.shader_hash,
+    };
 }
 
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
@@ -591,16 +613,23 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             modules = exec_entry->modules;
             fetch_shader = FetchOf(*exec_entry);
             bool resolved_all = true;
+            Core::NativeShaderEnv::DrawEnv entry_env;
+            const bool entry_native = lookup_inputs != nullptr && StagesFromEnvOn() && Core::NativeShaderEnv::Current(entry_env);
             for (u32 s = 0; s < MaxShaderStages && resolved_all; ++s) {
                 if (!infos[s]) {
                     continue;
                 }
-                const auto* pgm = lookup_regs->ProgramForStage(exec_entry->stage_hw[s]);
-                if (!pgm) {
+                std::optional<Shader::ShaderParams> stage_params_env;
+                if (entry_native) {
+                    stage_params_env = ParamsFromEnv(entry_env, exec_entry->stage_hw[s]);
+                    live.key_targets[stage_params_env ? 8 : 9].fetch_add(1, std::memory_order_relaxed);
+                }
+                const auto* pgm = stage_params_env ? nullptr : lookup_regs->ProgramForStage(exec_entry->stage_hw[s]);
+                if (!stage_params_env && !pgm) {
                     resolved_all = false;
                     break;
                 }
-                const auto stage_params = AmdGpu::GetParams(*pgm);
+                const auto stage_params = stage_params_env ? *stage_params_env : AmdGpu::GetParams(*pgm);
                 NoteCode(stage_params);
                 auto* info = const_cast<Shader::Info*>(infos[s]);
                 info->pgm_base = stage_params.Base();
@@ -1160,14 +1189,45 @@ bool PipelineCache::RefreshGraphicsStages() {
             return false;
         }
 
-        const auto* pgm = regs.ProgramForStage(stage_in_idx);
-        if (!pgm || !pgm->Address<u32*>()) {
+        // F3.2b: the program and the user data words from the shader environment and the record, the register image otherwise
+        std::optional<Shader::ShaderParams> env_params;
+        if (native_stages) {
+            env_params = ParamsFromEnv(stage_env, stage_in_idx);
+            live.key_targets[env_params ? 8 : 9].fetch_add(1, std::memory_order_relaxed);
+        }
+        const auto* pgm = env_params ? nullptr : regs.ProgramForStage(stage_in_idx);
+        if (!env_params && (!pgm || !pgm->Address<u32*>())) {
             key.stage_hashes[stage_out_idx] = 0;
             infos[stage_out_idx] = nullptr;
             return false;
         }
 
-        const auto params = AmdGpu::GetParams(*pgm);
+        const auto params = env_params ? *env_params : AmdGpu::GetParams(*pgm);
+        if (env_params && Core::NativePlanShadow::On()) {
+            // the register image's program and the words the shader reads (the first `num_user_regs` words of the stage) against the native ones
+            if (const auto* reg_pgm = regs.ProgramForStage(stage_in_idx); reg_pgm && reg_pgm->Address<u32*>()) {
+                const auto reg_params = AmdGpu::GetParams(*reg_pgm);
+                const bool is_vs = stage_in_idx == static_cast<u32>(HwStage::Vertex);
+                Core::NativePlanShadow::Compare("stage_program", is_vs ? "vs_code_address" : "ps_code_address", params.Base(), reg_params.Base());
+                Core::NativePlanShadow::Compare("stage_program", is_vs ? "vs_hash" : "ps_hash", params.hash, reg_params.hash);
+                Core::NativePlanShadow::Compare("stage_program", is_vs ? "vs_code_words" : "ps_code_words", params.code.size(), reg_params.code.size());
+                const u32 count = stage_in_idx == static_cast<u32>(HwStage::Vertex) ? stage_env.vertex.program.user_data_count : stage_env.pixel.program.user_data_count;
+                u32 differing = 0;
+                static constexpr const char* vs_names[16] = {"vs_user_word_0", "vs_user_word_1", "vs_user_word_2", "vs_user_word_3", "vs_user_word_4", "vs_user_word_5", "vs_user_word_6", "vs_user_word_7",
+                                                             "vs_user_word_8", "vs_user_word_9", "vs_user_word_10", "vs_user_word_11", "vs_user_word_12", "vs_user_word_13", "vs_user_word_14", "vs_user_word_15"};
+                for (u32 w = 0; w < count && w < params.user_data.size(); ++w) {
+                    differing += params.user_data[w] != reg_params.user_data[w] ? 1 : 0;
+                    if (is_vs) {
+                        Core::NativePlanShadow::Compare("stage_program", vs_names[w], params.user_data[w], reg_params.user_data[w]);
+                    }
+                }
+                if (is_vs && params.user_data[0] != reg_params.user_data[0]) {
+                    Core::RareEvents::Note("f3_2b_vs_user_word0", fmt::format("hash {:#x} user_data_count {} native words {:#x} {:#x} registers {:#x} {:#x}", params.hash, count, params.user_data[0],
+                                                                              params.user_data[1], reg_params.user_data[0], reg_params.user_data[1]));
+                }
+                Core::NativePlanShadow::Compare("stage_program", is_vs ? "vs_consumed_user_words_differing" : "ps_consumed_user_words_differing", differing, 0);
+            }
+        }
         NoteCode(params);
         stage_hw[stage_out_idx] = stage_in_idx;
         stage_base[stage_out_idx] = params.Base();
