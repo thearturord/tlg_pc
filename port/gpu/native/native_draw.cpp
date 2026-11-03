@@ -53,9 +53,7 @@
 #include "native/native_content.h"
 #include "native/native_updates.h"
 #include "native/native_sync.h"
-#include "native/native_zpass_audit.h"
 #include "native/native_zpass_gen.h"
-#include "native/native_gbuffer_audit.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "native/native_draw_tag.h"
 #include "video_core/renderer_vulkan/vk_fixed_state.h"
@@ -5523,9 +5521,6 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
     const u64 seq = Guarded([&] { return MakeRecord(ctx, kind, a1, a2, a3, ret); });
     record_sig = nullptr;
     v2_collect = nullptr;
-    if (seq != 0 && NativeZPass::Enabled()) {
-        NativeZPass::RealRecord(ctx, seq, kind, a1, a2, a3);
-    }
     if (seq != 0) {
         const auto& record = Slot(seq);
         std::array<StreamProbe::TableView, 8> views{};
@@ -5827,9 +5822,6 @@ u64 PS4_SYSV_ABI GarlicPoolPro(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u
 u64 PS4_SYSV_ABI TagIndexed(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     if (NativeZPassGen::VerifyActive()) {
         NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 0, ctx, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a3));
-    }
-    if (NativeZPass::Enabled()) {
-        NativeZPass::NoteDraw(ret - ImageBase() + 0x1000000, 0, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a4), Rd<u64>(ctx, Ctx::VertexShader), Rd<u64>(ctx, Ctx::PixelShader), ctx);
     }
     return Tag(ctx, a1, a2, a3, ret, 0, (a4 & 0xff) != 0, false, a4, a5);
 }
@@ -6898,7 +6890,6 @@ u64 PS4_SYSV_ABI RecordingWrites(u64 device, u64 a1, u64 a2, u64 a3, u64 a4, u64
         return 0;
     }
     Core::NativeUpdates::NoteRenderThread();
-    NativeZPass::FrameBoundary();
     InstallUnmapSlot();
     Guarded([&]() -> u64 {
         for (const u64 field : {u64{0x2830}, u64{0x26e0}}) {
@@ -7838,9 +7829,6 @@ u64 PS4_SYSV_ABI TagIndirect(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u6
     if (NativeZPassGen::VerifyActive()) {
         NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 1, ctx, a1, a2, 0);
     }
-    if (NativeZPass::Enabled()) {
-        NativeZPass::NoteDraw(ret - ImageBase() + 0x1000000, 1, a1, a2, 0, Rd<u64>(ctx, Ctx::VertexShader), Rd<u64>(ctx, Ctx::PixelShader), ctx);
-    }
     return Tag(ctx, a1, a2, a3, ret, 2, true);
 }
 /// PrepareDraw(ctx, 0, 1): its callers are the draw functions (hooked at their own entry) and one inlined copy of the auto
@@ -8037,24 +8025,11 @@ u64 PS4_SYSV_ABI PrimitiveBind(u64 render_device, u64 a1, u64 a2, u64 a3, u64 a4
     return 0;
 }
 
-/// RenderDev_DrawZPass(render device, pass description): the audit builds the draws the loop should issue from the snapshot it reads (native_zpass_audit.h).
+/// RenderDev_DrawZPass(render device, pass description): the cascade generator takes the pass over when it can; otherwise the engine's loop runs.
 u64 PS4_SYSV_ABI ZPassEnter(u64 render_device, u64 desc, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     if (NativeZPassGen::Enabled()) {
         static const u64 loop_entry = Core::GuestHooks::OriginalEntry("DrawZPass");
         if (NativeZPassGen::HandlePass(render_device, desc, loop_entry)) {
-            return 1;
-        }
-    }
-    if (!NativeZPass::Enabled()) {
-        return 0;
-    }
-    NativeZPass::PassEnter(render_device, desc);
-    if (NativeZPass::WrapEnabled()) {
-        // run the loop here, so the state right after it returns can be read, then skip the hooked call
-        const u64 entry = Core::GuestHooks::OriginalEntry("DrawZPass");
-        if (entry != 0) {
-            reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64)>(entry)(render_device, desc);
-            NativeZPass::PassExit(render_device);
             return 1;
         }
     }
@@ -8527,11 +8502,10 @@ u64 PS4_SYSV_ABI InstanceGroupBind(u64 inner, u64 group, u64 view, u64 a3, u64 a
     return 0;
 }
 
-/// N6.6: RenderDev_DrawGBufferPrimitives(render device, mode, list, a3, flags, query mode, param 7 on the stack): the census of what it is asked to draw (read only).
+/// N6.6: RenderDev_DrawGBufferPrimitives(render device, mode, list, a3, flags, query mode, param 7 on the stack): the G-buffer generator takes the pass over when it can.
 u64 PS4_SYSV_ABI GBufferEnter(u64 render_device, u64 mode, u64 list, u64 a3, u64 flags, u64 query_mode, u64 ret, u64 caller_rsp) {
     (void)ret;
     const u64 param7 = Rd<u8>(caller_rsp, 0);
-    NativeGBufferAudit::Enter(render_device, mode, list, flags, query_mode, param7);
     if (NativeZPassGen::GBufferEnabled()) {
         static const u64 loop_entry = Core::GuestHooks::OriginalEntry("DrawGBufferPrimitives");
         if (NativeZPassGen::HandleGBuffer(render_device, mode, list, a3, flags, query_mode, param7, loop_entry)) {
@@ -8541,10 +8515,9 @@ u64 PS4_SYSV_ABI GBufferEnter(u64 render_device, u64 mode, u64 list, u64 a3, u64
     return 0;
 }
 
-/// N6.7: RenderDev_DrawForwardPass(render device, a2, a3, list, mode): the census of what it is asked to draw (read only).
+/// N6.7: RenderDev_DrawForwardPass(render device, a2, a3, list, mode): the forward generator takes the pass over when it can.
 u64 PS4_SYSV_ABI ForwardEnter(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 a5, u64 ret) {
     (void)a5, (void)ret;
-    NativeGBufferAudit::EnterForward(render_device, list, mode);
     if (NativeZPassGen::ForwardEnabled()) {
         static const u64 loop_entry = Core::GuestHooks::OriginalEntry("DrawForwardPass");
         if (NativeZPassGen::HandleForward(render_device, a1, a2, list, mode, loop_entry)) {

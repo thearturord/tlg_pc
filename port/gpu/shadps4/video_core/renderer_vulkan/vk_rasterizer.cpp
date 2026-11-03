@@ -12,7 +12,6 @@
 #include "native/native_debug_server.h"
 #include "native/native_e3_census.h"
 #include "native/native_content.h"
-#include "native/native_field_use.h"
 #include "native/native_prof.h"
 #include "native/native_marker.h"
 #include "native/native_config.h"
@@ -2017,9 +2016,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         Core::NativeRegistry::NoteBinder(2);
                     }
                 }
-            }
-            if (Core::NativeFieldUse::On()) { // F4.0b
-                Core::NativeFieldUse::NoteBuffer(reinterpret_cast<const u32*>(&chosen_sharp));
             }
             // F4: from here on the buffer is a plain description (the descriptor type stays at the recompiler's interface above)
             const Core::NativeDesc::BufferDesc vsharp = Core::NativeDesc::BufferDescOf(chosen_sharp);

@@ -7,7 +7,6 @@
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/videoout/buffer.h"
 #include "native/native_desc.h"
-#include "native/native_field_use.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/amdgpu/tiling.h"
@@ -131,10 +130,6 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
 }
 
 Core::NativeDesc::ImageDesc ImageDescFromSharp(const AmdGpu::Image& sharp) noexcept {
-    if (Core::NativeFieldUse::On()) { // F4.0b
-        Core::NativeFieldUse::NoteImage(reinterpret_cast<const u32*>(&sharp));
-        Core::NativeFieldUse::NoteHostImageFields(sharp.alt_tile_mode, sharp.NumSamples());
-    }
     Core::NativeDesc::ImageDesc d;
     const auto dfmt = sharp.GetDataFmt();
     const auto nfmt = sharp.GetNumberFmt();

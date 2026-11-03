@@ -34,9 +34,7 @@
 #include "native/native_updates.h"
 #include "native/native_drain_audit.h"
 #include "native/native_uploads.h"
-#include "native/native_zpass_audit.h"
 #include "native/native_zpass_gen.h"
-#include "native/native_gbuffer_audit.h"
 #include "native/native_resources.h"
 #include "core/memory.h"
 #include "native/native_hooks.h"
@@ -677,12 +675,8 @@ void RegisterBuiltins() {
              [](const Params&) { return Core::NativeUploads::Report(); });
     Register("/drain", "(N6a, TLG_DRAIN_AUDIT=1) the command processor's wait for queued memory writes: did any guest read of the planning touch a pending write",
              [](const Params&) { return Core::DrainAudit::Report(); });
-    Register("/zpass", "(N6.3a, TLG_ZPASS_AUDIT=N) the depth pass loop against the draws built from the snapshot it reads: expected, issued, matched, missing, extra per view type",
-             [](const Params&) { return Core::NativeZPass::Report(); });
     Register("/zpassgen", "(N6.3i, TLG_ZPASS_GEN=1) the cascade generator: passes generated, run by the loop, declined (and why), verify runs and their differences, the learned variant table",
              [](const Params&) { return Core::NativeZPassGen::Report(); });
-    Register("/gbuffer", "(N6.6, TLG_GBUFFER_AUDIT=1) the arguments and shapes the G-buffer loop sees: passes, batches, primitives",
-             [](const Params&) { return Core::NativeGBufferAudit::Report(); });
     Register("/threads", "CPU use of the busiest threads since the previous call", Threads);
     Register("/memory", "?addr=0x..&size=N (max 65536): guest memory as hex", Memory);
     Register("/log", "?lines=N&filter=text&file=shad_log.txt: tail of a log file", Log);
