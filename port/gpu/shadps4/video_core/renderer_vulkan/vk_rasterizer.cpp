@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
+#include "native/native_draw_inputs.h"
 #include "native/native_target_desc.h"
 #include "native/native_light_recorder.h"
 #include "native/native_untracked_ring.h"
@@ -358,7 +359,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(DrawIndirectParams params, const 
     plan->stencil_copy = no_operation.stencil_copy;
     Core::NativeDraw::Live().fixed_native.fetch_add(1, std::memory_order_relaxed);
     plan->fixed = native;
-    plan->inputs = MakeInputsFromRecord(record, index_count);
+    plan->inputs = Core::NativeDrawInputs::FromRecord(record, index_count);
     Core::NativeDraw::Live().key_targets[10].fetch_add(1, std::memory_order_relaxed);
     {
         // F3.3: the words of the inputs that only the register image has (clip planes, border colour base, index offset) are checked: not zero would mean the native planning needs a value for them

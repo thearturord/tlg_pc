@@ -29,6 +29,7 @@
 #include "native/native_occlusion.h"
 #include "native/native_direct.h"
 #include "native/native_draw.h"
+#include "native/native_draw_inputs.h"
 #include "native/native_uploads.h"
 #include "native/native_drain_audit.h"
 #include "native/native_readbacks.h"
@@ -268,7 +269,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     if (draw.kind == 7) {
         // depth / stencil clear: the inputs of the clear come from the record (F3.5: no register image)
         native_tag_pending.valid = false;
-        auto clear_inputs = Vulkan::Rasterizer::MakeDepthClearInputs(draw);
+        auto clear_inputs = Core::NativeDrawInputs::ForDepthClear(draw);
         Core::NativeDraw::Live().state_planned.fetch_add(1, std::memory_order_relaxed);
         RasterRun(
             [this, extent = draw.db_extent, inputs = std::move(clear_inputs)] {

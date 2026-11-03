@@ -16,6 +16,7 @@
 #include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
+#include "native/native_draw_inputs.h"
 #include "native/native_light_recorder.h"
 #include "native/native_untracked_ring.h"
 #include "native/native_target_desc.h"
@@ -58,54 +59,6 @@
 
 namespace Vulkan {
 
-namespace {
-/// Register index -> where a record's register word goes in the draw inputs: 1 + the word index inside `DrawInputs` (0: the draw inputs have no member for the register). F3.6: the
-/// table is made from the register file's own layout (`Regs`) and `DrawInputs`; no draw state struct stands between them.
-const std::array<u32, AmdGpu::Regs::NumRegs>& InputWordMap() {
-    static const auto map = [] {
-        std::array<u32, AmdGpu::Regs::NumRegs> table{};
-        const auto add = [&table](size_t reg_byte_offset, size_t input_byte_offset, size_t size) {
-            for (size_t w = 0; w < size / sizeof(u32); ++w) {
-                table[reg_byte_offset / sizeof(u32) + w] = static_cast<u32>(input_byte_offset / sizeof(u32) + w + 1);
-            }
-        };
-#define TLG_INPUT_MEMBER(name) add(offsetof(AmdGpu::Regs, name), offsetof(DrawInputs, name), sizeof(DrawInputs::name))
-        TLG_INPUT_MEMBER(color_buffers);
-        TLG_INPUT_MEMBER(depth_buffer);
-        TLG_INPUT_MEMBER(depth_view);
-        TLG_INPUT_MEMBER(depth_control);
-        TLG_INPUT_MEMBER(depth_htile_data_base);
-        TLG_INPUT_MEMBER(depth_render_control);
-        TLG_INPUT_MEMBER(depth_clear);
-        TLG_INPUT_MEMBER(stencil_clear);
-        TLG_INPUT_MEMBER(ta_bc_base);
-        TLG_INPUT_MEMBER(clip_user_data);
-        TLG_INPUT_MEMBER(num_indices);
-        TLG_INPUT_MEMBER(num_instances);
-        TLG_INPUT_MEMBER(index_offset);
-        TLG_INPUT_MEMBER(vgt_instance_step_rate_0);
-        TLG_INPUT_MEMBER(vgt_instance_step_rate_1);
-        TLG_INPUT_MEMBER(index_base_address);
-        TLG_INPUT_MEMBER(index_buffer_type);
-        TLG_INPUT_MEMBER(max_index_size);
-#undef TLG_INPUT_MEMBER
-        return table;
-    }();
-    return map;
-}
-
-/// Writes register pairs of a record (entries `begin` to `end`) into the draw inputs.
-void ApplyExecRegisters(DrawInputs& in, const Core::NativeDraw::ExecDraw& draw, u32 begin, u32 end) {
-    const auto& map = InputWordMap();
-    for (u32 i = begin; i < end; ++i) {
-        const u32 index = draw.regs[i].index;
-        if (index >= map.size() || map[index] == 0) {
-            continue;
-        }
-        std::memcpy(reinterpret_cast<u8*>(&in) + (map[index] - 1) * sizeof(u32), &draw.regs[i].value, sizeof(u32));
-    }
-}
-} // namespace
 
 /// B9 (`TLG_DISPATCH_BINDER`): the descriptors of a dispatch come from its record's typed bindings. 0 off, 2 the record serves every descriptor it holds, 3 like 2 but every
 /// descriptor is compared with the guest's (the guest's wins on a difference: the audit of the record against stale table reads). Default 0 (off): mode 2 caused a GPU device lost on 2026-10-28; 3 is a controlled test only.
@@ -373,27 +326,8 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
     plan->inputs = cached->second;
     // E1b: the draw's arguments are the typed values the record builder set (the argument registers of the record are not decoded any more); a field the record did
     // not set keeps what the cached inputs hold, as before.
-    {
-        const auto& a = draw.args;
-        auto& in = plan->inputs;
-        if ((a.mask & Core::NativeDraw::DrawArgs::NumIndices) != 0) {
-            in.num_indices = a.num_indices;
-        }
-        if ((a.mask & Core::NativeDraw::DrawArgs::NumInstances) != 0) {
-            in.num_instances.num_instances = a.num_instances;
-        }
-        if ((a.mask & Core::NativeDraw::DrawArgs::IndexBase) != 0) {
-            in.index_base_address.base_addr_hi = a.index_base_hi;
-            in.index_base_address.base_addr_lo = a.index_base_lo;
-        }
-        if ((a.mask & Core::NativeDraw::DrawArgs::IndexType) != 0) {
-            in.index_buffer_type.raw = a.index_type;
-        }
-        if ((a.mask & Core::NativeDraw::DrawArgs::MaxIndexSize) != 0) {
-            in.max_index_size = a.max_index_size;
-        }
-        Core::NativeDraw::Live().draw_args_typed.fetch_add(1, std::memory_order_relaxed);
-    }
+    Core::NativeDrawInputs::ApplyDrawArgs(plan->inputs, draw.args);
+    Core::NativeDraw::Live().draw_args_typed.fetch_add(1, std::memory_order_relaxed);
     if (index_count != ~0u) {
         plan->inputs.num_indices = index_count; // an inline draw: the count comes with the draw packet
     }
@@ -432,45 +366,6 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
     return plan;
 }
 
-DrawInputs Rasterizer::MakeDepthClearInputs(const Core::NativeDraw::ExecDraw& draw) {
-    DrawInputs in{};
-    ApplyExecRegisters(in, draw, 0, draw.count);
-    Core::NativeTargetDesc::ApplyDepthClear(in, draw.native_targets); // E7 (TLG_TARGET_DESC_USE)
-    return in;
-}
-
-DrawInputs Rasterizer::MakeInputsFromRecord(const Core::NativeDraw::ExecDraw& draw, u32 index_count) {
-    DrawInputs in{};
-    ApplyExecRegisters(in, draw, 0, draw.count);
-    Core::NativeTargetDesc::ApplyAtFill(in);
-    const auto& a = draw.args;
-    if ((a.mask & Core::NativeDraw::DrawArgs::NumIndices) != 0) {
-        in.num_indices = a.num_indices;
-    }
-    if ((a.mask & Core::NativeDraw::DrawArgs::NumInstances) != 0) {
-        in.num_instances.num_instances = a.num_instances;
-    }
-    if ((a.mask & Core::NativeDraw::DrawArgs::IndexBase) != 0) {
-        in.index_base_address.base_addr_hi = a.index_base_hi;
-        in.index_base_address.base_addr_lo = a.index_base_lo;
-    }
-    if ((a.mask & Core::NativeDraw::DrawArgs::IndexType) != 0) {
-        in.index_buffer_type.raw = a.index_type;
-    }
-    if ((a.mask & Core::NativeDraw::DrawArgs::MaxIndexSize) != 0) {
-        in.max_index_size = a.max_index_size;
-    }
-    if (index_count != ~0u) {
-        in.num_indices = index_count;
-    }
-    Core::NativeShaderEnv::DrawEnv env;
-    if (Core::NativeShaderEnv::Current(env) && env.has_vertex) {
-        in.vgt_instance_step_rate_0 = env.vertex.rates.instance_step_rate_0;
-        in.vgt_instance_step_rate_1 = env.vertex.rates.instance_step_rate_1;
-    }
-    return in;
-}
-
 std::unique_ptr<DrawPlan> Rasterizer::PlanExecOperation(const Core::NativeDraw::ExecDraw& draw) {
     std::unique_ptr<DrawPlan> plan;
     {
@@ -487,9 +382,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecOperation(const Core::NativeDraw::
     plan->executed = false;
     plan->op_class = static_cast<u8>(DrawClass::EliminateFastClear);
     plan->depth_copy = plan->stencil_copy = false;
-    plan->inputs = DrawInputs{};
-    ApplyExecRegisters(plan->inputs, draw, 0, draw.count);
-    Core::NativeTargetDesc::ApplyEliminate(plan->inputs, draw.native_targets); // E7 (TLG_TARGET_DESC_USE)
+    Core::NativeDrawInputs::ForEliminate(plan->inputs, draw);
     return plan;
 }
 
