@@ -38,6 +38,8 @@ constexpr const char* AccessorNames[] = {"NumLayers", "NumLevels", "NumSamples",
 /// is `VideoCore::SamplerDescFromSharp`, compared in the shadow (`TLG_DESC_CHECKS=1`): `NoteSamplerDescCompare(equal)` counts, `example` names a difference.
 [[nodiscard]] NativeDesc::SamplerDesc SamplerDescFromWords(const u32* words) noexcept;
 void NoteSamplerDescCompare(bool equal, const char* example);
+/// The same for the buffer description (`BufferDescOf` against the V# type's own accessors), counted by `where` (0 buffer binding, 1 vertex binding).
+void NoteBufferDescCompare(u32 where, bool equal);
 constexpr float SamplerDescLodScale = 1.0f / 256.0f;
 
 /// F4.3 (`TLG_IMAGE_FROM_DESC`, default on since 2026-11-03, `=0` turns it off, read once): the host builds the `ImageInfo` / `ImageViewInfo` of a sampled or stored image from the plain

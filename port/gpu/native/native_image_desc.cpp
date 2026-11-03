@@ -632,6 +632,15 @@ void NoteSamplerDescCompare(bool equal, const char* example) {
     }
 }
 
+std::atomic<u64> g_bd_compared[2]{}, g_bd_differs[2]{};
+
+void NoteBufferDescCompare(u32 where, bool equal) {
+    g_bd_compared[where & 1].fetch_add(1, std::memory_order_relaxed);
+    if (!equal) {
+        g_bd_differs[where & 1].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 bool FromDescOn() noexcept {
     static const bool on = [] {
         const char* e = std::getenv("TLG_IMAGE_FROM_DESC");
@@ -907,6 +916,7 @@ nlohmann::json Report() {
         }
         j["f4_2_host_info_from_description"] = std::move(host);
         j["f4_1_sampler_description"] = {{"compared", g_sd_compared.load()}, {"equal", g_sd_equal.load()}, {"examples", g_sd_examples}};
+        j["f4_1_buffer_description"] = {{"binding_compared", g_bd_compared[0].load()}, {"binding_differs", g_bd_differs[0].load()}, {"vertex_compared", g_bd_compared[1].load()}, {"vertex_differs", g_bd_differs[1].load()}};
         j["f4_3_use"] = {{"on", FromDescOn()}, {"switch", "TLG_IMAGE_FROM_DESC=0 turns it off"}, {"bindings_served_from_the_description", g_use_served.load()}, {"engine_description_not_available", g_use_unavailable.load()},
                          {"alt_tile_set", g_use_alt_tile.load()}, {"depth_use_does_not_fit", g_use_depth_refused.load()}};
     }

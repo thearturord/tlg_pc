@@ -6,6 +6,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
+#include "native/native_image_desc.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -445,6 +446,10 @@ void GraphicsPipeline::GetVertexInputs(
         // the one decode of the vertex descriptor: the host reads the plain description from here on
         const auto sharp = attrib.GetSharp(vs_info);
         const Core::NativeDesc::BufferDesc buffer = Core::NativeDesc::BufferDescOf(sharp);
+        if (Core::NativeImageDesc::DescCompareOn()) { // F4.1 shadow: the plain decode against the V# type's own accessors
+            Core::NativeImageDesc::NoteBufferDescCompare(1, buffer.address == sharp.base_address && buffer.size == sharp.GetSize() && buffer.stride == sharp.GetStride() &&
+                                                                buffer.num_records == sharp.num_records && buffer.data_format == sharp.data_format && buffer.num_format == sharp.num_format);
+        }
         attributes.push_back(Attribute{
             .location = semantic,
             .binding = semantic,

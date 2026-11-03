@@ -2122,6 +2122,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
             // F4: from here on the buffer is a plain description (the descriptor type stays at the recompiler's interface above)
             const Core::NativeDesc::BufferDesc vsharp = Core::NativeDesc::BufferDescOf(chosen_sharp);
+            if (Core::NativeImageDesc::DescCompareOn()) { // F4.1 shadow: the plain decode against the V# type's own accessors
+                Core::NativeImageDesc::NoteBufferDescCompare(0, vsharp.address == chosen_sharp.base_address && vsharp.size == chosen_sharp.GetSize() && vsharp.stride == chosen_sharp.GetStride() &&
+                                                                    vsharp.num_records == chosen_sharp.num_records && vsharp.data_format == chosen_sharp.data_format && vsharp.num_format == chosen_sharp.num_format);
+            }
             if (vsharp.address == 0 || vsharp.size == 0) {
                 Census(census_base + CBufferNull);
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
