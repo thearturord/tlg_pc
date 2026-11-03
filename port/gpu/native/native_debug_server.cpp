@@ -25,6 +25,7 @@
 #include "native/native_flight.h"
 #include "native/native_marker.h"
 #include "native/native_invariant.h"
+#include "native/native_log.h"
 #include "native/native_timeline.h"
 #include "native/native_pass.h"
 #include "native/native_registry.h"
@@ -826,6 +827,38 @@ nlohmann::json CountersSnapshot() {
     return out;
 }
 
+/// L6: one line per 20 s snapshot in user/log/stats_history.jsonl (about 60 KB an hour): when did a counter start to move.
+void AppendStatsHistory(const nlohmann::json& snapshot) {
+    nlohmann::json line;
+    line["unix_s"] = snapshot.value("written_unix_s", 0);
+    if (snapshot.contains("/status")) {
+        const auto& status = snapshot["/status"];
+        for (const char* key : {"uptime_s", "presents", "fps_1s", "fps_5s"}) {
+            if (status.contains(key)) {
+                line[key] = status[key];
+            }
+        }
+    }
+    u64 rare_total = 0;
+    if (snapshot.contains("rare_events")) {
+        for (const auto& [kind, count] : snapshot["rare_events"].items()) {
+            rare_total += count.is_number() ? count.get<u64>() : 0;
+        }
+    }
+    line["rare_events"] = rare_total;
+    nlohmann::json invariants;
+    for (const auto& [name, value] : Core::Invariant::Report().items()) {
+        invariants[name] = value["count"];
+    }
+    line["invariants"] = invariants;
+    line["native_log_lines"] = Core::Log::Written();
+    line["native_log_suppressed"] = Core::Log::Suppressed();
+    line["markers"] = Core::Marker::Written();
+    line["flight_events"] = Core::Flight::EventsWritten();
+    std::ofstream file{Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "stats_history.jsonl", std::ios::app | std::ios::binary};
+    file << line.dump() << std::endl;
+}
+
 bool LastPeriodicSnapshot(nlohmann::json& out, double& age_s) {
     std::scoped_lock lk{periodic_snapshot_mutex};
     if (!periodic_snapshot_valid) {
@@ -920,6 +953,13 @@ void Start(u16 port) {
                     }
                 }
                 write_snapshot(path);
+                {
+                    nlohmann::json latest;
+                    double age = 0;
+                    if (LastPeriodicSnapshot(latest, age)) {
+                        AppendStatsHistory(latest);
+                    }
+                }
             }
         }};
     }

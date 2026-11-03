@@ -118,6 +118,11 @@ u64 EventsWritten() {
 std::string Report(u32 per_thread, bool bench, double max_age_ms) {
     std::string out = "{";
     if (bench) {
+        // the events go to a ring of their own that no report reads, so the thread's own ring stays clean
+        static Ring* scratch = new Ring();
+        scratch->slot = 0;
+        Ring* const own = t_ring;
+        t_ring = scratch;
         const bool was = g_enabled.exchange(true);
         constexpr u32 events = 1'000'000;
         const u64 t0 = SteadyNs();
@@ -126,6 +131,7 @@ std::string Report(u32 per_thread, bool bench, double max_age_ms) {
         }
         const u64 t1 = SteadyNs();
         g_enabled.store(was);
+        t_ring = own;
         out += fmt::format("\"bench_ns_per_event\": {:.2f}, \"bench_events\": {}, ", static_cast<double>(t1 - t0) / events, events);
     }
     const u64 tick_now = Tick();

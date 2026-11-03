@@ -139,6 +139,9 @@ nlohmann::json CounterDelta(const nlohmann::json& now, const nlohmann::json& bef
     std::ranges::sort(moved, [](const Moved& x, const Moved& y) { return std::abs(x.delta) > std::abs(y.delta); });
     nlohmann::json out;
     out["baseline_age_s"] = age_s;
+    if (now.contains("/status") && before.contains("/status") && now["/status"].contains("presents") && before["/status"].contains("presents")) {
+        out["frames"] = now["/status"]["presents"].get<double>() - before["/status"]["presents"].get<double>(); // the window in presented frames: the counters scale with the frame rate
+    }
     out["counters_moved"] = moved.size();
     out["note"] = "the 400 counters that moved most since the 20 s snapshot: [path, now, before, delta]";
     auto& list = out["moved"] = nlohmann::json::array();
