@@ -35,9 +35,12 @@ struct ImageDesc {
     u32 base_array{}, last_array{};
     u32 tile_mode{};       ///< the tiling index
     bool pow2_pad{};
-    bool alt_tile_mode{};  ///< neo mode alternative tiling: the engine never sets it, a description with it set is refused by the native consumer
+    bool alt_tile_mode{};  ///< neo mode alternative tiling: the engine never sets it (0 in every scene counted); only a descriptor read from guest memory can set it
+    u8 bank_swizzle{};     ///< the bank swizzle bits of the address when `alt_tile_mode` is set (the host computes them from the tile mode, format and samples when it decodes a T#)
     u32 min_lod{};
     u8 swizzle[4]{};       ///< r, g, b, a after the host's per-format remap
+
+    bool operator==(const ImageDesc&) const = default;
 
     [[nodiscard]] u32 BaseType() const noexcept {
         if (type == Type1DArray) {
@@ -106,6 +109,24 @@ struct ImageDesc {
         return tile_mode != 8 && tile_mode != 31; // display linear aligned, display linear general
     }
 };
+
+/// A hash of every field (the lookup cache of the rasterizer keys by it and compares with `==`)
+[[nodiscard]] inline u64 HashImageDesc(const ImageDesc& d, u64 seed = 0) noexcept {
+    u64 h = seed ^ 0x9E3779B97F4A7C15ull;
+    const auto mix = [&h](u64 v) {
+        h = (h ^ v) * 0xC2B2AE3D27D4EB4Full;
+        h ^= h >> 29;
+    };
+    mix(d.address);
+    mix(d.vk_format | static_cast<u64>(d.vk_format_storage) << 32);
+    mix(d.num_bits | static_cast<u64>(d.is_block) << 32 | static_cast<u64>(d.pow2_pad) << 33 | static_cast<u64>(d.alt_tile_mode) << 34 | static_cast<u64>(d.bank_swizzle) << 40);
+    mix(d.type | static_cast<u64>(d.width) << 32);
+    mix(d.height | static_cast<u64>(d.depth) << 32);
+    mix(d.pitch | static_cast<u64>(d.tile_mode) << 32);
+    mix(static_cast<u64>(d.base_level) | static_cast<u64>(d.last_level) << 16 | static_cast<u64>(d.base_array) << 32 | static_cast<u64>(d.last_array) << 48);
+    mix(d.min_lod | static_cast<u64>(d.swizzle[0]) << 32 | static_cast<u64>(d.swizzle[1]) << 40 | static_cast<u64>(d.swizzle[2]) << 48 | static_cast<u64>(d.swizzle[3]) << 56);
+    return h;
+}
 
 /// F4.1 samplers: what the host sampler creation reads of the console sampler descriptor (S#), as Vulkan-ready numbers. All fields are plain 32 bit values with no padding, so the struct
 /// is its own cache key (hash of its bytes). `valid` false: the descriptor holds a value the host refuses (the caller substitutes the all-zero sampler).

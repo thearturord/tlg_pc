@@ -130,45 +130,11 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
     stencil_size = guest_size / (num_bits >> 3);
 }
 
-ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& desc) noexcept {
+Core::NativeDesc::ImageDesc ImageDescFromSharp(const AmdGpu::Image& sharp) noexcept {
     if (Core::NativeFieldUse::On()) { // F4.0b
         Core::NativeFieldUse::NoteImage(reinterpret_cast<const u32*>(&sharp));
         Core::NativeFieldUse::NoteHostImageFields(sharp.alt_tile_mode, sharp.NumSamples());
     }
-    const bool is_depth = desc.is_depth;
-    const auto image = sharp;
-    const auto data_fmt = image.GetDataFmt();
-    tile_mode = image.GetTileMode();
-    array_mode = AmdGpu::GetArrayMode(tile_mode);
-    pixel_format = LiverpoolToVK::SurfaceFormat(data_fmt, image.GetNumberFmt());
-    if (is_depth) {
-        pixel_format = LiverpoolToVK::PromoteFormatToDepth(pixel_format);
-    }
-    type = image.GetBaseType();
-    props = ImageProperties{
-        .is_volume = type == AmdGpu::ImageType::Color3D,
-        .is_tiled = image.IsTiled(),
-        .is_pow2 = static_cast<u32>(image.pow2pad),
-        .is_block = AmdGpu::IsBlockCoded(data_fmt),
-        .is_depth = is_depth,
-    };
-    size.width = image.width + 1;
-    size.height = image.height + 1;
-    size.depth = props.is_volume ? image.depth + 1 : 1;
-    pitch = image.Pitch();
-    resources.levels = image.NumLevels();
-    resources.layers = image.NumLayers();
-    num_samples = image.NumSamples();
-    num_bits = NumBitsPerBlock(data_fmt);
-    guest_address = image.Address();
-    if (image.alt_tile_mode) {
-        bank_swizzle = sharp.GetBankSwizzle();
-        alt_tile = Libraries::Kernel::sceKernelIsNeoMode();
-    }
-    UpdateSize();
-}
-
-Core::NativeDesc::ImageDesc ImageDescFromSharp(const AmdGpu::Image& sharp) noexcept {
     Core::NativeDesc::ImageDesc d;
     const auto dfmt = sharp.GetDataFmt();
     const auto nfmt = sharp.GetNumberFmt();
@@ -189,6 +155,7 @@ Core::NativeDesc::ImageDesc ImageDescFromSharp(const AmdGpu::Image& sharp) noexc
     d.tile_mode = sharp.tiling_index;
     d.pow2_pad = sharp.pow2pad != 0;
     d.alt_tile_mode = sharp.alt_tile_mode != 0;
+    d.bank_swizzle = d.alt_tile_mode ? sharp.GetBankSwizzle() : 0;
     d.min_lod = static_cast<u32>(sharp.min_lod);
     const auto dst = sharp.DstSelect();
     d.swizzle[0] = static_cast<u8>(dst.r);
@@ -243,6 +210,10 @@ ImageInfo::ImageInfo(const Core::NativeDesc::ImageDesc& desc, bool is_depth) noe
     num_samples = desc.NumSamples();
     num_bits = desc.num_bits;
     guest_address = desc.address;
+    if (desc.alt_tile_mode) {
+        bank_swizzle = desc.bank_swizzle;
+        alt_tile = Libraries::Kernel::sceKernelIsNeoMode();
+    }
     UpdateSize();
 }
 

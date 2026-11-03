@@ -50,29 +50,6 @@ bool IsViewTypeCompatible(AmdGpu::ImageType view_type, AmdGpu::ImageType image_t
     }
 }
 
-ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept
-    : is_storage{desc.is_written} {
-    const auto dfmt = image.GetDataFmt();
-    auto nfmt = image.GetNumberFmt();
-    if (is_storage && nfmt == AmdGpu::NumberFormat::Srgb) {
-        nfmt = AmdGpu::NumberFormat::Unorm;
-    }
-    format = Vulkan::LiverpoolToVK::SurfaceFormat(dfmt, nfmt);
-    if (desc.is_depth) {
-        format = Vulkan::LiverpoolToVK::PromoteFormatToDepth(format);
-    }
-
-    range.base.level = image.base_level;
-    range.base.layer = std::min<u32>(image.base_array, image.NumLayers() - 1);
-    range.extent.levels = image.NumViewLevels(desc.is_array);
-    range.extent.layers = image.NumViewLayers(desc.is_array);
-    type = image.GetViewType(desc.is_array);
-    min_lod = static_cast<u32>(image.min_lod);
-    if (!is_storage) {
-        mapping = image.DstSelect();
-    }
-}
-
 u32 ImageViewInfoDiffMask(const ImageViewInfo& a, const ImageViewInfo& b) noexcept {
     u32 mask = 0;
     const auto diff = [&](u32 bit, bool different) { mask |= different ? 1u << bit : 0u; };

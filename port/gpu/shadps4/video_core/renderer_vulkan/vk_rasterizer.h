@@ -566,12 +566,19 @@ private:
     std::array<CachedTarget, AmdGpu::NUM_COLOR_BUFFERS + 1> rt_cache{};
     /// Sampled images (BindTextures): the result of FindImage for a T# and the way the shader uses it, valid while
     /// no image was registered or removed (native_draw_mode >= 2).
+    /// The lookup key of a sampled image: the plain description, the shader's use flags and the binding index (with the engine object the record names)
+    struct TextureKey {
+        Core::NativeDesc::ImageDesc image{};
+        u64 flags{};
+        u64 index{};
+        bool operator==(const TextureKey&) const = default;
+    };
     struct CachedTextureLookup {
         bool valid{};
         u64 generation{};
         VideoCore::ImageId image_id{};
         u64 image_uid{}; ///< L1(b): the unique id of that image (the slot index is reused), so the answer can be proven again after the generation moved
-        std::array<u64, 6> key{};
+        TextureKey key{};
         VideoCore::TextureCache::ImageDesc desc;
     };
     std::array<CachedTextureLookup, 8192> texture_lookup_cache{}; ///< L1(b): 8192 entries (was 512: 37k collision misses in 90 s)
@@ -581,7 +588,7 @@ private:
         u64 id{};
         u64 flags{};
         u32 index{};
-        std::array<u8, 32> tsharp{};
+        Core::NativeDesc::ImageDesc image_key{}; ///< the plain description the image was found for (the guard that the object still describes the same image)
         VideoCore::ImageId image_id{};
         u64 image_uid{};
         VideoCore::TextureCache::ImageDesc desc;

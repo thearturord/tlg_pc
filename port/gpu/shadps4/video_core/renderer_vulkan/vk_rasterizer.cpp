@@ -2553,13 +2553,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 }
                 chosen_tsharp = image_desc.FromWords(words);
                 image_from_record = true;
-                if (identity_binding != ~0u && !image_desc.is_r128 && Core::NativeImageDesc::Decides()) {
-                    // E2: the image of the binding comes from the engine's texture and view; the words of the record only verify
-                    AmdGpu::Image derived;
-                    if (Core::NativeImageDesc::Decide(image_engine_id, image_view_id, words, derived)) {
-                        chosen_tsharp = image_desc.Finish(derived);
-                    }
-                }
                 if (IdentityAuditOn()) {
                     const u32* record_words = words;
                     const auto& raw = chosen_tsharp;
@@ -2661,26 +2654,22 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         Core::NativeDesc::ImageDesc native_image_desc;
         const bool from_desc = image_from_record && image_engine_id != 0 && !image_desc.is_r128 && Core::NativeImageDesc::FromDescOn() &&
                                Core::NativeImageDesc::DescForBinding(image_engine_id, image_view_id, image_desc.post_op == Shader::SharpFetchPostOp::ConvertCubeTo2DArray, image_desc.is_depth, native_image_desc);
-        const auto make_image_desc = [&]() { return from_desc ? VideoCore::TextureCache::ImageDesc(native_image_desc, image_desc) : VideoCore::TextureCache::ImageDesc(tsharp, image_desc); };
+        // the plain description every host consumer below reads: the engine's, or (descriptors the engine has no object for) the one decode of the T# words
+        const Core::NativeDesc::ImageDesc binding_image = from_desc ? native_image_desc : VideoCore::ImageDescFromSharp(tsharp);
+        const auto make_image_desc = [&]() { return VideoCore::TextureCache::ImageDesc(binding_image, image_desc); };
 
         for (auto i = 0; i < num_bindings; i++) {
             auto& [image_id, desc] = image_bindings[num_images++];
             // Same T# and use as an earlier lookup, no image registered or removed since: the description and the
             // image FindImage returned are the same again (native_draw_mode >= 2).
-            std::array<u64, 6> key{};
-            static_assert(sizeof(AmdGpu::Image) <= 32);
-            std::memcpy(key.data(), &tsharp, sizeof(AmdGpu::Image));
-            key[4] = u64(image_desc.is_depth) | u64(image_desc.is_atomic) << 8 |
+            TextureKey key{binding_image};
+            key.flags = u64(image_desc.is_depth) | u64(image_desc.is_atomic) << 8 |
                      u64(image_desc.is_array) << 16 | u64(image_desc.is_written) << 24 |
                      u64(image_desc.is_r128) << 32 | u64(image_desc.constant_mip_index) << 40 |
                      u64(static_cast<u8>(image_desc.mip_fallback_mode)) << 48 |
                      u64(static_cast<u8>(image_desc.post_op)) << 56;
-            key[5] = u64(i) | (image_from_record ? image_engine_id << 16 : 0);
-            u64 hash = 0;
-            for (const u64 word : key) {
-                hash = (hash ^ word) * 0x9E3779B97F4A7C15ull;
-                hash ^= hash >> 29;
-            }
+            key.index = u64(i) | (image_from_record ? image_engine_id << 16 : 0);
+            const u64 hash = Core::NativeDesc::HashImageDesc(binding_image, key.flags * 0x9E3779B97F4A7C15ull ^ key.index);
             auto& cached = texture_lookup_cache[hash & 8191];
             const bool native_reuse =
                 Core::NativeConfig::DrawMode >=
@@ -2711,9 +2700,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             NativeImage* native_entry = nullptr;
             bool native_hit = false;
             if (B3ImagesOn() && image_from_record && image_engine_id != 0) {
-                native_entry = &native_images[(image_engine_id << 8) ^ (key[4] * 0x9E3779B97F4A7C15ull) ^ i];
-                native_hit = native_entry->valid && native_entry->id == image_engine_id && native_entry->flags == key[4] && native_entry->index == i &&
-                             std::memcmp(native_entry->tsharp.data(), &tsharp, sizeof(AmdGpu::Image)) == 0 && texture_cache.ImageUid(native_entry->image_id) == native_entry->image_uid &&
+                native_entry = &native_images[(image_engine_id << 8) ^ (key.flags * 0x9E3779B97F4A7C15ull) ^ i];
+                native_hit = native_entry->valid && native_entry->id == image_engine_id && native_entry->flags == key.flags && native_entry->index == i &&
+                             native_entry->image_key == binding_image && texture_cache.ImageUid(native_entry->image_id) == native_entry->image_uid &&
                              True(texture_cache.GetImage(native_entry->image_id).flags & VideoCore::ImageFlagBits::Registered);
                 b3_stats[native_hit ? 0 : native_entry->valid ? 2 : 1].fetch_add(1, std::memory_order_relaxed);
             }
@@ -2790,13 +2779,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
             if (native_entry != nullptr && !native_hit && image_id) {
                 if (!native_entry->valid) {
-                    native_image_keys[image_engine_id].push_back((image_engine_id << 8) ^ (key[4] * 0x9E3779B97F4A7C15ull) ^ i);
+                    native_image_keys[image_engine_id].push_back((image_engine_id << 8) ^ (key.flags * 0x9E3779B97F4A7C15ull) ^ i);
                 }
                 native_entry->valid = true;
                 native_entry->id = image_engine_id;
-                native_entry->flags = key[4];
+                native_entry->flags = key.flags;
                 native_entry->index = i;
-                std::memcpy(native_entry->tsharp.data(), &tsharp, sizeof(AmdGpu::Image));
+                native_entry->image_key = binding_image;
                 native_entry->image_id = image_id;
                 native_entry->image_uid = texture_cache.ImageUid(image_id);
                 native_entry->desc = desc;
@@ -2839,7 +2828,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     if (Core::NativeImageDesc::DeriveDesc(image_engine_id, image_view_id, engine_desc) && !engine_desc.alt_tile_mode && !image_desc.is_r128) {
                         VideoCore::TextureCache::ImageDesc fresh(engine_desc, image_desc);
                         finish_desc(fresh);
-                        VideoCore::TextureCache::ImageDesc from_t_sharp(tsharp, image_desc);
+                        VideoCore::TextureCache::ImageDesc from_t_sharp(VideoCore::ImageDescFromSharp(tsharp), image_desc);
                         finish_desc(from_t_sharp);
                         const auto& sharp_built = from_t_sharp;
                         const u32 info_mask = VideoCore::ImageInfoDiffMask(sharp_built.info, fresh.info) | VideoCore::ImageInfoDiffMask(desc.info, sharp_built.info),

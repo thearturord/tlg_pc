@@ -91,9 +91,6 @@ public:
         u64 engine_id{}; ///< E3: the engine resource / view the record binding names (0: none; targets, video out and copies)
 
         ImageDesc() = default;
-        ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc)
-            : info{image, desc}, view_info{image, desc},
-              type{desc.is_written ? BindingType::Storage : BindingType::Texture} {}
         /// F4.2: the sampled / stored image from the plain description
         ImageDesc(const Core::NativeDesc::ImageDesc& image, const Shader::ImageResource& desc)
             : info{image, desc.is_depth}, view_info{image, desc.is_depth, desc.is_written, desc.is_array},
