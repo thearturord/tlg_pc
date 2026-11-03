@@ -34,6 +34,19 @@ void CompareDesc(u64 resource_id, u64 view_id, const NativeDesc::ImageDesc& refe
 /// the description the accessor bit names (bit order of the mask `CompareDesc` receives)
 constexpr const char* AccessorNames[] = {"NumLayers", "NumLevels", "NumSamples", "BaseType", "ViewType", "NumViewLevels", "NumViewLayers", "IsTiled", "IsVolume"};
 
+/// F4.3 (`TLG_IMAGE_FROM_DESC`, default on since 2026-11-03, `=0` turns it off, read once): the host builds the `ImageInfo` / `ImageViewInfo` of a sampled or stored image from the plain
+/// description instead of the T#. `FromDescOn()` is the switch; `DescForBinding` is the consumer's call: the engine's description of the binding with the shader's fix ups applied
+/// (`cube_to_2d_array`: the cube is read as a 2D array; `is_depth`: the host reads a depth image only as a 16 or 32 bit single channel). False (counted, the T# path serves the binding)
+/// when the engine has nothing for the binding, the alternative tiling is set, or the depth use does not fit.
+[[nodiscard]] bool FromDescOn() noexcept;
+[[nodiscard]] bool DescForBinding(u64 resource_id, u64 view_id, bool cube_to_2d_array, bool is_depth, NativeDesc::ImageDesc& out);
+
+/// F4.2 shadow: the host `ImageInfo` / `ImageViewInfo` built from the plain description against the ones built from the T#: bit per differing field (names below).
+/// `engine_description_available` false: `DeriveDesc` had nothing for the binding (or the alternative tiling is set): counted, not compared.
+constexpr const char* InfoFieldNames[] = {"props", "pixel_format", "type", "levels", "layers", "size", "num_bits", "num_samples", "pitch", "tile_mode", "array_mode", "mips_layout", "micro_tiled_mips", "guest_address", "guest_size", "bank_swizzle_alt_tile", "meta_stencil"};
+constexpr const char* ViewFieldNames[] = {"type", "format", "range", "mapping", "min_lod", "is_storage"};
+void NoteHostInfoCompare(bool engine_description_available, u32 info_mask, u32 view_mask, const char* example);
+
 /// True: the image descriptor of a binding comes from `Derive` and the words the record holds only verify (default; `TLG_IMAGE_DESC=0` turns it off).
 [[nodiscard]] bool Decides() noexcept;
 /// The deciding call of the consumer: the image of the binding (the raw descriptor, before the shader's fix ups) in `out`; false when the engine table cannot say (the record's

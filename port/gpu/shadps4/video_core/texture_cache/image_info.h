@@ -43,6 +43,11 @@ struct ImageProperties {
 /// `ImageDescAccessorMismatch` checks the accessors of a description against the T# helpers (bit per accessor, `Core::NativeImageDesc::AccessorNames`) for `is_array` both ways.
 Core::NativeDesc::ImageDesc ImageDescFromSharp(const AmdGpu::Image& sharp) noexcept;
 u32 ImageDescAccessorMismatch(const AmdGpu::Image& sharp, const Core::NativeDesc::ImageDesc& desc) noexcept;
+struct ImageInfo;
+struct ImageViewInfo;
+/// F4.2 shadow: bit per differing field (`Core::NativeImageDesc::InfoFieldNames` / `ViewFieldNames`) between two infos built for the same binding.
+u32 ImageInfoDiffMask(const ImageInfo& a, const ImageInfo& b) noexcept;
+u32 ImageViewInfoDiffMask(const ImageViewInfo& a, const ImageViewInfo& b) noexcept;
 
 struct ImageInfo {
     ImageInfo() = default;
@@ -51,6 +56,9 @@ struct ImageInfo {
     ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr htile_address,
               AmdGpu::CbDbExtent hint, bool write_buffer = false) noexcept;
     ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& desc) noexcept;
+    /// F4.2: the same info from the plain description (no T# read). `is_depth` is the shader's use of the image (the host promotes the format to a depth one).
+    /// A description with the neo mode alternative tiling set is not supported here (the caller keeps the T# path for it).
+    ImageInfo(const Core::NativeDesc::ImageDesc& desc, bool is_depth) noexcept;
 
     bool IsTiled() const {
         return tile_mode != AmdGpu::TileMode::DisplayLinearAligned;

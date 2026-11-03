@@ -143,6 +143,11 @@ std::array<std::atomic<u64>, DescFieldCount> g_dc_differing{};
 std::array<std::atomic<u64>, 9> g_dc_accessor_differs{};
 std::array<std::vector<std::string>, DescFieldCount> g_dc_examples;
 
+std::atomic<u64> g_hi_compared{}, g_hi_equal{}, g_hi_unavailable{};
+std::array<std::atomic<u64>, 17> g_hi_info_differs{};
+std::array<std::atomic<u64>, 6> g_hi_view_differs{};
+std::vector<std::string> g_hi_examples;
+
 void DescValues(const NativeDesc::ImageDesc& d, u64 (&v)[DescFieldCount]) {
     v[DAddress] = d.address;
     v[DVkFormat] = d.vk_format;
@@ -564,6 +569,69 @@ void Compare(u64 resource_id, u64 view_id, const AmdGpu::Image& actual) {
     }
 }
 
+void NoteHostInfoCompare(bool available, u32 info_mask, u32 view_mask, const char* example) {
+    if (!available) {
+        g_hi_unavailable.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_hi_compared.fetch_add(1, std::memory_order_relaxed);
+    if (info_mask == 0 && view_mask == 0) {
+        g_hi_equal.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    for (u32 i = 0; i < g_hi_info_differs.size(); ++i) {
+        if ((info_mask >> i) & 1) {
+            g_hi_info_differs[i].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    for (u32 i = 0; i < g_hi_view_differs.size(); ++i) {
+        if ((view_mask >> i) & 1) {
+            g_hi_view_differs[i].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    std::scoped_lock lock{g_mutex};
+    if (g_hi_examples.size() < 12 && example != nullptr) {
+        const std::string text = example;
+        if (std::find(g_hi_examples.begin(), g_hi_examples.end(), text) == g_hi_examples.end()) {
+            g_hi_examples.push_back(text);
+        }
+    }
+}
+
+std::atomic<u64> g_use_served{}, g_use_unavailable{}, g_use_alt_tile{}, g_use_depth_refused{};
+
+bool FromDescOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_IMAGE_FROM_DESC");
+        return e == nullptr || *e != '0';
+    }();
+    return on;
+}
+
+bool DescForBinding(u64 resource_id, u64 view_id, bool cube_to_2d_array, bool is_depth, NativeDesc::ImageDesc& out) {
+    if (!DeriveDesc(resource_id, view_id, out)) {
+        g_use_unavailable.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (out.alt_tile_mode) {
+        g_use_alt_tile.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (cube_to_2d_array) {
+        out.type = NativeDesc::Type2DArray;
+        out.depth = (out.depth + 1) * 6 - 1;
+    }
+    if (is_depth) {
+        const auto format = static_cast<vk::Format>(out.vk_format);
+        if (format != vk::Format::eR32Sfloat && format != vk::Format::eR32Uint && format != vk::Format::eR16Sfloat && format != vk::Format::eR16Unorm) {
+            g_use_depth_refused.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    g_use_served.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 bool DescCompareOn() noexcept {
     static const bool on = [] {
         const char* e = std::getenv("TLG_DESC_CHECKS");
@@ -789,13 +857,29 @@ nlohmann::json Report() {
         for (u32 i = 0; i < g_dc_accessor_differs.size(); ++i) {
             plain["accessor_differs"][AccessorNames[i]] = g_dc_accessor_differs[i].load();
         }
-        std::scoped_lock plain_lock{g_mutex};
-        for (u32 i = 0; i < DescFieldCount; ++i) {
-            for (const auto& text : g_dc_examples[i]) {
-                plain["examples"][DescFieldNames[i]].push_back(text);
+        {
+            std::scoped_lock plain_lock{g_mutex};
+            for (u32 i = 0; i < DescFieldCount; ++i) {
+                for (const auto& text : g_dc_examples[i]) {
+                    plain["examples"][DescFieldNames[i]].push_back(text);
+                }
             }
         }
         j["f4_1_plain_description"] = std::move(plain);
+        nlohmann::json host = {{"compared", g_hi_compared.load()}, {"equal_info_and_view", g_hi_equal.load()}, {"engine_description_not_available", g_hi_unavailable.load()}};
+        for (u32 i = 0; i < g_hi_info_differs.size(); ++i) {
+            host["info_differs"][InfoFieldNames[i]] = g_hi_info_differs[i].load();
+        }
+        for (u32 i = 0; i < g_hi_view_differs.size(); ++i) {
+            host["view_differs"][ViewFieldNames[i]] = g_hi_view_differs[i].load();
+        }
+        {
+            std::scoped_lock host_lock{g_mutex};
+            host["examples"] = g_hi_examples;
+        }
+        j["f4_2_host_info_from_description"] = std::move(host);
+        j["f4_3_use"] = {{"on", FromDescOn()}, {"switch", "TLG_IMAGE_FROM_DESC=0 turns it off"}, {"bindings_served_from_the_description", g_use_served.load()}, {"engine_description_not_available", g_use_unavailable.load()},
+                         {"alt_tile_set", g_use_alt_tile.load()}, {"depth_use_does_not_fit", g_use_depth_refused.load()}};
     }
     auto& fields = j["differing_fields"] = nlohmann::json::object();
     for (u32 i = 0; i < FieldCount; ++i) {

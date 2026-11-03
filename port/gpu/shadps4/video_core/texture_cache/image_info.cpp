@@ -219,6 +219,62 @@ u32 ImageDescAccessorMismatch(const AmdGpu::Image& sharp, const Core::NativeDesc
     return mask;
 }
 
+ImageInfo::ImageInfo(const Core::NativeDesc::ImageDesc& desc, bool is_depth) noexcept {
+    tile_mode = static_cast<AmdGpu::TileMode>(desc.tile_mode);
+    array_mode = AmdGpu::GetArrayMode(tile_mode);
+    pixel_format = static_cast<vk::Format>(desc.vk_format);
+    if (is_depth) {
+        pixel_format = LiverpoolToVK::PromoteFormatToDepth(pixel_format);
+    }
+    type = static_cast<AmdGpu::ImageType>(desc.BaseType());
+    props = ImageProperties{
+        .is_volume = type == AmdGpu::ImageType::Color3D,
+        .is_tiled = desc.IsTiled(),
+        .is_pow2 = desc.pow2_pad,
+        .is_block = desc.is_block,
+        .is_depth = is_depth,
+    };
+    size.width = desc.width;
+    size.height = desc.height;
+    size.depth = props.is_volume ? desc.depth + 1 : 1;
+    pitch = desc.pitch;
+    resources.levels = desc.NumLevels();
+    resources.layers = desc.NumLayers();
+    num_samples = desc.NumSamples();
+    num_bits = desc.num_bits;
+    guest_address = desc.address;
+    UpdateSize();
+}
+
+u32 ImageInfoDiffMask(const ImageInfo& a, const ImageInfo& b) noexcept {
+    u32 mask = 0;
+    const auto diff = [&](u32 bit, bool different) { mask |= different ? 1u << bit : 0u; };
+    diff(0, a.props.is_volume != b.props.is_volume || a.props.is_tiled != b.props.is_tiled || a.props.is_pow2 != b.props.is_pow2 || a.props.is_block != b.props.is_block ||
+               a.props.is_depth != b.props.is_depth || a.props.has_stencil != b.props.has_stencil || a.props.is_host_2d != b.props.is_host_2d);
+    diff(1, a.pixel_format != b.pixel_format);
+    diff(2, a.type != b.type);
+    diff(3, a.resources.levels != b.resources.levels);
+    diff(4, a.resources.layers != b.resources.layers);
+    diff(5, a.size.width != b.size.width || a.size.height != b.size.height || a.size.depth != b.size.depth);
+    diff(6, a.num_bits != b.num_bits);
+    diff(7, a.num_samples != b.num_samples);
+    diff(8, a.pitch != b.pitch);
+    diff(9, a.tile_mode != b.tile_mode);
+    diff(10, a.array_mode != b.array_mode);
+    bool mips = false;
+    for (u32 m = 0; m < a.resources.levels && m < a.mips_layout.size(); ++m) {
+        mips |= std::memcmp(&a.mips_layout[m], &b.mips_layout[m], sizeof(MipInfo)) != 0;
+    }
+    diff(11, mips);
+    diff(12, a.micro_tiled_mips != b.micro_tiled_mips);
+    diff(13, a.guest_address != b.guest_address);
+    diff(14, a.guest_size != b.guest_size);
+    diff(15, a.bank_swizzle != b.bank_swizzle || a.alt_tile != b.alt_tile);
+    diff(16, a.meta_info.cmask_addr != b.meta_info.cmask_addr || a.meta_info.fmask_addr != b.meta_info.fmask_addr || a.meta_info.htile_addr != b.meta_info.htile_addr || a.stencil_addr != b.stencil_addr ||
+                 a.stencil_size != b.stencil_size);
+    return mask;
+}
+
 bool ImageInfo::IsCompatible(const ImageInfo& info) const {
     return (IsVulkanFormatCompatible(pixel_format, info.pixel_format) ||
             IsVulkanFormatCompatible(info.pixel_format, pixel_format)) &&

@@ -2657,6 +2657,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
         const u32 num_bindings = image_desc.NumBindings(stage);
+        // F4.3: the host infos of this binding come from the engine's plain description when it has one (the T# stays for the shader specialization and the lookup key)
+        Core::NativeDesc::ImageDesc native_image_desc;
+        const bool from_desc = image_from_record && image_engine_id != 0 && !image_desc.is_r128 && Core::NativeImageDesc::FromDescOn() &&
+                               Core::NativeImageDesc::DescForBinding(image_engine_id, image_view_id, image_desc.post_op == Shader::SharpFetchPostOp::ConvertCubeTo2DArray, image_desc.is_depth, native_image_desc);
+        const auto make_image_desc = [&]() { return from_desc ? VideoCore::TextureCache::ImageDesc(native_image_desc, image_desc) : VideoCore::TextureCache::ImageDesc(tsharp, image_desc); };
 
         for (auto i = 0; i < num_bindings; i++) {
             auto& [image_id, desc] = image_bindings[num_images++];
@@ -2723,7 +2728,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 static thread_local u64 b3_counter = 0;
                 if (b3_verify != 0 && ++b3_counter % b3_verify == 0) {
                     // verify: the lookup by address finds the same image
-                    VideoCore::TextureCache::ImageDesc check(tsharp, image_desc);
+                    VideoCore::TextureCache::ImageDesc check = make_image_desc();
                     finish_desc(check);
                     const VideoCore::ImageId found = texture_cache.FindImage(check);
                     b3_stats[found == image_id ? 3 : 4].fetch_add(1, std::memory_order_relaxed);
@@ -2741,7 +2746,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 const u32 every = TextureIdsVerifyEvery();
                 static thread_local u64 verify_counter = 0;
                 if (every != 0 && ++verify_counter % every == 0) {
-                    VideoCore::TextureCache::ImageDesc check(tsharp, image_desc);
+                    VideoCore::TextureCache::ImageDesc check = make_image_desc();
                     finish_desc(check);
                     const VideoCore::ImageId found = texture_cache.FindImage(check);
                     (by_id ? g_identity_audit.texture_id_verified : g_identity_audit.texture_gen_verified).fetch_add(1, std::memory_order_relaxed);
@@ -2766,7 +2771,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 }
             } else {
                 (!native_reuse ? g_identity_audit.texture_miss_native_reuse_off : !cached.valid ? g_identity_audit.texture_miss_cold : g_identity_audit.texture_miss_other_key).fetch_add(1, std::memory_order_relaxed);
-                std::construct_at(&desc, tsharp, image_desc);
+                std::construct_at(&desc, make_image_desc());
                 finish_desc(desc);
 
                 Census(census_base + CImageFind);
@@ -2829,6 +2834,27 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 if (Core::NativeImageDesc::DescCompareOn()) { // F4.1 plain description against the T# helpers
                     const auto reference = VideoCore::ImageDescFromSharp(tsharp);
                     Core::NativeImageDesc::CompareDesc(image_engine_id, image_view_id, reference, VideoCore::ImageDescAccessorMismatch(tsharp, reference));
+                    // F4.2 shadow: the host infos built from the engine's plain description against the ones built from the T#
+                    Core::NativeDesc::ImageDesc engine_desc;
+                    if (Core::NativeImageDesc::DeriveDesc(image_engine_id, image_view_id, engine_desc) && !engine_desc.alt_tile_mode && !image_desc.is_r128) {
+                        VideoCore::TextureCache::ImageDesc fresh(engine_desc, image_desc);
+                        finish_desc(fresh);
+                        VideoCore::TextureCache::ImageDesc from_t_sharp(tsharp, image_desc);
+                        finish_desc(from_t_sharp);
+                        const auto& sharp_built = from_t_sharp;
+                        const u32 info_mask = VideoCore::ImageInfoDiffMask(sharp_built.info, fresh.info) | VideoCore::ImageInfoDiffMask(desc.info, sharp_built.info),
+                                  view_mask = VideoCore::ImageViewInfoDiffMask(sharp_built.view_info, fresh.view_info) | VideoCore::ImageViewInfoDiffMask(desc.view_info, sharp_built.view_info);
+                        std::string example;
+                        if ((info_mask | view_mask) != 0) {
+                            example = fmt::format("info mask {:#x} view mask {:#x}: sharp format {} {}x{} pitch {} levels {} layers {} type {} tile {}; desc format {} {}x{} pitch {} levels {} layers {} type {} tile {}", info_mask, view_mask,
+                                                  u32(desc.info.pixel_format), desc.info.size.width, desc.info.size.height, desc.info.pitch, u32(desc.info.resources.levels), u32(desc.info.resources.layers),
+                                                  u32(desc.info.type), u32(desc.info.tile_mode), u32(fresh.info.pixel_format), fresh.info.size.width, fresh.info.size.height, fresh.info.pitch,
+                                                  u32(fresh.info.resources.levels), u32(fresh.info.resources.layers), u32(fresh.info.type), u32(fresh.info.tile_mode));
+                        }
+                        Core::NativeImageDesc::NoteHostInfoCompare(true, info_mask, view_mask, example.c_str());
+                    } else {
+                        Core::NativeImageDesc::NoteHostInfoCompare(false, 0, 0, nullptr);
+                    }
                 }
                 Core::NativeDevice::CheckImageSharp(image_engine_id, image_view_id, {.data_format = u32(tsharp.GetDataFmt()),
                                                                       .num_format = u32(tsharp.GetNumberFmt()),

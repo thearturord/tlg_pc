@@ -94,6 +94,10 @@ public:
         ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc)
             : info{image, desc}, view_info{image, desc},
               type{desc.is_written ? BindingType::Storage : BindingType::Texture} {}
+        /// F4.2: the sampled / stored image from the plain description
+        ImageDesc(const Core::NativeDesc::ImageDesc& image, const Shader::ImageResource& desc)
+            : info{image, desc.is_depth}, view_info{image, desc.is_depth, desc.is_written, desc.is_array},
+              type{desc.is_written ? BindingType::Storage : BindingType::Texture} {}
         ImageDesc(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
             : info{buffer, hint}, view_info{buffer}, type{BindingType::RenderTarget} {}
         ImageDesc(const AmdGpu::DepthBuffer& buffer, AmdGpu::DepthView view,

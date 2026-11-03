@@ -73,6 +73,37 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
     }
 }
 
+u32 ImageViewInfoDiffMask(const ImageViewInfo& a, const ImageViewInfo& b) noexcept {
+    u32 mask = 0;
+    const auto diff = [&](u32 bit, bool different) { mask |= different ? 1u << bit : 0u; };
+    diff(0, a.type != b.type);
+    diff(1, a.format != b.format);
+    diff(2, !(a.range == b.range));
+    diff(3, a.mapping.r != b.mapping.r || a.mapping.g != b.mapping.g || a.mapping.b != b.mapping.b || a.mapping.a != b.mapping.a);
+    diff(4, a.min_lod != b.min_lod);
+    diff(5, a.is_storage != b.is_storage);
+    return mask;
+}
+
+ImageViewInfo::ImageViewInfo(const Core::NativeDesc::ImageDesc& image, bool is_depth, bool is_written, bool is_array) noexcept : is_storage{is_written} {
+    format = static_cast<vk::Format>(is_storage ? image.vk_format_storage : image.vk_format);
+    if (is_depth) {
+        format = Vulkan::LiverpoolToVK::PromoteFormatToDepth(format);
+    }
+    range.base.level = image.base_level;
+    range.base.layer = std::min<u32>(image.base_array, image.NumLayers() - 1);
+    range.extent.levels = image.NumViewLevels(is_array);
+    range.extent.layers = image.NumViewLayers(is_array);
+    type = static_cast<AmdGpu::ImageType>(image.ViewType(is_array));
+    min_lod = image.min_lod;
+    if (!is_storage) {
+        mapping = {.r = static_cast<AmdGpu::CompSwizzle>(image.swizzle[0]),
+                   .g = static_cast<AmdGpu::CompSwizzle>(image.swizzle[1]),
+                   .b = static_cast<AmdGpu::CompSwizzle>(image.swizzle[2]),
+                   .a = static_cast<AmdGpu::CompSwizzle>(image.swizzle[3])};
+    }
+}
+
 ImageViewInfo::ImageViewInfo(const AmdGpu::ColorBuffer& col_buffer) noexcept {
     range.base.layer = col_buffer.BaseSlice();
     range.extent.layers = col_buffer.NumSlices() - range.base.layer;
