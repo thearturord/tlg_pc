@@ -349,13 +349,6 @@ void DrawResources::AddBinding(const Binding& binding) {
     }
 }
 
-namespace {
-struct BindingCounters {
-    std::atomic<u64> exact{}, differs{}, not_found{}, in_table{}, not_single_load{}, no_record{}, id_registered{}, id_unregistered{};
-};
-std::array<std::array<BindingCounters, 2>, 16> binding_counters;
-std::atomic<u32> binding_logged{0};
-} // namespace
 
 namespace {
 std::array<std::atomic<u64>, 16> binder_counters{};
@@ -369,76 +362,6 @@ std::array<std::array<std::array<std::atomic<u64>, 12>, 3>, 16> binder_reasons{}
 }
 void NoteBinderReason(u32 draw_class, u32 record_stage, u32 reason) {
     binder_reasons[draw_class & 15][std::min<u32>(record_stage, 2)][std::min<u32>(reason, 11)].fetch_add(1, std::memory_order_relaxed);
-}
-
-void AuditBinding(u32 sw_stage, bool image, u32 offset, const u32* words, u32 dwords) {
-    if (!enabled.load(std::memory_order_relaxed)) {
-        return;
-    }
-    auto& counters = binding_counters[draw_class & 15][image ? 1 : 0];
-    const DrawResources* draw = (current_draw_seq != 0 && draw_ring) ? &draw_ring[current_draw_seq % DrawRing] : nullptr;
-    if (draw == nullptr || draw->seq != current_draw_seq) {
-        ++counters.no_record;
-        return;
-    }
-    if (offset == 0xffff || words == nullptr) {
-        ++counters.not_single_load;
-        return;
-    }
-    const u32 stage = sw_stage == 3 ? 0 : sw_stage == 0 ? 1 : 2;
-    const u8 kind = image ? 2 : 1;
-    for (u32 i = 0; i < draw->binding_count; ++i) {
-        const auto& b = draw->bindings[i];
-        if (b.stage != stage || b.kind != kind || b.offset == 0xffff || offset < b.offset || offset + dwords > b.offset + b.dwords) {
-            continue;
-        }
-        bool same = true;
-        for (u32 k = 0; k < dwords; ++k) {
-            same &= b.words[offset - b.offset + k] == words[k];
-        }
-        if (same) {
-            ++counters.exact;
-            thread_local u32 sampled = 0;
-            if ((sampled++ & 7) == 0) {
-                std::shared_lock lock{registry_mutex};
-                ++(by_id.contains(b.id) ? counters.id_registered : counters.id_unregistered);
-            }
-        } else {
-            ++counters.differs;
-            if (binding_logged.fetch_add(1) < 10) {
-                std::string text = fmt::format("binding differs: draw {} class {} {} stage {} offset {} slot {} object {:#x} id {} binding words:", draw->seq, draw_class, image ? "image" : "buffer", stage, offset, b.slot, b.object, b.id);
-                for (u32 k = 0; k < dwords; ++k) {
-                    text += fmt::format(" {:x}", b.words[offset - b.offset + k]);
-                }
-                text += " legacy words:";
-                for (u32 k = 0; k < dwords; ++k) {
-                    text += fmt::format(" {:x}", words[k]);
-                }
-                NoteDebug(text);
-            }
-        }
-        return;
-    }
-    // not at that offset: is the same descriptor an entry of a table behind a pointer?
-    for (u32 i = 0; i < draw->binding_count; ++i) {
-        const auto& b = draw->bindings[i];
-        if (b.stage == stage && b.kind == kind && b.offset == 0xffff && dwords <= b.dwords && std::memcmp(b.words, words, dwords * sizeof(u32)) == 0) {
-            ++counters.in_table;
-            return;
-        }
-    }
-    ++counters.not_found;
-    if (binding_logged.fetch_add(1) < 10) {
-        std::string text = fmt::format("binding not found: draw {} class {} {} stage {} offset {} legacy words:", draw->seq, draw_class, image ? "image" : "buffer", stage, offset);
-        for (u32 k = 0; k < dwords; ++k) {
-            text += fmt::format(" {:x}", words[k]);
-        }
-        text += fmt::format(" | bindings ({}):", draw->binding_count);
-        for (u32 i = 0; i < draw->binding_count && i < 16; ++i) {
-            text += fmt::format(" [s{} k{} o{} sl{} w{:x}]", draw->bindings[i].stage, draw->bindings[i].kind, draw->bindings[i].offset, draw->bindings[i].slot, draw->bindings[i].words[0]);
-        }
-        NoteDebug(text);
-    }
 }
 
 void DrawResources::AddOther(u64 begin, u64 end, u32 where) {
@@ -1175,22 +1098,6 @@ nlohmann::json Report() {
                         kept[class_names[c]][stage_names[s]][reason_names[r]] = n;
                     }
                 }
-            }
-        }
-    }
-    {
-        auto& v2b = j["binding_audit"] = nlohmann::json::object();
-        constexpr const char* names[16] = {"z_prepass_shadow", "g_buffer", "forward", "compute_other", "indirect_draws", "", "", "", "", "", "", "", "", "", "", "untagged"};
-        for (u32 c = 0; c < 16; ++c) {
-            for (u32 image = 0; image < 2; ++image) {
-                const auto& k = binding_counters[c][image];
-                if (k.exact + k.differs + k.not_found + k.in_table + k.not_single_load + k.no_record == 0) {
-                    continue;
-                }
-                v2b[std::string(names[c][0] ? names[c] : std::to_string(c)) + (image ? " images" : " buffers")] = {
-                    {"exact_same_words_at_the_same_stage_and_offset", k.exact.load()}, {"words_differ", k.differs.load()}, {"found_as_an_entry_of_a_table", k.in_table.load()},
-                    {"no_binding_at_that_offset", k.not_found.load()}, {"legacy_descriptor_is_built_from_immediates_or_several_loads", k.not_single_load.load()},
-                    {"no_draw_record", k.no_record.load()}, {"exact_and_object_registered_sampled", k.id_registered.load()}, {"exact_and_object_not_registered_sampled", k.id_unregistered.load()}};
             }
         }
     }

@@ -179,21 +179,6 @@ enum CensusKind : u32 {
     CImageStorage, CImageTransit, CImageTransitTrue, CBindResources, CBufferInPlace, CBufferResolved,
     CGeometryVertexRing = 24, CGeometryVertexHandle, CGeometryVertexAddress, CGeometryIndexRing, CGeometryIndexHandle, CGeometryIndexAddress,
 };
-/// C1 / C2 identity audits (image ids, program pipelines): a hash map insert per image and per dispatch, off unless `TLG_IDENTITY_AUDIT=1` (2026-10-29)
-bool IdentityAuditOn() {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_IDENTITY_AUDIT");
-        return e != nullptr && *e == '1';
-    }();
-    return on;
-}
-bool DescCensusOn() {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_DESC_CENSUS");
-        return e != nullptr && *e != 0 && *e != '0';
-    }();
-    return on;
-}
 } // namespace
 
 void Rasterizer::MaybeFlushRecorded() {
@@ -960,28 +945,6 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     if (Core::LightRecorder::On()) {
         Core::LightRecorder::FrameOp(Core::DebugServer::PresentCount(), 0, cs_program.address, texture_cache.ImageGeneration());
     }
-    if (IdentityAuditOn()) {
-        // C1 / C2 audit: the pipeline of a program address
-        auto& audit = g_identity_audit;
-        audit.dispatches.fetch_add(1, std::memory_order_relaxed);
-        if (plan != nullptr && plan->native_seq != 0) {
-            audit.dispatch_with_record.fetch_add(1, std::memory_order_relaxed);
-            if (plan->bindings_complete) {
-                audit.dispatch_bindings_complete.fetch_add(1, std::memory_order_relaxed);
-                audit.dispatch_binding_entries.fetch_add(plan->binding_count, std::memory_order_relaxed);
-            }
-        }
-        const auto [it, is_new] = identity_tables.programs.try_emplace(cs_program.address, pipeline);
-        if (is_new) {
-            audit.programs_seen.fetch_add(1, std::memory_order_relaxed);
-        } else if (it->second == pipeline) {
-            audit.pipeline_same.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            audit.pipeline_switched.fetch_add(1, std::memory_order_relaxed);
-            it->second = pipeline;
-        }
-    }
-
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     {
         TLG_PROF_LEVEL("raster.shader_hle", 3);
@@ -990,8 +953,6 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
         }
     }
 
-    static const bool dispatch_audit_on = std::getenv("TLG_DISPATCH_AUDIT") != nullptr;
-    dispatch_audit_plan = (dispatch_audit_on && plan != nullptr && plan->bindings_complete) ? plan : nullptr;
     binder_plan = DispatchBinderFor(plan);
     resolved_dispatch = binder_plan != nullptr ? plan : nullptr;
     const bool light_recorded = Core::LightRecorder::On() && plan != nullptr && plan->native_seq != 0 && Core::LightRecorder::IsLightCaller(Core::NativeDraw::RecordCallerGhidra(plan->native_seq));
@@ -1034,7 +995,6 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     }
     resolved_dispatch = nullptr;
     binder_plan = nullptr;
-    dispatch_audit_plan = nullptr;
     if (!dispatch_bound) {
         return;
     }
@@ -1087,8 +1047,6 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Dis
         return;
     }
 
-    static const bool dispatch_audit_on = std::getenv("TLG_DISPATCH_AUDIT") != nullptr;
-    dispatch_audit_plan = (dispatch_audit_on && plan != nullptr && plan->bindings_complete) ? plan : nullptr;
     binder_plan = DispatchBinderFor(plan);
     resolved_dispatch = binder_plan != nullptr ? plan : nullptr;
     // dark frame: the indirect dispatches (the deferred sun pass CS_Deferred is one, two a frame) are recorded with all their inputs, caller tag 0xd15 + the record's call site
@@ -1102,7 +1060,6 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Dis
     }
     resolved_dispatch = nullptr;
     binder_plan = nullptr;
-    dispatch_audit_plan = nullptr;
     if (!dispatch_bound) {
         return;
     }
@@ -1329,15 +1286,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
         BindBuffers(*stage, binding, push_data);
         const u32 images_before = static_cast<u32>(image_infos.size());
         BindTextures(*stage, binding);
-        if (fixed != nullptr && DescCensusOn() && !pipeline->IsCompute()) {
-            for (u32 i = images_before; i < image_infos.size() && i - images_before < 16; ++i) {
-                DescriptorNoteImage(static_cast<u32>(stage->sw_stage), i - images_before, image_infos[i].imageView);
-            }
-        }
         uses_dma |= stage->uses_dma;
-    }
-    if (fixed != nullptr && DescCensusOn() && !pipeline->IsCompute()) {
-        DescriptorEndDraw();
     }
 
     if (uses_dma) {
@@ -1856,15 +1805,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
             }
         } else {
-            if (Core::NativeRegistry::enabled.load(std::memory_order_relaxed) && !StageFlatSkipped(stage)) {
-                // NativeDraw v2 audit: the descriptor the legacy path reads is the binding of the record at that offset
-                const auto flat = stage.FlatUserData();
-                if (desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad && desc.sharp_fetch.offsets[0] + 4 <= flat.size()) {
-                    Core::NativeRegistry::AuditBinding(static_cast<u32>(stage.sw_stage), false, desc.sharp_fetch.offsets[0], flat.data() + desc.sharp_fetch.offsets[0], 4);
-                } else {
-                    Core::NativeRegistry::AuditBinding(static_cast<u32>(stage.sw_stage), false, 0xffff, nullptr, 0);
-                }
-            }
             bool cp_no_object = false;
             if (const StagePlan* ns = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
                                       : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
@@ -1928,74 +1868,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (const u32* words = BinderWords(stage, desc.sharp_fetch.offsets[0], 4, 1, &record_binding)) {
                     chosen_sharp = desc.FromWords(words, stage);
                     from_record = true;
-                    if (binder_verify) {
-                        const auto legacy = desc.GetSharp(stage);
-                        if (std::memcmp(&legacy, &chosen_sharp, sizeof(legacy)) != 0) {
-                            Core::NativeRegistry::NoteBinder(4);
-                            chosen_sharp = legacy;
-                        }
-                    }
-                }
-            }
-            if (!from_record && dispatch_audit_plan != nullptr && stage.sw_stage == Shader::SwStage::Compute &&
-                desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
-                auto& audit = g_identity_audit;
-                audit.dispatch_buffer_loads.fetch_add(1, std::memory_order_relaxed);
-                const u32* words = nullptr;
-                u32 audit_index = 0;
-                for (u32 s = 0; s < 8 && words == nullptr; ++s) {
-                    words = FindRecordWords(stage, dispatch_audit_plan->bindings.data(), dispatch_audit_plan->binding_count, s, 1, desc.sharp_fetch.offsets[0], 4, &audit_index);
-                }
-                if (words == nullptr) {
-                    // the record builder leaves out a slot with no bound object: is the guest's descriptor there a null buffer too?
-                    const auto legacy = desc.GetSharp(stage);
-                    audit.dispatch_buffer_missing.fetch_add(1, std::memory_order_relaxed);
-                    if (legacy.base_address == 0 || legacy.GetSize() == 0) {
-                        audit.dispatch_buffer_missing_null.fetch_add(1, std::memory_order_relaxed);
-                    } else {
-                        static std::atomic<u32> logged{0};
-                        if (logged.fetch_add(1) < 12) {
-                            u32 l[4];
-                            std::memcpy(l, &legacy, 16);
-                            LOG_ERROR(Render_Vulkan, "L2 missing entry, guest descriptor is not null: caller {:#x} program {:#x} offset {} guest {:08x} {:08x} {:08x} {:08x}", Core::NativeDraw::RecordCallerGhidra(dispatch_audit_plan->native_seq),
-                                      stage.pgm_hash, desc.sharp_fetch.offsets[0], l[0], l[1], l[2], l[3]);
-                        }
-                    }
-                }
-                if (words != nullptr) {
-                    audit.dispatch_buffer_record.fetch_add(1, std::memory_order_relaxed);
-                    const auto legacy = desc.GetSharp(stage);
-                    const auto recorded = desc.FromWords(words, stage);
-                    {
-                        // does the record lag by one update? (its base is the guest's base of the previous dispatch of this program and offset)
-                        static std::unordered_map<u64, std::pair<u64, u64>> previous; // key -> (guest base, record base) of the last dispatch
-                        auto& last = previous[(u64{stage.pgm_hash} << 16) ^ desc.sharp_fetch.offsets[0]];
-                        if (std::memcmp(&legacy, &recorded, sizeof(legacy)) != 0) {
-                            audit.dispatch_lag[last.first == recorded.base_address ? 0 : last.second == legacy.base_address ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
-                        }
-                        last = {legacy.base_address, recorded.base_address};
-                    }
-                    (std::memcmp(&legacy, &recorded, sizeof(legacy)) == 0 ? audit.dispatch_buffer_equal : audit.dispatch_buffer_different).fetch_add(1, std::memory_order_relaxed);
-                    if (std::memcmp(&legacy, &recorded, sizeof(legacy)) != 0) {
-                        audit.dispatch_diff[legacy.base_address != recorded.base_address ? 0 : legacy.GetSize() != recorded.GetSize() ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
-                        {
-                            const u64 rec_size = recorded.GetSize(), leg_size = legacy.GetSize();
-                            const bool rec_ok = memory->ClampRangeSize(recorded.base_address, rec_size) == rec_size;
-                            const bool leg_ok = memory->ClampRangeSize(legacy.base_address, leg_size) == leg_size;
-                            audit.dispatch_diff[rec_ok ? (leg_ok ? 4 : 5) : (leg_ok ? 6 : 7)].fetch_add(1, std::memory_order_relaxed);
-                        }
-                        if (auto* handle = Core::NativeResources::FindImmutableById(dispatch_audit_plan->bindings[audit_index].id)) {
-                            audit.dispatch_diff[3].fetch_add(1, std::memory_order_relaxed);
-                        }
-                        static std::atomic<u32> logged{0};
-                        if (logged.fetch_add(1) < 12) {
-                            u32 l[4], r[4];
-                            std::memcpy(l, &legacy, 16);
-                            std::memcpy(r, &recorded, 16);
-                            LOG_ERROR(Render_Vulkan, "B9 dispatch buffer differs: caller {:#x} program {:#x} offset {} guest {:08x} {:08x} {:08x} {:08x} record {:08x} {:08x} {:08x} {:08x}", Core::NativeDraw::RecordCallerGhidra(dispatch_audit_plan->native_seq), stage.pgm_hash,
-                                      desc.sharp_fetch.offsets[0], l[0], l[1], l[2], l[3], r[0], r[1], r[2], r[3]);
-                        }
-                    }
                 }
             }
             if (from_record) {
@@ -2228,9 +2100,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         }
 
     buffer_bound:
-        if (census_base == 0 && DescCensusOn()) {
-            DescriptorNoteBuffer(static_cast<u32>(stage.sw_stage), buffer_index, buffer_infos.back());
-        }
         if (indexed_active && stage.indexed && Shader::Indexed::IsIndexedBufferType(desc.buffer_type)) {
             auto* indexed = IndexedData::Get();
             const auto& info = buffer_infos.back();
@@ -2424,15 +2293,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         if (image_desc.is_written) {
             Core::NativePass::NoteWrite(true);
         }
-        if (Core::NativeRegistry::enabled.load(std::memory_order_relaxed)) {
-            // NativeDraw v2 audit: the T# the legacy path reads is the binding of the record at that offset
-            const auto flat = StageFlatSkipped(stage) ? std::span<const u32>{} : stage.FlatUserData();
-            if (image_desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad && image_desc.sharp_fetch.offsets[0] + 8 <= flat.size()) {
-                Core::NativeRegistry::AuditBinding(static_cast<u32>(stage.sw_stage), true, image_desc.sharp_fetch.offsets[0], flat.data() + image_desc.sharp_fetch.offsets[0], 8);
-            } else {
-                Core::NativeRegistry::AuditBinding(static_cast<u32>(stage.sw_stage), true, 0xffff, nullptr, 0);
-            }
-        }
         AmdGpu::Image chosen_tsharp;
         bool image_from_record = false;
         u64 image_view_id = 0;   // E2: the engine's id of the view object the descriptor was built from
@@ -2451,47 +2311,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 }
                 chosen_tsharp = image_desc.FromWords(words);
                 image_from_record = true;
-                if (IdentityAuditOn()) {
-                    const u32* record_words = words;
-                    const auto& raw = chosen_tsharp;
-                    if (identity_binding != ~0u) {
-                        // C1 audit: does the engine's description of this image id stay the same?
-                        auto& audit = g_identity_audit;
-                        audit.image_bindings.fetch_add(1, std::memory_order_relaxed);
-                        if (const u64 id = binder_plan->bindings[identity_binding].id; id != 0) {
-                            audit.image_with_id.fetch_add(1, std::memory_order_relaxed);
-                            u64 hash = 0x9E3779B97F4A7C15ull;
-                            for (u32 w = 0; w < 8; ++w) {
-                                hash = (hash ^ record_words[w]) * 0xC2B2AE3D27D4EB4Full;
-                                hash ^= hash >> 29;
-                            }
-                            const u64 address = raw.Address();
-                            IdentityTables::ImageEntry fresh{hash, address};
-                            std::memcpy(fresh.words, record_words, sizeof(fresh.words));
-                            const auto [it, is_new] = identity_tables.images.try_emplace(id, fresh);
-                            if (is_new) {
-                                audit.image_ids_seen.fetch_add(1, std::memory_order_relaxed);
-                            } else if (it->second.words_hash == hash) {
-                                audit.image_same.fetch_add(1, std::memory_order_relaxed);
-                            } else {
-                                (it->second.address != address ? audit.image_address_changed : audit.image_other_words_changed).fetch_add(1, std::memory_order_relaxed);
-                                for (u32 w = 0; w < 8; ++w) {
-                                    if (it->second.words[w] != record_words[w]) {
-                                        audit.image_word_changed[w].fetch_add(1, std::memory_order_relaxed);
-                                    }
-                                }
-                                it->second = fresh;
-                            }
-                        }
-                    }
-                }
-                if (binder_verify) {
-                    const auto legacy = image_desc.GetSharp(stage);
-                    if (std::memcmp(&legacy, &chosen_tsharp, sizeof(legacy)) != 0) {
-                        Core::NativeRegistry::NoteBinder(5);
-                        chosen_tsharp = legacy;
-                    }
-                }
             }
         }
         if (image_from_record) {
@@ -2972,13 +2791,6 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
             std::memcpy(&raw, record_words, sizeof(raw));
             ssharp = sampler.PostOp(raw, aniso_dw3);
             Core::NativeRegistry::NoteBinder(7);
-            if (binder_verify) {
-                const auto legacy = sampler.GetSharp(stage);
-                if (std::memcmp(&legacy, &ssharp, sizeof(legacy)) != 0) {
-                    Core::NativeRegistry::NoteBinder(8);
-                    ssharp = legacy;
-                }
-            }
         } else if (sampler.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Sampler>::Summary::MultiLoad && sampler.sharp_fetch.load_mask == 0 &&
                    sampler.post_op != Shader::SharpFetchPostOp::DisableAnisoIfSingleLod) {
             // F5: the sampler is the shader's own immediates (no flat user data dword is read), so a stage whose flat user data was skipped still has it

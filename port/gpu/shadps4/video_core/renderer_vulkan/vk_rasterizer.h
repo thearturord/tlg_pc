@@ -133,7 +133,6 @@ public:
     /// C0 census (read only, counts per ~5 s interval): how every buffer and image binding, and every vertex / index buffer, of the draws and dispatches was resolved
     /// by the consumer. Index = (compute ? 32 : 0) + kind for the shader bindings, 24 + kind for the geometry (graphics only); see `CensusKind` in vk_rasterizer.cpp.
     std::array<u64, 64> TakeConsumerCensus() noexcept;
-    std::array<u64, 16> TakeDescriptorCensus() noexcept;
     [[nodiscard]] bool HazardAuditOn() const noexcept;
     Runtime::HazardAudit TakeHazardAudit();
     /// R2 (command processor thread): resolves the shader buffer bindings of a planned draw or dispatch whose record names a resident immutable engine buffer
@@ -344,22 +343,6 @@ private:
         inplace_image_or_meta{0}, inplace_verified{0}, inplace_differing{0}, inplace_verify_dropped{0};
     void CheckInPlaceVerifications();
     std::array<std::atomic<u64>, 64> consumer_census{};
-    // A5 / N7 groundwork (`TLG_DESC_CENSUS=1`): how often a graphics draw's descriptors repeat the previous draw's at the same (stage, binding) place.
-    enum DescKind : u32 {
-        DDraws, DDrawsAllSame, DDrawsSameButOffsets, DBuffers, DBufferNull, DBufferSame, DBufferOffsetOnly, DBufferOtherRange, DBufferOtherBuffer, DImages, DImageNull, DImageSame, DImageOther,
-        DDrawsBuffersOnlyChanged, DDrawsImagesOnlyChanged, DCount
-    };
-    struct PrevBuffer {
-        vk::Buffer buffer;
-        u64 offset, range;
-    };
-    std::array<std::atomic<u64>, DCount> descriptor_census{};
-    std::array<std::array<PrevBuffer, 32>, 8> desc_prev_buffers{};
-    std::array<std::array<vk::ImageView, 16>, 8> desc_prev_views{};
-    bool desc_draw_same{true}, desc_draw_same_but_offsets{true}, desc_draw_buffers_changed{false}, desc_draw_images_changed{false};
-    void DescriptorNoteBuffer(u32 stage, u32 index, const vk::DescriptorBufferInfo& info) noexcept;
-    void DescriptorNoteImage(u32 stage, u32 index, vk::ImageView view) noexcept;
-    void DescriptorEndDraw() noexcept;
     void Census(u32 index, u64 n = 1) noexcept {
         consumer_census[index & 63].fetch_add(n, std::memory_order_relaxed);
     }
@@ -612,7 +595,6 @@ private:
     const DrawPlan* geometry_plan{}; ///< N6.2: the plan of the draw whose vertex and index buffers are being bound (its record names their engine ids)
     std::unique_ptr<DrawPlan> dispatch_binder_plan; ///< B9: scratch plan the binder reads a dispatch's record from
     const DrawPlan* DispatchBinderFor(const DispatchPlan* plan);
-    const DispatchPlan* dispatch_audit_plan{}; ///< B9: the plan of the dispatch being bound; its record's descriptors are compared with the guest's (TLG_DISPATCH_AUDIT=1)
     const DrawPlan* binder_plan{};   ///< N3: the plan whose record binds the resources of the draw being recorded (null: from the flat user data)
     /// R3 step 2: the record words of image `index` of `stage` as the command processor found them (the binder plan's bindings), or false when it did not resolve it
     bool PlannedImageWords(const Shader::Info& stage, u32 index, u32 dwords, const u32*& words, u32& binding_index) const;
@@ -649,7 +631,6 @@ private:
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     /// tlg C9: the draw's row of slot numbers (the indexed buffers of the stages, in the order of the shaders' resources)
     bool indexed_active{false};
-    IdentityTables identity_tables; ///< C1 audit (vk_identity_audit.h), raster thread
     /// Puts the slot of one descriptor into the draw's row.
     void NoteIndexedRow(u32 slot);
     /// The dwords of a stage's flat user data go into the row (as many as the shader reserved), zero padded.
