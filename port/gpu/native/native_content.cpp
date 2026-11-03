@@ -21,7 +21,9 @@
 #include "tlg_toggles.h" // sigjmp_buf, tlg_setjmp, runtime_fault_recover
 #endif
 #include "native/native_content.h"
+#include "native/native_debug_server.h"
 #include "native/native_device.h"
+#include "native/native_draw.h"
 #include "native/native_registry.h"
 #include "native/native_updates.h"
 
@@ -112,6 +114,84 @@ u64 g_equal_bytes_by_writer[16]{};
 u64 g_equal_nonzero_by_writer[16]{};  ///< bytes of CPU sourced uploads that equal the store, by the writer of the entry (15: a copy)
 u64 g_uploads_by_main_writer[16]{}; ///< uploads by the writer that supplies most of their covered bytes
 std::vector<nlohmann::json> g_examples_differs, g_examples_hole;
+
+// ---- F2.5 write ledger (shadow) -------------------------------------------------------------------------------------------------------------------------------------
+/// Every announced write, whatever its writer and size, is remembered as a range and the record number it was announced at (no bytes). Non-overlapping ranges, each holding the newest stamp that
+/// wrote it. It answers "was this memory written after the draw's record?": if not, the memory an upload reads is what the draw saw, and the upload needs no copy of the bytes.
+struct LedgerRange {
+    u64 end;
+    u64 stamp;
+};
+std::mutex g_ledger_mutex;
+std::map<u64, LedgerRange> g_ledger;
+constexpr size_t MaxLedger = 1u << 20;
+std::atomic<u64> c_ledger_notes{0}, c_ledger_overflow{0};
+u64 g_ledger_max_len = 0;
+
+void LedgerNote(u64 begin, u64 end, u64 stamp) {
+    std::scoped_lock lock{g_ledger_mutex};
+    c_ledger_notes.fetch_add(1, std::memory_order_relaxed);
+    if (g_ledger.size() >= MaxLedger) {
+        c_ledger_overflow.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    struct Seg {
+        u64 b, e, s;
+    };
+    std::vector<Seg> add;
+    auto it = g_ledger.upper_bound(begin);
+    if (it != g_ledger.begin() && std::prev(it)->second.end > begin) {
+        --it;
+    }
+    u64 cursor = begin;
+    while (it != g_ledger.end() && it->first < end) {
+        const u64 ob = it->first, oe = it->second.end, os = it->second.stamp;
+        if (ob < begin) {
+            add.push_back({ob, begin, os});
+        }
+        if (oe > end) {
+            add.push_back({end, oe, os});
+        }
+        const u64 x = std::max(ob, begin), y = std::min(oe, end);
+        if (cursor < x) {
+            add.push_back({cursor, x, stamp});
+        }
+        add.push_back({x, y, std::max(os, stamp)});
+        cursor = y;
+        it = g_ledger.erase(it);
+    }
+    if (cursor < end) {
+        add.push_back({cursor, end, stamp});
+    }
+    for (const Seg& g : add) {
+        g_ledger.emplace(g.b, LedgerRange{g.e, g.s});
+        g_ledger_max_len = std::max(g_ledger_max_len, g.e - g.b);
+    }
+}
+
+struct LedgerAnswer {
+    u64 newest{}; ///< the newest stamp of any write that touched the range (0: none)
+    u64 covered{}; ///< bytes of the range some write touched
+};
+LedgerAnswer LedgerQuery(u64 begin, u64 end) {
+    LedgerAnswer a;
+    std::scoped_lock lock{g_ledger_mutex};
+    for (auto it = g_ledger.lower_bound(begin > g_ledger_max_len ? begin - g_ledger_max_len : 0); it != g_ledger.end() && it->first < end; ++it) {
+        if (it->second.end > begin) {
+            a.newest = std::max(a.newest, it->second.stamp);
+            a.covered += std::min(end, it->second.end) - std::max(begin, it->first);
+        }
+    }
+    return a;
+}
+
+/// How an upload's memory stands against the ledger at the draw's record S.
+enum LedgerClass : u32 { LedgerNoSeq, LedgerOpenMap, LedgerNeverWritten, LedgerPartlyWrittenUnchanged, LedgerWrittenUnchanged, LedgerWrittenAfter, LedgerClassCount };
+constexpr const char* LedgerNames[LedgerClassCount] = {"no_draw_record", "a_map_of_it_is_open", "never_written_by_anything_announced", "partly_written_none_after_the_draw",
+                                                       "written_none_after_the_draw", "written_after_the_draw"};
+u64 g_ledger_uploads[LedgerClassCount][4]{}; ///< [ledger class][store class: equal, empty_equal, differs, hole]
+u64 g_ledger_bytes[LedgerClassCount][4]{};
+std::vector<nlohmann::json> g_ledger_examples;
 
 // ---- F2.3 ring windows (shadow) ---------------------------------------------------------------------------------------------------------------------------------------
 struct RingWindow {
@@ -335,12 +415,26 @@ bool RingSwapOn() noexcept {
     return on;
 }
 
+bool LedgerOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_F2_LEDGER"); // default on since 2026-11-03; =0 turns it off
+        return e == nullptr || *e != '0';
+    }();
+    return on;
+}
+
 bool On() noexcept {
-    return ShadowOn() || RingSwapOn();
+    return ShadowOn() || RingSwapOn() || LedgerOn();
 }
 
 void NoteMark(u32 writer, u64 address, u64 size) {
-    if (!ShadowOn() || address == 0 || size == 0) {
+    if (address == 0 || size == 0) {
+        return;
+    }
+    if (LedgerOn() && (writer == 3 || writer == 6) && !InRing(address, size)) { // writers 1, 2 and 4 are noted by Announce with their own stamp
+        LedgerNote(address, address + size, Core::NativeDraw::NextSeq());
+    }
+    if (!ShadowOn()) {
         return;
     }
     std::scoped_lock lock{g_marks_mutex};
@@ -567,6 +661,9 @@ void Announce(u32 writer, u64 address, u64 size, u64 stamp) {
     if (!On() || address == 0 || size == 0) {
         return;
     }
+    if (LedgerOn() && !InRing(address, size)) { // the frame ring is the ring swap's (stamped bytes); the ledger is for the memory outside it
+        LedgerNote(address, address + size, stamp);
+    }
     if (!ShadowOn()) {
         // the swap alone keeps the ring's announcements only
         const u64 begin = g_ring_begin.load(std::memory_order_relaxed);
@@ -678,6 +775,41 @@ void NoteRingImageShape(u64 address, u64 size, u32 width, u32 height, u32 depth,
     std::scoped_lock lock{g_shape_mutex};
     if (g_shapes.size() < 64 || g_shapes.count(key) != 0) {
         ++g_shapes[key];
+    }
+}
+
+namespace {
+/// F2.5 (default on, `TLG_F2_LEDGER=0` off): the upload of an image outside the frame ring reads guest memory; the write ledger says whether that memory was written after the draw's record.
+enum CheckClass : u32 { CheckInRing, CheckNoRecord, CheckOpenMap, CheckNeverWritten, CheckPartlyWritten, CheckWrittenUnchanged, CheckWrittenAfter, CheckClassCount };
+constexpr const char* CheckNames[CheckClassCount] = {"in_the_ring_not_checked_here", "no_draw_record_before_the_first_draw", "a_map_of_it_is_open_not_checked", "never_written_by_anything_announced",
+                                                     "partly_written_none_after_the_draw", "written_none_after_the_draw", "WRITTEN_AFTER_THE_DRAW"};
+std::atomic<u64> c_check[CheckClassCount]{};
+std::atomic<u64> c_check_bytes[CheckClassCount]{};
+std::atomic<u64> c_check_after_logged{0};
+} // namespace
+
+void CheckUploadMemory(u64 address, u64 size) {
+    if (!LedgerOn() || size == 0) {
+        return;
+    }
+    CheckClass cls;
+    LedgerAnswer a;
+    const u64 seq = Core::NativeRegistry::CurrentDrawSeq();
+    if (InRing(address, size)) {
+        cls = CheckInRing;
+    } else if (seq == 0) {
+        cls = CheckNoRecord;
+    } else if (Core::NativeUpdates::OpenMapOverlaps(address, size)) {
+        cls = CheckOpenMap;
+    } else {
+        a = LedgerQuery(address, address + size);
+        cls = a.covered == 0 ? CheckNeverWritten : a.newest > seq ? CheckWrittenAfter : a.covered < size ? CheckPartlyWritten : CheckWrittenUnchanged;
+    }
+    c_check[cls].fetch_add(1, std::memory_order_relaxed);
+    c_check_bytes[cls].fetch_add(size, std::memory_order_relaxed);
+    if (cls == CheckWrittenAfter) {
+        // the game wrote this memory after the draw that uses it was recorded: the bytes the upload reads may not be the draw's, and the store keeps no bytes outside the ring
+        Core::RareEvents::Note("f25_image_memory_written_after_its_draw", fmt::format("{:#x} + {:#x}: draw record {}, newest write stamp {}", address, size, seq, a.newest));
     }
 }
 
@@ -982,6 +1114,32 @@ void CompareImage(const ImageUpload& upload) {
         (map_open ? c_cmp_open_differs : c_cmp_closed_differs).fetch_add(1, std::memory_order_relaxed);
     }
     const Class cls = differing != 0 ? ClassDiffers : hole != 0 ? ClassHole : covered == 0 ? ClassEmptyEqual : ClassEqual;
+    {
+        // F2.5 shadow: what the write ledger says about this memory at the draw's record
+        LedgerClass lc;
+        const u64 seq = Core::NativeRegistry::CurrentDrawSeq();
+        LedgerAnswer a;
+        if (seq == 0) {
+            lc = LedgerNoSeq;
+        } else if (map_open) {
+            lc = LedgerOpenMap;
+        } else {
+            a = LedgerQuery(upload.address, upload.address + upload.size);
+            lc = a.covered == 0 ? LedgerNeverWritten : a.newest > seq ? LedgerWrittenAfter : a.covered < upload.size ? LedgerPartlyWrittenUnchanged : LedgerWrittenUnchanged;
+        }
+        const u32 sc = cls == ClassEqual ? 0 : cls == ClassEmptyEqual ? 1 : cls == ClassDiffers ? 2 : 3;
+        static u64 ordinal = 0; // under g_mutex
+        ++ordinal;
+        ++g_ledger_uploads[lc][sc];
+        g_ledger_bytes[lc][sc] += upload.size;
+        if ((lc == LedgerWrittenAfter || lc == LedgerNoSeq || (lc == LedgerNeverWritten && cls != ClassEmptyEqual) || cls == ClassDiffers) && g_ledger_examples.size() < 16) {
+            Core::NativeDevice::Object owner;
+            const bool owned = Core::NativeDevice::ResourceAt(upload.address, owner);
+            g_ledger_examples.push_back({{"ledger", LedgerNames[lc]}, {"store_class", sc}, {"group", GroupName(group)}, {"address", fmt::format("{:#x}", upload.address)}, {"size", upload.size}, {"caller", upload.caller}, {"upload_number", ordinal},
+                                         {"draw_record", seq}, {"newest_write_stamp", a.newest}, {"ledger_covered_bytes", a.covered}, {"covered_by_store", covered}, {"hole_nonzero", hole},
+                                         {"engine_resource", owned ? fmt::format("kind {} usage {} cpu_access {:#x}", static_cast<u32>(owner.kind), owner.usage, owner.cpu_access) : "none"}});
+        }
+    }
     const u32 g = static_cast<u32>(group);
     ++g_class_uploads[g][cls];
     g_class_bytes[g][cls] += upload.size;
@@ -1059,6 +1217,17 @@ nlohmann::json Report() {
             w["examples_outside_ring_not_exact"] = g_gpu_examples;
         }
         out["ring_windows"] = std::move(w);
+    }
+    {
+        nlohmann::json check = {{"on", LedgerOn()}, {"switch", "TLG_F2_LEDGER=0 turns it off"}, {"ledger_notes", c_ledger_notes.load()}, {"ledger_overflow_skipped", c_ledger_overflow.load()}};
+        {
+            std::scoped_lock ledger_lock{g_ledger_mutex};
+            check["ledger_ranges"] = g_ledger.size();
+        }
+        for (u32 c = 0; c < CheckClassCount; ++c) {
+            check["cpu_image_uploads"][CheckNames[c]] = {{"uploads", c_check[c].load()}, {"image_bytes", c_check_bytes[c].load()}};
+        }
+        out["image_memory_check"] = std::move(check);
     }
     out["ring_index"] = {{"reused_exact_match", c_ring_index[0].load()},
                          {"created_new_image", c_ring_index[1].load()},
@@ -1162,6 +1331,23 @@ nlohmann::json Report() {
         one["hole_nonzero_bytes_total_by_cause"] = {{"announced_then_evicted_for_the_cap", g_hole_nonzero_evicted}, {"never_announced", g_hole_nonzero_never}, {"partly_evicted_partly_never", g_hole_nonzero_mixed},
                                                     {"hole_uploads_every_segment_evicted", g_hole_uploads_all_evicted}, {"hole_uploads_with_a_never_announced_part", g_hole_uploads_with_never}};
         uploads[GroupName(static_cast<Group>(g))] = std::move(one);
+    }
+    {
+        nlohmann::json ledger = {{"notes", c_ledger_notes.load()}, {"overflow_skipped", c_ledger_overflow.load()}};
+        {
+            std::scoped_lock ledger_lock{g_ledger_mutex};
+            ledger["ranges"] = g_ledger.size();
+        }
+        static constexpr const char* StoreNames[4] = {"equal", "empty_equal", "differs", "hole"};
+        for (u32 l = 0; l < LedgerClassCount; ++l) {
+            for (u32 c = 0; c < 4; ++c) {
+                if (g_ledger_uploads[l][c] != 0) {
+                    ledger["cpu_uploads_by_ledger_class_and_store_class"][LedgerNames[l]][StoreNames[c]] = {{"uploads", g_ledger_uploads[l][c]}, {"image_bytes", g_ledger_bytes[l][c]}};
+                }
+            }
+        }
+        ledger["examples"] = g_ledger_examples;
+        out["write_ledger"] = std::move(ledger);
     }
     uploads["gpu_source"] = {{"uploads", g_gpu_uploads}, {"image_bytes", g_gpu_total_bytes}, {"bytes_the_store_knows", g_gpu_covered_bytes}, {"fully_known", g_gpu_fully_covered}};
     out["uploads"] = std::move(uploads);

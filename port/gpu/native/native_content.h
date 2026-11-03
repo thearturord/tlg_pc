@@ -24,6 +24,11 @@ namespace Core::NativeContent {
 /// them, default 256), each stamped with the record number it was made at, and `RefreshImage` reads a ring image's bytes from the newest entry stamped at or before the draw's record instead of
 /// from the ring's memory, which a later allocation may have reused by the time the raster thread uploads. Bytes no entry covers still come from memory.
 [[nodiscard]] bool RingSwapOn() noexcept;
+/// F2.5 write ledger (`TLG_F2_LEDGER`, default on since 2026-11-03, `=0` turns it off, read once): every announced write outside the frame ring is remembered as a range and the record number it was
+/// announced at (no bytes). `CheckUploadMemory` asks it, for each CPU sourced image upload outside the ring, whether the memory was written after the draw's record; if not, the memory the upload
+/// reads is what the draw saw. A write after the record is counted and written to rare_events.txt (`f25_image_memory_written_after_its_draw`): the store keeps no bytes outside the ring.
+[[nodiscard]] bool LedgerOn() noexcept;
+void CheckUploadMemory(u64 address, u64 size);
 /// The frame allocator's ring (found by the engine's allocator hook).
 void SetRing(u64 begin, u64 end);
 /// F2.3 ring window shadow (`TLG_F2_RING_WINDOWS=1`, default off, read once): every allocation of the frame ring (`AllocFrameGarlic`) is a window; a newer window drops the older ones it overlaps,

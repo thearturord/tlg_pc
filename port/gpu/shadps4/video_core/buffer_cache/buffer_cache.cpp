@@ -571,6 +571,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
                                               instance.StorageMinAlignment());
     memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
+    Core::NativeContent::CheckUploadMemory(device_addr, size); // F2.5: outside the ring, was the memory written after the draw's record?
     Core::NativeContent::OverlayImage(device_addr, size, staging.mapped); // F2.2 swap (TLG_F2_RING_STORE=1): ring bytes as announced, not as the ring holds them now
     staging.Flush();
     return {staging.buffer, staging.offset};

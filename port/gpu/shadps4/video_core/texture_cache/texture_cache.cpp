@@ -1221,27 +1221,8 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
             }
         }
     }
-    const u32 b8 = Core::NativeUpdates::B8ImageMode();
-    if (image.b8_hash != 0 && False(image.flags & ImageFlagBits::Dirty) && False(image.flags & ImageFlagBits::GpuModified) && Core::NativeUpdates::B8VerifySample()) {
-        // B8.1 verify: an image no announcement dirtied must still hold the bytes of its last refresh
-        Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8VerifyChecked);
-        if ((XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size) | 1) != image.b8_hash) {
-            Core::NativeUpdates::NoteB8Unannounced(image.info.guest_address, image.info.guest_size, false);
-            image.b8_marks |= B8Owed;
-            image.flags |= ImageFlagBits::CpuDirty;
-            buffer_cache.InvalidateMemory(image.info.guest_address, image.info.guest_size, false);
-        }
-    }
-    if (b8 != 0 && True(image.flags & ImageFlagBits::CpuDirty) && (image.b8_marks & (B8Fault | B8Announced)) != 0) {
-        // B8.1: what told us the image changed
-        if ((image.b8_marks & B8Announced) != 0) {
-            Core::NativeUpdates::NoteB8((image.b8_marks & B8Fault) != 0 ? Core::NativeUpdates::B8RefreshFaultAndAnnounced : Core::NativeUpdates::B8RefreshAnnounced);
-        } else {
-            Core::NativeUpdates::NoteB8Unannounced(image.info.guest_address, image.info.guest_size, true);
-            image.b8_marks |= B8Owed;
-        }
-        image.b8_marks &= B8Owed;
-    }
+    // F2.4: the B8.1 verify (a hash of the guest bytes after each refresh, off by default) and the accounting of what dirtied the image are gone: an image is refreshed by the announcements and
+    // the engine's own writes (E3.1: the address route found a change in 0 of 8.7 million refreshes), and the write ledger (F2.5) says whether the memory moved after the draw that reads it.
     if (False(image.flags & ImageFlagBits::Dirty)) {
         Core::NativeE3Census::NoteOutcome(caller, Core::NativeE3Census::Outcome::NotDirty);
         return;
@@ -1330,9 +1311,6 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
         // E7 Task 4 (TLG_E3_CENSUS=1): does the upload carry bytes the image's last upload did not?
         Core::NativeE3Census::NoteUpload(caller, image.image_uid, BufferCache::last_image_source_gpu ? nullptr : std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size);
     }
-    image.b8_hash = Core::NativeUpdates::B8VerifyOn() && !BufferCache::last_image_source_gpu
-                        ? XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size) | 1
-                        : 0;
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,

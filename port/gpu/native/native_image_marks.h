@@ -5,5 +5,5 @@
 
 namespace VideoCore {
 /// Image::b8_marks: why the native path wants the image refreshed or forgotten (shared by the texture cache and native/native_texture_cache.cpp)
-constexpr u8 B8Fault = 1, B8Announced = 2, B8Owed = 4, B8Deleted = 8, B8Listed = 16;
+constexpr u8 B8Deleted = 8, B8Listed = 16;
 } // namespace VideoCore

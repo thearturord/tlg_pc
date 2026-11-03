@@ -163,16 +163,11 @@ void TextureCache::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
             continue;
         }
         Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8AnnouncedOnImage);
-        if ((image.b8_marks & B8Owed) != 0) {
-            Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8AnnouncedLater);
-            image.b8_marks &= ~B8Owed;
-        }
         if (!newer && True(image.flags & ImageFlagBits::GpuModified)) {
             // the GPU wrote the image after the first application: its bytes are newer than the CPU's
             Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8KeptForGpu);
             continue;
         }
-        image.b8_marks |= B8Announced;
         image.flags |= ImageFlagBits::CpuDirty;
         UntrackImage(image_id);
     }
