@@ -7002,7 +7002,8 @@ u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4
             const u64 bytes = Rd<u64>(resource, 0x38);
             if (pointer != 0 && bytes != 0 && bytes <= (1ull << 28)) {
                 Core::NativeContent::NoteTextureMap(Rd<u64>(resource, 0x10), pointer, bytes, Rd<u32>(out, 8), Rd<u32>(out, 0xc), static_cast<u32>(type));
-                Core::NativeUpdates::NoteMap(Rd<u64>(resource, 0x10), Core::NativeResources::ResourceUsage(resource), static_cast<u32>(type), pointer, static_cast<u32>(bytes),
+                const u64 announce = Core::NativeContent::MapAnnounceBytes(pointer, bytes);
+                Core::NativeUpdates::NoteMap(Rd<u64>(resource, 0x10), Core::NativeResources::ResourceUsage(resource), static_cast<u32>(type), pointer, static_cast<u32>(announce),
                                              Rd<u64>(resource, 0x30), ret, 0);
             }
             return 0;

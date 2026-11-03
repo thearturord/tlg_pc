@@ -398,6 +398,24 @@ std::map<std::string, u64> g_tmap_shapes; ///< announced / window remaining / ro
 std::vector<nlohmann::json> g_tmap_examples;
 } // namespace
 
+u64 MapAnnounceBytes(u64 pointer, u64 resource_bytes) {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_F2_MAP_WHOLE_WINDOW");
+        return e != nullptr && *e == '1';
+    }();
+    if (!on || pointer == 0) {
+        return resource_bytes;
+    }
+    std::scoped_lock lock{g_windows_mutex};
+    auto it = g_windows.upper_bound(pointer);
+    if (it == g_windows.begin()) {
+        return resource_bytes;
+    }
+    const auto before = std::prev(it);
+    const u64 remaining = before->first + before->second.size > pointer ? before->first + before->second.size - pointer : 0;
+    return std::max(resource_bytes, remaining);
+}
+
 void NoteTextureMap(u64 resource_id, u64 pointer, u64 announced_bytes, u32 row_pitch, u32 depth_pitch, u32 map_type) {
     if (!RingWindowsOn() || pointer == 0) {
         return;

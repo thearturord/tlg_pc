@@ -40,6 +40,9 @@ void NoteRingIndex(RingIndexEvent event) noexcept;
 void NoteRingWindow(u64 address, u64 size);
 /// F2.4 research (`TLG_F2_RING_WINDOWS=1`): a Map of a texture for writing returned `pointer` with this row / depth pitch, and the Map announces `announced_bytes` (the resource's byte size);
 /// compared with the frame ring window the Map's allocation made (is the announced range smaller than what the caller can write?)
+/// F2.4 (`TLG_F2_MAP_WHOLE_WINDOW=1`, read once, default off): a texture Map for writing in the frame ring announces the whole ring window the Map allocated instead of the resource's byte size
+/// (research 2026-11-03: for the stacked 4x8 / 4x16 float textures the window is twice the byte size, 2,080 of 10,400 Maps, and the game writes the second half). Returns the bytes to announce.
+[[nodiscard]] u64 MapAnnounceBytes(u64 pointer, u64 resource_bytes);
 void NoteTextureMap(u64 resource_id, u64 pointer, u64 announced_bytes, u32 row_pitch, u32 depth_pitch, u32 map_type);
 /// The engine's own GPU memory allocation (AllocGarlicMemory / AllocOnionMemory): always kept (a newer allocation drops the older ones it overlaps) so that the owner-less lookups outside the ring
 /// can be answered from the allocation they lie in (F2.3 ring image index).
