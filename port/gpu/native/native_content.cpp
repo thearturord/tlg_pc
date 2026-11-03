@@ -399,8 +399,18 @@ void NoteRingWindow(u64 address, u64 size) {
     c_win_noted.fetch_add(1, std::memory_order_relaxed);
 }
 
+bool InGpuAllocation(u64 address, u64 size) {
+    std::scoped_lock lock{g_windows_mutex};
+    auto it = g_gpu_windows.upper_bound(address);
+    if (it == g_gpu_windows.begin()) {
+        return false;
+    }
+    --it;
+    return address + size <= it->first + it->second.size;
+}
+
 void NoteGpuAllocation(u64 address, u64 size) {
-    if (!RingWindowsOn() || address == 0 || size == 0) {
+    if (address == 0 || size == 0) {
         return;
     }
     std::scoped_lock lock{g_windows_mutex};
@@ -816,6 +826,7 @@ nlohmann::json Report() {
                              {"stale_images_kept_not_old_enough", c_ring_index[3].load()},
                              {"audit_page_table_same_exact_match", c_ring_index[4].load()},
                              {"AUDIT_page_table_other_exact_match", c_ring_index[5].load()},
+                             {"owner_less_lookups_still_on_the_page_table", c_ring_index[6].load()},
                              {"switch", "TLG_F2_RING_INDEX=0 turns it off, 2 audits against the page table; default on"}};
     }
     out["enabled"] = On();

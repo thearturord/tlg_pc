@@ -420,6 +420,9 @@ private:
     /// priority thread puts the pixels into guest memory once the GPU executed the copy.
     void RecordImageCopyAsync(Image& image, u32 download_size);
 
+    /// Memory the ring image index covers (F2.3)
+    [[nodiscard]] bool RingIndexed(VAddr address, u64 size) const;
+
     /// Register image in the page table
     void RegisterImage(ImageId image);
 

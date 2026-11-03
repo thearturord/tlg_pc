@@ -36,11 +36,14 @@ void SetRing(u64 begin, u64 end);
 [[nodiscard]] u32 RingIndexMode() noexcept;
 /// [address, address + size) lies inside the frame ring.
 [[nodiscard]] bool InRing(u64 address, u64 size) noexcept;
-enum class RingIndexEvent : u32 { ReusedExact, CreatedNew, StaleFreed, StaleKept, AuditSame, AuditOtherExactMatch, Count };
+enum class RingIndexEvent : u32 { ReusedExact, CreatedNew, StaleFreed, StaleKept, AuditSame, AuditOtherExactMatch, PageTableFallback, Count };
 void NoteRingIndex(RingIndexEvent event) noexcept;
 void NoteRingWindow(u64 address, u64 size);
-/// The engine's own GPU memory allocation (AllocGarlicMemory / AllocOnionMemory): kept (with `TLG_F2_RING_WINDOWS=1`) to classify the owner-less lookups outside the ring.
+/// The engine's own GPU memory allocation (AllocGarlicMemory / AllocOnionMemory): always kept (a newer allocation drops the older ones it overlaps) so that the owner-less lookups outside the ring
+/// can be answered from the allocation they lie in (F2.3 ring image index).
 void NoteGpuAllocation(u64 address, u64 size);
+/// [address, address + size) lies inside one allocation the engine made.
+[[nodiscard]] bool InGpuAllocation(u64 address, u64 size);
 void ClassifyRingLookup(u64 address, u64 size, u32 binding_type);
 /// `staged` holds the guest memory bytes of [address, address + size) (what the upload would read): if the range lies in the ring, the bytes of the entries the current draw may see replace them.
 void OverlayImage(u64 address, u64 size, u8* staged);
