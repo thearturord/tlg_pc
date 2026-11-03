@@ -441,6 +441,14 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     // fixed-function state in Vulkan terms does not need the registers of that state either.
     const bool fixed_from_objects = draw.fixed != nullptr;
     bool planned_from_record = false;
+    // F3.5 (`TLG_PLAN_WITHOUT_REGISTERS`, default on, `=0` back): a draw with typed user data, a native fixed state and no other stage is planned from its record with an empty register
+    // block; the register image is not filled for it. The plan shadow needs the register image, so it turns this off.
+    static const bool plan_without_registers = [] {
+        const char* e = std::getenv("TLG_PLAN_WITHOUT_REGISTERS");
+        return e == nullptr || *e != '0';
+    }();
+    const bool register_free = plan_without_registers && !Core::NativePlanShadow::On() && draw.kind <= 2 && !draw.cb_extents_only && draw.typed && draw.fixed != nullptr && !draw.other_stage && split_active;
+    static const AmdGpu::DrawRegs no_registers{};
     if (draw.typed) {
         for (u32 mask = draw.vs_user_data_mask; mask != 0; mask &= mask - 1) {
             const u32 i = static_cast<u32>(std::countr_zero(mask));
@@ -524,9 +532,19 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     if (VideoCore::ReadbackPolicy::Get().cs_audit.load(std::memory_order_relaxed) != 0) {
         Core::NativeDraw::Live().overlay_records.fetch_add(1, std::memory_order_relaxed);
     }
+    if (!planned_from_record && draw.kind <= 2 && !draw.cb_extents_only) {
+        auto& live = Core::NativeDraw::Live();
+        if (register_free) {
+            live.plan_register_free.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            live.plan_register_path.fetch_add(1, std::memory_order_relaxed);
+            Core::RareEvents::Note("f3_5_draw_planned_from_registers", fmt::format("draw record {}: typed {}, native fixed {}, other stage {}, split {}, plan shadow {}, switch {}", draw.seq, draw.typed,
+                                                                                   draw.fixed != nullptr, draw.other_stage, split_active, Core::NativePlanShadow::On(), plan_without_registers));
+        }
+    }
     if (!planned_from_record) {
-        Core::NativeDraw::MaterializeRegs(draw); // A5.3: the register groups of a draw whose plan comes from the registers
-        if (!draw.cb_extents_only) {
+        Core::NativeDraw::MaterializeRegs(draw); // A5.3: the register groups of the record (the plan's inputs are made from them)
+        if (!draw.cb_extents_only && !register_free) {
             ExecApplyRecord(draw, fixed_from_objects, index_count); // a fast clear eliminate's registers are for that operation only (its plan comes from the record)
         }
     }
@@ -573,13 +591,13 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             Core::NativeShaderEnv::Scope shader_env{draw.vs_gnm, draw.ps_gnm, draw.fetch_object, draw.other_stage, draw.typed ? exec_vertex_user_data.data() : nullptr,
                                                     draw.typed ? exec_pixel_user_data.data() : nullptr};
             Core::NativeTargetDesc::Scope target_desc{draw.native_targets}; // E7 (TLG_TARGET_DESC_USE): PlanDraw applies the record's target description to the inputs it makes
-            auto made = rasterizer->PlanDraw(exec_state, params, native_fixed, native_exec_key, native_inputs_key, &draw, index_count);
+            auto made = rasterizer->PlanDraw(register_free ? no_registers : exec_state, params, native_fixed, native_exec_key, native_inputs_key, &draw, index_count);
             // F3.4 test (`TLG_POISON_REGS=1`, default off): the same draw is planned a second time with the register image overwritten by a pattern; the plan must not change.
             static const bool poison = [] {
                 const char* e = std::getenv("TLG_POISON_REGS");
                 return e != nullptr && *e == '1';
             }();
-            if (poison && made != nullptr && made->executed) {
+            if (poison && made != nullptr && made->executed && !register_free) {
                 static_assert(std::is_trivially_copyable_v<AmdGpu::DrawRegs>);
                 auto saved = std::make_unique<AmdGpu::DrawRegs>(exec_state);
                 std::memset(static_cast<void*>(&exec_state), 0xA5, sizeof(exec_state));
