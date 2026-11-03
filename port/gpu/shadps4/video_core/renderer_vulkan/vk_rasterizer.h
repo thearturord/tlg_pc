@@ -99,7 +99,7 @@ public:
     /// A hash of what the planning read from guest memory and put into the plan: pipeline, per stage the program, user data and flat user data (N6b plan verification).
     [[nodiscard]] static u64 PlanDigest(const DrawPlan& plan);
     [[nodiscard]] static u64 PlanDigest(const DispatchPlan& plan);
-    [[nodiscard]] std::unique_ptr<DispatchPlan> PlanDispatch(const AmdGpu::ComputeProgram& cs, const AmdGpu::BorderColorBuffer& ta_bc_base);
+    [[nodiscard]] std::unique_ptr<DispatchPlan> PlanDispatch(const AmdGpu::ComputeProgram& cs);
 
     /// Raster thread: hands a finished plan back for reuse. Allocating a plan for every draw on
     /// one thread and freeing it on another made them fight over the heap lock.

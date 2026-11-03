@@ -113,12 +113,7 @@ public:
     std::unordered_set<void*> partial_handles;
     void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb);
 
-    /// What the rasterizer reads while it executes draws and dispatches. Without the command
-    /// processor split (cp_split_mode) these are the command processor's own registers; with it
-    /// they are the raster thread's mirror, kept in sync through the operation queue.
-    [[nodiscard]] DrawRegs& RasterRegs() noexcept {
-        return direct_state;
-    }
+    /// What the rasterizer reads while it executes draws and dispatches (F3.5: the extent hints and the target resources; no register image).
     [[nodiscard]] std::array<CbDbExtent, NUM_COLOR_BUFFERS>& RasterCbExtents() noexcept {
         return last_cb_extent;
     }
@@ -314,23 +309,11 @@ private:
     /// Blocks until the raster thread has executed everything queued so far.
     void DrainRaster();
     [[nodiscard]] bool RasterIdle() const noexcept;
-    /// Register writes made by the command processor: copied to the raster mirror.
-    void MirrorRegs(u32 dword_offset, u32 count);
-    void MirrorRegsRaw(u32 dword_offset, u32 count);
     void ApplyStateTemplate(const Core::NativeDraw::StateTemplate& state);
-    void MirrorObject(const void* object, size_t size);
-    void MirrorSetDefaults();
 
     /// The registers of a record come in groups (targets, the two stage programs, their user data, the interpolants, the draw arguments, the rest). A group
     /// whose values are the ones the last record applied, and that nothing has written since, is not applied again (front thread only).
     static constexpr u32 NumRegisterGroups = 8;
-    std::array<u64, NumRegisterGroups> group_applied_sig{};
-    std::array<bool, NumRegisterGroups> group_sig_valid{};
-    std::array<bool, NumRegisterGroups> group_sig_full{}; ///< the group was applied with the fixed-function registers too
-    std::array<u64, NumRegisterGroups> group_applied_hash{};
-    std::array<bool, NumRegisterGroups> group_applied_valid{};
-    void InvalidateRegisterGroup(u32 index);
-    void InvalidateRegisterGroups();
     bool native_exec_scope{}; ///< the draw being dispatched is an executed record
     u64 native_inputs_key{};                        ///< identity of the render target inputs of the draw being dispatched (0: unknown)
     std::array<u32, 16> exec_vertex_user_data{};     ///< the typed user data of the last executed records, per stage
@@ -478,8 +461,6 @@ private:
 
     /// The draw state of the command processor (kept equal to `regs`, planning reads it), what the rasterizer reads
     /// without the split (rebuilt from `regs` before each operation) and the raster thread's own with it.
-    DrawRegs front_state{};
-    DrawRegs direct_state{};
     bool split_active{};
     std::unique_ptr<RasterSplit> split;
     const u32 fence_wait_shortcut;

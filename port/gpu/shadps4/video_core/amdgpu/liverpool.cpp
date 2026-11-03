@@ -156,7 +156,6 @@ void Liverpool::BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
         DrainRaster();
         split_active = false;
         StopRasterSplit();
-        direct_state = front_state;
         Core::DrainAudit::SetBackend(nullptr, nullptr, {});
         split.reset();
     }
@@ -233,13 +232,6 @@ void Liverpool::WakeRaster() {
 }
 
 
-void Liverpool::MirrorRegs(u32 dword_offset, u32 count) {
-    MirrorRegsRaw(dword_offset, count);
-}
-
-
-
-
 namespace {
 constexpr u32 GroupOther = 0, GroupArguments = 1, GroupVsProgram = 2, GroupVsUserData = 3, GroupPsProgram = 4, GroupPsUserData = 5, GroupInterpolants = 6,
               GroupTargets = 7;
@@ -281,41 +273,6 @@ u32 Liverpool::RegisterGroupOf(u32 index) {
     return index < Regs::NumRegs ? RegisterGroupTable()[index] : static_cast<u32>(GroupOther);
 }
 
-void Liverpool::InvalidateRegisterGroup(u32 index) {
-    if (index < Regs::NumRegs) {
-        const u8 group = RegisterGroupTable()[index];
-        group_applied_valid[group] = false;
-        group_sig_valid[group] = false;
-    }
-}
-
-void Liverpool::InvalidateRegisterGroups() {
-    group_applied_valid.fill(false);
-    group_sig_valid.fill(false);
-}
-
-void Liverpool::MirrorRegsRaw(u32 dword_offset, u32 count) {
-    for (u32 k = 0; k < count; ++k) {
-        front_state.Set(dword_offset + k, regs.reg_array[dword_offset + k]);
-        InvalidateRegisterGroup(dword_offset + k);
-    }
-}
-void Liverpool::MirrorObject(const void* object, size_t size) {
-    if (!split_active) {
-        return;
-    }
-    const auto base = reinterpret_cast<uintptr_t>(regs.reg_array.data());
-    const auto begin = reinterpret_cast<uintptr_t>(object);
-    ASSERT(begin >= base && begin + size <= base + sizeof(Regs));
-    const u32 first = static_cast<u32>((begin - base) / sizeof(u32));
-    const u32 last = static_cast<u32>((begin + size - base + sizeof(u32) - 1) / sizeof(u32));
-    MirrorRegs(first, last - first);
-}
-
-void Liverpool::MirrorSetDefaults() {
-    front_state.SetDefaults();
-    InvalidateRegisterGroups();
-}
 void Liverpool::DrainRaster() {
     if (!split_active) {
         return;
@@ -460,9 +417,8 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         } else if (++native_tag_skips > 6) {
             static u32 dropped_logs = 0;
             if (dropped_logs++ < 24) {
-                LOG_INFO(Render, "native tag dropped unmatched: seq {} kind {} record count {} call kind {} indexed {} num_indices {} vs hi {:#x} caller {:#x}",
-                         native_tag_pending.seq, tag_kind, Core::NativeDraw::RecordDrawCount(native_tag_pending.seq), static_cast<u32>(call.kind),
-                         call.indexed, front_state.num_indices, static_cast<u64>(front_state.vs_program.address >> 32), native_tag_pending.k1);
+                LOG_INFO(Render, "native tag dropped unmatched: seq {} kind {} record count {} call kind {} indexed {} caller {:#x}", native_tag_pending.seq, tag_kind,
+                         Core::NativeDraw::RecordDrawCount(native_tag_pending.seq), static_cast<u32>(call.kind), call.indexed, native_tag_pending.k1);
             }
             native_tag_pending.valid = false;
             native_tag_skips = 0;
@@ -504,9 +460,9 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         op.cs = call.cs_override ? *call.cs_override : GetCsRegs();
         // The pipeline lookup runs here, on the command processor thread (stage 2 of the split).
         TLG_PROF_NAMED_LEVEL(prof_plan_dispatch, "front.plan_dispatch", 2);
-        op.dispatch_plan = rasterizer->PlanDispatch(op.cs, front_state.ta_bc_base);
+        op.dispatch_plan = rasterizer->PlanDispatch(op.cs);
         if (verify == 2) {
-            op.dispatch_plan = ReplanAfterDrain(std::move(op.dispatch_plan), 0, [&] { return rasterizer->PlanDispatch(op.cs, front_state.ta_bc_base); });
+            op.dispatch_plan = ReplanAfterDrain(std::move(op.dispatch_plan), 0, [&] { return rasterizer->PlanDispatch(op.cs); });
         }
         if (op.dispatch_plan && call.tag.valid) {
             op.dispatch_plan->native_seq = call.tag.seq;
