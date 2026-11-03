@@ -786,6 +786,8 @@ constexpr const char* CheckNames[CheckClassCount] = {"in_the_ring_not_checked_he
 std::atomic<u64> c_check[CheckClassCount]{};
 std::atomic<u64> c_check_bytes[CheckClassCount]{};
 std::atomic<u64> c_check_after_logged{0};
+std::atomic<u64> c_check_record_seen{0}, c_check_no_record_after_a_record{0};
+std::atomic<u64> c_check_margin_log2[40]{}; ///< checked uploads by log2(draw record - newest write stamp): how many records ahead of the draw the memory was last written
 } // namespace
 
 void CheckUploadMemory(u64 address, u64 size) {
@@ -799,10 +801,17 @@ void CheckUploadMemory(u64 address, u64 size) {
         cls = CheckInRing;
     } else if (seq == 0) {
         cls = CheckNoRecord;
+        if (c_check_record_seen.load(std::memory_order_relaxed) != 0) {
+            c_check_no_record_after_a_record.fetch_add(1, std::memory_order_relaxed); // an upload on a thread that never draws (the presenter) or after the first draw of its thread
+        }
     } else if (Core::NativeUpdates::OpenMapOverlaps(address, size)) {
         cls = CheckOpenMap;
     } else {
+        c_check_record_seen.store(1, std::memory_order_relaxed);
         a = LedgerQuery(address, address + size);
+        if (a.covered != 0 && a.newest <= seq) {
+            c_check_margin_log2[std::min<u32>(39u, static_cast<u32>(std::bit_width(seq - a.newest)))].fetch_add(1, std::memory_order_relaxed);
+        }
         cls = a.covered == 0 ? CheckNeverWritten : a.newest > seq ? CheckWrittenAfter : a.covered < size ? CheckPartlyWritten : CheckWrittenUnchanged;
     }
     c_check[cls].fetch_add(1, std::memory_order_relaxed);
@@ -1226,6 +1235,12 @@ nlohmann::json Report() {
         }
         for (u32 c = 0; c < CheckClassCount; ++c) {
             check["cpu_image_uploads"][CheckNames[c]] = {{"uploads", c_check[c].load()}, {"image_bytes", c_check_bytes[c].load()}};
+        }
+        check["no_record_uploads_after_a_record_was_seen"] = c_check_no_record_after_a_record.load();
+        for (u32 b = 0; b < 40; ++b) {
+            if (const u64 n = c_check_margin_log2[b].load(); n != 0) {
+                check["records_between_the_newest_write_and_the_draw_log2"][b == 0 ? "0" : fmt::format("{}..{}", 1ull << (b - 1), (1ull << b) - 1)] = n;
+            }
         }
         out["image_memory_check"] = std::move(check);
     }
