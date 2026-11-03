@@ -3114,8 +3114,18 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
                         current_bc_base->Address());
             ssharp = AmdGpu::Sampler{};
         }
-        const auto vk_sampler =
-            texture_cache.GetSampler(ssharp, *current_bc_base, sampler.is_depth);
+        // F4.1 / F4.3: the host sampler is made from the plain description of the S# words (after the shader's post operation); the shadow compares it with the emulator's own decode
+        const auto from_t_sharp = VideoCore::SamplerDescFromSharp(ssharp);
+        const auto from_words = Core::NativeImageDesc::SamplerDescFromWords(reinterpret_cast<const u32*>(&ssharp));
+        if (Core::NativeImageDesc::DescCompareOn()) {
+            const bool equal = std::memcmp(&from_t_sharp, &from_words, sizeof(from_words)) == 0;
+            Core::NativeImageDesc::NoteSamplerDescCompare(equal, equal ? nullptr : fmt::format("sharp: filters {}/{} mip {} addr {}/{}/{} cmp {} border {} idx {} aniso {} {} bias {} lod {}-{}; words: filters {}/{} mip {} addr {}/{}/{} cmp {} border {} idx {} aniso {} {} bias {} lod {}-{}",
+                from_t_sharp.mag_filter, from_t_sharp.min_filter, from_t_sharp.mip_mode, from_t_sharp.address_u, from_t_sharp.address_v, from_t_sharp.address_w, from_t_sharp.compare_op, from_t_sharp.border, from_t_sharp.border_index,
+                from_t_sharp.aniso_filter, from_t_sharp.max_aniso, from_t_sharp.lod_bias, from_t_sharp.min_lod, from_t_sharp.max_lod, from_words.mag_filter, from_words.min_filter, from_words.mip_mode, from_words.address_u,
+                from_words.address_v, from_words.address_w, from_words.compare_op, from_words.border, from_words.border_index, from_words.aniso_filter, from_words.max_aniso, from_words.lod_bias, from_words.min_lod,
+                from_words.max_lod).c_str());
+        }
+        const auto vk_sampler = texture_cache.GetSampler(Core::NativeImageDesc::FromDescOn() ? from_words : from_t_sharp, *current_bc_base, sampler.is_depth);
         if (indexed_active && stage.indexed) {
             NoteIndexedSampler(vk_sampler);
             continue;

@@ -598,7 +598,62 @@ void NoteHostInfoCompare(bool available, u32 info_mask, u32 view_mask, const cha
     }
 }
 
+std::atomic<u64> g_sd_compared{}, g_sd_equal{}, g_sd_used{};
+std::vector<std::string> g_sd_examples;
+
 std::atomic<u64> g_use_served{}, g_use_unavailable{}, g_use_alt_tile{}, g_use_depth_refused{};
+
+NativeDesc::SamplerDesc SamplerDescFromWords(const u32* words) noexcept {
+    NativeDesc::SamplerDesc d;
+    const u64 raw0 = words[0] | static_cast<u64>(words[1]) << 32, raw1 = words[2] | static_cast<u64>(words[3]) << 32;
+    const auto bits = [](u64 raw, u32 pos, u32 count) { return static_cast<u32>((raw >> pos) & ((1ull << count) - 1)); };
+    const auto address = [](u32 mode) -> u32 {
+        switch (mode) {
+        case 0: return static_cast<u32>(vk::SamplerAddressMode::eRepeat);
+        case 1: return static_cast<u32>(vk::SamplerAddressMode::eMirroredRepeat);
+        case 2: return static_cast<u32>(vk::SamplerAddressMode::eClampToEdge);
+        case 3: case 5: case 7: return static_cast<u32>(vk::SamplerAddressMode::eMirrorClampToEdge); // the host's closest equivalents of the mirror once modes
+        default: return static_cast<u32>(vk::SamplerAddressMode::eClampToBorder);                    // 4 half border, 6 border
+        }
+    };
+    const u32 aniso = bits(raw0, 9, 3), filter_mode = bits(raw0, 29, 2), mip = bits(raw1, 26, 2), mag = bits(raw1, 20, 2), min = bits(raw1, 22, 2);
+    d.valid = aniso <= 4 && filter_mode <= 2 && mip <= 2;
+    d.address_u = address(bits(raw0, 0, 3));
+    d.address_v = address(bits(raw0, 3, 3));
+    d.address_w = address(bits(raw0, 6, 3));
+    d.max_aniso = aniso <= 4 ? static_cast<float>(1u << aniso) : 1.0f;
+    d.compare_op = bits(raw0, 12, 3); // the console numbering equals vk::CompareOp (never .. always)
+    d.min_lod = static_cast<float>(bits(raw0, 32, 12)) * SamplerDescLodScale;
+    d.max_lod = static_cast<float>(bits(raw0, 44, 12)) * SamplerDescLodScale;
+    d.lod_bias = static_cast<float>(static_cast<s16>((bits(raw1, 0, 14) ^ 0x2000u) - 0x2000u)) * SamplerDescLodScale;
+    d.mag_filter = static_cast<u32>((mag & 1) ? vk::Filter::eLinear : vk::Filter::eNearest); // 1 bilinear, 3 anisotropic linear
+    d.min_filter = static_cast<u32>((min & 1) ? vk::Filter::eLinear : vk::Filter::eNearest);
+    d.aniso_filter = (mag >= 2 || min >= 2) ? 1 : 0;
+    d.mip_mode = static_cast<u32>(mip == 2 ? vk::SamplerMipmapMode::eLinear : vk::SamplerMipmapMode::eNearest);
+    d.border_index = bits(raw1, 32, 12);
+    switch (bits(raw1, 62, 2)) {
+    case 0: d.border = static_cast<u32>(vk::BorderColor::eFloatTransparentBlack); break;
+    case 1: d.border = static_cast<u32>(vk::BorderColor::eFloatOpaqueBlack); break;
+    case 2: d.border = static_cast<u32>(vk::BorderColor::eFloatOpaqueWhite); break;
+    default: d.border = static_cast<u32>(vk::BorderColor::eFloatCustomEXT); break;
+    }
+    return d;
+}
+
+void NoteSamplerDescCompare(bool equal, const char* example) {
+    g_sd_compared.fetch_add(1, std::memory_order_relaxed);
+    if (equal) {
+        g_sd_equal.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    std::scoped_lock lock{g_mutex};
+    if (g_sd_examples.size() < 8 && example != nullptr) {
+        const std::string text = example;
+        if (std::find(g_sd_examples.begin(), g_sd_examples.end(), text) == g_sd_examples.end()) {
+            g_sd_examples.push_back(text);
+        }
+    }
+}
 
 bool FromDescOn() noexcept {
     static const bool on = [] {
@@ -878,6 +933,7 @@ nlohmann::json Report() {
             host["examples"] = g_hi_examples;
         }
         j["f4_2_host_info_from_description"] = std::move(host);
+        j["f4_1_sampler_description"] = {{"compared", g_sd_compared.load()}, {"equal", g_sd_equal.load()}, {"examples", g_sd_examples}};
         j["f4_3_use"] = {{"on", FromDescOn()}, {"switch", "TLG_IMAGE_FROM_DESC=0 turns it off"}, {"bindings_served_from_the_description", g_use_served.load()}, {"engine_description_not_available", g_use_unavailable.load()},
                          {"alt_tile_set", g_use_alt_tile.load()}, {"depth_use_does_not_fit", g_use_depth_refused.load()}};
     }

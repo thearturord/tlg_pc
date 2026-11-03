@@ -107,4 +107,26 @@ struct ImageDesc {
     }
 };
 
+/// F4.1 samplers: what the host sampler creation reads of the console sampler descriptor (S#), as Vulkan-ready numbers. All fields are plain 32 bit values with no padding, so the struct
+/// is its own cache key (hash of its bytes). `valid` false: the descriptor holds a value the host refuses (the caller substitutes the all-zero sampler).
+struct SamplerDesc {
+    u32 mag_filter{};  ///< `vk::Filter`
+    u32 min_filter{};
+    u32 mip_mode{};    ///< `vk::SamplerMipmapMode`
+    u32 address_u{};   ///< `vk::SamplerAddressMode`
+    u32 address_v{};
+    u32 address_w{};
+    u32 compare_op{};  ///< `vk::CompareOp` (applied only for depth uses)
+    u32 border{};      ///< `vk::BorderColor`
+    u32 border_index{}; ///< index into the custom border colour table (border colour pointer), used when `border` is the custom one
+    u32 aniso_filter{}; ///< 1: one of the two filters is an anisotropic one
+    float max_aniso{1.0f};
+    float lod_bias{};
+    float min_lod{};
+    float max_lod{};
+    u32 valid{1};
+    u32 pad{};         ///< keeps the struct free of padding bytes (hashed)
+};
+static_assert(sizeof(SamplerDesc) == 64);
+
 } // namespace Core::NativeDesc

@@ -245,7 +245,7 @@ public:
     void RefreshImage(Image& image, Core::NativeE3Census::Caller caller = Core::NativeE3Census::Caller::Unknown);
 
     /// Retrieves the sampler that matches the provided S# descriptor.
-    [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
+    [[nodiscard]] vk::Sampler GetSampler(const Core::NativeDesc::SamplerDesc& sampler,
                                          AmdGpu::BorderColorBuffer border_color_base,
                                          bool is_depth);
 

@@ -5,6 +5,7 @@
 
 #include "common/lru_cache.h"
 #include "video_core/amdgpu/regs_texture.h"
+#include "native/native_desc.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
@@ -14,9 +15,12 @@ class Instance;
 
 namespace VideoCore {
 
+/// F4.1: the plain description read from an S# with the emulator's own helpers (the reference of the shadow compare)
+[[nodiscard]] Core::NativeDesc::SamplerDesc SamplerDescFromSharp(const AmdGpu::Sampler& sampler) noexcept;
+
 class Sampler : public Common::LRUNode<> {
 public:
-    explicit Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sampler,
+    explicit Sampler(const Vulkan::Instance& instance, const Core::NativeDesc::SamplerDesc& sampler,
                      const AmdGpu::BorderColorBuffer border_color_base, bool is_depth,
                      float extra_lod_bias = 0.0f);
     ~Sampler();

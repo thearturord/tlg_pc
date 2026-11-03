@@ -34,6 +34,12 @@ void CompareDesc(u64 resource_id, u64 view_id, const NativeDesc::ImageDesc& refe
 /// the description the accessor bit names (bit order of the mask `CompareDesc` receives)
 constexpr const char* AccessorNames[] = {"NumLayers", "NumLevels", "NumSamples", "BaseType", "ViewType", "NumViewLevels", "NumViewLayers", "IsTiled", "IsVolume"};
 
+/// F4.1 samplers: the plain description of a sampler from the four S# words (bit extraction, the host mapping tables written as numbers); the host's own decode of the same words
+/// is `VideoCore::SamplerDescFromSharp`, compared in the shadow (`TLG_DESC_CHECKS=1`): `NoteSamplerDescCompare(equal)` counts, `example` names a difference.
+[[nodiscard]] NativeDesc::SamplerDesc SamplerDescFromWords(const u32* words) noexcept;
+void NoteSamplerDescCompare(bool equal, const char* example);
+constexpr float SamplerDescLodScale = 1.0f / 256.0f;
+
 /// F4.3 (`TLG_IMAGE_FROM_DESC`, default on since 2026-11-03, `=0` turns it off, read once): the host builds the `ImageInfo` / `ImageViewInfo` of a sampled or stored image from the plain
 /// description instead of the T#. `FromDescOn()` is the switch; `DescForBinding` is the consumer's call: the engine's description of the binding with the shader's fix ups applied
 /// (`cube_to_2d_array`: the cube is read as a 2D array; `is_depth`: the host reads a depth image only as a 16 or 32 bit single channel). False (counted, the T# path serves the binding)

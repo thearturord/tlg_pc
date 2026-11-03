@@ -1313,7 +1313,7 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
     }
 }
 
-vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
+vk::Sampler TextureCache::GetSampler(const Core::NativeDesc::SamplerDesc& sharp,
                                      AmdGpu::BorderColorBuffer border_color_base,
                                      const bool is_depth) {
     TLG_PROF_LEVEL("texture.get_sampler", 3);
