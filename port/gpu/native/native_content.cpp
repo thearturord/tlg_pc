@@ -391,6 +391,56 @@ void NoteRingWindow(u64 address, u64 size) {
     c_win_noted.fetch_add(1, std::memory_order_relaxed);
 }
 
+namespace {
+std::atomic<u64> c_tmap_total{0}, c_tmap_in_window{0}, c_tmap_equal{0}, c_tmap_announced_smaller{0}, c_tmap_announced_larger{0}, c_tmap_smaller_bytes{0};
+std::mutex g_tmap_mutex;
+std::map<std::string, u64> g_tmap_shapes; ///< announced / window remaining / row pitch / depth pitch -> count
+std::vector<nlohmann::json> g_tmap_examples;
+} // namespace
+
+void NoteTextureMap(u64 resource_id, u64 pointer, u64 announced_bytes, u32 row_pitch, u32 depth_pitch, u32 map_type) {
+    if (!RingWindowsOn() || pointer == 0) {
+        return;
+    }
+    c_tmap_total.fetch_add(1, std::memory_order_relaxed);
+    u64 remaining = 0, window_begin = 0, window_size = 0;
+    {
+        std::scoped_lock lock{g_windows_mutex};
+        auto it = g_windows.upper_bound(pointer);
+        if (it != g_windows.begin()) {
+            const auto before = std::prev(it);
+            if (before->first + before->second.size > pointer) {
+                window_begin = before->first;
+                window_size = before->second.size;
+                remaining = before->first + before->second.size - pointer;
+            }
+        }
+    }
+    if (remaining == 0) {
+        return;
+    }
+    c_tmap_in_window.fetch_add(1, std::memory_order_relaxed);
+    if (announced_bytes == remaining) {
+        c_tmap_equal.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (announced_bytes < remaining) {
+        c_tmap_announced_smaller.fetch_add(1, std::memory_order_relaxed);
+        c_tmap_smaller_bytes.fetch_add(remaining - announced_bytes, std::memory_order_relaxed);
+    } else {
+        c_tmap_announced_larger.fetch_add(1, std::memory_order_relaxed);
+    }
+    const std::string key = fmt::format("announced {} window_remaining {} row_pitch {} depth_pitch {} type {}", announced_bytes, remaining, row_pitch, depth_pitch, map_type);
+    std::scoped_lock lock{g_tmap_mutex};
+    if (g_tmap_shapes.size() < 48 || g_tmap_shapes.count(key) != 0) {
+        ++g_tmap_shapes[key];
+    }
+    if (g_tmap_examples.size() < 8) {
+        g_tmap_examples.push_back({{"resource_id", resource_id}, {"pointer", fmt::format("{:#x}", pointer)}, {"window_begin", fmt::format("{:#x}", window_begin)}, {"window_size", window_size},
+                                   {"announced_bytes", announced_bytes}, {"window_remaining", remaining}, {"row_pitch", row_pitch}, {"depth_pitch", depth_pitch}});
+    }
+}
+
 bool InGpuAllocation(u64 address, u64 size) {
     std::scoped_lock lock{g_windows_mutex};
     auto it = g_gpu_windows.upper_bound(address);
@@ -990,6 +1040,12 @@ nlohmann::json Report() {
         }
         unc["examples"] = g_unc_examples;
         out["ring_swap_uncovered"] = std::move(unc);
+        {
+            std::scoped_lock tmap_lock{g_tmap_mutex};
+            out["texture_maps"] = {{"maps_for_writing", c_tmap_total.load()}, {"inside_a_ring_window", c_tmap_in_window.load()}, {"announced_equals_window_remaining", c_tmap_equal.load()},
+                                   {"announced_SMALLER_than_window_remaining", c_tmap_announced_smaller.load()}, {"bytes_not_announced", c_tmap_smaller_bytes.load()},
+                                   {"announced_larger", c_tmap_announced_larger.load()}, {"shapes", g_tmap_shapes}, {"examples", g_tmap_examples}};
+        }
         {
             std::scoped_lock shape_lock{g_shape_mutex};
             for (const auto& [key, n] : g_shapes) {

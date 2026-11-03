@@ -38,6 +38,9 @@ void SetRing(u64 begin, u64 end);
 enum class RingIndexEvent : u32 { ReusedExact, CreatedNew, StaleFreed, StaleKept, RefusedNoOwner, Count };
 void NoteRingIndex(RingIndexEvent event) noexcept;
 void NoteRingWindow(u64 address, u64 size);
+/// F2.4 research (`TLG_F2_RING_WINDOWS=1`): a Map of a texture for writing returned `pointer` with this row / depth pitch, and the Map announces `announced_bytes` (the resource's byte size);
+/// compared with the frame ring window the Map's allocation made (is the announced range smaller than what the caller can write?)
+void NoteTextureMap(u64 resource_id, u64 pointer, u64 announced_bytes, u32 row_pitch, u32 depth_pitch, u32 map_type);
 /// The engine's own GPU memory allocation (AllocGarlicMemory / AllocOnionMemory): always kept (a newer allocation drops the older ones it overlaps) so that the owner-less lookups outside the ring
 /// can be answered from the allocation they lie in (F2.3 ring image index).
 void NoteGpuAllocation(u64 address, u64 size);
