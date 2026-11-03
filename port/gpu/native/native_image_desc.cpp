@@ -120,7 +120,6 @@ constexpr const char* FieldNames[FieldCount] = {"base_address", "data_format", "
 
 std::atomic<u64> g_sampler_derived{}, g_sampler_unknown{}, g_sampler_differing{};
 std::atomic<u32> g_sampler_unknown_logged{};
-std::atomic<u64> g_decided{}, g_decide_unknown{}, g_decide_no_id{}, g_decide_differing{};
 std::atomic<u64> g_held_equal{}, g_held_differ{}, g_held_none{};
 std::array<std::atomic<u64>, 8> g_held_word_differs{};
 std::atomic<u64> g_no_view{}, g_view_unknown{}, g_view_without_desc{}, g_view_with_desc{}, g_compared{}, g_equal{}, g_unknown_object{}, g_unknown_format{};
@@ -371,28 +370,6 @@ bool Decides() noexcept {
         return e == nullptr || *e != '0';
     }();
     return on;
-}
-
-bool Decide(u64 resource_id, u64 view_id, const u32* record_words, AmdGpu::Image& out) {
-    if (resource_id == 0) {
-        g_decide_no_id.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-    if (Derive(resource_id, view_id, out) != Result::Derived) {
-        g_decide_unknown.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-    g_decided.fetch_add(1, std::memory_order_relaxed);
-    if (record_words != nullptr && std::memcmp(record_words, &out, 8 * sizeof(u32)) != 0) {
-        if (g_decide_differing.fetch_add(1, std::memory_order_relaxed) < 8) {
-            u32 d[8];
-            std::memcpy(d, &out, sizeof(d));
-            Core::RareEvents::Note("image_desc_decided_differs_from_record",
-                                   fmt::format("derived {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} record {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}", d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
-                                               record_words[0], record_words[1], record_words[2], record_words[3], record_words[4], record_words[5], record_words[6], record_words[7]));
-        }
-    }
-    return true;
 }
 
 void Compare(u64 resource_id, u64 view_id, const AmdGpu::Image& actual) {
@@ -890,11 +867,7 @@ nlohmann::json Report() {
         j["view_holds_the_record_descriptor"]["dword_differs"].push_back(g_held_word_differs[w].load());
     }
     j["samplers"] = {{"derived", g_sampler_derived.load()}, {"value_not_in_the_table", g_sampler_unknown.load()}, {"derived_differs_from_record_words", g_sampler_differing.load()}};
-    j["decides"] = Decides();
-    j["decided_by_the_engine_objects"] = g_decided.load();
-    j["record_words_decided_no_engine_id"] = g_decide_no_id.load();
-    j["record_words_decided_object_unknown"] = g_decide_unknown.load();
-    j["decided_differs_from_record_words"] = g_decide_differing.load();
+    j["sampler_words_from_the_engine_object"] = Decides();
     j["compared"] = g_compared.load();
     j["bindings_without_a_view"] = g_no_view.load();
     j["view_id_not_in_the_table"] = g_view_unknown.load();

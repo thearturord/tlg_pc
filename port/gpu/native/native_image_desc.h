@@ -53,11 +53,9 @@ constexpr const char* InfoFieldNames[] = {"props", "pixel_format", "type", "leve
 constexpr const char* ViewFieldNames[] = {"type", "format", "range", "mapping", "min_lod", "is_storage"};
 void NoteHostInfoCompare(bool engine_description_available, u32 info_mask, u32 view_mask, const char* example);
 
-/// True: the image descriptor of a binding comes from `Derive` and the words the record holds only verify (default; `TLG_IMAGE_DESC=0` turns it off).
+/// True: the sampler words of a record binding come from the engine's sampler object (`DeriveSampler`) and the words the engine built only verify (default; `TLG_IMAGE_DESC=0` turns it off).
+/// Images no longer have this switch: the host reads the plain description (`DescForBinding`, `TLG_IMAGE_FROM_DESC`).
 [[nodiscard]] bool Decides() noexcept;
-/// The deciding call of the consumer: the image of the binding (the raw descriptor, before the shader's fix ups) in `out`; false when the engine table cannot say (the record's
-/// words then decide). `record_words` (8 dwords, or null) are compared with the result; a difference is counted and goes to the rare events.
-[[nodiscard]] bool Decide(u64 resource_id, u64 view_id, const u32* record_words, AmdGpu::Image& out);
 
 /// `TLG_DESC_CHECKS=1`: derive and compare with the T# the record holds (`actual`); counts per field.
 void Compare(u64 resource_id, u64 view_id, const AmdGpu::Image& actual);

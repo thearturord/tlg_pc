@@ -479,7 +479,7 @@ private:
     /// the raw T# and the use flags of each resource. A hit redoes only the per draw effects (touch, update, bound flags, layout transition, descriptor info).
     /// Raster thread only. Env TLG_TEXTURE_SET_MEMO=1 turns it on.
     struct TextureSetEntry {
-        AmdGpu::Image raw{};
+        std::array<u32, 8> raw{}; ///< the eight dwords of the T#
         u64 flags{};
         VideoCore::ImageId found{}; ///< what FindImage returned
         VideoCore::ImageId id{};    ///< after the depth redirect (null entry: an empty descriptor)
@@ -501,7 +501,7 @@ private:
     bool texture_set_on = false;
     TextureSetStats texture_set_stats;
     /// True when the stage's images were bound from the set (the descriptor writes are done).
-    bool BindTexturesFromSet(const Shader::Info& stage, TextureSet& set, const AmdGpu::Image* raws, const u64* flags, u32 count,
+    bool BindTexturesFromSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count,
                              Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline, const FixedState* fixed = nullptr);
 

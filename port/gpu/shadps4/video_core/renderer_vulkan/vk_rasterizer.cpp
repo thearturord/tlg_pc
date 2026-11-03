@@ -1749,19 +1749,19 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     }
 
     // Buffers must have the same size and each thread of the dispatch must copy 1 dword of data
-    const AmdGpu::Buffer buf0 = desc0.GetSharp(info);
-    const AmdGpu::Buffer buf1 = desc1.GetSharp(info);
-    if (buf0.GetSize() != buf1.GetSize() || cs_pgm.dim_x != (buf0.GetSize() / 256)) {
+    const auto buf0 = Core::NativeDesc::BufferDescOf(desc0.GetSharp(info));
+    const auto buf1 = Core::NativeDesc::BufferDescOf(desc1.GetSharp(info));
+    if (buf0.size != buf1.size || cs_pgm.dim_x != (buf0.size / 256)) {
         return false;
     }
 
     // Find images the buffer alias
-    const auto image0_id = texture_cache.FindImageFromRange(buf0.base_address, buf0.GetSize());
+    const auto image0_id = texture_cache.FindImageFromRange(buf0.address, buf0.size);
     if (!image0_id) {
         return false;
     }
     const auto image1_id =
-        texture_cache.FindImageFromRange(buf1.base_address, buf1.GetSize(), false);
+        texture_cache.FindImageFromRange(buf1.address, buf1.size, false);
     if (!image1_id) {
         return false;
     }
@@ -1770,7 +1770,7 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     VideoCore::Image& image0 = texture_cache.GetImage(image0_id);
     VideoCore::Image& image1 = texture_cache.GetImage(image1_id);
     if (image0.info.guest_size != image1.info.guest_size ||
-        image0.info.pitch != image1.info.pitch || image0.info.guest_size != buf0.GetSize() ||
+        image0.info.pitch != image1.info.pitch || image0.info.guest_size != buf0.size ||
         image0.info.num_bits != image1.info.num_bits) {
         return false;
     }
@@ -1806,29 +1806,30 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     }
 
     // First buffer must have size of vec4 and second the size of a single layer
-    const AmdGpu::Buffer buf0 = desc0.GetSharp(info);
-    const AmdGpu::Buffer buf1 = desc1.GetSharp(info);
-    const u32 buf1_bpp = AmdGpu::NumBitsPerBlock(buf1.GetDataFmt());
-    if (buf0.GetSize() != 16 || (cs_pgm.dim_x * 128ULL * (buf1_bpp / 8)) != buf1.GetSize()) {
+    const auto sharp1 = desc1.GetSharp(info);
+    const auto buf0 = Core::NativeDesc::BufferDescOf(desc0.GetSharp(info));
+    const auto buf1 = Core::NativeDesc::BufferDescOf(sharp1);
+    const u32 buf1_bpp = AmdGpu::NumBitsPerBlock(sharp1.GetDataFmt());
+    if (buf0.size != 16 || (cs_pgm.dim_x * 128ULL * (buf1_bpp / 8)) != buf1.size) {
         return false;
     }
 
     // Find image the buffer alias
     const auto image1_id =
-        texture_cache.FindImageFromRange(buf1.base_address, buf1.GetSize(), false);
+        texture_cache.FindImageFromRange(buf1.address, buf1.size, false);
     if (!image1_id) {
         return false;
     }
 
     // Image clear must be valid
     VideoCore::Image& image1 = texture_cache.GetImage(image1_id);
-    if (image1.info.guest_size != buf1.GetSize() || image1.info.num_bits != buf1_bpp ||
+    if (image1.info.guest_size != buf1.size || image1.info.num_bits != buf1_bpp ||
         image1.info.props.is_depth) {
         return false;
     }
 
     // Perform image clear
-    const float* values = reinterpret_cast<float*>(buf0.base_address);
+    const float* values = reinterpret_cast<float*>(buf0.address);
     const vk::ClearValue clear = {
         .color = {.float32 = std::array<float, 4>{values[0], values[1], values[2], values[3]}},
     };
@@ -2089,12 +2090,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         }
                         if (auto* handle = Core::NativeResources::FindImmutableById(dispatch_audit_plan->bindings[audit_index].id)) {
                             audit.dispatch_diff[3].fetch_add(1, std::memory_order_relaxed);
-                        }
-                        if (false) {
-                            auto* handle = static_cast<Core::NativeResources::ImmutableBuffer*>(nullptr);
-                            audit.dispatch_diff[3].fetch_add(1, std::memory_order_relaxed);
-                            const auto inside = [&](const AmdGpu::Buffer& b) { return b.base_address >= handle->begin && b.base_address + b.GetSize() <= handle->end; };
-                            audit.dispatch_diff[handle->alive.load(std::memory_order_acquire) ? (inside(recorded) ? 4 : inside(legacy) ? 5 : 6) : 7].fetch_add(1, std::memory_order_relaxed);
                         }
                         static std::atomic<u32> logged{0};
                         if (logged.fetch_add(1) < 12) {
@@ -2387,14 +2382,14 @@ u64 ImageUseFlags(const Shader::ImageResource& image_desc) {
 }
 } // namespace
 
-bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set, const AmdGpu::Image* raws, const u64* flags, u32 count,
+bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count,
                                      Shader::Backend::Bindings& binding) {
     if (set.count != count) {
         ++texture_set_stats.no_entry;
         return false;
     }
     for (u32 i = 0; i < count; ++i) {
-        if (set.entries[i].flags != flags[i] || std::memcmp(&set.entries[i].raw, &raws[i], sizeof(AmdGpu::Image)) != 0) {
+        if (set.entries[i].flags != flags[i] || set.entries[i].raw != raws[i]) {
             ++texture_set_stats.no_entry;
             return false;
         }
@@ -2467,7 +2462,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     // Texture set memo: the set of resolved images for these T#s, when the stage qualifies (no written image, no mip fallback binding, at most 16 images).
     TextureSet* set_slot = nullptr;
-    std::array<AmdGpu::Image, TextureSet::MaxImages> set_raws;
+    std::array<std::array<u32, 8>, TextureSet::MaxImages> set_raws;
     std::array<u64, TextureSet::MaxImages> set_flags{};
     std::array<VideoCore::ImageId, TextureSet::MaxImages> set_found{};
     bool set_record = false;
@@ -2495,7 +2490,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 } else if (!res.Fetch(flat.data(), &raw)) {
                     raw = {};
                 }
-                set_raws[i] = raw;
+                static_assert(sizeof(AmdGpu::Image) == sizeof(set_raws[0]));
+                std::memcpy(set_raws[i].data(), &raw, sizeof(raw));
                 set_flags[i] = ImageUseFlags(stage.images[i]);
                 std::array<u64, 5> words{};
                 std::memcpy(words.data(), &raw, sizeof(AmdGpu::Image));
