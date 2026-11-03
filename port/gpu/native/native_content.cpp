@@ -121,6 +121,11 @@ constexpr const char* RingClassNames[RingClassCount] = {"exact_start_and_fits", 
 std::atomic<u64> c_ring_lookups[5][RingClassCount]{};   ///< [binding type][class]
 std::atomic<u64> c_ring_age_log2[RingClassCount][24]{}; ///< windows older than 2^n allocations, by class
 std::vector<nlohmann::json> g_ring_examples;
+std::map<u64, RingWindow> g_gpu_windows; ///< F2.3: the engine's own GPU memory allocations (AllocGarlicMemory / AllocOnionMemory), under g_windows_mutex
+enum GpuClass : u32 { GpuExact, GpuInside, GpuNone, GpuClassCount };
+constexpr const char* GpuClassNames[GpuClassCount] = {"allocation_starts_here_and_fits", "inside_an_allocation", "no_allocation"};
+std::atomic<u64> c_gpu_lookups[5][GpuClassCount]{};
+std::vector<nlohmann::json> g_gpu_examples;
 
 std::atomic<u64> c_maps[8][8][4]{}; ///< [resource kind (0xff: unknown -> 7)][map type][path]
 const char* GroupName(Group g) {
@@ -344,7 +349,7 @@ void NoteMark(u32 writer, u64 address, u64 size) {
 u32 RingIndexMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_F2_RING_INDEX");
-        return e != nullptr ? static_cast<u32>(std::min(std::atoi(e), 2)) : 0u;
+        return e != nullptr ? static_cast<u32>(std::min(std::atoi(e), 2)) : 1u; // default on since 2026-11-03 (owner play, audit 6,076 of 6,076 equal); =0 turns it off
     }();
     return mode;
 }
@@ -394,6 +399,25 @@ void NoteRingWindow(u64 address, u64 size) {
     c_win_noted.fetch_add(1, std::memory_order_relaxed);
 }
 
+void NoteGpuAllocation(u64 address, u64 size) {
+    if (!RingWindowsOn() || address == 0 || size == 0) {
+        return;
+    }
+    std::scoped_lock lock{g_windows_mutex};
+    const u64 end = address + size;
+    auto it = g_gpu_windows.lower_bound(address);
+    if (it != g_gpu_windows.begin()) {
+        const auto before = std::prev(it);
+        if (before->first + before->second.size > address) {
+            it = before;
+        }
+    }
+    while (it != g_gpu_windows.end() && it->first < end) {
+        it = it->first + it->second.size > address ? g_gpu_windows.erase(it) : std::next(it);
+    }
+    g_gpu_windows.emplace(address, RingWindow{size, ++g_window_serial});
+}
+
 void ClassifyRingLookup(u64 address, u64 size, u32 binding_type) {
     if (!RingWindowsOn() || size == 0) {
         return;
@@ -402,6 +426,24 @@ void ClassifyRingLookup(u64 address, u64 size, u32 binding_type) {
     const u64 ring_begin = g_ring_begin.load(std::memory_order_relaxed);
     if (ring_begin == 0 || address < ring_begin || address >= g_ring_end.load(std::memory_order_relaxed)) {
         c_ring_lookups[type][RingNotInRing].fetch_add(1, std::memory_order_relaxed);
+        GpuClass gpu = GpuNone;
+        u64 alloc_begin = 0, alloc_size = 0;
+        {
+            std::scoped_lock lock{g_windows_mutex};
+            auto it = g_gpu_windows.upper_bound(address);
+            if (it != g_gpu_windows.begin()) {
+                const auto before = std::prev(it);
+                if (before->first + before->second.size > address) {
+                    gpu = before->first == address && before->second.size >= size ? GpuExact : GpuInside;
+                    alloc_begin = before->first, alloc_size = before->second.size;
+                }
+            }
+            if (gpu != GpuExact && g_gpu_examples.size() < 16) {
+                g_gpu_examples.push_back({{"class", GpuClassNames[gpu]}, {"binding_type", type}, {"image_address", fmt::format("{:#x}", address)}, {"image_size", size},
+                                          {"allocation_address", fmt::format("{:#x}", alloc_begin)}, {"allocation_size", alloc_size}});
+            }
+        }
+        c_gpu_lookups[type][gpu].fetch_add(1, std::memory_order_relaxed);
         return;
     }
     RingClass cls = RingNone;
@@ -752,6 +794,18 @@ nlohmann::json Report() {
             w["windows_now"] = g_windows.size();
             w["examples_not_exact"] = g_ring_examples;
         }
+        for (u32 t = 0; t < 5; ++t) {
+            for (u32 c = 0; c < GpuClassCount; ++c) {
+                if (const u64 n = c_gpu_lookups[t][c].load(); n != 0) {
+                    w["outside_the_ring_against_gpu_allocations"][types[t]][GpuClassNames[c]] = n;
+                }
+            }
+        }
+        {
+            std::scoped_lock lock{g_windows_mutex};
+            w["gpu_allocations_now"] = g_gpu_windows.size();
+            w["examples_outside_ring_not_exact"] = g_gpu_examples;
+        }
         out["ring_windows"] = std::move(w);
     }
     if (RingIndexMode() != 0) {
@@ -762,7 +816,7 @@ nlohmann::json Report() {
                              {"stale_images_kept_not_old_enough", c_ring_index[3].load()},
                              {"audit_page_table_same_exact_match", c_ring_index[4].load()},
                              {"AUDIT_page_table_other_exact_match", c_ring_index[5].load()},
-                             {"switch", "TLG_F2_RING_INDEX=0 turns it off, 2 audits against the page table"}};
+                             {"switch", "TLG_F2_RING_INDEX=0 turns it off, 2 audits against the page table; default on"}};
     }
     out["enabled"] = On();
     out["shadow"] = ShadowOn();

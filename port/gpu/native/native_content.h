@@ -39,6 +39,8 @@ void SetRing(u64 begin, u64 end);
 enum class RingIndexEvent : u32 { ReusedExact, CreatedNew, StaleFreed, StaleKept, AuditSame, AuditOtherExactMatch, Count };
 void NoteRingIndex(RingIndexEvent event) noexcept;
 void NoteRingWindow(u64 address, u64 size);
+/// The engine's own GPU memory allocation (AllocGarlicMemory / AllocOnionMemory): kept (with `TLG_F2_RING_WINDOWS=1`) to classify the owner-less lookups outside the ring.
+void NoteGpuAllocation(u64 address, u64 size);
 void ClassifyRingLookup(u64 address, u64 size, u32 binding_type);
 /// `staged` holds the guest memory bytes of [address, address + size) (what the upload would read): if the range lies in the ring, the bytes of the entries the current draw may see replace them.
 void OverlayImage(u64 address, u64 size, u8* staged);

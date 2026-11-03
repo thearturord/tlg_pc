@@ -8231,6 +8231,9 @@ u64 PS4_SYSV_ABI GpuAlloc(u64 device, u64 size, u64 alignment, u64 type, u64 a4,
             Core::NativeUpdates::NoteWriterRange(5, result, bytes);
         }
     }
+    if (result != 0) {
+        Core::NativeContent::NoteGpuAllocation(result, size & 0xffffffffull);
+    }
     if constexpr (Which == 0) {
         t_last_garlic_address = result;
         t_last_garlic_size = size & 0xffffffffull;
