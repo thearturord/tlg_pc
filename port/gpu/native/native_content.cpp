@@ -360,8 +360,8 @@ void NoteRingIndex(RingIndexEvent event) noexcept {
 
 bool RingWindowsOn() noexcept {
     static const bool on = [] {
-        const char* e = std::getenv("TLG_F2_RING_WINDOWS");
-        return e != nullptr && *e == '1';
+        const char* e = std::getenv("TLG_F2_RING_WINDOWS"); // default on since 2026-11-03 (the whole-window Map announcement needs the ring windows); =0 turns it off
+        return e == nullptr || *e != '0';
     }();
     return on;
 }
@@ -400,8 +400,8 @@ std::vector<nlohmann::json> g_tmap_examples;
 
 u64 MapAnnounceBytes(u64 pointer, u64 resource_bytes) {
     static const bool on = [] {
-        const char* e = std::getenv("TLG_F2_MAP_WHOLE_WINDOW");
-        return e != nullptr && *e == '1';
+        const char* e = std::getenv("TLG_F2_MAP_WHOLE_WINDOW"); // default on since 2026-11-03 (shadow play: 17,430 swap reads, 0 uncovered, 0 differing); =0 turns it off
+        return e == nullptr || *e != '0';
     }();
     if (!on || pointer == 0) {
         return resource_bytes;
