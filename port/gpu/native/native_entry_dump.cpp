@@ -11,6 +11,7 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "native/native_flip.h"
+#include "native/native_log.h"
 #include "native/native_draw.h"
 #include "native/native_entry_dump.h"
 #include "native/native_draw_tag.h"
@@ -114,7 +115,7 @@ void Finish() {
     const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "entry_dump.txt";
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) {
-        LOG_ERROR(Core, "entry dump: cannot write {}", path.string());
+        TLG_LOG(HOOK, Error, "entry dump: cannot write {}", path.string());
         lines.clear();
         by_label.clear();
         return;

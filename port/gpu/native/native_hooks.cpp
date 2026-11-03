@@ -23,6 +23,7 @@
 #include "common/path_util.h"
 #include "core/cpu_patches.h"
 #include "native/native_debug_server.h"
+#include "native/native_log.h"
 #include "native/native_timeline.h"
 #include "native/native_prof.h"
 #include "native/native_hooks.h"
@@ -398,14 +399,14 @@ void EmitMidStub(Xbyak::CodeGenerator& c, Hook& hook, const u8* original, size_t
 
 bool InstallHook(Hook& hook, u8* image_base, u64 image_size) {
     if (hook.offset + 16 > image_size) {
-        LOG_ERROR(Core, "guest hook '{}': offset {:#x} is outside the image", hook.name, hook.offset);
+        TLG_LOG(HOOK, Error, "guest hook '{}': offset {:#x} is outside the image", hook.name, hook.offset);
         return false;
     }
     u8* entry = image_base + hook.offset;
     std::string why;
     const size_t displaced = DisplacedLength(entry, why);
     if (displaced == 0) {
-        LOG_ERROR(Core, "guest hook '{}' at {:#x} refused: {}", hook.name, hook.offset, why);
+        TLG_LOG(HOOK, Error, "guest hook '{}' at {:#x} refused: {}", hook.name, hook.offset, why);
         return false;
     }
     u8 original[MaxDisplacedBytes];
@@ -442,13 +443,13 @@ bool InstallHook(Hook& hook, u8* image_base, u64 image_size) {
         return true;
     });
     if (!emitted) {
-        LOG_ERROR(Core, "guest hook '{}': no room in the trampoline area", hook.name);
+        TLG_LOG(HOOK, Error, "guest hook '{}': no room in the trampoline area", hook.name);
         return false;
     }
 
     const s64 rel = reinterpret_cast<s64>(stub) - reinterpret_cast<s64>(entry + 5);
     if (rel < INT32_MIN || rel > INT32_MAX) {
-        LOG_ERROR(Core, "guest hook '{}': trampoline is out of near-jump range", hook.name);
+        TLG_LOG(HOOK, Error, "guest hook '{}': trampoline is out of near-jump range", hook.name);
         return false;
     }
     u8 patch[MaxDisplacedBytes];
@@ -533,7 +534,7 @@ void InstallSpans(VAddr base, u64 image_size) {
         std::ifstream in(path);
         in >> config;
     } catch (const std::exception& e) {
-        LOG_ERROR(Core, "frame profiler spans: cannot read {}: {}", path.string(), e.what());
+        TLG_LOG(HOOK, Error, "frame profiler spans: cannot read {}: {}", path.string(), e.what());
         return;
     }
     u32 installed = 0;
@@ -544,13 +545,13 @@ void InstallSpans(VAddr base, u64 image_size) {
             const u64 slot_offset = ParseHex(item.at("slot")) - ghidra_base;
             const u64 target_offset = ParseHex(item.at("target")) - ghidra_base;
             if (slot_offset + 8 > image_size || target_offset >= image_size) {
-                LOG_ERROR(Core, "frame profiler span '{}': outside the image", name);
+                TLG_LOG(HOOK, Error, "frame profiler span '{}': outside the image", name);
                 continue;
             }
             auto* slot = reinterpret_cast<u64*>(base + slot_offset);
             const u64 original = base + target_offset;
             if (*slot != original) {
-                LOG_ERROR(Core, "frame profiler span '{}': the slot holds {:#x}, expected {:#x}: skipped", name, *slot, original);
+                TLG_LOG(HOOK, Error, "frame profiler span '{}': the slot holds {:#x}, expected {:#x}: skipped", name, *slot, original);
                 continue;
             }
             const u32 id = static_cast<u32>(span_names_installed.size());
@@ -593,7 +594,7 @@ void InstallSpans(VAddr base, u64 image_size) {
                 return true;
             });
             if (!emitted) {
-                LOG_ERROR(Core, "frame profiler span '{}': no room in the trampoline area", name);
+                TLG_LOG(HOOK, Error, "frame profiler span '{}': no room in the trampoline area", name);
                 continue;
             }
 #ifdef _WIN32
@@ -609,9 +610,9 @@ void InstallSpans(VAddr base, u64 image_size) {
             ++installed;
         }
     } catch (const std::exception& e) {
-        LOG_ERROR(Core, "frame profiler spans: bad file {}: {}", path.string(), e.what());
+        TLG_LOG(HOOK, Error, "frame profiler spans: bad file {}: {}", path.string(), e.what());
     }
-    LOG_WARNING(Core, "frame profiler: {} spans installed from {}", installed, path.filename().string());
+    TLG_LOG(HOOK, Warn, "frame profiler: {} spans installed from {}", installed, path.filename().string());
 }
 
 } // namespace
@@ -638,7 +639,7 @@ void InstallForEboot(VAddr base, u64 image_size) {
         std::ifstream in(path);
         in >> config;
     } catch (const std::exception& e) {
-        LOG_ERROR(Core, "guest hooks: cannot read {}: {}", path.string(), e.what());
+        TLG_LOG(HOOK, Error, "guest hooks: cannot read {}: {}", path.string(), e.what());
         return;
     }
 
@@ -650,7 +651,7 @@ void InstallForEboot(VAddr base, u64 image_size) {
         u64 ring_entries = config.value("ring_entries", u64{16384});
         if (ring_entries < 16 || (ring_entries & (ring_entries - 1)) != 0 ||
             ring_entries > (1u << 24)) {
-            LOG_WARNING(Core, "guest hooks: ring_entries must be a power of two in 16..16M, using 16384");
+            TLG_LOG(HOOK, Warn, "guest hooks: ring_entries must be a power of two in 16..16M, using 16384");
             ring_entries = 16384;
         }
 
@@ -668,13 +669,13 @@ void InstallForEboot(VAddr base, u64 image_size) {
             }
             if (found != expect) {
                 if (mismatches++ < 3) {
-                    LOG_ERROR(Core, "guest hooks: '{}' expects the code bytes {} at {:#x}, the game has {}", item.value("name", std::string()),
+                    TLG_LOG(HOOK, Error, "guest hooks: '{}' expects the code bytes {} at {:#x}, the game has {}", item.value("name", std::string()),
                               expect, address, found);
                 }
             }
         }
         if (mismatches != 0) {
-            LOG_ERROR(Core, "guest hooks: {} hooks do not match this build of the game (the hook file is made for The Last Guardian 1.03): no hook is installed",
+            TLG_LOG(HOOK, Error, "guest hooks: {} hooks do not match this build of the game (the hook file is made for The Last Guardian 1.03): no hook is installed",
                       mismatches);
             return;
         }
@@ -687,7 +688,7 @@ void InstallForEboot(VAddr base, u64 image_size) {
             if (item.contains("ghidra")) {
                 const u64 address = ParseHex(item.at("ghidra"));
                 if (address < ghidra_base) {
-                    LOG_ERROR(Core, "guest hook '{}': address below the image base", hook->name);
+                    TLG_LOG(HOOK, Error, "guest hook '{}': address below the image base", hook->name);
                     ++failed;
                     continue;
                 }
@@ -706,7 +707,7 @@ void InstallForEboot(VAddr base, u64 image_size) {
             if (hook->mode == Mode::Call || hook->mode == Mode::Mid) {
                 hook->handler = NativeDraw::FindHandler(item.value("handler", std::string()));
                 if (hook->handler == 0) {
-                    LOG_ERROR(Core, "guest hook '{}': unknown handler '{}'", hook->name,
+                    TLG_LOG(HOOK, Error, "guest hook '{}': unknown handler '{}'", hook->name,
                               item.value("handler", std::string()));
                     ++failed;
                     continue;
@@ -733,7 +734,7 @@ void InstallForEboot(VAddr base, u64 image_size) {
                     if (snap.reg == 99 ||
                         (snap.size != 1 && snap.size != 2 && snap.size != 4 && snap.size != 8) ||
                         snap.offset > 0x7fffffff || hook->snaps.size() >= 8) {
-                        LOG_ERROR(Core, "guest hook '{}': bad snap entry", hook->name);
+                        TLG_LOG(HOOK, Error, "guest hook '{}': bad snap entry", hook->name);
                         continue;
                     }
                     hook->snaps.push_back(snap);
@@ -755,7 +756,7 @@ void InstallForEboot(VAddr base, u64 image_size) {
                     if (deref.reg == 99 ||
                         (deref.size != 1 && deref.size != 2 && deref.size != 4 && deref.size != 8) ||
                         hook->derefs.size() >= 6) {
-                        LOG_ERROR(Core, "guest hook '{}': bad deref entry", hook->name);
+                        TLG_LOG(HOOK, Error, "guest hook '{}': bad deref entry", hook->name);
                         continue;
                     }
                     hook->derefs.push_back(deref);
@@ -771,7 +772,7 @@ void InstallForEboot(VAddr base, u64 image_size) {
         }
         LOG_INFO(Core, "guest hooks: {} installed, {} failed ({})", installed, failed, path.string());
     } catch (const std::exception& e) {
-        LOG_ERROR(Core, "guest hooks: bad configuration {}: {}", path.string(), e.what());
+        TLG_LOG(HOOK, Error, "guest hooks: bad configuration {}: {}", path.string(), e.what());
     }
 
     if (hooks.empty()) {

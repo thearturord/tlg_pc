@@ -11,6 +11,7 @@
 #include "core/guest_heap.h"
 #include "common/logging/log.h"
 #include "native/native_hooks.h"
+#include "native/native_log.h"
 #include "native/native_config.h"
 #include "native/native_direct.h"
 #include "native/native_flip.h"
@@ -276,7 +277,7 @@ std::shared_ptr<Buffer> Build(u32 queue, const u32* dcb, u32 dwords, bool has_co
         static std::set<std::string> off_signatures;
         std::scoped_lock off_lock{off_mutex};
         if (off_signatures.size() < 64 && off_signatures.insert(key).second) {
-            LOG_ERROR(Core, "a command buffer runs from its entries only: {} packets of a command buffer (queue {}, {} dwords) are not executed (opcode:count):{}", other_total, queue, dwords,
+            TLG_LOG(CP, Error, "a command buffer runs from its entries only: {} packets of a command buffer (queue {}, {} dwords) are not executed (opcode:count):{}", other_total, queue, dwords,
                       signature);
             std::vector<std::pair<u32, u32>> walk;
             for (u32 at = 0; at < dwords;) {
@@ -300,7 +301,7 @@ std::shared_ptr<Buffer> Build(u32 queue, const u32* dcb, u32 dwords, bool has_co
                 for (size_t j = i >= 4 ? i - 4 : 0; j < walk.size() && j < i + 5; ++j) {
                     around += fmt::format(" {}{:#x}@{}", j == i ? "*" : "", walk[j].second, walk[j].first);
                 }
-                LOG_ERROR(Core, "packet path is off: leftover packet around dword {} of {}:{}", walk[i].first, dwords, around);
+                TLG_LOG(CP, Error, "packet path is off: leftover packet around dword {} of {}:{}", walk[i].first, dwords, around);
             }
         }
     }

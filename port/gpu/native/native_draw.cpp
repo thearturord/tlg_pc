@@ -29,6 +29,7 @@
 #endif
 #include "core/guest_heap.h"
 #include "native/native_stream_probe.h"
+#include "native/native_log.h"
 #include "native/native_config.h"
 #include "native/native_stream_submit.h"
 #include "common/logging/log.h"
@@ -132,7 +133,7 @@ u64 Guarded(F&& body) {
     const u64 result = RunGuarded([](void* argument) -> u64 { return (*static_cast<F*>(argument))(); }, &body, &faulted);
     if (faulted) {
         if (guarded_faults.fetch_add(1) < 8) {
-            LOG_WARNING(Core, "native record builder: an engine object held a stale pointer, the draw takes the packet path");
+            TLG_LOG(CP, Warn, "native record builder: an engine object held a stale pointer, the draw takes the packet path");
         }
         return 0;
     }
@@ -2766,7 +2767,7 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
                 if (const char* what = ComparePackage(*package, slot)) {
                     nl_mismatch.fetch_add(1, std::memory_order_relaxed);
                     if (nl_logged.fetch_add(1) < 12) {
-                        LOG_ERROR(Core, "native list: package {:#x} differs from the synthesis ({})", package_key, what);
+                        TLG_LOG(CP, Error, "native list: package {:#x} differs from the synthesis ({})", package_key, what);
                     }
                     package->ready.store(2, std::memory_order_release); // dropped: the next record of the key makes a new one
                 }
@@ -4612,7 +4613,7 @@ bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed) {
     if (what != nullptr) {
         lazy_differences.fetch_add(1, std::memory_order_relaxed);
         if (lazy_logged.fetch_add(1) < 12) {
-            LOG_ERROR(Core, "native list: the lazy draw {} differs from the full one ({})", seq, what);
+            TLG_LOG(CP, Error, "native list: the lazy draw {} differs from the full one ({})", seq, what);
         }
     }
     return ok;
@@ -4817,7 +4818,7 @@ void RunResourceTracking(u64 ctx) {
             if (!valid(resource)) {
                 static std::atomic<u32> reports{0};
                 if (reports.fetch_add(1) < 6) {
-                    LOG_WARNING(Core, "native tracking: stage {} slot {} has view {:#x} with resource {:#x}: skipped", stage,
+                    TLG_LOG(CP, Warn, "native tracking: stage {} slot {} has view {:#x} with resource {:#x}: skipped", stage,
                                 slot, view, resource);
                 }
                 continue;
@@ -5629,7 +5630,7 @@ u64 PS4_SYSV_ABI WaitRenderProbe(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
     if (now - last_ms >= 5000) {
         last_ms = now;
         for (const auto& [caller, count] : callers) {
-            LOG_WARNING(Core, "WaitRender per 5 s: caller {:#x}: {} calls", caller, count);
+            TLG_LOG(CP, Warn, "WaitRender per 5 s: caller {:#x}: {} calls", caller, count);
         }
         callers.clear();
     }
@@ -5787,7 +5788,7 @@ u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64
     const u64 size = Rd<u64>(allocator, 0x0) & 0xffffffffull;
     if (base == 0 || (base & 0xfff) != 0 || (size & 0xfff) != 0 || size < (1ull << 20) ||
         size > (1ull << 30)) {
-        LOG_WARNING(Core, "native draw: frame allocator ring not recognised (base {:#x}, size {:#x})",
+        TLG_LOG(CP, Warn, "native draw: frame allocator ring not recognised (base {:#x}, size {:#x})",
                     base, size);
         return finish();
     }
@@ -6771,7 +6772,7 @@ u64 PS4_SYSV_ABI RenderDataCreateGuard(u64 render_data, u64 resource, u64 kind, 
     const auto stop = [&](u32 why) {
         const u64 count = render_data_guard_stopped[why].fetch_add(1, std::memory_order_relaxed);
         if (count < 3) {
-            LOG_WARNING(Core, "render data guard: the instancing loop asks for a view of resource {:#x} that the engine would divide by zero on ({}): kind {:#x}, +0x40 {:#x}, +0x44 {:#x}, +0x58 {:#x}, +0x60 {:#x}, +0x84 {:#x}",
+            TLG_LOG(CP, Warn, "render data guard: the instancing loop asks for a view of resource {:#x} that the engine would divide by zero on ({}): kind {:#x}, +0x40 {:#x}, +0x44 {:#x}, +0x58 {:#x}, +0x60 {:#x}, +0x84 {:#x}",
                         resource, why == 0 ? "no element size" : "unordered access view without a format", static_cast<u32>(kind), Rd<u32>(resource, 0x40), Rd<u32>(resource, 0x44), Rd<u64>(resource, 0x58),
                         Rd<u32>(resource, 0x60), Rd<u32>(resource, 0x84));
         }
@@ -6931,13 +6932,13 @@ void InstallUnmapSlot() {
     }
     auto* slot = reinterpret_cast<u64*>(base + 0x26fe200 - 0x1000000);
     if (*slot != base + 0x2480f80 - 0x1000000) {
-        LOG_ERROR(Core, "native updates: the Unmap slot holds {:#x}, expected {:#x}: not installed", *slot, base + 0x2480f80 - 0x1000000);
+        TLG_LOG(CP, Error, "native updates: the Unmap slot holds {:#x}, expected {:#x}: not installed", *slot, base + 0x2480f80 - 0x1000000);
         return;
     }
 #ifdef _WIN32
     DWORD old_protect = 0;
     if (!VirtualProtect(slot, sizeof(u64), PAGE_READWRITE, &old_protect)) { // the table is read only after relocation
-        LOG_ERROR(Core, "native updates: cannot make the Unmap slot writable");
+        TLG_LOG(CP, Error, "native updates: cannot make the Unmap slot writable");
         return;
     }
     *slot = reinterpret_cast<u64>(&UnmapSlot);

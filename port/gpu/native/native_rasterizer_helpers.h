@@ -9,6 +9,7 @@
 #include <tuple>
 
 #include "native/native_draw.h"
+#include "native/native_log.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace Vulkan {
@@ -56,10 +57,10 @@ inline void DumpDispatchRecord(const Shader::Info& stage, u32 kind, u32 offset, 
     ++dumps;
     u32 root = 0, src = 0;
     const bool table = stage.srt_info.TableSource(offset, root, src);
-    LOG_ERROR(Render_Vulkan, "L2 dump ({}): caller {:#x} program {:#x} kind {} flat offset {} table {} root sgpr {} src {} entries {}", why, caller, u64{stage.pgm_hash}, kind, offset, table, root, src, g_dump_context.count);
+    TLG_LOG(RASTER, Error, "L2 dump ({}): caller {:#x} program {:#x} kind {} flat offset {} table {} root sgpr {} src {} entries {}", why, caller, u64{stage.pgm_hash}, kind, offset, table, root, src, g_dump_context.count);
     for (u32 i = 0; i < g_dump_context.count && i < 64; ++i) {
         const auto& b = g_dump_context.list[i];
-        LOG_ERROR(Render_Vulkan, "L2 entry {}: stage {} kind {} slot {} offset {:#x} dwords {} table_sgpr {} entry_dwords {} id {:#x} words {:08x} {:08x} {:08x} {:08x}", i, b.stage, b.kind, b.slot, b.offset, b.dwords, b.table_sgpr,
+        TLG_LOG(RASTER, Error, "L2 entry {}: stage {} kind {} slot {} offset {:#x} dwords {} table_sgpr {} entry_dwords {} id {:#x} words {:08x} {:08x} {:08x} {:08x}", i, b.stage, b.kind, b.slot, b.offset, b.dwords, b.table_sgpr,
                   b.entry_dwords, b.id, b.words[0], b.words[1], b.words[2], b.words[3]);
     }
 }

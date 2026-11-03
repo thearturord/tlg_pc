@@ -26,6 +26,7 @@
 #endif
 #include "common/logging/log.h"
 #include "native/native_draw.h"
+#include "native/native_log.h"
 #include "native/native_config.h"
 #include "native/native_registry.h"
 #include "native/native_resources.h"
@@ -710,7 +711,7 @@ void NoteImageCensus(VAddr address, u32 width, u32 height, bool render_target, b
                         u64 tag = 0, mem = 0, size = 0, kind = 0, d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0;
                         SafeRead64(object + 0x18, &tag), SafeRead64(object + 0x30, &mem), SafeRead64(object + 0x38, &size), SafeRead64(object + 0x120, &kind);
                         SafeRead64(object + 0x180, &d0), SafeRead64(object + 0x188, &d1), SafeRead64(object + 0x190, &d2), SafeRead64(object + 0x198, &d3), SafeRead64(object + 0x1a0, &d4);
-                        LOG_WARNING(Core, "B1 census: texture object {:#x} id {} tag {:#x} mem {:#x} size {:#x} kind {:#x} desc {:016x} {:016x} {:016x} {:016x} {:016x}", object, id, tag & 0xffffffff, mem, size,
+                        TLG_LOG(IMAGE, Warn, "B1 census: texture object {:#x} id {} tag {:#x} mem {:#x} size {:#x} kind {:#x} desc {:016x} {:016x} {:016x} {:016x} {:016x}", object, id, tag & 0xffffffff, mem, size,
                                     kind, d0, d1, d2, d3, d4);
                     }
                     later.push_back(object);
@@ -743,13 +744,13 @@ void NoteImageCensus(VAddr address, u32 width, u32 height, bool render_target, b
         static std::unordered_map<u64, u64> seen;
         std::lock_guard lock{samples_mutex};
         if (++seen[address] == 1 && seen.size() <= 24) {
-            LOG_WARNING(Core, "B1 census: image {}x{} at {:#x} has no engine resource: {}", width, height, address, DescribeAddress(address));
+            TLG_LOG(IMAGE, Warn, "B1 census: image {}x{} at {:#x} has no engine resource: {}", width, height, address, DescribeAddress(address));
         }
         if (seen.size() == 24 || (seen.size() % 1000) == 0) {
             static u64 logged_size = 0;
             if (seen.size() != logged_size) {
                 logged_size = seen.size();
-                LOG_WARNING(Core, "B1 census: {} distinct addresses without an engine resource so far", seen.size());
+                TLG_LOG(IMAGE, Warn, "B1 census: {} distinct addresses without an engine resource so far", seen.size());
             }
         }
     }
@@ -987,7 +988,7 @@ bool ImmutableCheck(ImmutableBuffer& buffer) {
         return false;
     }
     if (immutable_stale.fetch_add(1, std::memory_order_relaxed) < 10) {
-        LOG_ERROR(Core, "immutable engine buffer {:#x} + {:#x} changed without a write fault", buffer.begin,
+        TLG_LOG(IMAGE, Error, "immutable engine buffer {:#x} + {:#x} changed without a write fault", buffer.begin,
                   buffer.end - buffer.begin);
     }
     buffer.synced.store(false, std::memory_order_release);

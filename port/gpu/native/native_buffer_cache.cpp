@@ -14,6 +14,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "native/native_device.h"
+#include "native/native_log.h"
 #include "native/native_readbacks.h"
 #include "native/native_registry.h"
 #include "native/native_updates.h"
@@ -157,7 +158,7 @@ void BufferCache::VerifyObjectCopy(const Core::NativeResources::ImmutableBuffer&
     const u64 whole = object.end - object.begin;
     if (std::memcmp(stream_buffer.mapped_data.data() + object.copy_offset, reinterpret_cast<const void*>(object.begin), whole) != 0) {
         if (object_copy_stale.fetch_add(1, std::memory_order_relaxed) < 12) {
-            LOG_ERROR(Render, "R1b: the copy of engine buffer {:#x}+{:#x} (usage {}) differs from guest memory at generation {}", object.begin, whole, object.usage,
+            TLG_LOG(BUFFER, Error, "R1b: the copy of engine buffer {:#x}+{:#x} (usage {}) differs from guest memory at generation {}", object.begin, whole, object.usage,
                       object.copy_generation);
         }
     }
@@ -218,7 +219,7 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
     if (zero_copy && (!buffer->is_device_local || buffer->mapped_data.empty())) {
         static std::atomic<bool> logged{false};
         if (!logged.exchange(true)) {
-            LOG_WARNING(Render_Vulkan, "zero copy: no device local memory the CPU can write (resizable BAR off?): engine buffers stay device local");
+            TLG_LOG(BUFFER, Warn, "zero copy: no device local memory the CPU can write (resizable BAR off?): engine buffers stay device local");
         }
         zero_copy_unavailable.store(true, std::memory_order_relaxed);
         buffer = std::make_unique<Buffer>(instance, base, end - base + PlacedSlack, MemoryType::DeviceLocal,
@@ -267,7 +268,7 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
         Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4GpuBytesLost, lost);
         static std::atomic<u32> logged{0};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 24) {
-            LOG_WARNING(Render_Vulkan, "E4: placing {:#x}+{:#x} ({} ids, first {:#x}): {} GPU written bytes no placed buffer holds, first {:#x} ({})", begin, end - begin, ids.size(), ids.front(), lost,
+            TLG_LOG(BUFFER, Warn, "E4: placing {:#x}+{:#x} ({} ids, first {:#x}): {} GPU written bytes no placed buffer holds, first {:#x} ({})", begin, end - begin, ids.size(), ids.front(), lost,
                         gpu_pieces[0].first, Core::NativeDevice::OwnerName(gpu_pieces[0].first));
         }
     }
@@ -508,7 +509,7 @@ void BufferCache::ZeroCopyVerifyPoll() {
                 zero_copy_counts[6].fetch_add(1, std::memory_order_relaxed);
                 static std::atomic<u32> logged{0};
                 if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                    LOG_WARNING(Render_Vulkan, "zero copy verify: buffer {:#x}+{:#x} ({} bytes) changed after its direct write with no GPU write planned", it->buffer->cpu_addr,
+                    TLG_LOG(BUFFER, Warn, "zero copy verify: buffer {:#x}+{:#x} ({} bytes) changed after its direct write with no GPU write planned", it->buffer->cpu_addr,
                                 it->offset, it->bytes.size());
                 }
             }

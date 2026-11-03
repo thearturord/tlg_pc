@@ -10,6 +10,7 @@
 
 #include "common/logging/log.h"
 #include "native/native_timeline.h"
+#include "native/native_log.h"
 #include "native/native_stream_submit.h"
 #include "native/native_readback_policy.h"
 
@@ -133,7 +134,7 @@ u32 Consumed(const u32* base, u32 dwords) {
         while (first < published_dwords && base[first] == published_copy[first]) {
             ++first;
         }
-        LOG_ERROR(Core, "streaming: the command buffer changed after it was handed over (first difference at dword {} of {}: {:#x} -> {:#x})", first,
+        TLG_LOG(CP, Error, "streaming: the command buffer changed after it was handed over (first difference at dword {} of {}: {:#x} -> {:#x})", first,
                   published_dwords, published_copy[first], base[first]);
         NoteViolation("the command buffer changed after it was handed over");
     }
@@ -164,7 +165,7 @@ void RealSubmitQueued() {
 void NoteViolation(const char* what) {
     ++stat_violations;
     last_violation = what;
-    LOG_ERROR(Core, "streaming switched off: {}", what);
+    TLG_LOG(CP, Error, "streaming switched off: {}", what);
     VideoCore::ReadbackPolicy::Get().stream_submit = 0;
 }
 

@@ -22,6 +22,7 @@
 #include <nlohmann/json.hpp>
 #include "common/logging/log.h"
 #include "native/native_drain_audit.h"
+#include "native/native_log.h"
 
 namespace Core::DrainAudit {
 
@@ -415,7 +416,7 @@ void NotePlanVerify(u32 site, bool same) {
     if (!same) {
         s.plan_differs[std::min<u32>(site, 3)].fetch_add(1, std::memory_order_relaxed);
         if (s.logged.fetch_add(1) < 20) {
-            LOG_ERROR(Render, "lazy drain: the plan made without waiting differs from the plan made after the full wait (site {})", site);
+            TLG_LOG(GATE, Error, "lazy drain: the plan made without waiting differs from the plan made after the full wait (site {})", site);
         }
     }
 }
@@ -470,10 +471,10 @@ void LookupDone() {
                 }
                 if (s.logged.fetch_add(1) < 20) {
                     if (nearest != nullptr) {
-                        LOG_ERROR(Render, "lazy drain: {} copied from {:#x} ({} bytes) changed after the full wait; {} writes were unfinished, the nearest (liverpool.cpp:{}, {:#x}, {} bytes) is {} bytes away",
+                        TLG_LOG(GATE, Error, "lazy drain: {} copied from {:#x} ({} bytes) changed after the full wait; {} writes were unfinished, the nearest (liverpool.cpp:{}, {:#x}, {} bytes) is {} bytes away",
                                   kind_names[note.kind], note.address, note.bytes, unfinished.size(), nearest->line, nearest->address, nearest->bytes, nearest_gap);
                     } else {
-                        LOG_ERROR(Render, "lazy drain: {} copied from {:#x} ({} bytes) changed after the full wait; no write was unfinished (changed by something else)", kind_names[note.kind], note.address, note.bytes);
+                        TLG_LOG(GATE, Error, "lazy drain: {} copied from {:#x} ({} bytes) changed after the full wait; no write was unfinished (changed by something else)", kind_names[note.kind], note.address, note.bytes);
                     }
                 }
             }

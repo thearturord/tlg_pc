@@ -11,6 +11,7 @@
 
 #include "common/logging/log.h"
 #include "native/native_draw.h"
+#include "native/native_log.h"
 #include "native/native_tsharp_watch.h"
 
 #ifdef _WIN32
@@ -74,7 +75,7 @@ LONG CALLBACK Handler(EXCEPTION_POINTERS* info) {
                     ++found;
                 }
             }
-            LOG_ERROR(Core, "{}", text);
+            TLG_LOG(IMAGE, Error, "{}", text);
         }
     }
     ctx->Dr6 = 0;
@@ -156,7 +157,7 @@ void Arm(u64 view_object, u64 address, u32 width, u32 height) {
     w.last.store(value);
     w.address.store(address);
     SetDebugRegisters(slot, address);
-    LOG_ERROR(Core, "tsharp watch {} armed: view {:#x} dword at {:#x} = {:#x} (height {})", slot, view_object, address, value, ((value >> 14) & 0x3fff) + 1);
+    TLG_LOG(IMAGE, Error, "tsharp watch {} armed: view {:#x} dword at {:#x} = {:#x} (height {})", slot, view_object, address, value, ((value >> 14) & 0x3fff) + 1);
 }
 
 #else

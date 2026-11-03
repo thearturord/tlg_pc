@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "native/native_marker.h"
+#include "native/native_log.h"
 
 #include <algorithm>
 #include <atomic>
@@ -232,7 +233,7 @@ std::string WriteMarker(u32 mode) {
             }
         }
     }
-    note += fmt::format("flight events written: {}, draw table rows: {}\n", Flight::EventsWritten(), head.load());
+    note += fmt::format("flight events written: {}, draw table rows: {}, native.log lines: {} (rate limit dropped {})\n", Flight::EventsWritten(), head.load(), Log::Written(), Log::Suppressed());
     note += "TLG_ environment (switches that were set for this run):\n" + SwitchesNotAtDefault();
     note += "\nWhat was seen (write one line here):\n";
     WriteText(dir / "note.txt", note);
@@ -263,7 +264,7 @@ void WriterMain(std::stop_token stop) {
                 hooks.toast(job.mode == 1 ? 7 : 8);
             }
         } catch (const std::exception& e) {
-            LOG_ERROR(Render, "glitch marker failed: {}", e.what());
+            TLG_LOG(RUNTIME, Error, "glitch marker failed: {}", e.what());
             folder = std::string{"failed: "} + e.what();
         }
         if (job.done) {

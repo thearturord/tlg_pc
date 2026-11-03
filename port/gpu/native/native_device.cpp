@@ -13,6 +13,7 @@
 
 #include "common/logging/log.h"
 #include "native/native_hooks.h"
+#include "native/native_log.h"
 #include "native/native_image_desc.h"
 #include "native/native_device.h"
 #include "native/native_resources.h"
@@ -436,7 +437,7 @@ void CheckImage(u64 id, VAddr address, u32 width, u32 height) {
     const u32 result = object.address != address ? 2u : (object.width == width && object.height == height) ? 0u : 1u;
     image_checks[result].fetch_add(1, std::memory_order_relaxed);
     if (result == 2 && mismatches_logged.fetch_add(1, std::memory_order_relaxed) < 12) {
-        LOG_WARNING(Core, "B1 native device: binding of {} id {} names memory {:#x} {}x{}, the texture cache bound {:#x} {}x{}", KindName(object.kind), id, object.address,
+        TLG_LOG(GPU, Warn, "B1 native device: binding of {} id {} names memory {:#x} {}x{}, the texture cache bound {:#x} {}x{}", KindName(object.kind), id, object.address,
                     object.width, object.height, address, width, height);
     }
 }
@@ -545,7 +546,7 @@ void CheckImageSharp(u64 id, u64 view_id, const SharpFacts& f) {
     static std::atomic<u32> logged_by[3]{};
     const u32 bad = keys[0][6] == 'D' ? 0u : keys[1][6] == 'L' ? 1u : keys[6][13] == 'O' ? 2u : 3u;
     if (bad < 3 && logged_by[bad].fetch_add(1, std::memory_order_relaxed) < 6) {
-        LOG_WARNING(Core, "E2 census: {} id {}: T# {}x{} levels {}+{} layers {}+{} depth {} type {}, resource {}x{} mips {} layers {} depth {}", KindName(res.kind), id, t_width, t_height, f.base_level, t_levels,
+        TLG_LOG(GPU, Warn, "E2 census: {} id {}: T# {}x{} levels {}+{} layers {}+{} depth {} type {}, resource {}x{} mips {} layers {} depth {}", KindName(res.kind), id, t_width, t_height, f.base_level, t_levels,
                     f.base_array, t_layers, f.depth + 1, f.type, res.width, res.height, res.mips, res.layers, res.depth);
     }
 }
@@ -622,7 +623,7 @@ void CheckBuffer(u64 id, VAddr address, u64 size) {
         const bool ring = Core::NativeResources::FrameRing(&ring_base, &ring_size) && address >= ring_base && address < ring_base + ring_size;
         outside_by[ring ? 0 : 1][std::min<u32>(object.usage, 3)].fetch_add(1, std::memory_order_relaxed);
         if (!ring && outside_logged.fetch_add(1, std::memory_order_relaxed) < 12) {
-            LOG_WARNING(Core, "B1 native device: buffer binding of {} id {} (usage {}, bind {:#x}, memory {:#x}+{:#x}) reads {:#x}+{:#x}", KindName(object.kind), id, object.usage, object.bind,
+            TLG_LOG(GPU, Warn, "B1 native device: buffer binding of {} id {} (usage {}, bind {:#x}, memory {:#x}+{:#x}) reads {:#x}+{:#x}", KindName(object.kind), id, object.usage, object.bind,
                         object.address, object.bytes, address, size);
         }
     }
@@ -645,7 +646,7 @@ void CheckTarget(bool depth, VAddr address, u32 width, u32 height) {
     }
     target_checks[depth ? 1 : 0][result].fetch_add(1, std::memory_order_relaxed);
     if (result >= 3 && targets_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-        LOG_WARNING(Core, "B4 census: {} target {:#x} {}x{} has no engine texture ({})", depth ? "depth" : "color", address, width, height, OwnerName(address));
+        TLG_LOG(GPU, Warn, "B4 census: {} target {:#x} {}x{} has no engine texture ({})", depth ? "depth" : "color", address, width, height, OwnerName(address));
     }
 }
 
@@ -775,7 +776,7 @@ u64 PS4_SYSV_ABI ClearRtvEnter(Core::GuestHooks::MidContext* c) {
         }
     }
     if (clear_logged.fetch_add(1, std::memory_order_relaxed) < 16 && c->rdx != 0) {
-        LOG_WARNING(Core, "B11: ClearRenderTargetView rtv id {} resource id {} memory {:#x} surface {:#x} color {} {} {} {}", Rd<u64>(c->rsi, 0x10),
+        TLG_LOG(GPU, Warn, "B11: ClearRenderTargetView rtv id {} resource id {} memory {:#x} surface {:#x} color {} {} {} {}", Rd<u64>(c->rsi, 0x10),
                     resource != 0 ? Rd<u64>(resource, 0x10) : 0, resource != 0 ? Rd<u64>(resource, 0x30) : 0, resource != 0 ? Rd<u64>(resource, 0x58) : 0,
                     Rd<float>(c->rdx, 0), Rd<float>(c->rdx, 4), Rd<float>(c->rdx, 8), Rd<float>(c->rdx, 12));
     }
@@ -818,7 +819,7 @@ u64 PS4_SYSV_ABI ClearDsvEnter(Core::GuestHooks::MidContext* c) {
     float depth;
     std::memcpy(&depth, c->ymm[0], sizeof(depth));
     if (clear_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-        LOG_WARNING(Core, "B11: ClearDepthStencilView dsv id {} resource id {} memory {:#x} surface {:#x} flags {} depth {} stencil {}", Rd<u64>(c->rsi, 0x10),
+        TLG_LOG(GPU, Warn, "B11: ClearDepthStencilView dsv id {} resource id {} memory {:#x} surface {:#x} flags {} depth {} stencil {}", Rd<u64>(c->rsi, 0x10),
                     resource != 0 ? Rd<u64>(resource, 0x10) : 0, resource != 0 ? Rd<u64>(resource, 0x30) : 0, resource != 0 ? Rd<u64>(resource, 0x48) : 0, flags, depth,
                     static_cast<u32>(c->rcx & 0xff));
     }

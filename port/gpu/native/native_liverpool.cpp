@@ -4,6 +4,7 @@
 #include <boost/preprocessor/stringize.hpp>
 
 #include "native/native_flight.h"
+#include "native/native_log.h"
 #include "native/native_raycast_cpu.h"
 #include "native/native_config.h"
 #include "native/native_stream_probe.h"
@@ -204,7 +205,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     Core::NativeDraw::ExecDraw draw;
     if (!rasterizer || !Core::NativeDraw::TakeExecDraw(native_tag_pending.seq, draw, true)) {
         native_tag_pending.valid = false;
-        LOG_ERROR(Render, "native draw: the record {} is gone, a draw is lost", native_tag_pending.seq);
+        TLG_LOG(CP, Error, "native draw: the record {} is gone, a draw is lost", native_tag_pending.seq);
         return;
     }
     if (draw.kind == 10) {

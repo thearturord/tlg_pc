@@ -37,6 +37,7 @@
 #include <nlohmann/json.hpp>
 #include "common/logging/log.h"
 #include "native/native_draw.h"
+#include "native/native_log.h"
 #include "native/native_zpass_gen.h"
 #include "native/native_job_gen.h"
 #include "native/native_site_gen.h"
@@ -1110,7 +1111,7 @@ void NoteMismatch(State& s, u32 view, const std::string& kind, const std::string
     ++s.mismatch_kinds[kind];
     if (s.samples.size() < 24) {
         s.samples.push_back(fmt::format("view type {}: {}: {}", view, kind, detail));
-        LOG_ERROR(Render, "cascade generator verify: view type {}: {}: {}", view, kind, detail);
+        TLG_LOG(GEN, Error, "cascade generator verify: view type {}: {}: {}", view, kind, detail);
     }
 }
 
@@ -3788,7 +3789,7 @@ void ScanWet(WetScanArgs& a) {
     } else {
         static std::atomic<u32> logged{0};
         if (logged.fetch_add(1) < 3) {
-            LOG_WARNING(Render, "wet: context {:#x} (vtable {:#x}), graphics {:#x} (vtable {:#x}), async {:#x}", p.ctx, vtable, graphics, graphics != 0 ? R<u64>(graphics) : 0, asc);
+            TLG_LOG(GEN, Warn, "wet: context {:#x} (vtable {:#x}), graphics {:#x} (vtable {:#x}), async {:#x}", p.ctx, vtable, graphics, graphics != 0 ? R<u64>(graphics) : 0, asc);
         }
         p.Decline("a device context the generator does not know");
         return;
@@ -5150,7 +5151,7 @@ bool HandlePass(u64 render_device, u64 desc, u64 original_loop) {
         } else {
             ++stats->verify_mismatched;
             stats->disabled = true;
-            LOG_ERROR(Render, "cascade generator: view type {} switched off, {} differences against the engine's loop", v.view, v.mismatches);
+            TLG_LOG(GEN, Error, "cascade generator: view type {} switched off, {} differences against the engine's loop", v.view, v.mismatches);
         }
         v.shadow = Target{};
         v.claimed.store(false);
@@ -5281,7 +5282,7 @@ bool HandleGBuffer(u64 render_device, u64 mode, u64 list, u64 args, u64 flags, u
         } else {
             ++gs.v.verify_mismatched;
             gs.v.disabled = true;
-            LOG_ERROR(Render, "G-buffer generator switched off, {} differences against the engine's loop", v.mismatches);
+            TLG_LOG(GEN, Error, "G-buffer generator switched off, {} differences against the engine's loop", v.mismatches);
         }
         v.shadow = Target{};
         v.lo = ZPassBegin;
@@ -5396,7 +5397,7 @@ bool HandleForward(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 or
         } else {
             ++fs.v.verify_mismatched;
             fs.v.disabled = true;
-            LOG_ERROR(Render, "forward generator switched off, {} differences against the engine's loop", v.mismatches);
+            TLG_LOG(GEN, Error, "forward generator switched off, {} differences against the engine's loop", v.mismatches);
         }
         v.shadow = Target{};
         v.lo = ZPassBegin;
@@ -5522,7 +5523,7 @@ bool HandleDecal(u64 render_device, u64 view, u64 a3, u64 a4, u64 desc, u32 flag
         } else {
             ++ds.v.verify_mismatched;
             ds.v.disabled = true;
-            LOG_ERROR(Render, "decal generator switched off, {} differences against the engine's loop", v.mismatches);
+            TLG_LOG(GEN, Error, "decal generator switched off, {} differences against the engine's loop", v.mismatches);
         }
         v.shadow = Target{};
         v.lo = ZPassBegin;
@@ -5632,7 +5633,7 @@ bool HandleSkin(u64 system, u64 scene, u64 async_flag, u64 original_loop) {
         } else {
             ++ss.v.verify_mismatched;
             ss.v.disabled = true;
-            LOG_ERROR(Render, "skinning generator switched off, {} differences against the engine's loop", v.mismatches);
+            TLG_LOG(GEN, Error, "skinning generator switched off, {} differences against the engine's loop", v.mismatches);
         }
         v.shadow = Target{};
         v.lo = ZPassBegin;
@@ -5746,7 +5747,7 @@ bool HandleWet(u64 system, u64 ctx, u64 scene, u64 original_loop) {
         } else {
             ++ws.v.verify_mismatched;
             ws.v.disabled = true;
-            LOG_ERROR(Render, "wet generator switched off, {} differences against the engine's loop", v.mismatches);
+            TLG_LOG(GEN, Error, "wet generator switched off, {} differences against the engine's loop", v.mismatches);
         }
         v.shadow = Target{};
         v.lo = ZPassBegin;
@@ -5855,7 +5856,7 @@ bool HandleInst(u64 holder, u64 scene, u64 original_loop) {
         } else {
             ++is.v.verify_mismatched;
             is.v.disabled = true;
-            LOG_ERROR(Render, "instance generator switched off, {} differences against the engine's loop", v.mismatches);
+            TLG_LOG(GEN, Error, "instance generator switched off, {} differences against the engine's loop", v.mismatches);
         }
         v.shadow = Target{};
         v.lo = ZPassBegin;

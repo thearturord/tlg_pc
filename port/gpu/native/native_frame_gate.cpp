@@ -14,6 +14,7 @@
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
 #include "native/native_debug_server.h"
+#include "native/native_log.h"
 #include "native/native_draw.h"
 #include "native/native_frame_gate.h"
 #include "native/native_flight.h"
@@ -65,7 +66,7 @@ Config LoadConfig() {
             presenter_waits = config.value("presenter_waits_own_frame", -1);
             source = "json";
         } catch (const std::exception& e) {
-            LOG_ERROR(Core, "frame gate: cannot read {}: {}", path.string(), e.what());
+            TLG_LOG(GATE, Error, "frame gate: cannot read {}: {}", path.string(), e.what());
         }
     }
     if (const char* env = std::getenv("TLG_FRAMES_IN_FLIGHT"); env && env[0]) {

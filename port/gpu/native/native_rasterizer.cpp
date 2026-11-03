@@ -10,6 +10,7 @@
 #endif
 #include "common/debug.h"
 #include "native/native_debug_server.h"
+#include "native/native_log.h"
 #include "native/native_e3_census.h"
 #include "native/native_config.h"
 #include "video_core/renderer_vulkan/vk_identity_audit.h"
@@ -614,7 +615,7 @@ Core::NativeResources::ImmutableBuffer* Rasterizer::GeometryHandle(VAddr address
                     if (lookup == nullptr) {
                         static std::atomic<u32> logged{0};
                         if (logged.fetch_add(1) < 12) {
-                            LOG_ERROR(Render_Vulkan, "N6.2 geometry handle differs: request {:#x}+{:#x}; handle {:#x}..{:#x}; the lookup finds none", address, size, handle->begin, handle->end);
+                            TLG_LOG(RASTER, Error, "N6.2 geometry handle differs: request {:#x}+{:#x}; handle {:#x}..{:#x}; the lookup finds none", address, size, handle->begin, handle->end);
                         }
                     }
                     return lookup;
@@ -947,14 +948,14 @@ void Rasterizer::NoteIndexedRow(u32 slot) {
     if (indexed_row_size < indexed_row.size()) {
         indexed_row[indexed_row_size++] = slot;
     } else {
-        LOG_ERROR(Render_Vulkan, "indexed data: the row of a draw is longer than {} entries", indexed_row.size());
+        TLG_LOG(RASTER, Error, "indexed data: the row of a draw is longer than {} entries", indexed_row.size());
     }
 }
 
 void Rasterizer::NoteIndexedFlat(const Shader::Info& stage) {
     const u32 count = stage.srt_info.flattened_bufsize_dw;
     if (indexed_row_size + count > indexed_row.size()) {
-        LOG_ERROR(Render_Vulkan, "indexed data: the row of a draw is longer than {} entries (flat user data of {} dwords)", indexed_row.size(), count);
+        TLG_LOG(RASTER, Error, "indexed data: the row of a draw is longer than {} entries (flat user data of {} dwords)", indexed_row.size(), count);
         return;
     }
     const u32 have = std::min<u32>(count, static_cast<u32>(stage.flattened_ud_buf.size()));
@@ -981,7 +982,7 @@ void Rasterizer::NoteIndexedImage(const vk::DescriptorImageInfo& info, u32 image
         const bool same = info.imageView ? (known && view_of == info.imageView && layout_of == info.imageLayout) : slot == 0;
         if (!same) {
             indexed->stats.verify_differences.fetch_add(1, std::memory_order_relaxed);
-            LOG_ERROR(Render_Vulkan, "indexed data: image slot {} (key {}) does not stand for the view {:#x} layout {} of the legacy binder", slot, image_key,
+            TLG_LOG(RASTER, Error, "indexed data: image slot {} (key {}) does not stand for the view {:#x} layout {} of the legacy binder", slot, image_key,
                       reinterpret_cast<u64>(static_cast<VkImageView>(info.imageView)), static_cast<u32>(info.imageLayout));
         }
     }
@@ -1007,7 +1008,7 @@ void Rasterizer::NoteIndexedRun(const vk::DescriptorImageInfo* infos, u32 count,
         }
         if (!same) {
             indexed->stats.verify_differences.fetch_add(1, std::memory_order_relaxed);
-            LOG_ERROR(Render_Vulkan, "indexed data: the run at slot {} (key {}, {} levels) does not stand for the views of the legacy binder", base, image_key, count);
+            TLG_LOG(RASTER, Error, "indexed data: the run at slot {} (key {}, {} levels) does not stand for the views of the legacy binder", base, image_key, count);
         }
     }
 }
@@ -1023,7 +1024,7 @@ void Rasterizer::NoteIndexedSampler(vk::Sampler sampler) {
         const bool same = indexed->SamplerOf(slot, sampler_of) && sampler_of == sampler;
         if (!same) {
             indexed->stats.verify_differences.fetch_add(1, std::memory_order_relaxed);
-            LOG_ERROR(Render_Vulkan, "indexed data: sampler slot {} does not stand for the sampler {:#x} of the legacy binder", slot,
+            TLG_LOG(RASTER, Error, "indexed data: sampler slot {} does not stand for the sampler {:#x} of the legacy binder", slot,
                       reinterpret_cast<u64>(static_cast<VkSampler>(sampler)));
         }
     }
@@ -1255,7 +1256,7 @@ void Rasterizer::FrontGeometryRing(DrawPlan& plan, u64 done, bool indexed, u32 i
                     Core::NativeUploads::NoteGeometry(12);
                     static std::atomic<u32> logged{0};
                     if (logged.fetch_add(1) < 6) {
-                        LOG_ERROR(Core, "geometry ring: attribute reads its table pointer from user data register {} but the vertex stage has {} (attributes {})", attrib.sgpr_base,
+                        TLG_LOG(RASTER, Error, "geometry ring: attribute reads its table pointer from user data register {} but the vertex stage has {} (attributes {})", attrib.sgpr_base,
                                  vertex->user_data_count, fetch_shader.attributes.size());
                     }
                     return;
@@ -1269,7 +1270,7 @@ void Rasterizer::FrontGeometryRing(DrawPlan& plan, u64 done, bool indexed, u32 i
                     Core::NativeUploads::NoteGeometry(12);
                     static std::atomic<u32> logged_pointer{0};
                     if (logged_pointer.fetch_add(1) < 6) {
-                        LOG_ERROR(Core, "geometry ring: the vertex table pointer {:#x} (register {}, dword offset {}) is no mapping", pointer, attrib.sgpr_base, attrib.dword_offset);
+                        TLG_LOG(RASTER, Error, "geometry ring: the vertex table pointer {:#x} (register {}, dword offset {}) is no mapping", pointer, attrib.sgpr_base, attrib.dword_offset);
                     }
                     return;
                 }

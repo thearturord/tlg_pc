@@ -19,6 +19,7 @@
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
 #include "native/native_debug_server.h"
+#include "native/native_log.h"
 #include "native/native_config.h"
 #include "native/native_stream_probe.h"
 #include "native/native_flight.h"
@@ -699,6 +700,15 @@ void RegisterBuiltins() {
                  const u64 mode = ParseNumber(params, "mode", 1);
                  return nlohmann::json{{"folder", Core::Marker::RequestForTest(mode == 2 ? 2 : 1)}, {"markers_written", Core::Marker::Written()}};
              });
+    Register("/log_test", "(L4) ?count=100 writes that many warnings from one call site: the rate limit (10 per second per site) cuts them; answers with the counts",
+             [](const Params& params) {
+                 const u64 count = ParseNumber(params, "count", 100);
+                 const u64 written_before = Core::Log::Written(), suppressed_before = Core::Log::Suppressed();
+                 for (u64 i = 0; i < count; ++i) {
+                     TLG_LOG(RUNTIME, Warn, "log test message {} of {}", i, count);
+                 }
+                 return nlohmann::json{{"sent", count}, {"written", Core::Log::Written() - written_before}, {"suppressed", Core::Log::Suppressed() - suppressed_before}};
+             });
     Register("/frames", "?n=600: the last n frame intervals (time stamp and length in ms)", Frames);
     Register("/timeline_capture", "?seconds=10&tag=name: records every frame timeline event for that long into log/timeline_<tag>.bin (+ .json); without arguments: the state", TimelineCapture);
     Register("/periodic", "last runs of periodic jobs (when they ended, how long they took)",
@@ -860,7 +870,7 @@ void Start(u16 port) {
         }
     });
     if (!server->bind_to_port("127.0.0.1", port)) {
-        LOG_ERROR(Core, "debug server: cannot listen on 127.0.0.1:{}", port);
+        TLG_LOG(RUNTIME, Error, "debug server: cannot listen on 127.0.0.1:{}", port);
         server.reset();
         return;
     }
@@ -952,7 +962,7 @@ void Note(const std::string& kind, const std::string& detail) {
         std::ofstream file{Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "rare_events.txt", std::ios::app | std::ios::binary};
         file << line;
     }
-    LOG_ERROR(Core, "rare event {} (#{}), saved in user/log/rare_events.txt: {}", kind, n, detail);
+    TLG_LOG(RUNTIME, Error, "rare event {} (#{}), saved in user/log/rare_events.txt: {}", kind, n, detail);
     if (n == 1) {
         DebugServer::snapshot_now.store(true);
     }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "native/native_target_desc.h"
+#include "native/native_log.h"
 
 #include <algorithm>
 #include <array>
@@ -336,7 +337,7 @@ void NoteExample(const std::string& text) {
     if (logged.fetch_add(1, std::memory_order_relaxed) >= 16) {
         return;
     }
-    LOG_WARNING(Core, "E7 target description differs from the console words: {}", text);
+    TLG_LOG(IMAGE, Warn, "E7 target description differs from the console words: {}", text);
     Core::RareEvents::Note("target_desc_differs", text);
     std::scoped_lock lock{g_mutex};
     g_examples.push_back(text);
