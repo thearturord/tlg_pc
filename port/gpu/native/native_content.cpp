@@ -97,6 +97,12 @@ u64 g_class_uploads[3][ClassCount]{};
 u64 g_class_bytes[3][ClassCount]{};
 u64 g_class_differing_bytes[3]{};
 u64 g_class_hole_bytes[3]{};
+/// F2 census: ranges the store dropped for its cap (tombstones: begin to end, bytes not kept). A hole in an upload that lies in tombstones was announced once and evicted; a hole nobody ever
+/// announced has no tombstone.
+std::multimap<u64, u64> g_tomb;
+u64 g_tomb_max = 0;
+constexpr size_t MaxTombs = 4u << 20;
+u64 g_hole_nonzero_evicted = 0, g_hole_nonzero_never = 0, g_hole_nonzero_mixed = 0, g_hole_uploads_all_evicted = 0, g_hole_uploads_with_never = 0;
 u64 g_gpu_covered_bytes = 0, g_gpu_total_bytes = 0, g_gpu_uploads = 0, g_gpu_fully_covered = 0, g_gpu_unreadable = 0;
 u64 g_unreadable = 0;
 u64 g_differs_by_writer[16]{};
@@ -250,6 +256,10 @@ void InsertLocked(u64 begin, Entry&& entry) {
         for (auto it = range.first; it != range.second; ++it) {
             if (it->second.seq == seq) {
                 g_stored_bytes -= it->second.writer == WriterCopy ? 0 : it->second.size;
+                if (g_tomb.size() < MaxTombs) {
+                    g_tomb.emplace(b, b + it->second.size);
+                    g_tomb_max = std::max(g_tomb_max, it->second.size);
+                }
                 c_evicted.fetch_add(1, std::memory_order_relaxed);
                 c_evicted_bytes.fetch_add(it->second.size, std::memory_order_relaxed);
                 g_entries.erase(it);
@@ -900,6 +910,7 @@ void CompareImage(const ImageUpload& upload) {
         }
     }
     u64 hole = 0;
+    bool hole_never = false;
     for (const auto& [s, t] : uncovered) {
         u64 nonzero = 0;
         if (!GuardedNonZero(reinterpret_cast<const void*>(s), t - s, nonzero)) {
@@ -907,6 +918,29 @@ void CompareImage(const ImageUpload& upload) {
             continue;
         }
         hole += nonzero;
+        if (nonzero != 0) {
+            // how much of this segment lies in dropped (evicted) ranges
+            u64 evicted = 0, at = s;
+            for (auto it = g_tomb.lower_bound(s > g_tomb_max ? s - g_tomb_max : 0); it != g_tomb.end() && it->first < t; ++it) {
+                const u64 x = std::max(at, it->first), y = std::min(t, it->second);
+                if (x < y) {
+                    evicted += y - x;
+                    at = y;
+                }
+            }
+            if (evicted >= t - s) {
+                g_hole_nonzero_evicted += nonzero;
+            } else if (evicted == 0) {
+                g_hole_nonzero_never += nonzero;
+                hole_never = true;
+            } else {
+                g_hole_nonzero_mixed += nonzero;
+                hole_never = true;
+            }
+        }
+    }
+    if (hole != 0) {
+        (hole_never ? g_hole_uploads_with_never : g_hole_uploads_all_evicted) += 1;
     }
     if (unreadable) {
         ++g_unreadable;
@@ -1125,6 +1159,8 @@ nlohmann::json Report() {
         }
         one["differing_bytes"] = g_class_differing_bytes[g];
         one["uncovered_nonzero_bytes"] = g_class_hole_bytes[g];
+        one["hole_nonzero_bytes_total_by_cause"] = {{"announced_then_evicted_for_the_cap", g_hole_nonzero_evicted}, {"never_announced", g_hole_nonzero_never}, {"partly_evicted_partly_never", g_hole_nonzero_mixed},
+                                                    {"hole_uploads_every_segment_evicted", g_hole_uploads_all_evicted}, {"hole_uploads_with_a_never_announced_part", g_hole_uploads_with_never}};
         uploads[GroupName(static_cast<Group>(g))] = std::move(one);
     }
     uploads["gpu_source"] = {{"uploads", g_gpu_uploads}, {"image_bytes", g_gpu_total_bytes}, {"bytes_the_store_knows", g_gpu_covered_bytes}, {"fully_known", g_gpu_fully_covered}};
