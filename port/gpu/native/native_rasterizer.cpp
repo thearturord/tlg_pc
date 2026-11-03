@@ -401,6 +401,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
     const bool skip_flat = (binder_mode == 1 || binder_mode == 2) && draw.bindings_complete && (binder_mode == 2 || draw_class == 0);
     if ((binder_mode == 1 || binder_mode == 2) && !draw.bindings_complete) {
         Core::NativeRegistry::NoteBinderReason(draw_class, 2, draw.bindings_overflow ? 10 : 1); // the whole draw keeps the flat user data: its binding list is not complete
+        NoteFlatRead(10, draw_class, draw.bindings_overflow ? 1 : 0, 0, Core::NativeDraw::RecordCallerGhidra(draw.seq), 0, draw.binding_count); // census: which call site
     }
     if (!pipeline_cache.PlanGraphicsTyped(exec_key, plan->fixed, vertex_user_data, pixel_user_data, *plan, skip_flat ? &draw : nullptr, draw_class)) {
         Core::NativeDraw::Live().plan_null[2].fetch_add(1, std::memory_order_relaxed);

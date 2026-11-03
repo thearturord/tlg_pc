@@ -1122,6 +1122,7 @@ struct NativeRecord {
     std::array<RecordBinding, MaxRecordBindings> bindings{};
     u32 binding_count{};
     bool bindings_overflow{};
+    bool no_inputs{}; ///< F5: the shaders of a graphics draw list no inputs at all, so its empty binding list is complete
     u64 bindings_for{};
     u64 fill_destination{}; ///< a dispatch of the device's fill shader: the pattern fill it performs
     u32 fill_bytes{};
@@ -2819,6 +2820,8 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
         SynthesizeUserData(ctx, 1, pixel_shader + 0x30, slot.ps_gnm, 0x3c, ShBase + 0x0c, slot.regs.data(), n, slot);
         mr.Mark(4);
         binding_record = nullptr;
+        slot.no_inputs = slot.binding_count == 0 && (slot.vs_gnm != 0 || slot.ps_gnm != 0) && (slot.vs_gnm == 0 || Rd<u8>(slot.vs_gnm, 3) == 0) &&
+                         (slot.ps_gnm == 0 || Rd<u8>(slot.ps_gnm, 3) == 0);
         slot.desc_key = synth_desc_key;
         // draw arguments: VGT_NUM_INDICES / VGT_NUM_INSTANCES, then for indexed draws the index buffer view
         // (IT_INDEX_BASE), the base vertex and the draw packet's maximum size
@@ -3420,7 +3423,10 @@ void ResourceTextureDescriptor(u64 resource, u32 subresource, bool writable, std
 }
 
 /// The record of the texture copy dispatch (the game's copy shader: a T# in, a T# out, the extent as constants).
-u64 MakeUploadRecord(u64 ctx, const std::array<u32, 8>& srv, const std::array<u32, 8>& uav, u32 width, u32 height, u64 caller, bool readback = false) {
+/// F5: with `source_resource` and `destination_resource` (the engine's resources behind the two T#) the record names its three
+/// bindings (source image, destination image, the extent constants), so the dispatch binds from the record and not from the flat user data.
+u64 MakeUploadRecord(u64 ctx, const std::array<u32, 8>& srv, const std::array<u32, 8>& uav, u32 width, u32 height, u64 caller, bool readback = false,
+                     u64 source_resource = 0, u64 destination_resource = 0, bool source_is_scratch = false) {
     const VAddr image = image_base.load(std::memory_order_relaxed);
     if (image == 0 || width == 0 || height == 0) {
         return 0;
@@ -3490,6 +3496,23 @@ u64 MakeUploadRecord(u64 ctx, const std::array<u32, 8>& srv, const std::array<u3
             }
         }
     };
+    // (a Map upload reads a linear scratch of the engine's: no engine object behind the source, its binding has id 0)
+    const bool name_bindings = destination_resource != 0 && (source_resource != 0 || source_is_scratch);
+    if (name_bindings) {
+        slot.binding_count = 0;
+        slot.geometry_id_count = 0;
+        slot.bindings_overflow = false;
+        slot.bindings_for = seq;
+        binding_record = &slot;
+    }
+    // a descriptor goes into the list at its flat offset (an offset from 16 on is the extended user data, as in the other record builders)
+    const auto name = [&](u32 kind, u64 object, u32 start, const u32* words, u32 dwords) {
+        if (!name_bindings) {
+            return;
+        }
+        SetLastDescriptorObject(object);
+        AddRecordBinding(5, kind, 0, start, words, dwords);
+    };
     for (u32 i = 0; i < Rd<u8>(gnm, 3) && i < 40; ++i) {
         const u64 e = gnm + 0x28 + i * 4;
         const u32 type = Rd<u8>(e, 0);
@@ -3503,16 +3526,24 @@ u64 MakeUploadRecord(u64 ctx, const std::array<u32, 8>& srv, const std::array<u3
             ++slot.unsupported_inputs;
         } else if (type == 0) {
             put(start, srv.data(), 8);
+            name(2, source_resource, start, srv.data(), 8);
         } else if (type == 4) {
             put(start, uav.data(), 8);
+            name(2, destination_resource, start, uav.data(), 8);
         } else if (start + 4 > 16 || checks >= slot.checks.size()) {
             ++slot.unsupported_inputs;
         } else {
             // the constant buffer descriptor holds the address of the constants: compared by content
             slot.checks[checks++] = {Core::NativeDraw::ComputeRegisterBase + 0x40 + start, 30, 8, constants_address, 0, {~0ull, ~0ull}, 0x100000};
             put(start + 2, constant_descriptor_tail.data(), 2);
+            // the words the dispatch will hold once the check wrote the address (as TakeExecDraw does)
+            const u64 window = ArenaWindowAddress(reinterpret_cast<const void*>(constants_address));
+            const std::array<u32, 4> constant_words{static_cast<u32>(window), static_cast<u32>(window >> 32) | 0x100000u, constant_descriptor_tail[0],
+                                                    constant_descriptor_tail[1]};
+            name(1, 0, start, constant_words.data(), 4);
         }
     }
+    binding_record = nullptr;
     if (have_eud_pointer) {
         if (eud_pointer_sgpr + 2 > 16 || checks >= slot.checks.size() || eud_dwords == 0) {
             ++slot.unsupported_inputs;
@@ -3543,7 +3574,7 @@ u64 MakeCopyResourceRecord(u64 ctx, u64 destination, u32 destination_sub, u64 so
     }
     const u32 mip_shift = (source_sub % source_mips) & 0x1f;
     const bool readback = Core::NativeResources::ResourceUsage(destination) == 3;
-    return MakeUploadRecord(ctx, srv, uav, Rd<u32>(source, 0x180) >> mip_shift, Rd<u32>(source, 0x184) >> mip_shift, caller, readback);
+    return MakeUploadRecord(ctx, srv, uav, Rd<u32>(source, 0x180) >> mip_shift, Rd<u32>(source, 0x184) >> mip_shift, caller, readback, source, destination);
 }
 
 /// Guest thread: the record of FUN_02485c00 with a source of several different dwords: the device's copy-with-wrap shader
@@ -4282,7 +4313,7 @@ static bool TakeExecDrawImpl(u64 seq, ExecDraw& out, bool typed, bool allow_lazy
             out.geometry_ids[i] = slot.geometry_ids[i];
         }
     }
-    if (slot.kind <= 2 && slot.bindings_for == seq && !slot.bindings_overflow && slot.binding_count != 0) {
+    if (slot.kind <= 2 && slot.bindings_for == seq && !slot.bindings_overflow && (slot.binding_count != 0 || slot.no_inputs)) {
         out.binding_count = slot.binding_count;
         out.bindings_complete = true;
         for (u32 i = 0; i < slot.binding_count; ++i) {
@@ -4494,7 +4525,8 @@ u64 RecordCallerGhidra(u64 seq) {
 bool TakeDispatchBindings(u64 seq, RecordBinding* out, u32 max, u32& count) {
     count = 0;
     auto& slot = Slot(seq);
-    if (slot.seq.load(std::memory_order_acquire) != seq || slot.kind != 3 || slot.bindings_for != seq) {
+    // kind 3: a dispatch record; kind 11: an indirect dispatch executed from its record (the same list, built by MakeComputeRecord; F5: the two RenderScene indirect sites)
+    if (slot.seq.load(std::memory_order_acquire) != seq || (slot.kind != 3 && slot.kind != 11) || slot.bindings_for != seq) {
         return false;
     }
     const u32 n = slot.binding_count;
@@ -6686,7 +6718,7 @@ u64 MakeMapUploadRecord(u64 ctx, u64 resource, u64 scratch, u64 caller) {
     srv[1] = (srv[1] & ~0xffu) | static_cast<u32>((base >> 32) & 0xff);
     srv[3] = (srv[3] & ~(0x1fu << 20)) | (8u << 20);
     srv[4] = (srv[4] & ~(0x3fffu << 13)) | (((pitch - 1) & 0x3fffu) << 13);
-    return MakeUploadRecord(ctx, srv, uav, width, height, caller);
+    return MakeUploadRecord(ctx, srv, uav, width, height, caller, false, 0, resource, true);
 }
 
 using GuestMap7 = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64);

@@ -1160,7 +1160,7 @@ nlohmann::json Report() {
                           {"skipped_stage_needed_the_flat_user_data", binder_counters[6].load()}, {"samplers_from_the_record", binder_counters[7].load()},
                           {"sampler_descriptors_differing_from_the_legacy_ones", binder_counters[8].load()},
                           {"stages_planned_without_the_flat_user_data", binder_counters[9].load()}, {"stages_planned_with_the_flat_user_data_not_covered", binder_counters[10].load()},
-                          {"samplers_from_the_shader_immediates", binder_counters[11].load()}};
+                          {"samplers_from_the_shader_immediates", binder_counters[11].load()}, {"buffers_from_the_shader_immediates", binder_counters[12].load()}};
     {
         constexpr const char* class_names[5] = {"z_prepass_shadow", "g_buffer", "forward", "compute_other", "indirect_draws"};
         constexpr const char* stage_names[3] = {"vertex_stage", "pixel_stage", "whole_draw"};

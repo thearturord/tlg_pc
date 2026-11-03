@@ -491,6 +491,15 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
                                                     draw.typed ? exec_pixel_user_data.data() : nullptr};
             Core::NativeTargetDesc::Scope target_desc{draw.native_targets}; // E7 (TLG_TARGET_DESC_USE): PlanDraw applies the record's target description to the inputs it makes
             auto made = rasterizer->PlanDraw(params, *native_fixed, native_exec_key, native_inputs_key, draw, index_count);
+            if (made && native_exec_key != 0 && native_inputs_key != 0 && draw.kind <= 2 && draw.typed && !draw.other_stage && draw.bindings_complete) {
+                // F5: a learning draw (first sight of its pipeline): the pipeline and the inputs exist now, so the draw is planned from its record like every later one (the
+                // flat user data of the stages the record covers is skipped); when that is not possible the draw keeps the plan it has
+                if (auto from_record = rasterizer->PlanExecDraw(*draw.fixed, native_exec_key, native_inputs_key, exec_vertex_user_data, exec_pixel_user_data, draw, index_count,
+                                                                native_tag_pending.valid ? (native_tag_pending.meta & 0xff) : 15u)) {
+                    rasterizer->RecyclePlan(std::move(made));
+                    return from_record;
+                }
+            }
             return made;
         };
         std::unique_ptr<Vulkan::DrawPlan> candidate;

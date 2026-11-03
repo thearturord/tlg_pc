@@ -1960,9 +1960,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 chosen_sharp = AmdGpu::Buffer::Null();
             } else {
                 chosen_sharp = desc.GetSharp(stage);
-                NoteFlatRead(1, static_cast<u32>(stage.sw_stage), static_cast<u32>(desc.sharp_fetch.summary), binder_plan != nullptr, binder_plan != nullptr ? Core::NativeDraw::RecordCallerGhidra(binder_plan->native_seq) : 0, stage.pgm_hash, FlatReadExtra(stage));
-                if (binder_plan != nullptr) {
-                    Core::NativeRegistry::NoteBinder(2);
+                if (desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::MultiLoad && desc.sharp_fetch.load_mask == 0) {
+                    Core::NativeRegistry::NoteBinder(12); // F5: built from the shader's immediates, GetSharp reads no flat dword (not a flat user data read)
+                } else {
+                    NoteFlatRead(1, static_cast<u32>(stage.sw_stage), static_cast<u32>(desc.sharp_fetch.summary), binder_plan != nullptr, binder_plan != nullptr ? Core::NativeDraw::RecordCallerGhidra(binder_plan->native_seq) : 0, stage.pgm_hash, FlatReadExtra(stage));
+                    if (binder_plan != nullptr) {
+                        Core::NativeRegistry::NoteBinder(2);
+                    }
                 }
             }
             if (Core::NativeFieldUse::On()) { // F4.0b
