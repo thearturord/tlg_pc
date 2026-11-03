@@ -288,6 +288,10 @@ bool Enabled() {
     return enabled;
 }
 
+u64 RowsWritten() {
+    return head.load(std::memory_order_relaxed);
+}
+
 void NoteRow(const Row& row) {
     if (!enabled) {
         return;

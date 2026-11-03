@@ -39,6 +39,9 @@ constexpr u32 TableRows = 16384; ///< power of two; about five frames of the bus
 
 [[nodiscard]] bool Enabled();
 
+/// Rows written to the table so far (the invariant checks compare it between two presents).
+[[nodiscard]] u64 RowsWritten();
+
 /// Raster thread (or whichever thread executes the draw): adds one row.
 void NoteRow(const Row& row);
 

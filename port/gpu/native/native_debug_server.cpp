@@ -24,6 +24,7 @@
 #include "native/native_stream_probe.h"
 #include "native/native_flight.h"
 #include "native/native_marker.h"
+#include "native/native_invariant.h"
 #include "native/native_timeline.h"
 #include "native/native_pass.h"
 #include "native/native_registry.h"
@@ -709,6 +710,7 @@ void RegisterBuiltins() {
                  }
                  return nlohmann::json{{"sent", count}, {"written", Core::Log::Written() - written_before}, {"suppressed", Core::Log::Suppressed() - suppressed_before}};
              });
+    Register("/invariants", "(L5) the checks at the boundaries that failed before: how often each one failed since the start", [](const Params&) { return Core::Invariant::Report(); });
     Register("/frames", "?n=600: the last n frame intervals (time stamp and length in ms)", Frames);
     Register("/timeline_capture", "?seconds=10&tag=name: records every frame timeline event for that long into log/timeline_<tag>.bin (+ .json); without arguments: the state", TimelineCapture);
     Register("/periodic", "last runs of periodic jobs (when they ended, how long they took)",
@@ -766,6 +768,7 @@ void Publish(const std::string& group, nlohmann::json value) {
 void NotePresent() {
     const u64 index = presents.fetch_add(1, std::memory_order_acq_rel);
     present_times[index & (TimeRing - 1)].store(NowNs(), std::memory_order_relaxed);
+    Core::Invariant::NoteFrame(); // L5
 }
 
 void NoteWriteFault(VAddr address) {
@@ -802,7 +805,7 @@ nlohmann::json CountersSnapshot() {
         out["rare_events"] = rare_counts;
     }
     out["written_unix_s"] = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-    for (const char* name : {"/status", "/zpassgen", "/native", "/registry", "/stats", "/resources"}) {
+    for (const char* name : {"/status", "/zpassgen", "/native", "/registry", "/stats", "/resources", "/invariants"}) {
         Handler handler;
         {
             std::scoped_lock lk{registry_mutex};

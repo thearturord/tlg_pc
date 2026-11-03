@@ -36,7 +36,8 @@ namespace Core::Flight {
     X(Mark, "marker pressed")                       /* a = marker number, b = 1 full, 2 light */                                                                               \
     X(DeviceLost, "device lost")                    /* a = submission tick */                                                                                                  \
     X(Hook, "hook fired")                           /* a = game call site (Ghidra address), b = hook id */                                                                     \
-    X(LogError, "error logged")                     /* a = hash of the source line text, b = line */
+    X(LogError, "error logged")                     /* a = hash of the source line text, b = line */                                                           \
+    X(Invariant, "invariant failed")                /* seq; a = invariant id (native_invariant.h), b = how many so far */
 
 enum Kind : u16 {
 #define X(id, text) id,

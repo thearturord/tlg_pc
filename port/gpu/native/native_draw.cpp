@@ -43,6 +43,7 @@
 #include "native/native_image_desc.h"
 #include "native/native_draw.h"
 #include "native/native_flight.h"
+#include "native/native_invariant.h"
 #include "native/native_job_gen.h"
 #include "native/native_site_gen.h"
 #include "native/native_readbacks.h"
@@ -1186,6 +1187,16 @@ void NoteConsumed(u64 seq) {
     u64 seen = consumed_seq.load(std::memory_order_relaxed);
     while (seq > seen && !consumed_seq.compare_exchange_weak(seen, seq, std::memory_order_relaxed)) {
     }
+}
+
+/// Takes the next record number. L5: a record number more than RecordSlots ahead of the newest one the command processor consumed reuses a slot whose record may still be needed.
+u64 TakeSeq() {
+    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    const u64 consumed = consumed_seq.load(std::memory_order_relaxed);
+    if (seq > consumed + RecordSlots && consumed != 0) [[unlikely]] {
+        Core::Invariant::Hit(Core::Invariant::RecordOverwritten, seq, consumed, seq - consumed);
+    }
+    return seq;
 }
 
 bool RecordRingFull(u64 seq) {
@@ -2709,7 +2720,7 @@ const char* ComparePackage(const StatePackage& p, const NativeRecord& slot) {
 /// Guest thread: builds the record of a draw. Returns its number.
 u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     PhaseClockMr mr;
-    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    const u64 seq = TakeSeq();
     BeginTables(seq);
     auto& slot = Slot(seq);
     slot.seq.store(0, std::memory_order_release);
@@ -3007,7 +3018,7 @@ u32 CompareRecordsImpl(u64 seq_a, u64 seq_b, std::vector<std::string>& out) {
 }
 
 u64 MakeComputeRecord(u64 ctx, u64 x, u64 y, u64 z, u64 caller) {
-    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    const u64 seq = TakeSeq();
     BeginTables(seq);
     auto& slot = Slot(seq);
     slot.seq.store(0, std::memory_order_release);
@@ -3091,7 +3102,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
         asc_fail = __LINE__;
         return 0;
     }
-    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    const u64 seq = TakeSeq();
     BeginTables(seq);
     auto& slot = Slot(seq);
     slot.binding_count = 0;
@@ -3331,7 +3342,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
 /// described by V# words built from the addresses. No program packets are written by the game's path for this one
 /// beyond the shader bind, so the record carries the program registers too.
 u64 MakeCopyRecord(u64 ctx, u64 destination, u64 source, u64 bytes, u64 caller, bool async_context = false) {
-    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    const u64 seq = TakeSeq();
     BeginTables(seq);
     auto& slot = Slot(seq);
     slot.seq.store(0, std::memory_order_release);
@@ -3456,7 +3467,7 @@ u64 MakeUploadRecord(u64 ctx, const std::array<u32, 8>& srv, const std::array<u3
     if (gnm == 0) {
         return 0;
     }
-    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    const u64 seq = TakeSeq();
     BeginTables(seq);
     auto& slot = Slot(seq);
     slot.seq.store(0, std::memory_order_release);
@@ -3608,7 +3619,7 @@ u64 MakeFillPatternRecord(u64 writer, u64 destination, u32 count, u64 source, u3
     if (gnm == 0) {
         return 0;
     }
-    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    const u64 seq = TakeSeq();
     BeginTables(seq);
     auto& slot = Slot(seq);
     slot.seq.store(0, std::memory_order_release);
@@ -4727,7 +4738,7 @@ void(PS4_SYSV_ABI* GameTrackFunction())(u64, u64) {
 }
 
 bool EmitFastClearEliminate(u64 ctx, u64 resource) {
-    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    const u64 seq = TakeSeq();
     BeginTables(seq);
     auto& slot = Slot(seq);
     slot.seq.store(0, std::memory_order_release);
@@ -6079,7 +6090,7 @@ u64 PS4_SYSV_ABI TagAscCounterReadback(u64 jcc, u64 buffer, u64 view, u64 a3, u6
     }
     if (slot != 0xffffffffu && pending == 0xffffffffu) {
         // the GPU counter: GDS to memory, in stream order
-        const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+        const u64 seq = TakeSeq();
         if (RecordRingFull(seq)) {
             return 0;
         }
@@ -6127,7 +6138,7 @@ u64 PS4_SYSV_ABI TagAscCounterReadback(u64 jcc, u64 buffer, u64 view, u64 a3, u6
 /// Writes the tag of a memory copy record (kind 10: destination, source, bytes) for the async compute context `jcc`.
 /// `destination` / `source` are the engine resources to stamp as used (0 when the copy was given plain addresses).
 u64 PublishAscMemoryCopy(u64 jcc, u64 destination, u64 source, u64 to, u64 from, u64 bytes, u64 ret) {
-    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    const u64 seq = TakeSeq();
     if (RecordRingFull(seq)) {
         return 0;
     }
@@ -6984,7 +6995,7 @@ u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4
     auto& live = Live();
     constexpr u32 TagDwords = 2 + VideoCore::NativeTagPayloadDwords - 1;
     // a tag in front of the function's packets: a placeholder record the game's packets stay valid for until the real one is known
-    const u64 placeholder = next_seq.fetch_add(1, std::memory_order_relaxed);
+    const u64 placeholder = TakeSeq();
     {
         auto& slot = Slot(placeholder);
         slot.seq.store(0, std::memory_order_release);
@@ -7241,7 +7252,7 @@ u64 TagAsc(u64 jcc, u64 x, u64 y, u64 z, u64 ret, bool allow_exec = true) {
         // counters the game initializes with DMA packets: GDS fill records, in front of the dispatch
         const u32 counter_base = Rd<u32>(jcc, 0x22f8);
         for (u32 k = 0; k < asc_counter_init_count; ++k) {
-            const u64 fill_seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+            const u64 fill_seq = TakeSeq();
             auto& fill = Slot(fill_seq);
             fill.seq.store(0, std::memory_order_release);
             fill.check_count = 0;
@@ -7364,7 +7375,7 @@ u64 PS4_SYSV_ABI TagFill(u64 ctx, u64 destination, u64 count_arg, u64 source, u6
         }
         return 0;
     }
-    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    const u64 seq = TakeSeq();
     auto& slot = Slot(seq);
     slot.seq.store(0, std::memory_order_release);
     slot.check_count = 0;
@@ -7673,7 +7684,7 @@ bool ConvertClearQuad(u64 target, u64 start, u64 begin, u64 end, u64 caller, con
     if (middle == 1) {
         return false;
     }
-    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    const u64 seq = TakeSeq();
     if (RecordRingFull(seq)) {
         return false;
     }
