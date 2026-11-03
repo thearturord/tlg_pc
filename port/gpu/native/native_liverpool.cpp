@@ -486,6 +486,10 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
                 left(0);
             } else if (!draw.typed || draw.stage_key == 0 || draw.fixed == nullptr) {
                 left(!draw.typed ? 1 : draw.stage_key == 0 ? 6 : 7);
+            } else if (draw.other_stage) {
+                // F3.2: the native pipeline is vertex plus pixel; the draw goes the old way, where the stage selection refuses it (no pipeline)
+                left(8);
+                Core::RareEvents::Note("f3_2_other_shader_stage_bound", fmt::format("draw record {}: a hull, domain or geometry shader is bound; stage key {:#x}", draw.seq, draw.stage_key));
             } else if (!split_active) {
                 left(2);
             } else {
@@ -550,7 +554,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     }
     native_exec_scope = true;
     native_fixed = draw.fixed;
-    native_exec_key = draw.stage_key != 0 && draw.grouped != 0 && !draw.cb_extents_only
+    native_exec_key = draw.stage_key != 0 && draw.grouped != 0 && !draw.cb_extents_only && !draw.other_stage // F3.2: a draw with another stage bound never takes a cached vertex plus pixel pipeline
                           ? draw.stage_key
                           : 0;
     if (!planned_from_record && split_active && !draw.cb_extents_only) {
@@ -566,7 +570,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         }
         const auto make_candidate = [&] {
             // E1c: the shader objects of the draw, for the comparison of the translator's input with the one derived from them
-            Core::NativeShaderEnv::Scope shader_env{draw.vs_gnm, draw.ps_gnm, draw.fetch_object};
+            Core::NativeShaderEnv::Scope shader_env{draw.vs_gnm, draw.ps_gnm, draw.fetch_object, draw.other_stage};
             Core::NativeTargetDesc::Scope target_desc{draw.native_targets}; // E7 (TLG_TARGET_DESC_USE): PlanDraw applies the record's target description to the inputs it makes
             return rasterizer->PlanDraw(exec_state, params, native_fixed, native_exec_key, native_inputs_key);
         };

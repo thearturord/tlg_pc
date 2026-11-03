@@ -470,6 +470,23 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
     }
     plan->inputs = MakeDrawInputs(regs);
     Core::NativeTargetDesc::ApplyAtFill(plan->inputs); // E7 (TLG_TARGET_DESC_USE): the engine's objects decide the target part, the registers keep the rest
+    {
+        // F3.3: the words of the inputs that only the register image has (clip planes, border colour base, index offset) are checked: not zero would mean the native planning needs a value for them
+        const auto not_zero = [](const auto& value) {
+            const auto* bytes = reinterpret_cast<const unsigned char*>(&value);
+            for (size_t i = 0; i < sizeof(value); ++i) {
+                if (bytes[i] != 0) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto& live = Core::NativeDraw::Live();
+        live.reg_only_checked.fetch_add(1, std::memory_order_relaxed);
+        if (not_zero(plan->inputs.ta_bc_base) || not_zero(plan->inputs.clip_user_data) || plan->inputs.index_offset != 0) {
+            live.reg_only_nonzero.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (inputs_key != 0 && plan->executed) {
         exec_inputs.insert_or_assign(inputs_key, plan->inputs);
     }

@@ -22,11 +22,13 @@ struct DrawEnv {
     ShaderEnv::ShaderEnv pixel{};
     bool has_vertex{};
     bool has_pixel{};
+    /// F3.2: a hull, domain or geometry shader is bound in the device context (the native pipeline is vertex plus pixel only; such a draw is a counted refusal)
+    bool other_stage{};
 };
 
 /// The shader objects of the draw that is being planned (set by the command processor around `PlanDraw`; nothing is read until `Current` asks).
 struct Scope {
-    Scope(u64 vertex_gnm, u64 pixel_gnm, u64 fetch_object);
+    Scope(u64 vertex_gnm, u64 pixel_gnm, u64 fetch_object, bool other_stage = false);
     ~Scope();
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;

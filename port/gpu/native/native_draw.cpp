@@ -1083,6 +1083,7 @@ struct NativeRecord {
     std::array<u64, MaxGeometryIds> geometry_ids{}; ///< N6.2: engine ids of the vertex and index buffers of the draw
     u32 geometry_id_count{};
     DrawArgs args{}; ///< E1b: the draw's arguments as typed values
+    bool other_stage{}; ///< F3.2: a hull, domain or geometry shader is bound
     u64 vs_gnm{}; ///< Gnm shader binaries of the draw (for the shader input dump)
     u64 ps_gnm{};
     u64 dbg_vs{};
@@ -2765,6 +2766,7 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     if (kind <= 2 && Core::NativeTargetDesc::Enabled()) {
         Core::NativeTargetDesc::Observe(ctx); // E7 Task 2: shadow only, compares the target blocks with the engine's objects
     }
+    slot.other_stage = kind <= 2 && (Rd<u64>(ctx, 0x4678) | Rd<u64>(ctx, 0x4680) | Rd<u64>(ctx, 0x4688)) != 0; // F3.2: domain, geometry, hull shader (PrepareDraw)
     if (kind <= 2 && Core::NativeTargetDesc::UseOn()) {
         slot.native_targets = Core::NativeTargetDesc::PrepareDraw(ctx); // E7 (TLG_TARGET_DESC_USE): the description travels with the record
         slot.native_targets_seq = seq;
@@ -4496,6 +4498,7 @@ static bool TakeExecDrawImpl(u64 seq, ExecDraw& out, bool typed, bool allow_lazy
     out.vs_gnm = slot.vs_gnm;
     out.ps_gnm = slot.ps_gnm;
     out.fetch_object = slot.dbg_fetch;
+    out.other_stage = slot.other_stage;
     out.dst_usage = slot.kind == 9 || slot.kind == 10 ? slot.dst_usage : ~0u;
     return slot.seq.load(std::memory_order_acquire) == seq;
 }

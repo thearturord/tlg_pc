@@ -68,12 +68,16 @@ struct LiveCounters {
     std::array<std::atomic<u64>, 3> plan_null{};   ///< why PlanExecDraw gave no plan: 0 stale surface / clip, 1 inputs not learned yet, 2 pipeline plan failed
     /// why a draw was not planned from its record: 0 the switches are not all on, 1 the record has no key (not typed, no fixed state), 2 the command processor is not split,
     /// 3 a fixed-state verify draw, 4 no cached render target inputs or pipeline for its keys yet, 5 a fast clear eliminate that could not be planned
-    std::array<std::atomic<u64>, 8> exec_reason{};
+    /// (index 8: F3.2, a hull, domain or geometry shader is bound; the draw is refused)
+    std::array<std::atomic<u64>, 9> exec_reason{};
     /// of the typed ones: fast clear eliminates and inline draws (the count came with the draw packet)
     std::atomic<u64> exec_fast_clear{}, exec_inline{}, exec_inline_seen{};
     /// F3.1: where the pipeline key took the render targets from: 0 the plan's inputs (the native target description), 1 the register image (no inputs: the packet path), and the
     /// colour export formats: 2 from the pixel shader's environment, 3 from the register image (no environment)
-    std::array<std::atomic<u64>, 4> key_targets{};
+    /// 4 stage set from the shader environment (vertex plus pixel), 5 stage set from the register image, 6 translator input from the shader environment (F3.3), 7 from the register image
+    std::array<std::atomic<u64>, 8> key_targets{};
+    /// F3.3: draws whose inputs still carry register-only words (clip planes, border colour base, index offset): checked, and not zero
+    std::atomic<u64> reg_only_checked{}, reg_only_nonzero{};
     /// the native path's private register block: draws and clears planned from it, plans compared with the shared register image (legacy switch on), differences
     std::atomic<u64> state_planned{}, state_group_violations{};
     std::atomic<u64> overlay_offered{}, overlay_unmapped{}, overlay_same{}, overlay_changed{}, overlay_records{};
@@ -240,6 +244,7 @@ struct ExecDraw {
     u64 copy_source{};
     u32 copy_bytes{};
     DrawArgs args{}; ///< E1b
+    bool other_stage{}; ///< F3.2: a hull, domain or geometry shader is bound in the device context (ctx +0x4678 / +0x4680 / +0x4688)
     u64 vs_gnm{}, ps_gnm{}, fetch_object{}; ///< E1c: the Gnm blocks of the draw's vertex and pixel shader objects and the input layout's fetch object (0: unknown)
     const Vulkan::FixedState* fixed{}; ///< draws: the fixed-function state built from the engine's objects (null: from the registers)
     u32 dst_usage{~0u};                ///< copy and counter read-back records: Usage of the destination resource (3 staging)

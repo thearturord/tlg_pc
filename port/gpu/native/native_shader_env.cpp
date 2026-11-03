@@ -22,6 +22,7 @@ thread_local u64 g_vertex_gnm = 0;
 thread_local u64 g_pixel_gnm = 0;
 thread_local u64 g_fetch_object = 0;
 thread_local bool g_active = false;
+thread_local bool g_other_stage = false;
 
 std::atomic<u64> g_unavailable{};
 std::atomic<u32> g_samples{};
@@ -128,7 +129,8 @@ void BuildPixel(ShaderEnv::ShaderEnv& env, u64 gnm, u64 vertex_gnm) {
 
 } // namespace
 
-Scope::Scope(u64 vertex_gnm, u64 pixel_gnm, u64 fetch_object) {
+Scope::Scope(u64 vertex_gnm, u64 pixel_gnm, u64 fetch_object, bool other_stage) {
+    g_other_stage = other_stage;
     g_vertex_gnm = vertex_gnm;
     g_pixel_gnm = pixel_gnm;
     g_fetch_object = fetch_object;
@@ -144,6 +146,7 @@ bool Current(DrawEnv& out) {
         return false;
     }
     out = {};
+    out.other_stage = g_other_stage;
     if (g_vertex_gnm != 0) {
         BuildVertex(out.vertex, g_vertex_gnm, g_fetch_object);
         out.has_vertex = true;
