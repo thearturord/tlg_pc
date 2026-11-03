@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "video_core/renderer_vulkan/vk_indexed_data.h"
 #include <algorithm>
 #include <array>
@@ -9144,29 +9143,6 @@ void NativeListRead(nlohmann::json& out) {
     out["lazy_registers_materialized"] = lazy_materialized.load();
     out["lazy_verify_full_take_compared"] = lazy_verified.load();
     out["lazy_verify_differences"] = lazy_differences.load();
-    {
-        const auto& a = Vulkan::g_identity_audit;
-        out["identity_audit"] = {{"image_bindings_with_a_record", a.image_bindings.load()}, {"of_them_with_an_engine_id", a.image_with_id.load()}, {"ids_seen", a.image_ids_seen.load()},
-                                 {"same_description", a.image_same.load()}, {"address_changed", a.image_address_changed.load()}, {"other_words_changed", a.image_other_words_changed.load()},
-                                 {"image_dword_changed_for_the_same_id", {a.image_word_changed[0].load(), a.image_word_changed[1].load(), a.image_word_changed[2].load(), a.image_word_changed[3].load(), a.image_word_changed[4].load(), a.image_word_changed[5].load(), a.image_word_changed[6].load(), a.image_word_changed[7].load()}},
-                                 {"texture_lookup_miss_cold_slot", a.texture_miss_cold.load()}, {"texture_lookup_miss_other_key_in_slot", a.texture_miss_other_key.load()}, {"texture_lookup_miss_native_reuse_off", a.texture_miss_native_reuse_off.load()},
-                                 {"texture_hit_same_generation_verified", a.texture_gen_verified.load()}, {"texture_hit_same_generation_image_differs", a.texture_gen_diff_image.load()}, {"texture_hit_same_generation_range_differs", a.texture_gen_diff_range.load()},
-                                 {"texture_id_served_after_generation_moved", a.texture_id_served.load()}, {"texture_id_refused", a.texture_id_refused.load()}, {"texture_id_verified", a.texture_id_verified.load()},
-                                 {"texture_id_verify_image_differs", a.texture_id_diff_image.load()}, {"texture_id_verify_range_differs", a.texture_id_diff_range.load()},
-                                 {"compute_dispatches", a.dispatches.load()}, {"flat_reads_top", [] { nlohmann::json out = nlohmann::json::array(); std::scoped_lock lock{Vulkan::g_flat_reads.mutex}; std::vector<std::pair<u64, std::string>> rows; for (const auto& [k, n] : Vulkan::g_flat_reads.counts) { rows.emplace_back(n, fmt::format("kind {} stage {} summary {} plan {} caller {:#x} program {:#x} extra {:#x}", std::get<0>(k), std::get<1>(k), std::get<2>(k), std::get<3>(k), std::get<4>(k), std::get<5>(k), std::get<6>(k))); } std::sort(rows.rbegin(), rows.rend()); for (size_t i = 0; i < rows.size() && i < 90; ++i) { out.push_back({{"count", rows[i].first}, {"what", rows[i].second}}); } return out; }()}, {"compute_programs_seen", a.programs_seen.load()}, {"compute_same_pipeline", a.pipeline_same.load()},
-                                 {"compute_pipeline_switched", a.pipeline_switched.load()},
-                                 {"dispatch_with_record", a.dispatch_with_record.load()},
-                                 {"dispatch_bindings_complete", a.dispatch_bindings_complete.load()},
-                                 {"dispatch_binding_entries", a.dispatch_binding_entries.load()},
-                                 {"dispatch_buffer_loads", a.dispatch_buffer_loads.load()},
-                                 {"dispatch_buffer_served_by_record", a.dispatch_buffer_record.load()},
-                                 {"dispatch_buffer_missing", a.dispatch_buffer_missing.load()},
-                                 {"dispatch_buffer_missing_guest_null", a.dispatch_buffer_missing_null.load()},
-                                 {"dispatch_buffer_equal", a.dispatch_buffer_equal.load()},
-                                 {"dispatch_buffer_different", a.dispatch_buffer_different.load()},
-                                 {"dispatch_diff_base_size_other_hasid_bothvalid_recordonly_trustbroken_ambiguous", {a.dispatch_diff[0].load(), a.dispatch_diff[1].load(), a.dispatch_diff[2].load(), a.dispatch_diff[3].load(), a.dispatch_diff[4].load(), a.dispatch_diff[5].load(), a.dispatch_diff[6].load(), a.dispatch_diff[7].load()}},
-                                 {"dispatch_diff_lag_recordlags_guestlags_neither", {a.dispatch_lag[0].load(), a.dispatch_lag[1].load(), a.dispatch_lag[2].load()}}};
-    }
     {
         const auto& c = Vulkan::g_indexed_census;
         out["pipeline_stage_census"] = {{"stages", c.stages.load()}, {"mip_level_images", c.mip_run_images.load()}, {"atomic_images", c.atomic_images.load()}, {"shared_memory_buffers", c.shared_memory_buffers.load()}};

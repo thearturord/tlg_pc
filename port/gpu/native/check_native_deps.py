@@ -17,7 +17,6 @@ ALLOWED_PS4 = {
     "video_core/amdgpu/liverpool.h": "by design: the record format is a list of register pairs; native_draw.cpp uses the register group map and the register word types (DepthShaderControl, ShaderProgram) of the record, native_shader_env.cpp the same words",
     "video_core/renderer_vulkan/vk_fixed_state.h": "by design: the Vulkan fixed state struct (Vulkan terms; it includes regs.h only for NUM_VIEWPORTS and PrimitiveType)",
     "video_core/renderer_vulkan/vk_indexed_data.h": "by design: the Vulkan host class of the indexed data path (C9); native_draw.cpp only reads its counters",
-    "video_core/renderer_vulkan/vk_identity_audit.h": "F6 (audits)",
 }
 # plain emulator infrastructure the native code shares (not GPU emulation); reviewed once, kept short
 ALLOWED_SHARED = {

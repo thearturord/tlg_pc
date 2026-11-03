@@ -15,7 +15,6 @@
 #include "native/native_prof.h"
 #include "native/native_marker.h"
 #include "native/native_config.h"
-#include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
 #include "native/native_draw_inputs.h"
@@ -123,20 +122,14 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     if (const_ring_level >= 2) {
         constant_ring = std::make_unique<ConstantRing>(instance, scheduler);
     }
-    if (const char* env = std::getenv("TLG_CONST_RING_VERIFY")) {
-        ring_verify_interval = static_cast<u32>(std::max(std::atoi(env), 0));
-    }
-    LOG_INFO(Render, "constant ring: level {}, verify every {}", const_ring_level, ring_verify_interval);
+    LOG_INFO(Render, "constant ring: level {}", const_ring_level);
     if (const char* env = std::getenv("TLG_INPLACE"); env != nullptr && *env != 0 && *env != '0') {
         host_import = std::make_unique<HostImport>(instance);
         inplace_on = host_import->Available();
         if (const char* cap = std::getenv("TLG_INPLACE_CAP"); cap != nullptr && *cap != 0) {
             inplace_cap = static_cast<u32>(std::clamp(std::atoi(cap), 16, 1 << 20));
         }
-        if (const char* verify = std::getenv("TLG_INPLACE_VERIFY"); verify != nullptr && *verify != 0) {
-            inplace_verify_interval = static_cast<u32>(std::max(std::atoi(verify), 0));
-        }
-        LOG_INFO(Render, "in place buffers: {}, cap {} bytes, verify every {}", inplace_on ? "on" : "unavailable", inplace_cap, inplace_verify_interval);
+        LOG_INFO(Render, "in place buffers: {}, cap {} bytes", inplace_on ? "on" : "unavailable", inplace_cap);
     }
     supersede_target = this;
     Core::NativeUpdates::SetSupersede([](u64 address, u64 size) {
@@ -370,13 +363,6 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(DrawIndirectParams params, const 
 }
 
 /// L1(b) (`TLG_TEXTURE_IDS`, default on; 0 turns it off): a cached image lookup is kept across generation changes when the texture cache proves that nothing touched its range.
-/// `TLG_TEXTURE_IDS_VERIFY=N` (default 64, 0 none, 1 every use): every Nth such answer is compared with FindImage.
-u32 Rasterizer::FlatReadExtra(const Shader::Info& stage) const {
-    // bit 0 the stage's flat user data was skipped, 1 the plan's list is complete, 2 verify mode, 3 a plan exists, 8.. the plan's binding count, 24.. the op class
-    return (StageFlatSkipped(stage) ? 1u : 0u) | (binder_plan != nullptr && binder_plan->bindings_complete ? 2u : 0u) | (binder_verify ? 4u : 0u) | (binder_plan != nullptr ? 8u : 0u) |
-           (binder_plan != nullptr ? std::min<u32>(binder_plan->binding_count, 255u) << 8 : 0u) | (draw_class_now << 24) | (draw_has_plan ? 16u : 0u);
-}
-
 /// B3 (`TLG_B3_IMAGES=0` turns it off): image bindings by the engine object's id
 static bool B3ImagesOn() {
     static const bool on = [] {
@@ -393,14 +379,6 @@ static bool TextureIdsOn() {
     }();
     return on;
 }
-static u32 TextureIdsVerifyEvery() {
-    static const u32 every = [] {
-        const char* e = std::getenv("TLG_TEXTURE_IDS_VERIFY");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 0u; // TLG_TEXTURE_IDS_VERIFY: off by default since 2026-10-30 (1 in 1024 until then)
-    }();
-    return every;
-}
-
 std::unique_ptr<DispatchPlan> Rasterizer::PlanDispatch(const AmdGpu::ComputeProgram& cs) {
     std::unique_ptr<DispatchPlan> plan;
     {
@@ -709,13 +687,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
 
     PrepareRenderState(pipeline, fixed);
     binder_plan = NativeBinderFor(plan, tag.valid ? (tag.meta & 0xff) : 15u);
-    draw_has_plan = plan != nullptr;
     draw_class_now = tag.valid ? (tag.meta & 0xff) : 15u;
     resolved_draw = binder_plan == plan ? plan : nullptr;
     const bool bound = BindResources(pipeline, &fixed);
     resolved_draw = nullptr;
     binder_plan = nullptr;
-    draw_has_plan = false;
     draw_class_now = 15;
     if (!bound) {
         return;
@@ -1396,14 +1372,6 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
                 range.offset = ring->offset;
                 Census(CGeometryVertexRing);
                 Core::NativeUploads::NoteGeometry(2);
-                if (ring_verify_interval != 0 && ++ring_verify_counter % ring_verify_interval == 0) {
-                    std::vector<u8> now(size);
-                    memory->CopySparseMemory(range.base_address, now.data(), size);
-                    Core::NativeUploads::NoteGeometry(8);
-                    if (std::memcmp(now.data(), constant_ring->Data(ring->offset), size) != 0) {
-                        Core::NativeUploads::NoteGeometry(9);
-                    }
-                }
                 continue;
             }
         }
@@ -1493,14 +1461,6 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
         index_buffer = constant_ring->Handle();
         buffer_offset = index_ring->offset;
         Core::NativeUploads::NoteGeometry(3);
-        if (ring_verify_interval != 0 && ++ring_verify_counter % ring_verify_interval == 0) {
-            std::vector<u8> now(index_buffer_size);
-            memory->CopySparseMemory(index_address, now.data(), index_buffer_size);
-            Core::NativeUploads::NoteGeometry(8);
-            if (std::memcmp(now.data(), constant_ring->Data(index_ring->offset), index_buffer_size) != 0) {
-                Core::NativeUploads::NoteGeometry(9);
-            }
-        }
     } else if (index_buffer_size != 0) {
         auto* index_handle = GeometryHandle(index_address, index_buffer_size);
         Census(index_handle != nullptr ? CGeometryIndexHandle : CGeometryIndexAddress);
@@ -1735,22 +1695,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             if (Core::NativeUploads::RingPrecise() && ring->address != 0 && buffer_cache.IsRangeGpuWritten(ring->address, ring->size)) {
                 Core::NativeUploads::NoteRingPrecise(1); // the GPU wrote bytes of this range after the command processor copied it
             }
-            if (ring_verify_interval != 0 && ring->address != 0 && ++ring_verify_counter % ring_verify_interval == 0) {
-                std::vector<u8> now(ring->size);
-                memory->CopySparseMemory(ring->address, now.data(), ring->size);
-                const bool differs = std::memcmp(now.data(), constant_ring->Data(ring->offset), ring->size) != 0;
-                if (ring->snapshot) {
-                    Core::NativeUploads::NoteSnapshotRing(2);
-                    if (differs) {
-                        Core::NativeUploads::NoteSnapshotRing(3);
-                    }
-                } else {
-                    ring_verified.fetch_add(1, std::memory_order_relaxed);
-                    if (differs) {
-                        ring_differing.fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
-            }
         } else if (desc.IsSpecial()) {
             Census(census_base + CBufferSpecial);
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
@@ -1883,7 +1827,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::MultiLoad && desc.sharp_fetch.load_mask == 0) {
                     Core::NativeRegistry::NoteBinder(12); // F5: built from the shader's immediates, GetSharp reads no flat dword (not a flat user data read)
                 } else {
-                    NoteFlatRead(1, static_cast<u32>(stage.sw_stage), static_cast<u32>(desc.sharp_fetch.summary), binder_plan != nullptr, binder_plan != nullptr ? Core::NativeDraw::RecordCallerGhidra(binder_plan->native_seq) : 0, stage.pgm_hash, FlatReadExtra(stage));
                     if (binder_plan != nullptr) {
                         Core::NativeRegistry::NoteBinder(2);
                     }
@@ -1911,7 +1854,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 // N7.5: a read-only buffer of guest memory bound where it is (imported view of the runtime's backing), no copy, no dirty tracking
                 bool in_place = false;
                 if (inplace_on) {
-                    CheckInPlaceVerifications();
                     inplace_offered.fetch_add(1, std::memory_order_relaxed);
                     if (desc.is_written) {
                         inplace_written.fetch_add(1, std::memory_order_relaxed);
@@ -1932,15 +1874,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                             buffer_infos.emplace_back(window.buffer, aligned, size + adjust);
                             inplace_taken.fetch_add(1, std::memory_order_relaxed);
                             inplace_bytes.fetch_add(size, std::memory_order_relaxed);
-                            if (inplace_verify_interval != 0 && ++inplace_counter % inplace_verify_interval == 0) {
-                                if (inplace_checks.size() < 8192) {
-                                    InPlaceCheck check{vsharp.address, scheduler.CurrentTick(), std::vector<u8>(size)};
-                                    memory->CopySparseMemory(vsharp.address, check.bytes.data(), size);
-                                    inplace_checks.push_back(std::move(check));
-                                } else {
-                                    inplace_verify_dropped.fetch_add(1, std::memory_order_relaxed);
-                                }
-                            }
                         } else {
                             inplace_not_in_backing.fetch_add(1, std::memory_order_relaxed);
                         }
@@ -2323,7 +2256,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             chosen_tsharp = AmdGpu::Image::Null(image_desc.is_depth);
         } else {
             chosen_tsharp = image_desc.GetSharp(stage);
-            NoteFlatRead(2, static_cast<u32>(stage.sw_stage), static_cast<u32>(image_desc.sharp_fetch.summary), binder_plan != nullptr, binder_plan != nullptr ? Core::NativeDraw::RecordCallerGhidra(binder_plan->native_seq) : 0, stage.pgm_hash, FlatReadExtra(stage));
             if (binder_plan != nullptr) {
                 Core::NativeRegistry::NoteBinder(3);
             }
@@ -2410,7 +2342,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             const bool by_id = native_reuse && !same_generation && cached.valid && cached.key == key && TextureIdsOn() &&
                                texture_cache.ImageUnchangedSince(cached.image_id, cached.image_uid, cached.generation, cached.desc.info.guest_address, cached.desc.info.guest_size);
             if (native_reuse && cached.valid && cached.key == key && !same_generation && !by_id && TextureIdsOn()) {
-                g_identity_audit.texture_id_refused.fetch_add(1, std::memory_order_relaxed);
             }
             // B3: the image of an engine object is found by the object's id (and the binding's use), not by its address; the T# the record holds for the object is the
             // guard that the object still describes the same image
@@ -2427,18 +2358,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 std::construct_at(&desc, native_entry->desc);
                 image_id = native_entry->image_id;
                 texture_cache.TouchFoundImage(image_id);
-                static const u32 b3_verify = [] {
-                    const char* e = std::getenv("TLG_B3_VERIFY");
-                    return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 0u;
-                }();
-                static thread_local u64 b3_counter = 0;
-                if (b3_verify != 0 && ++b3_counter % b3_verify == 0) {
-                    // verify: the lookup by address finds the same image
-                    VideoCore::TextureCache::ImageDesc check = make_image_desc();
-                    finish_desc(check);
-                    const VideoCore::ImageId found = texture_cache.FindImage(check);
-                    b3_stats[found == image_id ? 3 : 4].fetch_add(1, std::memory_order_relaxed);
-                }
             } else if (same_generation || by_id) {
                 Census(census_base + CImageLookupHit);
                 std::construct_at(&desc, cached.desc);
@@ -2446,37 +2365,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 texture_cache.TouchFoundImage(image_id);
                 if (by_id) {
                     cached.generation = generation_now;
-                    g_identity_audit.texture_id_served.fetch_add(1, std::memory_order_relaxed);
-                }
-                // verify (every Nth hit): what FindImage says now. The legacy lookup by address and T# only runs here and on a miss.
-                const u32 every = TextureIdsVerifyEvery();
-                static thread_local u64 verify_counter = 0;
-                if (every != 0 && ++verify_counter % every == 0) {
-                    VideoCore::TextureCache::ImageDesc check = make_image_desc();
-                    finish_desc(check);
-                    const VideoCore::ImageId found = texture_cache.FindImage(check);
-                    (by_id ? g_identity_audit.texture_id_verified : g_identity_audit.texture_gen_verified).fetch_add(1, std::memory_order_relaxed);
-                    const bool image_differs = found != image_id;
-                    const bool range_differs = check.view_info.range.base.level != desc.view_info.range.base.level || check.view_info.range.base.layer != desc.view_info.range.base.layer;
-                    if (image_differs || range_differs) {
-                        (by_id ? (image_differs ? g_identity_audit.texture_id_diff_image : g_identity_audit.texture_id_diff_range)
-                               : (image_differs ? g_identity_audit.texture_gen_diff_image : g_identity_audit.texture_gen_diff_range))
-                            .fetch_add(1, std::memory_order_relaxed);
-                        static std::atomic<u32> logged{0};
-                        if (logged.fetch_add(1) < 12) {
-                            LOG_ERROR(Render_Vulkan, "L1 texture lookup differs ({}): engine id {} address {:#x} size {:#x} served image {} (uid {}) found {} ({}), range level {} layer {} against {} {}", by_id ? "by id" : "same generation",
-                                      image_engine_id, desc.info.guest_address, desc.info.guest_size, image_id.index, cached.image_uid, found.index, image_differs ? "other image" : "same image", desc.view_info.range.base.level,
-                                      desc.view_info.range.base.layer, check.view_info.range.base.level, check.view_info.range.base.layer);
-                        }
-                        image_id = found;
-                        std::construct_at(&desc, check);
-                        cached.image_id = found;
-                        cached.image_uid = texture_cache.ImageUid(found);
-                        cached.desc = check;
-                    }
                 }
             } else {
-                (!native_reuse ? g_identity_audit.texture_miss_native_reuse_off : !cached.valid ? g_identity_audit.texture_miss_cold : g_identity_audit.texture_miss_other_key).fetch_add(1, std::memory_order_relaxed);
                 std::construct_at(&desc, make_image_desc());
                 finish_desc(desc);
 
@@ -2684,9 +2574,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             vk::ImageLayout bound_layout = transit_layout;
             if (!image.backing || !runtime.PlannerDecidesLayouts()) {
                 bound_layout = runtime.CurrentLayout(image);
-            } else if (static const bool verify = std::getenv("TLG_R3_VERIFY") != nullptr; verify && bound_layout != runtime.CurrentLayout(image)) {
-                image_layout_differing.fetch_add(1, std::memory_order_relaxed);
-                bound_layout = runtime.CurrentLayout(image);
             }
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view, bound_layout);
             if (set_record && i < TextureSet::MaxImages) {
@@ -2804,7 +2691,6 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
             ssharp = AmdGpu::Sampler{};
         } else {
             ssharp = sampler.GetSharp(stage);
-            NoteFlatRead(3, static_cast<u32>(stage.sw_stage), static_cast<u32>(sampler.sharp_fetch.summary), binder_plan != nullptr, binder_plan != nullptr ? Core::NativeDraw::RecordCallerGhidra(binder_plan->native_seq) : 0, stage.pgm_hash, FlatReadExtra(stage));
         }
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
                                 current_bc_base->Address() == 0)) {

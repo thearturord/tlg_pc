@@ -22,7 +22,6 @@
 #include "native/native_draw.h"
 #include "native/native_uploads.h"
 #include "video_core/readback_stats.h"
-#include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "video_core/renderer_vulkan/vk_constant_ring.h"
 #include "video_core/renderer_vulkan/vk_host_import.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -121,12 +120,10 @@ public:
     };
     RingStats TakeRingStats() noexcept;
     /// N7.5, in place buffers (`TLG_INPLACE=1`): read-only buffers up to `TLG_INPLACE_CAP` bytes (default 16 KiB) in guest memory are bound where they are, from an import of the
-    /// runtime's always read/write view of guest memory (`HostImport`), with no copy and no dirty tracking. `TLG_INPLACE_VERIFY=N`: every Nth in place binding keeps a copy of its
-    /// bytes, and when the GPU has finished the submission it was recorded in the guest memory is compared with the copy (the bytes the GPU may have seen changed after the bind).
+    /// runtime's always read/write view of guest memory (`HostImport`), with no copy and no dirty tracking.
     struct InPlaceStats {
         u64 offered{}, taken{}, bytes{};
         u64 written{}, special{}, too_large{}, not_in_backing{}, gpu_written{}, image_or_meta{};
-        u64 verified{}, differing{}, verify_dropped{};
         u64 imported_bytes{}, imported_chunks{}, failed_chunks{};
     };
     InPlaceStats TakeInPlaceStats() noexcept;
@@ -145,7 +142,7 @@ public:
     };
     std::array<u64, 18> TakeResolveStats();
     std::array<std::atomic<u64>, 4> slot_census{}; ///< R4 census: new buffer slots from the stream ring, -, other buffers; 3 slot hits
-    std::atomic<u64> image_words_planned{0}, image_words_verified{0}, image_words_differing{0}, image_layout_differing{0}; ///< R3 step 2 counters
+    std::atomic<u64> image_words_planned{0}; ///< R3 step 2 counter
     /// R1b verify counters (cumulative): copies checked, copies that differed from guest memory
     [[nodiscard]] u64 UploadsKeptForGpu() const noexcept {
         return buffer_cache.upload_bytes_kept_for_gpu.load(std::memory_order_relaxed);
@@ -330,18 +327,9 @@ private:
     // N7.5 (raster thread)
     bool inplace_on = false;
     u32 inplace_cap = 16384;
-    u32 inplace_verify_interval = 0;
-    u64 inplace_counter = 0;
     std::unique_ptr<HostImport> host_import;
-    struct InPlaceCheck {
-        VAddr address;
-        u64 tick;
-        std::vector<u8> bytes;
-    };
-    std::deque<InPlaceCheck> inplace_checks;
     std::atomic<u64> inplace_offered{0}, inplace_taken{0}, inplace_bytes{0}, inplace_written{0}, inplace_special{0}, inplace_too_large{0}, inplace_not_in_backing{0}, inplace_gpu_written{0},
-        inplace_image_or_meta{0}, inplace_verified{0}, inplace_differing{0}, inplace_verify_dropped{0};
-    void CheckInPlaceVerifications();
+        inplace_image_or_meta{0};
     std::array<std::atomic<u64>, 64> consumer_census{};
     void Census(u32 index, u64 n = 1) noexcept {
         consumer_census[index & 63].fetch_add(n, std::memory_order_relaxed);
@@ -367,11 +355,6 @@ private:
     const DrawPlan* ring_draw = nullptr;
     const DispatchPlan* ring_dispatch = nullptr;
     const RingBinding* FindRingBinding(const Shader::Info& stage, u32 index) const noexcept;
-    /// TLG_CONST_RING_VERIFY=N: every Nth ring binding of the raster thread is compared with the guest memory it was copied from (a difference is the guest
-    /// writing it after the copy, or a stale copy; the counts tell how often).
-    u32 ring_verify_interval = 0;
-    u64 ring_verify_counter = 0;
-    std::atomic<u64> ring_verified{0}, ring_differing{0};
     std::atomic<u64> ring_queued{0}, ring_written_buffers{0}, ring_offered{0}, ring_taken{0}, ring_bytes{0};
     std::atomic<u64> ring_no_sharp{0}, ring_written{0}, ring_formatted{0}, ring_too_large{0}, ring_immutable{0}, ring_gpu_modified{0}, ring_pending_write{0},
         ring_full{0}, ring_bound{0};
@@ -569,7 +552,7 @@ public:
     std::array<std::atomic<u64>, 5> b6_downloads{}; ///< B6: copy results downloaded into PS4 memory / left on the GPU (no CPU reader)
     std::atomic<u64> b5_copies_on_gpu{0}, b5_copies_on_cpu{0};
     std::atomic<u64> b9_dma_binds{0}, b9_all_binds{0}; ///< B9.4 census: draws / dispatches whose shaders read memory by a raw address, of all ///< B5: guest copies run on the GPU / as a CPU copy in PS4 memory
-    std::array<std::atomic<u64>, 5> b3_stats{}; ///< B3 image bindings: 0 by id, 1 first sight, 2 the object's image changed; verify 3 same image, 4 other image
+    std::array<std::atomic<u64>, 3> b3_stats{}; ///< B3 image bindings: 0 by id, 1 first sight, 2 the object's image changed
 private:
     const bool rt_reuse_enabled;
     bool RtReuseOn() const {
@@ -601,7 +584,6 @@ private:
     const DrawPlan* resolved_draw{};         ///< R2: the draw being bound, when its plan carries resolved bindings
     const DispatchPlan* resolved_dispatch{}; ///< R2: the dispatch being bound
     ResolveStats resolve_stats;
-    bool binder_verify{};
     const DrawPlan* NativeBinderFor(const DrawPlan* plan, u32 draw_class);
     /// kind: 1 buffer, 2 image, 3 sampler descriptor
     const u32* BinderWords(const Shader::Info& stage, u32 offset, u32 dwords, u32 kind, u32* binding_index = nullptr) const;
@@ -609,9 +591,7 @@ private:
     Core::NativeResources::ImmutableBuffer* GeometryHandle(VAddr address, u64 size) const;
     /// N3b: the binder's plan has no flat user data for this stage
     bool StageFlatSkipped(const Shader::Info& stage) const;
-    u32 FlatReadExtra(const Shader::Info& stage) const;
     u32 draw_class_now{15}; ///< census: the draw class of the draw being bound
-    bool draw_has_plan{}; ///< census: the draw being bound came with a plan from the record
     u64 dispatch_caller{}; ///< diagnostics: the game call that made the dispatch being bound
     u8 clip_plane_mask{}; ///< user clip planes of the draw being bound
     std::vector<std::unique_ptr<DispatchPlan>> dispatch_plan_pool;

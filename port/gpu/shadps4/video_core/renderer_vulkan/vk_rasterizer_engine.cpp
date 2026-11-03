@@ -13,7 +13,6 @@
 #include "native/native_log.h"
 #include "native/native_e3_census.h"
 #include "native/native_config.h"
-#include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
 #include "native/native_draw_inputs.h"
@@ -336,7 +335,6 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
     const bool skip_flat = (binder_mode == 1 || binder_mode == 2) && draw.bindings_complete && (binder_mode == 2 || draw_class == 0);
     if ((binder_mode == 1 || binder_mode == 2) && !draw.bindings_complete) {
         Core::NativeRegistry::NoteBinderReason(draw_class, 2, draw.bindings_overflow ? 10 : 1); // the whole draw keeps the flat user data: its binding list is not complete
-        NoteFlatRead(10, draw_class, draw.bindings_overflow ? 1 : 0, 0, Core::NativeDraw::RecordCallerGhidra(draw.seq), 0, draw.binding_count); // census: which call site
     }
     if (!pipeline_cache.PlanGraphicsTyped(exec_key, plan->fixed, vertex_user_data, pixel_user_data, *plan, skip_flat ? &draw : nullptr, draw_class)) {
         Core::NativeDraw::Live().plan_null[2].fetch_add(1, std::memory_order_relaxed);
@@ -436,11 +434,6 @@ void Rasterizer::RecyclePlan(std::unique_ptr<DispatchPlan>&& plan) {
 const DrawPlan* Rasterizer::DispatchBinderFor(const DispatchPlan* plan) {
     const u32 mode = DispatchBinderMode();
     if (mode == 0 || plan == nullptr || !plan->bindings_complete || plan->binding_count == 0) {
-        if (plan != nullptr) {
-            NoteFlatRead(9, mode == 0 ? 1 : !plan->bindings_complete ? 2 : 3, 0, 0, Core::NativeDraw::RecordCallerGhidra(plan->native_seq), 0, plan->binding_count); // a dispatch with no usable record: why and where from
-        } else {
-            NoteFlatRead(9, 4, 0, 0, 0, 0, 0);
-        }
         return nullptr;
     }
     if (!dispatch_binder_plan) {
@@ -466,14 +459,12 @@ const DrawPlan* Rasterizer::DispatchBinderFor(const DispatchPlan* plan) {
             out.has_handles |= out.handles[i] != nullptr;
         }
     }
-    binder_verify = mode == 3;
     g_dump_context = {out.bindings.data(), out.binding_count, plan->native_seq};
     return &out;
 }
 
 const DrawPlan* Rasterizer::NativeBinderFor(const DrawPlan* plan, u32 draw_class) {
     const u32 mode = NativeBinderMode();
-    binder_verify = mode == 3;
     if (plan != nullptr && plan->any_flat_skipped) {
         return plan; // a stage of the plan has no flat user data: the record serves every descriptor, whatever the class
     }
@@ -540,7 +531,6 @@ const u32* Rasterizer::BinderWords(const Shader::Info& stage, u32 offset, u32 dw
                                ? FindRecordWords(stage, binder_plan->bindings.data() + first + 1, binder_plan->binding_count - first - 1, s, kind, offset, dwords, &second, false)
                                : nullptr;
         if (other != nullptr && std::memcmp(words, other, dwords * sizeof(u32)) != 0) {
-            g_identity_audit.dispatch_diff[7].fetch_add(1, std::memory_order_relaxed); // counted as "ambiguous"
             return nullptr;
         }
     }
@@ -686,20 +676,6 @@ bool Rasterizer::PlannedImageWords(const Shader::Info& stage, u32 index, u32 dwo
         }
         words = binder_plan->bindings[binding_index].words + (entry & 0xff);
     }
-    static const u32 every = [] {
-        const char* e = std::getenv("TLG_R3_VERIFY");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::max(std::atoi(e), 0)) : 0u;
-    }();
-    static thread_local u64 counter = 0;
-    if (every != 0 && ++counter % every == 0) {
-        // verify: the raster thread's own lookup gives the same words
-        u32 check_index = ~0u;
-        const u32* check = BinderWords(stage, stage.images[index].sharp_fetch.offsets[0], dwords, 2, &check_index);
-        const_cast<Rasterizer*>(this)->image_words_verified.fetch_add(1, std::memory_order_relaxed);
-        if ((check == nullptr) != (words == nullptr) || (check != nullptr && std::memcmp(check, words, dwords * sizeof(u32)) != 0)) {
-            const_cast<Rasterizer*>(this)->image_words_differing.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
     return true;
 }
 
@@ -726,20 +702,6 @@ std::array<u64, 64> Rasterizer::TakeConsumerCensus() noexcept {
     return out;
 }
 
-void Rasterizer::CheckInPlaceVerifications() {
-    // the submissions the GPU has finished: the bytes it read of an in place buffer may have been rewritten by the CPU since the bind; compare with the copy kept at the bind
-    while (!inplace_checks.empty() && scheduler.IsFree(inplace_checks.front().tick)) {
-        const InPlaceCheck& check = inplace_checks.front();
-        std::vector<u8> now(check.bytes.size());
-        memory->CopySparseMemory(check.address, now.data(), now.size());
-        inplace_verified.fetch_add(1, std::memory_order_relaxed);
-        if (std::memcmp(now.data(), check.bytes.data(), now.size()) != 0) {
-            inplace_differing.fetch_add(1, std::memory_order_relaxed);
-        }
-        inplace_checks.pop_front();
-    }
-}
-
 Rasterizer::InPlaceStats Rasterizer::TakeInPlaceStats() noexcept {
     InPlaceStats s;
     s.offered = inplace_offered.exchange(0);
@@ -750,9 +712,6 @@ Rasterizer::InPlaceStats Rasterizer::TakeInPlaceStats() noexcept {
     s.not_in_backing = inplace_not_in_backing.exchange(0);
     s.gpu_written = inplace_gpu_written.exchange(0);
     s.image_or_meta = inplace_image_or_meta.exchange(0);
-    s.verified = inplace_verified.exchange(0);
-    s.differing = inplace_differing.exchange(0);
-    s.verify_dropped = inplace_verify_dropped.exchange(0);
     if (host_import) {
         s.imported_bytes = host_import->ImportedBytes();
         s.imported_chunks = host_import->ImportedChunks();
@@ -1227,8 +1186,6 @@ Rasterizer::RingStats Rasterizer::TakeRingStats() noexcept {
     s.pending_write = ring_pending_write.exchange(0);
     s.ring_full = ring_full.exchange(0);
     s.bound = ring_bound.exchange(0);
-    s.verified = ring_verified.exchange(0);
-    s.differing = ring_differing.exchange(0);
     return s;
 }
 

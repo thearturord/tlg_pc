@@ -955,8 +955,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                 Core::DebugServer::Publish("native_backend", {{"buffers_resolved_by_the_command_processor", r[0]}, {"bound_from_the_resolution", r[1]},
                                                               {"resolution_stale_at_bind", r[2]},
                                                               {"images", {{"record_words_resolved_by_the_command_processor", rasterizer->image_words_planned.exchange(0)},
-                                                                          {"verified", rasterizer->image_words_verified.load()}, {"WORDS_DIFFERING", rasterizer->image_words_differing.load()},
-                                                                          {"LAYOUT_DIFFERING", rasterizer->image_layout_differing.load()}}},
+                                                                          }},
                                                               {"buffer_slots", {{"new_for_stream_ring", rasterizer->slot_census[0].exchange(0)}, {"new_for_other_buffers", rasterizer->slot_census[2].exchange(0)},
                                                                                 {"hits", rasterizer->slot_census[3].exchange(0)}}},
                                                               {"image_census", Core::NativeResources::ImageCensus()},
@@ -967,7 +966,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                                                                                     {"downloaded_cpu_read_resource", rasterizer->b6_downloads[2].exchange(0)}, {"downloaded_no_engine_owner", rasterizer->b6_downloads[3].exchange(0)},
                                                                                     {"downloaded_explicit_readback", rasterizer->b6_downloads[4].exchange(0)}}},
                                                               {"b3_images", {{"by_engine_id", rasterizer->b3_stats[0].exchange(0)}, {"first_sight", rasterizer->b3_stats[1].exchange(0)},
-                                                                             {"image_changed", rasterizer->b3_stats[2].exchange(0)}, {"verified_same", rasterizer->b3_stats[3].load()}, {"VERIFIED_OTHER_IMAGE", rasterizer->b3_stats[4].load()}}},
+                                                                             {"image_changed", rasterizer->b3_stats[2].exchange(0)}}},
                                                               {"b2_applied", Core::NativeUpdates::B2Report()},
                                                               {"b8_images", Core::NativeUpdates::B8Report()},
                                                               {"b9_buffers", Core::NativeUpdates::B9Report()}, {"zero_copy", rasterizer->GetBufferCache().ZeroCopyReport()}, {"bind_memo", rasterizer->GetBufferCache().BindMemoReport()},
@@ -1100,7 +1099,6 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                                            {{"offered", p.offered}, {"bound_in_place", p.taken}, {"bytes", p.bytes},
                                             {"refused", {{"written_by_a_shader", p.written}, {"too_large", p.too_large}, {"gpu_written_bytes", p.gpu_written}, {"image_or_metadata", p.image_or_meta},
                                                          {"not_in_one_mapped_region_or_import_failed", p.not_in_backing}}},
-                                            {"verify", {{"checked_after_the_gpu_finished", p.verified}, {"bytes_changed_since_the_bind", p.differing}, {"dropped", p.verify_dropped}}},
                                             {"imported", {{"bytes", p.imported_bytes}, {"chunks", p.imported_chunks}, {"failed_chunks", p.failed_chunks}}},
                                             {"note", "counts per ~5 s interval; imported is cumulative"}});
             }
@@ -1109,7 +1107,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                 Core::DebugServer::Publish(
                     "const_ring",
                     {{"level", rasterizer->ConstRingLevel()}, {"queued_ops", ring.queued}, {"written_buffers_noted", ring.written_buffers}, {"offered", ring.offered},
-                     {"taken", ring.taken}, {"bytes", ring.bytes}, {"bound_by_raster", ring.bound}, {"verified", ring.verified}, {"differing", ring.differing},
+                     {"taken", ring.taken}, {"bytes", ring.bytes}, {"bound_by_raster", ring.bound},
                      {"refused", {{"no_sharp", ring.no_sharp}, {"written", ring.written}, {"formatted", ring.formatted}, {"too_large", ring.too_large},
                                   {"immutable", ring.immutable}, {"gpu_modified", ring.gpu_modified}, {"pending_write", ring.pending_write},
                                   {"ring_full", ring.ring_full}}},
