@@ -15,7 +15,9 @@
 #include <nlohmann/json.hpp>
 
 #include "native/native_debug_server.h"
+#include "native/native_desc.h"
 #include "native/native_device.h"
+#include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Core::NativeImageDesc {
 
@@ -34,6 +36,52 @@ constexpr FormatEntry FormatTable[] = {
 
 const FormatEntry* FindFormat(u32 dxgi) {
     for (const auto& entry : FormatTable) {
+        if (entry.dxgi == dxgi) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+/// F4.1: what the host makes of each console format above, as plain numbers: the Vulkan format (and the one a written view uses: sRGB replaced by unorm), bits per block, block
+/// compression, and the component select after the host's per-format remap (RemapSwizzle). Checked field by field against the host's own decode (`CompareDesc`).
+struct PlainEntry {
+    u32 dxgi;
+    vk::Format vk, vk_storage;
+    u32 bits;
+    bool block;
+    u8 swz[4];
+};
+constexpr u8 R = NativeDesc::SwizzleR, G = NativeDesc::SwizzleG, B = NativeDesc::SwizzleB, A = NativeDesc::SwizzleA, Z = NativeDesc::SwizzleZero, O = NativeDesc::SwizzleOne;
+constexpr PlainEntry PlainTable[] = {
+    {10, vk::Format::eR16G16B16A16Sfloat, vk::Format::eR16G16B16A16Sfloat, 64, false, {R, G, B, A}},
+    {16, vk::Format::eR32G32Sfloat, vk::Format::eR32G32Sfloat, 64, false, {R, G, Z, O}},
+    {24, vk::Format::eA2B10G10R10UnormPack32, vk::Format::eA2B10G10R10UnormPack32, 32, false, {R, G, B, A}},
+    {26, vk::Format::eB10G11R11UfloatPack32, vk::Format::eB10G11R11UfloatPack32, 32, false, {R, G, B, O}},
+    {28, vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Unorm, 32, false, {R, G, B, A}},
+    {29, vk::Format::eR8G8B8A8Srgb, vk::Format::eR8G8B8A8Unorm, 32, false, {R, G, B, A}},
+    {31, vk::Format::eR8G8B8A8Snorm, vk::Format::eR8G8B8A8Snorm, 32, false, {R, G, B, A}},
+    {34, vk::Format::eR16G16Sfloat, vk::Format::eR16G16Sfloat, 32, false, {R, G, Z, O}},
+    {37, vk::Format::eR16G16Snorm, vk::Format::eR16G16Snorm, 32, false, {R, G, Z, O}},
+    {39, vk::Format::eR32Uint, vk::Format::eR32Uint, 32, false, {R, Z, Z, Z}},
+    {40, vk::Format::eR32Sfloat, vk::Format::eR32Sfloat, 32, false, {R, Z, Z, O}},
+    {41, vk::Format::eR32Sfloat, vk::Format::eR32Sfloat, 32, false, {R, Z, Z, O}},
+    {46, vk::Format::eR32Sfloat, vk::Format::eR32Sfloat, 32, false, {R, Z, Z, O}},
+    {49, vk::Format::eR8G8Unorm, vk::Format::eR8G8Unorm, 16, false, {R, G, Z, O}},
+    {54, vk::Format::eR16Sfloat, vk::Format::eR16Sfloat, 16, false, {R, Z, Z, O}},
+    {61, vk::Format::eR8Unorm, vk::Format::eR8Unorm, 8, false, {R, Z, Z, O}},
+    {70, vk::Format::eBc1RgbaUnormBlock, vk::Format::eBc1RgbaUnormBlock, 64, true, {R, G, B, A}},
+    {76, vk::Format::eBc3UnormBlock, vk::Format::eBc3UnormBlock, 128, true, {R, G, B, A}},
+    {79, vk::Format::eBc4UnormBlock, vk::Format::eBc4UnormBlock, 64, true, {R, Z, Z, O}},
+    {84, vk::Format::eBc5SnormBlock, vk::Format::eBc5SnormBlock, 128, true, {R, G, Z, O}},
+    {87, vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Unorm, 32, false, {B, G, R, A}},
+    {94, vk::Format::eBc6HUfloatBlock, vk::Format::eBc6HUfloatBlock, 128, true, {R, G, B, O}},
+    {95, vk::Format::eBc6HUfloatBlock, vk::Format::eBc6HUfloatBlock, 128, true, {R, G, B, O}},
+    {97, vk::Format::eBc7UnormBlock, vk::Format::eBc7UnormBlock, 128, true, {R, G, B, A}},
+};
+
+const PlainEntry* FindPlain(u32 dxgi) {
+    for (const auto& entry : PlainTable) {
         if (entry.dxgi == dxgi) {
             return &entry;
         }
@@ -83,6 +131,39 @@ std::map<std::string, std::set<std::string>> g_sampler_map; ///< sampler object 
 std::array<std::array<std::string, 12>, FieldCount> g_examples; ///< the first distinct examples per field (derived -> actual, then the resource)
 std::array<u32, FieldCount> g_example_count{};
 std::map<std::string, std::set<std::pair<u32, u32>>> g_pitches; ///< "format F tile T" -> (width, pitch) pairs seen
+
+// F4.1 plain description compare
+enum DescField : u32 {
+    DAddress, DVkFormat, DVkFormatStorage, DNumBits, DIsBlock, DType, DWidth, DHeight, DDepth, DPitch, DBaseLevel, DLastLevel, DBaseArray, DLastArray, DTileMode, DPow2Pad, DAltTile, DMinLod, DSwizzle, DescFieldCount
+};
+constexpr const char* DescFieldNames[DescFieldCount] = {"address", "vk_format", "vk_format_storage", "num_bits", "is_block", "type", "width", "height", "depth", "pitch", "base_level", "last_level",
+                                                       "base_array", "last_array", "tile_mode", "pow2_pad", "alt_tile_mode", "min_lod", "swizzle"};
+std::atomic<u64> g_dc_compared{}, g_dc_equal{}, g_dc_not_derived{}, g_dc_accessor_bad{};
+std::array<std::atomic<u64>, DescFieldCount> g_dc_differing{};
+std::array<std::atomic<u64>, 9> g_dc_accessor_differs{};
+std::array<std::vector<std::string>, DescFieldCount> g_dc_examples;
+
+void DescValues(const NativeDesc::ImageDesc& d, u64 (&v)[DescFieldCount]) {
+    v[DAddress] = d.address;
+    v[DVkFormat] = d.vk_format;
+    v[DVkFormatStorage] = d.vk_format_storage;
+    v[DNumBits] = d.num_bits;
+    v[DIsBlock] = d.is_block;
+    v[DType] = d.type;
+    v[DWidth] = d.width;
+    v[DHeight] = d.height;
+    v[DDepth] = d.depth;
+    v[DPitch] = d.pitch;
+    v[DBaseLevel] = d.base_level;
+    v[DLastLevel] = d.last_level;
+    v[DBaseArray] = d.base_array;
+    v[DLastArray] = d.last_array;
+    v[DTileMode] = d.tile_mode;
+    v[DPow2Pad] = d.pow2_pad;
+    v[DAltTile] = d.alt_tile_mode;
+    v[DMinLod] = d.min_lod;
+    v[DSwizzle] = d.swizzle[0] | d.swizzle[1] << 4 | d.swizzle[2] << 8 | d.swizzle[3] << 12;
+}
 
 } // namespace
 
@@ -184,6 +265,99 @@ Result Derive(u64 resource_id, u64 view_id, AmdGpu::Image& out) {
     }
     out.depth = type == TypeColor3D ? res.depth - 1 : type == TypeCube ? layers / 6 - 1 : layers - 1;
     return Result::Derived;
+}
+
+bool DeriveDesc(u64 resource_id, u64 view_id, NativeDesc::ImageDesc& out) {
+    using NativeDevice::Kind;
+    NativeDevice::Object res, view;
+    if (resource_id == 0 || !NativeDevice::Lookup(resource_id, res)) {
+        return false;
+    }
+    const bool view_known = view_id != 0 && NativeDevice::Lookup(view_id, view);
+    const bool has_view = view_known && view.has_desc;
+    const u32 dxgi = has_view ? view.desc[0] : res.format;
+    const FormatEntry* format = FindFormat(dxgi);
+    const PlainEntry* plain = FindPlain(dxgi);
+    if (format == nullptr || plain == nullptr) {
+        return false;
+    }
+    out = {};
+    res.mips = std::max<u32>(res.mips, 1);
+    out.address = res.address >> 8 << 8;
+    out.vk_format = static_cast<u32>(plain->vk);
+    out.vk_format_storage = static_cast<u32>(plain->vk_storage);
+    out.num_bits = plain->bits;
+    out.is_block = plain->block;
+    std::memcpy(out.swizzle, plain->swz, 4);
+    out.width = res.width;
+    out.height = res.height;
+    const u32 layers = std::max<u32>(res.layers, 1);
+    out.tile_mode = res.kind == Kind::Texture3D ? 19 : (res.bind & 0x40) != 0 ? 0 : (res.bind & 0x20) != 0 ? 14 : 13;
+    out.pow2_pad = res.mips > 1;
+    {
+        const bool block_compressed = format->data_format >= 35 && format->data_format <= 41;
+        const bool one_byte = format->data_format == 1;
+        const u32 align = block_compressed ? 32 : (out.tile_mode == 0 || (out.tile_mode == 14 && one_byte)) ? 256 : 8;
+        const u32 pitch = out.pow2_pad ? std::bit_ceil(res.width) : res.width;
+        out.pitch = (pitch + align - 1) / align * align;
+    }
+    u32 base_level = 0, last_level = res.mips - 1, base_array = 0, last_array = 0;
+    u32 type = res.kind == Kind::Texture3D ? NativeDesc::Type3D
+               : res.kind == Kind::Texture1D ? (layers > 1 ? NativeDesc::Type1DArray : NativeDesc::Type1D)
+               : layers == 6                 ? NativeDesc::TypeCube
+               : layers > 1                  ? NativeDesc::Type2DArray
+                                             : NativeDesc::Type2D;
+    if (has_view) {
+        const u32 dim = view.desc[1];
+        if (view.kind == Kind::ShaderResourceView) {
+            const u32 most_detailed = std::min(view.desc[2], res.mips - 1);
+            const u32 levels = view.desc[3] == 0xffffffffu ? res.mips - most_detailed : view.desc[3];
+            base_level = most_detailed;
+            last_level = most_detailed + levels - 1;
+            if (dim == Dim2DArray || dim == Dim1DArray) {
+                base_array = view.desc[4];
+                last_array = base_array + (view.desc[5] == 0xffffffffu ? layers - base_array : view.desc[5]) - 1;
+            }
+        } else if (view.kind == Kind::UnorderedAccessView) {
+            base_level = last_level = view.desc[2];
+            if (dim == Dim2DArray || dim == Dim1DArray) {
+                base_array = view.desc[3];
+                last_array = base_array + (view.desc[4] == 0xffffffffu ? layers - base_array : view.desc[4]) - 1;
+            }
+        }
+        if (res.kind != Kind::Texture3D) {
+            type = dim == Dim1D        ? NativeDesc::Type1D
+                   : dim == Dim1DArray ? NativeDesc::Type1DArray
+                   : dim == Dim2D      ? NativeDesc::Type2D
+                   : dim == Dim2DArray ? NativeDesc::Type2DArray
+                   : (dim == DimCube || dim == DimCubeArray) ? NativeDesc::TypeCube
+                                                              : type;
+        }
+    }
+    if (type == NativeDesc::Type3D && has_view && view.kind == Kind::UnorderedAccessView) {
+        base_array = view.desc[3];
+        last_array = base_array + (view.desc[4] == 0xffffffffu ? res.depth - base_array : view.desc[4]) - 1;
+    } else if (type == NativeDesc::TypeCube && !(has_view && view.kind == Kind::ShaderResourceView && (view.desc[1] == Dim2DArray || view.desc[1] == Dim1DArray))) {
+        last_array = layers - 1;
+    }
+    out.type = type;
+    out.base_level = base_level;
+    out.last_level = last_level;
+    out.base_array = base_array;
+    out.last_array = last_array;
+    // the descriptor the engine keeps inside the view object (+0x58): the padded rows and the limited level count (see Derive)
+    if (view_known && view.object != 0) {
+        u64 q[2];
+        std::memcpy(q, reinterpret_cast<const void*>(view.object + 0x58), sizeof(q));
+        const u64 held_address = q[0] & ((1ull << 38) - 1), held_dfmt = (q[0] >> 52) & 0x3f, held_nfmt = (q[0] >> 58) & 0xf;
+        if (held_address == res.address >> 8 && held_dfmt == format->data_format && held_nfmt == format->num_format) {
+            out.width = static_cast<u32>(q[1] & 0x3fff) + 1;
+            out.height = static_cast<u32>((q[1] >> 14) & 0x3fff) + 1;
+            out.last_level = static_cast<u32>((q[1] >> 48) & 0xf);
+        }
+    }
+    out.depth = type == NativeDesc::Type3D ? res.depth - 1 : type == NativeDesc::TypeCube ? layers / 6 - 1 : layers - 1;
+    return true;
 }
 
 bool Decides() noexcept {
@@ -390,6 +564,56 @@ void Compare(u64 resource_id, u64 view_id, const AmdGpu::Image& actual) {
     }
 }
 
+bool DescCompareOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_DESC_CHECKS");
+        return e != nullptr && *e == '1';
+    }();
+    return on;
+}
+
+void CompareDesc(u64 resource_id, u64 view_id, const NativeDesc::ImageDesc& reference, u32 accessor_mismatch) {
+    NativeDesc::ImageDesc engine;
+    if (!DeriveDesc(resource_id, view_id, engine)) {
+        g_dc_not_derived.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_dc_compared.fetch_add(1, std::memory_order_relaxed);
+    u64 a[DescFieldCount], b[DescFieldCount];
+    DescValues(engine, a);
+    DescValues(reference, b);
+    bool any = false;
+    for (u32 i = 0; i < DescFieldCount; ++i) {
+        if (a[i] == b[i]) {
+            continue;
+        }
+        any = true;
+        g_dc_differing[i].fetch_add(1, std::memory_order_relaxed);
+        std::scoped_lock lock{g_mutex};
+        if (g_dc_examples[i].size() < 6) {
+            NativeDevice::Object res;
+            NativeDevice::Lookup(resource_id, res);
+            const std::string text = fmt::format("engine {:#x} reference {:#x} (resource {}x{} mips {} layers {} depth {} format {} bind {:#x}; reference type {} fmt {} tile {})", a[i], b[i], res.width, res.height, res.mips,
+                                                 res.layers, res.depth, res.format, res.bind, reference.type, reference.vk_format, reference.tile_mode);
+            if (std::find(g_dc_examples[i].begin(), g_dc_examples[i].end(), text) == g_dc_examples[i].end()) {
+                g_dc_examples[i].push_back(text);
+            }
+        }
+    }
+    if (accessor_mismatch != 0) {
+        any = true;
+        g_dc_accessor_bad.fetch_add(1, std::memory_order_relaxed);
+        for (u32 i = 0; i < g_dc_accessor_differs.size(); ++i) {
+            if ((accessor_mismatch >> i) & 1) {
+                g_dc_accessor_differs[i].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    if (!any) {
+        g_dc_equal.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 bool DeriveSampler(u64 object, const u32* record_words, u32* out) {
     const auto rd = [&](u32 off) {
         u32 v;
@@ -556,6 +780,23 @@ nlohmann::json Report() {
     j["equal_in_every_field"] = g_equal.load();
     j["object_not_in_the_table"] = g_unknown_object.load();
     j["format_not_in_the_table"] = g_unknown_format.load();
+    {
+        nlohmann::json plain = {{"compared", g_dc_compared.load()}, {"equal_in_every_field_and_accessor", g_dc_equal.load()}, {"engine_description_not_available", g_dc_not_derived.load()},
+                                {"accessor_mismatch_bindings", g_dc_accessor_bad.load()}};
+        for (u32 i = 0; i < DescFieldCount; ++i) {
+            plain["differing_fields"][DescFieldNames[i]] = g_dc_differing[i].load();
+        }
+        for (u32 i = 0; i < g_dc_accessor_differs.size(); ++i) {
+            plain["accessor_differs"][AccessorNames[i]] = g_dc_accessor_differs[i].load();
+        }
+        std::scoped_lock plain_lock{g_mutex};
+        for (u32 i = 0; i < DescFieldCount; ++i) {
+            for (const auto& text : g_dc_examples[i]) {
+                plain["examples"][DescFieldNames[i]].push_back(text);
+            }
+        }
+        j["f4_1_plain_description"] = std::move(plain);
+    }
     auto& fields = j["differing_fields"] = nlohmann::json::object();
     for (u32 i = 0; i < FieldCount; ++i) {
         fields[FieldNames[i]] = g_differing[i].load();

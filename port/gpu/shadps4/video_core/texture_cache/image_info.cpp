@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/videoout/buffer.h"
+#include "native/native_desc.h"
 #include "native/native_field_use.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/pixel_format.h"
@@ -165,6 +166,57 @@ ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& de
         alt_tile = Libraries::Kernel::sceKernelIsNeoMode();
     }
     UpdateSize();
+}
+
+Core::NativeDesc::ImageDesc ImageDescFromSharp(const AmdGpu::Image& sharp) noexcept {
+    Core::NativeDesc::ImageDesc d;
+    const auto dfmt = sharp.GetDataFmt();
+    const auto nfmt = sharp.GetNumberFmt();
+    d.address = sharp.Address();
+    d.vk_format = static_cast<u32>(LiverpoolToVK::SurfaceFormat(dfmt, nfmt));
+    d.vk_format_storage = static_cast<u32>(LiverpoolToVK::SurfaceFormat(dfmt, nfmt == AmdGpu::NumberFormat::Srgb ? AmdGpu::NumberFormat::Unorm : nfmt));
+    d.num_bits = NumBitsPerBlock(dfmt);
+    d.is_block = AmdGpu::IsBlockCoded(dfmt);
+    d.type = static_cast<u32>(sharp.type);
+    d.width = sharp.width + 1;
+    d.height = sharp.height + 1;
+    d.depth = sharp.depth;
+    d.pitch = sharp.Pitch();
+    d.base_level = sharp.base_level;
+    d.last_level = sharp.last_level;
+    d.base_array = sharp.base_array;
+    d.last_array = sharp.last_array;
+    d.tile_mode = sharp.tiling_index;
+    d.pow2_pad = sharp.pow2pad != 0;
+    d.alt_tile_mode = sharp.alt_tile_mode != 0;
+    d.min_lod = static_cast<u32>(sharp.min_lod);
+    const auto dst = sharp.DstSelect();
+    d.swizzle[0] = static_cast<u8>(dst.r);
+    d.swizzle[1] = static_cast<u8>(dst.g);
+    d.swizzle[2] = static_cast<u8>(dst.b);
+    d.swizzle[3] = static_cast<u8>(dst.a);
+    return d;
+}
+
+u32 ImageDescAccessorMismatch(const AmdGpu::Image& sharp, const Core::NativeDesc::ImageDesc& desc) noexcept {
+    u32 mask = 0;
+    const auto note = [&](u32 bit, bool equal) { mask |= equal ? 0u : 1u << bit; };
+    note(0, desc.NumLayers() == sharp.NumLayers());
+    note(1, desc.NumLevels() == sharp.NumLevels());
+    note(2, desc.NumSamples() == sharp.NumSamples());
+    note(3, desc.BaseType() == static_cast<u32>(sharp.GetBaseType()));
+    bool view_type = true, view_levels = true, view_layers = true;
+    for (const bool is_array : {false, true}) {
+        view_type &= desc.ViewType(is_array) == static_cast<u32>(sharp.GetViewType(is_array));
+        view_levels &= desc.NumViewLevels(is_array) == sharp.NumViewLevels(is_array);
+        view_layers &= desc.NumViewLayers(is_array) == sharp.NumViewLayers(is_array);
+    }
+    note(4, view_type);
+    note(5, view_levels);
+    note(6, view_layers);
+    note(7, desc.IsTiled() == sharp.IsTiled());
+    note(8, desc.IsVolume() == (sharp.GetBaseType() == AmdGpu::ImageType::Color3D));
+    return mask;
 }
 
 bool ImageInfo::IsCompatible(const ImageInfo& info) const {

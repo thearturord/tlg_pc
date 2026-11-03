@@ -2826,6 +2826,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             auto* image = &texture_cache.GetImage(image_id);
             if (image_from_record && i == 0) {
                 Core::NativeImageDesc::Compare(image_engine_id, image_view_id, tsharp); // E2 shadow derivation
+                if (Core::NativeImageDesc::DescCompareOn()) { // F4.1 plain description against the T# helpers
+                    const auto reference = VideoCore::ImageDescFromSharp(tsharp);
+                    Core::NativeImageDesc::CompareDesc(image_engine_id, image_view_id, reference, VideoCore::ImageDescAccessorMismatch(tsharp, reference));
+                }
                 Core::NativeDevice::CheckImageSharp(image_engine_id, image_view_id, {.data_format = u32(tsharp.GetDataFmt()),
                                                                       .num_format = u32(tsharp.GetNumberFmt()),
                                                                       .type = u32(tsharp.type),

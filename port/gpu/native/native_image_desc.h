@@ -3,6 +3,7 @@
 
 #include <nlohmann/json_fwd.hpp>
 #include "common/types.h"
+#include "native/native_desc.h"
 #include "video_core/amdgpu/resource.h"
 
 /// E2 (documents/tlg/native plan/no-emulation-plan.md): the description of an image a draw samples, derived from the engine's own objects instead of read from the
@@ -22,6 +23,16 @@ enum class Result : u8 {
 
 /// The image of the resource `resource_id` as seen through the view `view_id` (0: the resource itself).
 [[nodiscard]] Result Derive(u64 resource_id, u64 view_id, AmdGpu::Image& out);
+
+/// F4.1: the same description as plain numbers (`native_desc.h`), from the engine's objects only (no T# word is read; the view's own copy of the descriptor at +0x58 is read as plain
+/// bits for the padded rows and the limited level count). False when the object or its format is not in the tables.
+[[nodiscard]] bool DeriveDesc(u64 resource_id, u64 view_id, NativeDesc::ImageDesc& out);
+/// `TLG_DESC_CHECKS=1`: the caller builds the reference description from the T# (`ImageDescFromSharp`) and `CompareDesc` compares it field by field with `DeriveDesc`.
+/// `accessor_mismatch` is the host side's check of the accessors of the engine's description against the T# helper functions (bit per accessor, `AccessorNames`).
+[[nodiscard]] bool DescCompareOn() noexcept;
+void CompareDesc(u64 resource_id, u64 view_id, const NativeDesc::ImageDesc& reference, u32 accessor_mismatch);
+/// the description the accessor bit names (bit order of the mask `CompareDesc` receives)
+constexpr const char* AccessorNames[] = {"NumLayers", "NumLevels", "NumSamples", "BaseType", "ViewType", "NumViewLevels", "NumViewLayers", "IsTiled", "IsVolume"};
 
 /// True: the image descriptor of a binding comes from `Derive` and the words the record holds only verify (default; `TLG_IMAGE_DESC=0` turns it off).
 [[nodiscard]] bool Decides() noexcept;

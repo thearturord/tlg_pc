@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/types.h"
+#include "native/native_desc.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/tiling.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -37,6 +38,11 @@ struct ImageProperties {
     /// tlg: block-compressed 1D image: still 1D for the cache, a 2D image of height 1 in Vulkan.
     u32 is_host_2d : 1;
 };
+
+/// F4.1: the plain description (`native/native_desc.h`) read from a T# with the emulator's own helper functions: the reference the native description is compared with.
+/// `ImageDescAccessorMismatch` checks the accessors of a description against the T# helpers (bit per accessor, `Core::NativeImageDesc::AccessorNames`) for `is_array` both ways.
+Core::NativeDesc::ImageDesc ImageDescFromSharp(const AmdGpu::Image& sharp) noexcept;
+u32 ImageDescAccessorMismatch(const AmdGpu::Image& sharp, const Core::NativeDesc::ImageDesc& desc) noexcept;
 
 struct ImageInfo {
     ImageInfo() = default;
