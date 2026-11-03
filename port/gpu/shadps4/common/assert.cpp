@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "core/signals.h"
 #include "emulator.h"
+#include "native/native_flight.h"
 
 #if defined(ARCH_X86_64)
 #define Crash() __asm__ __volatile__("int $3")
@@ -15,6 +16,7 @@
 #endif
 
 void assert_fail_impl() {
+    Core::Flight::DumpCrash("assertion failed (the log has the message; a Vulkan device lost ends here too)");
     Core::Signals::Instance()->RemoveHandlers();
     Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     Crash();

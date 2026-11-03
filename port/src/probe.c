@@ -173,6 +173,14 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     const CONTEXT *c=info->ContextRecord;
     char where[MAX_PATH+64];
     describe_address(where,sizeof(where),(uintptr_t)c->Rip);
+    char crash_note[MAX_PATH+160];
+    if (record->ExceptionCode==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2)
+        snprintf(crash_note,sizeof(crash_note),"access violation (%s) of %p at %s, thread %lu",
+                 record->ExceptionInformation[0]==1 ? "write" : record->ExceptionInformation[0]==8 ? "execute" : "read",
+                 (void *)record->ExceptionInformation[1],where,GetCurrentThreadId());
+    else
+        snprintf(crash_note,sizeof(crash_note),"exception 0x%08lx at %s, thread %lu",record->ExceptionCode,where,GetCurrentThreadId());
+    if (gpu_enabled) tlggpu_dump_crash("CPU fault",crash_note);
     if (record->ExceptionCode==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2)
         fprintf(stderr,"Fault: %s access to %p at %s (thread %lu)\n",
                 record->ExceptionInformation[0]==1 ? "write" : record->ExceptionInformation[0]==8 ? "execute" : "read",

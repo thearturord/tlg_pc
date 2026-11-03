@@ -14,6 +14,7 @@
 #include <vector>
 #include <fmt/format.h>
 #include <httplib.h>
+#include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
@@ -444,6 +445,23 @@ nlohmann::json Policy(const Params&) {
 nlohmann::json SetPolicy(const Params& params) {
     nlohmann::json j;
     for (const auto& [name, value] : params) {
+        if (name == "inject_fault") {
+            // L2 dry run (development only): "cpu" faults on this thread, "device_lost" writes the report and goes on, "assert" is the real assertion path
+            if (value == "cpu") {
+                j[name] = "faulting now";
+                *static_cast<volatile int*>(nullptr) = 1;
+            } else if (value == "device_lost") {
+                Core::Flight::Add(Core::Flight::DeviceLost, 0, 0, 99);
+                Core::Flight::DumpCrash("injected Vulkan device lost");
+                j[name] = "report written";
+            } else if (value == "assert") {
+                j[name] = "asserting now";
+                ASSERT_MSG(false, "injected assertion (inject_fault=assert)");
+            } else {
+                j[name] = "unknown: cpu, device_lost or assert";
+            }
+            continue;
+        }
         const bool ok = VideoCore::ReadbackPolicy::Set(name, static_cast<s64>(std::stoll(value, nullptr, 0)));
         j[name] = ok ? "ok" : "unknown name";
     }
@@ -674,7 +692,7 @@ void RegisterBuiltins() {
     Register("/stream_probe", "(study) the shape of the submitted command buffers and what the game changes after the draw hook saw it", StreamProbeReport);
     Register("/timeline", "?n=8000: the latest frame events (study): hooks, submits, flips, command processor waits, presents", Timeline);
     Register("/flight", "(L1) the flight recorder: ?n=200 events per thread (merged by time), what each thread is doing; ?bench=1 first runs the microbenchmark",
-             [](const Params& params) { return Core::Flight::Report(static_cast<u32>(std::min<u64>(ParseNumber(params, "n", 200), Core::Flight::RingEvents)), ParseNumber(params, "bench", 0) != 0); });
+             [](const Params& params) { return nlohmann::json::parse(Core::Flight::Report(static_cast<u32>(std::min<u64>(ParseNumber(params, "n", 200), Core::Flight::RingEvents)), ParseNumber(params, "bench", 0) != 0)); });
     Register("/frames", "?n=600: the last n frame intervals (time stamp and length in ms)", Frames);
     Register("/timeline_capture", "?seconds=10&tag=name: records every frame timeline event for that long into log/timeline_<tag>.bin (+ .json); without arguments: the state", TimelineCapture);
     Register("/periodic", "last runs of periodic jobs (when they ended, how long they took)",
@@ -757,6 +775,10 @@ void NoteWriteFaultTime(VAddr address, u64 nanoseconds) {
 }
 
 void Start(u16 port) {
+    {
+        const auto log_dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir).string();
+        Core::Flight::SetLogDirectory(log_dir.c_str()); // L2: where crash_<time>.txt goes
+    }
     std::scoped_lock lk{lifecycle_mutex};
     if (port == 0 || server) {
         return;

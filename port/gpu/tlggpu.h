@@ -30,6 +30,8 @@ int tlggpu_handle_fault(void *ucontext, void *address);
 void tlggpu_note_host_write(const void *address, uint64_t size);
 /* TLG_WRITE_LOG=1: prints the logged GPU-side writes to guest memory near the fault. */
 void tlggpu_dump_guest_writes(void *ucontext);
+/* L2: the flight recorder's crash report (user/log/crash_<time>_<n>.txt and .flight.json); note may be NULL. */
+void tlggpu_dump_crash(const char *reason, const char *note);
 /* Keyboard text entry through the game window (IME dialog). begin returns 0 when
  * no window exists; poll returns 0 typing, 1 confirmed, 2 cancelled (UTF-8 text). */
 int tlggpu_text_input_begin(const char *initial_utf8, const char *prompt_utf8);

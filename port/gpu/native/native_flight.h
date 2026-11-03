@@ -161,4 +161,12 @@ std::string Report(u32 per_thread, bool bench);
 /// Total events written by all threads (for the stats line).
 u64 EventsWritten();
 
+/// L2: the folder the crash files go to (the debug server's start gives the user log folder; without it "user/log" next to the working directory).
+void SetLogDirectory(const char* utf8_path);
+
+/// L2: writes crash_<time>_<n>.txt and .flight.json in the log folder for the process state of this moment: why, what every thread is doing, the last event of every kind, the last rare
+/// events and the last 64 events of every thread in time order. For the fault handler and the device lost branches: it takes no lock and allocates nothing (static buffers, WriteFile).
+/// `note` is printed under the reason (the faulting address, for example) and may be null. At most 8 reports per run.
+void DumpCrash(const char* reason, const char* note = nullptr);
+
 } // namespace Core::Flight
