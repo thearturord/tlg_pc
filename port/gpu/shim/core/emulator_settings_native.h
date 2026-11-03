@@ -79,9 +79,6 @@
     std::string m_type = EnvString("TLG_TYPE", "wincolor");
     std::string GetLogType() const { return m_type; }
     void SetLogType(const std::string& v, bool = false) { m_type = v; }
-    u32 m_native_packet_path = static_cast<u32>(Number("TLG_NATIVE_PACKET_PATH", static_cast<long>(0)));
-    u32 GetNativePacketPath() const { return m_native_packet_path; }
-    void SetNativePacketPath(u32 v, bool = false) { m_native_packet_path = v; }
     u32 m_raster_delay_ns = static_cast<u32>(Number("TLG_RASTER_DELAY_NS", static_cast<long>(0)));
     u32 GetRasterDelayNs() const { return m_raster_delay_ns; }
     void SetRasterDelayNs(u32 v, bool = false) { m_raster_delay_ns = v; }

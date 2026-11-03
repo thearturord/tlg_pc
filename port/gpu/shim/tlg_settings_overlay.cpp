@@ -40,7 +40,6 @@ void EmulatorSettingsImpl::LoadOverlay(const std::string& path) {
         if (auto it = j.find("skip_duplicate"); it != j.end() && !it->is_null()) m_skip_duplicate = it->get<bool>();
         if (auto it = j.find("sync"); it != j.end() && !it->is_null()) m_sync = it->get<bool>();
         if (auto it = j.find("type"); it != j.end() && !it->is_null()) m_type = it->get<std::string>();
-        if (auto it = j.find("native_packet_path"); it != j.end() && !it->is_null()) m_native_packet_path = it->get<u32>();
         if (auto it = j.find("raster_delay_ns"); it != j.end() && !it->is_null()) m_raster_delay_ns = it->get<u32>();
         if (auto it = j.find("readback_async_fences_enabled"); it != j.end() && !it->is_null()) m_readback_async_fences_enabled = it->get<bool>();
         if (auto it = j.find("readback_async_guest_faults"); it != j.end() && !it->is_null()) m_readback_async_guest_faults = it->get<bool>();

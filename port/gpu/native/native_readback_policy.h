@@ -72,7 +72,6 @@ struct State {
     std::atomic<s32> rt_reuse_override{-1};       ///< rt_lookup_reuse_enabled 0/1
     /// Diagnostics: draw call sites (Ghidra addresses of the return address) that are not executed natively; /set?exclude_caller=<address> adds one, 0 clears the list
     std::array<std::atomic<u32>, 32> exclude_callers{};
-    std::atomic<s32> packet_path{0};              ///< 0: the packet walk is off: a command buffer runs from its entries only, the packets that are not entries are not executed (logged as errors)
     std::atomic<s32> cs_audit{0};                 ///< audit: a record dispatch's compute program against the record alone on a zeroed program (counters in /native)
     std::atomic<s32> register_packets{1};         ///< SET_SH_REG, DISPATCH_DIRECT and WRITE_DATA of the graphics queue are entries of a direct buffer (0: they make it mixed)
     std::atomic<s32> stage_reuse_override{-1};    ///< stage_lookup_reuse 0..2

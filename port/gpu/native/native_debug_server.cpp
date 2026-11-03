@@ -233,11 +233,6 @@ nlohmann::json Native(const Params&) {
     j["track_native"] = live.track_native.load();
     j["track_fce"] = live.track_fce.load();
     j["track_game"] = live.track_game_second.load() + live.track_game_depth.load();
-    auto& packets = j["packets"] = nlohmann::json::array();
-    for (const auto& p : live.packets) {
-        packets.push_back(p.load());
-    }
-    j["asc_packets"] = live.asc_packets.load();
     return j;
 }
 

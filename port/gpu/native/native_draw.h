@@ -53,7 +53,7 @@ struct LiveCounters {
     /// draws of a shader without a fetch object yet (`native_sdk_strip` bit 2147483648): the game's draw function ran, the record was built again afterwards
     /// the texture map helper's upload dispatch (`map_native`): calls seen, records patched into the tag, refused, executed
     /// compute program audit (`cs_audit`): record dispatches seen, those whose program (queue state plus record) differs from the record alone on a zeroed program, and the dwords that differ
-    /// `native_packet_path` 0: command buffers that are not pure and the packets of them that were not executed
+    /// command buffers that are not pure (they run from their entries only) and the packets of them that were not executed
     std::atomic<u64> packet_path_skipped_buffers{}, packet_path_skipped_packets{};
     /// register values the native records apply to the command processor's draw state (OverlaySet): offered, not covered by any member, equal to the held value, changed
     std::array<std::atomic<u32>, 65536> overlay_changed_by_index{};
@@ -100,10 +100,6 @@ struct LiveCounters {
     std::atomic<u64> track_native{}, track_fce{}, track_game_second{}, track_game_depth{};
     /// fixed-function state of native draws: used from the engine's objects, compared with the registers, and the compares that differed
     std::atomic<u64> fixed_native{};
-    /// command packets by the group of the last native tag: 0 none, 1 executed draw, 2 packet-path draw, 3 executed
-    /// dispatch, 4 packet-path dispatch, 5 fast clear eliminate
-    std::array<std::atomic<u64>, 6> packets{};
-    std::atomic<u64> asc_packets{};
 };
 LiveCounters& Live();
 

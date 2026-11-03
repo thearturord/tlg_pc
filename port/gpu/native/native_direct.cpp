@@ -209,11 +209,6 @@ void AddSpan(Buffer& buffer, const u32* begin, u32 dwords, u32 depth, bool marke
 
 } // namespace
 
-// C8 (2026-10-28): there is no packet path any more; a command buffer always runs from its entries.
-bool PacketPathOff() {
-    return true;
-}
-
 bool ExecuteEnabled() {
     return Enabled();
 }
@@ -273,7 +268,7 @@ std::shared_ptr<Buffer> Build(u32 queue, const u32* dcb, u32 dwords, bool has_co
         }
     }
     buffer->pure = other_total == 0;
-    if (!buffer->pure && PacketPathOff()) {
+    if (!buffer->pure) {
         auto& live_off = Core::NativeDraw::Live();
         live_off.packet_path_skipped_buffers.fetch_add(1, std::memory_order_relaxed);
         live_off.packet_path_skipped_packets.fetch_add(other_total, std::memory_order_relaxed);
@@ -281,7 +276,7 @@ std::shared_ptr<Buffer> Build(u32 queue, const u32* dcb, u32 dwords, bool has_co
         static std::set<std::string> off_signatures;
         std::scoped_lock off_lock{off_mutex};
         if (off_signatures.size() < 64 && off_signatures.insert(key).second) {
-            LOG_ERROR(Core, "packet path is off: {} packets of a command buffer (queue {}, {} dwords) are not executed (opcode:count):{}", other_total, queue, dwords,
+            LOG_ERROR(Core, "a command buffer runs from its entries only: {} packets of a command buffer (queue {}, {} dwords) are not executed (opcode:count):{}", other_total, queue, dwords,
                       signature);
             std::vector<std::pair<u32, u32>> walk;
             for (u32 at = 0; at < dwords;) {

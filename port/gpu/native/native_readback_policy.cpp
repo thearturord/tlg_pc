@@ -36,7 +36,6 @@ void InitFromSettings() {
     s.stream_probe = EmulatorSettings.GetCpStreamProbe();
     s.raster_delay_ns = EmulatorSettings.GetRasterDelayNs();
     s.raster_core = EmulatorSettings.GetCpRasterCore();
-    s.packet_path = static_cast<s32>(EmulatorSettings.GetNativePacketPath());
 }
 
 bool Set(std::string_view name, s64 value) {
@@ -96,8 +95,6 @@ bool Set(std::string_view name, s64 value) {
                 }
             }
         }
-    } else if (name == "packet_path") {
-        s.packet_path = static_cast<s32>(value);
     } else if (name == "cs_audit") {
         s.cs_audit = static_cast<s32>(value);
     } else if (name == "register_packets") {
@@ -140,7 +137,6 @@ nlohmann::json Dump() {
             {"stream_reuse", s.stream_reuse_override.load()},
             {"rt_reuse", s.rt_reuse_override.load()},
             {"stage_reuse", s.stage_reuse_override.load()},
-            {"packet_path", s.packet_path.load()},
             {"cs_audit", s.cs_audit.load()},
             {"register_packets", s.register_packets.load()},
             {"note", "fence kinds: 1 gfx EOP, 2 gfx EOS, 4 compute release, 8 held write, "

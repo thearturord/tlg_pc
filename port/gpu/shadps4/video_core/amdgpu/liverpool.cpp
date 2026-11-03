@@ -39,7 +39,6 @@
 #include "native/native_display.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/liverpool_internal.h"
-#include "video_core/amdgpu/pm4_cmds.h"
 #include "native/native_readback_policy.h"
 #include "video_core/readback_stats.h"
 #include "video_core/readback_trace.h"
@@ -88,20 +87,6 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 #define RESUME_ASC(task, id) RESUME(task, acb_task_name[id])
 
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
-
-static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset) {
-    if (offset > span.size()) {
-        LOG_ERROR(
-            Lib_GnmDriver,
-            ": packet length exceeds remaining submission size. Packet dword count={}, remaining "
-            "submission dwords={}",
-            offset, span.size());
-        // Return empty subspan so check for next packet bails out
-        return {};
-    }
-
-    return span.subspan(offset);
-}
 
 static void WriteFenceMemory(void* address, u64 data, u32 num_bytes) {
     auto* memory = Core::Memory::Instance();
@@ -1784,137 +1769,6 @@ void Liverpool::Process(std::stop_token stoken) {
     }
 }
 
-namespace {
-/// With native execution on: which command packets the game's own code still writes, grouped by the native tag that
-/// came last in the stream (per 5 s, logged): 0 before any tag, 1 after the tag of an executed draw, 2 draw on the
-/// packet path, 3 executed dispatch, 4 dispatch on the packet path, 5 fast clear eliminate.
-void CountGameCommand(const PM4Header* header, PM4ItOpcode opcode, u32 count) {
-    constexpr u32 Groups = 6;
-    static std::array<std::array<u64, 256>, Groups> opcodes{};
-    static std::array<u64, Regs::NumRegs> registers{};
-    static std::array<u64, Groups> packets{};
-    static u64 last_log_ns = 0;
-    static u32 group = 0;
-    if (opcode == PM4ItOpcode::Nop && count >= VideoCore::NativeTagPayloadDwords &&
-        reinterpret_cast<const u32*>(header)[1] == VideoCore::NativeTagMagic) {
-        const u32 meta = reinterpret_cast<const u32*>(header)[2];
-        const bool exec = (meta & VideoCore::NativeTagExecFlag) != 0;
-        const u32 kind = (meta >> 8) & 0xff;
-        group = kind == 4 ? 5 : kind == 3 ? (exec ? 3 : 4) : (exec ? 1 : 2);
-    }
-    ++opcodes[group][static_cast<u32>(opcode) & 255];
-    ++packets[group];
-    Core::NativeDraw::Live().packets[group].fetch_add(1, std::memory_order_relaxed);
-    if (opcode == PM4ItOpcode::SetContextReg || opcode == PM4ItOpcode::SetShReg ||
-        opcode == PM4ItOpcode::SetUconfigReg || opcode == PM4ItOpcode::SetConfigReg) {
-        const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-        const u32 base = opcode == PM4ItOpcode::SetContextReg ? Regs::ContextRegWordOffset
-                         : opcode == PM4ItOpcode::SetShReg    ? Regs::ShRegWordOffset
-                                                              : 0;
-        for (u32 i = 0; i + 1 < count; ++i) {
-            if (const u32 index = base + set_data->reg_offset + i; index < Regs::NumRegs) {
-                ++registers[index];
-            }
-        }
-    }
-    const u64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch())
-                        .count();
-    if (now - last_log_ns <= 5'000'000'000ull) {
-        return;
-    }
-    if (last_log_ns != 0) {
-        static constexpr const char* Names[Groups] = {"before any tag", "after executed draw", "after packet-path draw",
-                                                      "after executed dispatch", "after packet-path dispatch",
-                                                      "after fast clear eliminate"};
-        for (u32 g = 0; g < Groups; ++g) {
-            std::vector<std::pair<u64, u32>> top;
-            for (u32 i = 0; i < 256; ++i) {
-                if (opcodes[g][i] != 0) {
-                    top.emplace_back(opcodes[g][i], i);
-                }
-            }
-            std::sort(top.rbegin(), top.rend());
-            std::string text;
-            for (size_t i = 0; i < top.size() && i < 12; ++i) {
-                text += fmt::format(" {:#x}:{}", top[i].second, top[i].first);
-            }
-            LOG_INFO(Render, "game packets {}: {} (opcode:count{})", Names[g], packets[g], text);
-        }
-        std::vector<std::pair<u64, u32>> top;
-        for (u32 i = 0; i < registers.size(); ++i) {
-            if (registers[i] != 0) {
-                top.emplace_back(registers[i], i);
-            }
-        }
-        std::sort(top.rbegin(), top.rend());
-        std::string text;
-        for (size_t i = 0; i < top.size() && i < 60; ++i) {
-            text += fmt::format(" {:#x}:{}", top[i].second, top[i].first);
-        }
-        LOG_INFO(Render, "game register writes per 5 s (register index:count, top 60 of {}):{}", top.size(), text);
-    }
-    opcodes = {};
-    registers = {};
-    packets = {};
-    last_log_ns = now;
-}
-} // namespace
-
-namespace {
-/// Packets the game writes to its async compute queues (per 5 s, logged).
-void CountComputeQueueCommand(const PM4Header* header, PM4ItOpcode opcode) {
-    static std::array<u64, 256> opcodes{};
-    static std::map<u32, u64> sh_registers; ///< SET_SH_REG writes by register offset
-    static std::map<u64, u64> set_sh_sizes;
-    static u64 total = 0;
-    static u64 last_log_ns = 0;
-    ++opcodes[static_cast<u32>(opcode) & 255];
-    ++total;
-    if (opcode == PM4ItOpcode::SetShReg) {
-        const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-        for (u32 i = 0; i + 1 < header->type3.NumWords(); ++i) {
-            ++sh_registers[set_data->reg_offset + i];
-        }
-    }
-    Core::NativeDraw::Live().asc_packets.fetch_add(1, std::memory_order_relaxed);
-    const u64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch())
-                        .count();
-    if (now - last_log_ns <= 5'000'000'000ull) {
-        return;
-    }
-    if (last_log_ns != 0) {
-        std::vector<std::pair<u64, u32>> top;
-        for (u32 i = 0; i < 256; ++i) {
-            if (opcodes[i] != 0) {
-                top.emplace_back(opcodes[i], i);
-            }
-        }
-        std::sort(top.rbegin(), top.rend());
-        std::string text;
-        for (size_t i = 0; i < top.size() && i < 12; ++i) {
-            text += fmt::format(" {:#x}:{}", top[i].second, top[i].first);
-        }
-        LOG_INFO(Render, "async compute queue packets per 5 s: {} (opcode:count{})", total, text);
-        std::vector<std::pair<u64, u32>> registers;
-        for (const auto& [reg, count] : sh_registers) {
-            registers.emplace_back(count, reg);
-        }
-        std::sort(registers.rbegin(), registers.rend());
-        std::string reg_text;
-        for (size_t i = 0; i < registers.size() && i < 16; ++i) {
-            reg_text += fmt::format(" {:#x}:{}", registers[i].second, registers[i].first);
-        }
-        LOG_INFO(Render, "async compute queue set-SH registers per 5 s (offset:count):{}", reg_text);
-    }
-    sh_registers.clear();
-    opcodes = {};
-    total = 0;
-    last_log_ns = now;
-}
-} // namespace
-
 /// A wait of the graphics queue on a memory label (the walk's WaitRegMem case for a tag): tests the label, passes on the recorded
 /// fence timeline, and yields to the other queues until the label has the value.
 Liverpool::Task Liverpool::DirectWaitDisplay(u32 buffer) {
@@ -2069,7 +1923,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bo
         Core::NativeDevice::TakeClears(direct->begin, direct->begin + u64{direct->dwords} * 4, direct->clears);
     }
     Core::StreamProbe::NoteBuild(Core::FrameTimeline::Now() - build_start, direct && direct->pure, static_cast<u32>(dcb.size()));
-    const bool run_direct = direct && (direct->pure || Core::NativeDirect::PacketPathOff()) && Core::NativeDirect::ExecuteEnabled();
+    const bool run_direct = direct && Core::NativeDirect::ExecuteEnabled();
     if (!announced.Empty()) {
         if (direct) {
             direct->announced_first = std::move(announced.first);
@@ -2112,7 +1966,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
             RasterRun([batch = std::move(announced)] { Core::NativeUpdates::ApplyBatch(batch); });
         }
     }
-    const bool run_direct = direct && (direct->pure || Core::NativeDirect::PacketPathOff()) && Core::NativeDirect::ExecuteEnabled();
+    const bool run_direct = direct && Core::NativeDirect::ExecuteEnabled();
     const auto& task = run_direct ? ProcessDirectAsc(direct, vqid) : ProcessCompute(acb, vqid, std::move(direct));
     Core::NativeDraw::Live().direct_executed_asc.fetch_add(run_direct ? 1 : 0, std::memory_order_relaxed);
     {
