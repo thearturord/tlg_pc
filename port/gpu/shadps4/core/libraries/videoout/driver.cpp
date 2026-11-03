@@ -16,6 +16,7 @@
 #include <sys/resource.h>
 #endif
 #include "native/native_display.h"
+#include "native/native_flight.h"
 #include "native/native_presenter.h"
 #include "common/assert.h"
 #include "tlg_toggles.h"
@@ -107,6 +108,7 @@ void VideoOutDriver::SwapThread(std::stop_token token) {
         {
             std::unique_lock lock{swap_mutex};
             swap_busy = false;
+            FLIGHT_SCOPE("present: waiting for a request");
             if (!swap_cv.wait(lock, token, [this] { return !swap_queue.empty(); })) {
                 return;
             }
@@ -114,6 +116,7 @@ void VideoOutDriver::SwapThread(std::stop_token token) {
             swap_queue.pop_front();
             swap_busy = true;
         }
+        FLIGHT_SCOPE("present: running a request");
         work();
     }
 }

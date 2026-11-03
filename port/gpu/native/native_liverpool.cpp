@@ -3,6 +3,7 @@
 
 #include <boost/preprocessor/stringize.hpp>
 
+#include "native/native_flight.h"
 #include "native/native_raycast_cpu.h"
 #include "native/native_config.h"
 #include "native/native_stream_probe.h"
@@ -370,7 +371,8 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         auto& live = Core::NativeDraw::Live();
         const bool exec_on = true;
         const bool switches = exec_on;
-        const auto left = [&live](u32 reason) {
+        const auto left = [&live, &draw](u32 reason) {
+            Core::Flight::Add(Core::Flight::PlanLeft, draw.seq, reason); // L1
             live.exec_fallback.fetch_add(1, std::memory_order_relaxed);
             live.exec_reason[reason].fetch_add(1, std::memory_order_relaxed);
         };

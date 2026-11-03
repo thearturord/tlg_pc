@@ -20,6 +20,7 @@
 #include "native/native_debug_server.h"
 #include "native/native_config.h"
 #include "native/native_stream_probe.h"
+#include "native/native_flight.h"
 #include "native/native_timeline.h"
 #include "native/native_pass.h"
 #include "native/native_registry.h"
@@ -672,6 +673,8 @@ void RegisterBuiltins() {
              SetPolicy);
     Register("/stream_probe", "(study) the shape of the submitted command buffers and what the game changes after the draw hook saw it", StreamProbeReport);
     Register("/timeline", "?n=8000: the latest frame events (study): hooks, submits, flips, command processor waits, presents", Timeline);
+    Register("/flight", "(L1) the flight recorder: ?n=200 events per thread (merged by time), what each thread is doing; ?bench=1 first runs the microbenchmark",
+             [](const Params& params) { return Core::Flight::Report(static_cast<u32>(std::min<u64>(ParseNumber(params, "n", 200), Core::Flight::RingEvents)), ParseNumber(params, "bench", 0) != 0); });
     Register("/frames", "?n=600: the last n frame intervals (time stamp and length in ms)", Frames);
     Register("/timeline_capture", "?seconds=10&tag=name: records every frame timeline event for that long into log/timeline_<tag>.bin (+ .json); without arguments: the state", TimelineCapture);
     Register("/periodic", "last runs of periodic jobs (when they ended, how long they took)",
@@ -884,6 +887,7 @@ void Note(const std::string& kind, const std::string& detail) {
             DebugServer::rare_snapshot_kind = kind;
         }
     }
+    Core::Flight::Add(Core::Flight::RareEvent, 0, std::hash<std::string>{}(kind), n); // L1: the refusal appears in time order with the other events
     if (n > 5) {
         return; // counted, not written again
     }

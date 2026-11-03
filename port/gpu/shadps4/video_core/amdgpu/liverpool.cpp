@@ -3,6 +3,7 @@
 
 #include <boost/preprocessor/stringize.hpp>
 
+#include "native/native_flight.h"
 #include "native/native_stream_probe.h"
 #include "native/native_timeline.h"
 #include "native/native_prof.h"
@@ -159,6 +160,7 @@ void Liverpool::StartRasterSplit() {
         {
             Core::FrameTimeline::StageScope drain{Core::FrameTimeline::StageFrontDrain};
             TLG_PROF_LEVEL("wait.front_drain_position (front: queued memory writes executed up to a position)", 1);
+            FLIGHT_SCOPE("front: waiting for queued memory writes to execute");
             std::unique_lock lk{sp.mutex};
             sp.done_cv.wait(lk, [&] { return sp.done.load(std::memory_order_acquire) >= position || sp.write_done.load(std::memory_order_acquire) >= position; });
         }
@@ -267,6 +269,7 @@ void Liverpool::DrainRaster() {
     if (sp.done.load(std::memory_order_acquire) >= target) {
         return;
     }
+    FLIGHT_SCOPE("front: waiting for the raster thread to reach a position");
     std::unique_lock lk{sp.mutex};
     sp.done_cv.wait(lk, [&] { return sp.done.load(std::memory_order_acquire) >= target; });
 }
@@ -299,6 +302,7 @@ void Liverpool::RasterPush(RasterOp&& op, bool wait) {
         {
             Core::FrameTimeline::StageScope queue_full{Core::FrameTimeline::StageFrontQueueFull};
             TLG_PROF_LEVEL("wait.front_queue_full (front: the raster queue has no room)", 1);
+            FLIGHT_SCOPE("front: the raster queue has no room");
             sp.done_cv.wait(lk, [&] { return sp.queue.size() < RasterSplit::MaxQueued; });
         }
         sp.front_state.store(0, std::memory_order_relaxed);
@@ -347,6 +351,7 @@ void Liverpool::DrainRasterWrites(u32 caller) {
     {
         Core::FrameTimeline::StageScope drain{Core::FrameTimeline::StageFrontDrain};
         TLG_PROF_LEVEL("wait.front_drain_writes (front: all queued memory writing closures executed)", 1);
+        FLIGHT_SCOPE("front: draining queued memory writes");
         std::unique_lock lk{sp.mutex};
         sp.done_cv.wait(lk,
                         [&] { return sp.pending_writes.load(std::memory_order_acquire) == 0; });
@@ -792,6 +797,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             const u64 idle_start = VideoCore::ReadbackStats::NowNs();
             const u8 front_state_at_idle = sp.front_state.load(std::memory_order_relaxed);
             TLG_PROF_LEVEL("wait.raster_idle (raster: no work queued)", 1);
+            FLIGHT_SCOPE("raster: no work queued");
             std::unique_lock lk{sp.mutex};
             Common::CondvarWait(sp.work_cv, lk, stoken,
                                 [&] { return !sp.queue.empty() || num_commands != 0; });
@@ -818,6 +824,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             }
             sp.done_cv.notify_all(); // The queue has room again.
         }
+        FLIGHT_SCOPE("raster: running queued work");
         // Capture: consecutive operations of one kind are one span (a run of draws, of dispatches, of closures), written when the kind changes.
         u32 run_kind = 0;
         u64 run_start = 0, run_count = 0;
@@ -1528,6 +1535,7 @@ void Liverpool::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal,
                     Core::FrameTimeline::Record(Core::FrameTimeline::EopSignaled, started_ns - parsed_ns, Core::FrameTimeline::Now(), now - started_ns);
                 }
                 inner();
+                Core::Flight::Add(Core::Flight::FenceSignaled, 0, kind, u64(queue)); // L1
                 if (Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
                     // arg = ns from the parse to the start on the raster thread | queue << 48 | kind << 56, arg2 = ns from there to the signal; ts = after the write
                     Core::FrameTimeline::Record(Core::FrameTimeline::FenceSignaled, (started_ns - parsed_ns) | (u64(queue & 0xff) << 48) | (u64(kind) << 56),
@@ -1909,6 +1917,8 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 }
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bool partial) {
+    Core::Flight::Add(Core::Flight::SubmitBegin, 0, dcb.size(), 0); // L1
+    FLIGHT_SCOPE("command processor: graphics submission");
     auto announced = Core::NativeUpdates::TakeBatch(); // B2: applied on the raster thread before this submission's work
     auto& queue = mapped_queues[GfxQueueId];
 
@@ -1948,9 +1958,12 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bo
     std::scoped_lock lk{submit_mutex};
     ++num_submits;
     submit_cv.notify_one();
+    Core::Flight::Add(Core::Flight::SubmitEnd, 0, 0); // L1
 }
 
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
+    Core::Flight::Add(Core::Flight::SubmitBegin, 0, acb.size(), gnm_vqid); // L1
+    FLIGHT_SCOPE("command processor: compute submission");
     ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
     auto announced = Core::NativeUpdates::TakeBatch();
     auto& queue = mapped_queues[gnm_vqid];

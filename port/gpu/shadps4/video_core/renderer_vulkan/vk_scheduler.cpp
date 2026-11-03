@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <thread>
+#include "native/native_flight.h"
 #include "native/native_timeline.h"
 #include "native/native_pass.h"
 #include "common/assert.h"
@@ -56,6 +57,7 @@ void SchedulerCore::BeginRendering(const RenderState& new_state) {
     render_state = new_state;
     if (stream_id == 0) {
         Core::NativePass::PassBegin(render_state.num_color_attachments, render_state.width, render_state.height);
+        Core::Flight::Add(Core::Flight::PassBegin, 0, render_state.num_color_attachments, render_state.width | (u64{render_state.height} << 16)); // L1
     }
 
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
@@ -122,6 +124,7 @@ void SchedulerCore::EndRendering() {
     is_rendering = false;
     if (stream_id == 0) {
         Core::NativePass::PassEnd(__builtin_return_address(0));
+        Core::Flight::Add(Core::Flight::PassEnd, 0, render_state.num_color_attachments, render_state.width | (u64{render_state.height} << 16)); // L1
     }
     if (const auto* list = CommandBuffer().List(); list != nullptr && stream_id == 0 && list->Size() >= segment_begin_commands) {
         const u32 kind = render_state.num_color_attachments == 0 ? 0 : render_state.num_color_attachments >= 4 ? 2 : 1;
@@ -451,6 +454,7 @@ void SchedulerCore::EncoderThread(std::stop_token stoken) {
 }
 
 void SchedulerCore::SubmitExecution(SubmitInfo& info) {
+    Core::Flight::Add(Core::Flight::QueueSubmit, 0, info.num_signal_semas != 0 ? info.signal_ticks[0] : 0, stream_id); // L1
     // P4: the global descriptor set's new slots are written before the commands that name them are submitted, and finished slots are released
     if (IndexedData::FlushPerSubmit()) {
         if (auto* indexed = IndexedData::Get()) {
@@ -558,6 +562,9 @@ void SchedulerCore::SubmitCommandBuffers(std::span<const vk::CommandBuffer> cmd_
         ImGui::Core::TextureManager::Submit();
     }
     auto submit_result = submit_queue.submit(submit_info, info.fence);
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        Core::Flight::Add(Core::Flight::DeviceLost, 0, info.num_signal_semas != 0 ? info.signal_ticks[0] : 0, stream_id); // L1
+    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 }
 

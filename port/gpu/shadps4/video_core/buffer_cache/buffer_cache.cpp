@@ -19,6 +19,7 @@
 #include "native/native_registry.h"
 #include "native/native_updates.h"
 #include "native/native_e3_census.h"
+#include "native/native_flight.h"
 #include "native/native_prof.h"
 
 #include "native/native_resources.h"
@@ -895,6 +896,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             if (done.tick != tick || done.lo > lo || done.hi < hi) {
                 add_copy(lo, hi - lo);
                 Core::NativeUploads::NoteRingUpload(hi - lo);
+                Core::Flight::Add(Core::Flight::Upload, 0, lo, hi - lo, 1); // L1
                 done = {lo, hi, tick};
             } else {
                 Core::NativeUploads::NoteRingSkipped(hi - lo);

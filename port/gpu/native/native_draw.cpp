@@ -41,6 +41,7 @@
 #include "native/native_device.h"
 #include "native/native_image_desc.h"
 #include "native/native_draw.h"
+#include "native/native_flight.h"
 #include "native/native_job_gen.h"
 #include "native/native_site_gen.h"
 #include "native/native_readbacks.h"
@@ -613,6 +614,15 @@ struct Counters {
 };
 std::array<Counters, NumClasses> counters;
 std::atomic<VAddr> image_base{0};
+
+/// L1: the flight ring gets the rare record kinds only; kind 3 (copies, uploads, fills, dispatches) comes by the thousand per frame and belongs to the L3 work table.
+void FlightRecordMade(u64 seq, u32 kind, u64 caller) {
+    if (kind == 3) {
+        return;
+    }
+    const u64 base = image_base.load(std::memory_order_relaxed);
+    Core::Flight::Add(Core::Flight::RecordMade, seq, kind, caller >= base ? caller - base + 0x1000000 : 0);
+}
 std::atomic<u64> last_publish_ns{0};
 
 // Ghidra address ranges of the three passes (documents/tlg/Legacy/native-phase1-results-2026-10-15.md).
@@ -3043,6 +3053,7 @@ u64 MakeComputeRecord(u64 ctx, u64 x, u64 y, u64 z, u64 caller) {
     }
     slot.flags = (table_overflow || bad_object_seen ? SpecialPipeline : 0u) | synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
     slot.count = n;
+    FlightRecordMade(seq, slot.kind, slot.caller); // L1
     slot.seq.store(seq, std::memory_order_release);
     return seq;
 }
@@ -3309,6 +3320,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
     slot.check_count = checks;
     slot.flags = 0;
     slot.count = n;
+    FlightRecordMade(seq, slot.kind, slot.caller); // L1
     slot.seq.store(seq, std::memory_order_release);
     return seq;
 }
@@ -3396,6 +3408,7 @@ u64 MakeCopyRecord(u64 ctx, u64 destination, u64 source, u64 bytes, u64 caller, 
     }
     slot.flags = (table_overflow || bad_object_seen ? SpecialPipeline : 0u) | synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
     slot.count = n;
+    FlightRecordMade(seq, slot.kind, slot.caller); // L1
     slot.seq.store(seq, std::memory_order_release);
     return seq;
 }
@@ -3560,6 +3573,7 @@ u64 MakeUploadRecord(u64 ctx, const std::array<u32, 8>& srv, const std::array<u3
     slot.count = n;
     slot.readback = readback;
     slot.flags = (table_overflow || bad_object_seen ? SpecialPipeline : 0u) | synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
+    FlightRecordMade(seq, slot.kind, slot.caller); // L1
     slot.seq.store(seq, std::memory_order_release);
     return seq;
 }
@@ -3699,6 +3713,7 @@ u64 MakeFillPatternRecord(u64 writer, u64 destination, u32 count, u64 source, u3
     slot.check_count = checks;
     slot.count = n;
     slot.flags = (table_overflow || bad_object_seen ? SpecialPipeline : 0u) | synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
+    FlightRecordMade(seq, slot.kind, slot.caller); // L1
     slot.seq.store(seq, std::memory_order_release);
     return seq;
 }
@@ -4733,6 +4748,7 @@ bool EmitFastClearEliminate(u64 ctx, u64 resource) {
     slot.target_resources[0] = Rd<u64>(resource, 0x10);
     slot.native_targets = Core::NativeTargetDesc::UseOn() ? Core::NativeTargetDesc::PrepareEliminate(resource) : nullptr; // E7 (TLG_TARGET_DESC_USE)
     slot.native_targets_seq = seq;
+    FlightRecordMade(seq, slot.kind, slot.caller); // L1
     slot.seq.store(seq, std::memory_order_release);
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
     words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8);
@@ -7358,6 +7374,7 @@ u64 PS4_SYSV_ABI TagFill(u64 ctx, u64 destination, u64 count_arg, u64 source, u6
     slot.a1 = count;
     slot.a2 = Rd<u32>(source, 0); // the value the shader would read
     slot.args_addr = destination;
+    FlightRecordMade(seq, slot.kind, slot.caller); // L1
     slot.seq.store(seq, std::memory_order_release);
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
     words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
@@ -7697,6 +7714,7 @@ bool ConvertClearQuad(u64 target, u64 start, u64 begin, u64 end, u64 caller, con
     }
     slot.native_targets = Core::NativeTargetDesc::UseOn() ? Core::NativeTargetDesc::PrepareDepthClear(target, depth_call.valid ? &depth_call : nullptr) : nullptr; // E7 (TLG_TARGET_DESC_USE)
     slot.native_targets_seq = seq;
+    FlightRecordMade(seq, slot.kind, slot.caller); // L1
     slot.seq.store(seq, std::memory_order_release);
     u32 words[TagDwords];
     words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8);

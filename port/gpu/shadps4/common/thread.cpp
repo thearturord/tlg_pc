@@ -11,6 +11,7 @@
 #include "common/error.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
+#include "native/native_flight.h"
 #include "ntapi.h"
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -174,6 +175,7 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 // Sets the debugger-visible name of the current thread.
 void SetCurrentThreadName(const char* name) {
     // tlg: guest thread names are kept by the C runtime.
+    Core::Flight::NameThisThread(name); // L1: the flight recorder names its ring for the thread
     SetThreadDescription(GetCurrentThread(), UTF8ToUTF16W(name).data());
 }
 

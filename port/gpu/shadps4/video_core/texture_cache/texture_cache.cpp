@@ -9,6 +9,7 @@
 #include "native/native_e3_census.h"
 #include "native/native_content.h"
 #include "native/native_debug_server.h"
+#include "native/native_flight.h"
 #include "native/native_prof.h"
 
 #include "native/native_image_marks.h"
@@ -1288,6 +1289,7 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
         TLG_PROF_NAMED_LEVEL(prof_upload, "texture.refresh.upload", 2);
         runtime.UploadImage(&image, buffer, image_copies);
     }
+    Core::Flight::Add(Core::Flight::ImageRefresh, 0, image.info.guest_address, image.info.guest_size, static_cast<u8>(caller)); // L1
     Core::NativeResources::NoteImageUpload(image.info.guest_address, image.info.guest_size,
                                            BufferCache::last_image_source_gpu);
     Core::NativeE3Census::NoteOutcome(caller, Core::NativeE3Census::Outcome::Uploaded);

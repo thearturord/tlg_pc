@@ -16,6 +16,7 @@
 #include "native/native_debug_server.h"
 #include "native/native_draw.h"
 #include "native/native_frame_gate.h"
+#include "native/native_flight.h"
 #include "native/native_prof.h"
 
 namespace Core::FrameGate {
@@ -172,8 +173,11 @@ bool WaitFor(Done&& done, std::atomic<u64>& count, std::atomic<u64>& total_ns, c
         return true;
     }
     const auto start = std::chrono::steady_clock::now();
+    Flight::Add(Flight::GateWaitBegin, 0, Flight::GateFrame, submitted - ended); // L1
+    FLIGHT_SCOPE("waiting: the frame gate (frames in flight)");
     const bool ok = changed.wait_for(lock, WaitLimit, done);
     const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+    Flight::Add(Flight::GateWaitEnd, 0, Flight::GateFrame, static_cast<u64>(waited), ok ? 0 : 1); // L1
     count.fetch_add(1, std::memory_order_relaxed);
     total_ns.fetch_add(static_cast<u64>(waited), std::memory_order_relaxed);
     if (!ok) {
