@@ -18,6 +18,7 @@
 #include "native/native_light_recorder.h"
 #include "native/native_untracked_ring.h"
 #include "native/native_target_desc.h"
+#include "native/native_shader_env.h"
 #include "native/native_readbacks.h"
 #include "native/native_device.h"
 #include "native/native_resources.h"
@@ -422,6 +423,38 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
     }
     Core::NativeDraw::Live().fixed_native.fetch_add(1, std::memory_order_relaxed);
     return plan;
+}
+
+DrawInputs Rasterizer::MakeInputsFromRecord(const Core::NativeDraw::ExecDraw& draw, u32 index_count) {
+    DrawInputs in{};
+    ApplyExecRegisters(in, draw, 0, draw.count);
+    Core::NativeTargetDesc::ApplyAtFill(in);
+    const auto& a = draw.args;
+    if ((a.mask & Core::NativeDraw::DrawArgs::NumIndices) != 0) {
+        in.num_indices = a.num_indices;
+    }
+    if ((a.mask & Core::NativeDraw::DrawArgs::NumInstances) != 0) {
+        in.num_instances.num_instances = a.num_instances;
+    }
+    if ((a.mask & Core::NativeDraw::DrawArgs::IndexBase) != 0) {
+        in.index_base_address.base_addr_hi = a.index_base_hi;
+        in.index_base_address.base_addr_lo = a.index_base_lo;
+    }
+    if ((a.mask & Core::NativeDraw::DrawArgs::IndexType) != 0) {
+        in.index_buffer_type.raw = a.index_type;
+    }
+    if ((a.mask & Core::NativeDraw::DrawArgs::MaxIndexSize) != 0) {
+        in.max_index_size = a.max_index_size;
+    }
+    if (index_count != ~0u) {
+        in.num_indices = index_count;
+    }
+    Core::NativeShaderEnv::DrawEnv env;
+    if (Core::NativeShaderEnv::Current(env) && env.has_vertex) {
+        in.vgt_instance_step_rate_0 = env.vertex.rates.instance_step_rate_0;
+        in.vgt_instance_step_rate_1 = env.vertex.rates.instance_step_rate_1;
+    }
+    return in;
 }
 
 std::unique_ptr<DrawPlan> Rasterizer::PlanExecOperation(const Core::NativeDraw::ExecDraw& draw) {

@@ -573,7 +573,49 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             Core::NativeShaderEnv::Scope shader_env{draw.vs_gnm, draw.ps_gnm, draw.fetch_object, draw.other_stage, draw.typed ? exec_vertex_user_data.data() : nullptr,
                                                     draw.typed ? exec_pixel_user_data.data() : nullptr};
             Core::NativeTargetDesc::Scope target_desc{draw.native_targets}; // E7 (TLG_TARGET_DESC_USE): PlanDraw applies the record's target description to the inputs it makes
-            return rasterizer->PlanDraw(exec_state, params, native_fixed, native_exec_key, native_inputs_key);
+            auto made = rasterizer->PlanDraw(exec_state, params, native_fixed, native_exec_key, native_inputs_key, &draw, index_count);
+            // F3.4 test (`TLG_POISON_REGS=1`, default off): the same draw is planned a second time with the register image overwritten by a pattern; the plan must not change.
+            static const bool poison = [] {
+                const char* e = std::getenv("TLG_POISON_REGS");
+                return e != nullptr && *e == '1';
+            }();
+            if (poison && made != nullptr && made->executed) {
+                static_assert(std::is_trivially_copyable_v<AmdGpu::DrawRegs>);
+                auto saved = std::make_unique<AmdGpu::DrawRegs>(exec_state);
+                std::memset(static_cast<void*>(&exec_state), 0xA5, sizeof(exec_state));
+                auto second = rasterizer->PlanDraw(exec_state, params, native_fixed, native_exec_key, native_inputs_key, &draw, index_count);
+                std::memcpy(static_cast<void*>(&exec_state), static_cast<const void*>(saved.get()), sizeof(exec_state));
+                auto& live = Core::NativeDraw::Live();
+                const bool same = second != nullptr && second->pipeline == made->pipeline && Vulkan::Rasterizer::PlanDigest(*second) == Vulkan::Rasterizer::PlanDigest(*made) &&
+                                  std::memcmp(second->inputs.color_buffers, made->inputs.color_buffers, sizeof(made->inputs.color_buffers)) == 0 &&
+                                  std::memcmp(&second->inputs.depth_buffer, &made->inputs.depth_buffer, sizeof(made->inputs.depth_buffer)) == 0 &&
+                                  second->inputs.num_indices == made->inputs.num_indices && second->inputs.index_offset == made->inputs.index_offset;
+                live.poison_checked.fetch_add(1, std::memory_order_relaxed);
+                if (!same) {
+                    live.poison_different.fetch_add(1, std::memory_order_relaxed);
+                    std::string stage_text;
+                    if (second) {
+                        for (size_t k = 0; k < made->stages.size(); ++k) {
+                            const auto& x = made->stages[k];
+                            const auto& y = second->stages[k];
+                            stage_text += fmt::format(" [{}: info {}/{} base {:#x}/{:#x} udc {}/{} flat_skipped {}/{} flat {}/{}]", k, fmt::ptr(x.info), fmt::ptr(y.info), x.pgm_base, y.pgm_base, x.user_data_count,
+                                                      y.user_data_count, x.flat_skipped, y.flat_skipped, x.flat.size(), y.flat.size());
+                        }
+                    }
+                    Core::RareEvents::Note("f3_4_poisoned_stage_detail", stage_text);
+                    Core::RareEvents::Note("f3_4_poisoned_registers_changed_plan",
+                                           fmt::format("draw record {}: stage key {:#x}, second plan {}; pipeline equal {}, digest equal {}, colour equal {}, depth equal {}, num_indices {}/{}, index_offset {}/{}", draw.seq,
+                                                       draw.stage_key, second ? "present" : "null", second && second->pipeline == made->pipeline,
+                                                       second && Vulkan::Rasterizer::PlanDigest(*second) == Vulkan::Rasterizer::PlanDigest(*made),
+                                                       second && std::memcmp(second->inputs.color_buffers, made->inputs.color_buffers, sizeof(made->inputs.color_buffers)) == 0,
+                                                       second && std::memcmp(&second->inputs.depth_buffer, &made->inputs.depth_buffer, sizeof(made->inputs.depth_buffer)) == 0,
+                                                       second ? second->inputs.num_indices : 0, made->inputs.num_indices, second ? second->inputs.index_offset : 0, made->inputs.index_offset));
+                }
+                if (second) {
+                    rasterizer->RecyclePlan(std::move(second));
+                }
+            }
+            return made;
         };
         std::unique_ptr<Vulkan::DrawPlan> candidate;
         {

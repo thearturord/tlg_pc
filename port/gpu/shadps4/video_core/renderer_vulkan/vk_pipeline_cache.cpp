@@ -602,9 +602,11 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     ExecEntry* exec_entry = nullptr;
     bool exec_audit = false;
     auto& live = Core::NativeDraw::Live();
+    // F3.4: a native draw's stage set is vertex only before the pixel shader (nothing of the register image decides it)
+    const u32 stage_enable_now = lookup_inputs != nullptr && StagesFromEnvOn() ? static_cast<u32>(AmdGpu::ShaderStageEnable::Vs) : static_cast<u32>(lookup_regs->stage_enable.raw);
     if (lookup_exec_key != 0 && lookup_regs_pinned) {
         if (const auto found = exec_pipelines.find(lookup_exec_key); found != exec_pipelines.end() && found->second.epoch == exec_epoch &&
-                                                                       found->second.stage_enable == lookup_regs->stage_enable.raw) {
+                                                                       found->second.stage_enable == stage_enable_now) {
             exec_entry = &found.value();
             exec_audit = (++exec_tick & 31) == 0;
         }
@@ -708,7 +710,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         entry.pgm_base = stage_base;
         entry.fetch_program = fetch_shader != nullptr ? fetch_program : nullptr;
         entry.fetch_perm = fetch_perm;
-        entry.stage_enable = lookup_regs->stage_enable.raw;
+        entry.stage_enable = stage_enable_now;
         entry.epoch = exec_epoch;
     }
     return it->second.get();
@@ -1055,7 +1057,8 @@ bool PipelineCache::RefreshGraphicsKey() {
     const AmdGpu::ColorBuffer* color_buffers = from_inputs ? lookup_inputs->color_buffers : regs.color_buffers;
     // the export format of each target is the pixel shader's (SPI_SHADER_COL_FORMAT): from its environment when there is one
     Core::NativeShaderEnv::DrawEnv shader_env;
-    const bool export_from_env = from_inputs && Core::NativeShaderEnv::Current(shader_env) && shader_env.has_pixel;
+    const bool have_env = from_inputs && Core::NativeShaderEnv::Current(shader_env);
+    const bool export_from_env = have_env && shader_env.has_pixel;
 
     const bool db_enabled = depth_buffer.DepthValid() || depth_buffer.StencilValid();
 
@@ -1071,7 +1074,7 @@ bool PipelineCache::RefreshGraphicsKey() {
     key.prim_type = fixed.primitive_type;
     key.polygon_mode = fixed.polygon_mode;
     // F3.2: no hull shader in a native draw's pipeline
-    key.patch_control_points = export_from_env && shader_env.has_vertex && !shader_env.other_stage && StagesFromEnvOn()
+    key.patch_control_points = have_env && shader_env.has_vertex && !shader_env.other_stage && StagesFromEnvOn()
                                    ? 0
                                    : (regs.stage_enable.hs_en ? regs.ls_hs_config.hs_input_control_points : 0);
     key.logic_op = fixed.logic_op;
@@ -1098,6 +1101,8 @@ bool PipelineCache::RefreshGraphicsKey() {
         if (export_from_env) {
             color_buffer.export_format = static_cast<AmdGpu::ShaderExportFormat>(shader_env.pixel.fragment.color_export_format[cb]);
             live.key_targets[2].fetch_add(1, std::memory_order_relaxed);
+        } else if (have_env) {
+            color_buffer.export_format = AmdGpu::ShaderExportFormat::Zero; // no pixel shader: nothing is exported
         } else {
             color_buffer.export_format = regs.color_export_format.GetFormat(cb);
             live.key_targets[3].fetch_add(1, std::memory_order_relaxed);

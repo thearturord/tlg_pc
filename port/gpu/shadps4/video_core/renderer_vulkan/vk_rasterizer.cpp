@@ -418,7 +418,7 @@ bool Rasterizer::FilterDraw(const DrawPlan* plan) {
 
 std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
                                                DrawIndirectParams params,
-                                               const FixedState* native, u64 exec_key, u64 inputs_key) {
+                                               const FixedState* native, u64 exec_key, u64 inputs_key, const Core::NativeDraw::ExecDraw* record, u32 index_count) {
     // SkipShadow draws are still planned: the switch can change between the front and the raster
     // thread, and the raster thread must find a plan for every draw it does not drop.
     // An executed draw is a normal draw by construction (only the shadow skip switch looks at it, when the draw is
@@ -468,8 +468,20 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
     } else {
         plan->fixed = MakeFixedState(regs);
     }
-    plan->inputs = MakeDrawInputs(regs);
-    Core::NativeTargetDesc::ApplyAtFill(plan->inputs); // E7 (TLG_TARGET_DESC_USE): the engine's objects decide the target part, the registers keep the rest
+    // F3.4 (`TLG_INPUTS_FROM_RECORD`, default on, `=0` back to the register image, read once): the inputs of a draw with a record are made from the record (its register pairs, the target
+    // description, the typed draw arguments, the step rates of the vertex shader object), not from the register image.
+    static const bool inputs_from_record = [] {
+        const char* e = std::getenv("TLG_INPUTS_FROM_RECORD");
+        return e == nullptr || *e != '0';
+    }();
+    if (record != nullptr && inputs_from_record) {
+        plan->inputs = MakeInputsFromRecord(*record, index_count);
+        Core::NativeDraw::Live().key_targets[10].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        plan->inputs = MakeDrawInputs(regs);
+        Core::NativeTargetDesc::ApplyAtFill(plan->inputs); // E7 (TLG_TARGET_DESC_USE): the engine's objects decide the target part, the registers keep the rest
+        Core::NativeDraw::Live().key_targets[11].fetch_add(1, std::memory_order_relaxed);
+    }
     {
         // F3.3: the words of the inputs that only the register image has (clip planes, border colour base, index offset) are checked: not zero would mean the native planning needs a value for them
         const auto not_zero = [](const auto& value) {
@@ -486,6 +498,63 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
         if (not_zero(plan->inputs.ta_bc_base) || not_zero(plan->inputs.clip_user_data) || plan->inputs.index_offset != 0) {
             live.reg_only_nonzero.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+    if (record != nullptr && Core::NativePlanShadow::On()) {
+        // F3.4 shadow: the inputs made from the record against the ones made from the register image, member by member
+        const DrawInputs made = MakeInputsFromRecord(*record, index_count);
+        const char* d = "draw_inputs";
+        DrawInputs register_made = MakeDrawInputs(regs);
+        Core::NativeTargetDesc::ApplyAtFill(register_made);
+        const auto& r = register_made;
+#define SHADOW_INPUT(name) Core::NativePlanShadow::CompareBytes(d, #name, &made.name, &r.name, sizeof(made.name))
+        for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
+            if (made.color_buffers[i] || r.color_buffers[i]) {
+                Core::NativePlanShadow::CompareBytes(d, "color_buffers", &made.color_buffers[i], &r.color_buffers[i], sizeof(made.color_buffers[i]));
+            }
+        }
+        // a depth target that is not bound leaves stale register words (clear value, htile base, format words): compared only when a depth or stencil target is bound on either side
+        const bool depth_bound = made.depth_buffer.DepthValid() || made.depth_buffer.StencilValid() || r.depth_buffer.DepthValid() || r.depth_buffer.StencilValid();
+        Core::NativePlanShadow::Compare(d, "depth_bound", made.depth_buffer.DepthValid() || made.depth_buffer.StencilValid(), r.depth_buffer.DepthValid() || r.depth_buffer.StencilValid());
+        if (depth_bound) {
+            SHADOW_INPUT(depth_buffer);
+            SHADOW_INPUT(depth_clear);
+            SHADOW_INPUT(stencil_clear);
+            SHADOW_INPUT(depth_htile_data_base);
+        }
+        SHADOW_INPUT(depth_view);
+        SHADOW_INPUT(depth_control);
+        SHADOW_INPUT(depth_render_control);
+        SHADOW_INPUT(index_offset);
+        SHADOW_INPUT(vgt_instance_step_rate_0);
+        SHADOW_INPUT(vgt_instance_step_rate_1);
+        SHADOW_INPUT(index_buffer_type);
+        SHADOW_INPUT(ta_bc_base);
+        SHADOW_INPUT(clip_user_data);
+        // the draw arguments: compared where the record sets them; where it does not, the register value is counted by the kind of the draw (0 indexed, 1 auto, 2 indirect)
+        static const char* const unset_group[3] = {"draw_inputs_unset_kind0", "draw_inputs_unset_kind1", "draw_inputs_unset_kind2"};
+        const char* u = unset_group[std::min<u32>(record->kind, 2)];
+        const auto& m = record->args.mask;
+        if ((m & Core::NativeDraw::DrawArgs::NumIndices) != 0 || index_count != ~0u) {
+            SHADOW_INPUT(num_indices);
+        } else {
+            Core::NativePlanShadow::RegisterOnly(u, "num_indices", r.num_indices);
+        }
+        if ((m & Core::NativeDraw::DrawArgs::NumInstances) != 0) {
+            SHADOW_INPUT(num_instances);
+        } else {
+            Core::NativePlanShadow::RegisterOnly(u, "num_instances", r.num_instances.NumInstances());
+        }
+        if ((m & Core::NativeDraw::DrawArgs::IndexBase) != 0) {
+            SHADOW_INPUT(index_base_address);
+        } else {
+            Core::NativePlanShadow::RegisterOnly(u, "index_base_address", r.index_base_address.base_addr_lo | r.index_base_address.base_addr_hi);
+        }
+        if ((m & Core::NativeDraw::DrawArgs::MaxIndexSize) != 0) {
+            SHADOW_INPUT(max_index_size);
+        } else {
+            Core::NativePlanShadow::RegisterOnly(u, "max_index_size", r.max_index_size);
+        }
+#undef SHADOW_INPUT
     }
     if (inputs_key != 0 && plan->executed) {
         exec_inputs.insert_or_assign(inputs_key, plan->inputs);

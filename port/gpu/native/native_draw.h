@@ -74,10 +74,12 @@ struct LiveCounters {
     std::atomic<u64> exec_fast_clear{}, exec_inline{}, exec_inline_seen{};
     /// F3.1: where the pipeline key took the render targets from: 0 the plan's inputs (the native target description), 1 the register image (no inputs: the packet path), and the
     /// colour export formats: 2 from the pixel shader's environment, 3 from the register image (no environment)
-    /// 4 stage set from the shader environment (vertex plus pixel), 5 stage set from the register image, 6 translator input from the shader environment (F3.3), 7 from the register image, 8 program (address, code, hash) and user data of a stage from the shader environment and the record's words (F3.2b), 9 from the register image
-    std::array<std::atomic<u64>, 10> key_targets{};
+    /// 4 stage set from the shader environment (vertex plus pixel), 5 stage set from the register image, 6 translator input from the shader environment (F3.3), 7 from the register image, 8 program (address, code, hash) and user data of a stage from the shader environment and the record's words (F3.2b), 9 from the register image, 10 inputs of the plan made from the record (F3.4), 11 from the register image
+    std::array<std::atomic<u64>, 12> key_targets{};
     /// F3.3: draws whose inputs still carry register-only words (clip planes, border colour base, index offset): checked, and not zero
     std::atomic<u64> reg_only_checked{}, reg_only_nonzero{};
+    /// F3.4 test (`TLG_POISON_REGS=1`): learning draws planned a second time with the register image overwritten, and how many plans differed
+    std::atomic<u64> poison_checked{}, poison_different{};
     /// the native path's private register block: draws and clears planned from it, plans compared with the shared register image (legacy switch on), differences
     std::atomic<u64> state_planned{}, state_group_violations{};
     std::atomic<u64> overlay_offered{}, overlay_unmapped{}, overlay_same{}, overlay_changed{}, overlay_records{};

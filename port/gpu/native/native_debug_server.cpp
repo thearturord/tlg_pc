@@ -210,7 +210,9 @@ nlohmann::json Native(const Params&) {
                         {"f3_2_f3_3", {{"switch", "TLG_STAGES_FROM_ENV=0 turns it off"}, {"stage_set_from_environment", live.key_targets[4].load()}, {"stage_set_from_registers", live.key_targets[5].load()},
                                        {"translator_input_from_environment", live.key_targets[6].load()}, {"translator_input_from_registers", live.key_targets[7].load()},
                                        {"stage_program_from_environment", live.key_targets[8].load()}, {"stage_program_from_registers", live.key_targets[9].load()},
-                                       {"register_only_inputs_checked", live.reg_only_checked.load()}, {"register_only_inputs_not_zero", live.reg_only_nonzero.load()}}}};
+                                       {"draw_inputs_from_record", live.key_targets[10].load()}, {"draw_inputs_from_registers", live.key_targets[11].load()},
+                                       {"register_only_inputs_checked", live.reg_only_checked.load()}, {"register_only_inputs_not_zero", live.reg_only_nonzero.load()},
+                                       {"poison_registers_test", {{"switch", "TLG_POISON_REGS=1"}, {"checked", live.poison_checked.load()}, {"plan_changed", live.poison_different.load()}}}}}};
     j["exec_state"] = {{"planned", live.state_planned.load()}, {"group_violations", live.state_group_violations.load()}};
     j["fetch_rebuild"] = {{"tried", live.fetch_rebuild_tried.load()}, {"rebuilt", live.fetch_rebuilt.load()}, {"refused", live.fetch_rebuild_refused.load()}, {"executed", live.fetch_rebuild_exec.load()}};
     j["sync_converted_hook"] = live.sync_converted_hook.load();
