@@ -287,6 +287,7 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
 }
 
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
+    Core::NativeUpdates::NoteB8(Core::NativeUpdates::F24FaultEntered);
     const auto pages_start = Common::AlignDown(addr, 4096);
     const auto pages_end = Common::AlignUp(addr + size, 4096);
 
@@ -303,6 +304,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
         if (image.Overlaps(addr, size)) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::F24FaultOnImage);
             image.flags |= ImageFlagBits::CpuDirty;
             image.b8_marks |= B8Fault;
             UntrackImage(image_id);
@@ -311,15 +313,18 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // We should not mark it as dirty now. If it really was modified
             // it will receive more invalidations on its other pages.
             // Remove tracking from this page only.
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::F24FaultEdge);
             UntrackImageHead(image_id);
         } else if (image_begin < pages_start) {
             // This page access does not modify the image but the page should be untracked.
             // We should not mark this image as dirty now. If it really was modified
             // it will receive more invalidations on its other pages.
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::F24FaultEdge);
             UntrackImageTail(image_id);
         } else {
             // Image begins and ends on this page so it can not receive any more invalidations.
             // We will check it's hash later to see if it really was modified.
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::F24FaultMaybeDirty);
             MarkAsMaybeDirty(image_id, image);
         }
     }
@@ -1291,31 +1296,6 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
         }
         image.b8_marks &= B8Owed;
     }
-    {
-        // Dark frame (2026-10-29): an image inside the frame ring (UntrackedRing: its pages are never write protected, so no fault, no write watch and no announcement marks it
-        // dirty) keeps what the ring held when it was uploaded. The game maps small dynamic textures (R32F 4x4 / 16x16, call site 0x1c98a17) into the ring every frame and the
-        // draws sample them there; when the ring wraps, a new one lands on the address of an old image that is still registered and the old contents are drawn with. The bytes
-        // decide: a ring image whose guest bytes differ from the ones it was uploaded with is uploaded again (`TLG_RING_IMAGE_CHECK=1`; off by default).
-        static const bool ring_check = [] {
-            const char* e = std::getenv("TLG_RING_IMAGE_CHECK"); // off by default: the owner's walking play (2026-10-29) had 5 dark frames and 0 catches, so it is not the cause
-            return e != nullptr && *e == '1';
-        }();
-        const auto& ring = UntrackedRing::Get();
-        if (ring_check && ring.Active() && image.info.guest_size <= (256u << 10) && image.info.guest_address >= ring.Start() &&
-            image.info.guest_address + image.info.guest_size <= ring.End() && False(image.flags & ImageFlagBits::GpuModified)) {
-            const u64 now = XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size) | 1;
-            if (image.ring_hash != 0 && now != image.ring_hash && False(image.flags & ImageFlagBits::Dirty)) {
-                static std::atomic<u64> stale{0};
-                const u64 n = stale.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (n <= 20 || (n & (n - 1)) == 0) {
-                    LOG_WARNING(Render_Vulkan, "ring image stale ({} so far): {:#x}+{:#x} {}x{} format {} held old bytes, uploaded again", n, image.info.guest_address, image.info.guest_size, image.info.size.width,
-                                image.info.size.height, static_cast<u32>(image.info.pixel_format));
-                }
-                image.flags |= ImageFlagBits::CpuDirty;
-            }
-            image.ring_hash = now;
-        }
-    }
     if (False(image.flags & ImageFlagBits::Dirty)) {
         Core::NativeE3Census::NoteOutcome(caller, Core::NativeE3Census::Outcome::NotDirty);
         return;
@@ -1332,6 +1312,7 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
         False(image.flags & ImageFlagBits::CpuDirty)) {
         // The image size should be less than page size to be considered MaybeCpuDirty
         // So this calculation should be very uncommon and reasonably fast
+        Core::NativeUpdates::NoteB8(Core::NativeUpdates::F24MaybeDirtyChecked);
         // For now we'll just check up to 64 first pixels
         const auto addr = std::bit_cast<u8*>(image.info.guest_address);
         const u32 w = std::min(image.info.size.width, u32(8));
@@ -1343,6 +1324,7 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
         const u64 hash = XXH3_64bits(addr, size);
         if (image.hash == hash) {
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
+            Core::NativeUpdates::NoteB8(Core::NativeUpdates::F24MaybeDirtySame);
             Core::NativeE3Census::NoteOutcome(caller, Core::NativeE3Census::Outcome::MaybeCpuDirtySameHash);
             return;
         }

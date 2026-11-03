@@ -451,6 +451,8 @@ nlohmann::json B8Report() {
             {"of_those_announced_later", later},
             {"MISSES_never_announced", found > later ? found - later : 0},
             {"announcements_on_images", c(B8AnnouncedOnImage)},
+            {"f24_address_dirty_route", {{"invalidate_memory_calls", c(F24FaultEntered)}, {"image_overlapped_cpu_dirty_set", c(F24FaultOnImage)}, {"image_page_edge_untracked", c(F24FaultEdge)},
+                                         {"image_maybe_dirty_hashed", c(F24FaultMaybeDirty)}, {"refresh_reached_maybe_dirty_hash", c(F24MaybeDirtyChecked)}, {"... hash unchanged, refresh skipped", c(F24MaybeDirtySame)}}},
             {"second_applications_kept_for_gpu", c(B8KeptForGpu)},
             {"verify_checked", c(B8VerifyChecked)},
             {"lifetime", {{"mode", B8LifetimeMode()}, {"textures_deleted", c(B8TexturesDeleted)}, {"alias_kept", c(B8TextureAliasKept)},
