@@ -161,7 +161,6 @@ public:
     u8 b8_marks{};  ///< B8.1: what dirtied the image since its last refresh (1 a write fault, 2 an announcement), 4 a change found without one, still owed
     u64 lru_id{};
     u64 tick_accessed_last{};
-    u64 hash{};
 
     struct {
         u32 texture : 1;

@@ -115,9 +115,6 @@ public:
         return tile_manager;
     }
 
-    /// Invalidates any image in the logical page range.
-    void InvalidateMemory(VAddr addr, size_t size);
-
     /// B8.1: the engine announced a CPU write of [addr, addr + size) (applied in order on the raster thread); the images it touches are marked, and in native mode
     /// dirtied (`newer` false, the second application: an image the GPU wrote since is left alone)
     void NoteAnnouncedWrite(VAddr addr, size_t size, bool newer);
@@ -434,10 +431,6 @@ private:
 
     /// Stop tracking CPU reads and writes for image
     void UntrackImage(ImageId image_id);
-    void UntrackImageHead(ImageId image_id);
-    void UntrackImageTail(ImageId image_id);
-
-    void MarkAsMaybeDirty(ImageId image_id, Image& image);
 
     void RegisterMeta(VAddr address, MetaDataInfo info);
     void UnregisterMeta(VAddr address, u64 owner_uid);

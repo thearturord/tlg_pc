@@ -175,12 +175,6 @@ enum B8Count : u32 {
     E3NamedUnknownObject,       ///< ... named: the id is not in the engine table any more
     E3OwnerById,                ///< E3.2: the engine texture of a lookup came from the named id (not the address)
     E3OwnerByIdMissed,          ///< ... the id could not be resolved (the address asked instead)
-    F24FaultEntered,            ///< F2.4 census: `TextureCache::InvalidateMemory` (the write fault / runtime invalidation route) was called
-    F24FaultOnImage,            ///< ... an image overlapped the range: CpuDirty set by the address route
-    F24FaultEdge,               ///< ... an image shares a page edge with the range (head / tail untracked)
-    F24FaultMaybeDirty,         ///< ... a small image on the page: MaybeCpuDirty and its guest memory hash
-    F24MaybeDirtyChecked,       ///< ... `RefreshImage` reached the MaybeCpuDirty hash of the guest memory
-    F24MaybeDirtySame,          ///< ... of those, the hash was unchanged (the refresh was skipped)
     B8Counts,
 };
 void NoteB8(B8Count what) noexcept;

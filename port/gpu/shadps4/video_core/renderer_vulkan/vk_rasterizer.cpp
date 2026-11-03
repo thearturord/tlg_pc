@@ -3696,7 +3696,8 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
         return false;
     }
     buffer_cache.InvalidateMemory(addr, size, assume_locks);
-    texture_cache.InvalidateMemory(addr, size);
+    // F2.4: no page is watched, so the only callers are a guest mprotect and the AV player; the images are not dirtied by an address any more (owner play 2026-11-03 with a counter: 0 calls). Written down if it ever happens.
+    Core::RareEvents::Note("f24_invalidate_memory_on_mapped_range", fmt::format("{:#x} + {:#x}: images over it are not dirtied by the address any more", addr, size));
     return true;
 }
 

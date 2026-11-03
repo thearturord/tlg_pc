@@ -276,60 +276,6 @@ void TextureCache::TouchFoundImage(ImageId image_id) {
     TouchImage(image);
 }
 
-void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
-    if (image.hash == 0) {
-        // Initialize hash
-        const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
-        image.hash = XXH3_64bits(addr, image.info.guest_size);
-    }
-    image.flags |= ImageFlagBits::MaybeCpuDirty;
-    UntrackImage(image_id);
-}
-
-void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
-    Core::NativeUpdates::NoteB8(Core::NativeUpdates::F24FaultEntered);
-    const auto pages_start = Common::AlignDown(addr, 4096);
-    const auto pages_end = Common::AlignUp(addr + size, 4096);
-
-    SmallVector<ImageId, 8> image_ids;
-    ForEachImageInRegion(pages_start, pages_end - pages_start,
-                         [&](ImageId image_id, Image&) { image_ids.push_back(image_id); });
-
-    for (const auto image_id : image_ids) {
-        Image& image = slot_images[image_id];
-        std::scoped_lock lk{image.mutex};
-
-        const auto image_begin = image.info.guest_address;
-        const auto image_end = image.info.guest_address + image.info.guest_size;
-        if (image.Overlaps(addr, size)) {
-            // Modified region overlaps image, so the image was definitely accessed by this fault.
-            // Untrack the image, so that the range is unprotected and the guest can write freely.
-            Core::NativeUpdates::NoteB8(Core::NativeUpdates::F24FaultOnImage);
-            image.flags |= ImageFlagBits::CpuDirty;
-            image.b8_marks |= B8Fault;
-            UntrackImage(image_id);
-        } else if (pages_end < image_end) {
-            // This page access may or may not modify the image.
-            // We should not mark it as dirty now. If it really was modified
-            // it will receive more invalidations on its other pages.
-            // Remove tracking from this page only.
-            Core::NativeUpdates::NoteB8(Core::NativeUpdates::F24FaultEdge);
-            UntrackImageHead(image_id);
-        } else if (image_begin < pages_start) {
-            // This page access does not modify the image but the page should be untracked.
-            // We should not mark this image as dirty now. If it really was modified
-            // it will receive more invalidations on its other pages.
-            Core::NativeUpdates::NoteB8(Core::NativeUpdates::F24FaultEdge);
-            UntrackImageTail(image_id);
-        } else {
-            // Image begins and ends on this page so it can not receive any more invalidations.
-            // We will check it's hash later to see if it really was modified.
-            Core::NativeUpdates::NoteB8(Core::NativeUpdates::F24FaultMaybeDirty);
-            MarkAsMaybeDirty(image_id, image);
-        }
-    }
-}
-
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, const char* by) {
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Only consider images that match base address.
@@ -1308,29 +1254,6 @@ void TextureCache::RefreshImage(Image& image, Core::NativeE3Census::Caller calle
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
 
-    if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
-        False(image.flags & ImageFlagBits::CpuDirty)) {
-        // The image size should be less than page size to be considered MaybeCpuDirty
-        // So this calculation should be very uncommon and reasonably fast
-        Core::NativeUpdates::NoteB8(Core::NativeUpdates::F24MaybeDirtyChecked);
-        // For now we'll just check up to 64 first pixels
-        const auto addr = std::bit_cast<u8*>(image.info.guest_address);
-        const u32 w = std::min(image.info.size.width, u32(8));
-        const u32 h = std::min(image.info.size.height, u32(8));
-
-        const u32 s_w = image.info.props.is_block ? Common::DivCeil(w, 4u) : w;
-        const u32 s_h = image.info.props.is_block ? Common::DivCeil(h, 4u) : h;
-        const u32 size = s_w * s_h * (image.info.num_bits / 8);
-        const u64 hash = XXH3_64bits(addr, size);
-        if (image.hash == hash) {
-            image.flags &= ~ImageFlagBits::MaybeCpuDirty;
-            Core::NativeUpdates::NoteB8(Core::NativeUpdates::F24MaybeDirtySame);
-            Core::NativeE3Census::NoteOutcome(caller, Core::NativeE3Census::Outcome::MaybeCpuDirtySameHash);
-            return;
-        }
-        image.hash = hash;
-    }
-
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
     const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
@@ -1530,40 +1453,6 @@ void TextureCache::UntrackImage(ImageId image_id) {
     }
     image.track_addr = 0;
     image.track_addr_end = 0;
-}
-
-void TextureCache::UntrackImageHead(ImageId image_id) {
-    auto& image = slot_images[image_id];
-    const auto image_begin = image.info.guest_address;
-    if (image.IsUntracked() || image_begin < image.track_addr) {
-        return;
-    }
-    const auto addr = Common::AlignUp(image_begin + 1, 4096);
-
-    image.track_addr = addr;
-    if (image.track_addr == image.track_addr_end) {
-        // This image spans only 2 pages and both are modified,
-        // but the image itself was not directly affected.
-        // Cehck its hash later.
-        MarkAsMaybeDirty(image_id, image);
-    }
-}
-
-void TextureCache::UntrackImageTail(ImageId image_id) {
-    auto& image = slot_images[image_id];
-    const auto image_end = image.info.guest_address + image.info.guest_size;
-    if (image.IsUntracked() || image.track_addr_end < image_end) {
-        return;
-    }
-    ASSERT(image.track_addr_end != 0);
-    const auto addr = Common::AlignDown(image_end, 4096);
-    image.track_addr_end = addr;
-    if (image.track_addr == image.track_addr_end) {
-        // This image spans only 2 pages and both are modified,
-        // but the image itself was not directly affected.
-        // Cehck its hash later.
-        MarkAsMaybeDirty(image_id, image);
-    }
 }
 
 void TextureCache::GarbageCollectImages() {
