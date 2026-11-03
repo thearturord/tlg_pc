@@ -658,9 +658,6 @@ void RegisterBuiltins() {
              });
     Register("/updates", "?start=1 turns the update audit on (N5a): buffer Maps the engine announces, and which CPU write faults they cover",
              [](const Params& params) {
-                 if (ParseNumber(params, "start", 0) != 0) {
-                     Core::NativeUpdates::Start();
-                 }
                  return Core::NativeUpdates::Report();
              });
     Register("/uploads", "(N5c, TLG_NATIVE_UPLOADS=1) announced writes, how many were published, queued before records and uploaded before the draws that use them",

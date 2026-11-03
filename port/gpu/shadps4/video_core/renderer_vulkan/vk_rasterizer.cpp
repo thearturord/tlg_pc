@@ -3286,9 +3286,6 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     Core::DebugServer::NoteWriteFault(addr);
     Core::NativeResources::NoteCpuWrite(addr, size);
-    if (Core::NativeUpdates::AuditFaults()) {
-        Core::NativeUpdates::NoteFault(addr, size);
-    }
 #ifdef ARCH_X86_64
     Core::GuestHooks::NoteWriteFault(addr, size);
 #endif

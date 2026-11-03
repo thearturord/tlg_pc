@@ -930,8 +930,7 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
                                 std::memcpy(&snap_word, snap + word_at, 4);
                                 std::memcpy(&guest_word, now.data() + word_at, 4);
                             }
-                            const u32 who = Core::NativeUpdates::WhoWrote(address, size);
-                            Core::NativeUploads::NoteSnapshotDiff(address, size, first, count, snap_word, guest_word, who == ~0u ? 8 : (who & 0xff));
+                            Core::NativeUploads::NoteSnapshotDiff(address, size, first, count, snap_word, guest_word, 8);
                         }
                         std::memcpy(constant_ring->Data(*offset), now.data(), size);
                         Core::NativeUploads::NoteSnapshotRing(4);

@@ -4925,6 +4925,17 @@ void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3) {
                     ++s.raced_words[fmt::format("view {} skinning flag word {:#x}", v.view, 0xc)];
                 }
             }
+            if (mark.flag_source != 0 && bytes.size() >= 0x208) {
+                // dword 0x204 of the skinning constants is a time float the main thread keeps updating: the loop and the generator read it at different moments (a race, counted)
+                float live_time = 0.0f, generated_time = 0.0f;
+                std::memcpy(&live_time, reinterpret_cast<const void*>(address + 0x204), 4);
+                std::memcpy(&generated_time, bytes.data() + 0x204, 4);
+                if (std::memcmp(&live_time, &generated_time, 4) != 0 && std::isfinite(live_time) && std::isfinite(generated_time)) {
+                    std::memcpy(bytes.data() + 0x204, &live_time, 4);
+                    ++v.raced;
+                    ++s.raced_words[fmt::format("view {} skinning time word {:#x}", v.view, 0x204)];
+                }
+            }
             if (g_inst_scene_block != 0 && address == g_inst_scene_block && bytes.size() == 0x5b0) {
                 // the scene block is a copy of the scene, which the game's main thread keeps updating (times, fades): where the scene's word is no longer the one the generator copied the engine's loop
                 // copied a later value, which is a race and no difference
