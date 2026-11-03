@@ -126,73 +126,6 @@ void Liverpool::ApplyStateTemplate(const Core::NativeDraw::StateTemplate& state)
     }
 }
 
-/// Applies a record to the private register block, by register group (a group whose identity equals the last one applied is skipped).
-void Liverpool::ExecApplyRecord(const Core::NativeDraw::ExecDraw& draw, bool skip_fixed, u32 index_count) {
-    auto& live = Core::NativeDraw::Live();
-    const auto set = [&](u32 index, u32 value) {
-        if (u32* const word = exec_state.Word(index)) {
-            ExecSetWord(index, word, value);
-        }
-    };
-    const auto apply = [&](u32 begin, u32 end) {
-        for (u32 i = begin; i < end; ++i) {
-            if (skip_fixed && IsFixedStateRegister(draw.regs[i].index)) {
-                continue;
-            }
-            set(draw.regs[i].index, draw.regs[i].value);
-        }
-    };
-    if (draw.grouped != 0) {
-        for (u32 g = 0; g < NumRegisterGroups; ++g) {
-            const u32 begin = draw.group_begin[g];
-            const u32 end = draw.group_begin[g + 1];
-            if (begin == end) {
-                continue;
-            }
-            const u64 sig = draw.group_sig[g];
-            if (sig != 0 && exec_group_sig_valid[g] && exec_group_applied_sig[g] == sig && (skip_fixed || exec_group_sig_full[g])) {
-                if ((++exec_group_tick & 31) != 0) {
-                    continue;
-                }
-                bool violation = false;
-                for (u32 i = begin; i < end && !violation; ++i) {
-                    const u32 index = draw.regs[i].index;
-                    if (skip_fixed && IsFixedStateRegister(index)) {
-                        continue;
-                    }
-                    const u32* const word = exec_state.Word(index);
-                    violation = word != nullptr && *word != draw.regs[i].value;
-                }
-                if (!violation) {
-                    continue;
-                }
-                live.state_group_violations.fetch_add(1, std::memory_order_relaxed);
-            }
-            apply(begin, end);
-            exec_group_sig_valid[g] = sig != 0;
-            exec_group_applied_sig[g] = sig;
-            exec_group_sig_full[g] = !skip_fixed;
-        }
-        apply(draw.grouped, draw.count);
-        if (draw.typed) {
-            for (u32 mask = draw.vs_user_data_mask; mask != 0; mask &= mask - 1) {
-                const u32 i = static_cast<u32>(std::countr_zero(mask));
-                ExecSetWord(Core::NativeDraw::VsUserDataRegister + i, &exec_state.vs_program.user_data[i], draw.vs_user_data[i]);
-            }
-            for (u32 mask = draw.ps_user_data_mask; mask != 0; mask &= mask - 1) {
-                const u32 i = static_cast<u32>(std::countr_zero(mask));
-                ExecSetWord(Core::NativeDraw::PsUserDataRegister + i, &exec_state.ps_program.user_data[i], draw.ps_user_data[i]);
-            }
-        }
-    } else {
-        apply(0, draw.count);
-    }
-    set(static_cast<u32>(&regs.draw_initiator - regs.reg_array.data()), 0);
-    if (index_count != ~0u) {
-        set(static_cast<u32>(&regs.num_indices - regs.reg_array.data()), index_count);
-    }
-}
-
 void Liverpool::StartAscTag(const u32* tag, const void* address, u32 vqid) {
     native_tag_pending.valid = true;
     native_tag_pending.meta = tag[2];
@@ -280,8 +213,6 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         LOG_ERROR(Render, "native draw: the record {} is gone, a draw is lost", native_tag_pending.seq);
         return;
     }
-    SeedExecState();
-    // C8 (2026-10-28): the shared register image is no longer written by records; a record plans from the private register block only
     if (draw.kind == 10) {
         // memory copy: destination, source and the number of bytes travel in the record
         native_tag_pending.valid = false;
@@ -340,15 +271,9 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         return;
     }
     if (draw.kind == 7) {
-        // depth / stencil clear: the registers of the depth target go into the private register block, the clear is made from the inputs taken from it
+        // depth / stencil clear: the inputs of the clear come from the record (F3.5: no register image)
         native_tag_pending.valid = false;
-        for (u32 i = 0; i < draw.count; ++i) {
-            if (u32* const word = exec_state.Word(draw.regs[i].index)) {
-                ExecSetWord(draw.regs[i].index, word, draw.regs[i].value);
-            }
-        }
-        auto clear_inputs = Vulkan::MakeDrawInputs(exec_state);
-        Core::NativeTargetDesc::ApplyDepthClear(clear_inputs, draw.native_targets); // E7 (TLG_TARGET_DESC_USE)
+        auto clear_inputs = Vulkan::Rasterizer::MakeDepthClearInputs(draw);
         Core::NativeDraw::Live().state_planned.fetch_add(1, std::memory_order_relaxed);
         RasterRun(
             [this, extent = draw.db_extent, inputs = std::move(clear_inputs)] {
@@ -357,7 +282,6 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
                 rasterizer->ClearDepthStencilTarget(inputs, db_extent);
             },
             false, false);
-        ExecRestore();
         // what the SDK's clear leaves behind: all colour targets writable again, no clear bits in the depth render control
         regs.reg_array[Regs::ContextRegWordOffset + 0x8e] = 0xf;
         MirrorRegs(Regs::ContextRegWordOffset + 0x8e, 1);
@@ -435,19 +359,10 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         }
         last_target_resources = draw.target_resources;
     }
-    // The record goes straight into the draw state (and the raster thread's deltas), not through the register file: the
-    // next draw writes only what differs, and a draw of the packet path first gets back what its own packets wrote.
-    // Registers no member of the draw state covers are not needed by anything and are skipped. A draw that carries its
-    // fixed-function state in Vulkan terms does not need the registers of that state either.
-    const bool fixed_from_objects = draw.fixed != nullptr;
     bool planned_from_record = false;
-    // F3.5 (`TLG_PLAN_WITHOUT_REGISTERS`, default on, `=0` back): a draw with typed user data, a native fixed state and no other stage is planned from its record with an empty register
-    // block; the register image is not filled for it. The plan shadow needs the register image, so it turns this off.
-    static const bool plan_without_registers = [] {
-        const char* e = std::getenv("TLG_PLAN_WITHOUT_REGISTERS");
-        return e == nullptr || *e != '0';
-    }();
-    const bool register_free = plan_without_registers && !Core::NativePlanShadow::On() && draw.kind <= 2 && !draw.cb_extents_only && draw.typed && draw.fixed != nullptr && !draw.other_stage && split_active;
+    // F3.5: a draw is planned from its record and the engine objects, never from a register image. A draw that cannot be (no typed user data, no native fixed state, another shader
+    // stage bound) is a counted refusal: it is not drawn.
+    const bool plannable = draw.kind <= 2 && !draw.cb_extents_only && draw.typed && draw.fixed != nullptr && !draw.other_stage && split_active;
     static const AmdGpu::DrawRegs no_registers{};
     if (draw.typed) {
         for (u32 mask = draw.vs_user_data_mask; mask != 0; mask &= mask - 1) {
@@ -495,7 +410,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             } else if (!draw.typed || draw.stage_key == 0 || draw.fixed == nullptr) {
                 left(!draw.typed ? 1 : draw.stage_key == 0 ? 6 : 7);
             } else if (draw.other_stage) {
-                // F3.2: the native pipeline is vertex plus pixel; the draw goes the old way, where the stage selection refuses it (no pipeline)
+                // F3.2: the native pipeline is vertex plus pixel; a draw with another stage bound is refused below
                 left(8);
                 Core::RareEvents::Note("f3_2_other_shader_stage_bound", fmt::format("draw record {}: a hull, domain or geometry shader is bound; stage key {:#x}", draw.seq, draw.stage_key));
             } else if (!split_active) {
@@ -532,21 +447,8 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     if (VideoCore::ReadbackPolicy::Get().cs_audit.load(std::memory_order_relaxed) != 0) {
         Core::NativeDraw::Live().overlay_records.fetch_add(1, std::memory_order_relaxed);
     }
-    if (!planned_from_record && draw.kind <= 2 && !draw.cb_extents_only) {
-        auto& live = Core::NativeDraw::Live();
-        if (register_free) {
-            live.plan_register_free.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            live.plan_register_path.fetch_add(1, std::memory_order_relaxed);
-            Core::RareEvents::Note("f3_5_draw_planned_from_registers", fmt::format("draw record {}: typed {}, native fixed {}, other stage {}, split {}, plan shadow {}, switch {}", draw.seq, draw.typed,
-                                                                                   draw.fixed != nullptr, draw.other_stage, split_active, Core::NativePlanShadow::On(), plan_without_registers));
-        }
-    }
     if (!planned_from_record) {
         Core::NativeDraw::MaterializeRegs(draw); // A5.3: the register groups of the record (the plan's inputs are made from them)
-        if (!draw.cb_extents_only && !register_free) {
-            ExecApplyRecord(draw, fixed_from_objects, index_count); // a fast clear eliminate's registers are for that operation only (its plan comes from the record)
-        }
     }
     RasterCall call{};
     if (draw.kind == 2) {
@@ -575,8 +477,15 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     native_exec_key = draw.stage_key != 0 && draw.grouped != 0 && !draw.cb_extents_only && !draw.other_stage // F3.2: a draw with another stage bound never takes a cached vertex plus pixel pipeline
                           ? draw.stage_key
                           : 0;
-    if (!planned_from_record && split_active && !draw.cb_extents_only) {
-        // plan from the private register block (the shared image is not read)
+    bool refused = false;
+    if (!planned_from_record && (draw.kind <= 2 || draw.cb_extents_only) && !plannable) {
+        // F3.5: nothing to plan this draw from; counted above (exec_reason), noted here once per kind of reason
+        refused = true;
+        Core::NativeDraw::Live().plan_refused.fetch_add(1, std::memory_order_relaxed);
+        Core::RareEvents::Note("f3_5_draw_refused", fmt::format("draw record {}: typed {}, native fixed {}, other stage {}, split {}, stage key {:#x}", draw.seq, draw.typed, draw.fixed != nullptr,
+                                                               draw.other_stage, split_active, draw.stage_key));
+    } else if (!planned_from_record && plannable) {
+        Core::NativeDraw::Live().plan_register_free.fetch_add(1, std::memory_order_relaxed);
         Vulkan::DrawIndirectParams params{};
         if (call.kind == RasterCall::Kind::DrawIndirect) {
             params = Vulkan::DrawIndirectParams{.vertex_sgpr_offset = call.vertex_sgpr_offset, .instance_sgpr_offset = call.instance_sgpr_offset, .is_indirect = true};
@@ -591,48 +500,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             Core::NativeShaderEnv::Scope shader_env{draw.vs_gnm, draw.ps_gnm, draw.fetch_object, draw.other_stage, draw.typed ? exec_vertex_user_data.data() : nullptr,
                                                     draw.typed ? exec_pixel_user_data.data() : nullptr};
             Core::NativeTargetDesc::Scope target_desc{draw.native_targets}; // E7 (TLG_TARGET_DESC_USE): PlanDraw applies the record's target description to the inputs it makes
-            auto made = rasterizer->PlanDraw(register_free ? no_registers : exec_state, params, native_fixed, native_exec_key, native_inputs_key, &draw, index_count);
-            // F3.4 test (`TLG_POISON_REGS=1`, default off): the same draw is planned a second time with the register image overwritten by a pattern; the plan must not change.
-            static const bool poison = [] {
-                const char* e = std::getenv("TLG_POISON_REGS");
-                return e != nullptr && *e == '1';
-            }();
-            if (poison && made != nullptr && made->executed && !register_free) {
-                static_assert(std::is_trivially_copyable_v<AmdGpu::DrawRegs>);
-                auto saved = std::make_unique<AmdGpu::DrawRegs>(exec_state);
-                std::memset(static_cast<void*>(&exec_state), 0xA5, sizeof(exec_state));
-                auto second = rasterizer->PlanDraw(exec_state, params, native_fixed, native_exec_key, native_inputs_key, &draw, index_count);
-                std::memcpy(static_cast<void*>(&exec_state), static_cast<const void*>(saved.get()), sizeof(exec_state));
-                auto& live = Core::NativeDraw::Live();
-                const bool same = second != nullptr && second->pipeline == made->pipeline && Vulkan::Rasterizer::PlanDigest(*second) == Vulkan::Rasterizer::PlanDigest(*made) &&
-                                  std::memcmp(second->inputs.color_buffers, made->inputs.color_buffers, sizeof(made->inputs.color_buffers)) == 0 &&
-                                  std::memcmp(&second->inputs.depth_buffer, &made->inputs.depth_buffer, sizeof(made->inputs.depth_buffer)) == 0 &&
-                                  second->inputs.num_indices == made->inputs.num_indices && second->inputs.index_offset == made->inputs.index_offset;
-                live.poison_checked.fetch_add(1, std::memory_order_relaxed);
-                if (!same) {
-                    live.poison_different.fetch_add(1, std::memory_order_relaxed);
-                    std::string stage_text;
-                    if (second) {
-                        for (size_t k = 0; k < made->stages.size(); ++k) {
-                            const auto& x = made->stages[k];
-                            const auto& y = second->stages[k];
-                            stage_text += fmt::format(" [{}: info {}/{} base {:#x}/{:#x} udc {}/{} flat_skipped {}/{} flat {}/{}]", k, fmt::ptr(x.info), fmt::ptr(y.info), x.pgm_base, y.pgm_base, x.user_data_count,
-                                                      y.user_data_count, x.flat_skipped, y.flat_skipped, x.flat.size(), y.flat.size());
-                        }
-                    }
-                    Core::RareEvents::Note("f3_4_poisoned_stage_detail", stage_text);
-                    Core::RareEvents::Note("f3_4_poisoned_registers_changed_plan",
-                                           fmt::format("draw record {}: stage key {:#x}, second plan {}; pipeline equal {}, digest equal {}, colour equal {}, depth equal {}, num_indices {}/{}, index_offset {}/{}", draw.seq,
-                                                       draw.stage_key, second ? "present" : "null", second && second->pipeline == made->pipeline,
-                                                       second && Vulkan::Rasterizer::PlanDigest(*second) == Vulkan::Rasterizer::PlanDigest(*made),
-                                                       second && std::memcmp(second->inputs.color_buffers, made->inputs.color_buffers, sizeof(made->inputs.color_buffers)) == 0,
-                                                       second && std::memcmp(&second->inputs.depth_buffer, &made->inputs.depth_buffer, sizeof(made->inputs.depth_buffer)) == 0,
-                                                       second ? second->inputs.num_indices : 0, made->inputs.num_indices, second ? second->inputs.index_offset : 0, made->inputs.index_offset));
-                }
-                if (second) {
-                    rasterizer->RecyclePlan(std::move(second));
-                }
-            }
+            auto made = rasterizer->PlanDraw(no_registers, params, native_fixed, native_exec_key, native_inputs_key, &draw, index_count);
             return made;
         };
         std::unique_ptr<Vulkan::DrawPlan> candidate;
@@ -643,54 +511,18 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
                 candidate = ReplanAfterDrain(std::move(candidate), 2, make_candidate);
             }
         }
-        if (Core::NativePlanShadow::On() && candidate != nullptr) {
-            // E7b Task 3: the register fallback against the native side (the record's typed values, the native fixed state)
-            const auto& in = candidate->inputs;
-            const auto& args = draw.args;
-            const char* g = "draw_args";
-            if ((args.mask & Core::NativeDraw::DrawArgs::NumIndices) != 0 && index_count == ~0u) {
-                Core::NativePlanShadow::Compare(g, "num_indices", args.num_indices, in.num_indices);
-            }
-            if ((args.mask & Core::NativeDraw::DrawArgs::NumInstances) != 0) {
-                Core::NativePlanShadow::Compare(g, "num_instances", args.num_instances, in.num_instances.num_instances);
-            }
-            if ((args.mask & Core::NativeDraw::DrawArgs::IndexBase) != 0) {
-                Core::NativePlanShadow::Compare(g, "index_base_lo", args.index_base_lo, in.index_base_address.base_addr_lo);
-                Core::NativePlanShadow::Compare(g, "index_base_hi", args.index_base_hi, in.index_base_address.base_addr_hi);
-            }
-            if ((args.mask & Core::NativeDraw::DrawArgs::IndexType) != 0) {
-                Core::NativePlanShadow::Compare(g, "index_type", args.index_type, in.index_buffer_type.raw);
-            }
-            if ((args.mask & Core::NativeDraw::DrawArgs::MaxIndexSize) != 0) {
-                Core::NativePlanShadow::Compare(g, "max_index_size", args.max_index_size, in.max_index_size);
-            }
-            for (u32 mask = draw.vs_user_data_mask; mask != 0; mask &= mask - 1) {
-                const u32 i = static_cast<u32>(std::countr_zero(mask));
-                Core::NativePlanShadow::Compare("user_data", "vs_program.user_data", draw.vs_user_data[i], exec_state.vs_program.user_data[i]);
-            }
-            for (u32 mask = draw.ps_user_data_mask; mask != 0; mask &= mask - 1) {
-                const u32 i = static_cast<u32>(std::countr_zero(mask));
-                Core::NativePlanShadow::Compare("user_data", "ps_program.user_data", draw.ps_user_data[i], exec_state.ps_program.user_data[i]);
-            }
-            if (draw.fixed != nullptr) {
-                Vulkan::ShadowCompareFixedState(*draw.fixed, Vulkan::MakeFixedState(exec_state));
-            }
-            // fields of the register image read by the fallback with no native value: how often they are not at their default
-            Core::NativePlanShadow::RegisterOnly("stages", "stage_enable.raw", exec_state.stage_enable.raw);
-            Core::NativePlanShadow::RegisterOnly("stages", "vgt_gs_mode.onchip", exec_state.vgt_gs_mode.onchip);
-            Core::NativePlanShadow::RegisterOnly("stages", "vgt_strmout_config.raw", exec_state.vgt_strmout_config.raw);
-            const auto raw32 = [](const auto& value) {
-                u32 raw = 0;
-                std::memcpy(&raw, &value, sizeof(value) < sizeof(raw) ? sizeof(value) : sizeof(raw));
-                return raw;
-            };
-            Core::NativePlanShadow::RegisterOnly("stages", "ls_hs_config", raw32(exec_state.ls_hs_config));
-            Core::NativePlanShadow::RegisterOnly("stages", "tess_config", raw32(exec_state.tess_config));
+        if (candidate == nullptr) {
+            // no pipeline for the draw (a stage that does not compile, a target that cannot be bound): refused, not drawn from a register image
+            refused = true;
+            Core::NativeDraw::Live().plan_refused.fetch_add(1, std::memory_order_relaxed);
+            Core::RareEvents::Note("f3_5_draw_refused_no_plan", fmt::format("draw record {}: no plan (stage key {:#x})", draw.seq, draw.stage_key));
         }
         Core::NativeDraw::Live().state_planned.fetch_add(1, std::memory_order_relaxed);
         native_exec_plan = candidate.release();
     }
-    RasterDispatch(call);
+    if (!refused) {
+        RasterDispatch(call);
+    }
     if (native_exec_plan) {
         rasterizer->RecyclePlan(std::unique_ptr<Vulkan::DrawPlan>{std::exchange(native_exec_plan, nullptr)});
     }
@@ -702,7 +534,6 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         // the fast clear eliminate registers (color control in eliminate mode) must not reach the next draw
         last_cb_extent = saved_cb_extent;
         last_target_resources = saved_target_resources;
-        ExecRestore();
     }
 }
 

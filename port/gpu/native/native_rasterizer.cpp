@@ -425,6 +425,13 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
     return plan;
 }
 
+DrawInputs Rasterizer::MakeDepthClearInputs(const Core::NativeDraw::ExecDraw& draw) {
+    DrawInputs in{};
+    ApplyExecRegisters(in, draw, 0, draw.count);
+    Core::NativeTargetDesc::ApplyDepthClear(in, draw.native_targets); // E7 (TLG_TARGET_DESC_USE)
+    return in;
+}
+
 DrawInputs Rasterizer::MakeInputsFromRecord(const Core::NativeDraw::ExecDraw& draw, u32 index_count) {
     DrawInputs in{};
     ApplyExecRegisters(in, draw, 0, draw.count);

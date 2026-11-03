@@ -212,9 +212,9 @@ nlohmann::json Native(const Params&) {
                                        {"stage_program_from_environment", live.key_targets[8].load()}, {"stage_program_from_registers", live.key_targets[9].load()},
                                        {"draw_inputs_from_record", live.key_targets[10].load()}, {"draw_inputs_from_registers", live.key_targets[11].load()},
                                        {"register_only_inputs_checked", live.reg_only_checked.load()}, {"register_only_inputs_not_zero", live.reg_only_nonzero.load()},
-                                       {"f3_5", {{"switch", "TLG_PLAN_WITHOUT_REGISTERS=0 turns it off"}, {"learning_draws_planned_without_registers", live.plan_register_free.load()}, {"learning_draws_planned_from_registers", live.plan_register_path.load()}}},
+                                       {"f3_5", {{"learning_draws_planned_without_registers", live.plan_register_free.load()}, {"draws_refused_not_plannable", live.plan_refused.load()}}},
                                        {"poison_registers_test", {{"switch", "TLG_POISON_REGS=1"}, {"checked", live.poison_checked.load()}, {"plan_changed", live.poison_different.load()}}}}}};
-    j["exec_state"] = {{"planned", live.state_planned.load()}, {"group_violations", live.state_group_violations.load()}};
+    j["exec_state"] = {{"planned", live.state_planned.load()}};
     j["fetch_rebuild"] = {{"tried", live.fetch_rebuild_tried.load()}, {"rebuilt", live.fetch_rebuilt.load()}, {"refused", live.fetch_rebuild_refused.load()}, {"executed", live.fetch_rebuild_exec.load()}};
     j["sync_converted_hook"] = live.sync_converted_hook.load();
     j["sync_converted_sweep"] = live.sync_converted_sweep.load();

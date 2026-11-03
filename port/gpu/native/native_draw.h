@@ -80,11 +80,10 @@ struct LiveCounters {
     std::atomic<u64> reg_only_checked{}, reg_only_nonzero{};
     /// F3.4 test (`TLG_POISON_REGS=1`): learning draws planned a second time with the register image overwritten, and how many plans differed
     std::atomic<u64> poison_checked{}, poison_different{};
-    /// F3.5 (`TLG_PLAN_WITHOUT_REGISTERS`): learning draws planned from the record with an empty register block, and learning draws that still needed the register image (no typed user
-    /// data, no native fixed state, another stage bound, shadow on, switch off)
-    std::atomic<u64> plan_register_free{}, plan_register_path{};
+    /// F3.5: learning draws planned from the record with an empty register block, and draws refused because they cannot be (no typed user data, no native fixed state, another stage bound)
+    std::atomic<u64> plan_register_free{}, plan_refused{};
     /// the native path's private register block: draws and clears planned from it, plans compared with the shared register image (legacy switch on), differences
-    std::atomic<u64> state_planned{}, state_group_violations{};
+    std::atomic<u64> state_planned{};
     std::atomic<u64> overlay_offered{}, overlay_unmapped{}, overlay_same{}, overlay_changed{}, overlay_records{};
     std::atomic<u64> cs_audit_dispatches{}, cs_audit_differing{};
     std::array<std::atomic<u64>, 128> cs_audit_dword{};

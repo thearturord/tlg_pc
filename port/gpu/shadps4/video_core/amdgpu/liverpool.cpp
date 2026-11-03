@@ -234,9 +234,6 @@ void Liverpool::WakeRaster() {
 
 
 void Liverpool::MirrorRegs(u32 dword_offset, u32 count) {
-    if (!exec_overlay_list.empty()) {
-        ExecForget(dword_offset, count);
-    }
     MirrorRegsRaw(dword_offset, count);
 }
 
@@ -297,62 +294,10 @@ void Liverpool::InvalidateRegisterGroups() {
     group_sig_valid.fill(false);
 }
 
-void Liverpool::InvalidateExecGroup(u32 index) {
-    if (index < Regs::NumRegs) {
-        exec_group_sig_valid[RegisterGroupTable()[index]] = false;
-    }
-}
-
-void Liverpool::SeedExecState() {
-    if (exec_state_ready) {
-        return;
-    }
-    exec_state = front_state;
-    exec_group_sig_valid.fill(false);
-    exec_state_ready = true;
-}
-
-void Liverpool::ExecSetWord(u32 index, u32* word, u32 value) {
-    if (*word == value) {
-        return;
-    }
-    if (exec_overlay_bits.empty()) {
-        exec_overlay_bits.assign((Regs::NumRegs + 63) / 64, 0);
-    }
-    u64& bits = exec_overlay_bits[index >> 6];
-    if ((bits >> (index & 63) & 1) == 0) {
-        bits |= 1ull << (index & 63);
-        exec_overlay_list.push_back(index);
-    }
-    *word = value;
-    InvalidateExecGroup(index);
-}
-
-void Liverpool::ExecRestore() {
-    for (const u32 index : exec_overlay_list) {
-        exec_overlay_bits[index >> 6] &= ~(1ull << (index & 63));
-        if (u32* const word = exec_state.Word(index)) {
-            *word = regs.reg_array[index];
-        }
-        InvalidateExecGroup(index);
-    }
-    exec_overlay_list.clear();
-}
-
-void Liverpool::ExecForget(u32 dword_offset, u32 count) {
-    for (u32 index = dword_offset; index < dword_offset + count; ++index) {
-        exec_overlay_bits[index >> 6] &= ~(1ull << (index & 63));
-    }
-}
-
 void Liverpool::MirrorRegsRaw(u32 dword_offset, u32 count) {
     for (u32 k = 0; k < count; ++k) {
         front_state.Set(dword_offset + k, regs.reg_array[dword_offset + k]);
         InvalidateRegisterGroup(dword_offset + k);
-        if (exec_state_ready) {
-            exec_state.Set(dword_offset + k, regs.reg_array[dword_offset + k]);
-            InvalidateExecGroup(dword_offset + k);
-        }
     }
 }
 void Liverpool::MirrorObject(const void* object, size_t size) {
@@ -370,14 +315,6 @@ void Liverpool::MirrorObject(const void* object, size_t size) {
 void Liverpool::MirrorSetDefaults() {
     front_state.SetDefaults();
     InvalidateRegisterGroups();
-    for (const u32 index : exec_overlay_list) {
-        exec_overlay_bits[index >> 6] &= ~(1ull << (index & 63));
-    }
-    exec_overlay_list.clear();
-    if (exec_state_ready) {
-        exec_state.SetDefaults();
-        exec_group_sig_valid.fill(false);
-    }
 }
 void Liverpool::DrainRaster() {
     if (!split_active) {

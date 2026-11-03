@@ -90,6 +90,8 @@ public:
     /// F3.4: the inputs of a draw made from its record (register pairs of the record, the target description, the typed draw arguments, the step rates of the vertex shader object)
     /// instead of from the register image.
     [[nodiscard]] static DrawInputs MakeInputsFromRecord(const Core::NativeDraw::ExecDraw& draw, u32 index_count);
+    /// F3.5: the inputs of a depth / stencil clear (record kind 7) made from its record alone: the depth target words the record holds, the target description of the clear.
+    [[nodiscard]] static DrawInputs MakeDepthClearInputs(const Core::NativeDraw::ExecDraw& draw);
     /// cp_exec_inputs: plans a native draw from its record alone. Null when the render target inputs or the pipeline of the record's keys are not known yet, or the
     /// fixed-function state needs the registers (the caller plans the old way).
     [[nodiscard]] std::unique_ptr<DrawPlan> PlanExecDraw(const FixedState& native, u64 exec_key, u64 inputs_key,

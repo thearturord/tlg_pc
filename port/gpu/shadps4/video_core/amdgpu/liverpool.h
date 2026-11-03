@@ -327,24 +327,6 @@ private:
     std::array<u64, NumRegisterGroups> group_applied_sig{};
     std::array<bool, NumRegisterGroups> group_sig_valid{};
     std::array<bool, NumRegisterGroups> group_sig_full{}; ///< the group was applied with the fixed-function registers too
-    /// The native path's private register block: the mirror of the register file (packets and state templates write both) plus what the executed records wrote,
-    /// never restored. Executed draws, clears and operations are planned from it; the shared `front_state` and its overlay serve the game's own packets only.
-    DrawRegs exec_state{};
-    bool exec_state_ready{};
-    std::array<u64, NumRegisterGroups> exec_group_applied_sig{};
-    std::array<bool, NumRegisterGroups> exec_group_sig_valid{};
-    std::array<bool, NumRegisterGroups> exec_group_sig_full{};
-    u32 exec_group_tick{};
-    /// What the executed records wrote into the private block since the registers were last restored (a fast clear eliminate, a depth clear and a draw of the
-    /// game's own packets restore them to the register file's values, as the shared image's overlay does).
-    std::vector<u64> exec_overlay_bits;
-    std::vector<u32> exec_overlay_list;
-    void ExecRestore();
-    void ExecForget(u32 dword_offset, u32 count);
-    void SeedExecState();
-    void ExecApplyRecord(const Core::NativeDraw::ExecDraw& draw, bool skip_fixed, u32 index_count);
-    void ExecSetWord(u32 index, u32* word, u32 value);
-    void InvalidateExecGroup(u32 index);
     std::array<u64, NumRegisterGroups> group_applied_hash{};
     std::array<bool, NumRegisterGroups> group_applied_valid{};
     void InvalidateRegisterGroup(u32 index);
