@@ -205,15 +205,12 @@ nlohmann::json Native(const Params&) {
                                      live.exec_reason[4].load(), live.exec_reason[5].load(), live.exec_reason[6].load(), live.exec_reason[7].load(), live.exec_reason[8].load()}},
                         {"fixed_null_by_exit", [&live] { nlohmann::json a = nlohmann::json::array(); for (const auto& c : live.fixed_null) { a.push_back(c.load()); } return a; }()},
                         {"plan_null_stale_inputs_pipeline", {live.plan_null[0].load(), live.plan_null[1].load(), live.plan_null[2].load()}},
-                        {"f3_1_key_targets", {{"switch", "TLG_KEY_TARGETS_FROM_INPUTS=0 turns it off"}, {"key_from_plan_inputs", live.key_targets[0].load()}, {"key_from_register_image", live.key_targets[1].load()},
-                                              {"export_format_from_shader_environment", live.key_targets[2].load()}, {"export_format_from_register_image", live.key_targets[3].load()}}},
-                        {"f3_2_f3_3", {{"switch", "TLG_STAGES_FROM_ENV=0 turns it off"}, {"stage_set_from_environment", live.key_targets[4].load()}, {"stage_set_from_registers", live.key_targets[5].load()},
-                                       {"translator_input_from_environment", live.key_targets[6].load()}, {"translator_input_from_registers", live.key_targets[7].load()},
-                                       {"stage_program_from_environment", live.key_targets[8].load()}, {"stage_program_from_registers", live.key_targets[9].load()},
-                                       {"draw_inputs_from_record", live.key_targets[10].load()}, {"draw_inputs_from_registers", live.key_targets[11].load()},
-                                       {"register_only_inputs_checked", live.reg_only_checked.load()}, {"register_only_inputs_not_zero", live.reg_only_nonzero.load()},
-                                       {"f3_5", {{"learning_draws_planned_without_registers", live.plan_register_free.load()}, {"draws_refused_not_plannable", live.plan_refused.load()}}},
-                                       {"poison_registers_test", {{"switch", "TLG_POISON_REGS=1"}, {"checked", live.poison_checked.load()}, {"plan_changed", live.poison_different.load()}}}}}};
+                        {"f3_planning", {{"key_targets_from_plan_inputs", live.key_targets[0].load()}, {"export_format_from_shader_environment", live.key_targets[2].load()},
+                                         {"stage_set_from_environment", live.key_targets[4].load()}, {"translator_input_from_environment", live.key_targets[6].load()},
+                                         {"stage_program_from_environment", live.key_targets[8].load()}, {"stage_program_not_found", live.key_targets[9].load()},
+                                         {"draw_inputs_from_record", live.key_targets[10].load()},
+                                         {"inputs_ta_bc_clip_planes_index_offset_checked", live.reg_only_checked.load()}, {"inputs_ta_bc_clip_planes_index_offset_not_zero", live.reg_only_nonzero.load()},
+                                         {"learning_draws_planned", live.plan_register_free.load()}, {"draws_refused_not_plannable", live.plan_refused.load()}}}};
     j["exec_state"] = {{"planned", live.state_planned.load()}};
     j["fetch_rebuild"] = {{"tried", live.fetch_rebuild_tried.load()}, {"rebuilt", live.fetch_rebuilt.load()}, {"refused", live.fetch_rebuild_refused.load()}, {"executed", live.fetch_rebuild_exec.load()}};
     j["sync_converted_hook"] = live.sync_converted_hook.load();

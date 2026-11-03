@@ -72,17 +72,15 @@ struct LiveCounters {
     std::array<std::atomic<u64>, 9> exec_reason{};
     /// of the typed ones: fast clear eliminates and inline draws (the count came with the draw packet)
     std::atomic<u64> exec_fast_clear{}, exec_inline{}, exec_inline_seen{};
-    /// F3.1: where the pipeline key took the render targets from: 0 the plan's inputs (the native target description), 1 the register image (no inputs: the packet path), and the
-    /// colour export formats: 2 from the pixel shader's environment, 3 from the register image (no environment)
-    /// 4 stage set from the shader environment (vertex plus pixel), 5 stage set from the register image, 6 translator input from the shader environment (F3.3), 7 from the register image, 8 program (address, code, hash) and user data of a stage from the shader environment and the record's words (F3.2b), 9 from the register image, 10 inputs of the plan made from the record (F3.4), 11 from the register image
+    /// F3 planning counters (F3.5: the register-image alternatives are gone, the slots stay): 0 key targets from the plan's inputs, 2 colour export formats from the pixel shader's environment,
+    /// 4 stage set from the shader environment, 6 translator input from the environment, 8 program and user data of a stage from the environment and the record's words, 9 a stage whose
+    /// program was not found, 10 inputs of the plan made from the record
     std::array<std::atomic<u64>, 12> key_targets{};
     /// F3.3: draws whose inputs still carry register-only words (clip planes, border colour base, index offset): checked, and not zero
     std::atomic<u64> reg_only_checked{}, reg_only_nonzero{};
-    /// F3.4 test (`TLG_POISON_REGS=1`): learning draws planned a second time with the register image overwritten, and how many plans differed
-    std::atomic<u64> poison_checked{}, poison_different{};
     /// F3.5: learning draws planned from the record with an empty register block, and draws refused because they cannot be (no typed user data, no native fixed state, another stage bound)
     std::atomic<u64> plan_register_free{}, plan_refused{};
-    /// the native path's private register block: draws and clears planned from it, plans compared with the shared register image (legacy switch on), differences
+    /// draws and clears planned by the command processor
     std::atomic<u64> state_planned{};
     std::atomic<u64> overlay_offered{}, overlay_unmapped{}, overlay_same{}, overlay_changed{}, overlay_records{};
     std::atomic<u64> cs_audit_dispatches{}, cs_audit_differing{};
