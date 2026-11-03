@@ -28,16 +28,10 @@ ALLOWED_SHARED = {
     "video_core/renderer_vulkan/vk_common.h", "video_core/renderer_vulkan/vk_instance.h", "video_core/renderer_vulkan/vk_scheduler.h",  # the Vulkan host layer (device, command recording), not PS4 state
 }
 
-# Member files: out-of-class definitions of emulator class members that belong to the native path (E-1 part 2). They must include the
-# emulator's class headers, so they are exempt from the include rule; each one is a debt that goes when its class gets a native-side
-# interface (see the plan row E-1). The list is reported so it cannot grow silently.
-MEMBER_FILES = {
-    "native_liverpool.cpp": "Liverpool (command processor): F3/F5",
-    "native_texture_cache.cpp": "TextureCache: F2/F5",
-    "native_buffer_cache.cpp": "BufferCache: F4/F5",
-    "native_rasterizer.cpp": "Rasterizer (consumer): F3/F4/F5",
-    "native_rasterizer_helpers.h": "Rasterizer helpers shared with vk_rasterizer.cpp: F5",
-}
+# Member files: none. The out-of-class definitions of emulator class members that served the native path (Liverpool, TextureCache, BufferCache,
+# Rasterizer) lived here until 2026-11-03; they are now `*_engine.cpp` beside their class in shadps4/video_core/, where the emulator may include
+# native/ freely. The mechanism stays so that a member file cannot be added to native/ without being reported.
+MEMBER_FILES = {}
 
 include = re.compile(r'#\s*include\s+"([^"]+)"')
 bad = []

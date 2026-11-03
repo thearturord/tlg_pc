@@ -53,7 +53,7 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
-#include "native/native_rasterizer_helpers.h"
+#include "video_core/renderer_vulkan/vk_rasterizer_engine.h"
 #include "native/native_census.h"
 
 namespace Vulkan {

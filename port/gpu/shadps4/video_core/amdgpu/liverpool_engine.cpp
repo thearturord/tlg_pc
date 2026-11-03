@@ -54,7 +54,7 @@
 #include "video_core/renderer_vulkan/vk_fixed_state.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
-// Native renderer: member functions of an emulator class that belong to the native path. They live here (not in the emulator's file)
+// Engine path: member functions of an emulator class that serve the native path (moved out of native/ 2026-11-03).
 // so that the emulator files only call into native/; the class stays declared in the emulator's header until the owning plan phase
 // (documents/tlg/native plan/no-emulation-plan.md, E-1 part 2) gives the native side its own interface.
 
