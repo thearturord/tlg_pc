@@ -1881,7 +1881,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     Census(census_base + (size <= 256 ? CBufferAddrReadLe256 : size <= 4096 ? CBufferAddrReadLe4k : size <= 65536 ? CBufferAddrReadLe64k : CBufferAddrReadBig));
                 }
                 if (record_binding != ~0u && binder_plan != nullptr) {
-                    Core::NativeDevice::CheckBuffer(binder_plan->bindings[record_binding].id, vsharp.address, size); // B1 shadow check
                     Core::NativeDevice::CheckBufferSharp(binder_plan->bindings[record_binding].id, binder_plan->bindings[record_binding].view_id, vsharp.address, vsharp.stride,
                                                          vsharp.num_records, vsharp.data_format, vsharp.num_format, false); // E2 census
                 }
@@ -2439,7 +2438,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                                                       .tiling_index = u32(tsharp.tiling_index),
                                                                       .pow2pad = u32(tsharp.pow2pad),
                                                                       .address = tsharp.Address()}); // E2 census
-                Core::NativeDevice::CheckImage(image_engine_id, image->info.guest_address, image->info.size.width, image->info.size.height); // B1 shadow check
             }
             {
                 // Dark / bright frame check (2026-10-29): a sampled texture served by a cache image of another address or size than the texture asked for (an overlap resolved
@@ -2796,7 +2794,6 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         }
         texture_cache.UpdateImage(image_id, Core::ImageCaller::RasterizerBeginRendering);
         runtime.SetBackingSamples(image, key.color_samples[cb]);
-        Core::NativeDevice::CheckTarget(false, image->info.guest_address, image->info.size.width, image->info.size.height); // B4 census
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
         if (Core::LightRecorder::On()) {
             Core::LightRecorder::ImageWritten(Core::DebugServer::PresentCount(), image->info.guest_address, image->info.guest_size, texture_cache.ImageUid(image_id), 1);
@@ -2867,7 +2864,6 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         if (Core::LightRecorder::On()) {
             Core::LightRecorder::ImageWritten(Core::DebugServer::PresentCount(), image.info.guest_address, image.info.guest_size, texture_cache.ImageUid(image_id), 2);
         }
-        Core::NativeDevice::CheckTarget(true, image.info.guest_address, image.info.size.width, image.info.size.height); // B4 census
 
         const auto slice = image_view.info.range.base.layer;
         const bool is_depth_clear = regs.depth_render_control.depth_clear_enable && regs.depth_control.depth_enable && regs.depth_control.depth_write_enable;

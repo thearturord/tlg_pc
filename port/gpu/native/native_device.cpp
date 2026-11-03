@@ -72,11 +72,6 @@ void KeepRaw(u64 id, u64 object) {
 
 std::atomic<u64> resources_noted{0}, views_noted{0}, deletes_noted{0}, deletes_unknown{0}, bad_reads{0};
 std::array<std::atomic<u64>, 9> live_by_kind{};
-/// B1 shadow check counters: images [0 same memory and size, 1 same memory other size, 2 other memory, 3 id unknown], buffers [0 inside the object, 1 outside, 2 id unknown]
-std::array<std::atomic<u64>, 4> image_checks{};
-std::array<std::atomic<u64>, 3> buffer_checks{};
-std::atomic<u32> mismatches_logged{0}, outside_logged{0};
-std::array<std::array<std::atomic<u64>, 4>, 2> outside_by{};
 
 constexpr const char* KindName(Kind kind) {
     switch (kind) {
@@ -416,31 +411,6 @@ bool Lookup(u64 id, Object& out) {
     return true;
 }
 
-static bool ShadowChecksOn() {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_SHADOW_CHECKS");
-        return e != nullptr && *e == '1';
-    }();
-    return on;
-}
-
-void CheckImage(u64 id, VAddr address, u32 width, u32 height) {
-    if (!Enabled() || id == 0 || !ShadowChecksOn()) { // B1 shadow census: TLG_SHADOW_CHECKS=1 (off by default since 2026-10-30)
-        return;
-    }
-    Object object;
-    if (!Lookup(id, object)) {
-        image_checks[3].fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    const u32 result = object.address != address ? 2u : (object.width == width && object.height == height) ? 0u : 1u;
-    image_checks[result].fetch_add(1, std::memory_order_relaxed);
-    if (result == 2 && mismatches_logged.fetch_add(1, std::memory_order_relaxed) < 12) {
-        TLG_LOG(GPU, Warn, "B1 native device: binding of {} id {} names memory {:#x} {}x{}, the texture cache bound {:#x} {}x{}", KindName(object.kind), id, object.address,
-                    object.width, object.height, address, width, height);
-    }
-}
-
 namespace {
 struct LastMap {
     u64 address, size;
@@ -602,50 +572,6 @@ void CheckBufferSharp(u64 id, u64 view_id, u64 base_address, u32 stride, u32 num
                 ++sharp_counts[key];
             }
         }
-    }
-}
-
-void CheckBuffer(u64 id, VAddr address, u64 size) {
-    if (!Enabled() || id == 0 || !ShadowChecksOn()) {
-        return;
-    }
-    Object object;
-    if (!Lookup(id, object)) {
-        buffer_checks[2].fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    const bool inside = address >= object.address && address + size <= object.address + object.bytes;
-    buffer_checks[inside ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
-    if (!inside) {
-        // where the bytes are instead: 0 the frame allocator (a Map discard), 1 elsewhere; by usage (0 default, 1 immutable, 2 dynamic, 3 staging)
-        u64 ring_base = 0, ring_size = 0;
-        const bool ring = Core::NativeResources::FrameRing(&ring_base, &ring_size) && address >= ring_base && address < ring_base + ring_size;
-        outside_by[ring ? 0 : 1][std::min<u32>(object.usage, 3)].fetch_add(1, std::memory_order_relaxed);
-        if (!ring && outside_logged.fetch_add(1, std::memory_order_relaxed) < 12) {
-            TLG_LOG(GPU, Warn, "B1 native device: buffer binding of {} id {} (usage {}, bind {:#x}, memory {:#x}+{:#x}) reads {:#x}+{:#x}", KindName(object.kind), id, object.usage, object.bind,
-                        object.address, object.bytes, address, size);
-        }
-    }
-}
-
-namespace {
-/// [color, depth][0 engine texture with the same size, 1 engine texture of another size (a mip / slice / part), 2 inside an engine texture, 3 an engine buffer, 4 none]
-std::array<std::array<std::atomic<u64>, 5>, 2> target_checks{};
-std::atomic<u32> targets_logged{0};
-} // namespace
-
-void CheckTarget(bool depth, VAddr address, u32 width, u32 height) {
-    if (!Enabled() || !ShadowChecksOn()) {
-        return;
-    }
-    Object o;
-    u32 result = 4;
-    if (ResourceAt(address, o)) {
-        result = o.kind == Kind::Buffer ? 3u : o.address != address ? 2u : (o.width == width && o.height == height) ? 0u : 1u;
-    }
-    target_checks[depth ? 1 : 0][result].fetch_add(1, std::memory_order_relaxed);
-    if (result >= 3 && targets_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-        TLG_LOG(GPU, Warn, "B4 census: {} target {:#x} {}x{} has no engine texture ({})", depth ? "depth" : "color", address, width, height, OwnerName(address));
     }
 }
 
@@ -915,17 +841,6 @@ nlohmann::json Report() {
         live[KindName(static_cast<Kind>(k))] = live_by_kind[k].load();
     }
     out["live"] = std::move(live);
-    out["image_bindings"] = {{"same_memory_and_size", image_checks[0].load()}, {"same_memory_other_size", image_checks[1].load()},
-                             {"OTHER_MEMORY", image_checks[2].load()}, {"id_not_in_the_table", image_checks[3].load()}};
-    out["buffer_bindings"] = {{"inside_the_object", buffer_checks[0].load()}, {"OUTSIDE_THE_OBJECT", buffer_checks[1].load()}, {"id_not_in_the_table", buffer_checks[2].load()},
-                              {"outside_in_the_frame_allocator_by_usage", {outside_by[0][0].load(), outside_by[0][1].load(), outside_by[0][2].load(), outside_by[0][3].load()}},
-                              {"outside_elsewhere_by_usage", {outside_by[1][0].load(), outside_by[1][1].load(), outside_by[1][2].load(), outside_by[1][3].load()}}};
-    static constexpr const char* target_names[5] = {"engine_texture_same_size", "engine_texture_other_size", "inside_an_engine_texture", "ENGINE_BUFFER", "NONE"};
-    for (u32 d = 0; d < 2; ++d) {
-        for (u32 r = 0; r < 5; ++r) {
-            out[d ? "depth_targets" : "color_targets"][target_names[r]] = target_checks[d][r].load();
-        }
-    }
     {
         nlohmann::json census;
         census["checked"] = sharp_checked.load();
