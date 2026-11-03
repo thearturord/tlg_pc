@@ -579,6 +579,12 @@ std::atomic<u64> c_dif_bytes_newer{0}, c_dif_bytes_unexplained{0}, c_dif_images_
 std::atomic<u64> c_dif_writer[16]{}; ///< differing bytes by the writer of the store's (older) entry
 std::mutex g_dif_mutex;
 std::vector<nlohmann::json> g_dif_examples;
+/// The bytes of a swapped image that the store has no entry for (left to memory), by what is known about them: a newer entry (announced after the draw's record), a mark of a writer whose
+/// bytes are not kept (by writer), or nothing at all (never announced: zero bytes or not).
+enum UncClass : u32 { UncNewerEntry, UncMark, UncNothingZero, UncNothingNonZero, UncClassCount };
+constexpr const char* UncNames[UncClassCount] = {"a_newer_entry_overlaps", "a_mark_overlaps", "nothing_known_memory_all_zero", "nothing_known_memory_not_zero"};
+std::atomic<u64> c_unc_segments[UncClassCount]{}, c_unc_bytes[UncClassCount]{}, c_unc_mark_writer[8]{}, c_unc_images{0}, c_unc_images_whole{0};
+std::vector<nlohmann::json> g_unc_examples;
 } // namespace
 
 void OverlayImage(u64 address, u64 size, u8* staged) {
@@ -685,6 +691,52 @@ void OverlayImage(u64 address, u64 size, u8* staged) {
                                       {"chosen_entry_stamp", image_chosen_stamp}, {"newest_overlapping_stamp", image_newest_stamp}, {"writer_of_last_differing_entry", image_writer},
                                       {"writer_of_last_unexplained_entry", image_writer_unexplained}, {"mark_writer_after", mark_writer}, {"uncovered_segments", uncovered.size()},
                                       {"engine_resource", owned ? fmt::format("kind {} usage {} cpu_access {:#x}", static_cast<u32>(owner.kind), owner.usage, owner.cpu_access) : "none"}});
+        }
+    }
+    if (!uncovered.empty()) {
+        c_unc_images.fetch_add(1, std::memory_order_relaxed);
+        c_unc_images_whole.fetch_add(covered == 0, std::memory_order_relaxed);
+        for (const auto& [s, t] : uncovered) {
+            u32 cls = UncNothingZero;
+            u32 writer = 0;
+            bool zero = true;
+            for (u64 i = s; i < t && zero; ++i) {
+                zero = staged[i - address] == 0;
+            }
+            u64 newest_overlap_stamp = 0;
+            const u64 from = s > g_max_size ? s - g_max_size : 0;
+            for (auto it = g_entries.lower_bound(from); it != g_entries.end() && it->first < t; ++it) {
+                if (it->first + it->second.size > s && it->second.stamp > seq) {
+                    newest_overlap_stamp = std::max(newest_overlap_stamp, it->second.stamp);
+                }
+            }
+            if (newest_overlap_stamp != 0) {
+                cls = UncNewerEntry;
+            } else {
+                if (ShadowOn()) {
+                    std::scoped_lock marks_lock{g_marks_mutex};
+                    const u64 mfrom = s > g_marks_max_size ? s - g_marks_max_size : 0;
+                    for (auto it = g_marks.lower_bound(mfrom); it != g_marks.end() && it->first < t; ++it) {
+                        if (it->first + it->second.size > s) {
+                            writer = it->second.writer;
+                        }
+                    }
+                }
+                cls = writer != 0 ? UncMark : zero ? UncNothingZero : UncNothingNonZero;
+            }
+            c_unc_segments[cls].fetch_add(1, std::memory_order_relaxed);
+            c_unc_bytes[cls].fetch_add(t - s, std::memory_order_relaxed);
+            if (cls == UncMark) {
+                c_unc_mark_writer[writer & 7].fetch_add(t - s, std::memory_order_relaxed);
+            }
+            std::scoped_lock dif_lock{g_dif_mutex};
+            if (g_unc_examples.size() < 24 && (cls == UncNothingNonZero || g_unc_examples.size() < 8)) {
+                Core::NativeDevice::Object owner;
+                const bool owned = Core::NativeDevice::ResourceAt(address, owner);
+                g_unc_examples.push_back({{"class", UncNames[cls]}, {"image", fmt::format("{:#x}", address)}, {"image_size", size}, {"segment_offset", s - address}, {"segment_bytes", t - s},
+                                          {"covered_bytes_of_image", covered}, {"draw_record", seq}, {"mark_writer", writer}, {"newer_entry_stamp", newest_overlap_stamp}, {"memory_all_zero", zero},
+                                          {"engine_resource", owned ? fmt::format("kind {} usage {} cpu_access {:#x}", static_cast<u32>(owner.kind), owner.usage, owner.cpu_access) : "none"}});
+            }
         }
     }
     c_ov_images.fetch_add(1, std::memory_order_relaxed);
@@ -910,6 +962,18 @@ nlohmann::json Report() {
             }
         }
         std::scoped_lock dif_lock{g_dif_mutex};
+        nlohmann::json unc = {{"images_with_uncovered_bytes", c_unc_images.load()}, {"of_those_nothing_covered_at_all", c_unc_images_whole.load()}};
+        for (u32 c = 0; c < UncClassCount; ++c) {
+            unc["segments"][UncNames[c]] = c_unc_segments[c].load();
+            unc["bytes"][UncNames[c]] = c_unc_bytes[c].load();
+        }
+        for (u32 w = 0; w < 8; ++w) {
+            if (const u64 n = c_unc_mark_writer[w].load(); n != 0) {
+                unc["bytes_by_mark_writer"][std::to_string(w)] = n;
+            }
+        }
+        unc["examples"] = g_unc_examples;
+        out["ring_swap_uncovered"] = std::move(unc);
         out["ring_swap_differences"] = {{"images", c_dif_images.load()}, {"images_every_byte_matches_a_newer_entry", c_dif_images_all_newer.load()},
                                         {"images_with_bytes_matching_nothing", c_dif_images_unexplained.load()}, {"of_those_a_kept_less_writer_marked_after", c_dif_images_unexplained_mark.load()},
                                         {"bytes_matching_a_newer_entry", c_dif_bytes_newer.load()}, {"bytes_matching_nothing", c_dif_bytes_unexplained.load()},
