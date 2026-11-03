@@ -1195,6 +1195,8 @@ void SaveToastBox(SaveClock::time_point now) {
                        : toast_kind == 4 ? TL("Screenshot saved", "Captura de tela salva")
                        : toast_kind == 5 ? TL("Recording 5 seconds...", "Gravando 5 segundos...")
                        : toast_kind == 6 ? TL("Video saved", "Vídeo salvo")
+                       : toast_kind == 7 ? TL("Marker saved", "Marcador salvo")
+                       : toast_kind == 8 ? TL("Light marker saved", "Marcador leve salvo")
                                          : TL("Game saved", "Jogo salvo");
     const float in = std::chrono::duration<float>(now - toast_since).count();
     const float out = std::chrono::duration<float>(toast_until - now).count();

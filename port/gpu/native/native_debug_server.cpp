@@ -22,6 +22,7 @@
 #include "native/native_config.h"
 #include "native/native_stream_probe.h"
 #include "native/native_flight.h"
+#include "native/native_marker.h"
 #include "native/native_timeline.h"
 #include "native/native_pass.h"
 #include "native/native_registry.h"
@@ -693,6 +694,11 @@ void RegisterBuiltins() {
     Register("/timeline", "?n=8000: the latest frame events (study): hooks, submits, flips, command processor waits, presents", Timeline);
     Register("/flight", "(L1) the flight recorder: ?n=200 events per thread (merged by time), what each thread is doing; ?bench=1 first runs the microbenchmark",
              [](const Params& params) { return nlohmann::json::parse(Core::Flight::Report(static_cast<u32>(std::min<u64>(ParseNumber(params, "n", 200), Core::Flight::RingEvents)), ParseNumber(params, "bench", 0) != 0)); });
+    Register("/marker", "(L3) ?mode=1|2 writes a glitch marker folder (1 full, 2 light) and answers with its path; the keys F6 and F7 do the same while the owner plays",
+             [](const Params& params) {
+                 const u64 mode = ParseNumber(params, "mode", 1);
+                 return nlohmann::json{{"folder", Core::Marker::RequestForTest(mode == 2 ? 2 : 1)}, {"markers_written", Core::Marker::Written()}};
+             });
     Register("/frames", "?n=600: the last n frame intervals (time stamp and length in ms)", Frames);
     Register("/timeline_capture", "?seconds=10&tag=name: records every frame timeline event for that long into log/timeline_<tag>.bin (+ .json); without arguments: the state", TimelineCapture);
     Register("/periodic", "last runs of periodic jobs (when they ended, how long they took)",
@@ -774,6 +780,49 @@ void NoteWriteFaultTime(VAddr address, u64 nanoseconds) {
     fault_ns[(address >> 22) & (FaultRegions - 1)].fetch_add(nanoseconds, std::memory_order_relaxed);
 }
 
+std::mutex periodic_snapshot_mutex;
+nlohmann::json periodic_snapshot;
+std::chrono::steady_clock::time_point periodic_snapshot_time;
+bool periodic_snapshot_valid = false;
+
+nlohmann::json CountersSnapshot() {
+    nlohmann::json out;
+    {
+        std::scoped_lock lk{rare_mutex};
+        out["rare_events"] = rare_counts;
+    }
+    out["written_unix_s"] = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    for (const char* name : {"/status", "/zpassgen", "/native", "/registry", "/stats", "/resources"}) {
+        Handler handler;
+        {
+            std::scoped_lock lk{registry_mutex};
+            const auto it = registry.find(name);
+            if (it != registry.end()) {
+                handler = it->second.handler;
+            }
+        }
+        if (!handler) {
+            continue;
+        }
+        try {
+            out[name] = handler(Params{});
+        } catch (const std::exception& e) {
+            out[name] = nlohmann::json{{"error", e.what()}};
+        }
+    }
+    return out;
+}
+
+bool LastPeriodicSnapshot(nlohmann::json& out, double& age_s) {
+    std::scoped_lock lk{periodic_snapshot_mutex};
+    if (!periodic_snapshot_valid) {
+        return false;
+    }
+    out = periodic_snapshot;
+    age_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - periodic_snapshot_time).count();
+    return true;
+}
+
 void Start(u16 port) {
     {
         const auto log_dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir).string();
@@ -826,36 +875,19 @@ void Start(u16 port) {
             const auto write_snapshot = [&](const std::filesystem::path& target_path) {
                 auto temp = target_path;
                 temp += ".tmp";
-                nlohmann::json out;
-                {
-                    std::scoped_lock lk{rare_mutex};
-                    out["rare_events"] = rare_counts;
-                }
-                out["written_unix_s"] = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-                for (const char* name : {"/status", "/zpassgen", "/native", "/registry", "/stats", "/resources"}) {
-                    Handler handler;
-                    {
-                        std::scoped_lock lk{registry_mutex};
-                        const auto it = registry.find(name);
-                        if (it != registry.end()) {
-                            handler = it->second.handler;
-                        }
-                    }
-                    if (!handler) {
-                        continue;
-                    }
-                    try {
-                        out[name] = handler(Params{});
-                    } catch (const std::exception& e) {
-                        out[name] = nlohmann::json{{"error", e.what()}};
-                    }
-                }
+                nlohmann::json out = CountersSnapshot();
                 {
                     std::ofstream file{temp, std::ios::binary | std::ios::trunc};
                     file << out.dump(1);
                 }
                 std::error_code ec;
                 std::filesystem::rename(temp, target_path, ec);
+                {
+                    std::scoped_lock lk{periodic_snapshot_mutex};
+                    periodic_snapshot = std::move(out);
+                    periodic_snapshot_time = std::chrono::steady_clock::now();
+                    periodic_snapshot_valid = true;
+                }
             };
             const bool self_test = std::getenv("TLG_RARE_EVENT_TEST") != nullptr; // development: one made up event after 3 s, to see the file and the snapshot
             u32 ticks = 0;

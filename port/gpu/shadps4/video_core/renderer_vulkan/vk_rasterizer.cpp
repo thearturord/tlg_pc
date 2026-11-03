@@ -14,6 +14,7 @@
 #include "native/native_content.h"
 #include "native/native_field_use.h"
 #include "native/native_prof.h"
+#include "native/native_marker.h"
 #include "native/native_config.h"
 #include "video_core/renderer_vulkan/vk_identity_audit.h"
 #include "native/native_hooks.h"
@@ -619,6 +620,49 @@ void Rasterizer::ClearDepthTarget(const DrawInputs& regs, const AmdGpu::CbDbExte
 // B11 (2026-10-30, giant feathers): the work inside an engine clear's packet range is NOT skipped any more except the clear's own fill of the meta memory (FillBuffer below).
 // The engine's clear function first runs the resource transition of its target (FUN_02479db0), and that emits the game's own operations (fast clear eliminates, decompress
 // draws and dispatches of the previous state); the census of the skipped work found 4,105 such draws and 4,000 dispatches in 20 s that the native clear dropped.
+/// L3: one row of the glitch marker's draw table (what ran, from which record, with which programs and targets).
+static void NoteMarkerRow(u8 kind, u8 draw_class, const Pipeline* pipeline, u64 seq, const DrawInputs* inputs, u32 count, u32 instances) {
+    if (!Core::Marker::Enabled()) {
+        return;
+    }
+    Core::Marker::Row row{};
+    row.seq = seq;
+    row.caller = seq != 0 ? static_cast<u32>(Core::NativeDraw::RecordCallerGhidra(seq)) : 0;
+    row.frame = static_cast<u32>(Core::DebugServer::PresentCount());
+    row.kind = kind;
+    row.draw_class = draw_class;
+    row.flags = seq != 0 ? 1 : 0;
+    row.count = count;
+    row.instances = instances;
+    const auto stages = pipeline->GetStages();
+    if (kind >= 2) {
+        row.vs_hash = !stages.empty() && stages[0] != nullptr ? stages[0]->pgm_hash : 0;
+    } else {
+        constexpr u32 FragmentStage = static_cast<u32>(Shader::SwStage::Fragment);
+        constexpr u32 VertexStage = static_cast<u32>(Shader::SwStage::Vertex);
+        row.ps_hash = stages.size() > FragmentStage && stages[FragmentStage] != nullptr ? stages[FragmentStage]->pgm_hash : 0;
+        row.vs_hash = stages.size() > VertexStage && stages[VertexStage] != nullptr ? stages[VertexStage]->pgm_hash : 0;
+    }
+    if (inputs != nullptr) {
+        for (const auto& color : inputs->color_buffers) {
+            if (color) {
+                if (row.colors == 0) {
+                    row.color0 = color.Address();
+                    row.width = static_cast<u16>(color.Pitch());
+                    row.height = static_cast<u16>(color.Height());
+                }
+                ++row.colors;
+            }
+        }
+        row.depth = inputs->depth_buffer.DepthAddress();
+        if (row.colors == 0 && row.depth != 0) {
+            row.width = static_cast<u16>(inputs->depth_buffer.Pitch());
+            row.height = static_cast<u16>(inputs->depth_buffer.Height());
+        }
+    }
+    Core::Marker::NoteRow(row);
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseDraw, engine_clear_on);
     if (SkipForEngineClear() && plan != nullptr) {
@@ -721,6 +765,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     const auto& fetch_shader = pipeline->GetFetchShader();
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
+    NoteMarkerRow(0, tag.valid ? (tag.meta & 0xff) : 15u, pipeline, plan != nullptr ? plan->native_seq : 0, draw_inputs, regs.num_indices, regs.num_instances.NumInstances());
     const auto cmdbuf = scheduler.CommandBuffer();
     {
         TLG_PROF_LEVEL("raster.record_draw", 2);
@@ -826,6 +871,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     scheduler.BeginRendering(state);
     Core::NativePass::NoteDraw(4, true, pass_barrier, pipeline);
 
+    NoteMarkerRow(1, 4, pipeline, plan != nullptr ? plan->native_seq : 0, draw_inputs, max_count, 0);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
@@ -1004,6 +1050,7 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     }
     pipeline->BindResources(set_writes, push_data);
 
+    NoteMarkerRow(2, 3, pipeline, plan != nullptr ? plan->native_seq : 0, nullptr, cs_program.dim_x, cs_program.dim_y);
     const auto cmdbuf = scheduler.CommandBuffer();
     {
         TLG_PROF_LEVEL("raster.record_dispatch", 2);
@@ -1096,6 +1143,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Dis
     scheduler.EndRendering();
     pipeline->BindResources(set_writes, push_data);
 
+    NoteMarkerRow(3, 3, pipeline, plan != nullptr ? plan->native_seq : 0, nullptr, 0, 0);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatchIndirect(buffer->Handle(), base);

@@ -96,6 +96,16 @@ void NameThisThread(const char* name) {
     }
 }
 
+double MsAgo(u64 tick) {
+    const u64 tick_now = Tick();
+    const u64 ns_now = SteadyNs();
+    double ticks_per_ns = 1.0;
+    if (ns_now > start.ns0 + 5'000'000 && tick_now > start.tick0) {
+        ticks_per_ns = static_cast<double>(tick_now - start.tick0) / static_cast<double>(ns_now - start.ns0);
+    }
+    return -static_cast<double>(static_cast<s64>(tick_now - tick)) / ticks_per_ns / 1e6;
+}
+
 u64 EventsWritten() {
     u64 total = 0;
     const u32 count = g_ring_count.load(std::memory_order_acquire);
@@ -105,7 +115,7 @@ u64 EventsWritten() {
     return total;
 }
 
-std::string Report(u32 per_thread, bool bench) {
+std::string Report(u32 per_thread, bool bench, double max_age_ms) {
     std::string out = "{";
     if (bench) {
         const bool was = g_enabled.exchange(true);
@@ -153,6 +163,9 @@ std::string Report(u32 per_thread, bool bench) {
     bool first_line = true;
     for (const Line& line : lines) {
         const Entry& e = *line.entry;
+        if (max_age_ms > 0.0 && -ms_ago(e.tick) > max_age_ms) {
+            continue;
+        }
         out += fmt::format("{}[{:.3f}, {}, \"{}\", {}, {}, {}, {}]", first_line ? "" : ", ", ms_ago(e.tick), e.slot, KindName(e.kind), e.seq, e.a, e.b, e.flags);
         first_line = false;
     }

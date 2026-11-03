@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <string>
+
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
@@ -17,6 +19,8 @@ namespace TlgCapture {
 
 /// Window thread: the next presented frame is saved as a PNG.
 void RequestScreenshot();
+/// Any thread: like RequestScreenshot, the PNG goes to `path` (the glitch marker's folder) and no "saved" toast is shown.
+void RequestScreenshotTo(const std::string& path);
 /// Window thread: the next `seconds` of presented frames are recorded (ignored while a recording runs).
 void RequestVideo(double seconds);
 

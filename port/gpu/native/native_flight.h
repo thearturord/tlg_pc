@@ -155,8 +155,11 @@ private:
 #define FLIGHT_SCOPE(what) ::Core::Flight::Scope TLG_FLIGHT_CAT(flight_scope_, __LINE__) { what }
 
 /// The /flight report: every thread (name, id, what it is doing, events written) and the latest `per_thread` events of each, merged by time, as JSON. `bench` first runs the
-/// microbenchmark (one million events on the calling thread) and reports ns per event.
-std::string Report(u32 per_thread, bool bench);
+/// microbenchmark (one million events on the calling thread) and reports ns per event. `max_age_ms` > 0 leaves out events older than that.
+std::string Report(u32 per_thread, bool bench, double max_age_ms = 0.0);
+
+/// Milliseconds between a Tick() value and now (negative: in the past), with the calibration the reports use.
+double MsAgo(u64 tick);
 
 /// Total events written by all threads (for the stats line).
 u64 EventsWritten();

@@ -43,6 +43,11 @@ void Unregister(const std::string& path);
 /// Stores the latest value of a named group of figures; /stats returns all groups. Any thread.
 void Publish(const std::string& group, nlohmann::json value);
 
+/// The report the 20 s snapshot file holds (rare events, /status, /zpassgen, /native, /registry, /stats, /resources), built now. Any thread.
+nlohmann::json CountersSnapshot();
+/// The snapshot the 20 s thread took last (false before the first): what the glitch marker's counter delta is measured against. `age_s` is how old it is.
+bool LastPeriodicSnapshot(nlohmann::json& out, double& age_s);
+
 /// Milliseconds since the server's clock started (the time base of /frames and /periodic).
 double UptimeMs();
 

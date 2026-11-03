@@ -2,6 +2,8 @@
 #include "common/path_util.h"
 #include "native/native_debug_server.h"
 #include "native/native_hooks.h"
+#include "native/native_marker.h"
+#include "tlg_capture.h"
 #include "native/native_timeline.h"
 #include "native/native_prof.h"
 #include "core/guest_heap.h"
@@ -258,6 +260,7 @@ extern "C" int tlggpu_init(const TlgGpuConfig* config) {
         const auto dir = Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs);
         EmulatorSettings.LoadOverlay((dir / (MemoryPatcher::g_game_serial + ".json")).string());
         EmulatorSettings.LoadOverlay((dir / (MemoryPatcher::g_game_serial + ".readback.json")).string());
+        Core::Marker::SetHooks({.screenshot = [](const std::string& path) { TlgCapture::RequestScreenshotTo(path); }, .toast = [](int kind) { TlgOverlay::SaveToast(kind); }});
         if (const u32 port = EmulatorSettings.GetDebugServerPort()) {
             Core::DebugServer::Start(static_cast<u16>(port));
         }

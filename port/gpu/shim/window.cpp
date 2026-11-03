@@ -10,6 +10,7 @@
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "native/native_marker.h"
 #include "native/native_prof.h"
 #include "native/native_stall.h"
 #include "native/native_timeline.h"
@@ -384,6 +385,12 @@ bool WindowSDL::PollEvents() {
             if (!Core::Stall::Stop()) {
                 Core::Stall::Start(10, true);
             }
+            continue;
+        }
+        // tlg: F6 writes a full glitch marker (user/log/glitch_<n>_<time>/: flight recorder tail, draw table of the last two frames, counters that moved, the presented frame, a note), F7 a
+        // light one (no draw table or image). A thread of its own writes it; the game does not wait (documents/tlg/native plan/diagnostics-logging-plan.md).
+        if (event.type == SDL_EVENT_KEY_DOWN && (event.key.key == SDLK_F6 || event.key.key == SDLK_F7) && !event.key.repeat) {
+            Core::Marker::Request(event.key.key == SDLK_F6 ? 1 : 2);
             continue;
         }
         // tlg: F12 saves a screenshot, Shift+F12 records 5 seconds of video (user/screenshots, tlg_capture.h)

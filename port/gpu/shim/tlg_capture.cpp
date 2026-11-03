@@ -59,6 +59,7 @@ struct Slot {
     u32 width{}, height{};
     vk::Format format{};
     s64 pts_ms{};
+    std::string path; ///< screenshot: where the PNG goes (empty: user/screenshots)
 };
 
 /// What the writer thread gets
@@ -67,10 +68,13 @@ struct Job {
     u32 width{}, height{};
     vk::Format format{};
     s64 pts_ms{};
+    std::string path;
     std::vector<u8> pixels;
 };
 
 std::atomic<bool> screenshot_wanted{false};
+std::mutex screenshot_path_mutex;
+std::string screenshot_path_wanted; ///< set by RequestScreenshotTo, taken by the present thread with the request
 std::atomic<double> video_wanted{0.0};
 
 // present thread
@@ -185,6 +189,8 @@ void WriteScreenshot(const Job& job) {
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
         path = dir / OutputPath(fmt::format("_dark{:03}.png", job.pts_ms).c_str()).filename();
+    } else if (!job.path.empty()) {
+        path = job.path;
     } else {
         path = OutputPath(".png");
     }
@@ -196,7 +202,9 @@ void WriteScreenshot(const Job& job) {
             return;
         }
         LOG_INFO(Render, "screenshot saved: {} ({}x{})", path.string(), job.width, job.height);
-        TlgOverlay::SaveToast(4);
+        if (job.path.empty()) {
+            TlgOverlay::SaveToast(4);
+        }
     } else {
         LOG_ERROR(Render, "screenshot: cannot write {}", path.string());
     }
@@ -549,6 +557,14 @@ void RequestScreenshot() {
     screenshot_wanted.store(true, std::memory_order_release);
 }
 
+void RequestScreenshotTo(const std::string& path) {
+    {
+        std::scoped_lock lock{screenshot_path_mutex};
+        screenshot_path_wanted = path;
+    }
+    screenshot_wanted.store(true, std::memory_order_release);
+}
+
 void RequestVideo(double seconds) {
     video_wanted.store(seconds, std::memory_order_release);
 }
@@ -562,6 +578,11 @@ void Record(const Vulkan::Instance& instance, vk::CommandBuffer cmdbuf, vk::Imag
             screenshot_slot.busy = true;
             screenshot_slot.tick = tick;
             screenshot_slot.kind = Kind::Screenshot;
+            {
+                std::scoped_lock lock{screenshot_path_mutex};
+                screenshot_slot.path = std::move(screenshot_path_wanted);
+                screenshot_path_wanted.clear();
+            }
             screenshot_slot.width = width;
             screenshot_slot.height = height;
             screenshot_slot.format = format;
@@ -710,7 +731,8 @@ void Poll(Vulkan::Scheduler& scheduler) {
             return;
         }
         vmaInvalidateAllocation(vk_instance->GetAllocator(), slot.allocation, 0, VK_WHOLE_SIZE);
-        Job job{.kind = slot.kind, .width = slot.width, .height = slot.height, .format = slot.format, .pts_ms = slot.pts_ms};
+        Job job{.kind = slot.kind, .width = slot.width, .height = slot.height, .format = slot.format, .pts_ms = slot.pts_ms, .path = std::move(slot.path)};
+        slot.path.clear();
         const u8* data = static_cast<const u8*>(slot.mapped);
         job.pixels.assign(data, data + u64{slot.width} * slot.height * 4);
         slot.busy = false;
