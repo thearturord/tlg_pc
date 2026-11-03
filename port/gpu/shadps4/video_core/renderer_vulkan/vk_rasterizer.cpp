@@ -2930,6 +2930,11 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
                     ssharp = legacy;
                 }
             }
+        } else if (sampler.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Sampler>::Summary::MultiLoad && sampler.sharp_fetch.load_mask == 0 &&
+                   sampler.post_op != Shader::SharpFetchPostOp::DisableAnisoIfSingleLod) {
+            // F5: the sampler is the shader's own immediates (no flat user data dword is read), so a stage whose flat user data was skipped still has it
+            ssharp = sampler.GetSharp(stage);
+            Core::NativeRegistry::NoteBinder(11);
         } else if (StageFlatSkipped(stage)) {
             Core::NativeRegistry::NoteBinder(6); // must not happen
             if (stage.sw_stage == Shader::SwStage::Compute) {

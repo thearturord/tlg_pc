@@ -561,6 +561,10 @@ u32 StageCoverage(const Shader::Info& info, u32 record_stage, const Core::Native
         }
     }
     for (const auto& desc : info.samplers) {
+        if (desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Sampler>::Summary::MultiLoad && desc.sharp_fetch.load_mask == 0 &&
+            desc.post_op != Shader::SharpFetchPostOp::DisableAnisoIfSingleLod) {
+            continue; // F5: built from the shader's immediates, no descriptor word is read (as the buffers above)
+        }
         if (desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Sampler>::Summary::SingleLoad) {
             return 8;
         }
