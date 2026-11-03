@@ -84,18 +84,6 @@ struct DrawIndirectParams {
     bool is_indirect;
 };
 
-/// Per-draw state of one shader stage, captured by the command processor thread when it looks the
-/// pipeline up (cp_split_mode). `info` is the raster thread's own copy of the stage's Info: the
-/// shared one is rewritten by the next lookup while this draw is still being recorded.
-/// cp_split_prepare_images: the pure part of one image resource of a stage, decoded on the command
-/// processor thread from the plan's own copy of the user data.
-struct PreparedImage {
-    AmdGpu::Image tsharp{};
-    u32 num_bindings{1};
-    boost::container::small_vector<VideoCore::ImageInfo, 1> infos;
-    boost::container::small_vector<VideoCore::ImageViewInfo, 1> views;
-};
-
 /// A read-only buffer of a stage that the command processor thread copied into the constant ring (documents/tlg/pc-port-draw-pipeline-architecture.md, T1).
 struct RingBinding {
     u32 index{};      ///< index in the stage's buffer list
@@ -176,6 +164,9 @@ struct ResolvedBuffer {
     bool no_object{}; ///< the lookup by address found no engine object (the raster thread need not look again while the immutable epoch holds)
 };
 
+/// Per-draw state of one shader stage, captured by the command processor thread when it looks the
+/// pipeline up (cp_split_mode). `info` is the raster thread's own copy of the stage's Info: the
+/// shared one is rewritten by the next lookup while this draw is still being recorded.
 struct StagePlan {
     boost::container::small_vector<RingBinding, 8> ring; ///< T1: filled by the command processor thread, read by the raster thread
     boost::container::small_vector<ResolvedBuffer, 8> resolved; ///< R2: by the stage's buffer index (empty: none resolved)
@@ -185,8 +176,6 @@ struct StagePlan {
     boost::container::small_vector<u32, 8> image_words;
     static constexpr u32 ImageUnknown = ~0u, ImageNoEntry = ~0u - 1;
     Shader::Info* info{};
-    boost::container::small_vector<PreparedImage, 8> images;
-    bool images_prepared{};
     std::array<u32, Shader::NUM_USER_DATA_REGS> user_data{};
     u32 user_data_count{};
     boost::container::small_vector<u32, 64> flat;

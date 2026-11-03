@@ -1483,7 +1483,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
-    VertexInputs<AmdGpu::Buffer> guest_buffers;
+    VertexInputs<Core::NativeDesc::BufferDesc> guest_buffers;
     pipeline->GetVertexInputs(attributes, bindings, divisors, guest_buffers,
                               regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
 
@@ -1513,8 +1513,8 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     // Build list of ranges covering the requested buffers
     VertexInputs<BufferRange> ranges{};
     for (const auto& buffer : guest_buffers) {
-        if (buffer.base_address != 0 && buffer.GetSize() > 0) {
-            ranges.emplace_back(buffer.base_address, buffer.base_address + buffer.GetSize());
+        if (buffer.address != 0 && buffer.size > 0) {
+            ranges.emplace_back(buffer.address, buffer.address + buffer.size);
         }
     }
 
@@ -1577,22 +1577,22 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     VertexInputs<vk::DeviceSize> host_sizes;
     VertexInputs<vk::DeviceSize> host_strides;
     for (const auto& buffer : guest_buffers) {
-        if (buffer.base_address != 0 && buffer.GetSize() > 0) {
+        if (buffer.address != 0 && buffer.size > 0) {
             const auto host_buffer_info =
                 std::ranges::find_if(ranges_merged, [&](const BufferRange& range) {
-                    return buffer.base_address >= range.base_address &&
-                           buffer.base_address < range.end_address;
+                    return buffer.address >= range.base_address &&
+                           buffer.address < range.end_address;
                 });
             ASSERT(host_buffer_info != ranges_merged.cend());
             host_buffers.emplace_back(host_buffer_info->ring ? constant_ring->Handle() : host_buffer_info->buffer->Handle());
-            host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
+            host_offsets.push_back(host_buffer_info->offset + buffer.address -
                                    host_buffer_info->base_address);
         } else {
             host_buffers.emplace_back(VK_NULL_HANDLE);
             host_offsets.push_back(0);
         }
-        host_sizes.push_back(buffer.GetSize());
-        host_strides.push_back(buffer.GetStride());
+        host_sizes.push_back(buffer.size);
+        host_strides.push_back(buffer.stride);
     }
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -2122,22 +2122,23 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     Core::NativeRegistry::NoteBinder(2);
                 }
             }
-            const AmdGpu::Buffer vsharp = chosen_sharp;
             if (Core::NativeFieldUse::On()) { // F4.0b
-                Core::NativeFieldUse::NoteBuffer(reinterpret_cast<const u32*>(&vsharp));
+                Core::NativeFieldUse::NoteBuffer(reinterpret_cast<const u32*>(&chosen_sharp));
             }
-            if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+            // F4: from here on the buffer is a plain description (the descriptor type stays at the recompiler's interface above)
+            const Core::NativeDesc::BufferDesc vsharp = Core::NativeDesc::BufferDescOf(chosen_sharp);
+            if (vsharp.address == 0 || vsharp.size == 0) {
                 Census(census_base + CBufferNull);
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
-            } else if (vsharp.GetSize() >= (1ull << 30) && !memory->IsValidMapping(vsharp.base_address)) {
-                LOG_ERROR(Render, "buffer sharp at unmapped address {:#x} of {} bytes for stage {:#x}: bound as null", vsharp.base_address,
-                          vsharp.GetSize(), stage.pgm_hash);
+            } else if (vsharp.size >= (1ull << 30) && !memory->IsValidMapping(vsharp.address)) {
+                LOG_ERROR(Render, "buffer sharp at unmapped address {:#x} of {} bytes for stage {:#x}: bound as null", vsharp.address,
+                          vsharp.size, stage.pgm_hash);
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
-                const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-                if (size != vsharp.GetSize()) {
+                const u64 size = memory->ClampRangeSize(vsharp.address, vsharp.size);
+                if (size != vsharp.size) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
-                              vsharp.GetSize(), size, stage.pgm_hash);
+                              vsharp.size, size, stage.pgm_hash);
                 }
                 // N7.5: a read-only buffer of guest memory bound where it is (imported view of the runtime's backing), no copy, no dirty tracking
                 bool in_place = false;
@@ -2148,12 +2149,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         inplace_written.fetch_add(1, std::memory_order_relaxed);
                     } else if (size > inplace_cap) {
                         inplace_too_large.fetch_add(1, std::memory_order_relaxed);
-                    } else if (buffer_cache.IsRangeGpuWritten(vsharp.base_address, size)) {
+                    } else if (buffer_cache.IsRangeGpuWritten(vsharp.address, size)) {
                         inplace_gpu_written.fetch_add(1, std::memory_order_relaxed);
-                    } else if (desc.is_formatted && (texture_cache.AnyImageOverlaps(vsharp.base_address, size) || texture_cache.IsMeta(vsharp.base_address))) {
+                    } else if (desc.is_formatted && (texture_cache.AnyImageOverlaps(vsharp.address, size) || texture_cache.IsMeta(vsharp.address))) {
                         inplace_image_or_meta.fetch_add(1, std::memory_order_relaxed);
                     } else {
-                        const auto window = host_import->Find(vsharp.base_address, size);
+                        const auto window = host_import->Find(vsharp.address, size);
                         const u64 aligned = Common::AlignDown(window.offset, alignment);
                         if (window.buffer && window.offset - aligned + size <= window.chunk_remaining + (window.offset - aligned)) {
                             in_place = true;
@@ -2165,8 +2166,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                             inplace_bytes.fetch_add(size, std::memory_order_relaxed);
                             if (inplace_verify_interval != 0 && ++inplace_counter % inplace_verify_interval == 0) {
                                 if (inplace_checks.size() < 8192) {
-                                    InPlaceCheck check{vsharp.base_address, scheduler.CurrentTick(), std::vector<u8>(size)};
-                                    memory->CopySparseMemory(vsharp.base_address, check.bytes.data(), size);
+                                    InPlaceCheck check{vsharp.address, scheduler.CurrentTick(), std::vector<u8>(size)};
+                                    memory->CopySparseMemory(vsharp.address, check.bytes.data(), size);
                                     inplace_checks.push_back(std::move(check));
                                 } else {
                                     inplace_verify_dropped.fetch_add(1, std::memory_order_relaxed);
@@ -2197,21 +2198,21 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
                 Core::NativeUploads::SetDetail((desc.is_written ? 1u : 0u) | (desc.is_formatted ? 2u : 0u) | (size > VideoCore::BufferCache::StreamThreshold() ? 4u : 0u) |
                                                ((ring_draw || ring_dispatch) ? 16u : 0u) |
-                                               (Core::NativeUploads::OnDemandAudit() && buffer_cache.IsRegionGpuModified(vsharp.base_address, size) ? 32u : 0u) |
-                                               (Core::NativeUploads::OnDemandAudit() && buffer_cache.IsRangeGpuWritten(vsharp.base_address, size) ? 64u : 0u) |
-                                               (Core::NativeUploads::OnDemandAudit() && texture_cache.FindImageFromRange(vsharp.base_address, size) ? 128u : 0u));
+                                               (Core::NativeUploads::OnDemandAudit() && buffer_cache.IsRegionGpuModified(vsharp.address, size) ? 32u : 0u) |
+                                               (Core::NativeUploads::OnDemandAudit() && buffer_cache.IsRangeGpuWritten(vsharp.address, size) ? 64u : 0u) |
+                                               (Core::NativeUploads::OnDemandAudit() && texture_cache.FindImageFromRange(vsharp.address, size) ? 128u : 0u));
                 if (Core::NativeUploads::OnDemandAudit()) {
-                    Core::NativeUploads::SetWriter(Core::NativeUpdates::WhoWrote(vsharp.base_address, size));
+                    Core::NativeUploads::SetWriter(Core::NativeUpdates::WhoWrote(vsharp.address, size));
                 }
                 if (record_binding != ~0u && binder_plan != nullptr) {
-                    Core::NativeDevice::CheckBuffer(binder_plan->bindings[record_binding].id, vsharp.base_address, size); // B1 shadow check
-                    Core::NativeDevice::CheckBufferSharp(binder_plan->bindings[record_binding].id, binder_plan->bindings[record_binding].view_id, vsharp.base_address, vsharp.stride,
+                    Core::NativeDevice::CheckBuffer(binder_plan->bindings[record_binding].id, vsharp.address, size); // B1 shadow check
+                    Core::NativeDevice::CheckBufferSharp(binder_plan->bindings[record_binding].id, binder_plan->bindings[record_binding].view_id, vsharp.address, vsharp.stride,
                                                          vsharp.num_records, vsharp.data_format, vsharp.num_format, false); // E2 census
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-                    vsharp.base_address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2, cp_no_object);
+                    vsharp.address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2, cp_no_object);
                 if (Core::LightRecorder::On() && !Core::LightRecorder::Recording() && draw_class_now == 0 && size <= 1024 && !desc.is_written) {
-                    Core::LightRecorder::ShadowBuffer(Core::DebugServer::PresentCount(), vsharp.base_address, size); // a z / shadow draw's view constants candidate
+                    Core::LightRecorder::ShadowBuffer(Core::DebugServer::PresentCount(), vsharp.address, size); // a z / shadow draw's view constants candidate
                 }
                 if (Core::LightRecorder::On() && Core::LightRecorder::Recording()) {
                     Core::LightRecorder::Entry note{};
@@ -2219,14 +2220,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     note.via = immutable_hint != nullptr ? 1 : 0;
                     note.written = desc.is_written ? 1 : 0;
                     note.id = record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].id : 0;
-                    note.address = vsharp.base_address;
+                    note.address = vsharp.address;
                     note.size = size;
                     u64 h = 0xcbf29ce484222325ull;
                     const u64 hashed = std::min<u64>(size, 2048); // a light constant block is below 2 KB (more costs too much with the copy dispatches recorded too)
-                    const u64 bytes = memory->IsValidMapping(vsharp.base_address, hashed) ? hashed : 0;
+                    const u64 bytes = memory->IsValidMapping(vsharp.address, hashed) ? hashed : 0;
                     for (u64 b = 0; b < bytes; b += 4) {
                         u32 word = 0;
-                        std::memcpy(&word, reinterpret_cast<const void*>(vsharp.base_address + b), std::min<u64>(4, bytes - b));
+                        std::memcpy(&word, reinterpret_cast<const void*>(vsharp.address + b), std::min<u64>(4, bytes - b));
                         if (b < 704) {
                             note.words[b / 4] = word;
                         }
@@ -2235,7 +2236,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     note.hash = h;
                     Core::LightRecorder::Note(note);
                 }
-                if (Core::NativeRegistry::AuditBuffer(vsharp.base_address, size, desc.is_written, desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase)) {
+                if (Core::NativeRegistry::AuditBuffer(vsharp.address, size, desc.is_written, desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase)) {
                     {
                         // where did the shader get this descriptor from, and did the record write the registers it sits in?
                         thread_local u32 site_tick = 0;
@@ -2257,8 +2258,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                             }
                             // where is the buffer relative to the program of the stage (shader constants sit next to the code), and which post operation builds the descriptor
                             const u64 program = stage.ProgramBase();
-                            const u64 distance = vsharp.base_address >= program ? vsharp.base_address - program : program - vsharp.base_address;
-                            const u32 below = vsharp.base_address >= program ? 0u : 1u;
+                            const u64 distance = vsharp.address >= program ? vsharp.address - program : program - vsharp.address;
+                            const u32 below = vsharp.address >= program ? 0u : 1u;
                             const u32 bucket = distance == 0 ? 0u : static_cast<u32>(std::bit_width(distance));
                             Core::NativeRegistry::NoteUnexplainedSite(static_cast<u32>(stage.sw_stage), static_cast<u32>(desc.sharp_fetch.summary) != 0 ? 1u : 0u, offset, set_by_record, table_described,
                                                                       (static_cast<u32>(desc.post_op) << 8) | (below << 7) | std::min(bucket, 63u));
@@ -2268,7 +2269,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     static std::atomic<u64> details{0};
                     static std::atomic<u32> logged_details{0};
                     if (details.fetch_add(1) % 60000 == 0 && logged_details.fetch_add(1) < 30) {
-                        std::string text = fmt::format("unexplained buffer {:#x}+{} stage {} pgm {:#x} plan_from_record {} index {} sharp_fetch summary {} load_mask {:#x} flat_size {} offsets:", vsharp.base_address,
+                        std::string text = fmt::format("unexplained buffer {:#x}+{} stage {} pgm {:#x} plan_from_record {} index {} sharp_fetch summary {} load_mask {:#x} flat_size {} offsets:", vsharp.address,
                                                        size, static_cast<u32>(stage.sw_stage), stage.pgm_hash, Core::NativeRegistry::CurrentDrawFromPlan(), buffer_index,
                                                        static_cast<u32>(desc.sharp_fetch.summary), desc.sharp_fetch.load_mask, stage.FlatUserData().size());
                         for (u32 k = 0; k < 4; ++k) {
@@ -2284,7 +2285,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                             text += fmt::format(" {:x}", word);
                         }
                         u32 record_registers = 0;
-                        const u32 at = Core::NativeDraw::RecordRegisterWith(Core::NativeRegistry::CurrentDrawSeq(), static_cast<u32>(vsharp.base_address), &record_registers);
+                        const u32 at = Core::NativeDraw::RecordRegisterWith(Core::NativeRegistry::CurrentDrawSeq(), static_cast<u32>(vsharp.address), &record_registers);
                         text += fmt::format(" | record has base word at register {:#x} of {}", at, record_registers);
                         std::array<u32, 16> rvs{}, rps{};
                         const u32 masks = Core::NativeDraw::RecordUserData(Core::NativeRegistry::CurrentDrawSeq(), rvs.data(), rps.data());
@@ -2315,11 +2316,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         static std::atomic<u32> logged{0};
                         if (logged.fetch_add(1) < 6) {
                             LOG_INFO(Render_Vulkan, "stage {:#x} (user data {}) writes {} bytes at {:#x} through a storage buffer, caller {:#x}",
-                                     stage.pgm_hash, stage.user_data.size(), size, vsharp.base_address,
+                                     stage.pgm_hash, stage.user_data.size(), size, vsharp.address,
                                      dispatch_caller ? dispatch_caller - Core::NativeDraw::ImageBase() + 0x1000000 : 0);
                         }
                     }
-                    texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size, "a written storage buffer view");
+                    texture_cache.InvalidateMemoryFromGPU(vsharp.address, size, "a written storage buffer view");
                 }
                 Census(census_base + CBufferBarrierQuery);
                 if (runtime.IsBufferAccessed(buffer, offset, size, desc.is_written)) {

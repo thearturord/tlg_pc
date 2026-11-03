@@ -165,22 +165,22 @@ struct PlanStageView {
     }
 };
 
-/// N3d: the V# of a buffer of a planned stage. A stage planned without flat user data takes it from the record's bindings of the plan (the binder's source); a
+/// N3d: the buffer description of a planned stage's buffer (the V# is decoded once, here). A stage planned without flat user data takes it from the record's bindings of the plan (the binder's source); a
 /// descriptor built from immediates needs no flat data at all.
 template <class Desc>
-AmdGpu::Buffer PlanBufferSharp(const DrawPlan* owner, const StagePlan& stage, const Desc& desc, const PlanStageView& view) {
+Core::NativeDesc::BufferDesc PlanBufferDesc(const DrawPlan* owner, const StagePlan& stage, const Desc& desc, const PlanStageView& view) {
     if (owner == nullptr || !stage.flat_skipped || desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
-        return desc.GetSharp(view);
+        return Core::NativeDesc::BufferDescOf(desc.GetSharp(view));
     }
     const u32 s = stage.info->sw_stage == Shader::SwStage::Vertex ? 0 : stage.info->sw_stage == Shader::SwStage::Fragment ? 1 : 2;
     const u32 offset = desc.sharp_fetch.offsets[0];
     if (s <= 1) {
         if (const u32* words = FindRecordWords(*stage.info, owner->bindings.data(), owner->binding_count, s, 1, offset, 4)) {
-            return desc.FromWords(words, view);
+            return Core::NativeDesc::BufferDescOf(desc.FromWords(words, view));
         }
     }
     Core::NativeRegistry::NoteBinder(6); // must not happen: the cover test of the plan promised a binding
-    return AmdGpu::Buffer::Null();
+    return Core::NativeDesc::BufferDescOf(AmdGpu::Buffer::Null());
 }
 } // namespace
 
@@ -697,17 +697,17 @@ void Rasterizer::ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) 
                     continue;
                 }
             }
-            const AmdGpu::Buffer v = desc.FromWords(words, info);
-            const u64 bytes = v.GetSize();
-            if (v.base_address == 0 || bytes == 0 || bytes >= (u64{1} << 28)) {
+            const Core::NativeDesc::BufferDesc v = Core::NativeDesc::BufferDescOf(desc.FromWords(words, info));
+            const u64 bytes = v.size;
+            if (v.address == 0 || bytes == 0 || bytes >= (u64{1} << 28)) {
                 reject(1);
                 continue;
             }
             // the object of the engine id; in the handles' compare mode (2) the lookup by address wins, as it does in ObtainBuffer
-            auto* object = NativeHandleMode() == 2 || (handles == nullptr && list[first].id == 0) ? Core::NativeResources::FindImmutable(v.base_address, static_cast<u32>(bytes))
+            auto* object = NativeHandleMode() == 2 || (handles == nullptr && list[first].id == 0) ? Core::NativeResources::FindImmutable(v.address, static_cast<u32>(bytes))
                            : handles != nullptr                                               ? handles[first]
                                                                                               : Core::NativeResources::FindImmutableById(list[first].id);
-            if (object == nullptr || (object->usage != 1 && !mutable_on) || v.base_address < object->begin || v.base_address + bytes > object->end) {
+            if (object == nullptr || (object->usage != 1 && !mutable_on) || v.address < object->begin || v.address + bytes > object->end) {
                 reject(object == nullptr ? 2 : object->usage != 1 && !mutable_on ? 3 : 4);
                 if (object == nullptr && (NativeHandleMode() == 2 || (handles == nullptr && list[first].id == 0))) {
                     out.resolved[i].no_object = true; // what ObtainBuffer's own lookup by address would find
@@ -719,13 +719,13 @@ void Rasterizer::ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) 
                 reject(5);
                 continue;
             }
-            const u64 size = memory->ClampRangeSize(v.base_address, bytes);
+            const u64 size = memory->ClampRangeSize(v.address, bytes);
             if (size != bytes) {
                 reject(8);
                 continue;
             }
             // not synchronized yet is fine: the raster thread binds it only once it is (at this generation)
-            out.resolved[i] = {object, v.base_address, static_cast<u32>(size), generation};
+            out.resolved[i] = {object, v.address, static_cast<u32>(size), generation};
             resolve_stats.planned.fetch_add(1, std::memory_order_relaxed);
         }
     };
@@ -1009,11 +1009,11 @@ void Rasterizer::FrontStageNotes(StagePlan& stage, u64 position, const DrawPlan*
         if (desc.IsSpecial() || !desc.is_written) {
             continue;
         }
-        const auto vsharp = PlanBufferSharp(owner, stage, desc, view);
-        if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+        const auto vsharp = PlanBufferDesc(owner, stage, desc, view);
+        if (vsharp.address == 0 || vsharp.size == 0) {
             continue;
         }
-        NotePendingGpuWrite(vsharp.base_address, vsharp.GetSize(), position);
+        NotePendingGpuWrite(vsharp.address, vsharp.size, position);
         ring_written_buffers.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -1052,9 +1052,9 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
             ring_formatted.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        const auto vsharp = PlanBufferSharp(owner, stage, desc, view);
-        const VAddr address = vsharp.base_address;
-        const u64 size = vsharp.GetSize();
+        const auto vsharp = PlanBufferDesc(owner, stage, desc, view);
+        const VAddr address = vsharp.address;
+        const u64 size = vsharp.size;
         if (address == 0 || size == 0) {
             ring_no_sharp.fetch_add(1, std::memory_order_relaxed);
             continue;
@@ -1235,7 +1235,7 @@ void Rasterizer::FrontGeometryRing(DrawPlan& plan, u64 done, bool indexed, u32 i
                 table = reinterpret_cast<const u32*>(pointer & 0xFFFFFFFFFFFFULL);
                 const VAddr table_entry = reinterpret_cast<VAddr>(table + attrib.dword_offset);
                 // the descriptor tables of native draws can live in the table arena window, which is no mapping of the runtime
-                if (!ReadableGuestMemory(table_entry, sizeof(AmdGpu::Buffer))) {
+                if (!ReadableGuestMemory(table_entry, 16)) { // a V# is four dwords
                     Core::NativeUploads::NoteGeometry(12);
                     static std::atomic<u32> logged_pointer{0};
                     if (logged_pointer.fetch_add(1) < 6) {
@@ -1244,17 +1244,18 @@ void Rasterizer::FrontGeometryRing(DrawPlan& plan, u64 done, bool indexed, u32 i
                     return;
                 }
             }
-            AmdGpu::Buffer buffer;
+            u32 words[4];
             if (attrib.sgpr_base != Shader::IR::NumScalarRegs) {
-                Core::DrainAudit::Read(Core::DrainAudit::ReadFetch, reinterpret_cast<u64>(table + attrib.dword_offset), sizeof(buffer));
+                Core::DrainAudit::Read(Core::DrainAudit::ReadFetch, reinterpret_cast<u64>(table + attrib.dword_offset), sizeof(words));
             }
-            std::memcpy(&buffer, table + attrib.dword_offset, sizeof(buffer));
+            std::memcpy(words, table + attrib.dword_offset, sizeof(words));
             if (attrib.sgpr_base != Shader::IR::NumScalarRegs) {
-                Core::DrainAudit::Copied(Core::DrainAudit::ReadFetch, reinterpret_cast<u64>(table + attrib.dword_offset), &buffer, sizeof(buffer));
+                Core::DrainAudit::Copied(Core::DrainAudit::ReadFetch, reinterpret_cast<u64>(table + attrib.dword_offset), words, sizeof(words));
             }
-            buffer.base_address += attrib.inst_offset;
-            if (buffer.base_address != 0 && buffer.GetSize() > 0) {
-                ranges.push_back({buffer.base_address, buffer.base_address + buffer.GetSize()});
+            Core::NativeDesc::BufferDesc buffer = Core::NativeDesc::BufferDescFromWords(words);
+            buffer.address += attrib.inst_offset;
+            if (buffer.address != 0 && buffer.size > 0) {
+                ranges.push_back({buffer.address, buffer.address + buffer.size});
             }
         }
         std::ranges::sort(ranges, [](const Range& a, const Range& b) { return a.begin < b.begin; });

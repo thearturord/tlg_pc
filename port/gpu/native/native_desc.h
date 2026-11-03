@@ -128,6 +128,36 @@ struct ImageDesc {
     return h;
 }
 
+/// F4.1 buffers: what the host reads of a buffer descriptor (V#) when it binds a storage / uniform buffer: where, how big and, for a formatted buffer, the format numbers.
+struct BufferDesc {
+    u64 address{};
+    u64 size{};       ///< bytes (records x stride, or the byte count of a raw buffer)
+    u32 stride{};
+    u32 num_records{};
+    u32 data_format{}; ///< the console's data / number format numbers (formatted buffer bindings only; the host maps them with the recompiler's tables)
+    u32 num_format{};
+};
+
+/// The one decode of the four dwords of a V#: base address (40 bits), stride (14 bits), record count, number / data format. `size` is the byte count the host binds (the console's own
+/// rule: the record count alone when the stride is 0, else records x stride, in 32 bits).
+[[nodiscard]] inline BufferDesc BufferDescFromWords(const u32* w) noexcept {
+    BufferDesc d;
+    d.address = w[0] | static_cast<u64>(w[1] & 0xFFu) << 32;
+    d.stride = (w[1] >> 16) & 0x3FFFu;
+    d.num_records = w[2];
+    d.num_format = (w[3] >> 12) & 7u;
+    d.data_format = (w[3] >> 15) & 0xFu;
+    d.size = d.stride == 0 ? d.num_records : static_cast<u32>(d.stride * d.num_records);
+    return d;
+}
+
+/// The same from the recompiler's V# type (16 bytes of the same words)
+template <class Sharp>
+[[nodiscard]] inline BufferDesc BufferDescOf(const Sharp& sharp) noexcept {
+    static_assert(sizeof(Sharp) == 16);
+    return BufferDescFromWords(reinterpret_cast<const u32*>(&sharp));
+}
+
 /// F4.1 samplers: what the host sampler creation reads of the console sampler descriptor (S#), as Vulkan-ready numbers. All fields are plain 32 bit values with no padding, so the struct
 /// is its own cache key (hash of its bytes). `valid` false: the descriptor holds a value the host refuses (the caller substitutes the all-zero sampler).
 struct SamplerDesc {

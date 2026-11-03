@@ -60,7 +60,7 @@ void NoteFetch(const Shader::Gcn::VertexAttribute& attrib, const Shader::Info& i
     }
     u64 pointer = 0;
     std::memcpy(&pointer, &ud[attrib.sgpr_base], sizeof(pointer));
-    Core::DrainAudit::Read(Core::DrainAudit::ReadFetch, (pointer & 0xFFFFFFFFFFFFULL) + u64(attrib.dword_offset) * 4, sizeof(AmdGpu::Buffer));
+    Core::DrainAudit::Read(Core::DrainAudit::ReadFetch, (pointer & 0xFFFFFFFFFFFFULL) + u64(attrib.dword_offset) * 4, 16); // a V# is four dwords
 }
 
 } // Anonymous namespace
@@ -667,8 +667,6 @@ Shader::Info* PipelineCache::RasterInfoFor(const Shader::Info* shared) {
 
 void PipelineCache::CapturePlan(StagePlan& out, Shader::Info* clone, const Shader::Info& shared, bool skip_flat) {
     out.info = clone;
-    out.images.clear();
-    out.images_prepared = false;
     out.user_data_count = static_cast<u32>(shared.user_data.size());
     ASSERT(out.user_data_count <= out.user_data.size());
     std::copy_n(shared.user_data.begin(), out.user_data_count, out.user_data.begin());

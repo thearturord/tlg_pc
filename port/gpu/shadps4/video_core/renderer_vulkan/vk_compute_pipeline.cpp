@@ -41,11 +41,6 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         if (indexed && Shader::Indexed::IsIndexedBufferType(buffer.buffer_type)) {
             continue;
         }
-        // During deserialization, we don't have access to the UD to fetch sharp data. To address
-        // this properly we need to track shaprs or portion of them in `sdata`, but since we're
-        // interested only in "is storage" flag (which is not even effective atm), we can take a
-        // shortcut there.
-        const auto sharp = preloading ? AmdGpu::Buffer{} : buffer.GetSharp(*info);
         bindings.push_back({
             .binding = binding++,
             .descriptorType = vk::DescriptorType::eStorageBuffer,

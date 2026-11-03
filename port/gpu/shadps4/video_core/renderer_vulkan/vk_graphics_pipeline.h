@@ -6,6 +6,7 @@
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
+#include "native/native_desc.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_depth.h"
@@ -107,7 +108,7 @@ public:
     template <typename Attribute, typename Binding>
     void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
                          VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
-                         VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
+                         VertexInputs<Core::NativeDesc::BufferDesc>& guest_buffers, u32 step_rate_0,
                          u32 step_rate_1) const;
 
 private:
