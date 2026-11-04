@@ -6913,8 +6913,54 @@ u64 PS4_SYSV_ABI LightWrites(u64 object, u64 source, u64 a2, u64 a3, u64 a4, u64
         }
         return 0;
     });
-    (void)source;
-    return 0;
+    // native-v3-writers (TLG_LIGHT_RING=1): the light constants sit in a ring of three buffers that the game rewrites 4 submissions (about 2 frames) after a draw recorded them, while the raster thread
+    // may still read them with the game two frames ahead (late read samples, 2026-11-04: record submit 597, slot rewritten at 601). The game runs here; the 160 bytes it wrote are then copied into a
+    // fresh block of the frame ring (64 MB, lapped after about 50 frames) and the buffer's descriptor is pointed at the block, the way the game's UpdateSubresource does it for a dynamic constant buffer.
+    static const bool light_ring = [] { const char* e = std::getenv("TLG_LIGHT_RING"); return e != nullptr && e[0] == '1'; }();
+    static const u64 original = Core::GuestHooks::OriginalEntry("LightWrites");
+    if (!light_ring || original == 0 || !IsHeapPointer(object)) {
+        return 0;
+    }
+    reinterpret_cast<GuestDraw6>(original)(object, source, a2, a3, a4, a5);
+    Guarded([&]() -> u64 {
+        const u64 holder = Rd<u64>(ImageBase() + 0x6b03558 - 0x1000000, 0);
+        const u64 allocator = holder != 0 ? Rd<u64>(holder, 0x10238) : 0;
+        if (allocator == 0) {
+            return 0;
+        }
+        static const u64 alloc_original = Core::GuestHooks::OriginalEntry("AllocFrameGarlic");
+        const u64 alloc_entry = alloc_original != 0 ? alloc_original : ImageBase() + 0x2476350 - 0x1000000;
+        const u32 index = Rd<u32>(object, 0x440);
+        const u64 second = Rd<u64>(source, 0x40);
+        const bool has_second = second != 0 && Rd<u64>(second, 0x58) != 0;
+        for (const u64 base : {u64{0xc0}, u64{0x2d0}}) {
+            if (base == 0x2d0 && !has_second) {
+                continue;
+            }
+            const u64 buffer = Rd<u64>(object, base + index * 0xb0ull);
+            if (!IsHeapPointer(buffer)) {
+                continue;
+            }
+            const u64 memory = Rd<u64>(buffer, 0x30);
+            const u32 size = Rd<u32>(buffer, 0x180);
+            if (memory == 0 || size == 0 || size > 0x1000) {
+                continue;
+            }
+            const u64 block = reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u64)>(alloc_entry)(allocator, size, 0x10);
+            if (block == 0) {
+                continue;
+            }
+            std::memcpy(reinterpret_cast<void*>(block), reinterpret_cast<const void*>(memory), size);
+            Wr<u32>(buffer, 0x60, static_cast<u32>(block));
+            Wr<u32>(buffer, 0x64, static_cast<u32>(block >> 32) & 0xfffu | 0x100000u);
+            Wr<u32>(buffer, 0x6c, 0x20077facu);
+            Wr<u32>(buffer, 0x68, (size + 0xfu) >> 4);
+            const s64 version = reinterpret_cast<std::atomic<s64>*>(holder + 0x302a0)->fetch_add(1);
+            Wr<s64>(buffer, 0x160, version);
+        }
+        return 0;
+    });
+    return 0x8000000000000000ull;
 }
 
 /// N5b: `RenderDev::BeginRecording(this)` fills two small dynamic buffers directly (no Map) once per frame: the buffer at this + 0x2830 (28,672 bytes: 256 records of 0x70)

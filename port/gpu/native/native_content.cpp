@@ -731,9 +731,34 @@ void SetSite(u32 site) {
     t_site = site;
 }
 
+namespace {
+/// TLG_REWRITE_GAP=1 (measurement): per writer (1 skinning, 2 lights, 4 scene slots), how many graphics submissions lie between two writes that start at the same address
+std::mutex g_gap_mutex;
+std::unordered_map<u64, u32> g_gap_last[8];
+std::atomic<u64> c_gap[8][18]{};
+} // namespace
+
 void Announce(u32 writer, u64 address, u64 size, u64 stamp) {
     if (!On() || address == 0 || size == 0) {
         return;
+    }
+    {
+        static const bool gap_on = [] { const char* e = std::getenv("TLG_REWRITE_GAP"); return e != nullptr && e[0] == '1'; }();
+        if (gap_on && (writer == 1 || writer == 2 || writer == 4)) {
+            const u32 now = g_submit_count.load(std::memory_order_relaxed);
+            std::scoped_lock gap_lock{g_gap_mutex};
+            auto& last = g_gap_last[writer];
+            if (last.size() > 400000) {
+                last.clear();
+            }
+            const auto [it, inserted] = last.try_emplace(address, now);
+            if (inserted) {
+                c_gap[writer][17].fetch_add(1, std::memory_order_relaxed); // first write seen
+            } else {
+                c_gap[writer][std::min<u32>(now - it->second, 16u)].fetch_add(1, std::memory_order_relaxed);
+                it->second = now;
+            }
+        }
     }
     if (LedgerOn() && !InRing(address, size)) { // the frame ring is the ring swap's (stamped bytes); the ledger is for the memory outside it
         LedgerNote(address, address + size, stamp, writer);
@@ -1692,6 +1717,16 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
             c_late_margin[k][std::min<u32>(a.newest_site, MaxSites - 1)][std::min<u32>(a.newest_submit > submit ? a.newest_submit - submit : 0u, 9u)].fetch_add(1, std::memory_order_relaxed);
         }
         c_late_after_bytes_by_site[k][std::min<u32>(a.newest_site, MaxSites - 1)].fetch_add(size, std::memory_order_relaxed);
+        {
+            static const bool gap_on = [] { const char* e = std::getenv("TLG_REWRITE_GAP"); return e != nullptr && e[0] == '1'; }();
+            static std::atomic<u32> examples[LateKinds]{};
+            if (gap_on && k == static_cast<size_t>(LateKind::BufferObjectCopy) && examples[k].fetch_add(1, std::memory_order_relaxed) % 40000 < 6) {
+                Core::RareEvents::Note("late_read_example_object_copy",
+                                       fmt::format("{:#x} + {:#x}: record submit {}, newest write announced at submit count {} (belongs to submission {}), the write it replaced was at {}, submit count now {}, writer {}, site {}", address, size,
+                                                   submit, a.newest_submit, a.newest_submit + 1, a.newest_prev_submit, g_submit_count.load(std::memory_order_relaxed), a.newest_writer,
+                                                   a.newest_site < g_site_names.size() ? g_site_names[a.newest_site] : std::string("?")));
+            }
+        }
         if (c_late_rare_noted[k].fetch_add(1, std::memory_order_relaxed) < 3) {
             Core::RareEvents::Note(fmt::format("m0_late_read_written_after_its_record_{}", LateKindNames[k]), fmt::format("{:#x} + {:#x}: record {}, newest write stamp {}, writer {}", address, size, seq, a.newest, a.newest_writer));
         }
@@ -2108,7 +2143,14 @@ nlohmann::json Report() {
         out["ring_windows"] = std::move(w);
     }
     {
-        nlohmann::json check = {{"on", LedgerOn()}, {"switch", "TLG_F2_LEDGER=0 turns it off"}, {"ledger_notes", c_ledger_notes.load()}, {"ledger_overflow_skipped", c_ledger_overflow.load()}};
+        nlohmann::json check = {{"on", LedgerOn()}, {"switch", "TLG_F2_LEDGER=0 turns it off"}, {"ledger_notes", c_ledger_notes.load()}, {"ledger_overflow_skipped", c_ledger_overflow.load()}, {"graphics_submissions_so_far", g_submit_count.load()}};
+        for (u32 w : {1u, 2u, 4u}) {
+            for (u32 g = 0; g < 18; ++g) {
+                if (const u64 n = c_gap[w][g].load()) {
+                    check["rewrite_gap_submissions_by_writer"][std::to_string(w)][g == 17 ? "first" : std::to_string(g)] = n;
+                }
+            }
+        }
         {
             std::scoped_lock ledger_lock{g_ledger_mutex};
             check["ledger_ranges"] = g_ledger.size();
