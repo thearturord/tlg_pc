@@ -138,6 +138,9 @@ void NoteShPacket(u32 reg_offset, const u32* words, u32 count);
 void SetDrawClass(u32 draw_class);
 /// C5 (hazard audit): the draw class the raster thread is working on (0 z / shadow, 1 g-buffer, 2 forward, 3 compute, 4 indirect, 15 untagged).
 u32 CurrentDrawClass();
+/// Diagnostics (TLG_GPUWRITE_WHO): the shader the raster thread binds buffers for (program hash, software stage); read by the GPU written range book.
+void SetBufferWriter(u64 pgm_hash, u32 sw_stage);
+std::pair<u64, u32> BufferWriter();
 /// NativeDraw v2 audit (raster thread): the legacy backend reads the descriptor of a shader resource from the flat user data at `offset` (`words`, `dwords` of them;
 /// offset 0xffff: it is not a single load of consecutive dwords). Compares it with the binding of the current draw's record at that offset: same words.
 /// The native binder (N3): 0 buffer descriptor taken from the record, 1 image descriptor taken from the record, 2 buffer fell back to the flat user data, 3 image fell back,

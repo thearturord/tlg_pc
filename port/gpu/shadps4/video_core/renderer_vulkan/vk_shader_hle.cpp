@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "native/native_registry.h"
 #include "native/native_image_caller.h"
 #include "native/native_raycast_cpu.h"
 #include "native/native_skin_cpu.h"
@@ -84,6 +85,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const Core::NativeDis
         // Obtain buffers for the total source and destination ranges.
         const auto [src_buf, src_buf_offset] = buffer_cache.ObtainBuffer(
             src_buf_sharp.base_address + src_offset_min, src_offset_max - src_offset_min, false);
+        Core::NativeRegistry::SetBufferWriter(src_buf_sharp.base_address, 102); // diagnostics: shader HLE buffer copy (source)
         const auto [dst_buf, dst_buf_offset] = buffer_cache.ObtainBuffer(
             dst_buf_sharp.base_address + dst_offset_min, dst_offset_max - dst_offset_min, true);
 

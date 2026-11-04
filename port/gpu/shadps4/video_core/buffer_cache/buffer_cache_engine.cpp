@@ -249,8 +249,31 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
         Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4GpuBytesLost, lost);
         static std::atomic<u32> logged{0};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 24) {
-            TLG_LOG(BUFFER, Warn, "E4: placing {:#x}+{:#x} ({} ids, first {:#x}): {} GPU written bytes no placed buffer holds, first {:#x} ({})", begin, end - begin, ids.size(), ids.front(), lost,
-                        gpu_pieces[0].first, Core::NativeDevice::OwnerName(gpu_pieces[0].first));
+            std::string who;
+            std::shared_lock who_lock{gpu_ranges_mutex};
+            for (const auto& [a, n] : gpu_pieces) {
+                u32 steps = 0;
+                auto w = gpu_writer_who.upper_bound(a + n - 1);
+                u32 shown = 0;
+                while (w != gpu_writer_who.begin() && shown < 2 && ++steps < 64) {
+                    --w;
+                    if (w->first < a + n && w->first + w->second.first > a) {
+                        who += fmt::format(" | writer of {:#x}+{:#x}: {}", w->first, w->second.first, w->second.second);
+                        ++shown;
+                    } else if (w->first + 0x100000 < a) {
+                        break;
+                    }
+                }
+                break;
+            }
+            for (u32 k = 0; k < ids.size() && k < 4; ++k) {
+                Core::NativeDevice::Object object;
+                if (Core::NativeDevice::Lookup(ids[k], object)) {
+                    who += fmt::format(" | id {:#x} kind {} usage {} bind {:#x} bytes {:#x} at {:#x}", ids[k], static_cast<u32>(object.kind), object.usage, object.bind, object.bytes, object.address);
+                }
+            }
+            TLG_LOG(BUFFER, Warn, "E4: placing {:#x}+{:#x} ({} ids, first {:#x}): {} GPU written bytes no placed buffer holds, first {:#x} ({}){}", begin, end - begin, ids.size(), ids.front(), lost,
+                        gpu_pieces[0].first, Core::NativeDevice::OwnerName(gpu_pieces[0].first), who);
         }
     }
     u64 total = 0;

@@ -214,6 +214,8 @@ private:
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
     RangeSet gpu_modified_ranges;
+    /// TLG_GPUWRITE_WHO=1 (diagnostic): the draw that last wrote each GPU written range, by start address (guarded by gpu_ranges_mutex)
+    std::map<u64, std::pair<u64, std::string>> gpu_writer_who;
     /// B9.1: the bytes of each engine buffer (by its id) the engine announced since their last upload
     std::unordered_map<u64, RangeSet> object_dirty;
     RangeSet all_object_dirty; ///< B9.1 audit: the same bytes of all buffers by address

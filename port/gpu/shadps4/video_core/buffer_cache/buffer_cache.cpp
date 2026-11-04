@@ -495,6 +495,16 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
     if (is_written) {
         std::unique_lock lock{gpu_ranges_mutex};
         gpu_modified_ranges.Add(device_addr, size);
+        static const bool who_on = [] { const char* e = std::getenv("TLG_GPUWRITE_WHO"); return e && e[0] == '1'; }();
+        if (who_on) {
+            if (gpu_writer_who.size() > 200000) {
+                gpu_writer_who.clear();
+            }
+            const auto [pgm, sw_stage] = Core::NativeRegistry::BufferWriter();
+            gpu_writer_who[device_addr] = {size, fmt::format("shader {:#x} stage {} class {} seq {} tick {}{}", pgm, sw_stage, Core::NativeRegistry::CurrentDrawClass(),
+                                                             Core::NativeRegistry::CurrentDrawSeq(), scheduler.CurrentTick(),
+                                                             sw_stage >= 100 && sw_stage < 103 ? " source " + Core::NativeDevice::OwnerName(pgm) : std::string{})};
+        }
         Core::NativeResources::NoteGpuWritten(device_addr, size); // R1b: copies of engine buffers with these bytes are stale
     }
     TLG_PROF_ADD("buffer.uncached.arena_synchronized (sum = bytes uploaded)", last_upload_bytes);

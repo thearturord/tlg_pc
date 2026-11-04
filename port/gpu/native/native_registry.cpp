@@ -508,6 +508,18 @@ void NoteContextSlot(u32 offset, u32 resource_kind) {
     ++context_slots[{offset, resource_kind}];
 }
 
+namespace {
+thread_local u64 t_writer_hash = 0;
+thread_local u32 t_writer_stage = 0;
+} // namespace
+void SetBufferWriter(u64 pgm_hash, u32 sw_stage) {
+    t_writer_hash = pgm_hash;
+    t_writer_stage = sw_stage;
+}
+std::pair<u64, u32> BufferWriter() {
+    return {t_writer_hash, t_writer_stage};
+}
+
 std::string DescribeCurrentDraw() {
     if (current_draw_seq == 0 || !draw_ring) {
         return "no draw";

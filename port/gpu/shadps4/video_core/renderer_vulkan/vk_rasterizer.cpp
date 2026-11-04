@@ -1885,6 +1885,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     Core::NativeDevice::CheckBufferSharp(binder_plan->bindings[record_binding].id, binder_plan->bindings[record_binding].view_id, vsharp.address, vsharp.stride,
                                                          vsharp.num_records, vsharp.data_format, vsharp.num_format, false); // E2 census
                 }
+                Core::NativeRegistry::SetBufferWriter(stage.pgm_hash, static_cast<u32>(stage.sw_stage));
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2, cp_no_object);
                 if (Core::LightRecorder::On() && !Core::LightRecorder::Recording() && draw_class_now == 0 && size <= 1024 && !desc.is_written) {
@@ -3019,6 +3020,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         if (is_gds) {
             return {buffer_cache.GetGdsBuffer(), address};
         }
+        Core::NativeRegistry::SetBufferWriter(u64(value), 101); // diagnostics: a command processor fill (value)
         return buffer_cache.ObtainBuffer(address, num_bytes, true);
     }();
     runtime.FillBuffer(buffer, offset, num_bytes, value);
@@ -3252,6 +3254,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         if (explicit_readback) {
             return buffer_cache.ObtainBufferForDownload(dst, num_bytes);
         }
+        Core::NativeRegistry::SetBufferWriter(src, src_gds ? 103 : 100); // diagnostics: a GPU copy (source address)
         return buffer_cache.ObtainBuffer(dst, num_bytes, true, true);
     }();
     const vk::BufferCopy copy = {
