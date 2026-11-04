@@ -840,6 +840,7 @@ struct FsKindCounters {
 FsKindCounters c_fs_kind[static_cast<size_t>(LateKind::Count)];
 struct FsServeCounters {
     std::atomic<u64> reads{0}, replaced_reads{0}, replaced_bytes{0}, hole_reads{0}, hole_bytes{0}, loader_newest_reads{0};
+    std::atomic<u64> hole_pieces_by_writer[16]{}, hole_bytes_by_writer[16]{};
 };
 FsServeCounters c_fs_serve[static_cast<size_t>(LateKind::Count)];
 } // namespace
@@ -1053,14 +1054,14 @@ u64 FrameStoreServe(LateKind kind, u64 address, void* dst, u64 size) {
         FsCoverLocked(address, size, submit, covers, done);
         auto* out = static_cast<u8*>(dst);
         for (const Cover& cv : covers) {
+            // dst is only written, never read: it may be video memory the CPU maps write-combined (the zero copy upload), where a read is very slow. What changed is counted against the game's memory.
             u8* at = out + (cv.b - address);
             const u64 n = cv.e - cv.b;
-            if (std::memcmp(at, cv.src, n) != 0) {
-                for (u64 i = 0; i < n; ++i) {
-                    replaced += at[i] != cv.src[i] ? 1 : 0;
-                }
-                std::memcpy(at, cv.src, n);
+            u64 first_diff = ~0ull;
+            if (GuardedCompare(reinterpret_cast<const void*>(cv.b), cv.src, n, first_diff) && first_diff != ~0ull) {
+                replaced += n - first_diff; // from the first differing byte on (an upper bound)
             }
+            std::memcpy(at, cv.src, n);
         }
     }
     if (replaced != 0) {
@@ -1079,6 +1080,9 @@ u64 FrameStoreServe(LateKind kind, u64 address, void* dst, u64 size) {
         const LedgerAnswer a = LedgerQuery(b, e);
         if (a.covered != 0 && a.newest_submit >= submit) {
             hole += e - b;
+            const u32 w = std::min<u32>(a.newest_writer, 15u);
+            c.hole_pieces_by_writer[w].fetch_add(1, std::memory_order_relaxed);
+            c.hole_bytes_by_writer[w].fetch_add(e - b, std::memory_order_relaxed);
         }
     };
     for (const auto& d : done) {
@@ -1116,6 +1120,15 @@ nlohmann::json FrameStoreReport(size_t kind) {
             {"served_reads_with_a_hole", c_fs_serve[kind].hole_reads.load()},
             {"served_hole_bytes", c_fs_serve[kind].hole_bytes.load()},
             {"served_reads_where_a_loader_write_is_the_newest", c_fs_serve[kind].loader_newest_reads.load()},
+            {"hole_pieces_by_writer", [&] {
+                 nlohmann::json j = nlohmann::json::object();
+                 for (u32 w = 0; w < 16; ++w) {
+                     if (const u64 n = c_fs_serve[kind].hole_pieces_by_writer[w].load()) {
+                         j[std::to_string(w)] = {{"pieces", n}, {"bytes", c_fs_serve[kind].hole_bytes_by_writer[w].load()}};
+                     }
+                 }
+                 return j;
+             }()},
             {"note", "memory now against the newest version at or before the record's submission; differences at depth 0 are writes after the submission, at depth 2 the game running ahead"}};
 }
 

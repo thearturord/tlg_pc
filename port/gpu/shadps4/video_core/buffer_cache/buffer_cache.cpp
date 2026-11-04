@@ -909,7 +909,10 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         if (idle) {
             u8* const base = const_cast<u8*>(arena->mapped_data.data());
             for (const auto& copy : copies) {
-                memory->CopySparseMemory(copy.dstOffset, base + (copy.dstOffset - arena->cpu_addr), copy.size);
+                u8* const dst = base + (copy.dstOffset - arena->cpu_addr);
+                memory->CopySparseMemory(copy.dstOffset, dst, copy.size);
+                // M2b: the announced bytes are those of the submission being worked on (the raster thread applies announcements in order), so the game having run ahead is undone here
+                Core::NativeContent::FrameStoreServe(Core::NativeContent::LateKind::BufferArenaSync, copy.dstOffset, dst, copy.size);
             }
             if (!arena->is_coherent) {
                 const_cast<Buffer*>(arena)->Flush(0, arena->SizeBytes());
@@ -927,6 +930,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
         for (auto& copy : copies) {
             memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
+            Core::NativeContent::FrameStoreServe(Core::NativeContent::LateKind::BufferArenaSync, copy.dstOffset, staging.mapped + copy.srcOffset, copy.size); // M2b
             copy.srcOffset += staging.offset;
             copy.dstOffset -= arena->cpu_addr;
         }
