@@ -8034,6 +8034,35 @@ namespace {
 std::mutex life_mutex;
 std::map<std::tuple<std::string, u32, u64>, u64> life_counts;
 std::atomic<u64> life_last_publish_ms{0};
+struct Born {
+    u64 caller;
+    s64 frame;
+    u32 size;
+};
+std::unordered_map<u64, Born> life_born; // object -> who made it (under life_mutex)
+struct DeathKey {
+    u64 caller;
+    u32 age_class; // 0..3 = age, 4 = over 3, 5 = never stamped
+    u32 size_class; // log2 of the width, 0 when unknown
+    bool operator<(const DeathKey& o) const { return std::tie(caller, age_class, size_class) < std::tie(o.caller, o.age_class, o.size_class); }
+};
+struct DeathStat {
+    u64 count{0};
+    u64 lifetime_frames_sum{0};
+    s64 lifetime_min{INT64_MAX};
+    s64 lifetime_max{INT64_MIN};
+};
+std::map<DeathKey, DeathStat> life_deaths;
+s64 LifeGameFrame() {
+    const VAddr base = image_base.load(std::memory_order_relaxed);
+    if (base == 0) {
+        return 0;
+    }
+    return Guarded([&]() -> u64 {
+        const u64 holder = Rd<u64>(base + 0x6b03558 - 0x1000000, 0);
+        return holder != 0 ? static_cast<u64>(Rd<s64>(holder, 0x10240)) : 0;
+    });
+}
 bool LifeCensusOn() {
     static const bool on = [] { const char* e = std::getenv("TLG_LIFE_CENSUS"); return e != nullptr && e[0] == '1'; }();
     return on;
@@ -8060,6 +8089,66 @@ void NoteLife(u32 kind, u64 ret) {
 }
 } // namespace
 
+void LifeDeleted(u64 object, s64 age) {
+    if (!LifeCensusOn()) {
+        return;
+    }
+    const s64 frame = LifeGameFrame();
+    std::scoped_lock lock{life_mutex};
+    const auto it = life_born.find(object);
+    if (it == life_born.end()) {
+        return;
+    }
+    const Born born = it->second;
+    life_born.erase(it);
+    const u32 age_class = age < 0 ? 5 : age > 3 ? 4 : static_cast<u32>(age);
+    u32 size_class = 0;
+    for (u32 v = born.size; v > 1; v >>= 1) {
+        ++size_class;
+    }
+    DeathStat& d = life_deaths[{born.caller, age_class, size_class}];
+    const s64 life = frame - born.frame;
+    ++d.count;
+    d.lifetime_frames_sum += static_cast<u64>(std::max<s64>(life, 0));
+    d.lifetime_min = std::min(d.lifetime_min, life);
+    d.lifetime_max = std::max(d.lifetime_max, life);
+    nlohmann::json out = nlohmann::json::array();
+    for (const auto& [key, stat] : life_deaths) {
+        out.push_back({{"creator", fmt::format("{:#x}", key.caller)},
+                       {"age_at_delete", key.age_class == 5 ? "never_stamped" : key.age_class == 4 ? "over_3" : std::to_string(key.age_class)},
+                       {"size_log2", key.size_class},
+                       {"count", stat.count},
+                       {"lifetime_game_frames_avg", stat.count ? static_cast<double>(stat.lifetime_frames_sum) / static_cast<double>(stat.count) : 0.0},
+                       {"lifetime_min", stat.lifetime_min},
+                       {"lifetime_max", stat.lifetime_max}});
+    }
+    static std::atomic<u64> last{0};
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (now - last.load(std::memory_order_relaxed) > 1000) {
+        last.store(now, std::memory_order_relaxed);
+        Core::DebugServer::Publish("life_deaths", std::move(out));
+    }
+}
+
+void LifeBound(u64 object) {
+    if (!LifeCensusOn() || object == 0) {
+        return;
+    }
+    static std::atomic<u64> by_age[7]{}; // 0..3 = age, 4 = over 3, 5 = never stamped, 6 = stamp ahead of the frame
+    static std::atomic<u64> last{0};
+    const s64 frame = LifeGameFrame();
+    const u32 raw = Guarded([&]() -> u64 { return Rd<u32>(object, 0x2c); });
+    const s64 age = frame - static_cast<s64>(raw);
+    const u32 cls = raw == 0xffffffffu ? 5u : age < 0 ? 6u : age > 3 ? 4u : static_cast<u32>(age);
+    by_age[cls].fetch_add(1, std::memory_order_relaxed);
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (now - last.load(std::memory_order_relaxed) > 1000) {
+        last.store(now, std::memory_order_relaxed);
+        Core::DebugServer::Publish("life_binds", {{"stamp_age_0", by_age[0].load()}, {"stamp_age_1", by_age[1].load()}, {"stamp_age_2", by_age[2].load()}, {"stamp_age_3", by_age[3].load()},
+                                                  {"stamp_age_over_3", by_age[4].load()}, {"never_stamped", by_age[5].load()}, {"stamp_ahead_of_frame", by_age[6].load()}});
+    }
+}
+
 /// JsDevice::CreateBuffer(device, description, initial data, out): the buffer is complete when the original returns.
 u64 PS4_SYSV_ABI ResourceBufferCreated(u64 device, u64 description, u64 initial, u64 out, u64 a4, u64 a5, u64 ret) {
     static std::atomic<u64> original_entry{0};
@@ -8075,6 +8164,15 @@ u64 PS4_SYSV_ABI ResourceBufferCreated(u64 device, u64 description, u64 initial,
     NoteLife(0, ret);
     if (out != 0) {
         const u64 created = Guarded([&] { return Rd<u64>(out, 0); });
+        if (LifeCensusOn() && created != 0) {
+            const VAddr base = image_base.load(std::memory_order_relaxed);
+            const u32 size = Guarded([&]() -> u64 { return Rd<u32>(created, 0x180); });
+            const s64 frame = LifeGameFrame();
+            std::scoped_lock lock{life_mutex};
+            if (life_born.size() < 400000) {
+                life_born[created] = {base != 0 ? ret - base + 0x1000000 : ret, frame, size};
+            }
+        }
         NativeResources::NoteBufferObject(created);
         Guarded([&]() -> u64 { NativeDevice::NoteResource(created); return 0; }); // B1
         NativeRegistry::NoteBufferCreated(created);

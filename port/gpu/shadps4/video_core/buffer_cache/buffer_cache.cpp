@@ -15,6 +15,7 @@
 #include "core/memory.h"
 #include "native/native_config.h"
 #include "native/native_device.h"
+#include "native/native_draw.h"
 #include "native/native_readbacks.h"
 #include "native/native_registry.h"
 #include "native/native_updates.h"
@@ -344,6 +345,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             }
         } else {
             immutable = Core::NativeResources::FindImmutable(device_addr, size);
+        }
+        if (immutable != nullptr) {
+            Core::NativeDraw::LifeBound(immutable->object);
         }
         if (immutable != nullptr && immutable->usage != 1 && ObjectCopiesOn()) {
             // R1b (native back end): a default or dynamic engine buffer has its own copy in the stream ring, made once per generation from its exact bytes

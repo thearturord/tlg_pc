@@ -918,6 +918,7 @@ u64 PS4_SYSV_ABI DelayDelete(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
     const s64 stamp = static_cast<s64>(Rd<u32>(object, 0x2c));
     const s64 age = frame - stamp;
     delay_by_age[age < 0 ? 5 : age > 3 ? 4 : age].fetch_add(1, std::memory_order_relaxed);
+    Core::NativeDraw::LifeDeleted(object, age < 0 || stamp == 0xffffffffll ? -1 : age);
     if (extra == 0 || original == 0 || Rd<u64>(object, 8) != 0) {
         return 0; // the original runs
     }
