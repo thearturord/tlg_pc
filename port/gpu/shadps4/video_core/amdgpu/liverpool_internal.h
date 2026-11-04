@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "common/polyfill_thread.h"
+#include "native/native_dispatch_inputs.h"
 #include "native/native_draw_tag.h"
 #include "video_core/amdgpu/liverpool.h"
 
@@ -54,10 +55,13 @@ struct Liverpool::RasterOp {
     u64 position{};   ///< The queue position (Liverpool::RasterSplit::pushed after the push)
     RasterCall call{};
     Common::UniqueFunction<void> closure{};
-    ComputeProgram cs{};
+    Core::NativeDispatch::DispatchInputs cs{}; ///< G1: the dispatch's program as plain numbers (made from the record's dwords by MakeDispatchInputs)
     std::unique_ptr<Vulkan::DrawPlan> draw_plan{};
     std::unique_ptr<Vulkan::DispatchPlan> dispatch_plan{};
 };
+
+/// G1: the producer of the dispatch inputs; the record's register block is read here and nowhere else in the consumers.
+Core::NativeDispatch::DispatchInputs MakeDispatchInputs(const ComputeProgram& program);
 
 struct Liverpool::RasterSplit {
     static constexpr size_t MaxQueued = 256;

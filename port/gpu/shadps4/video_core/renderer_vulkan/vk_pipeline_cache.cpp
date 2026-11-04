@@ -216,10 +216,10 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         const auto& cs_pgm = *lookup_cs;
         info.props.num_user_data = cs_pgm.settings.num_user_regs;
         info.props.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
-        info.props.fp_denorm_mode32 = cs_pgm.settings.fp_denorm_mode32;
-        info.props.fp_denorm_mode16_64 = cs_pgm.settings.fp_denorm_mode64;
-        info.props.fp_round_mode32 = cs_pgm.settings.fp_round_mode32;
-        info.props.fp_round_mode16_64 = cs_pgm.settings.fp_round_mode64;
+        info.props.fp_denorm_mode32 = static_cast<decltype(info.props.fp_denorm_mode32)>(cs_pgm.settings.fp_denorm_mode32);
+        info.props.fp_denorm_mode16_64 = static_cast<decltype(info.props.fp_denorm_mode16_64)>(cs_pgm.settings.fp_denorm_mode64);
+        info.props.fp_round_mode32 = static_cast<decltype(info.props.fp_round_mode32)>(cs_pgm.settings.fp_round_mode32);
+        info.props.fp_round_mode16_64 = static_cast<decltype(info.props.fp_round_mode16_64)>(cs_pgm.settings.fp_round_mode64);
         info.props.dx10_clamp = cs_pgm.settings.dx10_clamp;
         info.hw.cs.workgroup_size = {cs_pgm.num_thread_x.full, cs_pgm.num_thread_y.full,
                                      cs_pgm.num_thread_z.full};
@@ -444,8 +444,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::PipelineLookup};
-    if (!lookup_pinned) {
-        lookup_cs = &liverpool->GetCsRegs();
+    if (!lookup_pinned || lookup_cs == nullptr) {
+        return nullptr; // G1: a dispatch is looked up from its plan's inputs only (it always has a plan)
     }
     if (!RefreshComputeKey()) {
         return nullptr;
@@ -725,7 +725,7 @@ void PipelineCache::PlanGraphics(const FixedState& fixed, DrawIndirectParams par
     }
 }
 
-void PipelineCache::PlanCompute(const AmdGpu::ComputeProgram& cs, DispatchPlan& plan) {
+void PipelineCache::PlanCompute(const Core::NativeDispatch::DispatchInputs& cs, DispatchPlan& plan) {
     lookup_pinned = true;
     lookup_cs = &cs;
     const ComputePipeline* pipeline = GetComputePipeline();

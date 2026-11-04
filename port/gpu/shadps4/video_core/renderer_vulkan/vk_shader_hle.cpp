@@ -15,7 +15,7 @@ namespace Vulkan {
 
 static constexpr u64 COPY_SHADER_HASH = 0xfefebf9f;
 
-static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
+static bool ExecuteCopyShaderHLE(const Shader::Info& info, const Core::NativeDispatch::DispatchInputs& cs_program,
                                  Rasterizer& rasterizer) {
     auto& runtime = rasterizer.GetRuntime();
     auto& buffer_cache = rasterizer.GetBufferCache();
@@ -107,7 +107,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
 
 /// Shadow run of the CPU port of the game's ray against triangle shader (native/native_raycast_cpu.h): reads the five buffers from guest memory, keeps the CPU's hit
 /// list, and lets the GPU dispatch run as before.
-static void ShadowRaycast(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program) {
+static void ShadowRaycast(const Shader::Info& info, const Core::NativeDispatch::DispatchInputs& cs_program) {
     if (info.buffers.size() < 5) {
         return;
     }
@@ -134,7 +134,7 @@ static void ShadowRaycast(const Shader::Info& info, const AmdGpu::ComputeProgram
 }
 
 /// Shadow run of the CPU port of the skinning shader (native/native_skin_cpu.h).
-static void ShadowSkin(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program) {
+static void ShadowSkin(const Shader::Info& info, const Core::NativeDispatch::DispatchInputs& cs_program) {
     if (info.buffers.size() < 6) {
         return;
     }
@@ -152,7 +152,7 @@ static void ShadowSkin(const Shader::Info& info, const AmdGpu::ComputeProgram& c
     Core::NativeSkinCpu::ShadowDispatch(buffers);
 }
 
-static void ShadowSkinWide(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program) {
+static void ShadowSkinWide(const Shader::Info& info, const Core::NativeDispatch::DispatchInputs& cs_program) {
     if (info.buffers.size() < 8) {
         return;
     }
@@ -169,7 +169,7 @@ static void ShadowSkinWide(const Shader::Info& info, const AmdGpu::ComputeProgra
     Core::NativeSkinCpu::ShadowDispatchWide(buffers);
 }
 
-bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
+bool ExecuteShaderHLE(const Shader::Info& info, const Core::NativeDispatch::DispatchInputs& cs_program, Rasterizer& rasterizer) {
     if (Core::NativeRaycast::ShadowOn()) {
         if (info.pgm_hash == Core::NativeSkinCpu::ShaderHashWide) {
             ShadowSkinWide(info, cs_program);

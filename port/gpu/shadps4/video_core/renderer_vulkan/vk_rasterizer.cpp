@@ -378,7 +378,7 @@ static bool TextureIdsOn() {
     }();
     return on;
 }
-std::unique_ptr<DispatchPlan> Rasterizer::PlanDispatch(const AmdGpu::ComputeProgram& cs) {
+std::unique_ptr<DispatchPlan> Rasterizer::PlanDispatch(const Core::NativeDispatch::DispatchInputs& cs) {
     std::unique_ptr<DispatchPlan> plan;
     {
         std::scoped_lock lk{plan_pool_mutex};
@@ -398,6 +398,7 @@ std::unique_ptr<DispatchPlan> Rasterizer::PlanDispatch(const AmdGpu::ComputeProg
     return plan;
 }
 
+static const Core::NativeDispatch::DispatchInputs no_program{}; // a dispatch always has a plan
 static const AmdGpu::BorderColorBuffer no_border_colors{}; // a dispatch always has a plan; the default stands for none
 
 const GraphicsPipeline* Rasterizer::ResolveDrawPipeline(const DrawPlan* plan,
@@ -907,7 +908,7 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
         }
     }
 
-    current_cs = plan ? &plan->cs : &liverpool->GetCsRegs();
+    current_cs = plan ? &plan->cs : &no_program;
     current_bc_base = plan ? &plan->ta_bc_base : &no_border_colors;
     const auto& cs_program = *current_cs;
     const ComputePipeline* pipeline = ResolveDispatchPipeline(plan);
@@ -1012,7 +1013,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Dis
         scheduler.PopPendingOperations();
     }
 
-    current_cs = plan ? &plan->cs : &liverpool->GetCsRegs();
+    current_cs = plan ? &plan->cs : &no_program;
     current_bc_base = plan ? &plan->ta_bc_base : &no_border_colors;
     const ComputePipeline* pipeline = ResolveDispatchPipeline(plan);
     if (!pipeline) {

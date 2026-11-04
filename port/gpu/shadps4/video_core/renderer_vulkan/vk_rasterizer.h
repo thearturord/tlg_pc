@@ -14,6 +14,7 @@
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "common/unique_function.h"
+#include "native/native_dispatch_inputs.h"
 #include "native/native_draw_tag.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include <span>
@@ -93,7 +94,7 @@ public:
     /// A hash of what the planning read from guest memory and put into the plan: pipeline, per stage the program, user data and flat user data (N6b plan verification).
     [[nodiscard]] static u64 PlanDigest(const DrawPlan& plan);
     [[nodiscard]] static u64 PlanDigest(const DispatchPlan& plan);
-    [[nodiscard]] std::unique_ptr<DispatchPlan> PlanDispatch(const AmdGpu::ComputeProgram& cs);
+    [[nodiscard]] std::unique_ptr<DispatchPlan> PlanDispatch(const Core::NativeDispatch::DispatchInputs& cs);
 
     /// Raster thread: hands a finished plan back for reuse. Allocating a plan for every draw on
     /// one thread and freeing it on another made them fight over the heap lock.
@@ -491,7 +492,7 @@ private:
     static constexpr std::array<u64, 9> kNoTargetResources{};
     const std::array<u64, 9>* current_target_resources{&kNoTargetResources}; ///< E3: engine resource ids behind the draw's color views (0..7) and depth view (8).
     const AmdGpu::BorderColorBuffer* current_bc_base{}; ///< The border colour table of the draw or dispatch being recorded.
-    const AmdGpu::ComputeProgram* current_cs{}; ///< The compute program of the dispatch being recorded (its plan's, or the queue's without a plan).
+    const Core::NativeDispatch::DispatchInputs* current_cs{}; ///< The compute program of the dispatch being recorded (its plan's; an empty one without a plan).
     Core::MemoryManager* memory;
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;

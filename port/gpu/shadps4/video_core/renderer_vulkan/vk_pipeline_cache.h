@@ -4,6 +4,7 @@
 #pragma once
 
 #include "native/native_binding.h"
+#include "native/native_dispatch_inputs.h"
 #include "native/native_draw.h"
 #include "native/native_resources.h"
 #include "video_core/amdgpu/regs.h"
@@ -216,7 +217,7 @@ struct DrawPlan {
 
 struct DispatchPlan {
     const ComputePipeline* pipeline{}; ///< Null if the pipeline lookup failed.
-    AmdGpu::ComputeProgram cs{};       ///< The compute program of this dispatch: the rasterizer reads it from here.
+    Core::NativeDispatch::DispatchInputs cs{};  ///< The compute program of this dispatch: the rasterizer reads it from here.
     AmdGpu::BorderColorBuffer ta_bc_base{}; ///< The custom border colour table the dispatch's samplers use.
     StagePlan stage{};
     u64 ring_end{}; ///< T1: the constant ring position after this plan's copies
@@ -257,7 +258,7 @@ public:
     /// skip_flat_for (N3b): the draw's record; a stage whose every descriptor it covers gets no flat user data.
     bool PlanGraphicsTyped(u64 exec_key, const FixedState& fixed, std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data, DrawPlan& plan,
                            const Core::NativeDraw::ExecDraw* skip_flat_for = nullptr, u32 draw_class = 15);
-    void PlanCompute(const AmdGpu::ComputeProgram& cs, DispatchPlan& plan);
+    void PlanCompute(const Core::NativeDispatch::DispatchInputs& cs, DispatchPlan& plan);
     /// Raster thread: writes the captured state into the stage Infos the pipeline uses.
     static void ApplyPlan(const DrawPlan& plan);
     static void ApplyPlan(const DispatchPlan& plan);
@@ -322,7 +323,7 @@ private:
     const DrawInputs* lookup_inputs{};
     const FixedState* lookup_fixed{};
     FixedState lookup_fixed_storage{};
-    const AmdGpu::ComputeProgram* lookup_cs{};
+    const Core::NativeDispatch::DispatchInputs* lookup_cs{};
     PlanStats plan_stats{};
     std::array<u64, MaxShaderStages> last_stage_hash{};
     bool lookup_pinned{}; ///< The lookup reads lookup_inputs/lookup_fixed/lookup_cs as set by the caller.

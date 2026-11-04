@@ -382,6 +382,41 @@ std::unique_ptr<Vulkan::DrawPlan> Liverpool::ReplanAfterDrain(std::unique_ptr<Vu
     return again;
 }
 
+Core::NativeDispatch::DispatchInputs MakeDispatchInputs(const ComputeProgram& p) {
+    Core::NativeDispatch::DispatchInputs in;
+    static_assert(sizeof(ComputeProgram) == sizeof(in.words), "the dispatch record words are the register block of the compute program");
+    static_assert(sizeof(p.user_data) == sizeof(in.user_data));
+    std::memcpy(in.words.data(), &p, sizeof(p));
+    in.dispatch_initiator = p.dispatch_initiator;
+    in.dim_x = p.dim_x;
+    in.dim_y = p.dim_y;
+    in.dim_z = p.dim_z;
+    in.num_thread_x = {p.num_thread_x.full, p.num_thread_x.partial};
+    in.num_thread_y = {p.num_thread_y.full, p.num_thread_y.partial};
+    in.num_thread_z = {p.num_thread_z.full, p.num_thread_z.partial};
+    in.address = p.address;
+    in.settings.num_vgprs = p.settings.num_vgprs;
+    in.settings.num_sgprs = p.settings.num_sgprs;
+    in.settings.fp_round_mode32 = static_cast<u32>(p.settings.fp_round_mode32);
+    in.settings.fp_round_mode64 = static_cast<u32>(p.settings.fp_round_mode64);
+    in.settings.fp_denorm_mode32 = static_cast<u32>(p.settings.fp_denorm_mode32);
+    in.settings.fp_denorm_mode64 = static_cast<u32>(p.settings.fp_denorm_mode64);
+    in.settings.dx10_clamp = p.settings.dx10_clamp;
+    in.settings.ieee_mode = p.settings.ieee_mode;
+    in.settings.scratch_en = p.settings.scratch_en;
+    in.settings.num_user_regs = p.settings.num_user_regs;
+    in.settings.tgid_enable = p.settings.tgid_enable;
+    in.settings.lds_dwords = p.settings.lds_dwords;
+    std::memcpy(in.user_data.data(), p.user_data.data(), sizeof(in.user_data));
+    // shadow: read back through the accessors the consumers use and compare with the register block
+    const bool equal = in.Address<u64>() == p.Address<u64>() && in.SharedMemSize() == p.SharedMemSize() && in.NumWorkgroups() == p.NumWorkgroups() &&
+                       in.IsTgidEnabled(0) == p.IsTgidEnabled(0) && in.IsTgidEnabled(1) == p.IsTgidEnabled(1) && in.IsTgidEnabled(2) == p.IsTgidEnabled(2) &&
+                       in.num_thread_x.full == p.num_thread_x.full && in.num_thread_y.full == p.num_thread_y.full && in.num_thread_z.full == p.num_thread_z.full &&
+                       std::memcmp(in.user_data.data(), p.user_data.data(), sizeof(in.user_data)) == 0 && std::memcmp(in.words.data(), &p, sizeof(p)) == 0;
+    Core::NativeDispatch::NoteChecked(equal);
+    return in;
+}
+
 std::unique_ptr<Vulkan::DispatchPlan> Liverpool::ReplanAfterDrain(std::unique_ptr<Vulkan::DispatchPlan> plan, u32 site, const std::function<std::unique_ptr<Vulkan::DispatchPlan>()>& make) {
     const u64 before = plan ? Vulkan::Rasterizer::PlanDigest(*plan) : 0;
     DrainRasterWrites(site);
@@ -448,7 +483,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
     op.call = call;
     if (call.kind == RasterCall::Kind::DispatchDirect ||
         call.kind == RasterCall::Kind::DispatchIndirect) {
-        op.cs = call.cs_override ? *call.cs_override : GetCsRegs();
+        op.cs = MakeDispatchInputs(call.cs_override ? *call.cs_override : GetCsRegs());
         // The pipeline lookup runs here, on the command processor thread (stage 2 of the split).
         TLG_PROF_NAMED_LEVEL(prof_plan_dispatch, "front.plan_dispatch", 2);
         op.dispatch_plan = rasterizer->PlanDispatch(op.cs);
@@ -701,7 +736,8 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
             rasterizer->ScopeMarker(c.marker, fmt::make_format_args(cmd_address), body);
         }
     };
-    const ComputeProgram& cs_program = dispatch_plan ? dispatch_plan->cs : GetCsRegs();
+    static const Core::NativeDispatch::DispatchInputs no_program{}; // a dispatch always has a plan
+    const Core::NativeDispatch::DispatchInputs& cs_program = dispatch_plan ? dispatch_plan->cs : no_program;
     {
         TLG_PROF_NAMED_LEVEL(prof_ring, "raster.ring_use", 3);
         rasterizer->BeginRingUse(draw_plan, dispatch_plan);
@@ -733,7 +769,7 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
                          c.marker, program.dispatch_initiator, program.dim_x, program.dim_y, program.dim_z,
                          static_cast<u64>(program.address), split_active);
             }
-            Core::NativeDraw::VerifyComputeRecord(c.tag.seq, reinterpret_cast<const u32*>(&cs_program));
+            Core::NativeDraw::VerifyComputeRecord(c.tag.seq, cs_program.words.data());
         }
         {
             const u64 start = VideoCore::ReadbackStats::NowNs();
@@ -752,7 +788,7 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
     case RasterCall::Kind::DispatchIndirect:
         rasterizer->NativeInvalidate();
         if (c.tag.valid && c.tag.seq != 0 && (c.tag.meta & VideoCore::NativeTagExecFlag) == 0) {
-            Core::NativeDraw::VerifyComputeRecord(c.tag.seq, reinterpret_cast<const u32*>(&cs_program));
+            Core::NativeDraw::VerifyComputeRecord(c.tag.seq, cs_program.words.data());
         }
         {
             const u64 start = VideoCore::ReadbackStats::NowNs();

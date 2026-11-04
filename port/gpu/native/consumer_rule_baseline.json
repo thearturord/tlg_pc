@@ -216,7 +216,7 @@
   ]
  },
  "renderer_vulkan/vk_pipeline_cache.cpp": {
-  "amdgpu_lines": 29,
+  "amdgpu_lines": 28,
   "includes": [
    "shader_recompiler/backend/spirv/emit_spirv.h",
    "shader_recompiler/info.h",
@@ -227,7 +227,7 @@
   ]
  },
  "renderer_vulkan/vk_pipeline_cache.h": {
-  "amdgpu_lines": 8,
+  "amdgpu_lines": 5,
   "includes": [
    "shader_recompiler/profile.h",
    "shader_recompiler/recompiler.h",
@@ -275,7 +275,7 @@
   ]
  },
  "renderer_vulkan/vk_rasterizer.cpp": {
-  "amdgpu_lines": 39,
+  "amdgpu_lines": 38,
   "includes": [
    "shader_recompiler/resource.h",
    "shader_recompiler/runtime_info.h",
@@ -285,7 +285,7 @@
   ]
  },
  "renderer_vulkan/vk_rasterizer.h": {
-  "amdgpu_lines": 17,
+  "amdgpu_lines": 15,
   "includes": [
    "video_core/amdgpu/cb_db_extent.h",
    "video_core/amdgpu/regs.h"
@@ -321,14 +321,10 @@
   ]
  },
  "renderer_vulkan/vk_shader_hle.cpp": {
-  "amdgpu_lines": 6,
+  "amdgpu_lines": 1,
   "includes": [
    "shader_recompiler/info.h"
   ]
- },
- "renderer_vulkan/vk_shader_hle.h": {
-  "amdgpu_lines": 1,
-  "includes": []
  },
  "texture_cache/image.cpp": {
   "amdgpu_lines": 9,
