@@ -952,6 +952,17 @@ u64 PS4_SYSV_ABI GomallocFree(u64 heap, u64 address, u64 a2, u64 a3, u64 a4, u64
     if (frames == 0 || original == 0 || heap == 0 || address == 0) {
         return 0; // the original runs
     }
+    {
+        // TLG_DEFER_HEAP=garlic|onion|other: only the frees of that heap are held (default all); the device keeps the garlic heap at +0x100b8 and the onion heap at +0x100e8
+        static const std::string only = [] { const char* e = std::getenv("TLG_DEFER_HEAP"); return std::string(e != nullptr ? e : ""); }();
+        if (!only.empty()) {
+            const u64 holder = Rd<u64>(Core::NativeDraw::ImageBase() + 0x6b03558 - 0x1000000, 0);
+            const char* kind = holder == 0 ? "other" : heap == Rd<u64>(holder, 0x100b8) ? "garlic" : heap == Rd<u64>(holder, 0x100e8) ? "onion" : "other";
+            if (only != kind) {
+                return 0;
+            }
+        }
+    }
     std::vector<DeferredFree> forced;
     {
         std::scoped_lock lock{deferred_mutex};
