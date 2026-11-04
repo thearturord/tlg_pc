@@ -500,6 +500,7 @@ Core::NativeResources::ImmutableBuffer* Rasterizer::GeometryHandle(VAddr address
                         static std::atomic<u32> logged{0};
                         if (logged.fetch_add(1) < 12) {
                             TLG_LOG(RASTER, Error, "N6.2 geometry handle differs: request {:#x}+{:#x}; handle {:#x}..{:#x}; the lookup finds none", address, size, handle->begin, handle->end);
+                            TLG_LOG(RASTER, Error, "N6.2 miss explained: {}", Core::NativeResources::ExplainImmutableMiss(handle, address));
                         }
                     }
                     return lookup;

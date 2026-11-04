@@ -91,6 +91,8 @@ std::array<u64, 8> TakeResidentCounters();
 bool ImmutableResidencyEnabled();
 /// The live immutable buffer that contains [address, address + size), or null.
 ImmutableBuffer* FindImmutable(VAddr address, u32 size);
+/// Diagnostic: why the lookup by address misses `handle` (a live handle that contains the request): is it in the map, who shadows it.
+std::string ExplainImmutableMiss(const ImmutableBuffer* handle, VAddr address);
 /// N3c: the live immutable buffer of the engine id `id` that contains [address, address + size) (size 0: the id alone), or null. Per thread cache by id, valid while
 /// `ImmutableEpoch` does not change (a buffer was registered or destroyed). The pointer is only good for the epoch read together with it.
 ImmutableBuffer* FindImmutableById(u64 id);

@@ -793,6 +793,32 @@ bool ImmutableResidencyEnabled() {
     return true;
 }
 
+namespace {
+/// Overlapping registrations: a buffer that starts inside a bigger live one hides the bigger one from the lookup by begin address. Walk back over the earlier entries
+/// (bounded) for one that contains the whole request; `reach` (optional) gets the highest end seen, so the caller's "gap" cache never claims a range an outer buffer covers.
+/// Called with the immutable_mutex held (shared); `it` is the first entry above the address.
+template <typename Contains, typename Positive>
+ImmutableBuffer* FindOuterImmutable(std::map<u64, std::shared_ptr<ImmutableBuffer>>::const_iterator it, u64 address, u32 size, const Contains& contains, Positive& hit,
+                                    u64 unit, u64* reach = nullptr) {
+    (void)size;
+    constexpr int MaxBack = 32;
+    auto walk = it;
+    for (int n = 0; n < MaxBack && walk != immutables.begin(); ++n) {
+        --walk;
+        ImmutableBuffer* b = walk->second.get();
+        if (reach != nullptr && b->end > *reach && b->end <= address) {
+            *reach = b->end;
+        }
+        if (address < b->end && contains(b)) {
+            hit = {unit + 1, b};
+            NoteHandle(9); // counted: the lookup found an outer buffer the nearest-entry rule missed
+            return b;
+        }
+    }
+    return nullptr;
+}
+} // namespace
+
 ImmutableBuffer* FindImmutable(VAddr address, u32 size) {
     // Two per thread caches, both dropped when a buffer is registered or destroyed. The positive one is indexed by the 1 KB unit of the address and
     // holds the buffer that contained the last request there. The negative one is indexed by the 64 KB unit and holds the gap between two immutable
@@ -838,13 +864,46 @@ ImmutableBuffer* FindImmutable(VAddr address, u32 size) {
     }
     if (previous != nullptr && address < previous->end) {
         if (!contains(previous)) {
-            return nullptr;
+            // the nearest buffer starts inside a bigger one that holds the request (overlapping registrations): look at the earlier ones
+            return FindOuterImmutable(it, address, size, contains, hit, address >> 10);
         }
         hit = {(address >> 10) + 1, previous};
         return previous;
     }
-    gap = {gap_unit, previous != nullptr ? previous->end : 0, it != immutables.end() ? it->first : ~0ull};
+    // The request is past the end of the nearest buffer, but a bigger earlier buffer can still reach over it (the nearest one lies inside it).
+    u64 reach = previous != nullptr ? previous->end : 0;
+    if (ImmutableBuffer* outer = FindOuterImmutable(it, address, size, contains, hit, address >> 10, &reach)) {
+        return outer;
+    }
+    gap = {gap_unit, reach, it != immutables.end() ? it->first : ~0ull};
     return nullptr;
+}
+
+std::string ExplainImmutableMiss(const ImmutableBuffer* handle, VAddr address) {
+    std::shared_lock lock{immutable_mutex};
+    std::string out;
+    const auto at = immutables.find(handle->begin);
+    if (at == immutables.end()) {
+        out += "handle is NOT in the map at its begin";
+    } else if (at->second.get() == handle) {
+        out += "handle is in the map at its begin";
+    } else {
+        out += fmt::format("another buffer {:#x}..{:#x} (alive {}) holds the handle's begin key", at->second->begin, at->second->end, at->second->alive.load());
+    }
+    out += fmt::format("; handle alive {} id {:#x} usage {}", handle->alive.load(), handle->id, handle->usage);
+    u32 between = 0;
+    const ImmutableBuffer* nearest = nullptr;
+    for (auto it = immutables.lower_bound(handle->begin); it != immutables.end() && it->first <= address; ++it) {
+        ++between;
+        nearest = it->second.get();
+    }
+    out += fmt::format("; entries from the handle's begin to the request: {}", between);
+    if (nearest != nullptr) {
+        out += fmt::format("; nearest {:#x}..{:#x} alive {} usage {}", nearest->begin, nearest->end, nearest->alive.load(), nearest->usage);
+    }
+    const auto by_id = immutable_by_id.find(handle->id);
+    out += fmt::format("; by id {}", by_id == immutable_by_id.end() ? "none" : (by_id->second.get() == handle ? "same" : "other"));
+    return out;
 }
 
 u64 ImmutableEpoch() {
@@ -1212,7 +1271,8 @@ nlohmann::json Report() {
                                       {"geometry_handles_used", immutable_handle_counters[5].load()},
                                       {"geometry_handles_stale_epoch_changed", immutable_handle_counters[6].load()},
                                       {"geometry_handles_differing_from_the_address_lookup", immutable_handle_counters[7].load()},
-                                      {"geometry_handles_aliasing_another_buffer_that_holds_the_range", immutable_handle_counters[8].load()}};
+                                      {"geometry_handles_aliasing_another_buffer_that_holds_the_range", immutable_handle_counters[8].load()},
+                                      {"lookups_that_found_an_outer_buffer_behind_nested_ones", immutable_handle_counters[9].load()}};
         out["lift_census_cpu_write_faults_by_what_the_page_holds"] = {{"no_registered_buffer", lift_census_faults[0].load()}, {"only_small_non_immutable_buffers_up_to_4k", lift_census_faults[1].load()},
                                                                       {"only_non_immutable_buffers_up_to_the_cap", lift_census_faults[2].load()}, {"an_immutable_buffer", lift_census_faults[3].load()},
                                                                       {"a_non_immutable_buffer_above_the_cap", lift_census_faults[4].load()}};
