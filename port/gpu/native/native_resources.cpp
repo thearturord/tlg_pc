@@ -801,6 +801,10 @@ template <typename Contains, typename Positive>
 ImmutableBuffer* FindOuterImmutable(std::map<u64, std::shared_ptr<ImmutableBuffer>>::const_iterator it, u64 address, u32 size, const Contains& contains, Positive& hit,
                                     u64 unit, u64* reach = nullptr) {
     (void)size;
+    static const bool on = [] { const char* e = std::getenv("TLG_FINDIMM_NESTED"); return e == nullptr || e[0] != '0'; }(); // =0: the old rule (the nearest entry only), for A/B
+    if (!on) {
+        return nullptr;
+    }
     constexpr int MaxBack = 32;
     auto walk = it;
     for (int n = 0; n < MaxBack && walk != immutables.begin(); ++n) {

@@ -1871,6 +1871,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         immutable_hint = binder_plan->handles[record_binding];
                     } else {
                         Core::NativeResources::NoteHandle(1);
+                        // life census: the plan's handle was made before a create / delete; is its object dead by now, and does its address hold another live buffer?
+                        if (auto* stale = binder_plan->handles[record_binding]; !stale->alive.load(std::memory_order_acquire)) {
+                            Core::NativeDraw::LifeStaleBind(stale->object, Core::NativeResources::FindImmutable(vsharp.address, static_cast<u32>(size)) != nullptr);
+                        }
                     }
                 }
                 if (immutable_hint != nullptr) {

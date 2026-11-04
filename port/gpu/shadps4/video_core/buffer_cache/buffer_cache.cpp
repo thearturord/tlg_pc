@@ -342,12 +342,15 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             } else {
                 Core::NativeResources::NoteHandle(3);
                 immutable = Core::NativeResources::FindImmutable(device_addr, size);
+                if (!immutable_hint->alive.load(std::memory_order_acquire)) {
+                    Core::NativeDraw::LifeStaleBind(immutable_hint->object, immutable != nullptr);
+                }
             }
         } else {
             immutable = Core::NativeResources::FindImmutable(device_addr, size);
         }
         if (immutable != nullptr) {
-            Core::NativeDraw::LifeBound(immutable->object);
+            Core::NativeDraw::LifeBound(immutable->object, immutable->id, immutable == immutable_hint);
         }
         if (immutable != nullptr && immutable->usage != 1 && ObjectCopiesOn()) {
             // R1b (native back end): a default or dynamic engine buffer has its own copy in the stream ring, made once per generation from its exact bytes

@@ -8053,6 +8053,8 @@ struct DeathStat {
     s64 lifetime_max{INT64_MIN};
 };
 std::map<DeathKey, DeathStat> life_deaths;
+std::unordered_map<u64, u64> life_dead; // deleted object -> creator (kept, capped)
+std::map<std::pair<u64, bool>, u64> life_stale; // (creator, address reused) -> stale binds
 s64 LifeGameFrame() {
     const VAddr base = image_base.load(std::memory_order_relaxed);
     if (base == 0) {
@@ -8101,6 +8103,10 @@ void LifeDeleted(u64 object, s64 age) {
     }
     const Born born = it->second;
     life_born.erase(it);
+    if (life_dead.size() > 400000) {
+        life_dead.clear();
+    }
+    life_dead[object] = born.caller;
     const u32 age_class = age < 0 ? 5 : age > 3 ? 4 : static_cast<u32>(age);
     u32 size_class = 0;
     for (u32 v = born.size; v > 1; v >>= 1) {
@@ -8130,9 +8136,39 @@ void LifeDeleted(u64 object, s64 age) {
     }
 }
 
-void LifeBound(u64 object) {
+void LifeStaleBind(u64 dead_object, bool address_found_other) {
+    if (!LifeCensusOn()) {
+        return;
+    }
+    std::scoped_lock lock{life_mutex};
+    const auto it = life_dead.find(dead_object);
+    const u64 creator = it != life_dead.end() ? it->second : 0;
+    ++life_stale[{creator, address_found_other}];
+    static std::atomic<u64> last{0};
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (now - last.load(std::memory_order_relaxed) > 1000) {
+        last.store(now, std::memory_order_relaxed);
+        nlohmann::json out = nlohmann::json::array();
+        for (const auto& [key, count] : life_stale) {
+            out.push_back({{"creator", key.first == 0 ? std::string("unknown_or_not_noted") : fmt::format("{:#x}", key.first)}, {"address_now_holds_another_live_buffer", key.second}, {"stale_binds", count}});
+        }
+        Core::DebugServer::Publish("life_stale_binds", std::move(out));
+    }
+}
+
+void LifeBound(u64 object, u64 id, bool by_plan_handle) {
     if (!LifeCensusOn() || object == 0) {
         return;
+    }
+    static std::atomic<u64> registry_dead{0}, registry_alive{0}, dead_by_handle{0}, dead_by_address{0};
+    {
+        NativeDevice::Object table;
+        const bool alive = NativeDevice::Lookup(id, table) && table.alive;
+        (alive ? registry_alive : registry_dead).fetch_add(1, std::memory_order_relaxed);
+        if (!alive) {
+            LifeStaleBind(object, false);
+            (by_plan_handle ? dead_by_handle : dead_by_address).fetch_add(1, std::memory_order_relaxed);
+        }
     }
     static std::atomic<u64> by_age[7]{}; // 0..3 = age, 4 = over 3, 5 = never stamped, 6 = stamp ahead of the frame
     static std::atomic<u64> last{0};
@@ -8145,7 +8181,9 @@ void LifeBound(u64 object) {
     if (now - last.load(std::memory_order_relaxed) > 1000) {
         last.store(now, std::memory_order_relaxed);
         Core::DebugServer::Publish("life_binds", {{"stamp_age_0", by_age[0].load()}, {"stamp_age_1", by_age[1].load()}, {"stamp_age_2", by_age[2].load()}, {"stamp_age_3", by_age[3].load()},
-                                                  {"stamp_age_over_3", by_age[4].load()}, {"never_stamped", by_age[5].load()}, {"stamp_ahead_of_frame", by_age[6].load()}});
+                                                  {"stamp_age_over_3", by_age[4].load()}, {"never_stamped", by_age[5].load()}, {"stamp_ahead_of_frame", by_age[6].load()},
+                                                  {"bound_registry_entry_object_alive", registry_alive.load()}, {"bound_registry_entry_object_dead_in_the_device_table", registry_dead.load()},
+                                                  {"dead_entry_found_through_the_plan_handle", dead_by_handle.load()}, {"dead_entry_found_through_the_address_lookup", dead_by_address.load()}});
     }
 }
 

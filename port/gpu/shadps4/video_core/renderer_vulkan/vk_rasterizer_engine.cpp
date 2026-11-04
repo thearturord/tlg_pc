@@ -483,10 +483,19 @@ Core::NativeResources::ImmutableBuffer* Rasterizer::GeometryHandle(VAddr address
     }
     if (geometry_plan->handle_epoch != Core::NativeResources::ImmutableEpoch()) {
         Core::NativeResources::NoteHandle(6);
+        for (u32 i = 0; i < geometry_plan->geometry_handle_count; ++i) {
+            auto* stale = geometry_plan->geometry_handles[i];
+            if (stale != nullptr && !stale->alive.load(std::memory_order_acquire) && address >= stale->begin && address + size <= stale->end) {
+                Core::NativeDraw::LifeStaleBind(stale->object, Core::NativeResources::FindImmutable(address, static_cast<u32>(size)) != nullptr);
+            }
+        }
         return nullptr;
     }
     for (u32 i = 0; i < geometry_plan->geometry_handle_count; ++i) {
         auto* handle = geometry_plan->geometry_handles[i];
+        if (handle != nullptr && !handle->alive.load(std::memory_order_acquire) && address >= handle->begin && address + size <= handle->end) {
+            Core::NativeDraw::LifeStaleBind(handle->object, Core::NativeResources::FindImmutable(address, static_cast<u32>(size)) != nullptr);
+        }
         if (handle != nullptr && address >= handle->begin && address + size <= handle->end && handle->alive.load(std::memory_order_acquire)) {
             if (NativeHandleMode() == 2) {
                 // compare mode: the lookup by address wins, and a difference is counted apart from the bindings'
