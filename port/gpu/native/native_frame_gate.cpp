@@ -331,8 +331,15 @@ void WaitForSlot() {
     }
     if (OwnershipGate()) {
         TLG_PROF_LEVEL("wait.frame_gate_slot_owned (game thread, ownership gate: fewer than 2 frames the raster thread has not reached)", 1);
-        WaitFor([depth] {
-            const bool raster_ok = submitted <= raster_reached || submitted - raster_reached < static_cast<u64>(depth);
+        // `TLG_OWNERSHIP_RASTER_LEAD=n` (experiment, native-v3-writers): how many frames the raster thread may be behind the game's submits (default: the depth, 2). The census of late reads
+        // shows the game's rings of 3 are rewritten before the raster thread has read them with a lead of 2; a lead of 1 leaves one frame of slack.
+        static const int lead = [depth] {
+            const char* e = std::getenv("TLG_OWNERSHIP_RASTER_LEAD");
+            const int v = e != nullptr ? std::atoi(e) : depth;
+            return v >= 1 && v <= depth ? v : depth;
+        }();
+        WaitFor([] {
+            const bool raster_ok = submitted <= raster_reached || submitted - raster_reached < static_cast<u64>(lead);
             const bool eop_ok = submitted <= ended || submitted - ended < OwnershipEopCap;
             if (raster_ok && !eop_ok) {
                 eop_cap_waits.fetch_add(1, std::memory_order_relaxed);
