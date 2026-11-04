@@ -21,8 +21,8 @@ namespace Frontend {
 class WindowSDL;
 }
 
-namespace AmdGpu {
-struct Liverpool;
+namespace Core {
+class NativeExecutor;
 }
 
 namespace Vulkan {
@@ -51,7 +51,7 @@ class Rasterizer;
 
 class Presenter {
 public:
-    Presenter(Frontend::WindowSDL& window, AmdGpu::Liverpool* liverpool);
+    Presenter(Frontend::WindowSDL& window, Core::NativeExecutor* executor);
     ~Presenter();
 
     HostPasses::PostProcessingPass::Settings& GetPPSettingsRef() {
@@ -125,7 +125,7 @@ private:
     HostPasses::SmaaPass smaa_pass;  ///< tlg: tlg.ini smaa
     HostPasses::CasPass cas_pass;    ///< tlg: tlg.ini cas
     HostPasses::PostFxTimer postfx_timer; ///< tlg: TLG_POSTFX_PROFILE=1
-    AmdGpu::Liverpool* liverpool;
+    Core::NativeExecutor* executor;
     Scheduler draw_scheduler;
     std::deque<u64> recent_frame_ticks; ///< tlg: TLG_FRAMES_AHEAD bound (PrepareFrame)
     Scheduler present_scheduler;

@@ -4,7 +4,7 @@
 // The raster thread and its operation queue (G4b, documents/tlg/native plan/executor-consumer-plan.md; cp_split_mode, documents/tlg/cp-split-design.md).
 // The command processor (the front thread) queues draws, dispatches and closures; the raster thread executes them in order. The queue, its positions, the waits of the front
 // thread (drain to a position, drain the queued memory writes) and the thread loop live here. What an operation does is the `Consumer`'s: the draw and dispatch calls, the
-// callbacks sent by other threads and the statistics of the rasterizer are still the command processor's (Liverpool implements the interface until G4d/G4e).
+// callbacks sent by other threads and the statistics of the rasterizer belong to the executor (native/native_executor.h implements the interface; the draw and dispatch calls go through native/native_raster_host.h).
 
 #include <array>
 #include <atomic>
@@ -32,7 +32,7 @@ struct DispatchPlan;
 
 namespace Core::NativeRasterQueue {
 
-/// Deletes a plan the queue still holds when it is destroyed (defined beside the plan types, in liverpool_engine.cpp: native/ does not include them).
+/// Deletes a plan the queue still holds when it is destroyed (defined beside the plan types, in vk_rasterizer_host.cpp: native/ does not include them).
 struct PlanDelete {
     void operator()(Vulkan::DrawPlan* plan) const;
     void operator()(Vulkan::DispatchPlan* plan) const;

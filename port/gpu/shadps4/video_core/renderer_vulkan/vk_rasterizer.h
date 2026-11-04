@@ -32,8 +32,8 @@
 #include "native/native_occlusion.h"
 #include "native/native_raster_host.h"
 
-namespace AmdGpu {
-struct Liverpool;
+namespace Core {
+class NativeExecutor;
 }
 
 namespace Core {
@@ -50,7 +50,7 @@ struct DrawInputs;
 class Rasterizer : public Core::RasterHost {
 public:
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
-                        AmdGpu::Liverpool* liverpool);
+                        Core::NativeExecutor* executor);
     ~Rasterizer() override;
 
     // ---- Core::RasterHost (native/native_raster_host.h): the functions below with a host name are in vk_rasterizer_host.cpp; the others are the ones of this class ----
@@ -66,7 +66,7 @@ public:
     void RecycleDispatchPlan(Core::DispatchPlanPtr&& plan) override;
     u64 DrawPlanSeq(const DrawPlan& plan) override;
     bool DrawPlanIsDepthOnly(const DrawPlan& plan) override;
-    void SetDrawPlanTargets(DrawPlan& plan, const std::array<AmdGpu::CbDbExtent, 8>& cb_extent, const AmdGpu::CbDbExtent& db_extent, const std::array<u64, 9>& target_resources) override;
+    void SetDrawPlanTargets(DrawPlan& plan, const ColorExtents& cb_extent, const DepthExtent& db_extent, const std::array<u64, 9>& target_resources) override;
     const Core::NativeDispatch::DispatchInputs& DispatchPlanInputs(const DispatchPlan& plan) override;
     void TagDispatchPlan(DispatchPlan& plan, u64 seq) override;
     bool MarkersEnabled() const noexcept override;
@@ -508,7 +508,7 @@ private:
     Runtime& runtime;
     VideoCore::BufferCache buffer_cache;
     VideoCore::TextureCache texture_cache;
-    AmdGpu::Liverpool* liverpool;
+    Core::NativeExecutor* executor;
     const std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS>* current_cb_extent{}; ///< The extent hints of the targets of the draw being recorded.
     const AmdGpu::CbDbExtent* current_db_extent{};
     static constexpr std::array<u64, 9> kNoTargetResources{};

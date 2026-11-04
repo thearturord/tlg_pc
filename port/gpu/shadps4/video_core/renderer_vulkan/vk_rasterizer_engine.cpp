@@ -34,7 +34,7 @@
 #include "core/memory.h"
 #include "shader_recompiler/resource.h"
 #include "shader_recompiler/runtime_info.h"
-#include "video_core/amdgpu/liverpool.h"
+#include "native/native_executor.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/readback_batch.h"

@@ -49,6 +49,10 @@ class RasterHost {
 public:
     virtual ~RasterHost() = default;
 
+    /// The extent hints of the eight color targets and of the depth target (register words of the PS4).
+    using ColorExtents = std::array<AmdGpu::CbDbExtent, 8>;
+    using DepthExtent = AmdGpu::CbDbExtent;
+
     /// What the interval statistics of the host hand back to the executor (the host publishes its own part, native/native_debug_server.h).
     struct IntervalStats {
         u64 plan_draws_all_stages_same{}, plan_draws{}, plan_stages_same{}, plan_stages{};
@@ -80,8 +84,7 @@ public:
     [[nodiscard]] virtual u64 DrawPlanSeq(const Vulkan::DrawPlan& plan) = 0;
     [[nodiscard]] virtual bool DrawPlanIsDepthOnly(const Vulkan::DrawPlan& plan) = 0;
     /// The extent hints and the engine resources behind the bound targets, as the executor holds them when the plan is queued.
-    virtual void SetDrawPlanTargets(Vulkan::DrawPlan& plan, const std::array<AmdGpu::CbDbExtent, 8>& cb_extent, const AmdGpu::CbDbExtent& db_extent,
-                                    const std::array<u64, 9>& target_resources) = 0;
+    virtual void SetDrawPlanTargets(Vulkan::DrawPlan& plan, const ColorExtents& cb_extent, const DepthExtent& db_extent, const std::array<u64, 9>& target_resources) = 0;
     [[nodiscard]] virtual const NativeDispatch::DispatchInputs& DispatchPlanInputs(const Vulkan::DispatchPlan& plan) = 0;
     /// Gives a dispatch plan the record it was planned for and the bindings the record carries.
     virtual void TagDispatchPlan(Vulkan::DispatchPlan& plan, u64 seq) = 0;

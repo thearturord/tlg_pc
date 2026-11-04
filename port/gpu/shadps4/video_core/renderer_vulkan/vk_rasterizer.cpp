@@ -35,7 +35,7 @@
 #include "core/memory.h"
 #include "shader_recompiler/resource.h"
 #include "shader_recompiler/runtime_info.h"
-#include "video_core/amdgpu/liverpool.h"
+#include "native/native_executor.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/readback_batch.h"
@@ -94,12 +94,12 @@ Rasterizer* supersede_target = nullptr;
 }
 
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
-                       AmdGpu::Liverpool* liverpool_)
+                       Core::NativeExecutor* executor_)
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_},
-      buffer_cache{instance, scheduler, runtime, liverpool_, texture_cache},
-      texture_cache{instance, scheduler, runtime, liverpool_, buffer_cache},
-      liverpool{liverpool_}, memory{Core::Memory::Instance()},
-      pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
+      buffer_cache{instance, scheduler, runtime, executor_, texture_cache},
+      texture_cache{instance, scheduler, runtime, executor_, buffer_cache},
+      executor{executor_}, memory{Core::Memory::Instance()},
+      pipeline_cache{instance, scheduler, executor, buffer_cache.GetSparsePageShift()},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
       readback_batching{EmulatorSettings.IsReadbackBatchingEnabled()},
@@ -111,7 +111,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     Core::LightRecorder::SetEventDescriber([](void* context, u64 first, u64 last) { return static_cast<VideoCore::TextureCache*>(context)->DescribeImageEvents(first, last); }, &texture_cache);
     VideoCore::ReadbackPolicy::InitFromSettings();
     if (!EmulatorSettings.IsNullGPU()) {
-        liverpool->BindRasterizer(this);
+        executor->BindRasterizer(this);
     }
     scheduler.SetEncoderMode(EmulatorSettings.GetCpEncoderMode());
     memory->SetRasterizer(this);
@@ -418,7 +418,7 @@ const ComputePipeline* Rasterizer::ResolveDispatchPipeline(const DispatchPlan* p
         PipelineCache::ApplyPlan(*plan);
         return plan->pipeline;
     }
-    if (liverpool->SplitActive()) {
+    if (executor->SplitActive()) {
         LOG_ERROR(Render_Vulkan, "CP split: dispatch without a pipeline plan skipped");
         return nullptr;
     }
@@ -677,9 +677,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     draw_inputs = &plan->inputs;
     prof_inputs.End();
     current_bc_base = &draw_inputs->ta_bc_base;
-    current_cb_extent = plan ? &plan->cb_extent : &liverpool->RasterCbExtents();
-    current_db_extent = plan ? &plan->db_extent : &liverpool->RasterDbExtent();
-    current_target_resources = plan ? &plan->target_resources : &liverpool->RasterTargetResources();
+    current_cb_extent = plan ? &plan->cb_extent : &executor->RasterCbExtents();
+    current_db_extent = plan ? &plan->db_extent : &executor->RasterDbExtent();
+    current_target_resources = plan ? &plan->target_resources : &executor->RasterTargetResources();
     const auto& regs = *draw_inputs;
     const bool same_cmdbuf = use_tag && last.valid && last.tick == scheduler.CurrentTick();
     const bool same_pipeline = same_cmdbuf && last.pipeline == pipeline;
@@ -787,9 +787,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const FixedState& fixed = plan->fixed;
     draw_inputs = &plan->inputs;
     current_bc_base = &draw_inputs->ta_bc_base;
-    current_cb_extent = plan ? &plan->cb_extent : &liverpool->RasterCbExtents();
-    current_db_extent = plan ? &plan->db_extent : &liverpool->RasterDbExtent();
-    current_target_resources = plan ? &plan->target_resources : &liverpool->RasterTargetResources();
+    current_cb_extent = plan ? &plan->cb_extent : &executor->RasterCbExtents();
+    current_db_extent = plan ? &plan->db_extent : &executor->RasterDbExtent();
+    current_target_resources = plan ? &plan->target_resources : &executor->RasterTargetResources();
 
     PrepareRenderState(pipeline, fixed);
     binder_plan = NativeBinderFor(plan, 4);
@@ -3480,12 +3480,12 @@ void Rasterizer::ScopedMarkerInsertColor(const std::string_view& str, const u32 
 }
 
 std::thread::id Rasterizer::GetGpuCommandProcessorThread() {
-    return liverpool->GetGpuCommandProcessorThread();
+    return executor->GetGpuCommandProcessorThread();
 }
 
 #ifdef __linux__
 u32 Rasterizer::GetGpuCommandProcessorThreadId() {
-    return liverpool->GetGpuCommandProcessorThreadId();
+    return executor->GetGpuCommandProcessorThreadId();
 }
 #endif
 

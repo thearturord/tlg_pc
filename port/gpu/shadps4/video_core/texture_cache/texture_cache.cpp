@@ -61,9 +61,9 @@ void NoteImageCreated(ImageSite site, const ImageInfo& info) {
 } // namespace
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
-                           Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
+                           Vulkan::Runtime& runtime_, Core::NativeExecutor* executor_,
                            BufferCache& buffer_cache_)
-    : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, liverpool{liverpool_},
+    : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, executor{executor_},
       buffer_cache{buffer_cache_}, slot_images{MAX_IMAGES},
       slot_image_views{MAX_IMAGE_VIEWS}, slot_samplers{MAX_SAMPLERS},
       blit_helper{instance, scheduler},

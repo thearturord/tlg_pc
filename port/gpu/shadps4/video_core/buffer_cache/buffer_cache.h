@@ -30,8 +30,8 @@
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
-namespace AmdGpu {
-struct Liverpool;
+namespace Core {
+class NativeExecutor;
 }
 
 namespace Core {
@@ -55,7 +55,7 @@ class BufferCache {
 
 public:
     explicit BufferCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-                         Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool,
+                         Vulkan::Runtime& runtime, Core::NativeExecutor* executor,
                          TextureCache& texture_cache);
     ~BufferCache();
 
@@ -205,7 +205,7 @@ private:
     Vulkan::Scheduler& scheduler;
     Vulkan::Runtime& runtime;
     Vulkan::StagingBufferPool& staging_pool;
-    AmdGpu::Liverpool* liverpool;
+    Core::NativeExecutor* executor;
     Core::MemoryManager* memory;
     TextureCache& texture_cache;
     std::atomic<u64> cpu_epoch{1}; ///< bumped when a CPU change is applied or announced bytes are uploaded (the upload memo's answers are stale)

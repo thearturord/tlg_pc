@@ -20,7 +20,7 @@
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
-#include "video_core/amdgpu/liverpool.h"
+#include "native/native_executor.h"
 #include "native/native_shader_env.h"
 #include "native/native_debug_server.h"
 #include "video_core/cache_storage.h"
@@ -152,8 +152,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
 }
 
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
-                             AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
-    : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
+                             Core::NativeExecutor* executor_, u32 sparse_page_shift)
+    : instance{instance_}, scheduler{scheduler_}, executor{executor_},
       desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes},
       stage_lookup_reuse{EmulatorSettings.GetStageLookupReuse()} {
     lookup_fixed = &lookup_fixed_storage;

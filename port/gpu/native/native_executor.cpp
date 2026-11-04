@@ -43,8 +43,6 @@ void NativeExecutor::StartRasterSplit(NativeRasterQueue::Consumer& consumer) {
     split->Start(consumer, EmulatorSettings.GetCpSplitMode() >= 2);
 }
 
-NativeExecutor::NativeExecutor() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {}
-
 void NativeExecutor::StartProcess() {
     process_thread = std::jthread{std::bind_front(&NativeExecutor::Process, this)};
 }

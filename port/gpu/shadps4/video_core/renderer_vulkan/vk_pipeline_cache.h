@@ -35,8 +35,8 @@ struct std::hash<vk::ShaderModule> {
     }
 };
 
-namespace AmdGpu {
-class Liverpool;
+namespace Core {
+class NativeExecutor;
 }
 
 namespace Serialization {
@@ -228,7 +228,7 @@ struct DispatchPlan {
 class PipelineCache {
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
-                           AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
+                           Core::NativeExecutor* executor, u32 sparse_page_shift);
     ~PipelineCache();
 
     void WarmUp();
@@ -308,7 +308,7 @@ private:
 private:
     const Instance& instance;
     Scheduler& scheduler;
-    AmdGpu::Liverpool* liverpool;
+    Core::NativeExecutor* executor;
     DescriptorHeap desc_heap;
     std::unique_ptr<IndexedData> indexed_data; ///< tlg C9: null unless TLG_INDEXED_DATA=1 and the device can do it
     vk::UniquePipelineCache pipeline_cache;

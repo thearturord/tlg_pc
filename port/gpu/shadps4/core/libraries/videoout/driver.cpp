@@ -32,14 +32,14 @@
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
-#include "video_core/amdgpu/liverpool.h"
+#include "native/native_executor.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_wait_diagnostics.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
-extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
+extern std::unique_ptr<Core::NativeExecutor> native_executor;
 
 namespace Vulkan {
 extern std::atomic<u64> g_tlg_compile_ns;
@@ -128,7 +128,8 @@ int VideoOutDriver::Open(const ServiceThreadParams* params) {
         return ORBIS_VIDEO_OUT_ERROR_RESOURCE_BUSY;
     }
     main_port.is_open = true;
-    liverpool->SetVoPort(&main_port);
+    native_executor->SetVoLabels({[this](const u64* address) { return main_port.IsVoLabel(address); },
+                                  [this](const std::function<bool()>& pred) { main_port.WaitVoLabel(pred); }});
     return 1;
 }
 
@@ -627,7 +628,7 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
+        native_executor->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
     } else {
         SubmitFlipInternal(port, index, flip_arg, is_eop);
     }

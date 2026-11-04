@@ -1,7 +1,10 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <boost/preprocessor/stringize.hpp>
+// The executor's direct path (G4e; the code of liverpool_engine.cpp): the command buffer of the game run entry by entry (ProcessDirect), the draw records executed from their
+// engine objects, the constant engine buffer and the announced updates.
+
+#include <bit>
+#include <cstring>
 
 #include "native/native_flight.h"
 #include "native/native_log.h"
@@ -12,6 +15,8 @@
 #include "native/native_prof.h"
 #include "native/native_registry.h"
 #include "native/native_resource_audit.h"
+#include "native/native_executor.h"
+#include "native/native_executor_tasks.h"
 #include "common/arch.h"
 #ifdef ARCH_X86_64
 #include <immintrin.h>
@@ -20,10 +25,8 @@
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
-#include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
-#include "core/libraries/videoout/driver.h"
 #include "core/memory.h"
 #include "native/native_census.h"
 #include "native/native_occlusion.h"
@@ -43,8 +46,6 @@
 #include "native/native_shader_env.h"
 #include "native/native_target_desc.h"
 #include "native/native_display.h"
-#include "video_core/amdgpu/liverpool.h"
-#include "video_core/amdgpu/liverpool_internal.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "native/native_readback_policy.h"
 #include "video_core/readback_stats.h"
@@ -54,58 +55,19 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_fixed_state.h"
 
-// Engine path: member functions of an emulator class that serve the native path (moved out of native/ 2026-11-03).
-// so that the emulator files only call into native/; the class stays declared in the emulator's header until the owning plan phase
-// (documents/tlg/native plan/no-emulation-plan.md, E-1 part 2) gives the native side its own interface.
+namespace Core {
 
-namespace AmdGpu {
-
-static const char* dcb_task_name{"DCB_TASK"};
-static const char* ccb_task_name{"CCB_TASK"};
-
-#define MAX_NAMES 56
-static_assert(Liverpool::NumComputeRings <= MAX_NAMES);
-
-#define NAME_NUM(z, n, name) BOOST_PP_STRINGIZE(name) BOOST_PP_STRINGIZE(n),
-#define NAME_ARRAY(name, num) {BOOST_PP_REPEAT(num, NAME_NUM, name)}
-
-static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
-
-#define YIELD(name)                                                                                \
-    FIBER_EXIT;                                                                                    \
-    co_yield {};                                                                                   \
-    FIBER_ENTER(name);
-
-#define YIELD_CE() YIELD(ccb_task_name)
-#define YIELD_GFX() YIELD(dcb_task_name)
-#define YIELD_ASC(id) YIELD(acb_task_name[id])
-
-#define RESUME(task, name)                                                                         \
-    FIBER_EXIT;                                                                                    \
-    task.handle.resume();                                                                          \
-    FIBER_ENTER(name);
-
-#define RESUME_CE(task) RESUME(task, ccb_task_name)
-#define RESUME_GFX(task) RESUME(task, dcb_task_name)
-#define RESUME_ASC(task, id) RESUME(task, acb_task_name[id])
-
-
-
-} // namespace AmdGpu
-
-namespace AmdGpu {
-
-void Liverpool::ApplyStateTemplate(const Core::NativeDraw::StateTemplate& state) {
+void NativeExecutor::ApplyStateTemplate(const Core::NativeDraw::StateTemplate& state) {
     // G4a: the executor keeps no register file. The one state that is read back is the compute program of the graphics queue (the dispatches the command processor runs itself).
     using Core::NativeDraw::StateWrite;
     for (const StateWrite& write : state.writes) {
-        if (write.kind == StateWrite::Sh && write.reg >= 0x200 && write.reg <= (0x200 + sizeof(ComputeProgram) / 4)) {
+        if (write.kind == StateWrite::Sh && write.reg >= 0x200 && write.reg <= (0x200 + sizeof(AmdGpu::ComputeProgram) / 4)) {
             reinterpret_cast<u32*>(&cs_states[GfxQueueId])[write.reg - 0x200] = write.value;
         }
     }
 }
 
-void Liverpool::StartAscTag(const u32* tag, const void* address, u32 vqid) {
+void NativeExecutor::StartAscTag(const u32* tag, const void* address, u32 vqid) {
     native_tag_pending.valid = true;
     native_tag_pending.meta = tag[2];
     std::memcpy(&native_tag_pending.k1, &tag[3], sizeof(u64));
@@ -118,7 +80,7 @@ void Liverpool::StartAscTag(const u32* tag, const void* address, u32 vqid) {
 }
 
 /// A pure window of an async compute queue: the entries copied at submit, executed in order (see ProcessDirect).
-Liverpool::Task Liverpool::ProcessDirectAsc(std::shared_ptr<Core::NativeDirect::Buffer> direct, u32 vqid) {
+NativeExecutor::Task NativeExecutor::ProcessDirectAsc(std::shared_ptr<Core::NativeDirect::Buffer> direct, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
     auto& queue = asc_queues[{vqid}];
     QueueAnnounced(*direct);
@@ -161,7 +123,7 @@ Liverpool::Task Liverpool::ProcessDirectAsc(std::shared_ptr<Core::NativeDirect::
     FIBER_EXIT;
 }
 
-void Liverpool::StartNativeTag(const u32* tag) {
+void NativeExecutor::StartNativeTag(const u32* tag) {
     native_tag_pending.valid = true;
     native_tag_pending.meta = tag[2];
     std::memcpy(&native_tag_pending.k1, &tag[3], sizeof(u64));
@@ -183,7 +145,7 @@ void Liverpool::StartNativeTag(const u32* tag) {
     }
 }
 
-void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_count) {
+void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_count) {
     TLG_PROF_LEVEL("front.execute_native_draw", 1);
     native_exec_calls++;
     Core::NativeDraw::ExecDraw draw;
@@ -256,7 +218,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         Core::NativeDraw::Live().state_planned.fetch_add(1, std::memory_order_relaxed);
         RasterRun(
             [this, extent = draw.db_extent, inputs = std::move(clear_inputs)] {
-                CbDbExtent db_extent;
+                AmdGpu::CbDbExtent db_extent;
                 db_extent.raw = extent;
                 rasterizer->ClearDepthStencilTarget(inputs, db_extent);
             },
@@ -278,11 +240,11 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     if (draw.kind == 3 || draw.kind == 11) {
         // dispatch (kind 11: indirect, the group counts are read from the argument buffer): the record holds dwords of the compute program (user data, dimensions); applied for this dispatch only
         // The dispatch runs on the program the record describes alone (a zeroed program with the record's dwords; C8: the queue's state is not touched)
-        ComputeProgram alone{};
+        AmdGpu::ComputeProgram alone{};
         auto* alone_dwords = reinterpret_cast<u32*>(&alone);
         for (u32 i = 0; i < draw.count; ++i) {
             const u32 dword = draw.regs[i].index - Core::NativeDraw::ComputeRegisterBase;
-            if (dword < sizeof(ComputeProgram) / sizeof(u32)) {
+            if (dword < sizeof(AmdGpu::ComputeProgram) / sizeof(u32)) {
                 alone_dwords[dword] = draw.regs[i].value;
             }
         }
@@ -299,7 +261,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             dispatch.kind = RasterCall::Kind::DispatchIndirect;
             dispatch.args_addr = draw.args_addr;
             dispatch.offset = draw.start_index;
-            dispatch.dispatch_size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
+            dispatch.dispatch_size = sizeof(AmdGpu::PM4CmdDispatchIndirect::GroupDimensions);
         }
         if (asc_vqid != ~0u) {
             dispatch.asc = true;
@@ -323,7 +285,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     }
     if (draw.has_extents) {
         // the extent hints the game's target bind sends in a trailing NOP packet
-        for (u32 slot = 0; slot < NUM_COLOR_BUFFERS && slot < draw.cb_extent.size(); ++slot) {
+        for (u32 slot = 0; slot < AmdGpu::NUM_COLOR_BUFFERS && slot < draw.cb_extent.size(); ++slot) {
             if ((draw.cb_extent_mask >> slot) & 1) {
                 last_cb_extent[slot].raw = draw.cb_extent[slot];
             }
@@ -431,7 +393,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         call.indexed = true;
         call.args_addr = draw.args_addr;
         call.offset = draw.offset;
-        call.stride = sizeof(DrawIndexedIndirectArgs);
+        call.stride = sizeof(AmdGpu::DrawIndexedIndirectArgs);
         call.max_count = 1;
         call.vertex_sgpr_offset = static_cast<u16>(draw.vertex_sgpr);
         call.instance_sgpr_offset = static_cast<u16>(draw.instance_sgpr);
@@ -520,7 +482,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     }
 }
 
-void Liverpool::QueueAnnounced(Core::NativeDirect::Buffer& direct) {
+void NativeExecutor::QueueAnnounced(Core::NativeDirect::Buffer& direct) {
     if (direct.announced_first.empty() && direct.announced_again.empty() && direct.announced_deleted.empty()) {
         return;
     }
@@ -536,14 +498,14 @@ void Liverpool::QueueAnnounced(Core::NativeDirect::Buffer& direct) {
 /// The constant engine buffer (CCB) of a submission, run in full before the submission's entries. The game submits one at start (E0 census: 10 WRITE_CONST_RAM, 2 DUMP_CONST_RAM,
 /// the counter packets and a NOP, 452 dwords): the constant RAM is a 48 KB heap, a dump copies a part of it to guest memory in order with the draws. The counters that order
 /// the constant engine against the draw engine need nothing here (it has finished when the entries start), so they are ignored. An opcode this does not know is a rare event.
-void Liverpool::ExecuteConstantEngine(std::span<const u32> ccb) {
+void NativeExecutor::ExecuteConstantEngine(std::span<const u32> ccb) {
     while (!ccb.empty()) {
-        const auto* header = reinterpret_cast<const PM4Header*>(ccb.data());
+        const auto* header = reinterpret_cast<const AmdGpu::PM4Header*>(ccb.data());
         if (header->type != 3) {
             Core::RareEvents::Note("constant_engine_not_type3", "a constant engine packet that is not type 3");
             return;
         }
-        const PM4ItOpcode opcode = header->type3.opcode;
+        const AmdGpu::PM4ItOpcode opcode = header->type3.opcode;
         const u32 dwords = header->type3.NumWords() + 1; // NumWords counts the body: the header dword is one more
         if (dwords > ccb.size()) {
             Core::RareEvents::Note("constant_engine_bad_length", "a constant engine packet that runs past its buffer");
@@ -551,17 +513,17 @@ void Liverpool::ExecuteConstantEngine(std::span<const u32> ccb) {
         }
         Core::NativeCensus::NoteCePacket(static_cast<u32>(opcode), dwords);
         switch (opcode) {
-        case PM4ItOpcode::Nop:
-        case PM4ItOpcode::IncrementCeCounter:
-        case PM4ItOpcode::WaitOnDeCounterDiff:
+        case AmdGpu::PM4ItOpcode::Nop:
+        case AmdGpu::PM4ItOpcode::IncrementCeCounter:
+        case AmdGpu::PM4ItOpcode::WaitOnDeCounterDiff:
             break;
-        case PM4ItOpcode::WriteConstRam: {
-            const auto* write_const = reinterpret_cast<const PM4WriteConstRam*>(header);
+        case AmdGpu::PM4ItOpcode::WriteConstRam: {
+            const auto* write_const = reinterpret_cast<const AmdGpu::PM4WriteConstRam*>(header);
             std::memcpy(cblock.constants_heap.data() + write_const->Offset(), &write_const->data, write_const->Size());
             break;
         }
-        case PM4ItOpcode::DumpConstRam: {
-            const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
+        case AmdGpu::PM4ItOpcode::DumpConstRam: {
+            const auto* dump_const = reinterpret_cast<const AmdGpu::PM4DumpConstRam*>(header);
             void* destination = dump_const->Address<void*>();
             const u8* source = cblock.constants_heap.data() + dump_const->Offset();
             const u32 bytes = dump_const->Size();
@@ -574,8 +536,8 @@ void Liverpool::ExecuteConstantEngine(std::span<const u32> ccb) {
             }
             break;
         }
-        case PM4ItOpcode::IndirectBufferConst: {
-            const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+        case AmdGpu::PM4ItOpcode::IndirectBufferConst: {
+            const auto* indirect_buffer = reinterpret_cast<const AmdGpu::PM4CmdIndirectBuffer*>(header);
             ExecuteConstantEngine({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
             break;
         }
@@ -587,7 +549,7 @@ void Liverpool::ExecuteConstantEngine(std::span<const u32> ccb) {
     }
 }
 
-Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buffer> direct, std::span<const u32> ccb) {
+NativeExecutor::Task NativeExecutor::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buffer> direct, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
     QueueAnnounced(*direct);
     if (!ccb.empty()) {
@@ -719,4 +681,5 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
     FIBER_EXIT;
 }
 
-} // namespace AmdGpu
+
+} // namespace Core

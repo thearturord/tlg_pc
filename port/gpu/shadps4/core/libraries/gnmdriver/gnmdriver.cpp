@@ -34,7 +34,7 @@
 #include "native/native_flip.h"
 #include "native/native_display.h"
 #include "native/native_sync.h"
-#include "video_core/amdgpu/liverpool.h"
+#include "native/native_executor.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "native/native_draw_tag.h"
 #include "native/native_readback_policy.h"
@@ -43,7 +43,7 @@
 
 extern Frontend::WindowSDL* g_window;
 std::unique_ptr<Vulkan::Presenter> presenter;
-std::unique_ptr<AmdGpu::Liverpool> liverpool;
+std::unique_ptr<Core::NativeExecutor> native_executor;
 
 namespace Libraries::GnmDriver {
 
@@ -89,7 +89,7 @@ static u64 frames_submitted{};      // frame counter
 static bool send_init_packet{true}; // initialize HW state before first game's submit in a frame
 static s32 sdk_version{0};
 
-static u32 asc_next_offs_dw[Liverpool::NumComputeRings];
+static u32 asc_next_offs_dw[Core::NativeExecutor::NumComputeRings];
 
 // This address is initialized in sceGnmGetTheTessellationFactorRingBufferBaseAddress
 static VAddr tessellation_factors_ring_addr = -1;
@@ -351,7 +351,7 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     }
 
     auto vqid = gnm_vqid - 1;
-    auto& asc_queue = liverpool->asc_queues[{vqid}];
+    auto& asc_queue = native_executor->asc_queues[{vqid}];
 
     auto& offs_dw = asc_next_offs_dw[vqid];
 
@@ -364,7 +364,7 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
                                                  asc_queue.ring_size_dw - offs_dw);
         // For cases if a submission is split at the end of the ring buffer, we need to submit it in
         // two parts to handle the wrap
-        liverpool->SubmitAsc(gnm_vqid, {reinterpret_cast<const u32*>(asc_queue.map_addr) + offs_dw,
+        native_executor->SubmitAsc(gnm_vqid, {reinterpret_cast<const u32*>(asc_queue.map_addr) + offs_dw,
                                         asc_queue.ring_size_dw - offs_dw});
         offs_dw = 0;
     }
@@ -409,7 +409,7 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
             .base_addr = base_addr,
         });
     }
-    liverpool->SubmitAsc(gnm_vqid, acb_span);
+    native_executor->SubmitAsc(gnm_vqid, acb_span);
 }
 
 void PS4_SYSV_ABI sceGnmDingDongForWorkload(u32 gnm_vqid, u32 next_offs_dw, u64 workload_id) {
@@ -1387,11 +1387,11 @@ int PS4_SYSV_ABI sceGnmMapComputeQueue(u32 pipe_id, u32 queue_id, VAddr ring_bas
                                        u32 ring_size_dw, u32* read_ptr_addr) {
     LOG_TRACE(Lib_GnmDriver, "called");
 
-    if (pipe_id >= Liverpool::NumComputePipes) {
+    if (pipe_id >= Core::NativeExecutor::NumComputePipes) {
         return ORBIS_GNM_ERROR_COMPUTEQUEUE_INVALID_PIPE_ID;
     }
 
-    if (queue_id >= Liverpool::NumQueuesPerPipe) {
+    if (queue_id >= Core::NativeExecutor::NumQueuesPerPipe) {
         return ORBIS_GNM_ERROR_COMPUTEQUEUE_INVALID_QUEUE_ID;
     }
 
@@ -1408,13 +1408,13 @@ int PS4_SYSV_ABI sceGnmMapComputeQueue(u32 pipe_id, u32 queue_id, VAddr ring_bas
     }
 
     const auto vqid =
-        liverpool->asc_queues.Insert(VAddr(ring_base_addr), read_ptr_addr, ring_size_dw, pipe_id);
+        native_executor->asc_queues.Insert(VAddr(ring_base_addr), read_ptr_addr, ring_size_dw, pipe_id);
     // We need to offset index as `dingDong` assumes it to be from the range [1..64]
     const auto gnm_vqid = vqid.index + 1;
     LOG_INFO(Lib_GnmDriver, "ASC pipe {} queue {} mapped to vqueue {}", pipe_id, queue_id,
              gnm_vqid);
 
-    const auto& queue = liverpool->asc_queues[vqid];
+    const auto& queue = native_executor->asc_queues[vqid];
     *queue.read_addr = 0u;
 
     return gnm_vqid;
@@ -1604,14 +1604,14 @@ s32 PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDoneForWorkload(u64 workload, u32* gp
             .base_addr = reinterpret_cast<uintptr_t>(gpu_addr),
         });
     }
-    liverpool->SubmitGfx(dcb_span, {});
+    native_executor->SubmitGfx(dcb_span, {});
 
-    const bool idle_at_flip_done = liverpool->IsGpuIdleForGame();
+    const bool idle_at_flip_done = native_executor->IsGpuIdleForGame();
     if (!idle_at_flip_done && Core::FrameGate::Depth() < 2) {
         submission_lock = true;
     }
     Core::FrameTimeline::Mark(Core::FrameTimeline::SubmitDone, (idle_at_flip_done ? 0 : 1) | (idle_at_flip_done ? 2 : 0) | 8);
-    liverpool->SubmitDone();
+    native_executor->SubmitDone();
     send_init_packet = true;
 
     return ORBIS_OK;
@@ -2425,26 +2425,26 @@ int PS4_SYSV_ABI sceGnmSqttWaitForEvent() {
 static void SendInitPacket() {
     if (send_init_packet) {
         if (sdk_version < Common::ElfInfo::FW_200) {
-            liverpool->SubmitGfx(InitSequence, {});
+            native_executor->SubmitGfx(InitSequence, {});
         } else if (sdk_version < Common::ElfInfo::FW_400) {
             if (sceKernelIsNeoMode()) {
                 if (!UseNeoCompatSequences) {
-                    liverpool->SubmitGfx(InitSequence200Neo, {});
+                    native_executor->SubmitGfx(InitSequence200Neo, {});
                 } else {
-                    liverpool->SubmitGfx(InitSequence200NeoCompat, {});
+                    native_executor->SubmitGfx(InitSequence200NeoCompat, {});
                 }
             } else {
-                liverpool->SubmitGfx(InitSequence200, {});
+                native_executor->SubmitGfx(InitSequence200, {});
             }
         } else {
             if (sceKernelIsNeoMode()) {
                 if (!UseNeoCompatSequences) {
-                    liverpool->SubmitGfx(InitSequence350Neo, {});
+                    native_executor->SubmitGfx(InitSequence350Neo, {});
                 } else {
-                    liverpool->SubmitGfx(InitSequence350NeoCompat, {});
+                    native_executor->SubmitGfx(InitSequence350NeoCompat, {});
                 }
             } else {
-                liverpool->SubmitGfx(InitSequence350, {});
+                native_executor->SubmitGfx(InitSequence350, {});
             }
         }
         send_init_packet = false;
@@ -2453,23 +2453,23 @@ static void SendInitPacket() {
 
 /// Streaming of the draws (core/stream_submit.cpp): a final part of the command buffer being recorded goes to the command processor as a submit of its own.
 bool StreamPublish(const u32* from, u32 dwords) {
-    if (!liverpool || DebugState.ShouldPauseInSubmit() || DebugState.DumpingCurrentFrame()) {
+    if (!native_executor || DebugState.ShouldPauseInSubmit() || DebugState.DumpingCurrentFrame()) {
         return false;
     }
     SendInitPacket();
     Core::NativeDraw::PrepareSubmittedBuffer(const_cast<u32*>(from), dwords);
-    liverpool->SubmitGfx(std::span<const u32>{from, dwords}, {}, true);
+    native_executor->SubmitGfx(std::span<const u32>{from, dwords}, {}, true);
     return true;
 }
 
 void StreamOpen(bool open) {
-    if (liverpool) {
-        liverpool->stream_open.store(open ? 1 : 0, std::memory_order_release);
+    if (native_executor) {
+        native_executor->stream_open.store(open ? 1 : 0, std::memory_order_release);
     }
 }
 
 bool StreamAllowed() {
-    return liverpool && !DebugState.ShouldPauseInSubmit() && !DebugState.DumpingCurrentFrame();
+    return native_executor && !DebugState.ShouldPauseInSubmit() && !DebugState.DumpingCurrentFrame();
 }
 
 static inline s32 PerformSubmit(u32 count, const u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes,
@@ -2524,7 +2524,7 @@ static inline s32 PerformSubmit(u32 count, const u32* dcb_gpu_addrs[], u32* dcb_
         const u64 prepare_start = Core::FrameTimeline::Now();
         Core::NativeDraw::PrepareSubmittedBuffer(const_cast<u32*>(dcb_rest.data()), static_cast<u32>(dcb_rest.size()));
         Core::StreamProbe::NotePrepare(Core::FrameTimeline::Now() - prepare_start);
-        liverpool->SubmitGfx(dcb_rest, ccb_span);
+        native_executor->SubmitGfx(dcb_rest, ccb_span);
     }
     Core::StreamSubmit::RealSubmitQueued();
     Core::StreamProbe::EndSubmit();
@@ -2651,12 +2651,12 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     LOG_DEBUG(Lib_GnmDriver, "called");
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
-    const bool idle_at_done = liverpool->IsGpuIdleForGame();
+    const bool idle_at_done = native_executor->IsGpuIdleForGame();
     if (!idle_at_done && Core::FrameGate::Depth() < 2) {
         submission_lock = true;
     }
     Core::FrameTimeline::Mark(Core::FrameTimeline::SubmitDone, (idle_at_done ? 0 : 1) | (idle_at_done ? 2 : 0) | 4);
-    liverpool->SubmitDone();
+    native_executor->SubmitDone();
     send_init_packet = true;
     ++frames_submitted;
     DebugState.IncGnmFrameNum();
@@ -2664,7 +2664,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
 }
 
 int PS4_SYSV_ABI sceGnmUnmapComputeQueue(u32 vqid) {
-    liverpool->asc_queues.Erase(Common::SlotId{vqid - 1});
+    native_executor->asc_queues.Erase(Common::SlotId{vqid - 1});
     return ORBIS_OK;
 }
 
@@ -3215,8 +3215,8 @@ int PS4_SYSV_ABI Func_F916890425496553() {
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LOG_INFO(Lib_GnmDriver, "Initializing presenter");
-    liverpool = std::make_unique<AmdGpu::Liverpool>();
-    presenter = std::make_unique<Vulkan::Presenter>(*g_window, liverpool.get());
+    native_executor = std::make_unique<Core::NativeExecutor>();
+    presenter = std::make_unique<Vulkan::Presenter>(*g_window, native_executor.get());
 
     const s32 result = sceKernelGetCompiledSdkVersion(&sdk_version);
     if (result != ORBIS_OK) {
@@ -3224,7 +3224,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     }
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
-        liverpool->ReserveCopyBufferSpace();
+        native_executor->ReserveCopyBufferSpace();
     }
 
     Core::NativeFrameEvents::Subscribe(Core::NativeFrameEvents::GpuIdleId, ResetSubmissionLock, nullptr);

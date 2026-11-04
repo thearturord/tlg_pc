@@ -24,7 +24,7 @@
 
 #include "native/native_resources.h"
 #include "native/native_resource_audit.h"
-#include "video_core/amdgpu/liverpool.h"
+#include "native/native_executor.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/readback_batch.h"
@@ -67,10 +67,10 @@ static_assert(CmaskColorExpandedValue(4) == 0xEEEEEEEE);
 static_assert(CmaskColorExpandedValue(8) == 0xFFFFFFFF);
 
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
-                         Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
+                         Vulkan::Runtime& runtime_, Core::NativeExecutor* executor_,
                          TextureCache& texture_cache_)
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_},
-      staging_pool{runtime_.GetStagingPool()}, liverpool{liverpool_},
+      staging_pool{runtime_.GetStagingPool()}, executor{executor_},
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},

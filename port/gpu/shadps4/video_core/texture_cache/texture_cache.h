@@ -27,8 +27,8 @@
 #include "video_core/texture_cache/sampler.h"
 #include "video_core/texture_cache/tile_manager.h"
 
-namespace AmdGpu {
-struct Liverpool;
+namespace Core {
+class NativeExecutor;
 }
 
 namespace Vulkan {
@@ -109,7 +109,7 @@ public:
 
 public:
     TextureCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-                 Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache);
+                 Vulkan::Runtime& runtime, Core::NativeExecutor* executor, BufferCache& buffer_cache);
     ~TextureCache();
 
     TileManager& GetTileManager() noexcept {
@@ -462,7 +462,7 @@ private:
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     Vulkan::Runtime& runtime;
-    AmdGpu::Liverpool* liverpool;
+    Core::NativeExecutor* executor;
     BufferCache& buffer_cache;
     PageTable page_table;
     Common::SlotVector<Image> slot_images;

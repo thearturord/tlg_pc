@@ -66,8 +66,7 @@ bool Rasterizer::DrawPlanIsDepthOnly(const DrawPlan& plan) {
     return plan.fixed.NoColorTargets();
 }
 
-void Rasterizer::SetDrawPlanTargets(DrawPlan& plan, const std::array<AmdGpu::CbDbExtent, 8>& cb_extent, const AmdGpu::CbDbExtent& db_extent,
-                                    const std::array<u64, 9>& target_resources) {
+void Rasterizer::SetDrawPlanTargets(DrawPlan& plan, const ColorExtents& cb_extent, const DepthExtent& db_extent, const std::array<u64, 9>& target_resources) {
     plan.cb_extent = cb_extent;
     plan.db_extent = db_extent;
     plan.target_resources = target_resources;

@@ -1,36 +1,4 @@
 {
- "amdgpu/liverpool.cpp": {
-  "amdgpu_lines": 1,
-  "includes": [
-   "core/libraries/videoout/driver.h",
-   "video_core/amdgpu/liverpool.h",
-   "video_core/amdgpu/liverpool_internal.h",
-   "video_core/renderer_vulkan/vk_fixed_state.h"
-  ]
- },
- "amdgpu/liverpool.h": {
-  "amdgpu_lines": 0,
-  "includes": [
-   "video_core/amdgpu/cb_db_extent.h",
-   "video_core/amdgpu/regs.h"
-  ]
- },
- "amdgpu/liverpool_engine.cpp": {
-  "amdgpu_lines": 0,
-  "includes": [
-   "core/libraries/videoout/driver.h",
-   "video_core/amdgpu/liverpool.h",
-   "video_core/amdgpu/liverpool_internal.h",
-   "video_core/amdgpu/pm4_cmds.h",
-   "video_core/renderer_vulkan/vk_fixed_state.h"
-  ]
- },
- "amdgpu/liverpool_internal.h": {
-  "amdgpu_lines": 0,
-  "includes": [
-   "video_core/amdgpu/liverpool.h"
-  ]
- },
  "amdgpu/pm4_cmds.h": {
   "amdgpu_lines": 0,
   "includes": [
@@ -69,22 +37,6 @@
   "amdgpu_lines": 0,
   "includes": [
    "video_core/renderer_vulkan/vk_indexed_data.h"
-  ]
- },
- "buffer_cache/buffer_cache.cpp": {
-  "amdgpu_lines": 1,
-  "includes": [
-   "video_core/amdgpu/liverpool.h"
-  ]
- },
- "buffer_cache/buffer_cache.h": {
-  "amdgpu_lines": 2,
-  "includes": []
- },
- "buffer_cache/buffer_cache_engine.cpp": {
-  "amdgpu_lines": 0,
-  "includes": [
-   "video_core/amdgpu/liverpool.h"
   ]
  },
  "renderer_vulkan/liverpool_to_vk.cpp": {
@@ -175,18 +127,17 @@
   ]
  },
  "renderer_vulkan/vk_pipeline_cache.cpp": {
-  "amdgpu_lines": 9,
+  "amdgpu_lines": 8,
   "includes": [
    "shader_recompiler/backend/spirv/emit_spirv.h",
    "shader_recompiler/info.h",
    "shader_recompiler/recompiler.h",
    "shader_recompiler/runtime_info.h",
-   "video_core/amdgpu/liverpool.h",
    "video_core/renderer_vulkan/liverpool_to_vk.h"
   ]
  },
  "renderer_vulkan/vk_pipeline_cache.h": {
-  "amdgpu_lines": 5,
+  "amdgpu_lines": 3,
   "includes": [
    "shader_recompiler/profile.h",
    "shader_recompiler/recompiler.h",
@@ -223,28 +174,23 @@
    "shader_recompiler/frontend/fetch_shader.h"
   ]
  },
- "renderer_vulkan/vk_presenter.cpp": {
-  "amdgpu_lines": 1,
-  "includes": []
- },
  "renderer_vulkan/vk_presenter.h": {
-  "amdgpu_lines": 2,
+  "amdgpu_lines": 0,
   "includes": [
    "core/libraries/videoout/buffer.h"
   ]
  },
  "renderer_vulkan/vk_rasterizer.cpp": {
-  "amdgpu_lines": 36,
+  "amdgpu_lines": 35,
   "includes": [
    "shader_recompiler/resource.h",
    "shader_recompiler/runtime_info.h",
-   "video_core/amdgpu/liverpool.h",
    "video_core/renderer_vulkan/liverpool_to_vk.h",
    "video_core/renderer_vulkan/vk_fixed_state.h"
   ]
  },
  "renderer_vulkan/vk_rasterizer.h": {
-  "amdgpu_lines": 15,
+  "amdgpu_lines": 13,
   "includes": [
    "video_core/amdgpu/cb_db_extent.h",
    "video_core/amdgpu/regs.h"
@@ -255,7 +201,6 @@
   "includes": [
    "shader_recompiler/resource.h",
    "shader_recompiler/runtime_info.h",
-   "video_core/amdgpu/liverpool.h",
    "video_core/renderer_vulkan/liverpool_to_vk.h",
    "video_core/renderer_vulkan/vk_fixed_state.h"
   ]
@@ -280,7 +225,7 @@
   ]
  },
  "renderer_vulkan/vk_shader_hle.cpp": {
-  "amdgpu_lines": 1,
+  "amdgpu_lines": 0,
   "includes": [
    "shader_recompiler/info.h"
   ]
@@ -335,13 +280,13 @@
   ]
  },
  "texture_cache/texture_cache.cpp": {
-  "amdgpu_lines": 4,
+  "amdgpu_lines": 3,
   "includes": [
    "video_core/renderer_vulkan/liverpool_to_vk.h"
   ]
  },
  "texture_cache/texture_cache.h": {
-  "amdgpu_lines": 5,
+  "amdgpu_lines": 3,
   "includes": [
    "shader_recompiler/resource.h"
   ]

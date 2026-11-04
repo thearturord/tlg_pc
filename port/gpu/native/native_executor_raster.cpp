@@ -1,7 +1,14 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <boost/preprocessor/stringize.hpp>
+// The executor's raster side (G4e; the code of Liverpool::liverpool.cpp, unchanged except for the names): queueing draws and dispatches for the raster thread, running
+// them there through the rasterizer host (native/native_raster_host.h), the fences and the waits of the command stream, the command processor's own writes and copies.
+
+#include <algorithm>
+#include <cstring>
+#include <functional>
+#include <unordered_map>
+
+#include <nlohmann/json.hpp>
 
 #include "native/native_content.h"
 #include "native/native_wait_registers.h"
@@ -12,6 +19,9 @@
 
 #include "native/native_registry.h"
 #include "native/native_resource_audit.h"
+#include "native/native_executor.h"
+#include "native/native_executor_tasks.h"
+#include "native/native_debug_server.h"
 #include "common/arch.h"
 #ifdef ARCH_X86_64
 #include <immintrin.h>
@@ -20,10 +30,8 @@
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
-#include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
-#include "core/libraries/videoout/driver.h"
 #include "core/memory.h"
 #include "native/native_census.h"
 #include "native/native_direct.h"
@@ -40,8 +48,6 @@
 #include "core/platform.h"
 #include "native/native_frame_events.h"
 #include "native/native_display.h"
-#include "video_core/amdgpu/liverpool.h"
-#include "video_core/amdgpu/liverpool_internal.h"
 #include "native/native_readback_policy.h"
 #include "video_core/readback_stats.h"
 #include "video_core/readback_trace.h"
@@ -50,38 +56,9 @@
 #include "video_core/renderdoc.h"
 
 
-namespace AmdGpu {
+namespace Core {
 
-static const char* dcb_task_name{"DCB_TASK"};
-static const char* ccb_task_name{"CCB_TASK"};
-
-#define MAX_NAMES 56
-static_assert(Liverpool::NumComputeRings <= MAX_NAMES);
-
-#define NAME_NUM(z, n, name) BOOST_PP_STRINGIZE(name) BOOST_PP_STRINGIZE(n),
-#define NAME_ARRAY(name, num) {BOOST_PP_REPEAT(num, NAME_NUM, name)}
-
-static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
-
-#define YIELD(name)                                                                                \
-    FIBER_EXIT;                                                                                    \
-    co_yield {};                                                                                   \
-    FIBER_ENTER(name);
-
-#define YIELD_CE() YIELD(ccb_task_name)
-#define YIELD_GFX() YIELD(dcb_task_name)
-#define YIELD_ASC(id) YIELD(acb_task_name[id])
-
-#define RESUME(task, name)                                                                         \
-    FIBER_EXIT;                                                                                    \
-    task.handle.resume();                                                                          \
-    FIBER_ENTER(name);
-
-#define RESUME_CE(task) RESUME(task, ccb_task_name)
-#define RESUME_GFX(task) RESUME(task, dcb_task_name)
-#define RESUME_ASC(task, id) RESUME(task, acb_task_name[id])
-
-std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
+std::array<u8, 48_KB> NativeExecutor::ConstantEngine::constants_heap;
 
 using Core::NativeExecutorSync::NoFenceWrite;
 using Core::NativeExecutorSync::WriteFenceMemory;
@@ -105,7 +82,7 @@ static bool TryWriteFenceOffThread(Core::RasterHost* rasterizer, void* address, 
 /// which may be waiting on that thread. If the backing can't be written, the whole signal is
 /// redone on the GPU thread instead.
 template <typename Write, typename Signal>
-static void RunFenceSignal(AmdGpu::Liverpool& liverpool, std::thread::id gpu_id, Write&& try_writes,
+static void RunFenceSignal(NativeExecutor& executor, std::thread::id gpu_id, Write&& try_writes,
                            Signal&& full_signal) {
     if (std::this_thread::get_id() == gpu_id) {
         full_signal();
@@ -114,11 +91,11 @@ static void RunFenceSignal(AmdGpu::Liverpool& liverpool, std::thread::id gpu_id,
     if (try_writes()) {
         return;
     }
-    liverpool.SendCommand(std::forward<Signal>(full_signal));
+    executor.SendCommand(std::forward<Signal>(full_signal));
 }
 
 
-void Liverpool::BindRasterizer(Core::RasterHost* rasterizer_) {
+void NativeExecutor::BindRasterizer(Core::RasterHost* rasterizer_) {
     if (!rasterizer_ && split_active) {
         // The rasterizer goes away: finish what is queued and stop the raster thread first.
         DrainRaster();
@@ -133,7 +110,7 @@ void Liverpool::BindRasterizer(Core::RasterHost* rasterizer_) {
     }
 }
 
-u32 Liverpool::LookupDrain(u32 caller) {
+u32 NativeExecutor::LookupDrain(u32 caller) {
     if (!Core::DrainAudit::LazyEnabled()) {
         DrainRasterWrites(caller);
         return 0;
@@ -141,7 +118,7 @@ u32 Liverpool::LookupDrain(u32 caller) {
     return static_cast<u32>(Core::DrainAudit::LookupBegin(caller));
 }
 
-Core::DrawPlanPtr Liverpool::ReplanAfterDrain(Core::DrawPlanPtr plan, u32 site, const std::function<Core::DrawPlanPtr()>& make) {
+Core::DrawPlanPtr NativeExecutor::ReplanAfterDrain(Core::DrawPlanPtr plan, u32 site, const std::function<Core::DrawPlanPtr()>& make) {
     const u64 before = plan ? rasterizer->DrawPlanDigest(*plan) : 0;
     DrainRasterWrites(site);
     auto again = make();
@@ -151,9 +128,9 @@ Core::DrawPlanPtr Liverpool::ReplanAfterDrain(Core::DrawPlanPtr plan, u32 site, 
     return again;
 }
 
-Core::NativeDispatch::DispatchInputs MakeDispatchInputs(const ComputeProgram& p) {
+static Core::NativeDispatch::DispatchInputs MakeDispatchInputs(const AmdGpu::ComputeProgram& p) {
     Core::NativeDispatch::DispatchInputs in;
-    static_assert(sizeof(ComputeProgram) == sizeof(in.words), "the dispatch record words are the register block of the compute program");
+    static_assert(sizeof(AmdGpu::ComputeProgram) == sizeof(in.words), "the dispatch record words are the register block of the compute program");
     static_assert(sizeof(p.user_data) == sizeof(in.user_data));
     std::memcpy(in.words.data(), &p, sizeof(p));
     in.dispatch_initiator = p.dispatch_initiator;
@@ -186,7 +163,7 @@ Core::NativeDispatch::DispatchInputs MakeDispatchInputs(const ComputeProgram& p)
     return in;
 }
 
-Core::DispatchPlanPtr Liverpool::ReplanAfterDrain(Core::DispatchPlanPtr plan, u32 site, const std::function<Core::DispatchPlanPtr()>& make) {
+Core::DispatchPlanPtr NativeExecutor::ReplanAfterDrain(Core::DispatchPlanPtr plan, u32 site, const std::function<Core::DispatchPlanPtr()>& make) {
     const u64 before = plan ? rasterizer->DispatchPlanDigest(*plan) : 0;
     DrainRasterWrites(site);
     auto again = make();
@@ -196,7 +173,7 @@ Core::DispatchPlanPtr Liverpool::ReplanAfterDrain(Core::DispatchPlanPtr plan, u3
     return again;
 }
 
-void Liverpool::RasterDispatch(const RasterCall& call_in) {
+void NativeExecutor::RasterDispatch(const RasterCall& call_in) {
     Core::FrameTimeline::StageScope front_op{Core::FrameTimeline::StageFrontOp, call_in.kind >= RasterCall::Kind::DispatchDirect ? 2u : 1u, 0};
     RasterCall call = call_in;
     if (native_tag_pending.valid) {
@@ -285,7 +262,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
     RasterPush(std::move(op), false);
 }
 
-void Liverpool::SignalGraphicsEop(const Core::NativeSync::Fence& event_eop) {
+void NativeExecutor::SignalGraphicsEop(const Core::NativeSync::Fence& event_eop) {
     if (!event_eop.valid) {
         return;
     }
@@ -320,7 +297,7 @@ void Liverpool::SignalGraphicsEop(const Core::NativeSync::Fence& event_eop) {
     SignalFenceAfterReadbacks(std::move(signal), false, static_cast<VAddr>(event_eop.address), event_eop.value, event_eop.Bytes(), GfxQueueId, VideoCore::FenceGfxEop);
 }
 
-void Liverpool::SignalComputeRelease(const Core::NativeSync::Fence& release_mem, u32 vqid, u32 pipe_id) {
+void NativeExecutor::SignalComputeRelease(const Core::NativeSync::Fence& release_mem, u32 vqid, u32 pipe_id) {
     if (!release_mem.valid) {
         return;
     }
@@ -350,7 +327,7 @@ void Liverpool::SignalComputeRelease(const Core::NativeSync::Fence& release_mem,
 }
 
 /// The async queue's wait on a memory label (the walk's WaitRegMem case for a tag).
-Liverpool::Task Liverpool::DirectWaitAsc(const Core::NativeSync::LabelWait& wait_packet, u32 vqid) {
+NativeExecutor::Task NativeExecutor::DirectWaitAsc(const Core::NativeSync::LabelWait& wait_packet, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
     const Core::NativeSync::LabelWait* wait_reg_mem = &wait_packet;
     ASSERT(!wait_reg_mem->pfp);
@@ -389,7 +366,7 @@ Liverpool::Task Liverpool::DirectWaitAsc(const Core::NativeSync::LabelWait& wait
     FIBER_EXIT;
 }
 
-void Liverpool::ExecuteDma(const Core::NativeSync::DmaCopy& dma) {
+void NativeExecutor::ExecuteDma(const Core::NativeSync::DmaCopy& dma) {
     if (!rasterizer || !Core::NativeExecutorSync::PrepareDma(dma)) {
         return;
     }
@@ -411,7 +388,7 @@ void Liverpool::ExecuteDma(const Core::NativeSync::DmaCopy& dma) {
         false, true);
 }
 
-void Liverpool::CpWriteData(void* address, const u32* data, u32 data_size, u32 queue) {
+void NativeExecutor::CpWriteData(void* address, const u32* data, u32 data_size, u32 queue) {
     const auto note = [this](void* address, u32 data_size) {
         if (rasterizer) {
             rasterizer->NoteCpGuestWrite(reinterpret_cast<VAddr>(address), data_size);
@@ -457,7 +434,7 @@ DispatchStat& DispatchStatFor(u64 caller, u64 program, bool indirect, bool asc) 
 }
 } // namespace
 
-void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw_plan,
+void NativeExecutor::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw_plan,
                                const Vulkan::DispatchPlan* dispatch_plan) {
     const auto run = [&](auto&& body) {
         if (c.no_marker) {
@@ -544,29 +521,29 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
     rasterizer->MaybeFlushRecorded();
 }
 
-void Liverpool::RasterConsumer::ThreadStarted() {
+void NativeExecutor::RasterConsumer::ThreadStarted() {
     owner.gpu_id = std::this_thread::get_id();
 }
 
-bool Liverpool::RasterConsumer::CallbacksPending() const {
+bool NativeExecutor::RasterConsumer::CallbacksPending() const {
     return owner.num_commands != 0;
 }
 
-void Liverpool::RasterConsumer::RunCallbacks() {
+void NativeExecutor::RasterConsumer::RunCallbacks() {
     owner.ProcessCommands();
 }
 
-void Liverpool::RasterConsumer::SelectStream(bool second) {
+void NativeExecutor::RasterConsumer::SelectStream(bool second) {
     if (owner.rasterizer) {
         owner.rasterizer->SelectStream(second);
     }
 }
 
-void Liverpool::RasterConsumer::RunCall(RasterOp& op) {
+void NativeExecutor::RasterConsumer::RunCall(RasterOp& op) {
     owner.ExecRasterCall(op.call, op.draw_plan.get(), op.dispatch_plan.get());
 }
 
-void Liverpool::RasterConsumer::RunClosure(RasterOp& op) {
+void NativeExecutor::RasterConsumer::RunClosure(RasterOp& op) {
     owner.rasterizer->NativeInvalidate();
     {
         TLG_PROF_NAMED_LEVEL(prof_closure, "raster.op.closure", 1);
@@ -575,21 +552,21 @@ void Liverpool::RasterConsumer::RunClosure(RasterOp& op) {
     }
 }
 
-bool Liverpool::RasterConsumer::IsDepthOnly(const Vulkan::DrawPlan& plan) const {
+bool NativeExecutor::RasterConsumer::IsDepthOnly(const Vulkan::DrawPlan& plan) const {
     return owner.rasterizer->DrawPlanIsDepthOnly(plan);
 }
 
-void Liverpool::RasterConsumer::Release(RasterOp& op) {
+void NativeExecutor::RasterConsumer::Release(RasterOp& op) {
     owner.rasterizer->RecycleDrawPlan(std::move(op.draw_plan));
     owner.rasterizer->RecycleDispatchPlan(std::move(op.dispatch_plan));
 }
 
-void Liverpool::RasterConsumer::BatchFinished() {
+void NativeExecutor::RasterConsumer::BatchFinished() {
     std::scoped_lock lk{owner.submit_mutex};
     owner.submit_cv.notify_all();
 }
 
-void Liverpool::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 now) {
+void NativeExecutor::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 now) {
     auto* rasterizer = owner.rasterizer;
     auto& fence_latency = owner.fence_latency;
     {
@@ -737,8 +714,9 @@ void Liverpool::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 now) {
 }
 
 
-Liverpool::Liverpool()
-    : fence_wait_shortcut{[] {
+NativeExecutor::NativeExecutor()
+    : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
+      fence_wait_shortcut{[] {
           // dark frame experiment (`TLG_FENCE_SHORTCUT=0..3`): the level of the fence wait shortcut for this run, over the settings (1: the compute queues' waits poll memory instead of
           // passing on a fence the other queue has only recorded; 0: no queue passes early)
           if (const char* e = std::getenv("TLG_FENCE_SHORTCUT"); e != nullptr && *e >= '0' && *e <= '3') {
@@ -750,15 +728,15 @@ Liverpool::Liverpool()
     StartProcess();
 }
 
-Liverpool::~Liverpool() {
+NativeExecutor::~NativeExecutor() {
     StopProcess();
 }
 
-Liverpool::FenceMatch Liverpool::MatchRecordedFence(const Core::NativeSync::LabelWait& wait_reg_mem) {
+NativeExecutor::FenceMatch NativeExecutor::MatchRecordedFence(const Core::NativeSync::LabelWait& wait_reg_mem) {
     return label_timeline.Match(wait_reg_mem);
 }
 
-void Liverpool::OnWaitPassedOnFence(const Core::NativeSync::LabelWait& wait_reg_mem, const FenceMatch& match,
+void NativeExecutor::OnWaitPassedOnFence(const Core::NativeSync::LabelWait& wait_reg_mem, const FenceMatch& match,
                                     u32 queue) {
     if (fence_wait_shortcut >= 3 && rasterizer) {
         // Recorded in order with the draws queued before and after this wait.
@@ -775,21 +753,21 @@ void Liverpool::OnWaitPassedOnFence(const Core::NativeSync::LabelWait& wait_reg_
     }
 }
 
-void Liverpool::ReportLongWait(const Core::NativeSync::LabelWait& wait_reg_mem, const char* queue,
+void NativeExecutor::ReportLongWait(const Core::NativeSync::LabelWait& wait_reg_mem, const char* queue,
                                u64 wait_start, bool& reported) {
     Core::NativeExecutorSync::ReportLongWait(label_timeline, wait_reg_mem, queue, wait_start, reported);
 }
 
-void Liverpool::ReportLongSpin(const char* what, const void* address, u64 wait_start,
+void NativeExecutor::ReportLongSpin(const char* what, const void* address, u64 wait_start,
                                bool& reported) {
     Core::NativeExecutorSync::ReportLongSpin(what, address, wait_start, reported);
 }
 
-void Liverpool::NoteFenceLatency(VideoCore::FenceKind kind, u64 queue_ns, u64 gpu_ns) {
+void NativeExecutor::NoteFenceLatency(VideoCore::FenceKind kind, u64 queue_ns, u64 gpu_ns) {
     fence_latency.Note(kind, queue_ns, gpu_ns);
 }
 
-void Liverpool::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal, bool must_sync,
+void NativeExecutor::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal, bool must_sync,
                                           VAddr address, u64 value, u32 num_bytes, u32 queue,
                                           VideoCore::FenceKind kind) {
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::Fence};
@@ -858,7 +836,7 @@ void Liverpool::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal,
         must_sync);
 }
 
-bool Liverpool::DeferWriteBehindFences(void* address, const u32* data, u32 num_bytes, u32 queue) {
+bool NativeExecutor::DeferWriteBehindFences(void* address, const u32* data, u32 num_bytes, u32 queue) {
     const VAddr begin = reinterpret_cast<VAddr>(address);
     if (!label_timeline.HeldBack(begin, num_bytes)) {
         return false;
@@ -885,7 +863,7 @@ bool Liverpool::DeferWriteBehindFences(void* address, const u32* data, u32 num_b
     return true;
 }
 
-bool Liverpool::ShouldYieldToOtherQueue(u64& last_ns) {
+bool NativeExecutor::ShouldYieldToOtherQueue(u64& last_ns) {
     static const bool enabled = [] {
         const char* value = std::getenv("TLG_CP_ASC_YIELD");
         return value == nullptr || value[0] != '0';
@@ -903,7 +881,7 @@ bool Liverpool::ShouldYieldToOtherQueue(u64& last_ns) {
 
 /// A wait of the graphics queue on a memory label (the walk's WaitRegMem case for a tag): tests the label, passes on the recorded
 /// fence timeline, and yields to the other queues until the label has the value.
-Liverpool::Task Liverpool::DirectWaitDisplay(u32 buffer) {
+NativeExecutor::Task NativeExecutor::DirectWaitDisplay(u32 buffer) {
     FIBER_ENTER(dcb_task_name);
     if (!Core::NativeDisplay::IsFree(buffer)) {
         if (num_submits == mapped_queues[GfxQueueId].submits.size()) {
@@ -922,14 +900,14 @@ Liverpool::Task Liverpool::DirectWaitDisplay(u32 buffer) {
     FIBER_EXIT;
 }
 
-Liverpool::Task Liverpool::DirectWait(const Core::NativeSync::LabelWait& wait_packet) {
+NativeExecutor::Task NativeExecutor::DirectWait(const Core::NativeSync::LabelWait& wait_packet) {
     FIBER_ENTER(dcb_task_name);
     const Core::NativeSync::LabelWait* wait_reg_mem = &wait_packet;
     const u64* wait_addr = wait_reg_mem->Address<u64*>();
-    if (vo_port->IsVoLabel(wait_addr) && num_submits == mapped_queues[GfxQueueId].submits.size()) {
+    if (vo_labels.is_label(wait_addr) && num_submits == mapped_queues[GfxQueueId].submits.size()) {
         VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::FlipSleep};
         Core::FrameTimeline::Span flip_span{Core::FrameTimeline::FlipWait};
-        vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(); });
+        vo_labels.wait([&] { return wait_reg_mem->Test(); });
     } else if (!wait_reg_mem->Test()) {
         using VideoCore::ReadbackStats::WaitClass;
         const u64 wait_start = VideoCore::ReadbackStats::NowNs();
@@ -951,7 +929,7 @@ Liverpool::Task Liverpool::DirectWait(const Core::NativeSync::LabelWait& wait_pa
             }
             blocked = true;
             ReportLongWait(*wait_reg_mem, "gfx", wait_start, reported);
-            VideoCore::ReadbackStats::CpWaitYield(vo_port->IsVoLabel(wait_addr));
+            VideoCore::ReadbackStats::CpWaitYield(vo_labels.is_label(wait_addr));
             YIELD_GFX();
         }
         if (blocked) {
@@ -965,7 +943,7 @@ Liverpool::Task Liverpool::DirectWait(const Core::NativeSync::LabelWait& wait_pa
     FIBER_EXIT;
 }
 
-void Liverpool::FakeOcclusionDump(VAddr address) {
+void NativeExecutor::FakeOcclusionDump(VAddr address) {
     // TLG_REAL_OCCLUSION=0: a made up answer, every query reads "visible" (the counters of each pair differ by a fixed step)
     static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
     static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
@@ -986,7 +964,7 @@ void Liverpool::FakeOcclusionDump(VAddr address) {
 
 // C8 (2026-10-28): the packet interpreter is removed. Every command buffer of the game runs on the native direct path (ProcessDirect); one that
 // cannot (no hooks, a packet the direct builder does not know) is skipped with an error instead of being interpreted from its packets.
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, std::shared_ptr<Core::NativeDirect::Buffer> direct) {
+NativeExecutor::Task NativeExecutor::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, std::shared_ptr<Core::NativeDirect::Buffer> direct) {
     FIBER_ENTER(dcb_task_name);
     static std::atomic<u32> logged{0};
     if (logged.fetch_add(1) < 20) {
@@ -995,18 +973,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
     (void)ccb;
     FIBER_EXIT;
+    co_return;
 }
 
-Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, std::shared_ptr<Core::NativeDirect::Buffer> direct) {
+NativeExecutor::Task NativeExecutor::ProcessCompute(std::span<const u32> acb, u32 vqid, std::shared_ptr<Core::NativeDirect::Buffer> direct) {
     FIBER_ENTER(acb_task_name[vqid]);
     static std::atomic<u32> logged{0};
     if (logged.fetch_add(1) < 20) {
         LOG_ERROR(Render, "C8: a compute command buffer the direct path cannot run is skipped (queue {}, {} dwords, built {})", vqid, acb.size(), direct != nullptr);
     }
     FIBER_EXIT;
+    co_return;
 }
 
-void Liverpool::SubmitEnd() {
+void NativeExecutor::SubmitEnd() {
     if (rasterizer) {
         RasterRun([this] {
             VideoCore::ReadbackStats::CpPhase phase{"end of submit (readbacks, flush)"};
@@ -1018,4 +998,5 @@ void Liverpool::SubmitEnd() {
     }
 }
 
-} // namespace AmdGpu
+
+} // namespace Core
