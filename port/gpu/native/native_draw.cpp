@@ -7001,6 +7001,21 @@ u64 PS4_SYSV_ABI RecordingWrites(u64 device, u64 a1, u64 a2, u64 a3, u64 a4, u64
     Core::NativeUpdates::NoteRenderThread();
     InstallUnmapSlot();
     Guarded([&]() -> u64 {
+        // W1 diagnostic (2026-11-04): which resources hold the staging buffers and the async copy pairs of BeginRecording (writers doc section 19)
+        static std::atomic<int> logged{0};
+        if (logged.load(std::memory_order_relaxed) < 3 && (logged.fetch_add(1) < 3)) {
+            for (const u64 field : {u64{0x2820}, u64{0x2830}, u64{0x2838}, u64{0x2840}, u64{0x2860}, u64{0x2868}, u64{0x2880}, u64{0x2888}, u64{0x28a0}, u64{0x28a8}, u64{0x26e0}, u64{0x26e8}, u64{0x26f0}}) {
+                const u64 res = Rd<u64>(device, field);
+                if (!IsHeapPointer(res)) {
+                    TLG_LOG(CP, Warn, "BeginRecording diag: dev {:#x} +{:#x} = {:#x} (not a heap pointer)", device, field, res);
+                    continue;
+                }
+                TLG_LOG(CP, Warn,
+                        "BeginRecording diag: dev {:#x} +{:#x} = {:#x} mem[+0x30] {:#x} kind[+0x124] {} width[+0x180] {} V#[+0x60,+0x64,+0x68,+0x6c] {:#x} {:#x} {:#x} {:#x} stamp[+0x2c] {}",
+                        device, field, res, Rd<u64>(res, 0x30), Rd<u32>(res, 0x124), Rd<u32>(res, 0x180), Rd<u32>(res, 0x60), Rd<u32>(res, 0x64), Rd<u32>(res, 0x68),
+                        Rd<u32>(res, 0x6c), Rd<u32>(res, 0x2c));
+            }
+        }
         for (const u64 field : {u64{0x2830}, u64{0x26e0}}) {
             const u64 buffer = Rd<u64>(device, field);
             const u64 width = IsHeapPointer(buffer) ? Rd<u32>(buffer, 0x180) : 0;
