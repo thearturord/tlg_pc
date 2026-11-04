@@ -302,9 +302,15 @@ void NativeExecutor::SignalGraphicsEop(const Core::NativeSync::Fence& event_eop)
     if (event_eop.interrupt) {
         // frames in flight, game wait mode 2: the raster thread has executed everything the frame recorded (in order, before the end-of-pipe signal below)
         if (early) {
-            RasterRun([ordinal] {
+            RasterRun([this, ordinal] {
                 Core::FrameGate::NoteRasterReached();
                 Core::FrameGate::EarlyFrameRecorded(ordinal); // M5b: the frame's data is ours; the interrupt comes now if the occlusion answers of earlier frames are written, else later; the label below is written when the GPU is done
+                // diagnostic TLG_GPU_SERIAL=1: the game still runs ahead, but the raster thread lets the GPU finish this frame before it records the next (no GPU side overlap of
+                // frames: tells GPU side hazards from stale CPU data when a frames in flight bug is hunted)
+                static const bool gpu_serial = [] { const char* e = std::getenv("TLG_GPU_SERIAL"); return e != nullptr && e[0] == '1'; }();
+                if (gpu_serial) {
+                    rasterizer->Finish();
+                }
             });
         } else {
             RasterRun([] { Core::FrameGate::NoteRasterReached(); });

@@ -142,6 +142,8 @@ public:
     virtual void OnFence(Common::UniqueFunction<void>&& signal, VideoCore::FenceKind kind, bool must_sync) = 0;
     virtual void OnSubmit() = 0;
     virtual u64 Flush() = 0;
+    /// Submits and waits until the GPU has finished everything recorded so far (diagnostic TLG_GPU_SERIAL).
+    virtual void Finish() = 0;
 
     // ---- statistics (raster) ----
     /// Publishes the host's own interval statistics to the debug server (planning, memos, census, buffers, rings) and returns the numbers the executor logs with its own.

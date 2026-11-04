@@ -300,7 +300,7 @@ public:
     void UnmapMemory(VAddr addr, u64 size);
 
     u64 Flush();
-    void Finish();
+    void Finish() override;
 
     /// Raster thread: records the following operations into the asynchronous stream (second Vulkan queue, TLG_ASC_QUEUE=1) or the graphics stream.
     /// Leaving the asynchronous stream submits what it recorded. No effect without the second queue; the first windows stay on the graphics stream
