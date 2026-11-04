@@ -180,7 +180,14 @@ void NoteSubmitFlip() {
     }
     if (first && Depth() >= 2) {
         // ownership gate: the game's own gate (one end of pipe per frame) must not be the limit, the slot wait is
-        CreditGuestGate(OwnershipGate() ? Depth() + 1 : Depth() - 1);
+        int credits = Depth() - 1;
+        if (OwnershipGate()) {
+            credits = Depth() - 1; // the engine's most is two frames ahead (3 frame contexts): 3 credits gave a black scene in the owner's play (2026-11-04)
+            if (const char* e = std::getenv("TLG_OWNERSHIP_CREDIT"); e && e[0]) { // experiment: the credits of the game's own gate with the ownership gate on
+                credits = std::clamp(std::atoi(e), 0, 4);
+            }
+        }
+        CreditGuestGate(credits);
     }
 }
 
