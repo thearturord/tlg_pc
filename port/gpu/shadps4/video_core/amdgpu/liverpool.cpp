@@ -3,6 +3,7 @@
 
 #include <boost/preprocessor/stringize.hpp>
 
+#include "native/native_content.h"
 #include "native/native_flight.h"
 #include "native/native_stream_probe.h"
 #include "native/native_timeline.h"
@@ -1827,6 +1828,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bo
     Core::Flight::Add(Core::Flight::SubmitBegin, 0, dcb.size(), 0); // L1
     FLIGHT_SCOPE("command processor: graphics submission");
     auto announced = Core::NativeUpdates::TakeBatch(); // B2: applied on the raster thread before this submission's work
+    Core::NativeContent::NoteSubmit(announced.first);  // M1: the frame data store (shadow) and the submission count
     auto& queue = mapped_queues[GfxQueueId];
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {

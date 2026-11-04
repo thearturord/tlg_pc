@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -122,16 +123,23 @@ struct LedgerRange {
     u64 end;
     u64 stamp;
     u32 writer; ///< the writer number of the announcement that made the stamp (M0 census: who wrote the memory a late read finds changed)
+    u32 submit; ///< `g_submit_count` when it was announced (M1)
 };
 std::mutex g_ledger_mutex;
 std::map<u64, LedgerRange> g_ledger;
 constexpr size_t MaxLedger = 1u << 20;
+/// M1: the number of graphics submissions so far (`NoteSubmit`). A write announced while it is N belongs to the frame the (N+1)th submission carries: the GPU of that submission sees it, so it is not a late write for a record of that submission.
+std::atomic<u32> g_submit_count{0};
 std::atomic<u64> c_ledger_notes{0}, c_ledger_overflow{0};
 u64 g_ledger_max_len = 0;
+std::vector<std::pair<u64, u64>> g_fs_pending; ///< M1: ranges announced since the last submission (only filled with the store on; under g_ledger_mutex)
 
 void LedgerNote(u64 begin, u64 end, u64 stamp, u32 writer) {
     std::scoped_lock lock{g_ledger_mutex};
     c_ledger_notes.fetch_add(1, std::memory_order_relaxed);
+    if (FrameStoreOn()) {
+        g_fs_pending.emplace_back(begin, end - begin);
+    }
     if (g_ledger.size() >= MaxLedger) {
         c_ledger_overflow.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -139,7 +147,9 @@ void LedgerNote(u64 begin, u64 end, u64 stamp, u32 writer) {
     struct Seg {
         u64 b, e, s;
         u32 w;
+        u32 sub;
     };
+    const u32 submit_now = g_submit_count.load(std::memory_order_relaxed);
     std::vector<Seg> add;
     auto it = g_ledger.upper_bound(begin);
     if (it != g_ledger.begin() && std::prev(it)->second.end > begin) {
@@ -148,26 +158,26 @@ void LedgerNote(u64 begin, u64 end, u64 stamp, u32 writer) {
     u64 cursor = begin;
     while (it != g_ledger.end() && it->first < end) {
         const u64 ob = it->first, oe = it->second.end, os = it->second.stamp;
-        const u32 ow = it->second.writer;
+        const u32 ow = it->second.writer, osub = it->second.submit;
         if (ob < begin) {
-            add.push_back({ob, begin, os, ow});
+            add.push_back({ob, begin, os, ow, osub});
         }
         if (oe > end) {
-            add.push_back({end, oe, os, ow});
+            add.push_back({end, oe, os, ow, osub});
         }
         const u64 x = std::max(ob, begin), y = std::min(oe, end);
         if (cursor < x) {
-            add.push_back({cursor, x, stamp, writer});
+            add.push_back({cursor, x, stamp, writer, submit_now});
         }
-        add.push_back({x, y, std::max(os, stamp), stamp >= os ? writer : ow});
+        add.push_back({x, y, std::max(os, stamp), stamp >= os ? writer : ow, std::max(osub, submit_now)});
         cursor = y;
         it = g_ledger.erase(it);
     }
     if (cursor < end) {
-        add.push_back({cursor, end, stamp, writer});
+        add.push_back({cursor, end, stamp, writer, submit_now});
     }
     for (const Seg& g : add) {
-        g_ledger.emplace(g.b, LedgerRange{g.e, g.s, g.w});
+        g_ledger.emplace(g.b, LedgerRange{g.e, g.s, g.w, g.sub});
         g_ledger_max_len = std::max(g_ledger_max_len, g.e - g.b);
     }
 }
@@ -176,6 +186,7 @@ struct LedgerAnswer {
     u64 newest{}; ///< the newest stamp of any write that touched the range (0: none)
     u64 covered{}; ///< bytes of the range some write touched
     u32 newest_writer{}; ///< the writer number of the write with the newest stamp
+    u32 newest_submit{}; ///< the newest `g_submit_count` any write of the range was announced at (M1)
 };
 LedgerAnswer LedgerQuery(u64 begin, u64 end) {
     LedgerAnswer a;
@@ -188,6 +199,7 @@ LedgerAnswer LedgerQuery(u64 begin, u64 end) {
     }
     for (; it != g_ledger.end() && it->first < end; ++it) {
         if (it->second.end > begin) {
+            a.newest_submit = std::max(a.newest_submit, it->second.submit);
             if (it->second.stamp >= a.newest) {
                 a.newest = it->second.stamp;
                 a.newest_writer = it->second.writer;
@@ -791,6 +803,227 @@ void NoteRingImageShape(u64 address, u64 size, u32 width, u32 height, u32 depth,
     }
 }
 
+// ---- M1: submissions and the frame data store (shadow) ------------------------------------------------------------------------------------------------------------------
+namespace {
+struct SubmitMark {
+    u32 index;
+    u64 stamp; ///< `NativeDraw::NextSeq()` at the submission: every record below it was made for this submission or an earlier one
+};
+std::mutex g_submit_mutex;
+std::deque<SubmitMark> g_submits; ///< the last 512 graphics submissions
+
+struct FsChunk {
+    u64 address;
+    u64 size;
+    std::unique_ptr<u8[]> bytes;
+};
+struct FsFrame {
+    u32 index;
+    std::vector<FsChunk> chunks; ///< sorted by address
+    u64 bytes{0};
+};
+std::mutex g_fs_mutex;
+std::deque<FsFrame> g_fs_frames; ///< the last FsKeep frames
+constexpr size_t FsKeep = 8;
+constexpr u64 FsMaxChunk = 16ull << 20;  ///< a bigger announcement is counted and not copied
+constexpr u64 FsMaxFrame = 128ull << 20; ///< per submission
+std::atomic<u64> c_fs_submits{0}, c_fs_chunks{0}, c_fs_bytes{0}, c_fs_skipped_big{0}, c_fs_skipped_unreadable{0}, c_fs_skipped_frame_full{0}, c_fs_capture_ns{0}, c_fs_max_frame_bytes{0};
+std::atomic<u64> c_fs_live_bytes{0};
+
+struct FsKindCounters {
+    std::atomic<u64> reads{0}, reads_overlapping{0}, reads_with_differences{0}, bytes_covered{0}, bytes_equal{0}, bytes_differ{0}, unreadable{0};
+};
+FsKindCounters c_fs_kind[static_cast<size_t>(LateKind::Count)];
+} // namespace
+
+bool FrameStoreOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_FRAME_STORE");
+        return e != nullptr && *e != '0' && *e != '\0';
+    }();
+    return on;
+}
+
+namespace {
+/// The index (1 based) of the submission that carries the record `seq`: the first whose stamp is above it. 0: unknown (no submission yet, or older than the 512 kept).
+u32 SubmitIndexOf(u64 seq) {
+    std::scoped_lock lock{g_submit_mutex};
+    if (g_submits.empty() || seq >= g_submits.back().stamp) {
+        return 0;
+    }
+    const auto it = std::upper_bound(g_submits.begin(), g_submits.end(), seq, [](u64 value, const SubmitMark& m) { return value < m.stamp; });
+    return it == g_submits.end() ? 0 : it->index;
+}
+} // namespace
+
+void NoteSubmit(const std::vector<std::pair<u64, u64>>& ranges) {
+    const u32 index = g_submit_count.load(std::memory_order_relaxed) + 1;
+    if (FrameStoreOn()) {
+        const auto start = std::chrono::steady_clock::now();
+        std::vector<std::pair<u64, u64>> all;
+        {
+            std::scoped_lock lock{g_ledger_mutex};
+            all.swap(g_fs_pending);
+        }
+        all.insert(all.end(), ranges.begin(), ranges.end());
+        FsFrame frame;
+        frame.index = index;
+        frame.chunks.reserve(all.size());
+        for (const auto& [address, size] : all) {
+            if (address == 0 || size == 0) {
+                continue;
+            }
+            if (size > FsMaxChunk) {
+                c_fs_skipped_big.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (frame.bytes + size > FsMaxFrame) {
+                c_fs_skipped_frame_full.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            auto bytes = std::make_unique<u8[]>(size);
+            if (!GuardedCopy(bytes.get(), reinterpret_cast<const void*>(address), size)) {
+                c_fs_skipped_unreadable.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            frame.bytes += size;
+            frame.chunks.push_back({address, size, std::move(bytes)});
+        }
+        std::sort(frame.chunks.begin(), frame.chunks.end(), [](const FsChunk& a, const FsChunk& b) { return a.address < b.address; });
+        c_fs_chunks.fetch_add(frame.chunks.size(), std::memory_order_relaxed);
+        c_fs_bytes.fetch_add(frame.bytes, std::memory_order_relaxed);
+        for (u64 seen = c_fs_max_frame_bytes.load(std::memory_order_relaxed); frame.bytes > seen && !c_fs_max_frame_bytes.compare_exchange_weak(seen, frame.bytes, std::memory_order_relaxed);) {
+        }
+        {
+            std::scoped_lock lock{g_fs_mutex};
+            c_fs_live_bytes.fetch_add(frame.bytes, std::memory_order_relaxed);
+            g_fs_frames.push_back(std::move(frame));
+            while (g_fs_frames.size() > FsKeep) {
+                c_fs_live_bytes.fetch_sub(g_fs_frames.front().bytes, std::memory_order_relaxed);
+                g_fs_frames.pop_front();
+            }
+        }
+        c_fs_capture_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    }
+    c_fs_submits.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{g_submit_mutex};
+        g_submits.push_back({index, Core::NativeDraw::NextSeq()});
+        if (g_submits.size() > 512) {
+            g_submits.pop_front();
+        }
+    }
+    g_submit_count.store(index, std::memory_order_release); // after the capture: writes announced from here on belong to later submissions
+}
+
+namespace {
+/// One read of the game's memory for a record of submission `submit`: what the store holds for [address, address + size) as of that submission (the newest version at or before it, per
+/// byte) against what the memory holds now. Only the bytes some version covers are compared.
+void FrameStoreCompare(size_t kind, u64 address, u64 size, u32 submit) {
+    FsKindCounters& c = c_fs_kind[kind];
+    c.reads.fetch_add(1, std::memory_order_relaxed);
+    const u64 end = address + size;
+    std::vector<std::pair<u64, u64>> done; // pieces already decided by a newer version, sorted by start
+    u64 covered = 0, equal = 0, differ = 0;
+    bool overlapping = false, unreadable = false;
+    std::scoped_lock lock{g_fs_mutex};
+    for (auto frame = g_fs_frames.rbegin(); frame != g_fs_frames.rend(); ++frame) {
+        if (frame->index > submit) {
+            continue;
+        }
+        // chunks of one frame may overlap each other (the same range announced twice): the later announcement is later in the list only if sorted stably; the chunks hold the same bytes
+        // unless the game wrote in between, which one frame\'s capture does not see, so within a frame the order does not matter
+        auto first = std::lower_bound(frame->chunks.begin(), frame->chunks.end(), address, [](const FsChunk& ch, u64 value) { return ch.address + ch.size <= value && ch.address < value; });
+        // chunks are sorted by start only; a long chunk before `first` may still reach into the range, so walk back over the chunks that could (bounded by FsMaxChunk)
+        while (first != frame->chunks.begin() && std::prev(first)->address + FsMaxChunk > address) {
+            --first;
+        }
+        std::vector<std::pair<u64, u64>> added;
+        for (auto it = first; it != frame->chunks.end() && it->address < end; ++it) {
+            const u64 b = std::max(address, it->address), e = std::min(end, it->address + it->size);
+            if (b >= e) {
+                continue;
+            }
+            overlapping = true;
+            // subtract what a newer version already decided
+            u64 cursor = b;
+            auto cut_piece = [&](u64 pb, u64 pe) {
+                if (pb >= pe) {
+                    return;
+                }
+                u64 first_diff = ~0ull;
+                if (!GuardedCompare(reinterpret_cast<const void*>(pb), it->bytes.get() + (pb - it->address), pe - pb, first_diff)) {
+                    unreadable = true;
+                    return;
+                }
+                covered += pe - pb;
+                if (first_diff == ~0ull) {
+                    equal += pe - pb;
+                } else {
+                    // count the differing bytes exactly only when the piece is small; otherwise count the piece as different from its first differing byte on
+                    differ += pe - pb - first_diff;
+                    equal += first_diff;
+                }
+                added.emplace_back(pb, pe);
+            };
+            for (const auto& [db, de] : done) {
+                if (de <= cursor) {
+                    continue;
+                }
+                if (db >= e) {
+                    break;
+                }
+                cut_piece(cursor, std::min(db, e));
+                cursor = std::max(cursor, de);
+            }
+            cut_piece(cursor, e);
+        }
+        for (const auto& piece : added) {
+            done.push_back(piece);
+        }
+        std::sort(done.begin(), done.end());
+    }
+    if (overlapping) {
+        c.reads_overlapping.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (differ != 0) {
+        c.reads_with_differences.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (unreadable) {
+        c.unreadable.fetch_add(1, std::memory_order_relaxed);
+    }
+    c.bytes_covered.fetch_add(covered, std::memory_order_relaxed);
+    c.bytes_equal.fetch_add(equal, std::memory_order_relaxed);
+    c.bytes_differ.fetch_add(differ, std::memory_order_relaxed);
+}
+
+nlohmann::json FrameStoreReport(size_t kind) {
+    const FsKindCounters& c = c_fs_kind[kind];
+    return {{"reads", c.reads.load()},
+            {"reads_overlapping_a_version", c.reads_overlapping.load()},
+            {"reads_with_bytes_that_differ_from_memory", c.reads_with_differences.load()},
+            {"bytes_covered_by_versions", c.bytes_covered.load()},
+            {"bytes_equal", c.bytes_equal.load()},
+            {"bytes_differ_upper_bound", c.bytes_differ.load()},
+            {"unreadable", c.unreadable.load()},
+            {"note", "memory now against the newest version at or before the record's submission; differences at depth 0 are writes after the submission, at depth 2 the game running ahead"}};
+}
+
+nlohmann::json FrameStoreSummary() {
+    return {{"on", FrameStoreOn()},
+            {"switch", "TLG_FRAME_STORE=1 (default off)"},
+            {"submissions", c_fs_submits.load()},
+            {"chunks_captured", c_fs_chunks.load()},
+            {"bytes_captured", c_fs_bytes.load()},
+            {"largest_frame_bytes", c_fs_max_frame_bytes.load()},
+            {"bytes_held_now", c_fs_live_bytes.load()},
+            {"skipped_over_16mb", c_fs_skipped_big.load()},
+            {"skipped_frame_over_128mb", c_fs_skipped_frame_full.load()},
+            {"skipped_unreadable", c_fs_skipped_unreadable.load()},
+            {"capture_ms_on_the_submitting_thread", c_fs_capture_ns.load() / 1e6}};
+}
+} // namespace
+
 namespace {
 /// F2.5 (default on, `TLG_F2_LEDGER=0` off) and M0 (memory-ownership-plan.md phase 0): every read of the game's memory after the frame's record was made (an image upload, a buffer
 /// copied at bind time, a constant or geometry ring copy on the command processor) asks the write ledger whether that memory was written after the record. Per kind of read.
@@ -804,6 +1037,7 @@ std::atomic<u64> c_check[LateKinds][CheckClassCount]{};
 std::atomic<u64> c_check_bytes[LateKinds][CheckClassCount]{};
 std::atomic<u64> c_late_after_bytes_by_writer[LateKinds][16]{}; ///< bytes read late (the range was written after the record) by the writer of the newest write
 std::atomic<u64> c_late_after_by_writer[LateKinds][16]{};
+std::atomic<u64> c_same_frame_after[LateKinds]{}; ///< reads that M0 counted as late (written after the record) but that were written before the record's submission
 std::atomic<u32> c_late_rare_noted[LateKinds]{}; ///< rare events written per kind (the first few only; the counters carry the rest)
 std::atomic<u64> c_check_record_seen{0}, c_check_no_record_after_a_record{0};
 std::atomic<u64> c_check_margin_log2[LateKinds][40]{}; ///< checked reads by log2(draw record - newest write stamp): how many records ahead of the draw the memory was last written
@@ -819,6 +1053,7 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
     if (seq == 0) {
         seq = Core::NativeRegistry::CurrentDrawSeq();
     }
+    const u32 submit = seq != 0 ? SubmitIndexOf(seq) : 0;
     if (InRing(address, size)) {
         cls = CheckInRing;
     } else if (seq == 0) {
@@ -834,7 +1069,17 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
         if (a.covered != 0 && a.newest <= seq) {
             c_check_margin_log2[k][std::min<u32>(39u, static_cast<u32>(std::bit_width(seq - a.newest)))].fetch_add(1, std::memory_order_relaxed);
         }
-        cls = a.covered == 0 ? CheckNeverWritten : a.newest > seq ? CheckWrittenAfter : a.covered < size ? CheckPartlyWritten : CheckWrittenUnchanged;
+        // M1: what the GPU of the record's submission sees is the memory as the game left it at the submission, so a write counts as late only when it was announced after that
+        // submission (M0 compared with the record, which also counted writes made later in the same frame: those are in the draw's data)
+        const bool after_record = a.newest > seq;
+        const bool after_submit = submit != 0 ? a.newest_submit >= submit : after_record;
+        if (after_record && !after_submit) {
+            c_same_frame_after[k].fetch_add(1, std::memory_order_relaxed);
+        }
+        cls = a.covered == 0 ? CheckNeverWritten : after_submit ? CheckWrittenAfter : a.covered < size ? CheckPartlyWritten : CheckWrittenUnchanged;
+    }
+    if (FrameStoreOn() && k != static_cast<size_t>(LateKind::ImageUpload) && submit != 0) {
+        FrameStoreCompare(k, address, size, submit);
     }
     c_check[k][cls].fetch_add(1, std::memory_order_relaxed);
     c_check_bytes[k][cls].fetch_add(size, std::memory_order_relaxed);
@@ -1267,6 +1512,7 @@ nlohmann::json Report() {
         for (u32 c = 0; c < CheckClassCount; ++c) {
             check["cpu_image_uploads"][CheckNames[c]] = {{"uploads", c_check[0][c].load()}, {"image_bytes", c_check_bytes[0][c].load()}};
         }
+        check["frame_store"] = FrameStoreSummary();
         check["no_record_uploads_after_a_record_was_seen"] = c_check_no_record_after_a_record.load();
         for (u32 b = 0; b < 40; ++b) {
             if (const u64 n = c_check_margin_log2[0][b].load(); n != 0) {
@@ -1284,6 +1530,10 @@ nlohmann::json Report() {
                 kj[CheckNames[c]] = {{"reads", n}, {"bytes", nb}};
             }
             kj["total_reads"] = reads;
+            kj["written_after_the_record_but_before_its_submission_not_late"] = c_same_frame_after[k].load();
+            if (FrameStoreOn()) {
+                kj["frame_store_shadow"] = FrameStoreReport(k);
+            }
             kj["total_bytes"] = bytes;
             for (u32 w = 0; w < 16; ++w) {
                 if (const u64 n = c_late_after_by_writer[k][w].load()) {

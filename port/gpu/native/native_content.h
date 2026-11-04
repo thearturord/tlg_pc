@@ -35,6 +35,11 @@ enum class LateKind : u32 { ImageUpload, BufferStreamCopy, BufferObjectCopy, Buf
 /// A read of [address, address + size) for the operation with record number `seq` (0: the record of the calling thread's current draw): the write ledger says whether the range was written
 /// after that record. Counted per kind and by the writer of the newest write (Report: /stats native_backend.device.f2_store.image_memory_check.m0_late_reads). `TLG_F2_LEDGER=0` turns it off.
 void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq = 0);
+/// M1 (memory-ownership-plan.md phase 1): the frame data store, in shadow. `TLG_FRAME_STORE=1` (default off, read once): at each graphics submission the bytes of the ranges the game announced
+/// since the previous one are copied (`ranges`, the submission's `Batch::first`), stamped with the submission's index; the buffer readers compare what they find in the game's memory with the store
+/// (`m0_late_reads.<kind>.frame_store_shadow`). Nothing reads the store for rendering. Whether or not the store is on, the submission is counted (the late-read census uses it).
+[[nodiscard]] bool FrameStoreOn() noexcept;
+void NoteSubmit(const std::vector<std::pair<u64, u64>>& ranges);
 /// The frame allocator's ring (found by the engine's allocator hook).
 void SetRing(u64 begin, u64 end);
 /// F2.3 ring window shadow (`TLG_F2_RING_WINDOWS=1`, default off, read once): every allocation of the frame ring (`AllocFrameGarlic`) is a window; a newer window drops the older ones it overlaps,
