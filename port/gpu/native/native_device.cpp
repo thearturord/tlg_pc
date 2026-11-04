@@ -78,6 +78,7 @@ std::atomic<u64> resources_noted{0}, views_noted{0}, deletes_noted{0}, deletes_u
 /// AddDelayDeleteObject (native-v3-writers): the game's own delay (frames until the object is freed) by age of the object's stamp, and the extra delay TLG_DELETE_DELAY adds
 std::atomic<u64> delay_by_age[6]{}, delay_added{0}, delay_requeued{0};
 std::atomic<u64> deferred_count{0}, deferred_released{0}, deferred_forced{0}, deferred_max_pending{0};
+std::atomic<u64> slot_advances{0}, slot_waits{0}, slot_waited_submissions{0};
 std::atomic<u64> gate_frees{0}, gate_checks{0}, gate_hits{0}, gate_waited_frames{0}, gate_missed{0}, gate_missed_unsized{0};
 std::array<std::atomic<u64>, 9> live_by_kind{};
 
@@ -850,6 +851,7 @@ nlohmann::json Report() {
         }
         out["delete_by_stamp_age_0_1_2_3_over_3_negative"] = std::move(ages);
         out["delete_delay_added"] = delay_added.load();
+        out["slot_gate"] = {{"group_advances", slot_advances.load()}, {"advances_that_waited", slot_waits.load()}, {"submissions_waited_for", slot_waited_submissions.load()}};
         out["loader_gate"] = {{"frees_noted", gate_frees.load()}, {"allocations_checked", gate_checks.load()}, {"allocations_that_waited", gate_hits.load()}, {"submissions_waited_for", gate_waited_frames.load()}, {"submit_count", Core::NativeContent::SubmitCount()}, {"raster_done_floor", Core::NativeContent::RasterDoneSubmissions()}, {"wait_timeouts", Core::NativeContent::GateWaitTimeouts()}, {"alloc_on_recently_freed_address_without_gate_entry", gate_missed.load()}, {"of_those_free_had_no_known_size", gate_missed_unsized.load()}};
         out["deferred_frees"] = {{"held", deferred_count.load()}, {"released", deferred_released.load()}, {"forced", deferred_forced.load()}, {"max_pending", deferred_max_pending.load()}};
     }
@@ -1034,6 +1036,33 @@ void LoaderGateAtAllocation(u64 address, u64 size) {
         gate_hits.fetch_add(1, std::memory_order_relaxed);
         gate_waited_frames.fetch_add(need - Core::NativeContent::RasterDoneSubmissions(), std::memory_order_relaxed);
         Core::NativeContent::WaitRasterSubmissions(static_cast<u32>(need));
+    }
+}
+
+void SceneGroupAdvanced(u32 new_group) {
+    static const int mode = [] { const char* e = std::getenv("TLG_SLOT_GATE"); return e != nullptr ? std::atoi(e) : 0; }();
+    const bool on = mode >= 1;
+    static u32 left_at[3]{};
+    static u32 previous = ~0u;
+    if (!on || new_group >= 3) {
+        return;
+    }
+    slot_advances.fetch_add(1, std::memory_order_relaxed);
+    const u32 count = Core::NativeContent::SubmitCount();
+    if (previous < 3) {
+        left_at[previous] = count; // draws recorded so far with the group we leave belong to submissions up to count + 1
+    }
+    previous = new_group;
+    // the group we come back to was left at left_at[new_group]: its draws sit in submissions up to left_at + 1 (the one being built cannot be waited for)
+    // mode 2 (experiment): wait for everything submitted so far, to tell a weak formula from a late read counter that is wrong
+    // mode 1: the draws of the group we come back to may sit in a submission announced after the group was left (the frame is submitted at its end): the count at which the FOLLOWING group was left
+    // is past all of them
+    const u32 following = left_at[(new_group + 1) % 3];
+    const u32 need = mode >= 2 ? count : std::min<u32>(following, count);
+    if ((mode >= 2 || following != 0) && need > Core::NativeContent::RasterDoneSubmissions()) {
+        slot_waits.fetch_add(1, std::memory_order_relaxed);
+        slot_waited_submissions.fetch_add(need - Core::NativeContent::RasterDoneSubmissions(), std::memory_order_relaxed);
+        Core::NativeContent::WaitRasterSubmissions(need);
     }
 }
 

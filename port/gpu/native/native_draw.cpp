@@ -8217,6 +8217,14 @@ void AnnounceSceneSlotRange(u64 frame, u32 upto, bool remember_group) {
         if (first_memory == 0 || last_memory == 0) {
             return 0;
         }
+        {
+            // diagnostic: where the three groups' slot memory sits (are they three separate blocks?)
+            static std::atomic<u32> noted_mask{0};
+            const u32 bit = 1u << group;
+            if ((noted_mask.fetch_or(bit) & bit) == 0) {
+                Core::RareEvents::Note(fmt::format("scene_slot_group_{}_memory", group), fmt::format("group {}: slot {} memory {:#x}, slot {} memory {:#x}, slot 0 memory {:#x}, slot 8191 memory {:#x}", group, first, first_memory, upto - 1, last_memory, memory_of(0), memory_of(8191)));
+            }
+        }
         if (first_memory - last_memory == static_cast<u64>(upto - 1 - first) * SceneSlotStride) {
             Core::NativeUpdates::NoteWriterRange(4, last_memory, first_memory - last_memory + SceneSlotBytes); // one block
         } else {
@@ -8231,6 +8239,13 @@ void AnnounceSceneSlotRange(u64 frame, u32 upto, bool remember_group) {
     });
 }
 } // namespace
+
+/// Mid hook at 0x1d18266 (`FUN_01d169b0`, inside `group = (group + 1) % 3`: rax holds the old group, the store comes 17 bytes later; 0x1d1827d was refused, a call follows after 4 bytes):
+/// see `NativeDevice::SceneGroupAdvanced`. The new group is computed here.
+u64 PS4_SYSV_ABI SceneGroupAdvanceHook(Core::GuestHooks::MidContext* ctx) {
+    NativeDevice::SceneGroupAdvanced((static_cast<u32>(ctx->rax) + 1) % 3);
+    return 0;
+}
 
 u64 PS4_SYSV_ABI SceneSlotWrites(u64 frame, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     (void)a1, (void)a2, (void)a3, (void)a4, (void)a5, (void)ret;
@@ -8767,6 +8782,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "native_view_dsv") {
         return reinterpret_cast<u64>(&NativeDevice::ViewCreatedDsv);
+    }
+    if (name == "native_scene_group_advance") {
+        return reinterpret_cast<u64>(&SceneGroupAdvanceHook);
     }
     if (name == "native_gomalloc_alloc") {
         return reinterpret_cast<u64>(&NativeDevice::GomallocAlloc);

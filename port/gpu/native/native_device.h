@@ -123,6 +123,10 @@ u64 PS4_SYSV_ABI GomallocAlloc(u64 heap, u64 size, u64 alignment, u64 type, u64 
 /// native-v3-writers (`TLG_LOADER_GATE=1`): the engine's allocation (`address`, `size`; hooks AllocGarlicMemory / AllocOnionMemory) overlaps memory that was freed (hook GomallocFree) when the game
 /// had submitted `n` frames: the game thread waits until the raster thread has executed `n` frames, so the loader never overwrites memory a frame in flight still reads. Keeps normal memory reuse.
 void LoaderGateAtAllocation(u64 address, u64 size);
+/// native-v3-writers (`TLG_SLOT_GATE=1`, mid hook `SceneGroupAdvance` at 0x1d1827d, handler `native_scene_group_advance`): the scene's per object constant slots are three groups, the engine advances
+/// the group (`(group + 1) % 3`, variable 0x69b1678) about twice per frame, so a group is written again after about 3 graphics submissions, sooner than the raster thread can be (it may lag 2 frames).
+/// When the group `new_group` is about to be written again, the game thread waits until the raster thread has finished the submissions that could still read its old contents.
+void SceneGroupAdvanced(u32 new_group);
 
 /// B11 census: mid hooks at +6 (after the 6 bytes the B0 count hook displaced) of `JsDeviceContext::ClearRenderTargetView` (0x2483380: ctx, rtv, color[4]) and `ClearDepthStencilView` (0x24860c0: depth in
 /// xmm0, ctx, dsv, flags, stencil). They record the target and the value and bracket the packets the clear writes into the context's command buffer (its write cursor at
