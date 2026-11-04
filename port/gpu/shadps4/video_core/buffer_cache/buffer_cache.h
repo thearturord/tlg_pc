@@ -216,6 +216,8 @@ private:
     RangeSet gpu_modified_ranges;
     /// TLG_GPUWRITE_WHO=1 (diagnostic): the draw that last wrote each GPU written range, by start address (guarded by gpu_ranges_mutex)
     std::map<u64, std::pair<u64, std::string>> gpu_writer_who;
+    /// TLG_GPUWRITE_WHO=1: placed blocks dropped while they held GPU written bytes: start -> {end, text} (guarded by gpu_ranges_mutex)
+    std::map<u64, std::pair<u64, std::string>> dropped_with_gpu_bytes;
     /// B9.1: the bytes of each engine buffer (by its id) the engine announced since their last upload
     std::unordered_map<u64, RangeSet> object_dirty;
     RangeSet all_object_dirty; ///< B9.1 audit: the same bytes of all buffers by address
@@ -260,7 +262,7 @@ private:
     bool PlacedMeets(VAddr address, u64 size) const;
     const Buffer* Place(std::vector<u64> ids, VAddr begin, VAddr end);
     void Demote(VAddr begin, bool by_request);
-    void DropPlaced(VAddr begin);
+    void DropPlaced(VAddr begin, const char* why = "?");
     /// B9.4: a resident object's binding resolution names `buffer` from now on (a placed buffer remembers it, so freeing the buffer resets it)
     void NoteResolutionUser(const Buffer* buffer, u64 id);
     std::atomic<u64> b9_epoch{0}; ///< B9.3 step 2: bumped when an engine buffer gets changed bytes (the upload memo's answers are stale)

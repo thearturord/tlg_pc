@@ -85,7 +85,7 @@ void BufferCache::NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool 
                 std::scoped_lock lock{placed_mutex};
                 placed.at(block).ids.push_back((u64{1} << 63) | block);
             } else {
-                DropPlaced(block);
+                DropPlaced(block, "last member deleted");
                 Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedFreed);
             }
         } else if (block != 0) {
@@ -272,6 +272,18 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
                     who += fmt::format(" | id {:#x} kind {} usage {} bind {:#x} bytes {:#x} at {:#x}", ids[k], static_cast<u32>(object.kind), object.usage, object.bind, object.bytes, object.address);
                 }
             }
+            for (const auto& [a, n] : gpu_pieces) {
+                auto d = dropped_with_gpu_bytes.upper_bound(a);
+                u32 steps = 0;
+                while (d != dropped_with_gpu_bytes.begin() && ++steps < 16) {
+                    --d;
+                    if (d->second.first > a && d->first < a + n) {
+                        who += fmt::format(" | block {:#x}..{:#x} {}", d->first, d->second.first, d->second.second);
+                        break;
+                    }
+                }
+                break;
+            }
             TLG_LOG(BUFFER, Warn, "E4: placing {:#x}+{:#x} ({} ids, first {:#x}): {} GPU written bytes no placed buffer holds, first {:#x} ({}){}", begin, end - begin, ids.size(), ids.front(), lost,
                         gpu_pieces[0].first, Core::NativeDevice::OwnerName(gpu_pieces[0].first), who);
         }
@@ -310,7 +322,7 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
     }
     // the placed buffers inside are replaced (freed after the GPU is done, the copies above included)
     for (const VAddr b : inside) {
-        DropPlaced(b);
+        DropPlaced(b, "replaced by a bigger block");
     }
     {
         std::scoped_lock lock{placed_mutex};
@@ -354,7 +366,7 @@ void BufferCache::NoteResolutionUser(const Buffer* buffer, u64 id) {
     }
 }
 
-void BufferCache::DropPlaced(VAddr begin) {
+void BufferCache::DropPlaced(VAddr begin, const char* why) {
     std::unique_ptr<Buffer> buffer;
     std::vector<u64> ids;
     {
@@ -362,6 +374,22 @@ void BufferCache::DropPlaced(VAddr begin) {
         const auto it = placed.find(begin);
         if (it == placed.end()) {
             return;
+        }
+        static const bool who_on = [] { const char* e = std::getenv("TLG_GPUWRITE_WHO"); return e && e[0] == '1'; }();
+        if (who_on) {
+            u64 gpu_bytes = 0;
+            {
+                std::shared_lock gpu_lock{gpu_ranges_mutex};
+                gpu_modified_ranges.ForEachInRange(it->second.begin, it->second.end - it->second.begin, [&](u64 x, u64 y) { gpu_bytes += y - x; });
+            }
+            if (gpu_bytes != 0) {
+                std::unique_lock gpu_lock{gpu_ranges_mutex};
+                if (dropped_with_gpu_bytes.size() > 20000) {
+                    dropped_with_gpu_bytes.clear();
+                }
+                dropped_with_gpu_bytes[it->second.begin] = {it->second.end, fmt::format("dropped ({}) with {} GPU written bytes, {} ids, first {:#x}, tick {}", why, gpu_bytes, it->second.ids.size(),
+                                                                                       it->second.ids.empty() ? 0 : it->second.ids.front(), scheduler.CurrentTick())};
+            }
         }
         ids = std::move(it->second.ids);
         ids.insert(ids.end(), it->second.users.begin(), it->second.users.end()); // every resolution that names it, members or not
