@@ -1,0 +1,327 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "native/native_raster_queue.h"
+
+#include <chrono>
+
+#include "common/logging/log.h"
+#include "common/thread.h"
+#include "core/emulator_settings.h"
+#include "native/native_debug_server.h"
+#include "native/native_drain_audit.h"
+#include "native/native_flight.h"
+#include "native/native_prof.h"
+#include "native/native_readback_policy.h"
+#include "native/native_resource_audit.h"
+#include "native/native_timeline.h"
+#include "video_core/readback_stats.h"
+#include "video_core/thread_usage.h"
+
+namespace Core::NativeRasterQueue {
+
+void Queue::Start(Consumer& consumer_, bool verify_) {
+    consumer = &consumer_;
+    verify = verify_;
+    Core::DrainAudit::SetBackend(&done, &write_done, [this](u64 position) {
+        front_state.store(2, std::memory_order_relaxed);
+        {
+            Core::FrameTimeline::StageScope drain{Core::FrameTimeline::StageFrontDrain};
+            TLG_PROF_LEVEL("wait.front_drain_position (front: queued memory writes executed up to a position)", 1);
+            FLIGHT_SCOPE("front: waiting for queued memory writes to execute");
+            std::unique_lock lk{mutex};
+            done_cv.wait(lk, [&] { return done.load(std::memory_order_acquire) >= position || write_done.load(std::memory_order_acquire) >= position; });
+        }
+        front_state.store(0, std::memory_order_relaxed);
+    });
+    thread = std::jthread{std::bind_front(&Queue::Run, this)};
+    housekeeping = std::jthread{[](std::stop_token stoken) {
+        Common::SetCurrentThreadName("shadPS4:Housekeeping");
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock lk{mutex};
+        while (!stoken.stop_requested()) {
+            if (cv.wait_for(lk, stoken, std::chrono::seconds(5), [] { return false; })) {
+                break;
+            }
+            const auto start = std::chrono::steady_clock::now();
+            if (const auto usage = VideoCore::ThreadUsageReport(); !usage.empty()) {
+                LOG_INFO(Render, "Thread CPU use (100% = one core): {}", usage);
+            }
+            const auto middle = std::chrono::steady_clock::now();
+            VideoCore::ReapplyCoreIsolation(); // threads created since (guest threads)
+            const auto end = std::chrono::steady_clock::now();
+            Core::DebugServer::RecordPeriodic(
+                "housekeeping_thread_cpu_report",
+                std::chrono::duration<double, std::milli>(middle - start).count());
+            Core::DebugServer::RecordPeriodic(
+                "housekeeping_core_isolation",
+                std::chrono::duration<double, std::milli>(end - middle).count());
+        }
+    }};
+    LOG_INFO(Render, "Command processor split: raster thread started{}",
+             verify ? " (synchronous)" : "");
+}
+
+void Queue::Stop() {
+    if (!thread.joinable()) {
+        return;
+    }
+    thread.request_stop();
+    work_cv.notify_all();
+    thread.join();
+}
+
+void Queue::Wake() {
+    std::scoped_lock lk{mutex};
+    work_cv.notify_all();
+}
+
+void Queue::Drain() {
+    const u64 target = pushed.load(std::memory_order_acquire);
+    if (done.load(std::memory_order_acquire) >= target) {
+        return;
+    }
+    FLIGHT_SCOPE("front: waiting for the raster thread to reach a position");
+    std::unique_lock lk{mutex};
+    done_cv.wait(lk, [&] { return done.load(std::memory_order_acquire) >= target; });
+}
+
+void Queue::Push(Op&& op, bool wait) {
+    op.audit_class = Core::ResourceAudit::front_class;
+    const bool audit_write = op.writes_memory;
+    const u32 audit_line = op.write_line;
+    if (op.has_call) {
+        Core::DrainAudit::LookupDone(); // N6: the planning of this operation is done
+    } else if (!op.writes_memory) {
+        Core::DrainAudit::ClearNextWrite();
+    }
+    if (op.writes_memory) {
+        pending_writes.fetch_add(1, std::memory_order_acq_rel);
+        last_write_line = op.write_line;
+        SiteFor(op.write_line)->pushes.fetch_add(1, std::memory_order_relaxed);
+    }
+    ++stat_ops;
+    u64 target;
+    {
+        std::unique_lock lk{mutex};
+        if (queue.size() >= MaxQueued) {
+            stat_front_blocked.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (queue.size() >= MaxQueued) {
+            front_state.store(3, std::memory_order_relaxed);
+        }
+        {
+            Core::FrameTimeline::StageScope queue_full{Core::FrameTimeline::StageFrontQueueFull};
+            TLG_PROF_LEVEL("wait.front_queue_full (front: the raster queue has no room)", 1);
+            FLIGHT_SCOPE("front: the raster queue has no room");
+            done_cv.wait(lk, [&] { return queue.size() < MaxQueued; });
+        }
+        front_state.store(0, std::memory_order_relaxed);
+        op.position = pushed.load(std::memory_order_relaxed) + 1;
+        queue.push_back(std::move(op));
+        target = pushed.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (audit_write) {
+            Core::DrainAudit::WriteQueued(target, audit_line);
+        }
+        work_cv.notify_all();
+        if (wait || verify) {
+            done_cv.wait(lk, [&] { return done.load(std::memory_order_acquire) >= target; });
+        }
+    }
+}
+
+void Queue::PushClosure(Common::UniqueFunction<void>&& func, bool wait, bool writes_memory, std::source_location site) {
+    Op op;
+    op.closure = std::move(func);
+    op.writes_memory = writes_memory;
+    op.write_line = site.line();
+    op.write_file = site.file_name();
+    for (const char* p = site.file_name(); *p != 0; ++p) { // the file name without the directories
+        if (*p == '/' || *p == '\\') {
+            op.write_file = p + 1;
+        }
+    }
+    Push(std::move(op), wait);
+}
+
+void Queue::DrainWrites(u32 caller) {
+    if (pending_writes.load(std::memory_order_acquire) == 0) {
+        Core::DrainAudit::DrainNothingPending();
+        return;
+    }
+    Core::DrainAudit::DrainBegin(done.load(std::memory_order_acquire), caller);
+    ++stat_write_drains;
+    front_state.store(2, std::memory_order_relaxed);
+    const u64 wait_start = VideoCore::ReadbackStats::NowNs();
+    {
+        Core::FrameTimeline::StageScope drain{Core::FrameTimeline::StageFrontDrain};
+        TLG_PROF_LEVEL("wait.front_drain_writes (front: all queued memory writing closures executed)", 1);
+        FLIGHT_SCOPE("front: draining queued memory writes");
+        std::unique_lock lk{mutex};
+        done_cv.wait(lk, [&] { return pending_writes.load(std::memory_order_acquire) == 0; });
+    }
+    front_state.store(0, std::memory_order_relaxed);
+    Core::DrainAudit::DrainWaited(VideoCore::ReadbackStats::NowNs() - wait_start);
+    SiteFor(last_write_line)
+        ->wait_ns.fetch_add(VideoCore::ReadbackStats::NowNs() - wait_start,
+                            std::memory_order_relaxed);
+}
+
+void Queue::Run(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:GpuRaster");
+    if (const u32 priority = EmulatorSettings.GetCpThreadPriority(); priority >= 2) {
+        Common::SetCurrentThreadPriority(static_cast<Common::ThreadPriority>(priority));
+    }
+    consumer->ThreadStarted();
+    s32 applied_core = -1;
+    VideoCore::ReadbackStats::MarkCpThread();
+    auto& sp = *this;
+    std::vector<Op> batch;
+    while (true) {
+        // cp_raster_core can be changed live (debug server /set?name=raster_core&value=N).
+        if (const s32 wanted = VideoCore::ReadbackPolicy::Get().raster_core.load();
+            wanted != applied_core) {
+            if (applied_core >= 0) {
+                VideoCore::ClearCoreIsolation();
+            }
+            if (wanted >= 0) {
+                VideoCore::PinThreadAndIsolateCore(static_cast<u32>(wanted));
+            }
+            applied_core = wanted;
+        }
+        {
+            const u64 idle_start = VideoCore::ReadbackStats::NowNs();
+            const u8 front_state_at_idle = sp.front_state.load(std::memory_order_relaxed);
+            TLG_PROF_LEVEL("wait.raster_idle (raster: no work queued)", 1);
+            FLIGHT_SCOPE("raster: no work queued");
+            std::unique_lock lk{sp.mutex};
+            Common::CondvarWait(sp.work_cv, lk, stoken,
+                                [&] { return !sp.queue.empty() || consumer->CallbacksPending(); });
+            {
+                const u64 idle = VideoCore::ReadbackStats::NowNs() - idle_start;
+                if (idle >= 20'000 && Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
+                    Core::FrameTimeline::Record(Core::FrameTimeline::StageSpan, idle | (u64(Core::FrameTimeline::StageRasterIdle) << 56), Core::FrameTimeline::Now(),
+                                                sp.front_state.load(std::memory_order_relaxed));
+                }
+                sp.stat_raster_idle_ns.fetch_add(idle, std::memory_order_relaxed);
+                sp.raster_idle_ns_by_front_state[front_state_at_idle & 3].fetch_add(
+                    idle, std::memory_order_relaxed);
+            }
+            if (stoken.stop_requested() && sp.queue.empty() && !consumer->CallbacksPending()) {
+                return;
+            }
+            batch.swap(sp.queue);
+            if (!batch.empty()) {
+                const auto& first = batch.front();
+                const size_t kind = first.has_call ? static_cast<size_t>(first.call.kind) : 4;
+                sp.raster_idle_ns_by_next_op[kind].fetch_add(
+                    VideoCore::ReadbackStats::NowNs() - idle_start, std::memory_order_relaxed);
+                sp.raster_idle_count_by_next_op[kind].fetch_add(1, std::memory_order_relaxed);
+            }
+            sp.done_cv.notify_all(); // The queue has room again.
+        }
+        FLIGHT_SCOPE("raster: running queued work");
+        // Capture: consecutive operations of one kind are one span (a run of draws, of dispatches, of closures), written when the kind changes.
+        u32 run_kind = 0;
+        u64 run_start = 0, run_count = 0;
+        const bool capturing = Core::FrameTimeline::capture_active.load(std::memory_order_relaxed);
+        const auto end_run = [&] {
+            if (run_kind != 0 && run_count != 0) {
+                const u64 now = Core::FrameTimeline::Now();
+                Core::FrameTimeline::Record(Core::FrameTimeline::StageSpan, (now - run_start) | (u64(Core::FrameTimeline::StageRasterOp) << 56), now,
+                                            run_kind | (run_count << 8));
+            }
+            run_kind = 0;
+            run_count = 0;
+        };
+        for (auto& op : batch) {
+            Core::ResourceAudit::raster_class = op.audit_class;
+            consumer->SelectStream(op.audit_class == 1);
+            if (capturing) {
+                // run key: kind (bits 0-3) | the queue that pushed the operation (bits 4-7, 15 = none), so a run never mixes queues
+                const u32 kind = (op.has_call ? (op.call.kind == Call::Kind::Draw || op.call.kind == Call::Kind::DrawIndirect ? 1u : 2u) : 3u) |
+                                 (u32(op.audit_class & 0xf) << 4);
+                if (kind != run_kind) {
+                    end_run();
+                    run_kind = kind;
+                    run_start = Core::FrameTimeline::Now();
+                }
+                ++run_count;
+            }
+            // Callbacks sent by other threads (fault readbacks, fences) run between operations,
+            // like they ran between packets before.
+            if (consumer->CallbacksPending()) {
+                TLG_PROF_NAMED_LEVEL(prof_callbacks, "raster.callbacks", 1);
+                const u64 callback_start = VideoCore::ReadbackStats::NowNs();
+                consumer->RunCallbacks();
+                sp.ns_callbacks += VideoCore::ReadbackStats::NowNs() - callback_start;
+            }
+            const u64 op_start = VideoCore::ReadbackStats::NowNs();
+            if (op.has_call) {
+                if (const u32 delay = VideoCore::ReadbackPolicy::Get().raster_delay_ns.load(std::memory_order_relaxed);
+                    delay != 0 && (op.call.kind == Call::Kind::Draw || op.call.kind == Call::Kind::DrawIndirect)) {
+                    const u64 until = Core::FrameTimeline::Now() + delay;
+                    while (Core::FrameTimeline::Now() < until) {
+                    }
+                }
+                {
+                    static Core::Prof::Site site_draw{"raster.op.draw", 1}, site_draw_indirect{"raster.op.draw_indirect", 1}, site_dispatch{"raster.op.dispatch", 1},
+                        site_dispatch_indirect{"raster.op.dispatch_indirect", 1};
+                    Core::Prof::Site& op_site = op.call.kind == Call::Kind::Draw           ? site_draw
+                                                : op.call.kind == Call::Kind::DrawIndirect ? site_draw_indirect
+                                                : op.call.kind == Call::Kind::DispatchDirect ? site_dispatch
+                                                                                             : site_dispatch_indirect;
+                    const Core::Prof::Scope prof_op{op_site};
+                    consumer->RunCall(op);
+                }
+                const u64 op_ns = VideoCore::ReadbackStats::NowNs() - op_start;
+                if (op.call.kind == Call::Kind::Draw ||
+                    op.call.kind == Call::Kind::DrawIndirect) {
+                    sp.ns_draws += op_ns;
+                    ++sp.n_draws;
+                    if (op.draw_plan && consumer->IsDepthOnly(*op.draw_plan)) {
+                        sp.ns_depth_only_draws += op_ns;
+                        ++sp.n_depth_only_draws;
+                    }
+                } else {
+                    sp.ns_dispatches += op_ns;
+                }
+            } else if (op.closure) {
+                consumer->RunClosure(op);
+                (op.writes_memory ? sp.ns_write_closures : sp.ns_other_closures) +=
+                    VideoCore::ReadbackStats::NowNs() - op_start;
+                if (op.writes_memory) {
+                    sp.write_done.store(op.position, std::memory_order_release);
+                    sp.pending_writes.fetch_sub(1, std::memory_order_acq_rel);
+                    std::scoped_lock lk{sp.mutex};
+                    sp.done_cv.notify_all();
+                }
+            }
+            op.closure = {};
+            consumer->Release(op);
+        }
+        end_run();
+        Core::ResourceAudit::raster_class = Core::ResourceAudit::NoClass;
+        consumer->SelectStream(false);
+        if (consumer->CallbacksPending()) {
+            consumer->RunCallbacks();
+        }
+        const u64 count = batch.size();
+        batch.clear();
+        if (const u64 now = VideoCore::ReadbackStats::NowNs();
+            now - sp.stat_last_log_ns > 5'000'000'000ULL) {
+            consumer->PublishIntervalStats(sp, now);
+        }
+        {
+            std::scoped_lock lk{sp.mutex};
+            sp.done.fetch_add(count, std::memory_order_acq_rel);
+            sp.done_cv.notify_all();
+        }
+        if (Idle()) {
+            consumer->BatchFinished();
+        }
+    }
+}
+
+} // namespace Core::NativeRasterQueue

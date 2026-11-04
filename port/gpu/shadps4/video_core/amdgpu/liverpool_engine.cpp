@@ -92,6 +92,20 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
 
 
+} // namespace AmdGpu
+
+namespace Core::NativeRasterQueue {
+void PlanDelete::operator()(Vulkan::DrawPlan* plan) const {
+    delete plan;
+}
+
+void PlanDelete::operator()(Vulkan::DispatchPlan* plan) const {
+    delete plan;
+}
+} // namespace Core::NativeRasterQueue
+
+namespace AmdGpu {
+
 void Liverpool::ApplyStateTemplate(const Core::NativeDraw::StateTemplate& state) {
     // G4a: the executor keeps no register file. The one state that is read back is the compute program of the graphics queue (the dispatches the command processor runs itself).
     using Core::NativeDraw::StateWrite;

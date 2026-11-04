@@ -155,68 +155,24 @@ void Liverpool::BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
 
 void Liverpool::StartRasterSplit() {
     split = std::make_unique<RasterSplit>();
-    auto& sp = *split;
-    sp.verify = EmulatorSettings.GetCpSplitMode() >= 2;
-    Core::DrainAudit::SetBackend(&sp.done, &sp.write_done, [&sp](u64 position) {
-        sp.front_state.store(2, std::memory_order_relaxed);
-        {
-            Core::FrameTimeline::StageScope drain{Core::FrameTimeline::StageFrontDrain};
-            TLG_PROF_LEVEL("wait.front_drain_position (front: queued memory writes executed up to a position)", 1);
-            FLIGHT_SCOPE("front: waiting for queued memory writes to execute");
-            std::unique_lock lk{sp.mutex};
-            sp.done_cv.wait(lk, [&] { return sp.done.load(std::memory_order_acquire) >= position || sp.write_done.load(std::memory_order_acquire) >= position; });
-        }
-        sp.front_state.store(0, std::memory_order_relaxed);
-    });
     split_active = true;
-    sp.thread = std::jthread{std::bind_front(&Liverpool::RasterMain, this)};
-    sp.housekeeping = std::jthread{[](std::stop_token stoken) {
-        Common::SetCurrentThreadName("shadPS4:Housekeeping");
-        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
-        std::mutex mutex;
-        std::condition_variable_any cv;
-        std::unique_lock lk{mutex};
-        while (!stoken.stop_requested()) {
-            if (cv.wait_for(lk, stoken, std::chrono::seconds(5), [] { return false; })) {
-                break;
-            }
-            const auto start = std::chrono::steady_clock::now();
-            if (const auto usage = VideoCore::ThreadUsageReport(); !usage.empty()) {
-                LOG_INFO(Render, "Thread CPU use (100% = one core): {}", usage);
-            }
-            const auto middle = std::chrono::steady_clock::now();
-            VideoCore::ReapplyCoreIsolation(); // threads created since (guest threads)
-            const auto end = std::chrono::steady_clock::now();
-            Core::DebugServer::RecordPeriodic(
-                "housekeeping_thread_cpu_report",
-                std::chrono::duration<double, std::milli>(middle - start).count());
-            Core::DebugServer::RecordPeriodic(
-                "housekeeping_core_isolation",
-                std::chrono::duration<double, std::milli>(end - middle).count());
-        }
-    }};
-    LOG_INFO(Render, "Command processor split: raster thread started{}",
-             sp.verify ? " (synchronous)" : "");
+    split->Start(raster_consumer, EmulatorSettings.GetCpSplitMode() >= 2);
 }
 
 void Liverpool::StopRasterSplit() {
     if (!split) {
         return;
     }
-    split->thread.request_stop();
-    split->work_cv.notify_all();
-    split->thread.join();
+    split->Stop();
 }
 
 bool Liverpool::RasterIdle() const noexcept {
-    return !split_active || split->pushed.load(std::memory_order_acquire) ==
-                                split->done.load(std::memory_order_acquire);
+    return !split_active || split->Idle();
 }
 
 void Liverpool::WakeRaster() {
     if (split_active) {
-        std::scoped_lock lk{split->mutex};
-        split->work_cv.notify_all();
+        split->Wake();
     }
 }
 
@@ -225,59 +181,11 @@ void Liverpool::DrainRaster() {
     if (!split_active) {
         return;
     }
-    auto& sp = *split;
-    const u64 target = sp.pushed.load(std::memory_order_acquire);
-    if (sp.done.load(std::memory_order_acquire) >= target) {
-        return;
-    }
-    FLIGHT_SCOPE("front: waiting for the raster thread to reach a position");
-    std::unique_lock lk{sp.mutex};
-    sp.done_cv.wait(lk, [&] { return sp.done.load(std::memory_order_acquire) >= target; });
+    split->Drain();
 }
 
 void Liverpool::RasterPush(RasterOp&& op, bool wait) {
-    auto& sp = *split;
-    op.audit_class = Core::ResourceAudit::front_class;
-    const bool audit_write = op.writes_memory;
-    const u32 audit_line = op.write_line;
-    if (op.has_call) {
-        Core::DrainAudit::LookupDone(); // N6: the planning of this operation is done
-    } else if (!op.writes_memory) {
-        Core::DrainAudit::ClearNextWrite();
-    }
-    if (op.writes_memory) {
-        sp.pending_writes.fetch_add(1, std::memory_order_acq_rel);
-        sp.last_write_line = op.write_line;
-        sp.SiteFor(op.write_line)->pushes.fetch_add(1, std::memory_order_relaxed);
-    }
-    ++sp.stat_ops;
-    u64 target;
-    {
-        std::unique_lock lk{sp.mutex};
-        if (sp.queue.size() >= RasterSplit::MaxQueued) {
-            sp.stat_front_blocked.fetch_add(1, std::memory_order_relaxed);
-        }
-        if (sp.queue.size() >= RasterSplit::MaxQueued) {
-            sp.front_state.store(3, std::memory_order_relaxed);
-        }
-        {
-            Core::FrameTimeline::StageScope queue_full{Core::FrameTimeline::StageFrontQueueFull};
-            TLG_PROF_LEVEL("wait.front_queue_full (front: the raster queue has no room)", 1);
-            FLIGHT_SCOPE("front: the raster queue has no room");
-            sp.done_cv.wait(lk, [&] { return sp.queue.size() < RasterSplit::MaxQueued; });
-        }
-        sp.front_state.store(0, std::memory_order_relaxed);
-        op.position = sp.pushed.load(std::memory_order_relaxed) + 1;
-        sp.queue.push_back(std::move(op));
-        target = sp.pushed.fetch_add(1, std::memory_order_acq_rel) + 1;
-        if (audit_write) {
-            Core::DrainAudit::WriteQueued(target, audit_line);
-        }
-        sp.work_cv.notify_all();
-        if (wait || sp.verify) {
-            sp.done_cv.wait(lk, [&] { return sp.done.load(std::memory_order_acquire) >= target; });
-        }
-    }
+    split->Push(std::move(op), wait);
 }
 
 void Liverpool::RasterRun(Common::UniqueFunction<void>&& func, bool wait, bool writes_memory,
@@ -286,42 +194,11 @@ void Liverpool::RasterRun(Common::UniqueFunction<void>&& func, bool wait, bool w
         func();
         return;
     }
-    RasterOp op;
-    op.closure = std::move(func);
-    op.writes_memory = writes_memory;
-    op.write_line = site.line();
-    op.write_file = site.file_name();
-    for (const char* p = site.file_name(); *p != 0; ++p) { // the file name without the directories
-        if (*p == '/' || *p == '\\') {
-            op.write_file = p + 1;
-        }
-    }
-    RasterPush(std::move(op), wait);
+    split->PushClosure(std::move(func), wait, writes_memory, site);
 }
 
 void Liverpool::DrainRasterWrites(u32 caller) {
-    auto& sp = *split;
-    if (sp.pending_writes.load(std::memory_order_acquire) == 0) {
-        Core::DrainAudit::DrainNothingPending();
-        return;
-    }
-    Core::DrainAudit::DrainBegin(sp.done.load(std::memory_order_acquire), caller);
-    ++sp.stat_write_drains;
-    sp.front_state.store(2, std::memory_order_relaxed);
-    const u64 wait_start = VideoCore::ReadbackStats::NowNs();
-    {
-        Core::FrameTimeline::StageScope drain{Core::FrameTimeline::StageFrontDrain};
-        TLG_PROF_LEVEL("wait.front_drain_writes (front: all queued memory writing closures executed)", 1);
-        FLIGHT_SCOPE("front: draining queued memory writes");
-        std::unique_lock lk{sp.mutex};
-        sp.done_cv.wait(lk,
-                        [&] { return sp.pending_writes.load(std::memory_order_acquire) == 0; });
-    }
-    sp.front_state.store(0, std::memory_order_relaxed);
-    Core::DrainAudit::DrainWaited(VideoCore::ReadbackStats::NowNs() - wait_start);
-    sp.SiteFor(sp.last_write_line)
-        ->wait_ns.fetch_add(VideoCore::ReadbackStats::NowNs() - wait_start,
-                            std::memory_order_relaxed);
+    split->DrainWrites(caller);
 }
 
 u32 Liverpool::LookupDrain(u32 caller) {
@@ -439,6 +316,8 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         ++sp.stat_draws;
     }
     RasterOp op;
+    std::unique_ptr<Vulkan::DrawPlan> draw_plan; // handed to the op below (the op deletes with PlanDelete, the pool takes the default deleter)
+    std::unique_ptr<Vulkan::DispatchPlan> dispatch_plan;
     op.has_call = true;
     op.call = call;
     if (call.kind == RasterCall::Kind::DispatchDirect ||
@@ -446,13 +325,13 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         op.cs = MakeDispatchInputs(call.cs_override ? *call.cs_override : GetCsRegs());
         // The pipeline lookup runs here, on the command processor thread (stage 2 of the split).
         TLG_PROF_NAMED_LEVEL(prof_plan_dispatch, "front.plan_dispatch", 2);
-        op.dispatch_plan = rasterizer->PlanDispatch(op.cs);
+        dispatch_plan = rasterizer->PlanDispatch(op.cs);
         if (verify == 2) {
-            op.dispatch_plan = ReplanAfterDrain(std::move(op.dispatch_plan), 0, [&] { return rasterizer->PlanDispatch(op.cs); });
+            dispatch_plan = ReplanAfterDrain(std::move(dispatch_plan), 0, [&] { return rasterizer->PlanDispatch(op.cs); });
         }
-        if (op.dispatch_plan && call.tag.valid) {
-            op.dispatch_plan->native_seq = call.tag.seq;
-            op.dispatch_plan->bindings_complete = Core::NativeDraw::TakeDispatchBindings(call.tag.seq, op.dispatch_plan->bindings.data(), static_cast<u32>(op.dispatch_plan->bindings.size()), op.dispatch_plan->binding_count);
+        if (dispatch_plan && call.tag.valid) {
+            dispatch_plan->native_seq = call.tag.seq;
+            dispatch_plan->bindings_complete = Core::NativeDraw::TakeDispatchBindings(call.tag.seq, dispatch_plan->bindings.data(), static_cast<u32>(dispatch_plan->bindings.size()), dispatch_plan->binding_count);
         }
     } else {
         const Vulkan::DrawIndirectParams params =
@@ -462,24 +341,26 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
                                              .is_indirect = true}
                 : Vulkan::DrawIndirectParams{};
         if (native_exec_plan) {
-            op.draw_plan.reset(std::exchange(native_exec_plan, nullptr));
+            draw_plan.reset(std::exchange(native_exec_plan, nullptr));
         }
-        if (op.draw_plan) {
-            op.draw_plan->cb_extent = last_cb_extent;
-            op.draw_plan->db_extent = last_db_extent;
-            op.draw_plan->target_resources = last_target_resources;
+        if (draw_plan) {
+            draw_plan->cb_extent = last_cb_extent;
+            draw_plan->db_extent = last_db_extent;
+            draw_plan->target_resources = last_target_resources;
         }
     }
     if (rasterizer->ConstRingLevel() != 0) {
         // The queue position this operation will have, and the position the raster thread has finished (documents/tlg/pc-port-draw-pipeline-architecture.md, T1).
-        rasterizer->FrontQueueOp(op.draw_plan.get(), op.dispatch_plan.get(), sp.pushed.load(std::memory_order_acquire) + 1,
-                                 sp.done.load(std::memory_order_acquire), call.tag.valid ? call.tag.seq : (op.draw_plan ? op.draw_plan->native_seq : 0),
+        rasterizer->FrontQueueOp(draw_plan.get(), dispatch_plan.get(), sp.pushed.load(std::memory_order_acquire) + 1,
+                                 sp.done.load(std::memory_order_acquire), call.tag.valid ? call.tag.seq : (draw_plan ? draw_plan->native_seq : 0),
                                  call.indexed, call.index_offset);
     }
     {
         TLG_PROF_LEVEL("front.resolve_ahead", 2);
-        rasterizer->ResolveAhead(op.draw_plan.get(), op.dispatch_plan.get()); // R2
+        rasterizer->ResolveAhead(draw_plan.get(), dispatch_plan.get()); // R2
     }
+    op.draw_plan.reset(draw_plan.release());
+    op.dispatch_plan.reset(dispatch_plan.release());
     RasterPush(std::move(op), false);
 }
 
@@ -768,159 +649,55 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
     rasterizer->MaybeFlushRecorded();
 }
 
-void Liverpool::RasterMain(std::stop_token stoken) {
-    Common::SetCurrentThreadName("shadPS4:GpuRaster");
-    if (const u32 priority = EmulatorSettings.GetCpThreadPriority(); priority >= 2) {
-        Common::SetCurrentThreadPriority(static_cast<Common::ThreadPriority>(priority));
+void Liverpool::RasterConsumer::ThreadStarted() {
+    owner.gpu_id = std::this_thread::get_id();
+}
+
+bool Liverpool::RasterConsumer::CallbacksPending() const {
+    return owner.num_commands != 0;
+}
+
+void Liverpool::RasterConsumer::RunCallbacks() {
+    owner.ProcessCommands();
+}
+
+void Liverpool::RasterConsumer::SelectStream(bool second) {
+    if (owner.rasterizer) {
+        owner.rasterizer->SelectStream(second);
     }
-    gpu_id = std::this_thread::get_id();
-    s32 applied_core = -1;
-    VideoCore::ReadbackStats::MarkCpThread();
-    auto& sp = *split;
-    std::vector<RasterOp> batch;
-    while (true) {
-        // cp_raster_core can be changed live (debug server /set?name=raster_core&value=N).
-        if (const s32 wanted = VideoCore::ReadbackPolicy::Get().raster_core.load();
-            wanted != applied_core) {
-            if (applied_core >= 0) {
-                VideoCore::ClearCoreIsolation();
-            }
-            if (wanted >= 0) {
-                VideoCore::PinThreadAndIsolateCore(static_cast<u32>(wanted));
-            }
-            applied_core = wanted;
-        }
-        {
-            const u64 idle_start = VideoCore::ReadbackStats::NowNs();
-            const u8 front_state_at_idle = sp.front_state.load(std::memory_order_relaxed);
-            TLG_PROF_LEVEL("wait.raster_idle (raster: no work queued)", 1);
-            FLIGHT_SCOPE("raster: no work queued");
-            std::unique_lock lk{sp.mutex};
-            Common::CondvarWait(sp.work_cv, lk, stoken,
-                                [&] { return !sp.queue.empty() || num_commands != 0; });
-            {
-                const u64 idle = VideoCore::ReadbackStats::NowNs() - idle_start;
-                if (idle >= 20'000 && Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
-                    Core::FrameTimeline::Record(Core::FrameTimeline::StageSpan, idle | (u64(Core::FrameTimeline::StageRasterIdle) << 56), Core::FrameTimeline::Now(),
-                                                sp.front_state.load(std::memory_order_relaxed));
-                }
-                sp.stat_raster_idle_ns.fetch_add(idle, std::memory_order_relaxed);
-                sp.raster_idle_ns_by_front_state[front_state_at_idle & 3].fetch_add(
-                    idle, std::memory_order_relaxed);
-            }
-            if (stoken.stop_requested() && sp.queue.empty() && num_commands == 0) {
-                return;
-            }
-            batch.swap(sp.queue);
-            if (!batch.empty()) {
-                const auto& first = batch.front();
-                const size_t kind = first.has_call ? static_cast<size_t>(first.call.kind) : 4;
-                sp.raster_idle_ns_by_next_op[kind].fetch_add(
-                    VideoCore::ReadbackStats::NowNs() - idle_start, std::memory_order_relaxed);
-                sp.raster_idle_count_by_next_op[kind].fetch_add(1, std::memory_order_relaxed);
-            }
-            sp.done_cv.notify_all(); // The queue has room again.
-        }
-        FLIGHT_SCOPE("raster: running queued work");
-        // Capture: consecutive operations of one kind are one span (a run of draws, of dispatches, of closures), written when the kind changes.
-        u32 run_kind = 0;
-        u64 run_start = 0, run_count = 0;
-        const bool capturing = Core::FrameTimeline::capture_active.load(std::memory_order_relaxed);
-        const auto end_run = [&] {
-            if (run_kind != 0 && run_count != 0) {
-                const u64 now = Core::FrameTimeline::Now();
-                Core::FrameTimeline::Record(Core::FrameTimeline::StageSpan, (now - run_start) | (u64(Core::FrameTimeline::StageRasterOp) << 56), now,
-                                            run_kind | (run_count << 8));
-            }
-            run_kind = 0;
-            run_count = 0;
-        };
-        for (auto& op : batch) {
-            Core::ResourceAudit::raster_class = op.audit_class;
-            if (rasterizer) {
-                rasterizer->SelectStream(op.audit_class == 1);
-            }
-            if (capturing) {
-                // run key: kind (bits 0-3) | the queue that pushed the operation (bits 4-7, 15 = none), so a run never mixes queues
-                const u32 kind = (op.has_call ? (op.call.kind == RasterCall::Kind::Draw || op.call.kind == RasterCall::Kind::DrawIndirect ? 1u : 2u) : 3u) |
-                                 (u32(op.audit_class & 0xf) << 4);
-                if (kind != run_kind) {
-                    end_run();
-                    run_kind = kind;
-                    run_start = Core::FrameTimeline::Now();
-                }
-                ++run_count;
-            }
-            // Callbacks sent by other threads (fault readbacks, fences) run between operations,
-            // like they ran between packets before.
-            if (num_commands != 0) {
-                TLG_PROF_NAMED_LEVEL(prof_callbacks, "raster.callbacks", 1);
-                const u64 callback_start = VideoCore::ReadbackStats::NowNs();
-                ProcessCommands();
-                sp.ns_callbacks += VideoCore::ReadbackStats::NowNs() - callback_start;
-            }
-            const u64 op_start = VideoCore::ReadbackStats::NowNs();
-            if (op.has_call) {
-                if (const u32 delay = VideoCore::ReadbackPolicy::Get().raster_delay_ns.load(std::memory_order_relaxed);
-                    delay != 0 && (op.call.kind == RasterCall::Kind::Draw || op.call.kind == RasterCall::Kind::DrawIndirect)) {
-                    const u64 until = Core::FrameTimeline::Now() + delay;
-                    while (Core::FrameTimeline::Now() < until) {
-                    }
-                }
-                {
-                    static Core::Prof::Site site_draw{"raster.op.draw", 1}, site_draw_indirect{"raster.op.draw_indirect", 1}, site_dispatch{"raster.op.dispatch", 1},
-                        site_dispatch_indirect{"raster.op.dispatch_indirect", 1};
-                    Core::Prof::Site& op_site = op.call.kind == RasterCall::Kind::Draw           ? site_draw
-                                                : op.call.kind == RasterCall::Kind::DrawIndirect ? site_draw_indirect
-                                                : op.call.kind == RasterCall::Kind::DispatchDirect ? site_dispatch
-                                                                                                   : site_dispatch_indirect;
-                    const Core::Prof::Scope prof_op{op_site};
-                    ExecRasterCall(op.call, op.draw_plan.get(), op.dispatch_plan.get());
-                }
-                const u64 op_ns = VideoCore::ReadbackStats::NowNs() - op_start;
-                if (op.call.kind == RasterCall::Kind::Draw ||
-                    op.call.kind == RasterCall::Kind::DrawIndirect) {
-                    sp.ns_draws += op_ns;
-                    ++sp.n_draws;
-                    if (op.draw_plan && op.draw_plan->fixed.NoColorTargets()) {
-                        sp.ns_depth_only_draws += op_ns;
-                        ++sp.n_depth_only_draws;
-                    }
-                } else {
-                    sp.ns_dispatches += op_ns;
-                }
-            } else if (op.closure) {
-                rasterizer->NativeInvalidate();
-                {
-                    TLG_PROF_NAMED_LEVEL(prof_closure, "raster.op.closure", 1);
-                    TLG_PROF_TAG("closure_site", op.write_line, op.write_file);
-                    op.closure();
-                }
-                (op.writes_memory ? sp.ns_write_closures : sp.ns_other_closures) +=
-                    VideoCore::ReadbackStats::NowNs() - op_start;
-                if (op.writes_memory) {
-                    sp.write_done.store(op.position, std::memory_order_release);
-                    sp.pending_writes.fetch_sub(1, std::memory_order_acq_rel);
-                    std::scoped_lock lk{sp.mutex};
-                    sp.done_cv.notify_all();
-                }
-            }
-            op.closure = {};
-            rasterizer->RecyclePlan(std::move(op.draw_plan));
-            rasterizer->RecyclePlan(std::move(op.dispatch_plan));
-        }
-        end_run();
-        Core::ResourceAudit::raster_class = Core::ResourceAudit::NoClass;
-        if (rasterizer) {
-            rasterizer->SelectStream(false);
-        }
-        if (num_commands != 0) {
-            ProcessCommands();
-        }
-        const u64 count = batch.size();
-        batch.clear();
-        if (const u64 now = VideoCore::ReadbackStats::NowNs();
-            now - sp.stat_last_log_ns > 5'000'000'000ULL) {
+}
+
+void Liverpool::RasterConsumer::RunCall(RasterOp& op) {
+    owner.ExecRasterCall(op.call, op.draw_plan.get(), op.dispatch_plan.get());
+}
+
+void Liverpool::RasterConsumer::RunClosure(RasterOp& op) {
+    owner.rasterizer->NativeInvalidate();
+    {
+        TLG_PROF_NAMED_LEVEL(prof_closure, "raster.op.closure", 1);
+        TLG_PROF_TAG("closure_site", op.write_line, op.write_file);
+        op.closure();
+    }
+}
+
+bool Liverpool::RasterConsumer::IsDepthOnly(const Vulkan::DrawPlan& plan) const {
+    return plan.fixed.NoColorTargets();
+}
+
+void Liverpool::RasterConsumer::Release(RasterOp& op) {
+    owner.rasterizer->RecyclePlan(std::unique_ptr<Vulkan::DrawPlan>(op.draw_plan.release()));
+    owner.rasterizer->RecyclePlan(std::unique_ptr<Vulkan::DispatchPlan>(op.dispatch_plan.release()));
+}
+
+void Liverpool::RasterConsumer::BatchFinished() {
+    std::scoped_lock lk{owner.submit_mutex};
+    owner.submit_cv.notify_all();
+}
+
+void Liverpool::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 now) {
+    auto* rasterizer = owner.rasterizer;
+    auto& fence_latency = owner.fence_latency;
+    {
             const u64 block_start = now;
             const auto plan_stats = rasterizer->TakePlanStats();
             const auto memo_stats = rasterizer->TakeBeginMemoStats();
@@ -1188,16 +965,6 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             Core::DebugServer::RecordPeriodic(
                 "raster_thread_5s_stats_block",
                 static_cast<double>(VideoCore::ReadbackStats::NowNs() - block_start) / 1e6);
-        }
-        {
-            std::scoped_lock lk{sp.mutex};
-            sp.done.fetch_add(count, std::memory_order_acq_rel);
-            sp.done_cv.notify_all();
-        }
-        if (RasterIdle()) {
-            std::scoped_lock lk{submit_mutex};
-            submit_cv.notify_all();
-        }
     }
 }
 

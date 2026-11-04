@@ -8,6 +8,7 @@
 #include "native/native_draw.h"
 
 #include "native/native_draw_tag.h"
+#include "native/native_raster_queue.h"
 #include "native/native_readback_policy.h"
 
 #include <source_location>
@@ -258,16 +259,31 @@ private:
     void Process(std::stop_token stoken);
 
     // ---- Command processor split (documents/tlg/cp-split-design.md) ----
-    struct RasterSplit;
-    struct RasterCall;
-    struct RasterOp;
+    using RasterSplit = Core::NativeRasterQueue::Queue;
+    using RasterCall = Core::NativeRasterQueue::Call;
+    using RasterOp = Core::NativeRasterQueue::Op;
+    /// What the raster thread does with an operation (native/native_raster_queue.h); the member functions are in liverpool.cpp.
+    struct RasterConsumer final : Core::NativeRasterQueue::Consumer {
+        explicit RasterConsumer(Liverpool& liverpool) : owner{liverpool} {}
+        void ThreadStarted() override;
+        [[nodiscard]] bool CallbacksPending() const override;
+        void RunCallbacks() override;
+        void SelectStream(bool second) override;
+        void RunCall(RasterOp& op) override;
+        void RunClosure(RasterOp& op) override;
+        [[nodiscard]] bool IsDepthOnly(const Vulkan::DrawPlan& plan) const override;
+        void Release(RasterOp& op) override;
+        void PublishIntervalStats(RasterSplit& queue, u64 now_ns) override;
+        void BatchFinished() override;
+        Liverpool& owner;
+    };
+    RasterConsumer raster_consumer{*this};
     /// Tag written by the game in front of the next draw (front thread only).
     VideoCore::NativeTag native_tag_pending{};
     u64 native_exec_calls{};
     u32 native_tag_skips{};
     void StartRasterSplit();
     void StopRasterSplit();
-    void RasterMain(std::stop_token stoken);
     void ExecRasterCall(const RasterCall& call, const Vulkan::DrawPlan* draw_plan,
                         const Vulkan::DispatchPlan* dispatch_plan);
     /// Queues `func` (a closure) for the raster thread, or runs it now without the split.

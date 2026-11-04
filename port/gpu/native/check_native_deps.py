@@ -25,7 +25,7 @@ ALLOWED_SHARED = {
     "core/memory.h", "core/guest_heap.h", "core/platform.h", "core/emulator_settings.h",  # settings and the CPU's view of PS4 memory (by design)
     "core/address_space.h", "core/cpu_patches.h", "core/libraries/kernel/process.h",     # PS4 OS / CPU side (out of scope of the plan)
     "core/libraries/kernel/time.h",      # the OS time stamp counter (GPU perf counter source), a clock, not GPU state
-    "video_core/renderdoc.h", "video_core/thread_profiler.h", "video_core/thread_usage.h",  # profiling and capture tools, not GPU state
+    "video_core/renderdoc.h", "video_core/thread_profiler.h", "video_core/thread_usage.h", "video_core/readback_stats.h",  # profiling, capture and statistics tools (a clock and counters), not GPU state
     "video_core/renderer_vulkan/vk_common.h", "video_core/renderer_vulkan/vk_instance.h", "video_core/renderer_vulkan/vk_scheduler.h",  # the Vulkan host layer (device, command recording), not PS4 state
 }
 
