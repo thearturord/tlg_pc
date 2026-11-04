@@ -129,6 +129,22 @@ int Depth() {
     return GetConfig().depth;
 }
 
+bool EarlyInterrupt() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_OWNERSHIP_EARLY_IRQ");
+        if (e == nullptr || *e == '\0' || *e == '0') {
+            return false;
+        }
+        if (!OwnershipGate()) {
+            RareEvents::Note("ownership_early_irq_refused", "needs the ownership gate");
+            return false;
+        }
+        LOG_INFO(Core, "frame gate: the end-of-pipe interrupt is raised when the raster thread reaches the frame end");
+        return true;
+    }();
+    return on;
+}
+
 bool OwnershipGate() {
     // M5 (memory-ownership-plan.md): the game's slot wait counts frames the raster thread has not reached (our side owns the frame's data) instead of frames the GPU has not finished.
     // Needs depth 2 and the frame store serving the readers (TLG_FRAME_STORE=2), or the late reads would see the game's next frame.
@@ -281,6 +297,7 @@ nlohmann::json Status() {
     j["note"] = "frames in flight (native_frame_gate.h): the setting, the frames handed to the command processor and their end-of-pipe interrupts, waits made by the gate";
     j["depth"] = Depth();
     j["ownership_gate"] = OwnershipGate();
+    j["early_interrupt"] = EarlyInterrupt();
     j["raster_behind_at_submit"] = {{"0", raster_behind_hist[0].load()}, {"1", raster_behind_hist[1].load()}, {"2", raster_behind_hist[2].load()}, {"3_or_more", raster_behind_hist[3].load()}};
     j["ownership_eop_cap_polls"] = eop_cap_waits.load();
     j["game_wait_mode"] = GameWaitMode();

@@ -27,6 +27,9 @@ int Depth();
 /// M5: `TLG_OWNERSHIP_GATE=1` (depth 2 and `TLG_FRAME_STORE=2` needed): the game's frame slot wait counts frames the raster thread has not reached, not frames the GPU has not
 /// finished; the game's own end-of-pipe gate gets one more credit. Off by default.
 bool OwnershipGate();
+/// M5b: `TLG_OWNERSHIP_EARLY_IRQ=1` (with the ownership gate): the frame's end-of-pipe interrupt (the guest's "EOP QUEUE" event that releases the engine's submit-done thread and with it the
+/// next submit) is raised when the raster thread has reached the frame end, not when the GPU is done. The label write stays at GPU completion (readers of GPU results wait for it).
+bool EarlyInterrupt();
 
 /// The two waits that depth 0 adds to depth 1, switchable on their own (to find which one matters): the game's thread waits for the end-of-pipe interrupt of its
 /// own frame (`WaitOwnFrame`), and the presenter waits for the frame it just made (vk_presenter.cpp). Default: both on at depth 0, both off otherwise.
