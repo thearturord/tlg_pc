@@ -39,6 +39,12 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq = 0);
 /// since the previous one are copied (`ranges`, the submission's `Batch::first`), stamped with the submission's index; the buffer readers compare what they find in the game's memory with the store
 /// (`m0_late_reads.<kind>.frame_store_shadow`). Nothing reads the store for rendering. Whether or not the store is on, the submission is counted (the late-read census uses it).
 [[nodiscard]] bool FrameStoreOn() noexcept;
+/// M2 (phase 2): `TLG_FRAME_STORE=2`. The store keeps only the per-frame writers' bytes, and the buffer readers call `FrameStoreServe` right after they copied the game's memory: the pieces of
+/// [address, address + size) some version at or before the record's submission covers are overwritten in `dst` with that version (the memory may have been written by the game running ahead since).
+/// Returns the number of bytes that changed. The pieces no version covers stay as copied; if the ledger says the game wrote them at or after the submission, it counts a hole (the old bytes are gone).
+[[nodiscard]] bool FrameStoreServes() noexcept;
+[[nodiscard]] u32 CurrentRecordSubmit();
+u64 FrameStoreServe(LateKind kind, u64 address, void* dst, u64 size);
 void NoteSubmit(const std::vector<std::pair<u64, u64>>& ranges);
 /// The frame allocator's ring (found by the engine's allocator hook).
 void SetRing(u64 begin, u64 end);

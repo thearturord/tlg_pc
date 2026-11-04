@@ -308,6 +308,7 @@ private:
         tsl::robin_map<u64, u64, Common::U64Hash> map;
         u64 tick{};
         u64 wraps{};
+        u32 submit{}; ///< M2: the submission the copies were made for (0: not tracked)
         VAddr min{~0ULL};
         VAddr max{};
     };

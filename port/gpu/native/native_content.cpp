@@ -128,6 +128,8 @@ struct LedgerRange {
 std::mutex g_ledger_mutex;
 std::map<u64, LedgerRange> g_ledger;
 constexpr size_t MaxLedger = 1u << 20;
+/// M2: the writers whose bytes the store keeps when it serves reads (`TLG_FRAME_STORE=2`): the ones that write every frame (0 map, 1 skinning, 2 lights, 3 command stream copy, 4 recording stores, 7 instance group upload). Buffer creation (5) and texture init (6) are the loader threads' big one-time writes.
+constexpr u32 FsServedWriters = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 7);
 /// M1: the number of graphics submissions so far (`NoteSubmit`). A write announced while it is N belongs to the frame the (N+1)th submission carries: the GPU of that submission sees it, so it is not a late write for a record of that submission.
 std::atomic<u32> g_submit_count{0};
 std::atomic<u64> c_ledger_notes{0}, c_ledger_overflow{0};
@@ -137,7 +139,7 @@ std::vector<std::pair<u64, u64>> g_fs_pending; ///< M1: ranges announced since t
 void LedgerNote(u64 begin, u64 end, u64 stamp, u32 writer) {
     std::scoped_lock lock{g_ledger_mutex};
     c_ledger_notes.fetch_add(1, std::memory_order_relaxed);
-    if (FrameStoreOn()) {
+    if (FrameStoreOn() && (!FrameStoreServes() || ((1u << std::min<u32>(writer, 31u)) & FsServedWriters) != 0)) {
         g_fs_pending.emplace_back(begin, end - begin);
     }
     if (g_ledger.size() >= MaxLedger) {
@@ -830,18 +832,37 @@ constexpr u64 FsMaxFrame = 128ull << 20; ///< per submission
 std::atomic<u64> c_fs_submits{0}, c_fs_chunks{0}, c_fs_bytes{0}, c_fs_skipped_big{0}, c_fs_skipped_unreadable{0}, c_fs_skipped_frame_full{0}, c_fs_capture_ns{0}, c_fs_max_frame_bytes{0};
 std::atomic<u64> c_fs_live_bytes{0};
 
+u32 SubmitIndexOf(u64 seq); // below
+
 struct FsKindCounters {
     std::atomic<u64> reads{0}, reads_overlapping{0}, reads_with_differences{0}, bytes_covered{0}, bytes_equal{0}, bytes_differ{0}, unreadable{0};
 };
 FsKindCounters c_fs_kind[static_cast<size_t>(LateKind::Count)];
+struct FsServeCounters {
+    std::atomic<u64> reads{0}, replaced_reads{0}, replaced_bytes{0}, hole_reads{0}, hole_bytes{0}, loader_newest_reads{0};
+};
+FsServeCounters c_fs_serve[static_cast<size_t>(LateKind::Count)];
 } // namespace
 
-bool FrameStoreOn() noexcept {
-    static const bool on = [] {
+int FrameStoreMode() noexcept {
+    static const int mode = [] {
         const char* e = std::getenv("TLG_FRAME_STORE");
-        return e != nullptr && *e != '0' && *e != '\0';
+        return e == nullptr || *e == '\0' ? 0 : std::clamp(std::atoi(e), 0, 2);
     }();
-    return on;
+    return mode;
+}
+
+bool FrameStoreOn() noexcept {
+    return FrameStoreMode() >= 1;
+}
+
+bool FrameStoreServes() noexcept {
+    return FrameStoreMode() >= 2;
+}
+
+u32 CurrentRecordSubmit() {
+    const u64 seq = Core::NativeRegistry::CurrentDrawSeq();
+    return seq != 0 ? SubmitIndexOf(seq) : 0;
 }
 
 namespace {
@@ -917,73 +938,83 @@ void NoteSubmit(const std::vector<std::pair<u64, u64>>& ranges) {
 }
 
 namespace {
+struct Cover {
+    u64 b, e;
+    const u8* src; ///< the store's bytes for b (valid while g_fs_mutex is held)
+};
+using Pieces = std::vector<std::pair<u64, u64>>;
+
+/// The pieces of [address, address + size) some version at or before `submit` covers, the newest version per byte (`out`), and the covered pieces sorted (`done`). g_fs_mutex held by the caller.
+void FsCoverLocked(u64 address, u64 size, u32 submit, std::vector<Cover>& out, Pieces& done) {
+    const u64 end = address + size;
+    const u64 lo = address > FsMaxChunk ? address - FsMaxChunk : 0; // a chunk is at most FsMaxChunk long, so none that starts before `lo` reaches the range
+    thread_local Pieces pieces;
+    for (auto frame = g_fs_frames.rbegin(); frame != g_fs_frames.rend(); ++frame) {
+        if (frame->index > submit) {
+            continue; // a later submission's capture holds writes the record's submission did not see
+        }
+        auto it = std::lower_bound(frame->chunks.begin(), frame->chunks.end(), lo, [](const FsChunk& c, u64 value) { return c.address < value; });
+        for (; it != frame->chunks.end() && it->address < end; ++it) {
+            const u64 b = std::max(address, it->address), e = std::min(end, it->address + it->size);
+            if (b >= e) {
+                continue;
+            }
+            pieces.clear();
+            u64 cursor = b;
+            for (const auto& d : done) { // what a newer version already decided is taken out
+                if (d.second <= cursor) {
+                    continue;
+                }
+                if (d.first >= e) {
+                    break;
+                }
+                if (d.first > cursor) {
+                    pieces.emplace_back(cursor, d.first);
+                }
+                cursor = std::max(cursor, d.second);
+            }
+            if (cursor < e) {
+                pieces.emplace_back(cursor, e);
+            }
+            for (const auto& p : pieces) {
+                out.push_back({p.first, p.second, it->bytes.get() + (p.first - it->address)});
+                done.insert(std::lower_bound(done.begin(), done.end(), p), p);
+            }
+        }
+    }
+}
+
 /// One read of the game's memory for a record of submission `submit`: what the store holds for [address, address + size) as of that submission (the newest version at or before it, per
 /// byte) against what the memory holds now. Only the bytes some version covers are compared.
 void FrameStoreCompare(size_t kind, u64 address, u64 size, u32 submit) {
     FsKindCounters& c = c_fs_kind[kind];
     c.reads.fetch_add(1, std::memory_order_relaxed);
-    const u64 end = address + size;
-    std::vector<std::pair<u64, u64>> done; // pieces already decided by a newer version, sorted by start
+    thread_local std::vector<Cover> covers;
+    thread_local Pieces done;
+    covers.clear();
+    done.clear();
     u64 covered = 0, equal = 0, differ = 0;
-    bool overlapping = false, unreadable = false;
-    std::scoped_lock lock{g_fs_mutex};
-    for (auto frame = g_fs_frames.rbegin(); frame != g_fs_frames.rend(); ++frame) {
-        if (frame->index > submit) {
-            continue;
-        }
-        // chunks of one frame may overlap each other (the same range announced twice): the later announcement is later in the list only if sorted stably; the chunks hold the same bytes
-        // unless the game wrote in between, which one frame\'s capture does not see, so within a frame the order does not matter
-        auto first = std::lower_bound(frame->chunks.begin(), frame->chunks.end(), address, [](const FsChunk& ch, u64 value) { return ch.address + ch.size <= value && ch.address < value; });
-        // chunks are sorted by start only; a long chunk before `first` may still reach into the range, so walk back over the chunks that could (bounded by FsMaxChunk)
-        while (first != frame->chunks.begin() && std::prev(first)->address + FsMaxChunk > address) {
-            --first;
-        }
-        std::vector<std::pair<u64, u64>> added;
-        for (auto it = first; it != frame->chunks.end() && it->address < end; ++it) {
-            const u64 b = std::max(address, it->address), e = std::min(end, it->address + it->size);
-            if (b >= e) {
+    bool unreadable = false;
+    {
+        std::scoped_lock lock{g_fs_mutex};
+        FsCoverLocked(address, size, submit, covers, done);
+        for (const Cover& cv : covers) {
+            u64 first_diff = ~0ull;
+            if (!GuardedCompare(reinterpret_cast<const void*>(cv.b), cv.src, cv.e - cv.b, first_diff)) {
+                unreadable = true;
                 continue;
             }
-            overlapping = true;
-            // subtract what a newer version already decided
-            u64 cursor = b;
-            auto cut_piece = [&](u64 pb, u64 pe) {
-                if (pb >= pe) {
-                    return;
-                }
-                u64 first_diff = ~0ull;
-                if (!GuardedCompare(reinterpret_cast<const void*>(pb), it->bytes.get() + (pb - it->address), pe - pb, first_diff)) {
-                    unreadable = true;
-                    return;
-                }
-                covered += pe - pb;
-                if (first_diff == ~0ull) {
-                    equal += pe - pb;
-                } else {
-                    // count the differing bytes exactly only when the piece is small; otherwise count the piece as different from its first differing byte on
-                    differ += pe - pb - first_diff;
-                    equal += first_diff;
-                }
-                added.emplace_back(pb, pe);
-            };
-            for (const auto& [db, de] : done) {
-                if (de <= cursor) {
-                    continue;
-                }
-                if (db >= e) {
-                    break;
-                }
-                cut_piece(cursor, std::min(db, e));
-                cursor = std::max(cursor, de);
+            covered += cv.e - cv.b;
+            if (first_diff == ~0ull) {
+                equal += cv.e - cv.b;
+            } else {
+                // the piece counts as different from its first differing byte on (an upper bound)
+                differ += cv.e - cv.b - first_diff;
+                equal += first_diff;
             }
-            cut_piece(cursor, e);
         }
-        for (const auto& piece : added) {
-            done.push_back(piece);
-        }
-        std::sort(done.begin(), done.end());
     }
-    if (overlapping) {
+    if (!covers.empty()) {
         c.reads_overlapping.fetch_add(1, std::memory_order_relaxed);
     }
     if (differ != 0) {
@@ -997,6 +1028,79 @@ void FrameStoreCompare(size_t kind, u64 address, u64 size, u32 submit) {
     c.bytes_differ.fetch_add(differ, std::memory_order_relaxed);
 }
 
+
+} // namespace
+
+u64 FrameStoreServe(LateKind kind, u64 address, void* dst, u64 size) {
+    if (!FrameStoreServes() || size == 0 || dst == nullptr || !LedgerOn()) {
+        return 0;
+    }
+    const size_t k = static_cast<size_t>(kind);
+    const u64 seq = Core::NativeRegistry::CurrentDrawSeq();
+    const u32 submit = seq != 0 ? SubmitIndexOf(seq) : 0;
+    if (submit == 0 || InRing(address, size)) {
+        return 0;
+    }
+    FsServeCounters& c = c_fs_serve[k];
+    c.reads.fetch_add(1, std::memory_order_relaxed);
+    thread_local std::vector<Cover> covers;
+    thread_local Pieces done;
+    covers.clear();
+    done.clear();
+    u64 replaced = 0;
+    {
+        std::scoped_lock lock{g_fs_mutex};
+        FsCoverLocked(address, size, submit, covers, done);
+        auto* out = static_cast<u8*>(dst);
+        for (const Cover& cv : covers) {
+            u8* at = out + (cv.b - address);
+            const u64 n = cv.e - cv.b;
+            if (std::memcmp(at, cv.src, n) != 0) {
+                for (u64 i = 0; i < n; ++i) {
+                    replaced += at[i] != cv.src[i] ? 1 : 0;
+                }
+                std::memcpy(at, cv.src, n);
+            }
+        }
+    }
+    if (replaced != 0) {
+        c.replaced_reads.fetch_add(1, std::memory_order_relaxed);
+        c.replaced_bytes.fetch_add(replaced, std::memory_order_relaxed);
+    }
+    // what no version covers is the memory as it is now: right unless the game wrote it at or after the record's submission (a hole: the old bytes are gone)
+    u64 hole = 0;
+    bool loader_newest = false;
+    u64 cursor = address;
+    const u64 end = address + size;
+    auto check = [&](u64 b, u64 e) {
+        if (b >= e) {
+            return;
+        }
+        const LedgerAnswer a = LedgerQuery(b, e);
+        if (a.covered != 0 && a.newest_submit >= submit) {
+            hole += e - b;
+        }
+    };
+    for (const auto& d : done) {
+        check(cursor, d.first);
+        cursor = std::max(cursor, d.second);
+    }
+    check(cursor, end);
+    if (hole != 0) {
+        c.hole_reads.fetch_add(1, std::memory_order_relaxed);
+        c.hole_bytes.fetch_add(hole, std::memory_order_relaxed);
+    }
+    if (!done.empty()) {
+        const LedgerAnswer all = LedgerQuery(address, end);
+        loader_newest = all.newest_writer == 5 || all.newest_writer == 6;
+        if (loader_newest) {
+            c.loader_newest_reads.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return replaced;
+}
+
+namespace {
 nlohmann::json FrameStoreReport(size_t kind) {
     const FsKindCounters& c = c_fs_kind[kind];
     return {{"reads", c.reads.load()},
@@ -1006,12 +1110,19 @@ nlohmann::json FrameStoreReport(size_t kind) {
             {"bytes_equal", c.bytes_equal.load()},
             {"bytes_differ_upper_bound", c.bytes_differ.load()},
             {"unreadable", c.unreadable.load()},
+            {"served_reads", c_fs_serve[kind].reads.load()},
+            {"served_reads_with_bytes_replaced", c_fs_serve[kind].replaced_reads.load()},
+            {"served_bytes_replaced", c_fs_serve[kind].replaced_bytes.load()},
+            {"served_reads_with_a_hole", c_fs_serve[kind].hole_reads.load()},
+            {"served_hole_bytes", c_fs_serve[kind].hole_bytes.load()},
+            {"served_reads_where_a_loader_write_is_the_newest", c_fs_serve[kind].loader_newest_reads.load()},
             {"note", "memory now against the newest version at or before the record's submission; differences at depth 0 are writes after the submission, at depth 2 the game running ahead"}};
 }
 
 nlohmann::json FrameStoreSummary() {
     return {{"on", FrameStoreOn()},
-            {"switch", "TLG_FRAME_STORE=1 (default off)"},
+            {"mode", FrameStoreMode()},
+            {"switch", "TLG_FRAME_STORE=1 shadow (all writers), =2 readers take the store (per-frame writers only); default off"},
             {"submissions", c_fs_submits.load()},
             {"chunks_captured", c_fs_chunks.load()},
             {"bytes_captured", c_fs_bytes.load()},

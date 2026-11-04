@@ -360,11 +360,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
                 const u32 gpu_writes = immutable->gpu_writes.load(std::memory_order_acquire);
                 const auto [data, at] = stream_buffer.Map(whole, instance.UniformMinAlignment());
                 memory->CopySparseMemory(immutable->begin, data, whole);
+                // M2: the bytes of the record's submission; a copy that was corrected must not be reused by a later generation's check, so it records a generation nobody has
+                const bool corrected = Core::NativeContent::FrameStoreServe(Core::NativeContent::LateKind::BufferObjectCopy, immutable->begin, data, whole) != 0;
                 Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::BufferObjectCopy, immutable->begin, whole);
                 stream_buffer.Commit();
                 immutable->copy_offset = at;
                 immutable->copy_wraps = stream_buffer.WrapCount();
-                immutable->copy_generation = generation;
+                immutable->copy_generation = corrected ? ~generation : generation;
                 immutable->copy_gpu_writes = gpu_writes;
                 Core::NativeResources::NoteResident(1);
                 Core::NativeResources::NoteBufferRequest(device_addr, size, false, Core::NativeResources::BufferPath::StreamCopy, whole);
@@ -431,7 +433,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
         if (StreamReuseOn()) {
             const u64 tick = scheduler.CurrentTick();
             const u64 wraps = stream_buffer.WrapCount();
-            if (tick != reuse.tick || wraps != reuse.wraps) {
+            const u32 record_submit = Core::NativeContent::FrameStoreServes() ? Core::NativeContent::CurrentRecordSubmit() : 0; // M2: copies are per submission
+            if (tick != reuse.tick || wraps != reuse.wraps || record_submit != reuse.submit) {
+                reuse.submit = record_submit;
                 // A new command buffer: the game may have changed the data since. A wrap of the
                 // stream buffer may overwrite earlier copies.
                 reuse.tick = tick;
@@ -448,6 +452,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
         }
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
+        Core::NativeContent::FrameStoreServe(Core::NativeContent::LateKind::BufferStreamCopy, device_addr, data, size); // M2
         Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::BufferStreamCopy, device_addr, size);
         stream_buffer.Commit();
         Core::NativeResources::NoteBufferRequest(device_addr, size, false,
