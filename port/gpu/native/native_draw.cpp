@@ -9007,6 +9007,9 @@ u64 FindHandler(const std::string& name) {
     if (name == "native_gomalloc_alloc") {
         return reinterpret_cast<u64>(&NativeDevice::GomallocAlloc);
     }
+    if (name == "native_begin_frame_tick") {
+        return reinterpret_cast<u64>(&NativeDevice::BeginFrameTick);
+    }
     if (name == "native_gomalloc_free") {
         return reinterpret_cast<u64>(&NativeDevice::GomallocFree);
     }

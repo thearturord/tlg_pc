@@ -120,9 +120,11 @@ void DrainDeferredFrees();
 /// Hook `GomallocAlloc` (0x248fb10, `native_gomalloc_alloc`): the engine heap's allocation (heap, size, alignment, type). Runs the original; with `TLG_LOADER_GATE=1` remembers the block's size and
 /// waits at once when the block lies on memory freed while the raster thread had not finished the submissions that could read it.
 u64 PS4_SYSV_ABI GomallocAlloc(u64 heap, u64 size, u64 alignment, u64 type, u64 a4, u64 a5, u64 ret);
+/// Hook `B0_SwapChainBeginFrame` (0x2495480, `native_begin_frame_tick`): runs the original and marks the Gomalloc frees inside it as the game's delete tick (W2, `TLG_W2_TICK=1`).
+u64 PS4_SYSV_ABI BeginFrameTick(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret);
 /// native-v3-writers (`TLG_LOADER_GATE=1`): the engine's allocation (`address`, `size`; hooks AllocGarlicMemory / AllocOnionMemory) overlaps memory that was freed (hook GomallocFree) when the game
 /// had submitted `n` frames: the game thread waits until the raster thread has executed `n` frames, so the loader never overwrites memory a frame in flight still reads. Keeps normal memory reuse.
-void LoaderGateAtAllocation(u64 address, u64 size);
+void LoaderGateAtAllocation(u64 address, u64 size, u64 ret = 0);
 /// native-v3-writers (`TLG_SLOT_GATE=1`, mid hook `SceneGroupAdvance` at 0x1d1827d, handler `native_scene_group_advance`): the scene's per object constant slots are three groups, the engine advances
 /// the group (`(group + 1) % 3`, variable 0x69b1678) about twice per frame, so a group is written again after about 3 graphics submissions, sooner than the raster thread can be (it may lag 2 frames).
 /// When the group `new_group` is about to be written again, the game thread waits until the raster thread has finished the submissions that could still read its old contents.
