@@ -17,6 +17,7 @@
 #include "native/native_log.h"
 #include "native/native_draw.h"
 #include "native/native_frame_gate.h"
+#include "native/native_content.h"
 #include "native/native_flight.h"
 #include "native/native_prof.h"
 
@@ -42,6 +43,9 @@ std::atomic<u64> slot_waits{0}, slot_wait_ns{0}, own_frame_waits{0}, own_frame_w
 std::atomic<u64> credited{0};
 std::atomic<int> credit_state{0}; // 0 not tried, 1 done, 2 refused
 std::atomic<u64> unfinished_hist[4]{};   // frames unfinished at a submit (before it counts): 0, 1, 2, more
+std::atomic<u64> raster_behind_hist[4]{}; // M5: frames the raster thread had not reached at a submit (before it counts): 0, 1, 2, more
+std::atomic<u64> eop_cap_waits{0};
+constexpr u64 OwnershipEopCap = 4;       // M5: the GPU may be this many frames behind before the game is held anyway
 
 struct Config {
     int depth = 1;
@@ -125,6 +129,24 @@ int Depth() {
     return GetConfig().depth;
 }
 
+bool OwnershipGate() {
+    // M5 (memory-ownership-plan.md): the game's slot wait counts frames the raster thread has not reached (our side owns the frame's data) instead of frames the GPU has not finished.
+    // Needs depth 2 and the frame store serving the readers (TLG_FRAME_STORE=2), or the late reads would see the game's next frame.
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_OWNERSHIP_GATE");
+        if (e == nullptr || *e == '\0' || *e == '0') {
+            return false;
+        }
+        if (GetConfig().depth < 2 || !NativeContent::FrameStoreServes()) {
+            RareEvents::Note("ownership_gate_refused", "needs frames in flight 2 and TLG_FRAME_STORE=2");
+            return false;
+        }
+        LOG_INFO(Core, "frame gate: ownership gate on (slot wait counts frames the raster thread has not reached)");
+        return true;
+    }();
+    return on;
+}
+
 int GameWaitMode() {
     return GetConfig().game_wait;
 }
@@ -147,12 +169,18 @@ void NoteSubmitFlip() {
         ++submitted;
     }
     unfinished_hist[std::min<u64>(unfinished, 3)].fetch_add(1, std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{mutex};
+        const u64 behind = submitted > raster_reached + 1 ? submitted - 1 - raster_reached : 0; // `submitted` already counts this frame
+        raster_behind_hist[std::min<u64>(behind, 3)].fetch_add(1, std::memory_order_relaxed);
+    }
     const u64 now_unfinished = unfinished + 1;
     u64 peak = peak_unfinished.load(std::memory_order_relaxed);
     while (now_unfinished > peak && !peak_unfinished.compare_exchange_weak(peak, now_unfinished)) {
     }
     if (first && Depth() >= 2) {
-        CreditGuestGate(Depth() - 1);
+        // ownership gate: the game's own gate (one end of pipe per frame) must not be the limit, the slot wait is
+        CreditGuestGate(OwnershipGate() ? Depth() + 1 : Depth() - 1);
     }
 }
 
@@ -199,6 +227,18 @@ void WaitForSlot() {
     if (depth < 2) {
         return;
     }
+    if (OwnershipGate()) {
+        TLG_PROF_LEVEL("wait.frame_gate_slot_owned (game thread, ownership gate: fewer than 2 frames the raster thread has not reached)", 1);
+        WaitFor([depth] {
+            const bool raster_ok = submitted <= raster_reached || submitted - raster_reached < static_cast<u64>(depth);
+            const bool eop_ok = submitted <= ended || submitted - ended < OwnershipEopCap;
+            if (raster_ok && !eop_ok) {
+                eop_cap_waits.fetch_add(1, std::memory_order_relaxed);
+            }
+            return raster_ok && eop_ok;
+        }, slot_waits, slot_wait_ns, "wait for a frame slot (ownership gate)");
+        return;
+    }
     TLG_PROF_LEVEL("wait.frame_gate_slot (game thread, depth 2: fewer than 2 unfinished frames)", 1);
     WaitFor([depth] { return submitted <= ended || submitted - ended < static_cast<u64>(depth); }, slot_waits, slot_wait_ns, "wait for a frame slot");
 }
@@ -233,6 +273,9 @@ nlohmann::json Status() {
     nlohmann::json j;
     j["note"] = "frames in flight (native_frame_gate.h): the setting, the frames handed to the command processor and their end-of-pipe interrupts, waits made by the gate";
     j["depth"] = Depth();
+    j["ownership_gate"] = OwnershipGate();
+    j["raster_behind_at_submit"] = {{"0", raster_behind_hist[0].load()}, {"1", raster_behind_hist[1].load()}, {"2", raster_behind_hist[2].load()}, {"3_or_more", raster_behind_hist[3].load()}};
+    j["ownership_eop_cap_polls"] = eop_cap_waits.load();
     j["game_wait_mode"] = GameWaitMode();
     j["presenter_waits_own_frame"] = PresenterWaitsOwnFrame();
     {
