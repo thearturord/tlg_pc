@@ -33,6 +33,11 @@ void NoteExplicit(bool done, u64 bytes, u32 reason);
 using LandingGate = std::function<u32(VAddr address, u64 size, u32 timeout_ms)>;
 void SetLandingGate(LandingGate gate);
 
+/// M4: a copy or counter read-back record into a STAGING resource was made (game thread): the CPU may map the destination only after the raster thread has run the record and its
+/// download landed. `ClearPending` is called when the raster thread has run record `seq` (the download, if any, is then tracked by the landing gate).
+void NotePending(VAddr address, u64 size, u64 seq);
+void ClearPending(u64 seq);
+
 /// The `AsyncMap` gate: if [address, address + size) is a staging destination of an explicit readback and a download of it is still in flight,
 /// waits for it to land (at most 20 ms), so the engine never gets a pointer to bytes that are not there yet.
 void GateMap(VAddr address, u64 size);

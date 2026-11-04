@@ -151,6 +151,7 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
     Core::NativeDraw::ExecDraw draw;
     if (!rasterizer || !Core::NativeDraw::TakeExecDraw(native_tag_pending.seq, draw, true)) {
         native_tag_pending.valid = false;
+        Core::NativeReadbacks::ClearPending(native_tag_pending.seq); // M4
         TLG_LOG(CP, Error, "native draw: the record {} is gone, a draw is lost ({})", native_tag_pending.seq, Core::NativeDraw::DescribeMissingRecord(native_tag_pending.seq));
         return;
     }
@@ -160,12 +161,13 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
         if (rasterizer) {
             Core::DrainAudit::SetNextWrite(draw.args_addr, draw.a1);
             RasterRun(
-                [this, destination = static_cast<VAddr>(draw.args_addr), source = static_cast<VAddr>(draw.extra_addr), bytes = draw.a1,
+                [this, destination = static_cast<VAddr>(draw.args_addr), source = static_cast<VAddr>(draw.extra_addr), bytes = draw.a1, seq = draw.seq,
                  staging = draw.dst_usage == 3 && Core::NativeReadbacks::ExplicitEnabled()] {
                     if (Core::NativeRaycast::ShadowOn()) {
                         Core::NativeRaycast::NoteMemoryCopy(source, destination, bytes);
                     }
                     rasterizer->CopyBuffer(destination, source, bytes, false, false, staging);
+                    Core::NativeReadbacks::ClearPending(seq); // M4: the download, if any, is tracked by the landing gate from here
                 },
                 false, true);
         }
@@ -177,12 +179,13 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
         if (rasterizer) {
             Core::DrainAudit::SetNextWrite(draw.args_addr, sizeof(u32));
             RasterRun(
-                [this, destination = static_cast<VAddr>(draw.args_addr), source = draw.start_index,
+                [this, destination = static_cast<VAddr>(draw.args_addr), source = draw.start_index, seq = draw.seq,
                  staging = draw.dst_usage == 3 && Core::NativeReadbacks::ExplicitEnabled()] {
                     if (Core::NativeRaycast::ShadowOn()) {
                         Core::NativeRaycast::NoteCounterCopy(source, destination);
                     }
                     rasterizer->CopyBuffer(destination, source, sizeof(u32), false, true, staging);
+                    Core::NativeReadbacks::ClearPending(seq); // M4
                 },
                 false, true);
         }

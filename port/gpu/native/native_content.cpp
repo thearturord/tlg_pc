@@ -915,6 +915,11 @@ u32 SubmitIndexOf(u64 seq) {
 }
 } // namespace
 
+u64 LastSubmitStamp() {
+    std::scoped_lock lock{g_submit_mutex};
+    return g_submits.empty() ? 0 : g_submits.back().stamp;
+}
+
 void NoteSubmit(const std::vector<std::pair<u64, u64>>& ranges) {
     const u32 index = g_submit_count.load(std::memory_order_relaxed) + 1;
     if (FrameStoreOn()) {

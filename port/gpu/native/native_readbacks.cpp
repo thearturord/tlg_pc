@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <condition_variable>
+#include <vector>
 #include <array>
 #include <chrono>
 #include <atomic>
@@ -10,6 +12,7 @@
 #include <nlohmann/json.hpp>
 #include <fmt/format.h>
 #include "native/native_readbacks.h"
+#include "native/native_content.h"
 #include "native/native_prof.h"
 #include "native/native_config.h"
 #include "native/native_readback_policy.h"
@@ -160,12 +163,68 @@ void NoteExplicit(bool done, u64 bytes, u32 reason) {
     }
 }
 
+namespace {
+struct Pending {
+    VAddr begin, end;
+    u64 seq;
+};
+std::mutex pending_mutex;
+std::condition_variable pending_cv;
+std::vector<Pending> pending;
+std::atomic<u64> pending_noted{0}, pending_checks{0}, pending_waits{0}, pending_wait_ns{0}, pending_timeouts{0}, pending_dropped{0}, pending_max{0};
+constexpr u32 PendingTimeoutMs = 1000;
+} // namespace
+
+void NotePending(VAddr address, u64 size, u64 seq) {
+    pending_noted.fetch_add(1, std::memory_order_relaxed);
+    std::scoped_lock lock{pending_mutex};
+    if (pending.size() >= 4096) {
+        pending_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    pending.push_back({address, address + size, seq});
+    if (pending.size() > pending_max.load(std::memory_order_relaxed)) {
+        pending_max.store(pending.size(), std::memory_order_relaxed);
+    }
+}
+
+void ClearPending(u64 seq) {
+    {
+        std::scoped_lock lock{pending_mutex};
+        std::erase_if(pending, [seq](const Pending& p) { return p.seq == seq; });
+    }
+    pending_cv.notify_all();
+}
+
+/// Waits until the records made for submissions already handed over, and that write into [address, address + size), have run. A record of the frame still being recorded is not
+/// waited for (its submission has not happened, the game could not have its result yet). A record that never runs times out once and is dropped.
+static void WaitPending(VAddr address, u64 size) {
+    pending_checks.fetch_add(1, std::memory_order_relaxed);
+    const u64 submitted = NativeContent::LastSubmitStamp();
+    std::unique_lock lock{pending_mutex};
+    const auto blocking = [&] {
+        return std::ranges::any_of(pending, [&](const Pending& p) { return p.seq < submitted && p.begin < address + size && address < p.end; });
+    };
+    if (!blocking()) {
+        return;
+    }
+    const u64 start = NowNs();
+    TLG_PROF_LEVEL("wait.readback_pending_map (game thread: the copy into the staging resource has not run yet)", 1);
+    pending_waits.fetch_add(1, std::memory_order_relaxed);
+    if (!pending_cv.wait_for(lock, std::chrono::milliseconds(PendingTimeoutMs), [&] { return !blocking(); })) {
+        pending_timeouts.fetch_add(1, std::memory_order_relaxed);
+        std::erase_if(pending, [&](const Pending& p) { return p.seq < submitted && p.begin < address + size && address < p.end; });
+    }
+    pending_wait_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
+}
+
 void SetLandingGate(LandingGate gate) {
     std::scoped_lock lock{mutex};
     landing_gate = std::move(gate);
 }
 
 void GateMap(VAddr address, u64 size) {
+    WaitPending(address, size ? size : 1);
     LandingGate gate;
     {
         std::scoped_lock lock{mutex};
@@ -271,6 +330,9 @@ nlohmann::json Report() {
                        {"bytes", explicit_bytes.load()},
                        {"refused_other_path", explicit_refused[0].load()},
                        {"refused_too_large", explicit_refused[1].load()}};
+    out["pending_before_the_map"] = {{"copies_into_staging_noted", pending_noted.load()}, {"map_checks", pending_checks.load()}, {"map_waits", pending_waits.load()},
+                                     {"map_wait_ms_total", static_cast<double>(pending_wait_ns.load()) / 1e6}, {"timeouts", pending_timeouts.load()},
+                                     {"dropped_list_full", pending_dropped.load()}, {"most_pending_at_once", pending_max.load()}};
     out["gate"] = {{"checks", gate_checks.load()}, {"waits", gate_waits.load()}, {"timeouts", gate_timeouts.load()},
                    {"wait_ms_total", static_cast<double>(gate_wait_ns.load()) / 1e6}};
     {

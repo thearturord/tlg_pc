@@ -6128,6 +6128,9 @@ u64 PS4_SYSV_ABI TagAscCounterReadback(u64 jcc, u64 buffer, u64 view, u64 a3, u6
         record.args_addr = memory;
         record.dst_usage = Core::NativeResources::ResourceUsage(buffer);
         Core::NativeReadbacks::NoteDestination(memory, sizeof(u32), record.dst_usage, 9, ret - ImageBase() + 0x1000000);
+        if (record.dst_usage == 3) {
+            Core::NativeReadbacks::NotePending(memory, sizeof(u32), seq); // M4
+        }
         record.seq.store(seq, std::memory_order_release);
         u32 words[2 + VideoCore::NativeTagPayloadDwords];
         words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
@@ -6176,6 +6179,9 @@ u64 PublishAscMemoryCopy(u64 jcc, u64 destination, u64 source, u64 to, u64 from,
     record.extra_addr = from;
     record.dst_usage = destination != 0 ? Core::NativeResources::ResourceUsage(destination) : ~0u;
     Core::NativeReadbacks::NoteDestination(to, bytes, record.dst_usage, 10, ret - ImageBase() + 0x1000000);
+    if (record.dst_usage == 3) {
+        Core::NativeReadbacks::NotePending(to, bytes, seq); // M4
+    }
     record.seq.store(seq, std::memory_order_release);
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
     words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
