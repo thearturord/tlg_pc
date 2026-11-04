@@ -156,8 +156,11 @@ bool OwnershipGate() {
         if (e == nullptr || *e == '\0' || *e == '0') {
             return false;
         }
-        if (GetConfig().depth < 2 || !NativeContent::FrameStoreServes()) {
-            RareEvents::Note("ownership_gate_refused", "needs frames in flight 2 and TLG_FRAME_STORE=2");
+        // W0 (memory-ownership-plan.md): TLG_WRITER_PATH_ONLY=1 lets the gate run with the store NOT serving (TLG_FRAME_STORE=1, shadow only): the writer patches have to carry the frames alone
+        const char* writer_only = std::getenv("TLG_WRITER_PATH_ONLY");
+        const bool store_free = writer_only != nullptr && writer_only[0] == '1';
+        if (GetConfig().depth < 2 || (!NativeContent::FrameStoreServes() && !store_free)) {
+            RareEvents::Note("ownership_gate_refused", "needs frames in flight 2 and TLG_FRAME_STORE=2 (or TLG_WRITER_PATH_ONLY=1)");
             return false;
         }
         LOG_INFO(Core, "frame gate: ownership gate on (slot wait counts frames the raster thread has not reached)");
