@@ -8431,6 +8431,7 @@ u64 PS4_SYSV_ABI MidProbeB7(Core::GuestHooks::MidContext* ctx) {
 }
 
 void FlushSceneSlotAnnouncements() {
+    NativeDevice::DrainDeferredFrees();
     const u64 frame = scene_slot_frame.load(std::memory_order_relaxed);
     if (frame != 0 && Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
         Guarded([&]() -> u64 {
@@ -8766,6 +8767,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "native_view_dsv") {
         return reinterpret_cast<u64>(&NativeDevice::ViewCreatedDsv);
+    }
+    if (name == "native_gomalloc_free") {
+        return reinterpret_cast<u64>(&NativeDevice::GomallocFree);
     }
     if (name == "native_delay_delete") {
         return reinterpret_cast<u64>(&NativeDevice::DelayDelete);

@@ -98,6 +98,8 @@ void SetSite(u32 site);
 void NoteCopy(u64 destination, u64 source, u64 size);
 /// The engine deleted the memory's owner or reused it: nothing is dropped in the shadow stage, this only counts (so the report can say how much content outlived its owner).
 void NoteDeleted(u64 address, u64 size);
+/// The engine's memory free (Gomalloc, hook GomallocFree) of `address` was called: remembered with the submission count (late read samples print it)
+void NoteHeapFree(u64 address);
 /// A Map the hook saw (counted by resource kind, map type and the path taken, see Report "maps_note").
 void CountMap(u32 kind, u32 type, u32 path);
 /// A write whose bytes are not kept (it announces nothing or before it writes): only the range and the order are remembered, so a differing upload can be attributed (writers: 1 skin, 2 lights,

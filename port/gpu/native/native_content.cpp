@@ -735,6 +735,8 @@ namespace {
 /// TLG_REWRITE_GAP=1 (measurement): per writer (1 skinning, 2 lights, 4 scene slots), how many graphics submissions lie between two writes that start at the same address
 std::mutex g_gap_mutex;
 std::unordered_map<u64, u32> g_gap_last[8];
+std::mutex g_heap_free_mutex;
+std::unordered_map<u64, u32> g_heap_free_at; // engine memory frees (Gomalloc): address -> submit count
 std::atomic<u64> c_gap[8][18]{};
 } // namespace
 
@@ -1612,6 +1614,7 @@ std::atomic<u64> c_check_bytes[LateKinds][CheckClassCount]{};
 std::atomic<u64> c_late_after_bytes_by_writer[LateKinds][16]{}; ///< bytes read late (the range was written after the record) by the writer of the newest write
 std::atomic<u64> c_late_after_by_writer[LateKinds][16]{};
 std::atomic<u64> c_late_margin[LateKinds][MaxSites][10]{}; ///< submissions between the read's record and the newest write that made it late (0..8, 9 more), by call site
+std::atomic<u64> c_late_free_class[LateKinds][MaxSites][3]{}; ///< rewritten late reads by the engine free of the address: [0] none seen, [1] freed after the record's submission, [2] freed before it
 std::atomic<u64> c_late_rewrite_by_site[LateKinds][MaxSites]{}, c_late_rewrite_bytes_by_site[LateKinds][MaxSites]{}; ///< late reads whose range had an older version before the newest write (memory reuse), and the bytes rewritten
 std::atomic<u64> c_late_after_by_site[LateKinds][MaxSites]{}, c_late_after_bytes_by_site[LateKinds][MaxSites]{}; ///< `TLG_WRITER_SITES`: the same by call site of the newest write
 std::atomic<u64> c_same_frame_after[LateKinds]{}; ///< reads that M0 counted as late (written after the record) but that were written before the record's submission
@@ -1716,6 +1719,19 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
         c_late_after_by_site[k][std::min<u32>(a.newest_site, MaxSites - 1)].fetch_add(1, std::memory_order_relaxed);
         if (a.rewritten != 0) {
             c_late_rewrite_by_site[k][std::min<u32>(a.newest_site, MaxSites - 1)].fetch_add(1, std::memory_order_relaxed);
+            {
+                u32 freed_at = 0;
+                bool freed = false;
+                {
+                    std::scoped_lock lock{g_heap_free_mutex};
+                    const auto it = g_heap_free_at.find(address);
+                    if (it != g_heap_free_at.end()) {
+                        freed = true;
+                        freed_at = it->second;
+                    }
+                }
+                c_late_free_class[k][std::min<u32>(a.newest_site, MaxSites - 1)][!freed ? 0 : freed_at > submit ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
+            }
             c_late_rewrite_bytes_by_site[k][std::min<u32>(a.newest_site, MaxSites - 1)].fetch_add(a.rewritten, std::memory_order_relaxed);
         }
         if (submit != 0) {
@@ -1727,15 +1743,24 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
             static std::atomic<u32> examples[LateKinds]{};
             if (gap_on && (k == static_cast<size_t>(LateKind::BufferObjectCopy) || k == static_cast<size_t>(LateKind::BufferArenaSync)) && examples[k].fetch_add(1, std::memory_order_relaxed) % (k == static_cast<size_t>(LateKind::BufferArenaSync) ? 150 : 40000) < (k == static_cast<size_t>(LateKind::BufferArenaSync) ? 1 : 6)) {
                 Core::RareEvents::Note(k == static_cast<size_t>(LateKind::BufferArenaSync) ? "late_read_example_arena_sync" : "late_read_example_object_copy",
-                                       fmt::format("{:#x} + {:#x} (covered {:#x}, rewritten {:#x}): record submit {}, newest write announced at submit count {} (belongs to submission {}), the write it replaced was at {}, submit count now {}, writer {}, site {}", address, size, a.covered, a.rewritten,
+                                       fmt::format("{:#x} + {:#x} (covered {:#x}, rewritten {:#x}): record submit {}, newest write announced at submit count {} (belongs to submission {}), the write it replaced was at {}, submit count now {}, writer {}, site {}, memory freed by the engine at submit {}", address, size, a.covered, a.rewritten,
                                                    submit, a.newest_submit, a.newest_submit + 1, a.newest_prev_submit, g_submit_count.load(std::memory_order_relaxed), a.newest_writer,
-                                                   a.newest_site < g_site_names.size() ? g_site_names[a.newest_site] : std::string("?")));
+                                                   a.newest_site < g_site_names.size() ? g_site_names[a.newest_site] : std::string("?"),
+                                                   [&] { std::scoped_lock lock{g_heap_free_mutex}; const auto it = g_heap_free_at.find(address); return it == g_heap_free_at.end() ? -1 : static_cast<int>(it->second); }()));
             }
         }
         if (c_late_rare_noted[k].fetch_add(1, std::memory_order_relaxed) < 3) {
             Core::RareEvents::Note(fmt::format("m0_late_read_written_after_its_record_{}", LateKindNames[k]), fmt::format("{:#x} + {:#x}: record {}, newest write stamp {}, writer {}", address, size, seq, a.newest, a.newest_writer));
         }
     }
+}
+
+void NoteHeapFree(u64 address) {
+    std::scoped_lock lock{g_heap_free_mutex};
+    if (g_heap_free_at.size() > 400000) {
+        g_heap_free_at.clear();
+    }
+    g_heap_free_at[address] = g_submit_count.load(std::memory_order_relaxed);
 }
 
 void CheckUploadMemory(u64 address, u64 size) {
@@ -2196,7 +2221,8 @@ nlohmann::json Report() {
                 for (u32 i = 0; i < MaxSites; ++i) {
                     if (const u64 n = c_late_after_by_site[k][i].load()) {
                         auto& site_json = kj["written_after_by_site"][i < g_site_names.size() ? g_site_names[i] : std::to_string(i)];
-                        site_json = {{"reads", n}, {"bytes", c_late_after_bytes_by_site[k][i].load()}, {"reads_with_rewritten_memory", c_late_rewrite_by_site[k][i].load()}, {"rewritten_bytes", c_late_rewrite_bytes_by_site[k][i].load()}};
+                        site_json = {{"reads", n}, {"bytes", c_late_after_bytes_by_site[k][i].load()}, {"reads_with_rewritten_memory", c_late_rewrite_by_site[k][i].load()}, {"rewritten_bytes", c_late_rewrite_bytes_by_site[k][i].load()},
+                                     {"rewritten_reads_by_engine_free_none_after_record_before_record", {c_late_free_class[k][i][0].load(), c_late_free_class[k][i][1].load(), c_late_free_class[k][i][2].load()}}};
                         for (u32 m = 0; m < 10; ++m) {
                             if (const u64 x = c_late_margin[k][i][m].load()) {
                                 site_json["submissions_between_record_and_write"][std::to_string(m)] = x;

@@ -113,6 +113,10 @@ u64 PS4_SYSV_ABI ViewCreatedUav(u64 resource, u64 desc, u64 out, u64 a3, u64 a4,
 u64 PS4_SYSV_ABI ViewCreatedRtv(u64 resource, u64 desc, u64 out, u64 a3, u64 a4, u64 a5, u64 ret);
 u64 PS4_SYSV_ABI ViewCreatedDsv(u64 resource, u64 desc, u64 out, u64 a3, u64 a4, u64 a5, u64 ret);
 u64 PS4_SYSV_ABI DelayDelete(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret);
+/// native-v3-writers (`TLG_DEFER_FREE=K`, hook `GomallocFree` at 0x248fd20, handler `native_gomalloc_free`): the engine's memory free (heap, address) of its GPU heaps (garlic / onion) is held for K game
+/// frames so the loader cannot reuse memory a frame in flight (raster thread, up to 2 frames behind) still reads; `DrainDeferredFrees` (called at the start of every frame) frees what is due.
+u64 PS4_SYSV_ABI GomallocFree(u64 heap, u64 address, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret);
+void DrainDeferredFrees();
 
 /// B11 census: mid hooks at +6 (after the 6 bytes the B0 count hook displaced) of `JsDeviceContext::ClearRenderTargetView` (0x2483380: ctx, rtv, color[4]) and `ClearDepthStencilView` (0x24860c0: depth in
 /// xmm0, ctx, dsv, flags, stencil). They record the target and the value and bracket the packets the clear writes into the context's command buffer (its write cursor at

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <shared_mutex>
@@ -74,6 +75,7 @@ void KeepRaw(u64 id, u64 object) {
 std::atomic<u64> resources_noted{0}, views_noted{0}, deletes_noted{0}, deletes_unknown{0}, bad_reads{0};
 /// AddDelayDeleteObject (native-v3-writers): the game's own delay (frames until the object is freed) by age of the object's stamp, and the extra delay TLG_DELETE_DELAY adds
 std::atomic<u64> delay_by_age[6]{}, delay_added{0}, delay_requeued{0};
+std::atomic<u64> deferred_count{0}, deferred_released{0}, deferred_forced{0}, deferred_max_pending{0};
 std::array<std::atomic<u64>, 9> live_by_kind{};
 
 constexpr const char* KindName(Kind kind) {
@@ -845,6 +847,7 @@ nlohmann::json Report() {
         }
         out["delete_by_stamp_age_0_1_2_3_over_3_negative"] = std::move(ages);
         out["delete_delay_added"] = delay_added.load();
+        out["deferred_frees"] = {{"held", deferred_count.load()}, {"released", deferred_released.load()}, {"forced", deferred_forced.load()}, {"max_pending", deferred_max_pending.load()}};
     }
     out["unreadable_objects"] = bad_reads.load();
     nlohmann::json live;
@@ -915,6 +918,76 @@ u64 PS4_SYSV_ABI DelayDelete(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
     delay->fetch_add(extra, std::memory_order_relaxed);
     delay_added.fetch_add(1, std::memory_order_relaxed);
     return 0x8000000000000000ull;
+}
+
+namespace {
+
+struct DeferredFree {
+    u64 heap, address;
+    s64 due_frame;
+    u64 ordinal;
+};
+std::mutex deferred_mutex;
+std::deque<DeferredFree> deferred_frees;
+constexpr size_t DeferredMax = 20000; // more pending than this: the oldest are released at once (the heap must not run dry)
+
+s64 EngineFrame() {
+    const u64 holder = Rd<u64>(Core::NativeDraw::ImageBase() + 0x6b03558 - 0x1000000, 0);
+    return holder != 0 ? Rd<s64>(holder, 0x10240) : 0;
+}
+
+u32 DeferFrames() {
+    static const u32 frames = [] { const char* e = std::getenv("TLG_DEFER_FREE"); return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u; }();
+    return frames;
+}
+
+} // namespace
+
+u64 PS4_SYSV_ABI GomallocFree(u64 heap, u64 address, u64 a2, u64 a3, u64 a4, u64 a5, u64) {
+    static const u64 original = Core::GuestHooks::OriginalEntry("GomallocFree");
+    const u32 frames = DeferFrames();
+    if (address != 0) {
+        Core::NativeContent::NoteHeapFree(address);
+    }
+    if (frames == 0 || original == 0 || heap == 0 || address == 0) {
+        return 0; // the original runs
+    }
+    std::vector<DeferredFree> forced;
+    {
+        std::scoped_lock lock{deferred_mutex};
+        deferred_frees.push_back({heap, address, EngineFrame() + frames, deferred_count.fetch_add(1, std::memory_order_relaxed)});
+        deferred_max_pending.store(std::max<u64>(deferred_max_pending.load(), deferred_frees.size()), std::memory_order_relaxed);
+        while (deferred_frees.size() > DeferredMax) {
+            forced.push_back(deferred_frees.front());
+            deferred_frees.pop_front();
+        }
+    }
+    for (const auto& entry : forced) {
+        reinterpret_cast<GuestFunction6>(original)(entry.heap, entry.address, 0, 0, 0, 0);
+        deferred_forced.fetch_add(1, std::memory_order_relaxed);
+    }
+    (void)a2, (void)a3, (void)a4, (void)a5;
+    return 0x8000000000000000ull; // the free is skipped (done later)
+}
+
+void DrainDeferredFrees() {
+    static const u64 original = Core::GuestHooks::OriginalEntry("GomallocFree");
+    if (DeferFrames() == 0 || original == 0) {
+        return;
+    }
+    const s64 frame = EngineFrame();
+    std::vector<DeferredFree> due;
+    {
+        std::scoped_lock lock{deferred_mutex};
+        while (!deferred_frees.empty() && deferred_frees.front().due_frame <= frame) {
+            due.push_back(deferred_frees.front());
+            deferred_frees.pop_front();
+        }
+    }
+    for (const auto& entry : due) {
+        reinterpret_cast<GuestFunction6>(original)(entry.heap, entry.address, 0, 0, 0, 0);
+        deferred_released.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 } // namespace Core::NativeDevice
