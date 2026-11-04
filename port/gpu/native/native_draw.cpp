@@ -6890,7 +6890,7 @@ void SkinWritesAnnounce(u64 ring, u64 scene) {
         for (u64 node = first; node != 0 && jobs < 100000; node = Rd<u64>(node, 0), ++jobs) {
             matrices += Rd<u32>(node, 0x50);
         }
-        Core::NativeUpdates::NoteWriterRange(1, memory, matrices * 64);
+        Core::NativeUpdates::NoteWriterRange(1, memory, matrices * 64, "skinning matrices");
         return 0;
     });
 }
@@ -6908,7 +6908,7 @@ u64 PS4_SYSV_ABI LightWrites(u64 object, u64 source, u64 a2, u64 a3, u64 a4, u64
         for (const u64 base : {u64{0xc0}, u64{0x2d0}}) {
             const u64 buffer = Rd<u64>(object, base + index * 0xb0ull);
             if (IsHeapPointer(buffer)) {
-                Core::NativeUpdates::NoteWriterRange(2, Rd<u64>(buffer, 0x30), 0xa0);
+                Core::NativeUpdates::NoteWriterRange(2, Rd<u64>(buffer, 0x30), 0xa0, "light constants");
             }
         }
         return 0;
@@ -6934,7 +6934,7 @@ u64 PS4_SYSV_ABI RecordingWrites(u64 device, u64 a1, u64 a2, u64 a3, u64 a4, u64
             const u64 buffer = Rd<u64>(device, field);
             const u64 width = IsHeapPointer(buffer) ? Rd<u32>(buffer, 0x180) : 0;
             if (width != 0 && width <= (1u << 24)) {
-                Core::NativeUpdates::NoteWriterRange(4, Rd<u64>(buffer, 0x30), width);
+                Core::NativeUpdates::NoteWriterRange(4, Rd<u64>(buffer, 0x30), width, "BeginRecording buffers");
             }
         }
         return 0;
@@ -7948,7 +7948,7 @@ u64 PS4_SYSV_ABI ResourceBufferCreated(u64 device, u64 description, u64 initial,
             Guarded([&]() -> u64 {
                 const u64 width = Rd<u32>(created, 0x180);
                 if (width != 0 && width <= (1ull << 30)) {
-                    NativeUpdates::NoteWriterRange(5, Rd<u64>(created, 0x30), width);
+                    NativeUpdates::NoteWriterRange(5, Rd<u64>(created, 0x30), width, "CreateBuffer");
                 }
                 return 0;
             });
@@ -7993,7 +7993,7 @@ u64 PS4_SYSV_ABI ResourceTextureInitAnnounced(u64 object, u64 a1, u64 a2, u64 a3
             const u64 texture = a3 != 0 ? Rd<u64>(a3, 0) : 0;
             const u64 memory = texture != 0 ? Rd<u64>(texture, 0x30) : 0;
             if (memory != 0 && memory == t_last_garlic_address && t_last_garlic_size != 0) {
-                NativeUpdates::NoteWriterRange(6, memory, t_last_garlic_size);
+                NativeUpdates::NoteWriterRange(6, memory, t_last_garlic_size, "texture 1D/3D creation");
             }
             return 0;
         });
@@ -8004,7 +8004,7 @@ u64 PS4_SYSV_ABI ResourceTextureInitAnnounced(u64 object, u64 a1, u64 a2, u64 a3
         const u64 memory = Rd<u64>(object, 0x30);
         const u64 size = Rd<u64>(object, 0x38);
         if (memory != 0 && size != 0 && size <= (1ull << 32)) {
-            NativeUpdates::NoteWriterRange(6, memory, size);
+            NativeUpdates::NoteWriterRange(6, memory, size, "texture 2D initialization");
         }
         return 0;
     });
@@ -8223,7 +8223,7 @@ u64 PS4_SYSV_ABI TextureUpdateSubresource(u64 context, u64 resource, u64 subreso
                 Core::NativeContent::NoteMark(3, static_cast<u64>(Rd<u32>(resource, 0x60)) | (static_cast<u64>(Rd<u32>(resource, 0x64) & 0xfffu) << 32), width);
             }
             if ((bind & 0x4) == 0 && Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && memory != 0 && width != 0 && width < (1u << 30)) {
-                Core::NativeUpdates::NoteWriterRange(5, memory, width);
+                Core::NativeUpdates::NoteWriterRange(5, memory, width, "UpdateSubresource non-constant buffer");
             }
             return 0;
         }
@@ -8232,7 +8232,7 @@ u64 PS4_SYSV_ABI TextureUpdateSubresource(u64 context, u64 resource, u64 subreso
         const u64 n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
         bytes.fetch_add(size, std::memory_order_relaxed);
         if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && memory != 0 && size != 0 && size < (1ull << 32)) {
-            Core::NativeUpdates::NoteWriterRange(6, memory, size);
+            Core::NativeUpdates::NoteWriterRange(6, memory, size, "UpdateSubresource texture");
             announced.fetch_add(1, std::memory_order_relaxed);
         }
         {
@@ -8272,7 +8272,7 @@ u64 PS4_SYSV_ABI GpuAlloc(u64 device, u64 size, u64 alignment, u64 type, u64 a4,
     const u64 result = reinterpret_cast<GuestDraw6>(original)(device, size, alignment, type, a4, a5);
     if (result != 0 && Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
         if (const u64 bytes = size & 0xffffffffull; bytes != 0) {
-            Core::NativeUpdates::NoteWriterRange(5, result, bytes);
+            Core::NativeUpdates::NoteWriterRange(5, result, bytes, Which == 0 ? "AllocGarlicMemory" : "AllocOnionMemory");
         }
     }
     if (result != 0) {
@@ -8534,7 +8534,7 @@ u64 PS4_SYSV_ABI InstanceGroupBind(u64 inner, u64 group, u64 view, u64 a3, u64 a
         if ((index & ~1) != 0 || bytes <= 0) {
             return 0;
         }
-        Core::NativeUpdates::NoteWriterRange(7, Rd<u64>(uploader, 0x18 + static_cast<u64>(index) * 8), static_cast<u32>(bytes));
+        Core::NativeUpdates::NoteWriterRange(7, Rd<u64>(uploader, 0x18 + static_cast<u64>(index) * 8), static_cast<u32>(bytes), "instance group staging");
         return 0;
     });
     return 0;

@@ -63,6 +63,7 @@ struct OpenMap {
     u64 address{}, size{};
     u64 serial{}; ///< order in which Maps were made (FlushOpenMapsSince)
     u64 stamp{}; ///< the number the next record got when the Map was made (F2.2: a draw of an earlier record cannot depend on the write)
+    bool in_ring{};
 };
 std::mutex open_map_mutex;
 u64 open_map_serial = 0;
@@ -118,7 +119,7 @@ void NoteUnmap(u64 resource_id) {
         open_maps.erase(it);
     }
     NativeUploads::SnapshotTake(map.address, map.size, NativeDraw::NextSeq());
-    NoteWriterRange(0, map.address, map.size);
+    NoteWriterRange(0, map.address, map.size, map.in_ring ? "Map into a frame ring window" : "Map into the buffer's own memory");
 }
 
 u64 OpenMapSerial() {
@@ -169,11 +170,39 @@ void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u6
     const u64 written = requested_size != 0 && requested_size < size ? requested_size : size;
     NativeContent::NoteMapOpen(address, written); // M3: before the write
     std::scoped_lock lock{open_map_mutex};
-    open_maps[{ThreadKey(), resource_id}] = {address, written, ++open_map_serial, NativeDraw::NextSeq()};
+    open_maps[{ThreadKey(), resource_id}] = {address, written, ++open_map_serial, NativeDraw::NextSeq(), in_ring};
     (void)usage, (void)in_ring;
 }
 
-void NoteWriterRange(u32 writer, u64 address, u64 size) {
+namespace {
+struct SiteStat {
+    u64 count{}, bytes{}, largest{};
+    u64 by_size_log2[40]{};
+};
+std::mutex site_mutex;
+std::map<std::pair<u32, std::string>, SiteStat> site_stats;
+bool SitesOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_WRITER_SITES");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+} // namespace
+
+void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site) {
+    if (SitesOn() && address != 0 && size != 0) {
+        std::scoped_lock lock{site_mutex};
+        SiteStat& stat = site_stats[{writer, site != nullptr ? site : "?"}];
+        ++stat.count;
+        stat.bytes += size;
+        stat.largest = std::max(stat.largest, size);
+        u32 log = 0;
+        while ((size >> log) > 1 && log < 39) {
+            ++log;
+        }
+        ++stat.by_size_log2[log];
+    }
     NoteWriterRangeOf(writer, address, size, ThreadKey());
 }
 
@@ -452,6 +481,19 @@ nlohmann::json Report() {
     for (u32 i = 0; i < 4; ++i) {
         if (const u64 n = maps.by_usage[i].load()) {
             m["by_buffer_usage"][usage_names[i]] = n;
+        }
+    }
+    if (SitesOn()) {
+        std::scoped_lock lock{site_mutex};
+        auto& sites = j["writer_sites"] = nlohmann::json::object();
+        for (const auto& [key, stat] : site_stats) {
+            auto& e = sites[std::to_string(key.first) + " " + key.second];
+            e = {{"count", stat.count}, {"bytes", stat.bytes}, {"largest", stat.largest}};
+            for (u32 i = 0; i < 40; ++i) {
+                if (stat.by_size_log2[i] != 0) {
+                    e["by_size_log2"][std::to_string(i)] = stat.by_size_log2[i];
+                }
+            }
         }
     }
     return j;

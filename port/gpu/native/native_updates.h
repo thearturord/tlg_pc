@@ -33,7 +33,8 @@ bool OpenMapOverlaps(u64 address, u64 size);
 u64 OpenMapSerial();
 void FlushOpenMapsSince(u64 serial);
 /// A hooked engine function announces the memory it is about to write (`writer` names the function: 1 skinning matrices, 2 light constants, 3 a memory copy of the command stream, 4 the BeginRecording stores, 5 buffer creation with initial data, 6 texture initialization).
-void NoteWriterRange(u32 writer, u64 address, u64 size);
+/// `site` names the call site for the census `TLG_WRITER_SITES=1` (`/stats` writer_sites: count, bytes, size classes per writer and site); it must be a string literal.
+void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site = nullptr);
 /// N5h (`TLG_RING_SUPERSEDE=1`): a write that gives memory new contents supersedes what the GPU wrote there before. The announcer is told (`fn`) for: the creation of a
 /// buffer, the initialization of a texture (any thread) and the unmap of a buffer on the render thread. Safe because anything the GPU writes into that memory afterwards is
 /// issued after the announcement; marks that older GPU writes add later are only too many.
