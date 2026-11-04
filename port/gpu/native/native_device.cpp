@@ -13,6 +13,7 @@
 
 #include "common/logging/log.h"
 #include "native/native_hooks.h"
+#include "native/native_draw.h"
 #include "native/native_log.h"
 #include "native/native_image_desc.h"
 #include "native/native_device.h"
@@ -71,6 +72,8 @@ void KeepRaw(u64 id, u64 object) {
 }
 
 std::atomic<u64> resources_noted{0}, views_noted{0}, deletes_noted{0}, deletes_unknown{0}, bad_reads{0};
+/// AddDelayDeleteObject (native-v3-writers): the game's own delay (frames until the object is freed) by age of the object's stamp, and the extra delay TLG_DELETE_DELAY adds
+std::atomic<u64> delay_by_age[6]{}, delay_added{0}, delay_requeued{0};
 std::array<std::atomic<u64>, 9> live_by_kind{};
 
 constexpr const char* KindName(Kind kind) {
@@ -835,6 +838,14 @@ nlohmann::json Report() {
     out["views_noted"] = views_noted.load();
     out["deletes_noted"] = deletes_noted.load();
     out["deletes_of_objects_not_in_the_table"] = deletes_unknown.load();
+    {
+        nlohmann::json ages = nlohmann::json::array();
+        for (const auto& count : delay_by_age) {
+            ages.push_back(count.load());
+        }
+        out["delete_by_stamp_age_0_1_2_3_over_3_negative"] = std::move(ages);
+        out["delete_delay_added"] = delay_added.load();
+    }
     out["unreadable_objects"] = bad_reads.load();
     nlohmann::json live;
     for (u32 k = 1; k < live_by_kind.size(); ++k) {
@@ -882,9 +893,28 @@ u64 PS4_SYSV_ABI ViewCreatedDsv(u64 resource, u64 desc, u64 out, u64 a3, u64 a4,
     return ViewCreated<Kind::DepthStencilView>("NativeViewDsv", resource, desc, out, a3, a4, a5);
 }
 
-u64 PS4_SYSV_ABI DelayDelete(u64 object, u64, u64, u64, u64, u64, u64) {
+u64 PS4_SYSV_ABI DelayDelete(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64) {
     NoteDelete(object);
-    return 0; // the original runs
+    // native-v3-writers: the game frees an object `3 - age` frames after its last stamp (age = frame - [object + 0x2c]), 0 frames when it was stamped this frame or more than 3 frames ago; the freed memory
+    // is then reused by the next resource while the raster thread (up to 2 frames behind the game) can still read the old one (late reads with rewritten memory, 2026-11-04). TLG_DELETE_DELAY=N adds N frames.
+    static const u32 extra = [] { const char* e = std::getenv("TLG_DELETE_DELAY"); return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u; }();
+    static const u64 original = Core::GuestHooks::OriginalEntry("NativeDelayDelete");
+    const u64 holder = Rd<u64>(Core::NativeDraw::ImageBase() + 0x6b03558 - 0x1000000, 0);
+    if (holder == 0 || object == 0) {
+        return 0;
+    }
+    const s64 frame = Rd<s64>(holder, 0x10240);
+    const s64 stamp = static_cast<s64>(Rd<u32>(object, 0x2c));
+    const s64 age = frame - stamp;
+    delay_by_age[age < 0 ? 5 : age > 3 ? 4 : age].fetch_add(1, std::memory_order_relaxed);
+    if (extra == 0 || original == 0 || Rd<u64>(object, 8) != 0) {
+        return 0; // the original runs
+    }
+    reinterpret_cast<GuestFunction6>(original)(object, a1, a2, a3, a4, a5);
+    auto* delay = reinterpret_cast<std::atomic<u32>*>(object + 0x28);
+    delay->fetch_add(extra, std::memory_order_relaxed);
+    delay_added.fetch_add(1, std::memory_order_relaxed);
+    return 0x8000000000000000ull;
 }
 
 } // namespace Core::NativeDevice
