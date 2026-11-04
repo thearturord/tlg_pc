@@ -48,6 +48,9 @@ u64 FrameStoreServe(LateKind kind, u64 address, void* dst, u64 size);
 void NoteSubmit(const std::vector<std::pair<u64, u64>>& ranges);
 /// M4: every record number below this was made for a graphics submission that has been handed to the command processor (0: none yet).
 [[nodiscard]] u64 LastSubmitStamp();
+/// M5 follow-up: the raster thread starts the record `seq` (called from `SetCurrentDraw`). The oldest submission it can still read for is the one that carries this record: a retired version
+/// stays alive as long as a newer version could not have been the one such a read picks.
+void NoteRasterRecord(u64 seq);
 /// M3: a thread maps [address, address + size) for writing (before the write): if the memory holds a version no capture holds (a loader's write, never captured), it is kept as the retired layer's
 /// version, so a late reader of an earlier record still gets the bytes this write is about to replace. Only with `TLG_FRAME_STORE=2`.
 void NoteMapOpen(u64 address, u64 size);

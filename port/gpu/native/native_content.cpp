@@ -915,6 +915,14 @@ u32 SubmitIndexOf(u64 seq) {
 }
 } // namespace
 
+namespace {
+std::atomic<u64> g_raster_seq{0}; ///< the record the raster thread started last
+} // namespace
+
+void NoteRasterRecord(u64 seq) {
+    g_raster_seq.store(seq, std::memory_order_relaxed);
+}
+
 u64 LastSubmitStamp() {
     std::scoped_lock lock{g_submit_mutex};
     return g_submits.empty() ? 0 : g_submits.back().stamp;
@@ -1098,11 +1106,23 @@ void FsBaseAddLocked(u64 b, u64 e, u32 index, const std::shared_ptr<u8[]>& owner
 void FsRetireLocked(FsFrame&& frame) {
     thread_local std::vector<Cover> covers;
     thread_local Pieces done;
+    // the oldest submission a read can still ask for: the one that carries the record the raster thread is on (0: not started)
+    const u64 raster_seq = g_raster_seq.load(std::memory_order_relaxed);
+    u32 oldest_reader = 1;
+    if (raster_seq != 0) {
+        // a record newer than the last submission mark belongs to the submission that comes next
+        oldest_reader = raster_seq >= LastSubmitStamp() ? g_submit_count.load(std::memory_order_relaxed) + 1 : std::max<u32>(SubmitIndexOf(raster_seq), 1u);
+    }
     for (FsChunk& chunk : frame.chunks) {
-        // most chunks are rewritten every frame: one newer chunk of the window holds all their bytes, nothing to keep
+        // most chunks are rewritten every frame: one newer chunk of the window holds all their bytes, nothing to keep. But only a newer chunk that every pending read picks over this one
+        // counts: a read of an older submission (the raster thread is behind) must still get this version, even when the memory was rewritten and captured since (owner play 2026-11-04:
+        // light blocks rewritten exactly one window later were holes, writer 2, 18 in 8 minutes)
         const u64 chunk_end = chunk.address + chunk.size;
         bool superseded = false;
         for (auto newer = g_fs_frames.rbegin(); newer != g_fs_frames.rend() && !superseded; ++newer) {
+            if (newer->index > oldest_reader) {
+                continue;
+            }
             auto it = std::upper_bound(newer->chunks.begin(), newer->chunks.end(), chunk.address, [](u64 value, const FsChunk& c) { return value < c.address; });
             if (it != newer->chunks.begin()) {
                 const FsChunk& c = *std::prev(it);
@@ -1114,7 +1134,7 @@ void FsRetireLocked(FsFrame&& frame) {
         }
         covers.clear();
         done.clear();
-        FsCoverLocked(chunk.address, chunk.size, ~0u, covers, done, false);
+        FsCoverLocked(chunk.address, chunk.size, oldest_reader, covers, done, false); // only versions every pending read picks over this one hide it
         std::shared_ptr<u8[]> owner{std::move(chunk.bytes)};
         const auto add = [&](u64 b, u64 e) { FsBaseAddLocked(b, e, frame.index, owner, owner.get() + (b - chunk.address)); };
         u64 cursor = chunk.address;
@@ -1345,6 +1365,12 @@ u64 FrameStoreServe(LateKind kind, u64 address, void* dst, u64 size) {
                 c.hole_pieces_by_writer[w].fetch_add(1, std::memory_order_relaxed);
                 c.hole_bytes_by_writer[w].fetch_add(rewrite, std::memory_order_relaxed);
                 c.hole_bytes_by_prev[std::min<u32>(a.newest_prev, 15u)].fetch_add(rewrite, std::memory_order_relaxed);
+                if (w != 5 && w != 6) {
+                    // M5 follow-up: the dark frame at depth 2 is searched in the holes of the per-frame writers (the lights, writer 2, in the stream copy); the first three of each kind are written out
+                    Core::RareEvents::Note(fmt::format("m3_store_hole_writer{}_kind{}", w, k),
+                                           fmt::format("{:#x} + {:#x}: record {} of submission {}, newest write in submission {} (stamp {}), it replaced a write of writer {} from submission {}, now submission {}", b, e - b, seq, submit,
+                                                       a.newest_submit, a.newest, a.newest_prev, a.newest_prev_submit, g_submit_count.load(std::memory_order_relaxed)));
+                }
             }
         }
     };
