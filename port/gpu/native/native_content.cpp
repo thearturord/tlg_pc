@@ -1586,6 +1586,7 @@ std::atomic<u64> c_check[LateKinds][CheckClassCount]{};
 std::atomic<u64> c_check_bytes[LateKinds][CheckClassCount]{};
 std::atomic<u64> c_late_after_bytes_by_writer[LateKinds][16]{}; ///< bytes read late (the range was written after the record) by the writer of the newest write
 std::atomic<u64> c_late_after_by_writer[LateKinds][16]{};
+std::atomic<u64> c_late_margin[LateKinds][MaxSites][10]{}; ///< submissions between the read's record and the newest write that made it late (0..8, 9 more), by call site
 std::atomic<u64> c_late_after_by_site[LateKinds][MaxSites]{}, c_late_after_bytes_by_site[LateKinds][MaxSites]{}; ///< `TLG_WRITER_SITES`: the same by call site of the newest write
 std::atomic<u64> c_same_frame_after[LateKinds]{}; ///< reads that M0 counted as late (written after the record) but that were written before the record's submission
 std::atomic<u32> c_late_rare_noted[LateKinds]{}; ///< rare events written per kind (the first few only; the counters carry the rest)
@@ -1687,6 +1688,9 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
         c_late_after_by_writer[k][writer].fetch_add(1, std::memory_order_relaxed);
         c_late_after_bytes_by_writer[k][writer].fetch_add(size, std::memory_order_relaxed);
         c_late_after_by_site[k][std::min<u32>(a.newest_site, MaxSites - 1)].fetch_add(1, std::memory_order_relaxed);
+        if (submit != 0) {
+            c_late_margin[k][std::min<u32>(a.newest_site, MaxSites - 1)][std::min<u32>(a.newest_submit > submit ? a.newest_submit - submit : 0u, 9u)].fetch_add(1, std::memory_order_relaxed);
+        }
         c_late_after_bytes_by_site[k][std::min<u32>(a.newest_site, MaxSites - 1)].fetch_add(size, std::memory_order_relaxed);
         if (c_late_rare_noted[k].fetch_add(1, std::memory_order_relaxed) < 3) {
             Core::RareEvents::Note(fmt::format("m0_late_read_written_after_its_record_{}", LateKindNames[k]), fmt::format("{:#x} + {:#x}: record {}, newest write stamp {}, writer {}", address, size, seq, a.newest, a.newest_writer));
@@ -2144,7 +2148,13 @@ nlohmann::json Report() {
                 std::scoped_lock site_lock{g_site_mutex};
                 for (u32 i = 0; i < MaxSites; ++i) {
                     if (const u64 n = c_late_after_by_site[k][i].load()) {
-                        kj["written_after_by_site"][i < g_site_names.size() ? g_site_names[i] : std::to_string(i)] = {{"reads", n}, {"bytes", c_late_after_bytes_by_site[k][i].load()}};
+                        auto& site_json = kj["written_after_by_site"][i < g_site_names.size() ? g_site_names[i] : std::to_string(i)];
+                        site_json = {{"reads", n}, {"bytes", c_late_after_bytes_by_site[k][i].load()}};
+                        for (u32 m = 0; m < 10; ++m) {
+                            if (const u64 x = c_late_margin[k][i][m].load()) {
+                                site_json["submissions_between_record_and_write"][std::to_string(m)] = x;
+                            }
+                        }
                     }
                 }
             }
