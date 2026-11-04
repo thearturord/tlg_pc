@@ -203,7 +203,9 @@ void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site) {
         }
         ++stat.by_size_log2[log];
     }
+    NativeContent::SetSite(SitesOn() ? NativeContent::SiteId(site != nullptr ? site : "?") : 0);
     NoteWriterRangeOf(writer, address, size, ThreadKey());
+    NativeContent::SetSite(0);
 }
 
 namespace {

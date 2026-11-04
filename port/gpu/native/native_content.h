@@ -90,6 +90,10 @@ void OverlayImage(u64 address, u64 size, u8* staged);
 
 /// The engine wrote [address, address + size) and has finished (any thread). `writer` is the number NativeUpdates::NoteWriterRange gets.
 void Announce(u32 writer, u64 address, u64 size, u64 stamp = 0);
+/// `TLG_WRITER_SITES`: the call site of the announcements the calling thread makes next (SetSite before NoteWriterRange, 0 after); the ledger keeps it with the newest write and the late read census
+/// names the site of the write that made a read late. `SiteId` interns a string literal (0: unknown).
+[[nodiscard]] u32 SiteId(const char* name);
+void SetSite(u32 site);
 /// The raster thread runs a GPU copy of guest memory to guest memory.
 void NoteCopy(u64 destination, u64 source, u64 size);
 /// The engine deleted the memory's owner or reused it: nothing is dropped in the shadow stage, this only counts (so the report can say how much content outlived its owner).

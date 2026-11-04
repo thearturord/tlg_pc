@@ -124,6 +124,13 @@ PATCHES['skip_worker_render_wait'] = [
      'job worker 0: do not wait for the render thread before every job pick'),
 ]
 
+# native-v3-writers (2026-11-04): JsDeviceContext_Map (0x247f990) maps a buffer into its own memory (in place) only when `frame - resource.last_use_stamp > 2` (cmp eax,2 / ja at 0x247fa19);
+# otherwise it takes ring memory and copies the old contents there. At depth 2 the game may be two frames ahead of what the raster thread has read, so the rule has no slack: 3 frames since
+# the last use is exactly the frame the credit lets through. This makes the threshold one frame larger (`> 3`). Not part of any mode; TLG_EXTRA_PATCHES=map_inplace_4 adds it.
+PATCHES['map_inplace_4'] = [
+    (0x247fa1b, bytes.fromhex('02'), bytes.fromhex('03'), 'JsDeviceContext::Map: write a buffer in place only when it was last used more than 3 frames ago (was 2)'),
+]
+
 MODES = {
     '30': [],
     # max_fps_double/max_fps_off are left out: 60 and unlocked were reached without them
@@ -214,6 +221,7 @@ def prepare(game_dir, out_dir, mode, mods_dir=None, mods_config=None):
     eboot = None
     # TLG_FPS_PATCHES="a,b" (measurements): these patches instead of the mode's own.
     names = [n for n in os.environ.get('TLG_FPS_PATCHES', '').split(',') if n in PATCHES] or MODES[mode]
+    names = names + [n for n in os.environ.get('TLG_EXTRA_PATCHES', '').split(',') if n in PATCHES and n not in names]
     if os.environ.get('TLG_GC_BUDGET') == '0':
         names = [n for n in names if not n.startswith('gc_budget')]
     # The render wait patches (skip_render_wait, skip_worker_render_wait) were failed experiments and are no longer selectable here; see their entries above.

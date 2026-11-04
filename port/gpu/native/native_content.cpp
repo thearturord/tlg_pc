@@ -127,6 +127,7 @@ struct LedgerRange {
     bool rewrite; ///< M3: an earlier announced write covered some of this memory (so an older version of it existed); false: the first write the ledger saw
     u32 prev;     ///< M3: the writer of the write this one replaced (15: none)
     u32 prev_submit; ///< M3: `g_submit_count` when that write was announced
+    u32 site{};      ///< `TLG_WRITER_SITES`: the call site of the announcement that made the stamp (SiteId; 0 unknown)
 };
 std::mutex g_ledger_mutex;
 std::map<u64, LedgerRange> g_ledger;
@@ -139,7 +140,13 @@ std::atomic<u64> c_ledger_notes{0}, c_ledger_overflow{0};
 u64 g_ledger_max_len = 0;
 std::vector<std::pair<u64, u64>> g_fs_pending; ///< M1: ranges announced since the last submission (only filled with the store on; under g_ledger_mutex)
 
+constexpr u32 MaxSites = 64;
+thread_local u32 t_site = 0;
+std::mutex g_site_mutex;
+std::vector<std::string> g_site_names{"?"};
+
 void LedgerNote(u64 begin, u64 end, u64 stamp, u32 writer) {
+    const u32 site = t_site;
     std::scoped_lock lock{g_ledger_mutex};
     c_ledger_notes.fetch_add(1, std::memory_order_relaxed);
     if (FrameStoreOn() && (!FrameStoreServes() || ((1u << std::min<u32>(writer, 31u)) & FsServedWriters) != 0)) {
@@ -156,6 +163,7 @@ void LedgerNote(u64 begin, u64 end, u64 stamp, u32 writer) {
         bool rw;
         u32 prev;
         u32 prev_sub;
+        u32 site;
     };
     const u32 submit_now = g_submit_count.load(std::memory_order_relaxed);
     std::vector<Seg> add;
@@ -169,24 +177,24 @@ void LedgerNote(u64 begin, u64 end, u64 stamp, u32 writer) {
         const u32 ow = it->second.writer, osub = it->second.submit;
         const bool orw = it->second.rewrite;
         if (ob < begin) {
-            add.push_back({ob, begin, os, ow, osub, orw, it->second.prev, it->second.prev_submit});
+            add.push_back({ob, begin, os, ow, osub, orw, it->second.prev, it->second.prev_submit, it->second.site});
         }
         if (oe > end) {
-            add.push_back({end, oe, os, ow, osub, orw, it->second.prev, it->second.prev_submit});
+            add.push_back({end, oe, os, ow, osub, orw, it->second.prev, it->second.prev_submit, it->second.site});
         }
         const u64 x = std::max(ob, begin), y = std::min(oe, end);
         if (cursor < x) {
-            add.push_back({cursor, x, stamp, writer, submit_now, false, 15u, 0u});
+            add.push_back({cursor, x, stamp, writer, submit_now, false, 15u, 0u, site});
         }
-        add.push_back({x, y, std::max(os, stamp), stamp >= os ? writer : ow, std::max(osub, submit_now), true, stamp >= os ? ow : it->second.prev, stamp >= os ? osub : it->second.prev_submit});
+        add.push_back({x, y, std::max(os, stamp), stamp >= os ? writer : ow, std::max(osub, submit_now), true, stamp >= os ? ow : it->second.prev, stamp >= os ? osub : it->second.prev_submit, stamp >= os ? site : it->second.site});
         cursor = y;
         it = g_ledger.erase(it);
     }
     if (cursor < end) {
-        add.push_back({cursor, end, stamp, writer, submit_now, false, 15u, 0u});
+        add.push_back({cursor, end, stamp, writer, submit_now, false, 15u, 0u, site});
     }
     for (const Seg& g : add) {
-        g_ledger.emplace(g.b, LedgerRange{g.e, g.s, g.w, g.sub, g.rw, g.prev, g.prev_sub});
+        g_ledger.emplace(g.b, LedgerRange{g.e, g.s, g.w, g.sub, g.rw, g.prev, g.prev_sub, g.site});
         g_ledger_max_len = std::max(g_ledger_max_len, g.e - g.b);
     }
 }
@@ -198,6 +206,7 @@ struct LedgerAnswer {
     u32 newest_submit{}; ///< the newest `g_submit_count` any write of the range was announced at (M1)
     u32 newest_prev{15}; ///< M3: the writer the newest write replaced
     u32 newest_prev_submit{0}; ///< M3: when that write was announced
+    u32 newest_site{};         ///< the call site id of the newest write
     u64 rewritten{}; ///< M3: bytes of the range some earlier write had covered before the newest one (the memory had an older version)
 };
 LedgerAnswer LedgerQuery(u64 begin, u64 end) {
@@ -217,6 +226,7 @@ LedgerAnswer LedgerQuery(u64 begin, u64 end) {
                 a.newest_writer = it->second.writer;
                 a.newest_prev = it->second.prev;
                 a.newest_prev_submit = it->second.prev_submit;
+                a.newest_site = it->second.site;
             }
             const u64 n = std::min(end, it->second.end) - std::max(begin, it->first);
             a.covered += n;
@@ -698,6 +708,27 @@ void ClassifyRingLookup(u64 address, u64 size, u32 binding_type) {
 void SetRing(u64 begin, u64 end) {
     g_ring_begin.store(begin, std::memory_order_relaxed);
     g_ring_end.store(end, std::memory_order_relaxed);
+}
+
+u32 SiteId(const char* name) {
+    if (name == nullptr) {
+        return 0;
+    }
+    std::scoped_lock lock{g_site_mutex};
+    for (u32 i = 0; i < g_site_names.size(); ++i) {
+        if (g_site_names[i] == name) {
+            return i;
+        }
+    }
+    if (g_site_names.size() >= MaxSites - 1) {
+        return 0;
+    }
+    g_site_names.emplace_back(name);
+    return static_cast<u32>(g_site_names.size() - 1);
+}
+
+void SetSite(u32 site) {
+    t_site = site;
 }
 
 void Announce(u32 writer, u64 address, u64 size, u64 stamp) {
@@ -1555,6 +1586,7 @@ std::atomic<u64> c_check[LateKinds][CheckClassCount]{};
 std::atomic<u64> c_check_bytes[LateKinds][CheckClassCount]{};
 std::atomic<u64> c_late_after_bytes_by_writer[LateKinds][16]{}; ///< bytes read late (the range was written after the record) by the writer of the newest write
 std::atomic<u64> c_late_after_by_writer[LateKinds][16]{};
+std::atomic<u64> c_late_after_by_site[LateKinds][MaxSites]{}, c_late_after_bytes_by_site[LateKinds][MaxSites]{}; ///< `TLG_WRITER_SITES`: the same by call site of the newest write
 std::atomic<u64> c_same_frame_after[LateKinds]{}; ///< reads that M0 counted as late (written after the record) but that were written before the record's submission
 std::atomic<u32> c_late_rare_noted[LateKinds]{}; ///< rare events written per kind (the first few only; the counters carry the rest)
 std::atomic<u64> c_check_record_seen{0}, c_check_no_record_after_a_record{0};
@@ -1654,6 +1686,8 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
         const u32 writer = std::min<u32>(a.newest_writer, 15u);
         c_late_after_by_writer[k][writer].fetch_add(1, std::memory_order_relaxed);
         c_late_after_bytes_by_writer[k][writer].fetch_add(size, std::memory_order_relaxed);
+        c_late_after_by_site[k][std::min<u32>(a.newest_site, MaxSites - 1)].fetch_add(1, std::memory_order_relaxed);
+        c_late_after_bytes_by_site[k][std::min<u32>(a.newest_site, MaxSites - 1)].fetch_add(size, std::memory_order_relaxed);
         if (c_late_rare_noted[k].fetch_add(1, std::memory_order_relaxed) < 3) {
             Core::RareEvents::Note(fmt::format("m0_late_read_written_after_its_record_{}", LateKindNames[k]), fmt::format("{:#x} + {:#x}: record {}, newest write stamp {}, writer {}", address, size, seq, a.newest, a.newest_writer));
         }
@@ -2104,6 +2138,14 @@ nlohmann::json Report() {
             for (u32 w = 0; w < 16; ++w) {
                 if (const u64 n = c_late_after_by_writer[k][w].load()) {
                     kj["written_after_by_writer"][std::to_string(w)] = {{"reads", n}, {"bytes", c_late_after_bytes_by_writer[k][w].load()}};
+                }
+            }
+            {
+                std::scoped_lock site_lock{g_site_mutex};
+                for (u32 i = 0; i < MaxSites; ++i) {
+                    if (const u64 n = c_late_after_by_site[k][i].load()) {
+                        kj["written_after_by_site"][i < g_site_names.size() ? g_site_names[i] : std::to_string(i)] = {{"reads", n}, {"bytes", c_late_after_bytes_by_site[k][i].load()}};
+                    }
                 }
             }
             for (u32 b = 0; b < 40; ++b) {
