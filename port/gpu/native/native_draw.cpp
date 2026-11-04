@@ -4592,6 +4592,12 @@ bool TakeDispatchBindings(u64 seq, RecordBinding* out, u32 max, u32& count) {
     return true;
 }
 
+std::string DescribeMissingRecord(u64 seq) {
+    const auto& slot = Slot(seq);
+    return fmt::format("slot holds record {} (kind {}), newest record made {}, newest consumed {}, slots {}", slot.seq.load(std::memory_order_acquire), slot.kind, next_seq.load(std::memory_order_relaxed) - 1,
+                       consumed_seq.load(std::memory_order_relaxed), RecordSlots);
+}
+
 bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed) {
     NoteConsumed(seq);
     const bool ok = TakeExecDrawImpl(seq, out, typed, NativeListOn());

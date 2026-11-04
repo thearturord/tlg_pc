@@ -151,7 +151,7 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
     Core::NativeDraw::ExecDraw draw;
     if (!rasterizer || !Core::NativeDraw::TakeExecDraw(native_tag_pending.seq, draw, true)) {
         native_tag_pending.valid = false;
-        TLG_LOG(CP, Error, "native draw: the record {} is gone, a draw is lost", native_tag_pending.seq);
+        TLG_LOG(CP, Error, "native draw: the record {} is gone, a draw is lost ({})", native_tag_pending.seq, Core::NativeDraw::DescribeMissingRecord(native_tag_pending.seq));
         return;
     }
     if (draw.kind == 10) {

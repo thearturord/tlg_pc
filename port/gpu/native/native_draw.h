@@ -281,6 +281,8 @@ u32 RecordUserData(u64 seq, u32* vs, u32* ps);
 
 /// Command processor: the record of a draw the hook executed natively. False when the record was overwritten.
 bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed = false);
+/// For the log when `TakeExecDraw` finds no record: what the slot holds and how far records were made and consumed.
+std::string DescribeMissingRecord(u64 seq);
 /// B9: the typed bindings of a dispatch record (kind 3). Fills `out` (up to `max` entries), sets `count`; returns true when the list is complete (none dropped, at least one).
 bool TakeDispatchBindings(u64 seq, RecordBinding* out, u32 max, u32& count);
 /// The call site (ghidra address) that made the record `seq`; 0 when the record was recycled.
