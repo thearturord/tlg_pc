@@ -11,6 +11,8 @@
 #include <memory>
 #include <string>
 #include <mutex>
+#include <set>
+#include <condition_variable>
 #include <unordered_set>
 #include <vector>
 #include <fmt/format.h>
@@ -624,6 +626,53 @@ bool InGpuAllocation(u64 address, u64 size) {
     }
     --it;
     return address + size <= it->first + it->second.size;
+}
+
+namespace {
+std::mutex g_done_mutex;
+std::condition_variable g_done_changed;
+std::set<u32> g_done_pending; // done submissions above the contiguous floor
+std::atomic<u32> g_done_floor{0};
+std::atomic<u64> c_done_wait_timeouts{0};
+} // namespace
+
+u32 SubmitCount() {
+    return g_submit_count.load(std::memory_order_acquire);
+}
+
+void NoteRasterSubmissionDone(u32 index) {
+    {
+        std::scoped_lock lock{g_done_mutex};
+        g_done_pending.insert(index);
+        u32 floor = g_done_floor.load(std::memory_order_relaxed);
+        while (!g_done_pending.empty() && *g_done_pending.begin() <= floor + 1) {
+            floor = std::max(floor, *g_done_pending.begin());
+            g_done_pending.erase(g_done_pending.begin());
+        }
+        g_done_floor.store(floor, std::memory_order_release);
+    }
+    g_done_changed.notify_all();
+}
+
+u32 RasterDoneSubmissions() {
+    return g_done_floor.load(std::memory_order_acquire);
+}
+
+void WaitRasterSubmissions(u32 target) {
+    std::unique_lock lock{g_done_mutex};
+    if (!g_done_changed.wait_for(lock, std::chrono::seconds(2), [target] { return g_done_floor.load(std::memory_order_acquire) >= target; })) {
+        c_done_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+u64 GateWaitTimeouts() {
+    return c_done_wait_timeouts.load(std::memory_order_relaxed);
+}
+
+u64 GpuAllocationSize(u64 address) {
+    std::scoped_lock lock{g_windows_mutex};
+    const auto it = g_gpu_windows.find(address);
+    return it != g_gpu_windows.end() ? it->second.size : 0;
 }
 
 void NoteGpuAllocation(u64 address, u64 size) {
@@ -1761,6 +1810,12 @@ void NoteHeapFree(u64 address) {
         g_heap_free_at.clear();
     }
     g_heap_free_at[address] = g_submit_count.load(std::memory_order_relaxed);
+}
+
+u32 HeapFreeAt(u64 address) {
+    std::scoped_lock lock{g_heap_free_mutex};
+    const auto it = g_heap_free_at.find(address);
+    return it == g_heap_free_at.end() ? 0u : it->second;
 }
 
 void CheckUploadMemory(u64 address, u64 size) {

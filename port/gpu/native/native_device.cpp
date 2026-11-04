@@ -11,6 +11,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "common/logging/log.h"
 #include "native/native_hooks.h"
@@ -24,6 +25,7 @@
 #include "native/native_image_caller.h"
 #include "native/native_content.h"
 #include "native/native_sync.h"
+#include "native/native_frame_gate.h"
 #include "native/native_tsharp_watch.h"
 
 namespace Core::NativeDevice {
@@ -76,6 +78,7 @@ std::atomic<u64> resources_noted{0}, views_noted{0}, deletes_noted{0}, deletes_u
 /// AddDelayDeleteObject (native-v3-writers): the game's own delay (frames until the object is freed) by age of the object's stamp, and the extra delay TLG_DELETE_DELAY adds
 std::atomic<u64> delay_by_age[6]{}, delay_added{0}, delay_requeued{0};
 std::atomic<u64> deferred_count{0}, deferred_released{0}, deferred_forced{0}, deferred_max_pending{0};
+std::atomic<u64> gate_frees{0}, gate_checks{0}, gate_hits{0}, gate_waited_frames{0}, gate_missed{0}, gate_missed_unsized{0};
 std::array<std::atomic<u64>, 9> live_by_kind{};
 
 constexpr const char* KindName(Kind kind) {
@@ -847,6 +850,7 @@ nlohmann::json Report() {
         }
         out["delete_by_stamp_age_0_1_2_3_over_3_negative"] = std::move(ages);
         out["delete_delay_added"] = delay_added.load();
+        out["loader_gate"] = {{"frees_noted", gate_frees.load()}, {"allocations_checked", gate_checks.load()}, {"allocations_that_waited", gate_hits.load()}, {"submissions_waited_for", gate_waited_frames.load()}, {"submit_count", Core::NativeContent::SubmitCount()}, {"raster_done_floor", Core::NativeContent::RasterDoneSubmissions()}, {"wait_timeouts", Core::NativeContent::GateWaitTimeouts()}, {"alloc_on_recently_freed_address_without_gate_entry", gate_missed.load()}, {"of_those_free_had_no_known_size", gate_missed_unsized.load()}};
         out["deferred_frees"] = {{"held", deferred_count.load()}, {"released", deferred_released.load()}, {"forced", deferred_forced.load()}, {"max_pending", deferred_max_pending.load()}};
     }
     out["unreadable_objects"] = bad_reads.load();
@@ -943,11 +947,121 @@ u32 DeferFrames() {
 
 } // namespace
 
+namespace {
+
+struct FreedRange {
+    u64 end;
+    u64 submitted; // graphics submissions announced when the memory was freed
+};
+std::mutex gate_mutex;
+std::map<u64, FreedRange> gate_freed;
+std::unordered_set<u64> gate_unsized; // freed addresses whose size was unknown
+std::unordered_map<u64, u64> gate_block_size; // live engine heap blocks: address -> size (every Gomalloc allocation, while the gate is on)
+
+bool LoaderGateOn() {
+    static const bool on = [] { const char* e = std::getenv("TLG_LOADER_GATE"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+
+void GateNoteFree(u64 address) {
+    u64 size = 0;
+    {
+        std::scoped_lock lock{gate_mutex};
+        const auto it = gate_block_size.find(address);
+        if (it != gate_block_size.end()) {
+            size = it->second;
+            gate_block_size.erase(it);
+        }
+    }
+    if (size == 0) {
+        std::scoped_lock lock{gate_mutex};
+        if (gate_unsized.size() > 100000) {
+            gate_unsized.clear();
+        }
+        gate_unsized.insert(address);
+        return;
+    }
+    const u64 submitted = Core::NativeContent::SubmitCount();
+    const u64 reached = Core::NativeContent::RasterDoneSubmissions();
+    std::scoped_lock lock{gate_mutex};
+    if (gate_freed.size() > 100000) {
+        for (auto it = gate_freed.begin(); it != gate_freed.end();) {
+            it = it->second.submitted <= reached ? gate_freed.erase(it) : std::next(it);
+        }
+    }
+    gate_freed[address] = {address + size, submitted};
+    gate_frees.fetch_add(1, std::memory_order_relaxed);
+}
+
+} // namespace
+
+void LoaderGateAtAllocation(u64 address, u64 size) {
+    if (!LoaderGateOn() || address == 0 || size == 0) {
+        return;
+    }
+    gate_checks.fetch_add(1, std::memory_order_relaxed);
+    const u64 end = address + size;
+    u64 need = 0;
+    {
+        std::scoped_lock lock{gate_mutex};
+        auto it = gate_freed.lower_bound(address);
+        if (it != gate_freed.begin()) {
+            const auto before = std::prev(it);
+            if (before->second.end > address) {
+                it = before;
+            }
+        }
+        while (it != gate_freed.end() && it->first < end) {
+            if (it->second.end > address) {
+                need = std::max(need, it->second.submitted);
+                it = gate_freed.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    if (need == 0) {
+        const u32 freed_at = Core::NativeContent::HeapFreeAt(address);
+        if (freed_at != 0 && freed_at > Core::NativeContent::RasterDoneSubmissions()) {
+            gate_missed.fetch_add(1, std::memory_order_relaxed);
+            std::scoped_lock lock{gate_mutex};
+            if (gate_unsized.contains(address)) {
+                gate_missed_unsized.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    if (need != 0 && Core::NativeContent::RasterDoneSubmissions() < need) {
+        gate_hits.fetch_add(1, std::memory_order_relaxed);
+        gate_waited_frames.fetch_add(need - Core::NativeContent::RasterDoneSubmissions(), std::memory_order_relaxed);
+        Core::NativeContent::WaitRasterSubmissions(static_cast<u32>(need));
+    }
+}
+
+u64 PS4_SYSV_ABI GomallocAlloc(u64 heap, u64 size, u64 alignment, u64 type, u64 a4, u64 a5, u64) {
+    static const u64 original = Core::GuestHooks::OriginalEntry("GomallocAlloc");
+    if (!LoaderGateOn() || original == 0) {
+        return 0; // the original runs
+    }
+    const u64 result = reinterpret_cast<GuestFunction6>(original)(heap, size, alignment, type, a4, a5);
+    if (result != 0) {
+        const u64 block = size == 0 ? 0x40 : static_cast<u32>(static_cast<u32>(size) + 0x3f) & 0xffffffc0u; // the allocator rounds up to 64 bytes
+        {
+            std::scoped_lock lock{gate_mutex};
+            gate_block_size[result] = block;
+        }
+        LoaderGateAtAllocation(result, block);
+    }
+    return 0x8000000000000000ull | (result & 0x7fffffffffffffffull);
+}
+
 u64 PS4_SYSV_ABI GomallocFree(u64 heap, u64 address, u64 a2, u64 a3, u64 a4, u64 a5, u64) {
     static const u64 original = Core::GuestHooks::OriginalEntry("GomallocFree");
     const u32 frames = DeferFrames();
     if (address != 0) {
         Core::NativeContent::NoteHeapFree(address);
+        if (LoaderGateOn()) {
+            GateNoteFree(address);
+        }
     }
     if (frames == 0 || original == 0 || heap == 0 || address == 0) {
         return 0; // the original runs

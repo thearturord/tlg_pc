@@ -117,6 +117,12 @@ u64 PS4_SYSV_ABI DelayDelete(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
 /// frames so the loader cannot reuse memory a frame in flight (raster thread, up to 2 frames behind) still reads; `DrainDeferredFrees` (called at the start of every frame) frees what is due.
 u64 PS4_SYSV_ABI GomallocFree(u64 heap, u64 address, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret);
 void DrainDeferredFrees();
+/// Hook `GomallocAlloc` (0x248fb10, `native_gomalloc_alloc`): the engine heap's allocation (heap, size, alignment, type). Runs the original; with `TLG_LOADER_GATE=1` remembers the block's size and
+/// waits at once when the block lies on memory freed while the raster thread had not finished the submissions that could read it.
+u64 PS4_SYSV_ABI GomallocAlloc(u64 heap, u64 size, u64 alignment, u64 type, u64 a4, u64 a5, u64 ret);
+/// native-v3-writers (`TLG_LOADER_GATE=1`): the engine's allocation (`address`, `size`; hooks AllocGarlicMemory / AllocOnionMemory) overlaps memory that was freed (hook GomallocFree) when the game
+/// had submitted `n` frames: the game thread waits until the raster thread has executed `n` frames, so the loader never overwrites memory a frame in flight still reads. Keeps normal memory reuse.
+void LoaderGateAtAllocation(u64 address, u64 size);
 
 /// B11 census: mid hooks at +6 (after the 6 bytes the B0 count hook displaced) of `JsDeviceContext::ClearRenderTargetView` (0x2483380: ctx, rtv, color[4]) and `ClearDepthStencilView` (0x24860c0: depth in
 /// xmm0, ctx, dsv, flags, stencil). They record the target and the value and bracket the packets the clear writes into the context's command buffer (its write cursor at

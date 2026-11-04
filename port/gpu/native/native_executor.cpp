@@ -261,6 +261,7 @@ void NativeExecutor::SubmitGfx(std::span<const u32> dcb, std::span<const u32> cc
     FLIGHT_SCOPE("command processor: graphics submission");
     auto announced = Core::NativeUpdates::TakeBatch(); // B2: applied on the raster thread before this submission's work
     Core::NativeContent::NoteSubmit(announced.first);  // M1: the frame data store (shadow) and the submission count
+    const u32 submit_index = Core::NativeContent::SubmitCount();
     auto& queue = mapped_queues[GfxQueueId];
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
@@ -275,6 +276,11 @@ void NativeExecutor::SubmitGfx(std::span<const u32> dcb, std::span<const u32> cc
     }
     Core::StreamProbe::NoteBuild(Core::FrameTimeline::Now() - build_start, direct && direct->pure, static_cast<u32>(dcb.size()));
     const bool run_direct = direct && Core::NativeDirect::ExecuteEnabled();
+    if (run_direct) {
+        direct->submit_index = submit_index;
+    } else {
+        Core::NativeContent::NoteRasterSubmissionDone(submit_index); // (not on the direct path: reported at once, the loader gate cannot wait for it)
+    }
     if (!announced.Empty()) {
         if (direct) {
             direct->announced_first = std::move(announced.first);

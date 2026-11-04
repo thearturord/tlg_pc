@@ -6,6 +6,7 @@
 #include <bit>
 #include <cstring>
 
+#include "native/native_content.h"
 #include "native/native_flight.h"
 #include "native/native_log.h"
 #include "native/native_raycast_cpu.h"
@@ -681,6 +682,10 @@ NativeExecutor::Task NativeExecutor::ProcessDirect(std::shared_ptr<Core::NativeD
         }
     }
     leave_clear();
+    if (direct->submit_index != 0) {
+        // everything this submission needs on the raster thread is queued before this item: it runs after it
+        RasterRun([index = direct->submit_index] { Core::NativeContent::NoteRasterSubmissionDone(index); });
+    }
     FIBER_EXIT;
 }
 

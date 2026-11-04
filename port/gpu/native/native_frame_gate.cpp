@@ -360,6 +360,22 @@ void NoteRasterReached() {
     changed.notify_all();
 }
 
+u64 SubmittedFrames() {
+    std::scoped_lock lock{mutex};
+    return submitted;
+}
+
+u64 RasterReachedFrames() {
+    std::scoped_lock lock{mutex};
+    return raster_reached;
+}
+
+void WaitRasterReachedFrames(u64 target_frames) {
+    static std::atomic<u64> waits{0}, wait_ns{0};
+    TLG_PROF_LEVEL("wait.loader_gate (game thread, a write into freed memory waits for the raster thread)", 1);
+    WaitFor([target_frames] { return raster_reached >= target_frames; }, waits, wait_ns, "wait for the raster thread (loader gate)");
+}
+
 void WaitOwnFrame() {
     const int mode = GameWaitMode();
     if (mode == 0) {

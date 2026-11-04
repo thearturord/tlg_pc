@@ -35,6 +35,7 @@ public:
     bool pure{true};
     bool markers{};
     bool complete{true}; ///< the list holds every entry (false: the build gave up: constant engine buffer, bad packet, indirect buffer it cannot follow)
+    u32 submit_index{}; ///< the graphics submission's number in the content ledger (`NativeContent::SubmitCount()` after its NoteSubmit); the raster thread reports it done at the task's end
     u32 depth{}; ///< ProcessGraphics frames running over this buffer (the top one and the indirect buffers it calls)
     std::vector<Entry> entries;
     std::vector<u32> pool; ///< the dwords of Packet entries longer than `Entry::words` (the entry's `seq` is the offset)

@@ -40,6 +40,12 @@ int GameWaitMode();
 bool GameWaitsOwnFrame();
 /// The raster thread passed the end of a frame (queued in order behind the frame's work, before its end-of-pipe signal)
 void NoteRasterReached();
+/// Frames the game has submitted, and frames the raster thread has reached the end of (loader gate: a writer that reuses freed memory waits until the raster thread has
+/// executed every frame that was submitted when the memory was freed).
+u64 SubmittedFrames();
+u64 RasterReachedFrames();
+/// Blocks (up to 2 s, counted and reported like the slot wait) until the raster thread has reached the end of `target_frames` frames.
+void WaitRasterReachedFrames(u64 target_frames);
 bool PresenterWaitsOwnFrame();
 
 /// M5b early interrupt (`TLG_OWNERSHIP_EARLY_IRQ=1`). The end-of-pipe interrupt of a frame is raised on whichever comes first: (a) the raster thread has recorded the frame and the occlusion

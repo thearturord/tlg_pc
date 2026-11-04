@@ -100,6 +100,19 @@ void NoteCopy(u64 destination, u64 source, u64 size);
 void NoteDeleted(u64 address, u64 size);
 /// The engine's memory free (Gomalloc, hook GomallocFree) of `address` was called: remembered with the submission count (late read samples print it)
 void NoteHeapFree(u64 address);
+/// Size of the engine GPU allocation that starts at `address` (0 when unknown)
+u64 GpuAllocationSize(u64 address);
+/// The submission count at the engine's last free of exactly `address` (0: never seen)
+[[nodiscard]] u32 HeapFreeAt(u64 address);
+/// Graphics submissions announced so far (the number the newest submission has in the ledger)
+[[nodiscard]] u32 SubmitCount();
+/// Raster thread: everything submission `index` carried was executed (called through `RasterRun`, in order behind the submission's work). Submissions that do not travel the direct path are reported
+/// at once by the submit. `RasterDoneSubmissions()` is the highest number below which every submission is done.
+void NoteRasterSubmissionDone(u32 index);
+[[nodiscard]] u32 RasterDoneSubmissions();
+/// Blocks (up to 2 s, then gives up and counts it) until `RasterDoneSubmissions() >= target`.
+void WaitRasterSubmissions(u32 target);
+[[nodiscard]] u64 GateWaitTimeouts();
 /// A Map the hook saw (counted by resource kind, map type and the path taken, see Report "maps_note").
 void CountMap(u32 kind, u32 type, u32 path);
 /// A write whose bytes are not kept (it announces nothing or before it writes): only the range and the order are remembered, so a differing upload can be attributed (writers: 1 skin, 2 lights,
