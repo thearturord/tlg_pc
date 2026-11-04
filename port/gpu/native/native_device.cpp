@@ -79,6 +79,7 @@ std::atomic<u64> resources_noted{0}, views_noted{0}, deletes_noted{0}, deletes_u
 std::atomic<u64> delay_by_age[6]{}, delay_added{0}, delay_requeued{0};
 std::atomic<u64> deferred_count{0}, deferred_released{0}, deferred_forced{0}, deferred_max_pending{0};
 std::atomic<u64> slot_advances{0}, slot_waits{0}, slot_waited_submissions{0};
+std::atomic<u64> skin_writes{0}, skin_waits{0}, skin_waited_submissions{0};
 std::atomic<u64> gate_frees{0}, gate_checks{0}, gate_hits{0}, gate_waited_frames{0}, gate_missed{0}, gate_missed_unsized{0}, gate_window_open{0};
 std::array<std::atomic<u64>, 9> live_by_kind{};
 
@@ -852,6 +853,7 @@ nlohmann::json Report() {
         out["delete_by_stamp_age_0_1_2_3_over_3_negative"] = std::move(ages);
         out["delete_delay_added"] = delay_added.load();
         out["slot_gate"] = {{"group_advances", slot_advances.load()}, {"advances_that_waited", slot_waits.load()}, {"submissions_waited_for", slot_waited_submissions.load()}};
+        out["skin_gate"] = {{"matrix_slot_writes", skin_writes.load()}, {"writes_that_waited", skin_waits.load()}, {"submissions_waited_for", skin_waited_submissions.load()}};
         out["loader_gate"] = {{"frees_noted", gate_frees.load()}, {"allocations_checked", gate_checks.load()}, {"allocations_that_waited", gate_hits.load()}, {"submissions_waited_for", gate_waited_frames.load()}, {"submit_count", Core::NativeContent::SubmitCount()}, {"raster_done_floor", Core::NativeContent::RasterDoneSubmissions()}, {"wait_timeouts", Core::NativeContent::GateWaitTimeouts()}, {"alloc_on_recently_freed_address_without_gate_entry", gate_missed.load()}, {"of_those_free_had_no_known_size", gate_missed_unsized.load()}, {"alloc_in_the_window_of_the_free_not_waitable", gate_window_open.load()}};
         out["deferred_frees"] = {{"held", deferred_count.load()}, {"released", deferred_released.load()}, {"forced", deferred_forced.load()}, {"max_pending", deferred_max_pending.load()}};
     }
@@ -1074,6 +1076,26 @@ void SceneGroupAdvanced(u32 new_group) {
         slot_waited_submissions.fetch_add(need - Core::NativeContent::RasterDoneSubmissions(), std::memory_order_relaxed);
         Core::NativeContent::WaitRasterSubmissions(need);
     }
+}
+
+void SkinSlotAboutToWrite(u32 index) {
+    static const int mode = [] { const char* e = std::getenv("TLG_SKIN_GATE"); return e != nullptr ? std::atoi(e) : 0; }();
+    static u32 written_at[4]{}; // SubmitCount() when the slot was last written (0 = never)
+    if (mode < 1 || index >= 4) {
+        return;
+    }
+    skin_writes.fetch_add(1, std::memory_order_relaxed);
+    const u32 count = Core::NativeContent::SubmitCount();
+    // The ring has 4 slots and two passes per frame advance it, so slot `index` is written again two frames after its last write. The draws and dispatches that read it sit in submissions
+    // announced by the time the following frame began, which is when the slot two passes after `index` was written: wait until the raster thread has finished those.
+    const u32 following = written_at[(index + 2) & 3];
+    const u32 need = std::min<u32>(following, count);
+    if (following != 0 && need > Core::NativeContent::RasterDoneSubmissions()) {
+        skin_waits.fetch_add(1, std::memory_order_relaxed);
+        skin_waited_submissions.fetch_add(need - Core::NativeContent::RasterDoneSubmissions(), std::memory_order_relaxed);
+        Core::NativeContent::WaitRasterSubmissions(need);
+    }
+    written_at[index] = count;
 }
 
 u64 PS4_SYSV_ABI GomallocAlloc(u64 heap, u64 size, u64 alignment, u64 type, u64 a4, u64 a5, u64) {

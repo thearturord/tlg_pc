@@ -6880,6 +6880,15 @@ u64 PS4_SYSV_ABI InstanceLoop(u64 holder, u64 scene, u64 a2, u64 a3, u64 a4, u64
 void SkinWritesAnnounce(u64 ring, u64 scene);
 u64 PS4_SYSV_ABI SkinWrites(u64 ring, u64 scene, u64 flag, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
     (void)a3, (void)a4, (void)a5, (void)ret, (void)caller_rsp;
+    if (IsHeapPointer(ring) && IsHeapPointer(scene)) {
+        // TLG_SKIN_GATE: the slot the original is about to write must not still be read by a frame the raster thread has not finished
+        Guarded([&]() -> u64 {
+            if (Rd<u64>(scene, 0x29e00) != 0) {
+                NativeDevice::SkinSlotAboutToWrite((Rd<u32>(ring, 0x40) + 1) & 3);
+            }
+            return 0;
+        });
+    }
     if (NativeZPassGen::SkinEnabled() && IsHeapPointer(ring) && IsHeapPointer(scene)) {
         // B3: the loop is generated; the announcement of its writes stays (it reads the same objects)
         static const u64 loop_entry = Core::GuestHooks::OriginalEntry("SkinWrites");

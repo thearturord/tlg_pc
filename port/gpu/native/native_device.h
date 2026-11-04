@@ -127,6 +127,9 @@ void LoaderGateAtAllocation(u64 address, u64 size);
 /// the group (`(group + 1) % 3`, variable 0x69b1678) about twice per frame, so a group is written again after about 3 graphics submissions, sooner than the raster thread can be (it may lag 2 frames).
 /// When the group `new_group` is about to be written again, the game thread waits until the raster thread has finished the submissions that could still read its old contents.
 void SceneGroupAdvanced(u32 new_group);
+/// native-v3-writers (`TLG_SKIN_GATE=1`, called by the `SkinWrites` hook before the original): the skinning matrix ring has 4 slots and two passes per frame, so a slot is written again two frames
+/// after its last write. When slot `index` is about to be written, the game thread waits until the raster thread has finished the submissions that could still read its old contents.
+void SkinSlotAboutToWrite(u32 index);
 
 /// B11 census: mid hooks at +6 (after the 6 bytes the B0 count hook displaced) of `JsDeviceContext::ClearRenderTargetView` (0x2483380: ctx, rtv, color[4]) and `ClearDepthStencilView` (0x24860c0: depth in
 /// xmm0, ctx, dsv, flags, stencil). They record the target and the value and bracket the packets the clear writes into the context's command buffer (its write cursor at
