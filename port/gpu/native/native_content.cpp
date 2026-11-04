@@ -1769,10 +1769,17 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
         c_late_after_bytes_by_writer[k][writer].fetch_add(size, std::memory_order_relaxed);
         c_late_after_by_site[k][std::min<u32>(a.newest_site, MaxSites - 1)].fetch_add(1, std::memory_order_relaxed);
         {
-            const size_t marker = submit == 0 ? 2 : RasterDoneSubmissions() >= submit + 1 ? 1 : 0;
+            const size_t marker = submit == 0 ? 2 : RasterDoneSubmissions() >= submit ? 1 : 0; // SubmitIndexOf is the (1 based) submission that carries the record: done when the floor reached it (a read after that has a stale record: the raster thread is on a later task)
             c_late_marker[k][marker].fetch_add(1, std::memory_order_relaxed);
             if (marker == 0) {
                 c_late_notdone_by_site[k][std::min<u32>(a.newest_site, MaxSites - 1)].fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<u32> before_marker_examples{0};
+                if (before_marker_examples.fetch_add(1, std::memory_order_relaxed) < 40) {
+                    Core::RareEvents::Note("late_read_before_done_marker",
+                                           fmt::format("{} {:#x} + {:#x} (rewritten {:#x}): record submit {}, raster done floor {}, submit count now {}, newest write announced at {} (site {}, writer {}), previous write at {}, freed by the engine at {}",
+                                                       LateKindNames[k], address, size, a.rewritten, submit, RasterDoneSubmissions(), g_submit_count.load(std::memory_order_relaxed), a.newest_submit,
+                                                       a.newest_site < g_site_names.size() ? g_site_names[a.newest_site] : std::string("?"), a.newest_writer, a.newest_prev_submit, HeapFreeAt(address)));
+                }
             }
         }
         if (a.rewritten != 0) {

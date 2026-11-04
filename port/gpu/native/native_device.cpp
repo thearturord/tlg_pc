@@ -79,7 +79,7 @@ std::atomic<u64> resources_noted{0}, views_noted{0}, deletes_noted{0}, deletes_u
 std::atomic<u64> delay_by_age[6]{}, delay_added{0}, delay_requeued{0};
 std::atomic<u64> deferred_count{0}, deferred_released{0}, deferred_forced{0}, deferred_max_pending{0};
 std::atomic<u64> slot_advances{0}, slot_waits{0}, slot_waited_submissions{0};
-std::atomic<u64> gate_frees{0}, gate_checks{0}, gate_hits{0}, gate_waited_frames{0}, gate_missed{0}, gate_missed_unsized{0};
+std::atomic<u64> gate_frees{0}, gate_checks{0}, gate_hits{0}, gate_waited_frames{0}, gate_missed{0}, gate_missed_unsized{0}, gate_window_open{0};
 std::array<std::atomic<u64>, 9> live_by_kind{};
 
 constexpr const char* KindName(Kind kind) {
@@ -852,7 +852,7 @@ nlohmann::json Report() {
         out["delete_by_stamp_age_0_1_2_3_over_3_negative"] = std::move(ages);
         out["delete_delay_added"] = delay_added.load();
         out["slot_gate"] = {{"group_advances", slot_advances.load()}, {"advances_that_waited", slot_waits.load()}, {"submissions_waited_for", slot_waited_submissions.load()}};
-        out["loader_gate"] = {{"frees_noted", gate_frees.load()}, {"allocations_checked", gate_checks.load()}, {"allocations_that_waited", gate_hits.load()}, {"submissions_waited_for", gate_waited_frames.load()}, {"submit_count", Core::NativeContent::SubmitCount()}, {"raster_done_floor", Core::NativeContent::RasterDoneSubmissions()}, {"wait_timeouts", Core::NativeContent::GateWaitTimeouts()}, {"alloc_on_recently_freed_address_without_gate_entry", gate_missed.load()}, {"of_those_free_had_no_known_size", gate_missed_unsized.load()}};
+        out["loader_gate"] = {{"frees_noted", gate_frees.load()}, {"allocations_checked", gate_checks.load()}, {"allocations_that_waited", gate_hits.load()}, {"submissions_waited_for", gate_waited_frames.load()}, {"submit_count", Core::NativeContent::SubmitCount()}, {"raster_done_floor", Core::NativeContent::RasterDoneSubmissions()}, {"wait_timeouts", Core::NativeContent::GateWaitTimeouts()}, {"alloc_on_recently_freed_address_without_gate_entry", gate_missed.load()}, {"of_those_free_had_no_known_size", gate_missed_unsized.load()}, {"alloc_in_the_window_of_the_free_not_waitable", gate_window_open.load()}};
         out["deferred_frees"] = {{"held", deferred_count.load()}, {"released", deferred_released.load()}, {"forced", deferred_forced.load()}, {"max_pending", deferred_max_pending.load()}};
     }
     out["unreadable_objects"] = bad_reads.load();
@@ -1030,6 +1030,16 @@ void LoaderGateAtAllocation(u64 address, u64 size) {
             if (gate_unsized.contains(address)) {
                 gate_missed_unsized.fetch_add(1, std::memory_order_relaxed);
             }
+        }
+    }
+    if (need != 0) {
+        // the free was announced at submission count `need`: draws recorded before it in that window belong to submission need + 1 (a record's submission is the first announced after it), so that one has to be
+        // done too. When it is not announced yet (count still `need`) nothing can be waited for: the loader writes before the draws leave (counted)
+        const u64 count = Core::NativeContent::SubmitCount();
+        if (need < count) {
+            need += 1;
+        } else {
+            gate_window_open.fetch_add(1, std::memory_order_relaxed);
         }
     }
     if (need != 0 && Core::NativeContent::RasterDoneSubmissions() < need) {
