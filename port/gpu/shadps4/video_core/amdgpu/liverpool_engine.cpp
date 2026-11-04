@@ -111,7 +111,7 @@ void Liverpool::ApplyStateTemplate(const Core::NativeDraw::StateTemplate& state)
     using Core::NativeDraw::StateWrite;
     for (const StateWrite& write : state.writes) {
         if (write.kind == StateWrite::Sh && write.reg >= 0x200 && write.reg <= (0x200 + sizeof(ComputeProgram) / 4)) {
-            reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state)[write.reg - 0x200] = write.value;
+            reinterpret_cast<u32*>(&cs_states[GfxQueueId])[write.reg - 0x200] = write.value;
         }
     }
 }

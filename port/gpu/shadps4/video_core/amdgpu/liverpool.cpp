@@ -51,12 +51,6 @@
 #include "video_core/renderer_vulkan/vk_fixed_state.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
-#ifdef _WIN32
-extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void);
-static u32 GetCurrentThreadIdForProfile() {
-    return static_cast<u32>(GetCurrentThreadId());
-}
-#endif
 
 namespace AmdGpu {
 
@@ -137,56 +131,8 @@ void Liverpool::BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
     }
     rasterizer = rasterizer_;
     if (rasterizer && EmulatorSettings.GetCpSplitMode() != 0 && !split) {
-        StartRasterSplit();
+        StartRasterSplit(raster_consumer);
     }
-}
-
-void Liverpool::StartRasterSplit() {
-    split = std::make_unique<RasterSplit>();
-    split_active = true;
-    split->Start(raster_consumer, EmulatorSettings.GetCpSplitMode() >= 2);
-}
-
-void Liverpool::StopRasterSplit() {
-    if (!split) {
-        return;
-    }
-    split->Stop();
-}
-
-bool Liverpool::RasterIdle() const noexcept {
-    return !split_active || split->Idle();
-}
-
-void Liverpool::WakeRaster() {
-    if (split_active) {
-        split->Wake();
-    }
-}
-
-
-void Liverpool::DrainRaster() {
-    if (!split_active) {
-        return;
-    }
-    split->Drain();
-}
-
-void Liverpool::RasterPush(RasterOp&& op, bool wait) {
-    split->Push(std::move(op), wait);
-}
-
-void Liverpool::RasterRun(Common::UniqueFunction<void>&& func, bool wait, bool writes_memory,
-                          std::source_location site) {
-    if (!split_active) {
-        func();
-        return;
-    }
-    split->PushClosure(std::move(func), wait, writes_memory, site);
-}
-
-void Liverpool::DrainRasterWrites(u32 caller) {
-    split->DrainWrites(caller);
 }
 
 u32 Liverpool::LookupDrain(u32 caller) {
@@ -910,8 +856,7 @@ void Liverpool::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 now) {
 
 
 Liverpool::Liverpool()
-    : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
-      fence_wait_shortcut{[] {
+    : fence_wait_shortcut{[] {
           // dark frame experiment (`TLG_FENCE_SHORTCUT=0..3`): the level of the fence wait shortcut for this run, over the settings (1: the compute queues' waits poll memory instead of
           // passing on a fence the other queue has only recorded; 0: no queue passes early)
           if (const char* e = std::getenv("TLG_FENCE_SHORTCUT"); e != nullptr && *e >= '0' && *e <= '3') {
@@ -920,13 +865,11 @@ Liverpool::Liverpool()
           return static_cast<u32>(EmulatorSettings.GetReadbackFenceWaitShortcut());
       }()} {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
-    process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
+    StartProcess();
 }
 
 Liverpool::~Liverpool() {
-    process_thread.request_stop();
-    process_thread.join();
-    StopRasterSplit();
+    StopProcess();
 }
 
 Liverpool::FenceMatch Liverpool::MatchRecordedFence(const Core::NativeSync::LabelWait& wait_reg_mem) {
@@ -1076,141 +1019,6 @@ bool Liverpool::ShouldYieldToOtherQueue(u64& last_ns) {
     return true;
 }
 
-void Liverpool::ProcessCommands() {
-    if (split_active && std::this_thread::get_id() != gpu_id) {
-        return; // The raster thread runs the callbacks.
-    }
-    // Process incoming commands with high priority
-    while (num_commands) {
-        Common::UniqueFunction<void> callback{};
-        {
-            std::scoped_lock lk{submit_mutex};
-            callback = std::move(command_queue.front());
-            command_queue.pop();
-            --num_commands;
-        }
-        VideoCore::ReadbackStats::CpPhase phase{"guest command (SendCommand)"};
-        VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::GuestCommand};
-        callback();
-    }
-}
-
-void Liverpool::Process(std::stop_token stoken) {
-    Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
-    if (const u32 priority = EmulatorSettings.GetCpThreadPriority(); priority >= 2) {
-        Common::SetCurrentThreadPriority(static_cast<Common::ThreadPriority>(priority));
-    }
-    gpu_id = std::this_thread::get_id();
-    front_id = gpu_id;
-    if (const s32 core = EmulatorSettings.GetCpFrontCore(); core >= 0) {
-        VideoCore::PinThreadAndIsolateCore(static_cast<u32>(core));
-    }
-    VideoCore::ReadbackStats::MarkCpThread();
-    VideoCore::ReadbackStats::RegisterSampledThread("cp");
-#ifdef __linux__
-    gpu_tid = gettid();
-#elif defined(_WIN32)
-    gpu_tid = GetCurrentThreadIdForProfile();
-#endif
-
-    while (!stoken.stop_requested()) {
-        VideoCore::ReadbackTrace::NoteMark("front_wait");
-        {
-            VideoCore::ReadbackStats::CpTimer idle_timer{VideoCore::ReadbackStats::CpTime::Idle};
-            std::unique_lock lk{submit_mutex};
-            if (split_active) {
-                split->front_state.store(1, std::memory_order_relaxed);
-            }
-            Common::CondvarWait(submit_cv, lk, stoken, [this] {
-                return (!split_active && num_commands) || num_submits || submit_done;
-            });
-            if (split_active) {
-                split->front_state.store(0, std::memory_order_relaxed);
-            }
-        }
-        if (stoken.stop_requested()) {
-            break;
-        }
-
-        VideoCore::StartCapture();
-        VideoCore::ReadbackTrace::NoteMark("submit_begin");
-
-        curr_qid = -1;
-
-        while (num_submits || (!split_active && num_commands)) {
-            ProcessCommands();
-
-            curr_qid = (curr_qid + 1) % num_mapped_queues;
-
-            auto& queue = mapped_queues[curr_qid];
-
-            Task::Handle task{};
-            {
-                std::scoped_lock lock{queue.m_access};
-                if (queue.submits.empty()) {
-                    continue;
-                }
-                task = queue.submits.front();
-            }
-            const u64 resume_start = Core::FrameTimeline::capture_active.load(std::memory_order_relaxed) ? Core::FrameTimeline::Now() : 0;
-            Core::ResourceAudit::front_class = static_cast<u8>(curr_qid);
-            task.resume();
-            Core::ResourceAudit::front_class = Core::ResourceAudit::NoClass;
-            if (resume_start != 0) {
-                const u64 resume_end = Core::FrameTimeline::Now();
-                Core::FrameTimeline::Record(Core::FrameTimeline::CpResume, static_cast<u64>(curr_qid) | (task.done() ? 0x100u : 0u), resume_end, resume_end - resume_start);
-            }
-
-            if (task.done()) {
-                bool was_partial = false;
-                {
-                    std::scoped_lock partial_lock{partial_mutex};
-                    was_partial = partial_handles.erase(task.address()) != 0;
-                }
-                task.destroy();
-
-                std::scoped_lock lock{queue.m_access};
-                queue.submits.pop();
-
-                --num_submits;
-                if (was_partial) {
-                    partial_pending.fetch_sub(1, std::memory_order_acq_rel);
-                }
-                std::scoped_lock lock2{submit_mutex};
-                submit_cv.notify_all();
-                if (!was_partial && stream_open.load(std::memory_order_acquire) != 0 && num_submits <= partial_pending.load(std::memory_order_acquire)) {
-                    // everything the game submitted is done; the spans streamed for the frame it is still recording do not count: the game gets its idle signal now
-                    RasterRun([] { Core::NativeFrameEvents::GpuIdle(); });
-                }
-            }
-        }
-
-        const bool submit_was_done = submit_done;
-        if (submit_done) {
-            VideoCore::EndCapture();
-            if (rasterizer) {
-                RasterRun([this] {
-                    VideoCore::ReadbackStats::CpPhase phase{"end of submit (readbacks, flush)"};
-                    VideoCore::ReadbackStats::CpTimer timer{
-                        VideoCore::ReadbackStats::CpTime::SubmitEnd};
-                    rasterizer->OnSubmit();
-                    rasterizer->Flush();
-                });
-            }
-            submit_done = false;
-        }
-
-        Core::FrameTimeline::Mark(Core::FrameTimeline::CpIdleQueued, submit_was_done ? 1 : 0);
-        if (stream_open.load(std::memory_order_acquire) != 0) {
-            continue; // the frame is still being recorded: the real submit is yet to come, the GPU is not idle
-        }
-        RasterRun([] {
-            Core::FrameTimeline::Mark(Core::FrameTimeline::RasterIdleSignal);
-            Core::NativeFrameEvents::GpuIdle();
-        });
-    }
-}
-
 /// A wait of the graphics queue on a memory label (the walk's WaitRegMem case for a tag): tests the label, passes on the recorded
 /// fence timeline, and yields to the other queues until the label has the value.
 Liverpool::Task Liverpool::DirectWaitDisplay(u32 buffer) {
@@ -1307,7 +1115,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     FIBER_EXIT;
 }
 
-template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, std::shared_ptr<Core::NativeDirect::Buffer> direct) {
     FIBER_ENTER(acb_task_name[vqid]);
     static std::atomic<u32> logged{0};
@@ -1317,115 +1124,16 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, st
     FIBER_EXIT;
 }
 
-Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb) {
-    auto& queue = mapped_queues[GfxQueueId];
-    ASSERT_MSG(queue.dcb_buffer.capacity() >= queue.dcb_buffer_offset + dcb.size(),
-               "dcb copy buffer out of reserved space");
-    ASSERT_MSG(queue.ccb_buffer.capacity() >= queue.ccb_buffer_offset + ccb.size(),
-               "ccb copy buffer out of reserved space");
-
-    queue.dcb_buffer.resize(
-        std::max(queue.dcb_buffer.size(), queue.dcb_buffer_offset + dcb.size()));
-    queue.ccb_buffer.resize(
-        std::max(queue.ccb_buffer.size(), queue.ccb_buffer_offset + ccb.size()));
-
-    const u32 prev_dcb_buffer_offset = queue.dcb_buffer_offset;
-    const u32 prev_ccb_buffer_offset = queue.ccb_buffer_offset;
-    if (!dcb.empty()) {
-        std::memcpy(queue.dcb_buffer.data() + queue.dcb_buffer_offset, dcb.data(),
-                    dcb.size_bytes());
-        queue.dcb_buffer_offset += dcb.size();
-        dcb = std::span<const u32>{queue.dcb_buffer.begin() + prev_dcb_buffer_offset,
-                                   queue.dcb_buffer.begin() + queue.dcb_buffer_offset};
+void Liverpool::SubmitEnd() {
+    if (rasterizer) {
+        RasterRun([this] {
+            VideoCore::ReadbackStats::CpPhase phase{"end of submit (readbacks, flush)"};
+            VideoCore::ReadbackStats::CpTimer timer{
+                VideoCore::ReadbackStats::CpTime::SubmitEnd};
+            rasterizer->OnSubmit();
+            rasterizer->Flush();
+        });
     }
-
-    if (!ccb.empty()) {
-        std::memcpy(queue.ccb_buffer.data() + queue.ccb_buffer_offset, ccb.data(),
-                    ccb.size_bytes());
-        queue.ccb_buffer_offset += ccb.size();
-        ccb = std::span<const u32>{queue.ccb_buffer.begin() + prev_ccb_buffer_offset,
-                                   queue.ccb_buffer.begin() + queue.ccb_buffer_offset};
-    }
-
-    return std::make_pair(dcb, ccb);
-}
-
-void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bool partial) {
-    Core::Flight::Add(Core::Flight::SubmitBegin, 0, dcb.size(), 0); // L1
-    FLIGHT_SCOPE("command processor: graphics submission");
-    auto announced = Core::NativeUpdates::TakeBatch(); // B2: applied on the raster thread before this submission's work
-    Core::NativeContent::NoteSubmit(announced.first);  // M1: the frame data store (shadow) and the submission count
-    auto& queue = mapped_queues[GfxQueueId];
-
-    if (EmulatorSettings.IsCopyGpuBuffers()) {
-        std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
-    }
-
-    const u64 build_start = Core::FrameTimeline::Now();
-    auto direct = Core::NativeDirect::Build(0, dcb.data(), static_cast<u32>(dcb.size()), !ccb.empty(), guest_markers_enabled);
-    if (direct) {
-        // B11: the engine's clears written into this command buffer travel with it
-        Core::NativeDevice::TakeClears(direct->begin, direct->begin + u64{direct->dwords} * 4, direct->clears);
-    }
-    Core::StreamProbe::NoteBuild(Core::FrameTimeline::Now() - build_start, direct && direct->pure, static_cast<u32>(dcb.size()));
-    const bool run_direct = direct && Core::NativeDirect::ExecuteEnabled();
-    if (!announced.Empty()) {
-        if (direct) {
-            direct->announced_first = std::move(announced.first);
-            direct->announced_again = std::move(announced.again);
-            direct->announced_deleted = std::move(announced.deleted);
-        } else {
-            RasterRun([batch = std::move(announced)] { Core::NativeUpdates::ApplyBatch(batch); });
-        }
-    }
-    auto task = run_direct ? ProcessDirect(direct, ccb) : ProcessGraphics(dcb, ccb, std::move(direct));
-    Core::NativeDraw::Live().direct_executed.fetch_add(run_direct ? 1 : 0, std::memory_order_relaxed);
-    if (partial) {
-        std::scoped_lock lock{partial_mutex};
-        partial_handles.insert(task.handle.address());
-        partial_pending.fetch_add(1, std::memory_order_acq_rel);
-    }
-    {
-        std::scoped_lock lock{queue.m_access};
-        queue.submits.emplace(task.handle);
-    }
-
-    std::scoped_lock lk{submit_mutex};
-    ++num_submits;
-    submit_cv.notify_one();
-    Core::Flight::Add(Core::Flight::SubmitEnd, 0, 0); // L1
-}
-
-void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
-    Core::Flight::Add(Core::Flight::SubmitBegin, 0, acb.size(), gnm_vqid); // L1
-    FLIGHT_SCOPE("command processor: compute submission");
-    ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
-    auto announced = Core::NativeUpdates::TakeBatch();
-    auto& queue = mapped_queues[gnm_vqid];
-
-    const auto vqid = gnm_vqid - 1;
-    auto direct = Core::NativeDirect::Build(gnm_vqid, acb.data(), static_cast<u32>(acb.size()), false, guest_markers_enabled);
-    if (!announced.Empty()) {
-        if (direct) {
-            direct->announced_first = std::move(announced.first);
-            direct->announced_again = std::move(announced.again);
-            direct->announced_deleted = std::move(announced.deleted);
-        } else {
-            RasterRun([batch = std::move(announced)] { Core::NativeUpdates::ApplyBatch(batch); });
-        }
-    }
-    const bool run_direct = direct && Core::NativeDirect::ExecuteEnabled();
-    const auto& task = run_direct ? ProcessDirectAsc(direct, vqid) : ProcessCompute(acb, vqid, std::move(direct));
-    Core::NativeDraw::Live().direct_executed_asc.fetch_add(run_direct ? 1 : 0, std::memory_order_relaxed);
-    {
-        std::scoped_lock lock{queue.m_access};
-        queue.submits.emplace(task.handle);
-    }
-
-    std::scoped_lock lk{submit_mutex};
-    num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
-    ++num_submits;
-    submit_cv.notify_one();
 }
 
 } // namespace AmdGpu
