@@ -104,8 +104,8 @@ GraphicsPipeline::GraphicsPipeline(
         .topology = topology,
     };
 
-    const bool is_rect_list = key.prim_type == AmdGpu::PrimitiveType::RectList;
-    const bool is_quad_list = key.prim_type == AmdGpu::PrimitiveType::QuadList;
+    const bool is_rect_list = key.prim_type == Core::NativePrimitive::Kind::RectList;
+    const bool is_quad_list = key.prim_type == Core::NativePrimitive::Kind::QuadList;
     const vk::PipelineTessellationStateCreateInfo tessellation_state = {
         .patchControlPoints = is_rect_list ? 3U : (is_quad_list ? 4U : key.patch_control_points),
     };

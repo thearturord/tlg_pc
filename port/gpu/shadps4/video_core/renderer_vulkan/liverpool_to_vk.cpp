@@ -79,26 +79,26 @@ vk::CompareOp CompareOp(Core::NativeTarget::CompareFunc func) {
     }
 }
 
-bool IsPrimitiveCulled(AmdGpu::PrimitiveType type) {
+bool IsPrimitiveCulled(Core::NativePrimitive::Kind type) {
     switch (type) {
-    case AmdGpu::PrimitiveType::TriangleList:
-    case AmdGpu::PrimitiveType::TriangleFan:
-    case AmdGpu::PrimitiveType::TriangleStrip:
-    case AmdGpu::PrimitiveType::PatchPrimitive:
-    case AmdGpu::PrimitiveType::AdjTriangleList:
-    case AmdGpu::PrimitiveType::AdjTriangleStrip:
-    case AmdGpu::PrimitiveType::QuadList:
-    case AmdGpu::PrimitiveType::QuadStrip:
-    case AmdGpu::PrimitiveType::Polygon:
+    case Core::NativePrimitive::Kind::TriangleList:
+    case Core::NativePrimitive::Kind::TriangleFan:
+    case Core::NativePrimitive::Kind::TriangleStrip:
+    case Core::NativePrimitive::Kind::PatchPrimitive:
+    case Core::NativePrimitive::Kind::AdjTriangleList:
+    case Core::NativePrimitive::Kind::AdjTriangleStrip:
+    case Core::NativePrimitive::Kind::QuadList:
+    case Core::NativePrimitive::Kind::QuadStrip:
+    case Core::NativePrimitive::Kind::Polygon:
         return true;
-    case AmdGpu::PrimitiveType::None:
-    case AmdGpu::PrimitiveType::PointList:
-    case AmdGpu::PrimitiveType::LineList:
-    case AmdGpu::PrimitiveType::LineStrip:
-    case AmdGpu::PrimitiveType::AdjLineList:
-    case AmdGpu::PrimitiveType::AdjLineStrip:
-    case AmdGpu::PrimitiveType::RectList: // Screen-aligned rectangles that are not culled
-    case AmdGpu::PrimitiveType::LineLoop:
+    case Core::NativePrimitive::Kind::None:
+    case Core::NativePrimitive::Kind::PointList:
+    case Core::NativePrimitive::Kind::LineList:
+    case Core::NativePrimitive::Kind::LineStrip:
+    case Core::NativePrimitive::Kind::AdjLineList:
+    case Core::NativePrimitive::Kind::AdjLineStrip:
+    case Core::NativePrimitive::Kind::RectList: // Screen-aligned rectangles that are not culled
+    case Core::NativePrimitive::Kind::LineLoop:
         return false;
     default:
         UNREACHABLE();
@@ -106,36 +106,36 @@ bool IsPrimitiveCulled(AmdGpu::PrimitiveType type) {
     }
 }
 
-vk::PrimitiveTopology PrimitiveType(AmdGpu::PrimitiveType type) {
+vk::PrimitiveTopology PrimitiveType(Core::NativePrimitive::Kind type) {
     switch (type) {
-    case AmdGpu::PrimitiveType::PointList:
+    case Core::NativePrimitive::Kind::PointList:
         return vk::PrimitiveTopology::ePointList;
-    case AmdGpu::PrimitiveType::LineList:
+    case Core::NativePrimitive::Kind::LineList:
         return vk::PrimitiveTopology::eLineList;
-    case AmdGpu::PrimitiveType::LineStrip:
+    case Core::NativePrimitive::Kind::LineStrip:
         return vk::PrimitiveTopology::eLineStrip;
-    case AmdGpu::PrimitiveType::TriangleList:
+    case Core::NativePrimitive::Kind::TriangleList:
         return vk::PrimitiveTopology::eTriangleList;
-    case AmdGpu::PrimitiveType::TriangleFan:
-    case AmdGpu::PrimitiveType::Polygon:
+    case Core::NativePrimitive::Kind::TriangleFan:
+    case Core::NativePrimitive::Kind::Polygon:
         return vk::PrimitiveTopology::eTriangleFan;
-    case AmdGpu::PrimitiveType::TriangleStrip:
+    case Core::NativePrimitive::Kind::TriangleStrip:
         return vk::PrimitiveTopology::eTriangleStrip;
-    case AmdGpu::PrimitiveType::QuadStrip:
+    case Core::NativePrimitive::Kind::QuadStrip:
         LOG_WARNING(Render_Vulkan, "Unimplemented primitive type, using TriangleStrip.");
         return vk::PrimitiveTopology::eTriangleStrip;
-    case AmdGpu::PrimitiveType::AdjLineList:
+    case Core::NativePrimitive::Kind::AdjLineList:
         return vk::PrimitiveTopology::eLineListWithAdjacency;
-    case AmdGpu::PrimitiveType::AdjLineStrip:
+    case Core::NativePrimitive::Kind::AdjLineStrip:
         return vk::PrimitiveTopology::eLineStripWithAdjacency;
-    case AmdGpu::PrimitiveType::AdjTriangleList:
+    case Core::NativePrimitive::Kind::AdjTriangleList:
         return vk::PrimitiveTopology::eTriangleListWithAdjacency;
-    case AmdGpu::PrimitiveType::AdjTriangleStrip:
+    case Core::NativePrimitive::Kind::AdjTriangleStrip:
         return vk::PrimitiveTopology::eTriangleStripWithAdjacency;
-    case AmdGpu::PrimitiveType::PatchPrimitive:
+    case Core::NativePrimitive::Kind::PatchPrimitive:
         return vk::PrimitiveTopology::ePatchList;
-    case AmdGpu::PrimitiveType::QuadList:
-    case AmdGpu::PrimitiveType::RectList:
+    case Core::NativePrimitive::Kind::QuadList:
+    case Core::NativePrimitive::Kind::RectList:
         return vk::PrimitiveTopology::ePatchList;
     default:
         UNREACHABLE_MSG("Unimplemented primitive type: {}", static_cast<u32>(type));

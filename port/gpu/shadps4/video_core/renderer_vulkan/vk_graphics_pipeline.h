@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "native/native_primitive.h"
+
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -53,7 +55,7 @@ struct GraphicsPipelineKey {
         u32 depth_clamp_enable : 1;
     };
     struct {
-        AmdGpu::PrimitiveType prim_type : 5;
+        Core::NativePrimitive::Kind prim_type : 5;
         u32 negative_one_to_one : 1;
         u32 provoking_first : 1;
         u32 depth_clip_enable : 1;

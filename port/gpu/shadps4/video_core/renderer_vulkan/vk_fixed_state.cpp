@@ -11,9 +11,9 @@
 
 namespace Vulkan {
 
-void SetFixedStateTopology(FixedState& out, AmdGpu::PrimitiveType type, vk::CullModeFlags cull_mode) {
+void SetFixedStateTopology(FixedState& out, Core::NativePrimitive::Kind type, vk::CullModeFlags cull_mode) {
     out.primitive_type = type;
-    const auto topology = type != AmdGpu::PrimitiveType::None
+    const auto topology = type != Core::NativePrimitive::Kind::None
                               ? LiverpoolToVK::PrimitiveType(type)
                               : vk::PrimitiveTopology::ePatchList;
     out.list_topology = topology == vk::PrimitiveTopology::ePointList ||
@@ -22,9 +22,9 @@ void SetFixedStateTopology(FixedState& out, AmdGpu::PrimitiveType type, vk::Cull
                         topology == vk::PrimitiveTopology::eLineListWithAdjacency ||
                         topology == vk::PrimitiveTopology::eTriangleListWithAdjacency;
     // Quad and rect lists are emulated using tessellation.
-    out.patch_list_topology = type == AmdGpu::PrimitiveType::PatchPrimitive ||
-                              type == AmdGpu::PrimitiveType::QuadList ||
-                              type == AmdGpu::PrimitiveType::RectList;
+    out.patch_list_topology = type == Core::NativePrimitive::Kind::PatchPrimitive ||
+                              type == Core::NativePrimitive::Kind::QuadList ||
+                              type == Core::NativePrimitive::Kind::RectList;
     out.cull_mode = LiverpoolToVK::IsPrimitiveCulled(type) ? cull_mode : vk::CullModeFlagBits::eNone;
 }
 
@@ -37,7 +37,7 @@ const FixedState& DefaultFixedState() {
         s.clip_disabled = true;
         s.viewports[0] = vk::Viewport{.x = -1.0f, .y = -1.0f, .width = 1.0f, .height = 1.0f, .minDepth = 0.0f, .maxDepth = 1.0f};
         s.scissors[0] = vk::Rect2D{.offset = {0, 0}, .extent = {1, 1}};
-        SetFixedStateTopology(s, AmdGpu::PrimitiveType::TriangleList, vk::CullModeFlagBits::eNone);
+        SetFixedStateTopology(s, Core::NativePrimitive::Kind::TriangleList, vk::CullModeFlagBits::eNone);
         s.front_face = vk::FrontFace::eClockwise;
         s.target_write_mask = {15, 14, 14, 11, 13, 10, 14, 13};
         s.logic_op_enabled = true;

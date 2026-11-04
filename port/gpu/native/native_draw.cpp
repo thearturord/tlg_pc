@@ -27,6 +27,7 @@
 #include "tlg_toggles.h" // sigjmp_buf, tlg_setjmp, runtime_fault_recover
 #endif
 #include "core/guest_heap.h"
+#include "native/native_primitive.h"
 #include "native/native_stream_probe.h"
 #include "native/native_log.h"
 #include "native/native_config.h"
@@ -2320,12 +2321,12 @@ const Vulkan::FixedState* Build(u64 ctx, const DeviceAddresses& dev) {
                                             : cull == 3 ? vk::CullModeFlagBits::eBack
                                                         : vk::CullModeFlagBits::eNone;
         const u32 prim_code = topology < 10 ? (Rd<u32>(dev.topology_table, topology * 4) & 0x3f) : 9u;
-        const auto prim = static_cast<AmdGpu::PrimitiveType>(prim_code);
-        if (prim == AmdGpu::PrimitiveType::None) {
+        const auto prim = static_cast<Core::NativePrimitive::Kind>(prim_code);
+        if (prim == Core::NativePrimitive::Kind::None) {
             { Live().fixed_null[3].fetch_add(1, std::memory_order_relaxed); return nullptr; }
         }
         Vulkan::SetFixedStateTopology(s, prim, cull_mode);
-        s.clip_disabled = prim == AmdGpu::PrimitiveType::RectList;
+        s.clip_disabled = prim == Core::NativePrimitive::Kind::RectList;
         s.user_clip_plane_mask = 0;
         s.degamma = false;
         s.viewport_empty = false;

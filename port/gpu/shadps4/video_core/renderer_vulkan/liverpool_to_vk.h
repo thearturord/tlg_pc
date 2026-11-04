@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "native/native_primitive.h"
 #include "native/native_target_inputs.h"
 #include <span>
 #include "common/assert.h"
@@ -20,9 +21,9 @@ vk::StencilOp StencilOp(AmdGpu::StencilFunc op);
 
 vk::CompareOp CompareOp(Core::NativeTarget::CompareFunc func);
 
-bool IsPrimitiveCulled(AmdGpu::PrimitiveType type);
+bool IsPrimitiveCulled(Core::NativePrimitive::Kind type);
 
-vk::PrimitiveTopology PrimitiveType(AmdGpu::PrimitiveType type);
+vk::PrimitiveTopology PrimitiveType(Core::NativePrimitive::Kind type);
 
 vk::PolygonMode PolygonMode(AmdGpu::PolygonMode mode);
 

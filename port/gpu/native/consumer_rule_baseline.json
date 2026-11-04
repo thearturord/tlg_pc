@@ -120,14 +120,14 @@
   ]
  },
  "renderer_vulkan/liverpool_to_vk.cpp": {
-  "amdgpu_lines": 342,
+  "amdgpu_lines": 308,
   "includes": [
    "video_core/amdgpu/pixel_format.h",
    "video_core/renderer_vulkan/liverpool_to_vk.h"
   ]
  },
  "renderer_vulkan/liverpool_to_vk.h": {
-  "amdgpu_lines": 26,
+  "amdgpu_lines": 24,
   "includes": [
    "video_core/amdgpu/pixel_format.h",
    "video_core/amdgpu/regs_color.h",
@@ -152,20 +152,20 @@
   ]
  },
  "renderer_vulkan/vk_fixed_state.cpp": {
-  "amdgpu_lines": 6,
+  "amdgpu_lines": 0,
   "includes": [
    "video_core/renderer_vulkan/liverpool_to_vk.h",
    "video_core/renderer_vulkan/vk_fixed_state.h"
   ]
  },
  "renderer_vulkan/vk_fixed_state.h": {
-  "amdgpu_lines": 14,
+  "amdgpu_lines": 12,
   "includes": [
    "video_core/amdgpu/regs.h"
   ]
  },
  "renderer_vulkan/vk_graphics_pipeline.cpp": {
-  "amdgpu_lines": 4,
+  "amdgpu_lines": 2,
   "includes": [
    "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h",
    "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h",
@@ -174,7 +174,7 @@
   ]
  },
  "renderer_vulkan/vk_graphics_pipeline.h": {
-  "amdgpu_lines": 5,
+  "amdgpu_lines": 4,
   "includes": [
    "shader_recompiler/frontend/fetch_shader.h",
    "video_core/amdgpu/regs_color.h",
@@ -210,7 +210,7 @@
   ]
  },
  "renderer_vulkan/vk_pipeline_cache.cpp": {
-  "amdgpu_lines": 24,
+  "amdgpu_lines": 9,
   "includes": [
    "shader_recompiler/backend/spirv/emit_spirv.h",
    "shader_recompiler/info.h",

@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shader_boundary.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
@@ -76,103 +77,6 @@ constexpr static std::array DescriptorHeapSizes = {
     vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
 };
 
-static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsOutputControl& ctl) {
-    u32 num_outputs = 0;
-
-    if (ctl.vs_out_misc_enable) {
-        auto& misc_vec = outputs[num_outputs++];
-        misc_vec[0] = ctl.use_vtx_point_size ? Output::PointSize : Output::None;
-        misc_vec[1] = ctl.use_vtx_edge_flag
-                          ? Output::EdgeFlag
-                          : (ctl.use_vtx_gs_cut_flag ? Output::GsCutFlag : Output::None);
-        misc_vec[2] =
-            ctl.use_vtx_kill_flag
-                ? Output::KillFlag
-                : (ctl.use_vtx_render_target_idx ? Output::RenderTargetIndex : Output::None);
-        misc_vec[3] = ctl.use_vtx_viewport_idx ? Output::ViewportIndex : Output::None;
-    }
-
-    if (ctl.vs_out_ccdist0_enable) {
-        auto& ccdist0 = outputs[num_outputs++];
-        ccdist0[0] = ctl.IsClipDistEnabled(0)
-                         ? Output::ClipDist0
-                         : (ctl.IsCullDistEnabled(0) ? Output::CullDist0 : Output::None);
-        ccdist0[1] = ctl.IsClipDistEnabled(1)
-                         ? Output::ClipDist1
-                         : (ctl.IsCullDistEnabled(1) ? Output::CullDist1 : Output::None);
-        ccdist0[2] = ctl.IsClipDistEnabled(2)
-                         ? Output::ClipDist2
-                         : (ctl.IsCullDistEnabled(2) ? Output::CullDist2 : Output::None);
-        ccdist0[3] = ctl.IsClipDistEnabled(3)
-                         ? Output::ClipDist3
-                         : (ctl.IsCullDistEnabled(3) ? Output::CullDist3 : Output::None);
-    }
-
-    if (ctl.vs_out_ccdist1_enable) {
-        auto& ccdist1 = outputs[num_outputs++];
-        ccdist1[0] = ctl.IsClipDistEnabled(4)
-                         ? Output::ClipDist4
-                         : (ctl.IsCullDistEnabled(4) ? Output::CullDist4 : Output::None);
-        ccdist1[1] = ctl.IsClipDistEnabled(5)
-                         ? Output::ClipDist5
-                         : (ctl.IsCullDistEnabled(5) ? Output::CullDist5 : Output::None);
-        ccdist1[2] = ctl.IsClipDistEnabled(6)
-                         ? Output::ClipDist6
-                         : (ctl.IsCullDistEnabled(6) ? Output::CullDist6 : Output::None);
-        ccdist1[3] = ctl.IsClipDistEnabled(7)
-                         ? Output::ClipDist7
-                         : (ctl.IsCullDistEnabled(7) ? Output::CullDist7 : Output::None);
-    }
-
-    return num_outputs;
-}
-
-/// E1c: the fields of a stage's translator input that belong to the shader's own environment, set from the shader objects (native/native_shader_env.h) instead of from
-/// the register image. Everything else in `info` (the fixed-function inputs, the render target formats) is left as it is.
-static void ApplyShaderEnv(Shader::RuntimeInfo& info, const Core::NativeShaderEnv::DrawEnv& draw, HwStage stage, u32 aa_samples) {
-    const Core::ShaderEnv::ShaderEnv& env = stage == HwStage::Vertex ? draw.vertex : draw.pixel;
-    info.props.fp_denorm_mode32 = static_cast<AmdGpu::FpDenormMode>(env.program.fp_denorm_mode32);
-    info.props.fp_denorm_mode16_64 = static_cast<AmdGpu::FpDenormMode>(env.program.fp_denorm_mode16_64);
-    info.props.fp_round_mode32 = static_cast<AmdGpu::FpRoundMode>(env.program.fp_round_mode32);
-    info.props.fp_round_mode16_64 = static_cast<AmdGpu::FpRoundMode>(env.program.fp_round_mode16_64);
-    info.props.num_allocated_vgprs = env.program.vgprs;
-    info.props.num_user_data = env.program.user_data_count;
-    info.props.num_input_vgprs = env.program.input_vgpr_components;
-    info.props.dx10_clamp = env.program.dx10_clamp ? 1u : 0u;
-    if (stage == HwStage::Vertex) {
-        info.hw.vs.num_outputs = MapOutputs(info.hw.vs.outputs, std::bit_cast<AmdGpu::VsOutputControl>(env.exports.vs_out_control));
-        if (info.sw_stage == SwStage::Vertex) {
-            info.sw.vs.step_rate_0 = env.rates.instance_step_rate_0;
-            info.sw.vs.step_rate_1 = env.rates.instance_step_rate_1;
-        }
-        return;
-    }
-    const auto& f = env.fragment;
-    info.hw.fs.en_flags = std::bit_cast<AmdGpu::PsInput>(f.input_enable);
-    info.hw.fs.addr_flags = std::bit_cast<AmdGpu::PsInput>(f.input_address);
-    info.hw.fs.num_inputs = f.num_interpolants;
-    info.hw.fs.front_face_all_bits = f.front_face_all_bits ? 1u : 0u;
-    info.hw.fs.depth_before_shader = f.depth_before_shader ? 1u : 0u;
-    info.hw.fs.z_export_format = static_cast<AmdGpu::ShaderExportFormat>(f.z_export_format);
-    info.hw.fs.mrtz_mask = f.depth_export_mask;
-    info.hw.fs.num_samples = f.sample_coverage ? aa_samples : 1;
-    for (u32 i = 0; i < f.num_interpolants && i < 32; ++i) {
-        const auto& want = f.interpolants[i];
-        info.hw.fs.inputs[i] = {
-            .param_index = u16(want.input_offset),
-            .is_default = u16(want.use_default ? 1 : 0),
-            .is_flat = u16(want.flat_shade ? 1 : 0),
-            .default_value = u16(want.default_value),
-        };
-    }
-    for (u32 i = 0; i < Shader::MaxColorBuffers; ++i) {
-        // the export format of each target is the shader's (SPI_SHADER_COL_FORMAT); only the targets the key keeps bound have one
-        if (info.hw.fs.color_buffers[i].data_format != AmdGpu::DataFormat::FormatInvalid) {
-            info.hw.fs.color_buffers[i].export_format = static_cast<AmdGpu::ShaderExportFormat>(f.color_export_format[i]);
-        }
-    }
-}
-
 /// F3.3: the sample count the pixel shader's coverage input sees: that of the targets the draw has bound (the largest of the colour targets and the depth target; 1 without targets).
 static u32 TargetSampleCount(const DrawInputs& in) {
     u32 samples = 1;
@@ -213,19 +117,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
     info.Initialize(stage, l_stage);
     auto& live = Core::NativeDraw::Live();
     if (stage == HwStage::Compute) {
-        const auto& cs_pgm = *lookup_cs;
-        info.props.num_user_data = cs_pgm.settings.num_user_regs;
-        info.props.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
-        info.props.fp_denorm_mode32 = static_cast<decltype(info.props.fp_denorm_mode32)>(cs_pgm.settings.fp_denorm_mode32);
-        info.props.fp_denorm_mode16_64 = static_cast<decltype(info.props.fp_denorm_mode16_64)>(cs_pgm.settings.fp_denorm_mode64);
-        info.props.fp_round_mode32 = static_cast<decltype(info.props.fp_round_mode32)>(cs_pgm.settings.fp_round_mode32);
-        info.props.fp_round_mode16_64 = static_cast<decltype(info.props.fp_round_mode16_64)>(cs_pgm.settings.fp_round_mode64);
-        info.props.dx10_clamp = cs_pgm.settings.dx10_clamp;
-        info.hw.cs.workgroup_size = {cs_pgm.num_thread_x.full, cs_pgm.num_thread_y.full,
-                                     cs_pgm.num_thread_z.full};
-        info.hw.cs.tgid_enable = {cs_pgm.IsTgidEnabled(0), cs_pgm.IsTgidEnabled(1),
-                                  cs_pgm.IsTgidEnabled(2)};
-        info.hw.cs.shared_memory_size = cs_pgm.SharedMemSize();
+        ShaderBoundary::FillComputeInfo(info, *lookup_cs);
         return info;
     }
     // F3.5: a graphics stage is the vertex or the pixel shader of a native draw; its translator input is built from the shader environment, the fixed state, the key's targets and the
@@ -244,7 +136,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.sw.vs.vertex_sgpr_offset = draw_indirect_params.vertex_sgpr_offset;
         info.sw.vs.instance_sgpr_offset = draw_indirect_params.instance_sgpr_offset;
         info.sw.vs.is_indirect = draw_indirect_params.is_indirect;
-        info.sw.vs.tess_emulated_primitive = fixed.primitive_type == AmdGpu::PrimitiveType::RectList || fixed.primitive_type == AmdGpu::PrimitiveType::QuadList;
+        info.sw.vs.tess_emulated_primitive = fixed.primitive_type == Core::NativePrimitive::Kind::RectList || fixed.primitive_type == Core::NativePrimitive::Kind::QuadList;
     } else {
         info.hw.fs.dual_source_blending = fixed.DualSourceBlending();
         for (u32 i = 0; i < Shader::MaxColorBuffers; i++) {
@@ -252,10 +144,9 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         }
         // lowered user clip planes and guest exported clip distances both arm the emulation; no geometry or local stage exists in this pipeline
         const bool lowers_user_clip_planes = fixed.user_clip_plane_mask != 0;
-        const auto vs_out = std::bit_cast<AmdGpu::VsOutputControl>(env.vertex.exports.vs_out_control);
-        info.hw.fs.clip_distance_emulation = ((env.has_vertex && vs_out.clip_distance_enable) || lowers_user_clip_planes) && profile.needs_clip_distance_emulation;
+        info.hw.fs.clip_distance_emulation = ((env.has_vertex && ShaderBoundary::GuestClipDistances(env.vertex)) || lowers_user_clip_planes) && profile.needs_clip_distance_emulation;
     }
-    ApplyShaderEnv(info, env, stage, TargetSampleCount(*lookup_inputs));
+    ShaderBoundary::ApplyShaderEnv(info, env, stage, TargetSampleCount(*lookup_inputs));
     live.key_targets[6].fetch_add(1, std::memory_order_relaxed);
     return info;
 }
@@ -814,10 +705,10 @@ bool PipelineCache::RefreshGraphicsKey() {
         color_buffer.num_format = col_buf.GetNumberFmt();
         color_buffer.num_conversion = col_buf.GetNumberConversion();
         if (export_from_env) {
-            color_buffer.export_format = static_cast<AmdGpu::ShaderExportFormat>(shader_env.pixel.fragment.color_export_format[cb]);
+            ShaderBoundary::SetExportFormat(color_buffer, shader_env.pixel.fragment.color_export_format[cb]);
             live.key_targets[2].fetch_add(1, std::memory_order_relaxed);
         } else {
-            color_buffer.export_format = AmdGpu::ShaderExportFormat::Zero; // no pixel shader: nothing is exported
+            ShaderBoundary::SetNoExport(color_buffer); // no pixel shader: nothing is exported
         }
         color_buffer.swizzle = col_buf.Swizzle();
 

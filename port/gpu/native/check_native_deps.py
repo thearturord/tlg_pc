@@ -69,6 +69,14 @@ CONSUMER_BASELINE = os.path.join(NATIVE, "consumer_rule_baseline.json")
 PS4_HEADER = re.compile(r"^(video_core/amdgpu/|shader_recompiler/|video_core/renderer_vulkan/(liverpool_to_vk|vk_fixed_state|vk_indexed_data)\.h$|core/libraries/(gnmdriver|videoout)/)")
 
 
+# The recompiler boundary (G2): files whose job is to make the shader recompiler's own types from plain numbers. They are not counted by the consumer rule;
+# nothing else may be added here without a note in executor-consumer-plan.md.
+RECOMPILER_BOUNDARY = {
+    "renderer_vulkan/vk_shader_boundary.cpp": "the recompiler's fp modes, export formats, vertex output control, pixel input flags and primitive type made from the plain numbers of a draw or dispatch",
+    "renderer_vulkan/vk_shader_boundary.h": "its interface (takes the recompiler's RuntimeInfo)",
+}
+
+
 def scan_consumers():
     result = {}
     for dirpath, _, names in os.walk(VIDEO_CORE):
@@ -77,6 +85,8 @@ def scan_consumers():
                 continue
             path = os.path.join(dirpath, name)
             rel = os.path.relpath(path, VIDEO_CORE).replace(os.sep, "/")
+            if rel in RECOMPILER_BOUNDARY:
+                continue
             includes, lines = set(), 0
             for line in open(path, encoding="utf-8", errors="replace"):
                 m = include.search(line)
@@ -125,6 +135,8 @@ for line in bad:
 print(f"native/ includes {len(used)} of {len(ALLOWED_PS4)} allowlisted PS4 headers; {len(bad)} violation(s)")
 for target in sorted(ALLOWED_PS4):
     print(f"  {'used  ' if target in used else 'unused'}  {target}  -> goes with {ALLOWED_PS4[target]}")
+for rel, why in RECOMPILER_BOUNDARY.items():
+    print(f"  recompiler boundary {rel}  -> {why}")
 for name, owner in MEMBER_FILES.items():
     exists = os.path.exists(os.path.join(NATIVE, name))
     print(f"  member file {name:28s} {'present' if exists else 'absent '}  -> {owner}")

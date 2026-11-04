@@ -5,6 +5,7 @@
 
 #include <array>
 #include <string>
+#include "native/native_primitive.h"
 #include "native/native_target_inputs.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -68,7 +69,7 @@ struct FixedState {
 
     bool primitive_restart{};
     u32 primitive_restart_index{};
-    AmdGpu::PrimitiveType primitive_type{};
+    Core::NativePrimitive::Kind primitive_type{};
     bool list_topology{};       ///< point, line or triangle list: restart needs the list restart feature
     bool patch_list_topology{}; ///< patch, quad or rect list (tessellation): restart needs the patch list feature
     bool rasterizer_discard{};
@@ -146,6 +147,6 @@ const FixedState& DefaultFixedState();
 
 /// Sets the topology dependent fields: list / patch classification and culling (only primitives that have faces are
 /// culled; `cull_mode` is what the rasterizer state asks for).
-void SetFixedStateTopology(FixedState& out, AmdGpu::PrimitiveType type, vk::CullModeFlags cull_mode);
+void SetFixedStateTopology(FixedState& out, Core::NativePrimitive::Kind type, vk::CullModeFlags cull_mode);
 
 } // namespace Vulkan
