@@ -132,4 +132,9 @@ std::string DescribeAddress(VAddr address);
 void Start();
 nlohmann::json Report();
 
+/// `TLG_GARLIC_LOG=1` (diagnostic, branch native-v3-writers): at every present one row of user/log/garlic_ring.csv: the frame allocator's (`AllocFrameGarlic`) state next to the frame gate's
+/// progress. Allocator (`*(JsDevice + 0x10238)`): ring size, bump offset, frame counter (+8), the three segment indices (+0xc, +0x10, +0x14); the engine frame counter (JsDevice + 0x10240); the gate:
+/// frames submitted, end of pipe interrupts, frames the raster thread finished. Shows when the game releases ring space against when the GPU is done with it.
+void GarlicLogRow(u64 tick);
+
 } // namespace Core::NativeResources

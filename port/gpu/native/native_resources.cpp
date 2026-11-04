@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <array>
 #include <atomic>
@@ -25,7 +26,9 @@
 #include "tlg_toggles.h" // sigjmp_buf, tlg_setjmp, runtime_fault_recover
 #endif
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "native/native_draw.h"
+#include "native/native_frame_gate.h"
 #include "native/native_log.h"
 #include "native/native_config.h"
 #include "native/native_registry.h"
@@ -1215,6 +1218,43 @@ nlohmann::json Report() {
                                                                       {"a_non_immutable_buffer_above_the_cap", lift_census_faults[4].load()}};
     }
     return out;
+}
+
+void GarlicLogRow(u64 tick) {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_GARLIC_LOG");
+        return e != nullptr && *e != ' ' && *e != '0';
+    }();
+    if (!on) {
+        return;
+    }
+    static std::mutex mutex;
+    static FILE* csv = nullptr;
+    static u64 rows = 0;
+    std::scoped_lock lock{mutex};
+    if (csv == nullptr) {
+        const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "garlic_ring.csv";
+        csv = std::fopen(path.string().c_str(), "wb");
+        if (csv == nullptr) {
+            return;
+        }
+        std::fputs("row,tick,ring_size,offset,alloc_frame,seg0,seg1,seg2,engine_frame,gate_submitted,gate_eop,gate_raster_done\n", csv);
+    }
+    u64 allocator = 0, first = 0, counter = 0, seg01 = 0, seg2 = 0, engine_frame = 0;
+    const u64 device = Core::NativeDraw::EngineDevice();
+    if (device == 0 || !SafeRead64(device + 0x10238, &allocator) || allocator == 0 || !SafeRead64(allocator, &first) || !SafeRead64(allocator + 8, &counter) ||
+        !SafeRead64(allocator + 0xc, &seg01) || !SafeRead64(allocator + 0x14, &seg2)) {
+        return;
+    }
+    SafeRead64(device + 0x10240, &engine_frame);
+    const auto gate = Core::FrameGate::Status();
+    std::fprintf(csv, "%llu,%llu,%u,%u,%u,%u,%u,%u,%u,%llu,%llu,%llu\n", static_cast<unsigned long long>(rows), static_cast<unsigned long long>(tick), static_cast<u32>(first),
+                 static_cast<u32>(first >> 32), static_cast<u32>(counter), static_cast<u32>(seg01), static_cast<u32>(seg01 >> 32), static_cast<u32>(seg2), static_cast<u32>(engine_frame),
+                 static_cast<unsigned long long>(gate.value("submitted_frames", 0ull)), static_cast<unsigned long long>(gate.value("end_of_pipe_interrupts", 0ull)),
+                 static_cast<unsigned long long>(gate.value("raster_reached_frame_end", 0ull)));
+    if (++rows % 60 == 0) {
+        std::fflush(csv);
+    }
 }
 
 } // namespace Core::NativeResources

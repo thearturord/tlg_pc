@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "native/native_counter_ring.h"
+#include "native/native_resources.h"
 #include "tlg_capture.h"
 #include "native/native_light_recorder.h"
 #include <fmt/format.h>
@@ -662,6 +663,7 @@ void Record(const Vulkan::Instance& instance, vk::CommandBuffer cmdbuf, vk::Imag
         }
     }
     Core::CounterRing::NotePresent(tick);
+    Core::NativeResources::GarlicLogRow(tick);
     if (MonitorOn()) {
         Slot* slot = nullptr;
         for (auto& s : monitor_slots) {
