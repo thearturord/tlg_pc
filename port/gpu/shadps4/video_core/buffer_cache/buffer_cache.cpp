@@ -560,6 +560,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
 }
 
 const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanning, bool written) {
+    OrderedViewCheck(address, size, written);
     if (const PlacedBuffer* entry = PlacedAt(address, size, written)) {
         Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedServed);
         return entry->buffer.get();

@@ -250,6 +250,17 @@ private:
     // zero copy (TLG_ZERO_COPY=1, zero-copy-dynamic-buffers.md): counters
     std::array<std::atomic<u64>, 10> zero_copy_counts{};
     std::atomic<bool> zero_copy_unavailable{false};
+    /// TLG_ORDERED_VIEW_CHECK=1 (measurement): the engine buffers as the in order create and delete events know them (raster thread view), against the live table of the game thread.
+    struct OrderedBuffer {
+        VAddr begin, end;
+    };
+    mutable std::mutex ordered_mutex;
+    std::map<VAddr, std::pair<VAddr, u64>> ordered_by_address; ///< begin -> {end, id}
+    std::unordered_map<u64, OrderedBuffer> ordered_by_id;
+    /// [written][class]: 0 same, 1 the live table has buffers the ordered view lacks (the game created them ahead), 2 the ordered view has buffers the live table lacks (the game deleted them
+    /// ahead), 3 both; and the request count
+    std::atomic<u64> ordered_counts[2][5]{};
+    void OrderedViewCheck(VAddr address, u64 size, bool written);
 
 public:
     [[nodiscard]] bool ZeroCopyOn() const noexcept;

@@ -13,6 +13,7 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "native/native_debug_server.h"
 #include "native/native_device.h"
 #include "native/native_log.h"
 #include "native/native_readbacks.h"
@@ -44,6 +45,15 @@
 namespace VideoCore {
 
 void BufferCache::NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool native) {
+    {
+        std::scoped_lock ordered_lock{ordered_mutex};
+        if (const auto it = ordered_by_id.find(id); it != ordered_by_id.end()) {
+            if (const auto at = ordered_by_address.find(it->second.begin); at != ordered_by_address.end() && at->second.second == id) {
+                ordered_by_address.erase(at);
+            }
+            ordered_by_id.erase(it);
+        }
+    }
     Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9BuffersDeleted);
     if (Core::NativeUpdates::B9PlaceOn()) {
         // B9.4: the block that holds it loses the member; a block with no member left is freed (its contents are gone with them)
@@ -412,6 +422,11 @@ void BufferCache::Demote(VAddr begin, bool by_request) {
 }
 
 void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, bool texture) {
+    if (!texture && bytes != 0) {
+        std::scoped_lock ordered_lock{ordered_mutex};
+        ordered_by_address[address] = {address + bytes, id};
+        ordered_by_id[id] = {address, address + bytes};
+    }
     if (!Core::NativeUpdates::B9PlaceOn() || bytes == 0) {
         return;
     }
@@ -493,8 +508,59 @@ bool BufferCache::ZeroCopyOn() const noexcept {
     return on && !zero_copy_unavailable.load(std::memory_order_relaxed);
 }
 
+void BufferCache::OrderedViewCheck(VAddr address, u64 size, bool written) {
+    static const bool on = [] { const char* e = std::getenv("TLG_ORDERED_VIEW_CHECK"); return e != nullptr && e[0] == '1'; }();
+    if (!on || size == 0) {
+        return;
+    }
+    static thread_local std::vector<Core::NativeDevice::BufferPart> live;
+    live.clear();
+    Core::NativeDevice::BuffersIn(address, size, live);
+    boost::container::small_vector<u64, 8> live_ids, ordered_ids;
+    for (const auto& part : live) {
+        live_ids.push_back(part.id);
+    }
+    {
+        std::scoped_lock lock{ordered_mutex};
+        auto it = ordered_by_address.upper_bound(address);
+        if (it != ordered_by_address.begin()) {
+            --it;
+        }
+        for (; it != ordered_by_address.end() && it->first < address + size; ++it) {
+            if (it->second.first > address) {
+                ordered_ids.push_back(it->second.second);
+            }
+        }
+    }
+    std::ranges::sort(live_ids);
+    std::ranges::sort(ordered_ids);
+    live_ids.erase(std::unique(live_ids.begin(), live_ids.end()), live_ids.end());
+    const bool extra_live = std::ranges::any_of(live_ids, [&](u64 id) { return !std::ranges::binary_search(ordered_ids, id); });
+    const bool extra_ordered = std::ranges::any_of(ordered_ids, [&](u64 id) { return !std::ranges::binary_search(live_ids, id); });
+    const u32 cls = extra_live ? (extra_ordered ? 3u : 1u) : (extra_ordered ? 2u : 0u);
+    ordered_counts[written ? 1 : 0][4].fetch_add(1, std::memory_order_relaxed);
+    ordered_counts[written ? 1 : 0][cls].fetch_add(1, std::memory_order_relaxed);
+    if (cls != 0) {
+        static std::atomic<u32> noted[4]{};
+        if (noted[cls].fetch_add(1, std::memory_order_relaxed) < 6) {
+            std::string text = fmt::format("{} {:#x}+{:#x} ({}): live ids", written ? "written" : "read", address, size, cls == 1 ? "live has more" : cls == 2 ? "ordered has more" : "both differ");
+            for (const u64 id : live_ids) {
+                text += fmt::format(" {:#x}", id);
+            }
+            text += " ordered ids";
+            for (const u64 id : ordered_ids) {
+                text += fmt::format(" {:#x}", id);
+            }
+            text += fmt::format(" shader {:#x} tick {}", Core::NativeRegistry::BufferWriter().first, scheduler.CurrentTick());
+            Core::RareEvents::Note(fmt::format("m5_ordered_view_class{}", cls), text);
+        }
+    }
+}
+
 nlohmann::json BufferCache::ZeroCopyReport() const {
     return {{"on", ZeroCopyOn()},
+            {"ordered_view_check", {{"read", {{"requests", ordered_counts[0][4].load()}, {"same", ordered_counts[0][0].load()}, {"live_has_more", ordered_counts[0][1].load()}, {"ordered_has_more", ordered_counts[0][2].load()}, {"both_differ", ordered_counts[0][3].load()}}},
+                                    {"written", {{"requests", ordered_counts[1][4].load()}, {"same", ordered_counts[1][0].load()}, {"live_has_more", ordered_counts[1][1].load()}, {"ordered_has_more", ordered_counts[1][2].load()}, {"both_differ", ordered_counts[1][3].load()}}}}},
             {"direct_writes", zero_copy_counts[0].load()},
             {"direct_write_ranges", zero_copy_counts[1].load()},
             {"direct_write_bytes", zero_copy_counts[2].load()},
