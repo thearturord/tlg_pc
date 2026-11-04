@@ -1663,6 +1663,8 @@ std::atomic<u64> c_check_bytes[LateKinds][CheckClassCount]{};
 std::atomic<u64> c_late_after_bytes_by_writer[LateKinds][16]{}; ///< bytes read late (the range was written after the record) by the writer of the newest write
 std::atomic<u64> c_late_after_by_writer[LateKinds][16]{};
 std::atomic<u64> c_late_margin[LateKinds][MaxSites][10]{}; ///< submissions between the read's record and the newest write that made it late (0..8, 9 more), by call site
+std::atomic<u64> c_late_notdone_by_site[LateKinds][MaxSites]{}; ///< late reads whose record's submission was not yet done by the marker (the ones that can be real), by newest writer site
+std::atomic<u64> c_late_marker[LateKinds][3]{}; ///< late reads by the raster thread's submission-done marker: [0] the record's submission was not done, [1] done (the read came after the marker), [2] no record
 std::atomic<u64> c_late_free_class[LateKinds][MaxSites][3]{}; ///< rewritten late reads by the engine free of the address: [0] none seen, [1] freed after the record's submission, [2] freed before it
 std::atomic<u64> c_late_rewrite_by_site[LateKinds][MaxSites]{}, c_late_rewrite_bytes_by_site[LateKinds][MaxSites]{}; ///< late reads whose range had an older version before the newest write (memory reuse), and the bytes rewritten
 std::atomic<u64> c_late_after_by_site[LateKinds][MaxSites]{}, c_late_after_bytes_by_site[LateKinds][MaxSites]{}; ///< `TLG_WRITER_SITES`: the same by call site of the newest write
@@ -1766,6 +1768,13 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
         c_late_after_by_writer[k][writer].fetch_add(1, std::memory_order_relaxed);
         c_late_after_bytes_by_writer[k][writer].fetch_add(size, std::memory_order_relaxed);
         c_late_after_by_site[k][std::min<u32>(a.newest_site, MaxSites - 1)].fetch_add(1, std::memory_order_relaxed);
+        {
+            const size_t marker = submit == 0 ? 2 : RasterDoneSubmissions() >= submit + 1 ? 1 : 0;
+            c_late_marker[k][marker].fetch_add(1, std::memory_order_relaxed);
+            if (marker == 0) {
+                c_late_notdone_by_site[k][std::min<u32>(a.newest_site, MaxSites - 1)].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (a.rewritten != 0) {
             c_late_rewrite_by_site[k][std::min<u32>(a.newest_site, MaxSites - 1)].fetch_add(1, std::memory_order_relaxed);
             {
@@ -2266,6 +2275,7 @@ nlohmann::json Report() {
                 kj["frame_store_shadow"] = FrameStoreReport(k);
             }
             kj["total_bytes"] = bytes;
+            kj["late_reads_by_done_marker_not_done_done_norecord"] = {c_late_marker[k][0].load(), c_late_marker[k][1].load(), c_late_marker[k][2].load()};
             for (u32 w = 0; w < 16; ++w) {
                 if (const u64 n = c_late_after_by_writer[k][w].load()) {
                     kj["written_after_by_writer"][std::to_string(w)] = {{"reads", n}, {"bytes", c_late_after_bytes_by_writer[k][w].load()}};
@@ -2277,6 +2287,7 @@ nlohmann::json Report() {
                     if (const u64 n = c_late_after_by_site[k][i].load()) {
                         auto& site_json = kj["written_after_by_site"][i < g_site_names.size() ? g_site_names[i] : std::to_string(i)];
                         site_json = {{"reads", n}, {"bytes", c_late_after_bytes_by_site[k][i].load()}, {"reads_with_rewritten_memory", c_late_rewrite_by_site[k][i].load()}, {"rewritten_bytes", c_late_rewrite_bytes_by_site[k][i].load()},
+                                     {"reads_before_the_done_marker_of_the_records_submission", c_late_notdone_by_site[k][i].load()},
                                      {"rewritten_reads_by_engine_free_none_after_record_before_record", {c_late_free_class[k][i][0].load(), c_late_free_class[k][i][1].load(), c_late_free_class[k][i][2].load()}}};
                         for (u32 m = 0; m < 10; ++m) {
                             if (const u64 x = c_late_margin[k][i][m].load()) {
