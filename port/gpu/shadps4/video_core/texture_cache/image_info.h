@@ -6,7 +6,7 @@
 #include "common/types.h"
 #include "native/native_desc.h"
 #include "video_core/amdgpu/cb_db_extent.h"
-#include "video_core/amdgpu/tiling.h"
+#include "native/ps4_data_layout/tiling.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/tile.h"
 #include "video_core/texture_cache/types.h"
@@ -63,7 +63,7 @@ struct ImageInfo {
     ImageInfo(const Core::NativeDesc::ImageDesc& desc, bool is_depth) noexcept;
 
     bool IsTiled() const {
-        return tile_mode != AmdGpu::TileMode::DisplayLinearAligned;
+        return tile_mode != Ps4Layout::TileMode::DisplayLinearAligned;
     }
 
     Extent2D BlockDim() const {
@@ -91,8 +91,8 @@ struct ImageInfo {
     u32 num_bits;
     u32 num_samples;
     u32 pitch;
-    AmdGpu::TileMode tile_mode;
-    AmdGpu::ArrayMode array_mode;
+    Ps4Layout::TileMode tile_mode;
+    Ps4Layout::ArrayMode array_mode;
     std::array<MipInfo, MAX_MIPS> mips_layout;
     u32 micro_tiled_mips{};
     VAddr guest_address;

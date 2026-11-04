@@ -5,7 +5,7 @@
 
 #include "native/native_desc.h"
 #include "native/native_target_inputs.h"
-#include "video_core/amdgpu/pixel_format.h"
+#include "native/ps4_data_layout/pixel_format.h"
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -33,7 +33,7 @@ struct ImageViewInfo {
     AmdGpu::ImageType type = AmdGpu::ImageType::Color2D;
     vk::Format format = vk::Format::eR8G8B8A8Unorm;
     SubresourceRange range;
-    AmdGpu::CompMapping mapping{AmdGpu::IdentityMapping};
+    Ps4Layout::CompMapping mapping{Ps4Layout::IdentityMapping};
     u32 min_lod = 0;
     bool is_storage = false;
 

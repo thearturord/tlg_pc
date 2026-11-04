@@ -3,9 +3,9 @@
 
 #include <bit>
 #include <magic_enum/magic_enum.hpp>
-#include "video_core/amdgpu/tiling.h"
+#include "native/ps4_data_layout/tiling.h"
 
-namespace AmdGpu {
+namespace Ps4Layout {
 
 static constexpr u32 MICROTILE_SIZE = 8;
 static constexpr u32 DRAM_ROW_SIZE = 1024;
@@ -389,4 +389,4 @@ MacroTileMode CalculateMacrotileMode(TileMode tile_mode, u32 bpp, u32 num_sample
     return IsPrt(array_mode) ? MacroTileMode(mtm_idx + 8) : MacroTileMode(mtm_idx);
 }
 
-} // namespace AmdGpu
+} // namespace Ps4Layout

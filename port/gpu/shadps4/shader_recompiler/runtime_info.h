@@ -7,7 +7,7 @@
 #include <span>
 #include "common/types.h"
 #include "shader_recompiler/frontend/tessellation.h"
-#include "video_core/amdgpu/pixel_format.h"
+#include "native/ps4_data_layout/pixel_format.h"
 #include "video_core/amdgpu/regs_shader.h"
 #include "video_core/amdgpu/regs_vertex.h"
 

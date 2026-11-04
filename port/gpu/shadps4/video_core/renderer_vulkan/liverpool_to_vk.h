@@ -7,7 +7,7 @@
 #include "native/native_target_inputs.h"
 #include <span>
 #include "common/assert.h"
-#include "video_core/amdgpu/pixel_format.h"
+#include "native/ps4_data_layout/pixel_format.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/regs_primitive.h"
@@ -38,7 +38,7 @@ bool IsDualSourceBlendFactor(AmdGpu::BlendControl::BlendFactor factor);
 vk::BlendOp BlendOp(AmdGpu::BlendControl::BlendFunc func);
 
 void NormalizeMinMaxBlend(vk::BlendOp& op, vk::BlendFactor& src, vk::BlendFactor& dst,
-                          AmdGpu::NumberFormat format);
+                          Ps4Layout::NumberFormat format);
 
 vk::LogicOp LogicOp(AmdGpu::ColorControl::LogicOp logic_op);
 
@@ -54,13 +54,13 @@ vk::SamplerMipmapMode MipFilter(AmdGpu::MipFilter filter);
 
 vk::BorderColor BorderColor(AmdGpu::BorderColor color);
 
-vk::ComponentSwizzle ComponentSwizzle(AmdGpu::CompSwizzle comp_swizzle);
+vk::ComponentSwizzle ComponentSwizzle(Ps4Layout::CompSwizzle comp_swizzle);
 
-vk::ComponentMapping ComponentMapping(AmdGpu::CompMapping comp_mapping);
+vk::ComponentMapping ComponentMapping(Ps4Layout::CompMapping comp_mapping);
 
 struct SurfaceFormatInfo {
-    AmdGpu::DataFormat data_format;
-    AmdGpu::NumberFormat number_format;
+    Ps4Layout::DataFormat data_format;
+    Ps4Layout::NumberFormat number_format;
     vk::Format vk_format;
     vk::FormatFeatureFlags2 flags;
 };
@@ -89,8 +89,8 @@ constexpr size_t surface_format_table_size =
 
 extern const std::array<vk::Format, surface_format_table_size> surface_format_table;
 
-constexpr size_t GetSurfaceFormatTableIndex(AmdGpu::DataFormat data_format,
-                                            AmdGpu::NumberFormat num_format) {
+constexpr size_t GetSurfaceFormatTableIndex(Ps4Layout::DataFormat data_format,
+                                            Ps4Layout::NumberFormat num_format) {
     DEBUG_ASSERT(u32(data_format) < 1 << amd_gpu_data_format_bit_size);
     DEBUG_ASSERT(u32(num_format) < 1 << amd_gpu_number_format_bit_size);
     size_t result = static_cast<size_t>(num_format) |
@@ -98,11 +98,11 @@ constexpr size_t GetSurfaceFormatTableIndex(AmdGpu::DataFormat data_format,
     return result;
 }
 
-constexpr vk::Format SurfaceFormat(AmdGpu::DataFormat data_format,
-                                   AmdGpu::NumberFormat num_format) noexcept {
+constexpr vk::Format SurfaceFormat(Ps4Layout::DataFormat data_format,
+                                   Ps4Layout::NumberFormat num_format) noexcept {
     vk::Format result = surface_format_table[GetSurfaceFormatTableIndex(data_format, num_format)];
     bool found =
-        result != vk::Format::eUndefined || data_format == AmdGpu::DataFormat::FormatInvalid;
+        result != vk::Format::eUndefined || data_format == Ps4Layout::DataFormat::FormatInvalid;
     ASSERT_MSG(found, "Unknown data_format={} and num_format={}", static_cast<u32>(data_format),
                static_cast<u32>(num_format));
     return result;

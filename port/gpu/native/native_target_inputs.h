@@ -5,8 +5,8 @@
 #include <nlohmann/json_fwd.hpp>
 #include "common/assert.h"
 #include "common/types.h"
-#include "video_core/amdgpu/pixel_format.h"
-#include "video_core/amdgpu/tiling.h"
+#include "native/ps4_data_layout/pixel_format.h"
+#include "native/ps4_data_layout/tiling.h"
 
 namespace Vulkan {
 struct DrawInputs;
@@ -65,7 +65,7 @@ struct ColorTarget {
         u32 alt_tile_mode{};
     } info;
     struct {
-        AmdGpu::TileMode tile_mode_index{};
+        Ps4Layout::TileMode tile_mode_index{};
         u32 num_samples_log2{};
         u32 num_fragments_log2{};
     } attrib;
@@ -111,34 +111,34 @@ struct ColorTarget {
     }
 
     u32 GetColorSliceSize() const {
-        const auto num_bytes_per_element = AmdGpu::NumBitsPerBlock(AmdGpu::DataFormat(info.format)) / 8u;
+        const auto num_bytes_per_element = Ps4Layout::NumBitsPerBlock(Ps4Layout::DataFormat(info.format)) / 8u;
         const auto slice_size = num_bytes_per_element * (slice.tile_max + 1) * 64u * NumSamples();
         return slice_size;
     }
 
-    AmdGpu::TileMode GetTileMode() const {
-        return info.linear_general ? AmdGpu::TileMode::DisplayLinearGeneral : attrib.tile_mode_index;
+    Ps4Layout::TileMode GetTileMode() const {
+        return info.linear_general ? Ps4Layout::TileMode::DisplayLinearGeneral : attrib.tile_mode_index;
     }
 
     bool IsTiled() const {
-        return GetTileMode() != AmdGpu::TileMode::DisplayLinearAligned && GetTileMode() != AmdGpu::TileMode::DisplayLinearGeneral;
+        return GetTileMode() != Ps4Layout::TileMode::DisplayLinearAligned && GetTileMode() != Ps4Layout::TileMode::DisplayLinearGeneral;
     }
 
-    AmdGpu::DataFormat GetDataFmt() const {
-        return AmdGpu::RemapDataFormat(AmdGpu::DataFormat(info.format));
+    Ps4Layout::DataFormat GetDataFmt() const {
+        return Ps4Layout::RemapDataFormat(Ps4Layout::DataFormat(info.format));
     }
 
-    AmdGpu::NumberFormat GetNumberFmt() const {
-        return AmdGpu::RemapNumberFormat(GetFixedNumberFormat(), AmdGpu::DataFormat(info.format));
+    Ps4Layout::NumberFormat GetNumberFmt() const {
+        return Ps4Layout::RemapNumberFormat(GetFixedNumberFormat(), Ps4Layout::DataFormat(info.format));
     }
 
-    AmdGpu::NumberConversion GetNumberConversion() const {
-        return AmdGpu::MapNumberConversion(GetFixedNumberFormat(), AmdGpu::DataFormat(info.format));
+    Ps4Layout::NumberConversion GetNumberConversion() const {
+        return Ps4Layout::MapNumberConversion(GetFixedNumberFormat(), Ps4Layout::DataFormat(info.format));
     }
 
-    AmdGpu::CompMapping Swizzle() const {
-        using AmdGpu::CompMapping;
-        using AmdGpu::CompSwizzle;
+    Ps4Layout::CompMapping Swizzle() const {
+        using Ps4Layout::CompMapping;
+        using Ps4Layout::CompSwizzle;
         // clang-format off
         static constexpr std::array<std::array<CompMapping, 4>, 4> mrt_swizzles{{
             // Standard
@@ -172,15 +172,15 @@ struct ColorTarget {
         }};
         // clang-format on
         const auto swap_idx = static_cast<u32>(info.comp_swap);
-        const auto components_idx = AmdGpu::NumComponents(AmdGpu::DataFormat(info.format)) - 1;
+        const auto components_idx = Ps4Layout::NumComponents(Ps4Layout::DataFormat(info.format)) - 1;
         const auto mrt_swizzle = mrt_swizzles[swap_idx][components_idx];
-        return AmdGpu::RemapSwizzle(AmdGpu::DataFormat(info.format), mrt_swizzle);
+        return Ps4Layout::RemapSwizzle(Ps4Layout::DataFormat(info.format), mrt_swizzle);
     }
 
-    AmdGpu::NumberFormat GetFixedNumberFormat() const {
+    Ps4Layout::NumberFormat GetFixedNumberFormat() const {
         // There is a small difference between T# and CB number types, account for it.
-        const auto number_fmt = AmdGpu::NumberFormat(info.number_type);
-        return number_fmt == AmdGpu::NumberFormat::SnormNz ? AmdGpu::NumberFormat::Srgb : number_fmt;
+        const auto number_fmt = Ps4Layout::NumberFormat(info.number_type);
+        return number_fmt == Ps4Layout::NumberFormat::SnormNz ? Ps4Layout::NumberFormat::Srgb : number_fmt;
     }
 };
 
@@ -272,12 +272,12 @@ struct DepthTarget {
         return (depth_slice.tile_max + 1) * 64 * bpe * NumSamples();
     }
 
-    AmdGpu::TileMode GetTileMode() const {
-        return static_cast<AmdGpu::TileMode>(z_info.tile_mode_index);
+    Ps4Layout::TileMode GetTileMode() const {
+        return static_cast<Ps4Layout::TileMode>(z_info.tile_mode_index);
     }
 
     bool IsTiled() const {
-        return GetTileMode() != AmdGpu::TileMode::DisplayLinearAligned && GetTileMode() != AmdGpu::TileMode::DisplayLinearGeneral;
+        return GetTileMode() != Ps4Layout::TileMode::DisplayLinearAligned && GetTileMode() != Ps4Layout::TileMode::DisplayLinearGeneral;
     }
 };
 

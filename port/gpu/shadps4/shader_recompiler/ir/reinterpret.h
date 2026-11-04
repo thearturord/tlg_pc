@@ -4,7 +4,7 @@
 #pragma once
 
 #include "shader_recompiler/ir/ir_emitter.h"
-#include "video_core/amdgpu/pixel_format.h"
+#include "native/ps4_data_layout/pixel_format.h"
 
 namespace Shader::IR {
 

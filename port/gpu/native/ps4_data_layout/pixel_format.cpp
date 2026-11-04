@@ -3,9 +3,9 @@
 
 #include <array>
 #include "common/assert.h"
-#include "video_core/amdgpu/pixel_format.h"
+#include "native/ps4_data_layout/pixel_format.h"
 
-namespace AmdGpu {
+namespace Ps4Layout {
 
 std::string_view NameOf(DataFormat fmt) {
     switch (fmt) {
@@ -246,4 +246,4 @@ constexpr std::array<s32, NUM_ENTRIES> BITS_PER_ELEMENT = {
     8,   // 41 FormatBc7
 };
 
-} // namespace AmdGpu
+} // namespace Ps4Layout

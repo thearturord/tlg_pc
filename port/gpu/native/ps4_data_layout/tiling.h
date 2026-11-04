@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
+// The PS4 data layout module (G3, documents/tlg/native plan/executor-consumer-plan.md): the layout of data in PS4 memory (tile modes, array modes, data and number formats, block
+// sizes). It is the layout of the bytes behind the game's images, so it stays by design; the host image code includes it from here instead of from the emulator's amdgpu/ folder.
+// Namespace Ps4Layout; the shader recompiler keeps reaching the names through `AmdGpu::` (compat block at the end of each header).
 
 #pragma once
 
@@ -8,9 +11,7 @@
 #include "common/assert.h"
 #include "common/types.h"
 
-namespace AmdGpu {
-
-struct Image;
+namespace Ps4Layout {
 
 static constexpr size_t NUM_TILE_MODES = 32;
 
@@ -308,4 +309,9 @@ u32 CalculateTileSplit(TileMode tile_mode, ArrayMode array_mode, MicroTileMode m
 
 MacroTileMode CalculateMacrotileMode(TileMode tile_mode, u32 bpp, u32 num_samples);
 
+} // namespace Ps4Layout
+
+namespace AmdGpu {
+using namespace Ps4Layout;
+using Ps4Layout::NameOf; // AmdGpu has a NameOf of its own (ImageType): the using-directive alone would hide these
 } // namespace AmdGpu

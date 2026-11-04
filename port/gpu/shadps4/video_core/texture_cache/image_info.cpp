@@ -8,8 +8,8 @@
 #include "core/libraries/videoout/buffer.h"
 #include "native/native_desc.h"
 #include "shader_recompiler/resource.h"
-#include "video_core/amdgpu/pixel_format.h"
-#include "video_core/amdgpu/tiling.h"
+#include "native/ps4_data_layout/pixel_format.h"
+#include "native/ps4_data_layout/tiling.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/image_info.h"
@@ -46,8 +46,8 @@ ImageInfo::ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group,
         .is_tiled = attrib.tiling_mode == TilingMode::Tile,
     };
     tile_mode =
-        props.is_tiled ? AmdGpu::TileMode::Display2DThin : AmdGpu::TileMode::DisplayLinearAligned;
-    array_mode = AmdGpu::GetArrayMode(tile_mode);
+        props.is_tiled ? Ps4Layout::TileMode::Display2DThin : Ps4Layout::TileMode::DisplayLinearAligned;
+    array_mode = Ps4Layout::GetArrayMode(tile_mode);
     pixel_format = ConvertPixelFormat(attrib.pixel_format);
     num_samples = 1;
     type = AmdGpu::ImageType::Color2D;
@@ -67,7 +67,7 @@ ImageInfo::ImageInfo(const Core::NativeTarget::ColorTarget& buffer, AmdGpu::CbDb
         .is_tiled = buffer.IsTiled(),
     };
     tile_mode = buffer.GetTileMode();
-    array_mode = AmdGpu::GetArrayMode(tile_mode);
+    array_mode = Ps4Layout::GetArrayMode(tile_mode);
     pixel_format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
     num_samples = buffer.NumSamples();
     num_bits = NumBitsPerBlock(buffer.GetDataFmt());
@@ -96,7 +96,7 @@ ImageInfo::ImageInfo(const Core::NativeTarget::ColorTarget& buffer, AmdGpu::CbDb
 ImageInfo::ImageInfo(const Core::NativeTarget::DepthTarget& buffer, u32 num_slices, VAddr htile_address,
                      AmdGpu::CbDbExtent hint, bool write_buffer) noexcept {
     tile_mode = buffer.GetTileMode();
-    array_mode = AmdGpu::GetArrayMode(tile_mode);
+    array_mode = Ps4Layout::GetArrayMode(tile_mode);
     pixel_format = LiverpoolToVK::DepthFormat(buffer.z_info.format, buffer.stencil_info.format);
     type = AmdGpu::ImageType::Color2D;
     props = ImageProperties{
@@ -135,9 +135,9 @@ Core::NativeDesc::ImageDesc ImageDescFromSharp(const AmdGpu::Image& sharp) noexc
     const auto nfmt = sharp.GetNumberFmt();
     d.address = sharp.Address();
     d.vk_format = static_cast<u32>(LiverpoolToVK::SurfaceFormat(dfmt, nfmt));
-    d.vk_format_storage = static_cast<u32>(LiverpoolToVK::SurfaceFormat(dfmt, nfmt == AmdGpu::NumberFormat::Srgb ? AmdGpu::NumberFormat::Unorm : nfmt));
+    d.vk_format_storage = static_cast<u32>(LiverpoolToVK::SurfaceFormat(dfmt, nfmt == Ps4Layout::NumberFormat::Srgb ? Ps4Layout::NumberFormat::Unorm : nfmt));
     d.num_bits = NumBitsPerBlock(dfmt);
-    d.is_block = AmdGpu::IsBlockCoded(dfmt);
+    d.is_block = Ps4Layout::IsBlockCoded(dfmt);
     d.type = static_cast<u32>(sharp.type);
     d.width = sharp.width + 1;
     d.height = sharp.height + 1;
@@ -182,8 +182,8 @@ u32 ImageDescAccessorMismatch(const AmdGpu::Image& sharp, const Core::NativeDesc
 }
 
 ImageInfo::ImageInfo(const Core::NativeDesc::ImageDesc& desc, bool is_depth) noexcept {
-    tile_mode = static_cast<AmdGpu::TileMode>(desc.tile_mode);
-    array_mode = AmdGpu::GetArrayMode(tile_mode);
+    tile_mode = static_cast<Ps4Layout::TileMode>(desc.tile_mode);
+    array_mode = Ps4Layout::GetArrayMode(tile_mode);
     pixel_format = static_cast<vk::Format>(desc.vk_format);
     if (is_depth) {
         pixel_format = LiverpoolToVK::PromoteFormatToDepth(pixel_format);
@@ -248,12 +248,12 @@ bool ImageInfo::IsCompatible(const ImageInfo& info) const {
 }
 
 void ImageInfo::UpdateSize() noexcept {
-    ASSERT_MSG(array_mode != AmdGpu::ArrayMode::ArrayLinearGeneral,
+    ASSERT_MSG(array_mode != Ps4Layout::ArrayMode::ArrayLinearGeneral,
                "Unhandled array mode: ArrayLinearGeneral");
     if (std::has_single_bit(pitch) && std::bit_width(pitch) <= MAX_DIM_LOG2 &&
         pitch == size.height && size.depth == 1 && resources.levels == std::bit_width(pitch) &&
         resources.layers == 1 && num_samples == 1 && props.is_block && props.is_pow2 && !alt_tile &&
-        tile_mode == AmdGpu::TileMode::Thin1DThin) {
+        tile_mode == Ps4Layout::TileMode::Thin1DThin) {
         if (num_bits == 128) {
             const auto& entry = Pow2Bcn128ImageTable[std::bit_width(pitch) - 1];
             mips_layout = entry.mips_layout;

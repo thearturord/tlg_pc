@@ -927,7 +927,7 @@ nlohmann::json Report() {
             // F4.6: the draw code's own bits-per-element table against the console header's (-1 entries count as 0), every code of the field
             u32 differing = 0;
             for (u32 code = 0; code < 42; ++code) {
-                const s32 reference = static_cast<s32>(AmdGpu::NumBitsPerElement(static_cast<AmdGpu::DataFormat>(code)));
+                const s32 reference = static_cast<s32>(Ps4Layout::NumBitsPerElement(static_cast<Ps4Layout::DataFormat>(code)));
                 if (NativeDesc::BitsPerElementOfDataFormat(code) != static_cast<u32>(std::max(reference, 0))) {
                     ++differing;
                 }

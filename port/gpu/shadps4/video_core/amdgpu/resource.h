@@ -7,8 +7,8 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/bit_field.h"
-#include "video_core/amdgpu/pixel_format.h"
-#include "video_core/amdgpu/tiling.h"
+#include "native/ps4_data_layout/pixel_format.h"
+#include "native/ps4_data_layout/tiling.h"
 
 namespace AmdGpu {
 

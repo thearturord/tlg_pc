@@ -15,8 +15,6 @@ NATIVE = os.path.dirname(os.path.abspath(__file__))
 
 ALLOWED_PS4 = {
     "video_core/amdgpu/resource.h": "by design: the shader recompiler reads T# words, so Derive writes them in the PS4 layout (pixel_format.h comes with it); goes when the recompiler interface changes",
-    "video_core/amdgpu/pixel_format.h": "G3: the data format / number format enums and tables of the memory layout behind the plain targets (native_target_inputs.h); goes to the layout module in G3",
-    "video_core/amdgpu/tiling.h": "G3: the tile mode enum of the memory layout behind the plain targets (native_target_inputs.h); goes to the layout module in G3",
     "video_core/amdgpu/regs.h":"by design: bit layouts of the colour/depth target words the shader and the host format code take (ColorBuffer, DepthBuffer, DepthView, DataFormat tables); native_target_desc.cpp only",
     "video_core/amdgpu/liverpool.h": "by design: the record format is a list of register pairs; native_draw.cpp uses the register group map and the register word types (DepthShaderControl, ShaderProgram) of the record, native_shader_env.cpp the same words",
     "video_core/renderer_vulkan/vk_fixed_state.h": "by design: the Vulkan fixed state struct (Vulkan terms; it includes regs.h only for NUM_VIEWPORTS and PrimitiveType)",
@@ -39,7 +37,8 @@ MEMBER_FILES = {}
 include = re.compile(r'#\s*include\s+"([^"]+)"')
 bad = []
 used = set()
-for name in sorted(os.listdir(NATIVE)):
+native_files = sorted(os.listdir(NATIVE)) + ["ps4_data_layout/" + n for n in sorted(os.listdir(os.path.join(NATIVE, "ps4_data_layout")))]  # G3: the layout module is part of native/
+for name in native_files:
     if not name.endswith((".cpp", ".h")):
         continue
     if name in MEMBER_FILES:

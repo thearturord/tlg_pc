@@ -98,26 +98,26 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
     }
 
     const auto device = instance.GetDevice();
-    const auto micro_tile_mode = AmdGpu::GetMicroTileMode(info.tile_mode);
-    const bool is_macro = AmdGpu::IsMacroTiled(info.array_mode);
+    const auto micro_tile_mode = Ps4Layout::GetMicroTileMode(info.tile_mode);
+    const bool is_macro = Ps4Layout::IsMacroTiled(info.array_mode);
     std::array<u32, 12> spec_data{
         info.num_samples,
         u32(micro_tile_mode),
-        AmdGpu::GetMicroTileThickness(info.array_mode),
+        Ps4Layout::GetMicroTileThickness(info.array_mode),
         u32(is_tiler),
     };
     if (is_macro) {
         const auto macro_tile_mode =
-            AmdGpu::CalculateMacrotileMode(info.tile_mode, info.num_bits, info.num_samples);
+            Ps4Layout::CalculateMacrotileMode(info.tile_mode, info.num_bits, info.num_samples);
         spec_data[4] = u32(info.array_mode);
-        spec_data[5] = u32(AmdGpu::GetPipeConfig(info.tile_mode));
-        spec_data[6] = AmdGpu::GetBankWidth(macro_tile_mode);
-        spec_data[7] = AmdGpu::GetBankHeight(macro_tile_mode);
-        spec_data[8] = AmdGpu::GetNumBanks(macro_tile_mode);
+        spec_data[5] = u32(Ps4Layout::GetPipeConfig(info.tile_mode));
+        spec_data[6] = Ps4Layout::GetBankWidth(macro_tile_mode);
+        spec_data[7] = Ps4Layout::GetBankHeight(macro_tile_mode);
+        spec_data[8] = Ps4Layout::GetNumBanks(macro_tile_mode);
         spec_data[9] = std::bit_width(spec_data[8]) - 1;
-        spec_data[10] = AmdGpu::CalculateTileSplit(info.tile_mode, info.array_mode, micro_tile_mode,
+        spec_data[10] = Ps4Layout::CalculateTileSplit(info.tile_mode, info.array_mode, micro_tile_mode,
                                                    info.num_bits);
-        spec_data[11] = AmdGpu::GetMacrotileAspect(macro_tile_mode);
+        spec_data[11] = Ps4Layout::GetMacrotileAspect(macro_tile_mode);
     }
 
     std::span<const u32> code;

@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
+// The PS4 data layout module (G3, documents/tlg/native plan/executor-consumer-plan.md): the layout of data in PS4 memory (tile modes, array modes, data and number formats, block
+// sizes). It is the layout of the bytes behind the game's images, so it stays by design; the host image code includes it from here instead of from the emulator's amdgpu/ folder.
+// Namespace Ps4Layout; the shader recompiler keeps reaching the names through `AmdGpu::` (compat block at the end of each header).
 
 #pragma once
 
@@ -8,7 +11,7 @@
 #include "common/assert.h"
 #include "common/types.h"
 
-namespace AmdGpu {
+namespace Ps4Layout {
 
 // Table 8.13 Data and Image Formats [Sea Islands Series Instruction Set Architecture]
 enum class DataFormat : u32 {
@@ -152,7 +155,7 @@ union CompMapping {
 
     [[nodiscard]] u32 Map(u32 comp) const {
         const u32 swizzled_comp = u32(array[comp]);
-        constexpr u32 min_comp = u32(AmdGpu::CompSwizzle::Red);
+        constexpr u32 min_comp = u32(Ps4Layout::CompSwizzle::Red);
         return swizzled_comp >= min_comp ? swizzled_comp - min_comp : comp;
     }
 
@@ -420,24 +423,29 @@ constexpr u32 NumBitsPerElement(DataFormat format) noexcept {
     return BITS_PER_ELEMENT[index];
 }
 
+} // namespace Ps4Layout
+
+namespace AmdGpu {
+using namespace Ps4Layout;
+using Ps4Layout::NameOf;
 } // namespace AmdGpu
 
 template <>
-struct fmt::formatter<AmdGpu::DataFormat> {
+struct fmt::formatter<Ps4Layout::DataFormat> {
     constexpr auto parse(format_parse_context& ctx) {
         return ctx.begin();
     }
-    auto format(AmdGpu::DataFormat fmt, format_context& ctx) const {
-        return fmt::format_to(ctx.out(), "{}", AmdGpu::NameOf(fmt));
+    auto format(Ps4Layout::DataFormat fmt, format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", Ps4Layout::NameOf(fmt));
     }
 };
 
 template <>
-struct fmt::formatter<AmdGpu::NumberFormat> {
+struct fmt::formatter<Ps4Layout::NumberFormat> {
     constexpr auto parse(format_parse_context& ctx) {
         return ctx.begin();
     }
-    auto format(AmdGpu::NumberFormat fmt, format_context& ctx) const {
-        return fmt::format_to(ctx.out(), "{}", AmdGpu::NameOf(fmt));
+    auto format(Ps4Layout::NumberFormat fmt, format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", Ps4Layout::NameOf(fmt));
     }
 };

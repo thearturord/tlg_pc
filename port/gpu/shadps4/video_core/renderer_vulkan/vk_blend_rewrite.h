@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include "video_core/amdgpu/pixel_format.h"
+#include "native/ps4_data_layout/pixel_format.h"
 #include "video_core/amdgpu/regs_color.h"
 
 namespace Vulkan {
@@ -28,8 +28,8 @@ enum class BlendRewriteResult {
     Unsupported,
 };
 
-[[nodiscard]] constexpr bool IsUnsignedNormalizedBlendTarget(const AmdGpu::NumberFormat format) {
-    using Format = AmdGpu::NumberFormat;
+[[nodiscard]] constexpr bool IsUnsignedNormalizedBlendTarget(const Ps4Layout::NumberFormat format) {
+    using Format = Ps4Layout::NumberFormat;
     return format == Format::Unorm || format == Format::Srgb;
 }
 
@@ -54,7 +54,7 @@ enum class BlendRewriteResult {
  * kept and the caller squares its result with a second draw.
  */
 [[nodiscard]] constexpr BlendRewriteResult RewriteScaledMinMaxBlend(
-    BlendEquation& equation, const AmdGpu::NumberFormat target_format, const BlendChannel channel) {
+    BlendEquation& equation, const Ps4Layout::NumberFormat target_format, const BlendChannel channel) {
     using Factor = AmdGpu::BlendControl::BlendFactor;
     using Function = AmdGpu::BlendControl::BlendFunc;
 

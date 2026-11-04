@@ -1607,7 +1607,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     const auto sharp1 = desc1.GetSharp(info);
     const auto buf0 = Core::NativeDesc::BufferDescOf(desc0.GetSharp(info));
     const auto buf1 = Core::NativeDesc::BufferDescOf(sharp1);
-    const u32 buf1_bpp = AmdGpu::NumBitsPerBlock(sharp1.GetDataFmt());
+    const u32 buf1_bpp = Ps4Layout::NumBitsPerBlock(sharp1.GetDataFmt());
     if (buf0.size != 16 || (cs_pgm.dim_x * 128ULL * (buf1_bpp / 8)) != buf1.size) {
         return false;
     }
@@ -2248,7 +2248,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
         }
         Census(census_base + CImageTotal);
-        if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
+        if (tsharp.Address() == 0 || data_fmt == Ps4Layout::DataFormat::FormatInvalid) {
             Census(census_base + CImageNull);
             image_bindings[num_images++].image_id = {};
             image_descriptor_array_sizes.push_back(1);

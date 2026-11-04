@@ -8,11 +8,7 @@
 
 #include "common/assert.h"
 #include "common/types.h"
-#include "video_core/amdgpu/tiling.h"
-
-namespace AmdGpu {
-enum class TileMode : u32;
-}
+#include "native/ps4_data_layout/tiling.h"
 
 namespace VideoCore {
 
@@ -293,7 +289,7 @@ constexpr std::array macro_tile_extents_alt{
 constexpr std::pair micro_tile_extent{8u, 8u};
 constexpr auto hw_pipe_interleave = 256u;
 
-constexpr std::pair<u32, u32> GetMacroTileExtents(AmdGpu::TileMode tile_mode, u32 bpp,
+constexpr std::pair<u32, u32> GetMacroTileExtents(Ps4Layout::TileMode tile_mode, u32 bpp,
                                                   u32 num_samples, bool alt) {
     ASSERT(num_samples > 0 && num_samples <= 8);
     const auto samples_log = std::bit_width(num_samples) - 1;
@@ -331,7 +327,7 @@ constexpr std::tuple<u16, u16, size_t> ImageSizeMicroTiled(u32 pitch, u32 height
 }
 
 constexpr bool IsMacroTiledMip(u32 pitch, u32 height, u32 bpp, u32 num_samples,
-                               AmdGpu::TileMode tile_mode, u32 mip_n, bool alt) {
+                               Ps4Layout::TileMode tile_mode, u32 mip_n, bool alt) {
     if (mip_n == 0) {
         return true;
     }
@@ -341,7 +337,7 @@ constexpr bool IsMacroTiledMip(u32 pitch, u32 height, u32 bpp, u32 num_samples,
 
 constexpr std::tuple<u16, u16, size_t> ImageSizeMacroTiled(u32 pitch, u32 height, u32 bpp,
                                                            u32 num_samples,
-                                                           AmdGpu::TileMode tile_mode, bool alt) {
+                                                           Ps4Layout::TileMode tile_mode, bool alt) {
     const auto [pitch_align, height_align] = GetMacroTileExtents(tile_mode, bpp, num_samples, alt);
     ASSERT(pitch_align != 0 && height_align != 0);
     const auto pitch_aligned = (pitch + pitch_align - 1) & ~(pitch_align - 1);
@@ -361,11 +357,11 @@ static constexpr std::size_t MAX_MIPS = 16;
 
 constexpr void ComputeImageSize(u32 pitch, u32 height, u32 depth, u32 levels, u32 layers,
                                 u32 num_bits, u32 num_samples, bool is_block, bool is_pow2,
-                                bool alt_tile, AmdGpu::TileMode tile_mode,
-                                AmdGpu::ArrayMode array_mode, u32* out_size,
+                                bool alt_tile, Ps4Layout::TileMode tile_mode,
+                                Ps4Layout::ArrayMode array_mode, u32* out_size,
                                 u32* out_micro_tiled_mips, MipInfo* out_mips_layout) {
-    const u32 thickness = AmdGpu::GetMicroTileThickness(array_mode);
-    const bool macro = AmdGpu::IsMacroTiled(array_mode);
+    const u32 thickness = Ps4Layout::GetMicroTileThickness(array_mode);
+    const bool macro = Ps4Layout::IsMacroTiled(array_mode);
     *out_size = 0;
     *out_micro_tiled_mips = 0;
     for (s32 mip = 0; mip < levels; ++mip) {
@@ -387,7 +383,7 @@ constexpr void ComputeImageSize(u32 pitch, u32 height, u32 depth, u32 levels, u3
 
         auto& mip_info = out_mips_layout[mip];
         u32 mip_thickness = 1;
-        if (array_mode == AmdGpu::ArrayMode::ArrayLinearAligned) {
+        if (array_mode == Ps4Layout::ArrayMode::ArrayLinearAligned) {
             std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
                 ImageSizeLinearAligned(mip_w, mip_h, num_bits, num_samples);
         } else if (macro &&
@@ -428,7 +424,7 @@ constexpr auto Pow2Bcn64ImageTable = [] {
     for (u32 i = 0; i < MAX_DIM_LOG2; ++i) {
         const u32 pitch = 1 << i;
         ComputeImageSize(pitch, pitch, 1, std::bit_width(pitch), 1, 64, 1, true, true, false,
-                         AmdGpu::TileMode::Thin1DThin, AmdGpu::ArrayMode::Array1DTiledThin1,
+                         Ps4Layout::TileMode::Thin1DThin, Ps4Layout::ArrayMode::Array1DTiledThin1,
                          &entry[i].guest_size, &entry[i].micro_tiled_mips,
                          entry[i].mips_layout.data());
     }
@@ -440,7 +436,7 @@ constexpr auto Pow2Bcn128ImageTable = [] {
     for (u32 i = 0; i < MAX_DIM_LOG2; ++i) {
         const u32 pitch = 1 << i;
         ComputeImageSize(pitch, pitch, 1, std::bit_width(pitch), 1, 128, 1, true, true, false,
-                         AmdGpu::TileMode::Thin1DThin, AmdGpu::ArrayMode::Array1DTiledThin1,
+                         Ps4Layout::TileMode::Thin1DThin, Ps4Layout::ArrayMode::Array1DTiledThin1,
                          &entry[i].guest_size, &entry[i].micro_tiled_mips,
                          entry[i].mips_layout.data());
     }

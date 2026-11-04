@@ -8,7 +8,7 @@
 #include <boost/container_hash/hash.hpp>
 
 #include "common/types.h"
-#include "video_core/amdgpu/tiling.h"
+#include "native/ps4_data_layout/tiling.h"
 #include "video_core/buffer_cache/buffer.h"
 
 namespace Vulkan {
@@ -22,7 +22,7 @@ struct Image;
 
 class TileManager {
     struct TilingKey {
-        AmdGpu::TileMode tile_mode;
+        Ps4Layout::TileMode tile_mode;
         u32 num_bits;
         u32 num_samples;
         bool is_tiler;

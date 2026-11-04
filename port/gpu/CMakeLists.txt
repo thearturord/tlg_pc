@@ -188,7 +188,7 @@ find_package(absl REQUIRED) # tlg-native: our texture cache uses absl::flat_hash
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 # tlg-native: our native render path (records, hooks, debug server, readbacks).
 # The native renderer lives in native/ (next to shadps4/, not inside it): included as "native/<name>.h".
-file(GLOB NATIVE_CORE CONFIGURE_DEPENDS native/*.cpp shadps4/core/*.cpp)
+file(GLOB NATIVE_CORE CONFIGURE_DEPENDS native/*.cpp native/ps4_data_layout/*.cpp shadps4/core/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
 # Windows: a DLL cannot leave the runtime_* symbols for tlg-probe.exe to resolve, so the

@@ -3,7 +3,7 @@
 
 #include "common/assert.h"
 #include "common/number_utils.h"
-#include "video_core/amdgpu/pixel_format.h"
+#include "native/ps4_data_layout/pixel_format.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 
 #include <magic_enum/magic_enum.hpp>
@@ -263,8 +263,8 @@ vk::BlendOp BlendOp(AmdGpu::BlendControl::BlendFunc func) {
 }
 
 void NormalizeMinMaxBlend(vk::BlendOp& op, vk::BlendFactor& src, vk::BlendFactor& dst,
-                          AmdGpu::NumberFormat format) {
-    if (format != AmdGpu::NumberFormat::Unorm && format != AmdGpu::NumberFormat::Srgb) {
+                          Ps4Layout::NumberFormat format) {
+    if (format != Ps4Layout::NumberFormat::Unorm && format != Ps4Layout::NumberFormat::Srgb) {
         return;
     }
     if (op != vk::BlendOp::eMin && op != vk::BlendOp::eMax) {
@@ -430,26 +430,26 @@ vk::BorderColor BorderColor(AmdGpu::BorderColor color) {
     }
 }
 
-vk::ComponentSwizzle ComponentSwizzle(AmdGpu::CompSwizzle comp_swizzle) {
+vk::ComponentSwizzle ComponentSwizzle(Ps4Layout::CompSwizzle comp_swizzle) {
     switch (comp_swizzle) {
-    case AmdGpu::CompSwizzle::Zero:
+    case Ps4Layout::CompSwizzle::Zero:
         return vk::ComponentSwizzle::eZero;
-    case AmdGpu::CompSwizzle::One:
+    case Ps4Layout::CompSwizzle::One:
         return vk::ComponentSwizzle::eOne;
-    case AmdGpu::CompSwizzle::Red:
+    case Ps4Layout::CompSwizzle::Red:
         return vk::ComponentSwizzle::eR;
-    case AmdGpu::CompSwizzle::Green:
+    case Ps4Layout::CompSwizzle::Green:
         return vk::ComponentSwizzle::eG;
-    case AmdGpu::CompSwizzle::Blue:
+    case Ps4Layout::CompSwizzle::Blue:
         return vk::ComponentSwizzle::eB;
-    case AmdGpu::CompSwizzle::Alpha:
+    case Ps4Layout::CompSwizzle::Alpha:
         return vk::ComponentSwizzle::eA;
     default:
         UNREACHABLE();
     }
 }
 
-vk::ComponentMapping ComponentMapping(AmdGpu::CompMapping comp_mapping) {
+vk::ComponentMapping ComponentMapping(Ps4Layout::CompMapping comp_mapping) {
     return vk::ComponentMapping{
         .r = ComponentSwizzle(comp_mapping.r),
         .g = ComponentSwizzle(comp_mapping.g),
@@ -472,65 +472,65 @@ static constexpr vk::FormatFeatureFlags2 Mrt = vk::FormatFeatureFlagBits2::eColo
 
 // Table 8.13 Data and Image Formats [Sea Islands Series Instruction Set Architecture]
 static constexpr vk::FormatFeatureFlags2 GetDataFormatFeatureFlags(
-    const AmdGpu::DataFormat data_format) {
+    const Ps4Layout::DataFormat data_format) {
     switch (data_format) {
-    case AmdGpu::DataFormat::FormatInvalid:
-    case AmdGpu::DataFormat::Format8:
-    case AmdGpu::DataFormat::Format16:
-    case AmdGpu::DataFormat::Format8_8:
-    case AmdGpu::DataFormat::Format32:
-    case AmdGpu::DataFormat::Format16_16:
-    case AmdGpu::DataFormat::Format10_11_11:
-    case AmdGpu::DataFormat::Format11_11_10:
-    case AmdGpu::DataFormat::Format10_10_10_2:
-    case AmdGpu::DataFormat::Format2_10_10_10:
-    case AmdGpu::DataFormat::Format8_8_8_8:
-    case AmdGpu::DataFormat::Format32_32:
-    case AmdGpu::DataFormat::Format16_16_16_16:
-    case AmdGpu::DataFormat::Format32_32_32_32:
+    case Ps4Layout::DataFormat::FormatInvalid:
+    case Ps4Layout::DataFormat::Format8:
+    case Ps4Layout::DataFormat::Format16:
+    case Ps4Layout::DataFormat::Format8_8:
+    case Ps4Layout::DataFormat::Format32:
+    case Ps4Layout::DataFormat::Format16_16:
+    case Ps4Layout::DataFormat::Format10_11_11:
+    case Ps4Layout::DataFormat::Format11_11_10:
+    case Ps4Layout::DataFormat::Format10_10_10_2:
+    case Ps4Layout::DataFormat::Format2_10_10_10:
+    case Ps4Layout::DataFormat::Format8_8_8_8:
+    case Ps4Layout::DataFormat::Format32_32:
+    case Ps4Layout::DataFormat::Format16_16_16_16:
+    case Ps4Layout::DataFormat::Format32_32_32_32:
         return BufferRead | BufferWrite | ImageRead | ImageWrite | Mrt;
-    case AmdGpu::DataFormat::Format32_32_32:
+    case Ps4Layout::DataFormat::Format32_32_32:
         return BufferRead | BufferWrite | ImageRead;
-    case AmdGpu::DataFormat::Format5_6_5:
-    case AmdGpu::DataFormat::Format1_5_5_5:
-    case AmdGpu::DataFormat::Format5_5_5_1:
-    case AmdGpu::DataFormat::Format4_4_4_4:
+    case Ps4Layout::DataFormat::Format5_6_5:
+    case Ps4Layout::DataFormat::Format1_5_5_5:
+    case Ps4Layout::DataFormat::Format5_5_5_1:
+    case Ps4Layout::DataFormat::Format4_4_4_4:
         return ImageRead | ImageWrite | Mrt;
-    case AmdGpu::DataFormat::Format8_24:
-    case AmdGpu::DataFormat::Format24_8:
-    case AmdGpu::DataFormat::FormatX24_8_32:
+    case Ps4Layout::DataFormat::Format8_24:
+    case Ps4Layout::DataFormat::Format24_8:
+    case Ps4Layout::DataFormat::FormatX24_8_32:
         return ImageRead | Mrt;
-    case AmdGpu::DataFormat::FormatGB_GR:
-    case AmdGpu::DataFormat::FormatBG_RG:
-    case AmdGpu::DataFormat::Format5_9_9_9:
-    case AmdGpu::DataFormat::FormatBc1:
-    case AmdGpu::DataFormat::FormatBc2:
-    case AmdGpu::DataFormat::FormatBc3:
-    case AmdGpu::DataFormat::FormatBc4:
-    case AmdGpu::DataFormat::FormatBc5:
-    case AmdGpu::DataFormat::FormatBc6:
-    case AmdGpu::DataFormat::FormatBc7:
-    case AmdGpu::DataFormat::Format4_4:
-    case AmdGpu::DataFormat::Format6_5_5:
-    case AmdGpu::DataFormat::Format1:
-    case AmdGpu::DataFormat::Format1_Reversed:
-    case AmdGpu::DataFormat::Format32_As_8:
-    case AmdGpu::DataFormat::Format32_As_8_8:
-    case AmdGpu::DataFormat::Format32_As_32_32_32_32:
+    case Ps4Layout::DataFormat::FormatGB_GR:
+    case Ps4Layout::DataFormat::FormatBG_RG:
+    case Ps4Layout::DataFormat::Format5_9_9_9:
+    case Ps4Layout::DataFormat::FormatBc1:
+    case Ps4Layout::DataFormat::FormatBc2:
+    case Ps4Layout::DataFormat::FormatBc3:
+    case Ps4Layout::DataFormat::FormatBc4:
+    case Ps4Layout::DataFormat::FormatBc5:
+    case Ps4Layout::DataFormat::FormatBc6:
+    case Ps4Layout::DataFormat::FormatBc7:
+    case Ps4Layout::DataFormat::Format4_4:
+    case Ps4Layout::DataFormat::Format6_5_5:
+    case Ps4Layout::DataFormat::Format1:
+    case Ps4Layout::DataFormat::Format1_Reversed:
+    case Ps4Layout::DataFormat::Format32_As_8:
+    case Ps4Layout::DataFormat::Format32_As_8_8:
+    case Ps4Layout::DataFormat::Format32_As_32_32_32_32:
         return ImageRead;
-    case AmdGpu::DataFormat::FormatFmask8_S2_F1:
-    case AmdGpu::DataFormat::FormatFmask8_S4_F1:
-    case AmdGpu::DataFormat::FormatFmask8_S8_F1:
-    case AmdGpu::DataFormat::FormatFmask8_S2_F2:
-    case AmdGpu::DataFormat::FormatFmask8_S4_F2:
-    case AmdGpu::DataFormat::FormatFmask8_S4_F4:
-    case AmdGpu::DataFormat::FormatFmask16_S16_F1:
-    case AmdGpu::DataFormat::FormatFmask16_S8_F2:
-    case AmdGpu::DataFormat::FormatFmask32_S16_F2:
-    case AmdGpu::DataFormat::FormatFmask32_S8_F4:
-    case AmdGpu::DataFormat::FormatFmask32_S8_F8:
-    case AmdGpu::DataFormat::FormatFmask64_S16_F4:
-    case AmdGpu::DataFormat::FormatFmask64_S16_F8:
+    case Ps4Layout::DataFormat::FormatFmask8_S2_F1:
+    case Ps4Layout::DataFormat::FormatFmask8_S4_F1:
+    case Ps4Layout::DataFormat::FormatFmask8_S8_F1:
+    case Ps4Layout::DataFormat::FormatFmask8_S2_F2:
+    case Ps4Layout::DataFormat::FormatFmask8_S4_F2:
+    case Ps4Layout::DataFormat::FormatFmask8_S4_F4:
+    case Ps4Layout::DataFormat::FormatFmask16_S16_F1:
+    case Ps4Layout::DataFormat::FormatFmask16_S8_F2:
+    case Ps4Layout::DataFormat::FormatFmask32_S16_F2:
+    case Ps4Layout::DataFormat::FormatFmask32_S8_F4:
+    case Ps4Layout::DataFormat::FormatFmask32_S8_F8:
+    case Ps4Layout::DataFormat::FormatFmask64_S16_F4:
+    case Ps4Layout::DataFormat::FormatFmask64_S16_F8:
         return ImageRead | ImageWrite;
     }
     UNREACHABLE_MSG("Missing feature flags for data format {}", static_cast<u32>(data_format));
@@ -538,31 +538,31 @@ static constexpr vk::FormatFeatureFlags2 GetDataFormatFeatureFlags(
 
 // Table 8.13 Data and Image Formats [Sea Islands Series Instruction Set Architecture]
 static constexpr vk::FormatFeatureFlags2 GetNumberFormatFeatureFlags(
-    const AmdGpu::NumberFormat number_format) {
+    const Ps4Layout::NumberFormat number_format) {
     switch (number_format) {
-    case AmdGpu::NumberFormat::Unorm:
-    case AmdGpu::NumberFormat::Snorm:
-    case AmdGpu::NumberFormat::Uint:
-    case AmdGpu::NumberFormat::Sint:
-    case AmdGpu::NumberFormat::Float:
+    case Ps4Layout::NumberFormat::Unorm:
+    case Ps4Layout::NumberFormat::Snorm:
+    case Ps4Layout::NumberFormat::Uint:
+    case Ps4Layout::NumberFormat::Sint:
+    case Ps4Layout::NumberFormat::Float:
         return BufferRead | BufferWrite | ImageRead | ImageWrite | Mrt;
-    case AmdGpu::NumberFormat::Uscaled:
-    case AmdGpu::NumberFormat::Sscaled:
-    case AmdGpu::NumberFormat::SnormNz:
+    case Ps4Layout::NumberFormat::Uscaled:
+    case Ps4Layout::NumberFormat::Sscaled:
+    case Ps4Layout::NumberFormat::SnormNz:
         return BufferRead | ImageRead;
-    case AmdGpu::NumberFormat::Srgb:
+    case Ps4Layout::NumberFormat::Srgb:
         return ImageRead | Mrt;
-    case AmdGpu::NumberFormat::Ubnorm:
-    case AmdGpu::NumberFormat::UbnormNz:
-    case AmdGpu::NumberFormat::Ubint:
-    case AmdGpu::NumberFormat::Ubscaled:
+    case Ps4Layout::NumberFormat::Ubnorm:
+    case Ps4Layout::NumberFormat::UbnormNz:
+    case Ps4Layout::NumberFormat::Ubint:
+    case Ps4Layout::NumberFormat::Ubscaled:
         return ImageRead;
     }
     UNREACHABLE_MSG("Missing feature flags for number format {}", static_cast<u32>(number_format));
 }
 
-static constexpr SurfaceFormatInfo CreateSurfaceFormatInfo(const AmdGpu::DataFormat data_format,
-                                                           const AmdGpu::NumberFormat number_format,
+static constexpr SurfaceFormatInfo CreateSurfaceFormatInfo(const Ps4Layout::DataFormat data_format,
+                                                           const Ps4Layout::NumberFormat number_format,
                                                            const vk::Format vk_format) {
     return {
         .data_format = data_format,
@@ -576,153 +576,153 @@ static constexpr SurfaceFormatInfo CreateSurfaceFormatInfo(const AmdGpu::DataFor
 // Uscaled, Sscaled, and Ubnorm formats are automatically remapped and handled in shader.
 static constexpr std::array formats{
     // Invalid
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatInvalid, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatInvalid, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eUndefined),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatInvalid, AmdGpu::NumberFormat::Snorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatInvalid, Ps4Layout::NumberFormat::Snorm,
                             vk::Format::eUndefined),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatInvalid, AmdGpu::NumberFormat::Uscaled,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatInvalid, Ps4Layout::NumberFormat::Uscaled,
                             vk::Format::eUndefined),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatInvalid, AmdGpu::NumberFormat::Sscaled,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatInvalid, Ps4Layout::NumberFormat::Sscaled,
                             vk::Format::eUndefined),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatInvalid, AmdGpu::NumberFormat::Uint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatInvalid, Ps4Layout::NumberFormat::Uint,
                             vk::Format::eUndefined),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatInvalid, AmdGpu::NumberFormat::Sint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatInvalid, Ps4Layout::NumberFormat::Sint,
                             vk::Format::eUndefined),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatInvalid, AmdGpu::NumberFormat::SnormNz,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatInvalid, Ps4Layout::NumberFormat::SnormNz,
                             vk::Format::eUndefined),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatInvalid, AmdGpu::NumberFormat::Float,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatInvalid, Ps4Layout::NumberFormat::Float,
                             vk::Format::eUndefined),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatInvalid, AmdGpu::NumberFormat::Srgb,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatInvalid, Ps4Layout::NumberFormat::Srgb,
                             vk::Format::eUndefined),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatInvalid, AmdGpu::NumberFormat::Ubnorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatInvalid, Ps4Layout::NumberFormat::Ubnorm,
                             vk::Format::eUndefined),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatInvalid, AmdGpu::NumberFormat::UbnormNz,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatInvalid, Ps4Layout::NumberFormat::UbnormNz,
                             vk::Format::eUndefined),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatInvalid, AmdGpu::NumberFormat::Ubint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatInvalid, Ps4Layout::NumberFormat::Ubint,
                             vk::Format::eUndefined),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatInvalid, AmdGpu::NumberFormat::Ubscaled,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatInvalid, Ps4Layout::NumberFormat::Ubscaled,
                             vk::Format::eUndefined),
     // 8
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format8, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format8, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eR8Unorm),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format8, AmdGpu::NumberFormat::Snorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format8, Ps4Layout::NumberFormat::Snorm,
                             vk::Format::eR8Snorm),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format8, AmdGpu::NumberFormat::Uint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format8, Ps4Layout::NumberFormat::Uint,
                             vk::Format::eR8Uint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format8, AmdGpu::NumberFormat::Sint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format8, Ps4Layout::NumberFormat::Sint,
                             vk::Format::eR8Sint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format8, AmdGpu::NumberFormat::Srgb,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format8, Ps4Layout::NumberFormat::Srgb,
                             vk::Format::eR8Srgb),
     // 16
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format16, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format16, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eR16Unorm),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format16, AmdGpu::NumberFormat::Snorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format16, Ps4Layout::NumberFormat::Snorm,
                             vk::Format::eR16Snorm),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format16, AmdGpu::NumberFormat::Uint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format16, Ps4Layout::NumberFormat::Uint,
                             vk::Format::eR16Uint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format16, AmdGpu::NumberFormat::Sint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format16, Ps4Layout::NumberFormat::Sint,
                             vk::Format::eR16Sint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format16, AmdGpu::NumberFormat::Float,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format16, Ps4Layout::NumberFormat::Float,
                             vk::Format::eR16Sfloat),
     // 8_8
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format8_8, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format8_8, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eR8G8Unorm),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format8_8, AmdGpu::NumberFormat::Snorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format8_8, Ps4Layout::NumberFormat::Snorm,
                             vk::Format::eR8G8Snorm),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format8_8, AmdGpu::NumberFormat::Uint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format8_8, Ps4Layout::NumberFormat::Uint,
                             vk::Format::eR8G8Uint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format8_8, AmdGpu::NumberFormat::Sint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format8_8, Ps4Layout::NumberFormat::Sint,
                             vk::Format::eR8G8Sint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format8_8, AmdGpu::NumberFormat::Srgb,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format8_8, Ps4Layout::NumberFormat::Srgb,
                             vk::Format::eR8G8Srgb),
     // 32
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format32, AmdGpu::NumberFormat::Uint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format32, Ps4Layout::NumberFormat::Uint,
                             vk::Format::eR32Uint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format32, AmdGpu::NumberFormat::Sint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format32, Ps4Layout::NumberFormat::Sint,
                             vk::Format::eR32Sint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format32, AmdGpu::NumberFormat::Float,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format32, Ps4Layout::NumberFormat::Float,
                             vk::Format::eR32Sfloat),
     // 16_16
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format16_16, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format16_16, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eR16G16Unorm),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format16_16, AmdGpu::NumberFormat::Snorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format16_16, Ps4Layout::NumberFormat::Snorm,
                             vk::Format::eR16G16Snorm),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format16_16, AmdGpu::NumberFormat::Uint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format16_16, Ps4Layout::NumberFormat::Uint,
                             vk::Format::eR16G16Uint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format16_16, AmdGpu::NumberFormat::Sint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format16_16, Ps4Layout::NumberFormat::Sint,
                             vk::Format::eR16G16Sint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format16_16, AmdGpu::NumberFormat::Float,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format16_16, Ps4Layout::NumberFormat::Float,
                             vk::Format::eR16G16Sfloat),
     // 10_11_11
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format10_11_11, AmdGpu::NumberFormat::Float,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format10_11_11, Ps4Layout::NumberFormat::Float,
                             vk::Format::eB10G11R11UfloatPack32),
     // 11_11_10 - Remapped to 10_11_11.
     // 10_10_10_2 - Remapped to 2_10_10_10.
     // 2_10_10_10
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format2_10_10_10, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format2_10_10_10, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eA2B10G10R10UnormPack32),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format2_10_10_10, AmdGpu::NumberFormat::Snorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format2_10_10_10, Ps4Layout::NumberFormat::Snorm,
                             vk::Format::eA2B10G10R10SnormPack32),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format2_10_10_10, AmdGpu::NumberFormat::Uint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format2_10_10_10, Ps4Layout::NumberFormat::Uint,
                             vk::Format::eA2B10G10R10UintPack32),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format2_10_10_10, AmdGpu::NumberFormat::Sint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format2_10_10_10, Ps4Layout::NumberFormat::Sint,
                             vk::Format::eA2B10G10R10SintPack32),
     // 8_8_8_8
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format8_8_8_8, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format8_8_8_8, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eR8G8B8A8Unorm),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format8_8_8_8, AmdGpu::NumberFormat::Snorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format8_8_8_8, Ps4Layout::NumberFormat::Snorm,
                             vk::Format::eR8G8B8A8Snorm),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format8_8_8_8, AmdGpu::NumberFormat::Uint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format8_8_8_8, Ps4Layout::NumberFormat::Uint,
                             vk::Format::eR8G8B8A8Uint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format8_8_8_8, AmdGpu::NumberFormat::Sint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format8_8_8_8, Ps4Layout::NumberFormat::Sint,
                             vk::Format::eR8G8B8A8Sint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format8_8_8_8, AmdGpu::NumberFormat::Srgb,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format8_8_8_8, Ps4Layout::NumberFormat::Srgb,
                             vk::Format::eR8G8B8A8Srgb),
     // 32_32
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format32_32, AmdGpu::NumberFormat::Uint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format32_32, Ps4Layout::NumberFormat::Uint,
                             vk::Format::eR32G32Uint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format32_32, AmdGpu::NumberFormat::Sint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format32_32, Ps4Layout::NumberFormat::Sint,
                             vk::Format::eR32G32Sint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format32_32, AmdGpu::NumberFormat::Float,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format32_32, Ps4Layout::NumberFormat::Float,
                             vk::Format::eR32G32Sfloat),
     // 16_16_16_16
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format16_16_16_16, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format16_16_16_16, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eR16G16B16A16Unorm),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format16_16_16_16, AmdGpu::NumberFormat::Snorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format16_16_16_16, Ps4Layout::NumberFormat::Snorm,
                             vk::Format::eR16G16B16A16Snorm),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format16_16_16_16, AmdGpu::NumberFormat::Uint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format16_16_16_16, Ps4Layout::NumberFormat::Uint,
                             vk::Format::eR16G16B16A16Uint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format16_16_16_16, AmdGpu::NumberFormat::Sint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format16_16_16_16, Ps4Layout::NumberFormat::Sint,
                             vk::Format::eR16G16B16A16Sint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format16_16_16_16, AmdGpu::NumberFormat::SnormNz,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format16_16_16_16, Ps4Layout::NumberFormat::SnormNz,
                             vk::Format::eR16G16B16A16Snorm),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format16_16_16_16, AmdGpu::NumberFormat::Float,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format16_16_16_16, Ps4Layout::NumberFormat::Float,
                             vk::Format::eR16G16B16A16Sfloat),
     // 32_32_32
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format32_32_32, AmdGpu::NumberFormat::Uint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format32_32_32, Ps4Layout::NumberFormat::Uint,
                             vk::Format::eR32G32B32Uint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format32_32_32, AmdGpu::NumberFormat::Sint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format32_32_32, Ps4Layout::NumberFormat::Sint,
                             vk::Format::eR32G32B32Sint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format32_32_32, AmdGpu::NumberFormat::Float,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format32_32_32, Ps4Layout::NumberFormat::Float,
                             vk::Format::eR32G32B32Sfloat),
     // 32_32_32_32
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format32_32_32_32, AmdGpu::NumberFormat::Uint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format32_32_32_32, Ps4Layout::NumberFormat::Uint,
                             vk::Format::eR32G32B32A32Uint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format32_32_32_32, AmdGpu::NumberFormat::Sint,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format32_32_32_32, Ps4Layout::NumberFormat::Sint,
                             vk::Format::eR32G32B32A32Sint),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format32_32_32_32, AmdGpu::NumberFormat::Float,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format32_32_32_32, Ps4Layout::NumberFormat::Float,
                             vk::Format::eR32G32B32A32Sfloat),
     // 5_6_5
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format5_6_5, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format5_6_5, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eR5G6B5UnormPack16),
     // 1_5_5_5
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format1_5_5_5, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format1_5_5_5, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eA1R5G5B5UnormPack16),
     // 5_5_5_1
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format5_5_5_1, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format5_5_5_1, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eR5G5B5A1UnormPack16),
     // 4_4_4_4
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format4_4_4_4, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format4_4_4_4, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eB4G4R4A4UnormPack16),
     // 8_24
     // 24_8
@@ -730,42 +730,42 @@ static constexpr std::array formats{
     // GB_GR
     // BG_RG
     // 5_9_9_9
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::Format5_9_9_9, AmdGpu::NumberFormat::Float,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::Format5_9_9_9, Ps4Layout::NumberFormat::Float,
                             vk::Format::eE5B9G9R9UfloatPack32),
     // BC1
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc1, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatBc1, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eBc1RgbaUnormBlock),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc1, AmdGpu::NumberFormat::Srgb,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatBc1, Ps4Layout::NumberFormat::Srgb,
                             vk::Format::eBc1RgbaSrgbBlock),
     // BC2
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc2, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatBc2, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eBc2UnormBlock),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc2, AmdGpu::NumberFormat::Srgb,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatBc2, Ps4Layout::NumberFormat::Srgb,
                             vk::Format::eBc2SrgbBlock),
     // BC3
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc3, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatBc3, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eBc3UnormBlock),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc3, AmdGpu::NumberFormat::Srgb,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatBc3, Ps4Layout::NumberFormat::Srgb,
                             vk::Format::eBc3SrgbBlock),
     // BC4
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc4, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatBc4, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eBc4UnormBlock),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc4, AmdGpu::NumberFormat::Snorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatBc4, Ps4Layout::NumberFormat::Snorm,
                             vk::Format::eBc4SnormBlock),
     // BC5
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc5, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatBc5, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eBc5UnormBlock),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc5, AmdGpu::NumberFormat::Snorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatBc5, Ps4Layout::NumberFormat::Snorm,
                             vk::Format::eBc5SnormBlock),
     // BC6
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc6, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatBc6, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eBc6HUfloatBlock),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc6, AmdGpu::NumberFormat::Snorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatBc6, Ps4Layout::NumberFormat::Snorm,
                             vk::Format::eBc6HSfloatBlock),
     // BC7
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc7, AmdGpu::NumberFormat::Unorm,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatBc7, Ps4Layout::NumberFormat::Unorm,
                             vk::Format::eBc7UnormBlock),
-    CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc7, AmdGpu::NumberFormat::Srgb,
+    CreateSurfaceFormatInfo(Ps4Layout::DataFormat::FormatBc7, Ps4Layout::NumberFormat::Srgb,
                             vk::Format::eBc7SrgbBlock),
 };
 
@@ -829,7 +829,7 @@ vk::Format DepthFormat(DepthBuffer::ZFormat z_format, DepthBuffer::StencilFormat
 
 vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& color_buffer) {
     const auto comp_swizzle = color_buffer.Swizzle();
-    const auto format = AmdGpu::DataFormat(color_buffer.info.format);
+    const auto format = Ps4Layout::DataFormat(color_buffer.info.format);
     const auto number_type = color_buffer.GetFixedNumberFormat();
 
     const auto& c0 = color_buffer.clear_word0;
@@ -838,8 +838,8 @@ vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& colo
     vk::ClearColorValue color{};
 
     switch (number_type) {
-    case AmdGpu::NumberFormat::Uint:
-    case AmdGpu::NumberFormat::Sint:
+    case Ps4Layout::NumberFormat::Uint:
+    case Ps4Layout::NumberFormat::Sint:
         color.uint32[3] = 1;
         break;
     default:
@@ -848,19 +848,19 @@ vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& colo
     }
 
     switch (format) {
-    case AmdGpu::DataFormat::Format8:
+    case Ps4Layout::DataFormat::Format8:
         switch (number_type) {
-        case AmdGpu::NumberFormat::Unorm:
-        case AmdGpu::NumberFormat::Srgb: // Should we handle gamma correction here?
+        case Ps4Layout::NumberFormat::Unorm:
+        case Ps4Layout::NumberFormat::Srgb: // Should we handle gamma correction here?
             color.float32[0] = NumberUtils::U8ToUnorm(c0 & 0xff);
             break;
             break;
-        case AmdGpu::NumberFormat::Snorm:
-        case AmdGpu::NumberFormat::SnormNz:
+        case Ps4Layout::NumberFormat::Snorm:
+        case Ps4Layout::NumberFormat::SnormNz:
             color.float32[0] = NumberUtils::S8ToSnorm(c0 & 0xff);
             break;
-        case AmdGpu::NumberFormat::Uint:
-        case AmdGpu::NumberFormat::Sint:
+        case Ps4Layout::NumberFormat::Uint:
+        case Ps4Layout::NumberFormat::Sint:
             color.uint32[0] = c0;
             break;
         default:
@@ -868,20 +868,20 @@ vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& colo
             break;
         }
         break;
-    case AmdGpu::DataFormat::Format16:
+    case Ps4Layout::DataFormat::Format16:
         switch (number_type) {
-        case AmdGpu::NumberFormat::Unorm:
+        case Ps4Layout::NumberFormat::Unorm:
             color.float32[0] = NumberUtils::U16ToUnorm(c0 & 0xffff);
             break;
-        case AmdGpu::NumberFormat::Snorm:
-        case AmdGpu::NumberFormat::SnormNz:
+        case Ps4Layout::NumberFormat::Snorm:
+        case Ps4Layout::NumberFormat::SnormNz:
             color.float32[0] = NumberUtils::S16ToSnorm(c0 & 0xffff);
             break;
-        case AmdGpu::NumberFormat::Uint:
-        case AmdGpu::NumberFormat::Sint:
+        case Ps4Layout::NumberFormat::Uint:
+        case Ps4Layout::NumberFormat::Sint:
             color.uint32[0] = c0;
             break;
-        case AmdGpu::NumberFormat::Float:
+        case Ps4Layout::NumberFormat::Float:
             color.float32[0] = NumberUtils::Uf16ToF32(c0 & 0xffff);
             break;
         default:
@@ -889,20 +889,20 @@ vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& colo
             break;
         }
         break;
-    case AmdGpu::DataFormat::Format8_8:
+    case Ps4Layout::DataFormat::Format8_8:
         switch (number_type) {
-        case AmdGpu::NumberFormat::Unorm:
-        case AmdGpu::NumberFormat::Srgb: // Should we handle gamma correction here?
+        case Ps4Layout::NumberFormat::Unorm:
+        case Ps4Layout::NumberFormat::Srgb: // Should we handle gamma correction here?
             color.float32[0] = NumberUtils::U8ToUnorm(c0 & 0xff);
             color.float32[1] = NumberUtils::U8ToUnorm((c0 >> 8) & 0xff);
             break;
-        case AmdGpu::NumberFormat::Snorm:
-        case AmdGpu::NumberFormat::SnormNz:
+        case Ps4Layout::NumberFormat::Snorm:
+        case Ps4Layout::NumberFormat::SnormNz:
             color.float32[0] = NumberUtils::S8ToSnorm(c0 & 0xff);
             color.float32[1] = NumberUtils::S8ToSnorm((c0 >> 8) & 0xff);
             break;
-        case AmdGpu::NumberFormat::Uint:
-        case AmdGpu::NumberFormat::Sint:
+        case Ps4Layout::NumberFormat::Uint:
+        case Ps4Layout::NumberFormat::Sint:
             color.uint32[0] = c0 & 0xff;
             color.uint32[1] = (c0 >> 8) & 0xff;
             break;
@@ -911,13 +911,13 @@ vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& colo
             break;
         }
         break;
-    case AmdGpu::DataFormat::Format32:
+    case Ps4Layout::DataFormat::Format32:
         switch (number_type) {
-        case AmdGpu::NumberFormat::Uint:
-        case AmdGpu::NumberFormat::Sint:
+        case Ps4Layout::NumberFormat::Uint:
+        case Ps4Layout::NumberFormat::Sint:
             color.uint32[0] = c0;
             break;
-        case AmdGpu::NumberFormat::Float:
+        case Ps4Layout::NumberFormat::Float:
             color.float32[0] = *(reinterpret_cast<const float*>(&c0));
             break;
         default:
@@ -925,23 +925,23 @@ vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& colo
             break;
         }
         break;
-    case AmdGpu::DataFormat::Format16_16:
+    case Ps4Layout::DataFormat::Format16_16:
         switch (number_type) {
-        case AmdGpu::NumberFormat::Unorm:
+        case Ps4Layout::NumberFormat::Unorm:
             color.float32[0] = NumberUtils::U16ToUnorm(c0 & 0xffff);
             color.float32[1] = NumberUtils::U16ToUnorm((c0 >> 16) & 0xffff);
             break;
-        case AmdGpu::NumberFormat::Snorm:
-        case AmdGpu::NumberFormat::SnormNz:
+        case Ps4Layout::NumberFormat::Snorm:
+        case Ps4Layout::NumberFormat::SnormNz:
             color.float32[0] = NumberUtils::S16ToSnorm(c0 & 0xffff);
             color.float32[1] = NumberUtils::S16ToSnorm((c0 >> 16) & 0xffff);
             break;
-        case AmdGpu::NumberFormat::Uint:
-        case AmdGpu::NumberFormat::Sint:
+        case Ps4Layout::NumberFormat::Uint:
+        case Ps4Layout::NumberFormat::Sint:
             color.uint32[0] = c0 & 0xffff;
             color.uint32[1] = (c0 >> 16) & 0xffff;
             break;
-        case AmdGpu::NumberFormat::Float:
+        case Ps4Layout::NumberFormat::Float:
             color.float32[0] = NumberUtils::Uf16ToF32(c0 & 0xffff);
             color.float32[1] = NumberUtils::Uf16ToF32((c0 >> 16) & 0xffff);
             break;
@@ -950,17 +950,17 @@ vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& colo
             break;
         }
         break;
-    case AmdGpu::DataFormat::Format10_11_11:
+    case Ps4Layout::DataFormat::Format10_11_11:
         color.float32[0] = NumberUtils::Uf11ToF32(c0 & 0x7ff);
         color.float32[1] = NumberUtils::Uf11ToF32((c0 >> 11) & 0x7ff);
         color.float32[2] = NumberUtils::Uf10ToF32((c0 >> 22) & 0x3ff);
         break;
-    case AmdGpu::DataFormat::Format11_11_10:
+    case Ps4Layout::DataFormat::Format11_11_10:
         color.float32[0] = NumberUtils::Uf10ToF32(c0 & 0x3ff);
         color.float32[1] = NumberUtils::Uf11ToF32((c0 >> 10) & 0x7ff);
         color.float32[2] = NumberUtils::Uf11ToF32((c0 >> 21) & 0x7ff);
         break;
-    case AmdGpu::DataFormat::Format5_9_9_9: {
+    case Ps4Layout::DataFormat::Format5_9_9_9: {
         int exponent;
         union {
             float f;
@@ -975,23 +975,23 @@ vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& colo
         color.float32[2] = ((c0 >> 18) & 0x1ff) * scale.f;
         break;
     }
-    case AmdGpu::DataFormat::Format10_10_10_2:
+    case Ps4Layout::DataFormat::Format10_10_10_2:
         switch (number_type) {
-        case AmdGpu::NumberFormat::Unorm:
+        case Ps4Layout::NumberFormat::Unorm:
             color.float32[0] = NumberUtils::U2ToUnorm(c0 & 0x3);
             color.float32[1] = NumberUtils::U10ToUnorm((c0 >> 2) & 0x3ff);
             color.float32[2] = NumberUtils::U10ToUnorm((c0 >> 12) & 0x3ff);
             color.float32[3] = NumberUtils::U10ToUnorm(c0 >> 22);
             break;
-        case AmdGpu::NumberFormat::Snorm:
-        case AmdGpu::NumberFormat::SnormNz:
+        case Ps4Layout::NumberFormat::Snorm:
+        case Ps4Layout::NumberFormat::SnormNz:
             color.float32[0] = NumberUtils::S2ToSnorm(c0 & 0x3);
             color.float32[1] = NumberUtils::S10ToSnorm((c0 >> 2) & 0x3ff);
             color.float32[2] = NumberUtils::S10ToSnorm((c0 >> 12) & 0x3ff);
             color.float32[3] = NumberUtils::S2ToSnorm(c0 >> 22);
             break;
-        case AmdGpu::NumberFormat::Uint:
-        case AmdGpu::NumberFormat::Sint:
+        case Ps4Layout::NumberFormat::Uint:
+        case Ps4Layout::NumberFormat::Sint:
             color.uint32[0] = c0 & 0x3;
             color.uint32[1] = (c0 >> 2) & 0x3ff;
             color.uint32[2] = (c0 >> 12) & 0x3ff;
@@ -1002,23 +1002,23 @@ vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& colo
             break;
         }
         break;
-    case AmdGpu::DataFormat::Format2_10_10_10:
+    case Ps4Layout::DataFormat::Format2_10_10_10:
         switch (number_type) {
-        case AmdGpu::NumberFormat::Unorm:
+        case Ps4Layout::NumberFormat::Unorm:
             color.float32[0] = NumberUtils::U10ToUnorm(c0 & 0x3ff);
             color.float32[1] = NumberUtils::U10ToUnorm((c0 >> 10) & 0x3ff);
             color.float32[2] = NumberUtils::U10ToUnorm((c0 >> 20) & 0x3ff);
             color.float32[3] = NumberUtils::U2ToUnorm(c0 >> 30);
             break;
-        case AmdGpu::NumberFormat::Snorm:
-        case AmdGpu::NumberFormat::SnormNz:
+        case Ps4Layout::NumberFormat::Snorm:
+        case Ps4Layout::NumberFormat::SnormNz:
             color.float32[0] = NumberUtils::S10ToSnorm(c0 & 0x3ff);
             color.float32[1] = NumberUtils::S10ToSnorm((c0 >> 10) & 0x3ff);
             color.float32[2] = NumberUtils::S10ToSnorm((c0 >> 20) & 0x3ff);
             color.float32[3] = NumberUtils::S2ToSnorm(c0 >> 30);
             break;
-        case AmdGpu::NumberFormat::Uint:
-        case AmdGpu::NumberFormat::Sint:
+        case Ps4Layout::NumberFormat::Uint:
+        case Ps4Layout::NumberFormat::Sint:
             color.uint32[0] = c0 & 0x3ff;
             color.uint32[1] = (c0 >> 10) & 0x3ff;
             color.uint32[2] = (c0 >> 20) & 0x3ff;
@@ -1029,24 +1029,24 @@ vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& colo
             break;
         }
         break;
-    case AmdGpu::DataFormat::Format8_8_8_8:
+    case Ps4Layout::DataFormat::Format8_8_8_8:
         switch (number_type) {
-        case AmdGpu::NumberFormat::Unorm:
-        case AmdGpu::NumberFormat::Srgb: // Should we handle gamma correction here?
+        case Ps4Layout::NumberFormat::Unorm:
+        case Ps4Layout::NumberFormat::Srgb: // Should we handle gamma correction here?
             color.float32[0] = NumberUtils::U8ToUnorm(c0 & 0xff);
             color.float32[1] = NumberUtils::U8ToUnorm((c0 >> 8) & 0xff);
             color.float32[2] = NumberUtils::U8ToUnorm((c0 >> 16) & 0xff);
             color.float32[3] = NumberUtils::U8ToUnorm(c0 >> 24);
             break;
-        case AmdGpu::NumberFormat::Snorm:
-        case AmdGpu::NumberFormat::SnormNz:
+        case Ps4Layout::NumberFormat::Snorm:
+        case Ps4Layout::NumberFormat::SnormNz:
             color.float32[0] = NumberUtils::S8ToSnorm(c0 & 0xff);
             color.float32[1] = NumberUtils::S8ToSnorm((c0 >> 8) & 0xff);
             color.float32[2] = NumberUtils::S8ToSnorm((c0 >> 16) & 0xff);
             color.float32[3] = NumberUtils::S8ToSnorm(c0 >> 24);
             break;
-        case AmdGpu::NumberFormat::Uint:
-        case AmdGpu::NumberFormat::Sint:
+        case Ps4Layout::NumberFormat::Uint:
+        case Ps4Layout::NumberFormat::Sint:
             color.uint32[0] = c0 & 0xff;
             color.uint32[1] = (c0 >> 8) & 0xff;
             color.uint32[2] = (c0 >> 16) & 0xff;
@@ -1057,14 +1057,14 @@ vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& colo
             break;
         }
         break;
-    case AmdGpu::DataFormat::Format32_32:
+    case Ps4Layout::DataFormat::Format32_32:
         switch (number_type) {
-        case AmdGpu::NumberFormat::Uint:
-        case AmdGpu::NumberFormat::Sint:
+        case Ps4Layout::NumberFormat::Uint:
+        case Ps4Layout::NumberFormat::Sint:
             color.uint32[0] = c0;
             color.uint32[1] = c1;
             break;
-        case AmdGpu::NumberFormat::Float:
+        case Ps4Layout::NumberFormat::Float:
             color.float32[0] = *(reinterpret_cast<const float*>(&c0));
             color.float32[1] = *(reinterpret_cast<const float*>(&c1));
             break;
@@ -1073,29 +1073,29 @@ vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& colo
             break;
         }
         break;
-    case AmdGpu::DataFormat::Format16_16_16_16:
+    case Ps4Layout::DataFormat::Format16_16_16_16:
         switch (number_type) {
-        case AmdGpu::NumberFormat::Unorm:
+        case Ps4Layout::NumberFormat::Unorm:
             color.float32[0] = NumberUtils::U16ToUnorm(c0 & 0xffff);
             color.float32[1] = NumberUtils::U16ToUnorm((c0 >> 16) & 0xffff);
             color.float32[2] = NumberUtils::U16ToUnorm(c1 & 0xffff);
             color.float32[3] = NumberUtils::U16ToUnorm((c1 >> 16) & 0xffff);
             break;
-        case AmdGpu::NumberFormat::Snorm:
-        case AmdGpu::NumberFormat::SnormNz:
+        case Ps4Layout::NumberFormat::Snorm:
+        case Ps4Layout::NumberFormat::SnormNz:
             color.float32[0] = NumberUtils::S16ToSnorm(c0 & 0xffff);
             color.float32[1] = NumberUtils::S16ToSnorm((c0 >> 16) & 0xffff);
             color.float32[2] = NumberUtils::S16ToSnorm(c1 & 0xffff);
             color.float32[3] = NumberUtils::S16ToSnorm((c1 >> 16) & 0xffff);
             break;
-        case AmdGpu::NumberFormat::Uint:
-        case AmdGpu::NumberFormat::Sint:
+        case Ps4Layout::NumberFormat::Uint:
+        case Ps4Layout::NumberFormat::Sint:
             color.uint32[0] = c0 & 0xffff;
             color.uint32[1] = (c0 >> 16) & 0xffff;
             color.uint32[2] = c1 & 0xffff;
             color.uint32[3] = (c1 >> 16) & 0xffff;
             break;
-        case AmdGpu::NumberFormat::Float:
+        case Ps4Layout::NumberFormat::Float:
             color.float32[0] = NumberUtils::Uf16ToF32(c0 & 0xffff);
             color.float32[1] = NumberUtils::Uf16ToF32((c0 >> 16) & 0xffff);
             color.float32[2] = NumberUtils::Uf16ToF32(c1 & 0xffff);
@@ -1106,16 +1106,16 @@ vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& colo
             break;
         }
         break;
-    case AmdGpu::DataFormat::Format32_32_32_32:
+    case Ps4Layout::DataFormat::Format32_32_32_32:
         switch (number_type) {
-        case AmdGpu::NumberFormat::Uint:
-        case AmdGpu::NumberFormat::Sint:
+        case Ps4Layout::NumberFormat::Uint:
+        case Ps4Layout::NumberFormat::Sint:
             color.uint32[0] = c0;
             color.uint32[1] = c0;
             color.uint32[2] = c0;
             color.uint32[3] = c1;
             break;
-        case AmdGpu::NumberFormat::Float:
+        case Ps4Layout::NumberFormat::Float:
             color.float32[0] = *(reinterpret_cast<const float*>(&c0));
             color.float32[1] = *(reinterpret_cast<const float*>(&c0));
             color.float32[2] = *(reinterpret_cast<const float*>(&c0));
@@ -1126,24 +1126,24 @@ vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& colo
             break;
         }
         break;
-    case AmdGpu::DataFormat::Format5_6_5:
+    case Ps4Layout::DataFormat::Format5_6_5:
         color.float32[0] = NumberUtils::U5ToUnorm(c0 & 0x1f);
         color.float32[1] = NumberUtils::U6ToUnorm((c0 >> 5) & 0x3f);
         color.float32[2] = NumberUtils::U5ToUnorm(c0 >> 11);
         break;
-    case AmdGpu::DataFormat::Format1_5_5_5:
+    case Ps4Layout::DataFormat::Format1_5_5_5:
         color.float32[0] = NumberUtils::U5ToUnorm(c0 & 0x1f);
         color.float32[1] = NumberUtils::U5ToUnorm((c0 >> 5) & 0x1f);
         color.float32[2] = NumberUtils::U5ToUnorm((c0 >> 10) & 0x1f);
         color.float32[3] = (c0 >> 15) ? 1.0f : 0.0f;
         break;
-    case AmdGpu::DataFormat::Format5_5_5_1:
+    case Ps4Layout::DataFormat::Format5_5_5_1:
         color.float32[0] = (c0 & 0x1) ? 1.0f : 0.0f;
         color.float32[1] = NumberUtils::U5ToUnorm((c0 >> 1) & 0x1f);
         color.float32[2] = NumberUtils::U5ToUnorm((c0 >> 6) & 0x1f);
         color.float32[3] = NumberUtils::U5ToUnorm((c0 >> 11) & 0x1f);
         break;
-    case AmdGpu::DataFormat::Format4_4_4_4:
+    case Ps4Layout::DataFormat::Format4_4_4_4:
         color.float32[0] = NumberUtils::U4ToUnorm(c0 & 0xf);
         color.float32[1] = NumberUtils::U4ToUnorm((c0 >> 4) & 0xf);
         color.float32[2] = NumberUtils::U4ToUnorm((c0 >> 8) & 0xf);

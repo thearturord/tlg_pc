@@ -8,7 +8,7 @@
 #include "common/enum.h"
 #include "common/types.h"
 #include "shader_recompiler/ir/type.h"
-#include "video_core/amdgpu/pixel_format.h"
+#include "native/ps4_data_layout/pixel_format.h"
 
 namespace Shader::IR {
 

@@ -3,7 +3,7 @@
 
 #include "common/logging/log.h"
 #include "shader_recompiler/resource.h"
-#include "video_core/amdgpu/pixel_format.h"
+#include "native/ps4_data_layout/pixel_format.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_indexed_data.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -74,10 +74,10 @@ ImageViewInfo::ImageViewInfo(const Core::NativeDesc::ImageDesc& image, bool is_d
     type = static_cast<AmdGpu::ImageType>(image.ViewType(is_array));
     min_lod = image.min_lod;
     if (!is_storage) {
-        mapping = {.r = static_cast<AmdGpu::CompSwizzle>(image.swizzle[0]),
-                   .g = static_cast<AmdGpu::CompSwizzle>(image.swizzle[1]),
-                   .b = static_cast<AmdGpu::CompSwizzle>(image.swizzle[2]),
-                   .a = static_cast<AmdGpu::CompSwizzle>(image.swizzle[3])};
+        mapping = {.r = static_cast<Ps4Layout::CompSwizzle>(image.swizzle[0]),
+                   .g = static_cast<Ps4Layout::CompSwizzle>(image.swizzle[1]),
+                   .b = static_cast<Ps4Layout::CompSwizzle>(image.swizzle[2]),
+                   .a = static_cast<Ps4Layout::CompSwizzle>(image.swizzle[3])};
     }
 }
 
@@ -127,7 +127,7 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         aspect = vk::ImageAspectFlagBits::eStencil;
     }
 
-    const auto components = info.mapping == AmdGpu::IdentityMapping
+    const auto components = info.mapping == Ps4Layout::IdentityMapping
                                 ? vk::ComponentMapping{}
                                 : Vulkan::LiverpoolToVK::ComponentMapping(info.mapping);
 

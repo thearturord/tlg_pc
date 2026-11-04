@@ -216,7 +216,7 @@ constexpr u8 StoredOrder[4][4][4] = {
 /// channel count has k at c is the answer. Derived from the repo's own swizzle table and checked against the cases seen (data format 10 / dst_sel 0xf2e -> 1; 1 / 0x204, 5 / 0x22c, 6 / 0x3ac,
 /// 9 / 0xfac and 10 / 0xfac -> 0); FUN_0246be80 itself has not been read. False: no row matches (counted).
 bool CompSwapOf(u32 data_format, u32 dst_sel, u32& swap, bool& ambiguous) {
-    const u32 channels = data_format < AmdGpu::NUM_DATA_FMTS ? AmdGpu::NumComponents(static_cast<AmdGpu::DataFormat>(data_format)) : 0;
+    const u32 channels = data_format < Ps4Layout::NUM_DATA_FMTS ? Ps4Layout::NumComponents(static_cast<Ps4Layout::DataFormat>(data_format)) : 0;
     if (channels < 1 || channels > 4) {
         return false;
     }
@@ -1179,7 +1179,7 @@ bool BuildColour(u64 view, u64 resource, std::array<WordOverride, ColourWords>& 
         const u32 fmask_base = mip0 ? Rd<u32>(resource, 0xb0 + 9 * 4) : 0;
         const u32 fmask_slice = mip0 ? Rd<u32>(resource, 0xb0 + 10 * 4) : 0;
         // compression: an fmask address is in the block of every target (non-zero and varying even with one sample and compression 0), so its presence says nothing; only a multisample target can have it
-        SetShadow(w[4], 0x80, static_cast<u32>(t.tiling_index) == static_cast<u32>(AmdGpu::TileMode::DisplayLinearGeneral) ? 0x80u : 0u);
+        SetShadow(w[4], 0x80, static_cast<u32>(t.tiling_index) == static_cast<u32>(Ps4Layout::TileMode::DisplayLinearGeneral) ? 0x80u : 0u);
         SetShadow(w[4], 0x4000, samples > 1 ? 0x4000u : 0u);
         SetShadow(w[4], 0x80000000u, t.alt_tile_mode != 0 ? 0x80000000u : 0u);
         SetShadow(w[9], Full, fmask_base);
@@ -1206,7 +1206,7 @@ bool BuildColour(u64 view, u64 resource, std::array<WordOverride, ColourWords>& 
             }
         };
         guard("info_alt_tile_mode", t.alt_tile_mode != 0 || (block_info & 0x80000000u) != 0, 0x80000000u, Core::NativeConfig::TargetAltTileMode << 31);
-        guard("info_linear_general", static_cast<u32>(t.tiling_index) == static_cast<u32>(AmdGpu::TileMode::DisplayLinearGeneral) || (block_info & 0x80u) != 0, 0x80u,
+        guard("info_linear_general", static_cast<u32>(t.tiling_index) == static_cast<u32>(Ps4Layout::TileMode::DisplayLinearGeneral) || (block_info & 0x80u) != 0, 0x80u,
               Core::NativeConfig::TargetLinearGeneral << 7);
         guard("info_compression", samples > 1 || (block_info & 0x4000u) != 0, 0x4000u, Core::NativeConfig::TargetCompression << 14);
         // the fmask words, the fmask tile max of the pitch word and the fmask bits of the attribute word: read only through the fmask address of a target with compression (never set here)
