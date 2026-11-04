@@ -33,6 +33,7 @@
 #include "native/native_config.h"
 #include "native/native_stream_submit.h"
 #include "common/logging/log.h"
+#include "common/thread.h"
 #include "native/native_debug_server.h"
 #include "core/emulator_settings.h"
 #include "native/native_hooks.h"
@@ -8027,6 +8028,38 @@ u64 PS4_SYSV_ABI ProbeIndirect(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, 
 
 } // namespace
 
+namespace {
+/// CPU frame map C2/C4 (cpu-frame-map-plan.md): who creates and destroys the engine's buffers and textures. `TLG_LIFE_CENSUS=1` (default off, counters only):
+/// count by (calling thread, kind, caller address as a Ghidra address); published as `life_census` in /stats. kind 0 = buffer created, 1 = buffer destroyed, 2 = texture initialized.
+std::mutex life_mutex;
+std::map<std::tuple<std::string, u32, u64>, u64> life_counts;
+std::atomic<u64> life_last_publish_ms{0};
+bool LifeCensusOn() {
+    static const bool on = [] { const char* e = std::getenv("TLG_LIFE_CENSUS"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+void NoteLife(u32 kind, u64 ret) {
+    if (!LifeCensusOn()) {
+        return;
+    }
+    const VAddr base = image_base.load(std::memory_order_relaxed);
+    const u64 caller = base != 0 ? ret - base + 0x1000000 : ret;
+    const std::string thread = Common::GetCurrentThreadName();
+    std::scoped_lock lock{life_mutex};
+    ++life_counts[{thread, kind, caller}];
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (now - life_last_publish_ms.load(std::memory_order_relaxed) > 1000) {
+        life_last_publish_ms.store(now, std::memory_order_relaxed);
+        nlohmann::json out = nlohmann::json::array();
+        for (const auto& [key, count] : life_counts) {
+            out.push_back({{"thread", std::get<0>(key)}, {"kind", std::get<1>(key) == 0 ? "buffer_created" : std::get<1>(key) == 1 ? "buffer_destroyed" : "texture_initialized"},
+                           {"caller", fmt::format("{:#x}", std::get<2>(key))}, {"count", count}});
+        }
+        Core::DebugServer::Publish("life_census", std::move(out));
+    }
+}
+} // namespace
+
 /// JsDevice::CreateBuffer(device, description, initial data, out): the buffer is complete when the original returns.
 u64 PS4_SYSV_ABI ResourceBufferCreated(u64 device, u64 description, u64 initial, u64 out, u64 a4, u64 a5, u64 ret) {
     static std::atomic<u64> original_entry{0};
@@ -8039,6 +8072,7 @@ u64 PS4_SYSV_ABI ResourceBufferCreated(u64 device, u64 description, u64 initial,
         return 0;
     }
     reinterpret_cast<GuestFunction6>(original)(device, description, initial, out, a4, a5);
+    NoteLife(0, ret);
     if (out != 0) {
         const u64 created = Guarded([&] { return Rd<u64>(out, 0); });
         NativeResources::NoteBufferObject(created);
@@ -8061,6 +8095,7 @@ u64 PS4_SYSV_ABI ResourceBufferCreated(u64 device, u64 description, u64 initial,
 
 /// JsTexture initialization (this, description, initial data): the object is read later.
 u64 PS4_SYSV_ABI ResourceTextureInit(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    NoteLife(2, ret);
     NativeResources::NoteTextureObject(object);
     NativeRegistry::NoteTextureInitializing(object);
     return 0;
@@ -8114,6 +8149,7 @@ u64 PS4_SYSV_ABI ResourceTextureInitAnnounced(u64 object, u64 a1, u64 a2, u64 a3
 }
 
 u64 PS4_SYSV_ABI ResourceBufferDestroyed(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    NoteLife(1, ret);
     NativeResources::NoteBufferDestroyed(object);
     NativeRegistry::NoteBufferDestroyed(object);
     return 0;
