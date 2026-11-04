@@ -5796,17 +5796,42 @@ u64 PS4_SYSV_ABI DynTextureFill(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, 
     return 0x8000000000000000ull | (result & 0x7fffffffffffffffull);
 }
 
+/// `TLG_LIGHT_RING=1`: the frame allocator (`JsDevice_AllocFrameGarlic`, Ghidra 0x2476350) bumps its offset (`allocator + 4`) with plain reads and writes: the engine only calls it from the render thread.
+/// The light ring redirect calls it from the thread that writes the lights, so every call (the engine's own, through the hook below, and ours) takes this lock.
+bool FrameAllocLocked() {
+    static const bool on = [] { const char* e = std::getenv("TLG_LIGHT_RING"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+std::mutex g_frame_alloc_mutex;
+
+u64 LockedFrameAlloc(u64 original, u64 allocator, u64 size, u64 alignment) {
+    u64 block;
+    {
+        std::scoped_lock lock{g_frame_alloc_mutex};
+        block = reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u64)>(original)(allocator, size, alignment);
+    }
+    if (Core::NativeContent::ShadowOn() || Core::NativeContent::RingWindowsOn()) {
+        Core::NativeContent::NoteMark(6, block, size & 0xffffffffull);
+        Core::NativeContent::NoteRingWindow(block, size & 0xffffffffull);
+    }
+    return block;
+}
+
 u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     // F2.2 shadow (TLG_F2_STORE=1): every allocation of the frame ring is remembered as a mark (writer 6): whatever the caller writes there, the bytes of an older entry over the same
     // addresses are not the memory's any more. The function (allocator, size, alignment) runs here and its result is returned.
     u64 allocated = 0;
     bool ran = false;
-    if ((Core::NativeContent::ShadowOn() || Core::NativeContent::RingWindowsOn()) && allocator != 0) {
+    if ((Core::NativeContent::ShadowOn() || Core::NativeContent::RingWindowsOn() || FrameAllocLocked()) && allocator != 0) {
         if (const u64 original = Core::GuestHooks::OriginalEntry("AllocFrameGarlic"); original != 0) {
-            allocated = reinterpret_cast<GuestDraw6>(original)(allocator, a1, a2, a3, a4, a5);
+            if (FrameAllocLocked()) {
+                allocated = LockedFrameAlloc(original, allocator, a1, a2);
+            } else {
+                allocated = reinterpret_cast<GuestDraw6>(original)(allocator, a1, a2, a3, a4, a5);
+                Core::NativeContent::NoteMark(6, allocated, a1 & 0xffffffffull);
+                Core::NativeContent::NoteRingWindow(allocated, a1 & 0xffffffffull);
+            }
             ran = true;
-            Core::NativeContent::NoteMark(6, allocated, a1 & 0xffffffffull);
-            Core::NativeContent::NoteRingWindow(allocated, a1 & 0xffffffffull);
         }
     }
     const auto finish = [&]() -> u64 { return ran ? (0x8000000000000000ull | (allocated & 0x7fffffffffffffffull)) : 0; };
@@ -6946,7 +6971,7 @@ u64 PS4_SYSV_ABI LightWrites(u64 object, u64 source, u64 a2, u64 a3, u64 a4, u64
             if (memory == 0 || size == 0 || size > 0x1000) {
                 continue;
             }
-            const u64 block = reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u64)>(alloc_entry)(allocator, size, 0x10);
+            const u64 block = LockedFrameAlloc(alloc_entry, allocator, size, 0x10);
             if (block == 0) {
                 continue;
             }
