@@ -100,9 +100,9 @@ void NoteEngineDelete(u64 id, u64 address, u64 bytes, u32 what);
 void SetDelete(void (*fn)(void* context, u64 id, u64 address, u64 bytes, u32 what), void* context);
 /// B8.4: the engine created a texture (its memory gets a new owner); queued with the next submission's batch like a deletion
 void NoteEngineCreate(u64 id, u64 address, u64 bytes);
-void SetCreate(void (*fn)(void* context, u64 id, u64 address, u64 bytes, bool texture), void* context);
+void SetCreate(void (*fn)(void* context, u64 id, u64 address, u64 bytes, bool texture, u32 usage, u32 cpu_access), void* context);
 /// B9.4: the engine created a buffer (a placed buffer under its memory moves back into the arena)
-void NoteEngineBufferCreate(u64 id, u64 address, u64 bytes);
+void NoteEngineBufferCreate(u64 id, u64 address, u64 bytes, u32 usage, u32 cpu_access);
 enum B8Count : u32 {
     B8AnnouncedOnImage,         ///< announcements that touched an image
     B8KeptForGpu,               ///< second applications that left an image the GPU wrote since alone

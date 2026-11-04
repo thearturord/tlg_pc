@@ -182,7 +182,7 @@ std::mutex pending_mutex;
 std::vector<std::pair<u64, u64>> pending_ranges, applied_last;
 std::vector<std::array<u64, 4>> pending_deleted;
 void (*delete_fn)(void*, u64, u64, u64, u32) = nullptr;
-void (*create_fn)(void*, u64, u64, u64, bool) = nullptr;
+void (*create_fn)(void*, u64, u64, u64, bool, u32, u32) = nullptr;
 void* create_context = nullptr;
 void* delete_context = nullptr;
 void (*apply_fn)(void*, u64, u64, bool) = nullptr;
@@ -214,17 +214,17 @@ void SetDelete(void (*fn)(void*, u64, u64, u64, u32), void* context) {
     delete_fn = fn;
 }
 
-void SetCreate(void (*fn)(void*, u64, u64, u64, bool), void* context) {
+void SetCreate(void (*fn)(void*, u64, u64, u64, bool, u32, u32), void* context) {
     create_context = context;
     create_fn = fn;
 }
 
-void NoteEngineBufferCreate(u64 id, u64 address, u64 bytes) {
+void NoteEngineBufferCreate(u64 id, u64 address, u64 bytes, u32 usage, u32 cpu_access) {
     if (!B9PlaceOn() || B2NativeMode() == 0) {
         return;
     }
     std::scoped_lock lock{pending_mutex};
-    pending_deleted.push_back({id, address, bytes, 5u});
+    pending_deleted.push_back({id, address, bytes, 5u | (u64{usage} << 8) | (u64{cpu_access} << 32)}); // the buffer's usage and CPU access ride along: the ordered view of the raster thread needs them
 }
 
 void NoteEngineCreate(u64 id, u64 address, u64 bytes) {
@@ -252,12 +252,13 @@ void ApplyBatch(const Batch& batch) {
         TLG_PROF_LEVEL("updates.deletions", 2);
         // deletions first: the work of this submission comes after them in the game's order, and no announcement of it touches a deleted object
         for (const auto& d : batch.deleted) {
-            if (d[3] == 2 || d[3] == 5) {
+            const u32 what = static_cast<u32>(d[3] & 0xff);
+            if (what == 2 || what == 5) {
                 if (create_fn != nullptr) {
-                    create_fn(create_context, d[0], d[1], d[2], d[3] == 2);
+                    create_fn(create_context, d[0], d[1], d[2], what == 2, static_cast<u32>((d[3] >> 8) & 0xffffff), static_cast<u32>(d[3] >> 32));
                 }
             } else {
-                delete_fn(delete_context, d[0], d[1], d[2], static_cast<u32>(d[3]));
+                delete_fn(delete_context, d[0], d[1], d[2], what);
             }
         }
     }

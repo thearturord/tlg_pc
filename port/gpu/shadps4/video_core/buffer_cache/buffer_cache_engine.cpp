@@ -46,9 +46,9 @@ namespace VideoCore {
 
 void BufferCache::NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool native) {
     {
-        std::scoped_lock ordered_lock{ordered_mutex};
+        std::unique_lock ordered_lock{ordered_mutex};
         if (const auto it = ordered_by_id.find(id); it != ordered_by_id.end()) {
-            if (const auto at = ordered_by_address.find(it->second.begin); at != ordered_by_address.end() && at->second.second == id) {
+            if (const auto at = ordered_by_address.find(it->second); at != ordered_by_address.end() && at->second.id == id) {
                 ordered_by_address.erase(at);
             }
             ordered_by_id.erase(it);
@@ -130,7 +130,7 @@ void BufferCache::NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool 
     // another live buffer over the same memory (an alias, a buffer holding this one) keeps what the GPU wrote there
     static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
     parts.clear();
-    Core::NativeDevice::BuffersIn(address, bytes, parts);
+    BuffersInView(address, bytes, parts);
     if (!parts.empty()) {
         Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9DeletedAlias);
         return;
@@ -200,7 +200,7 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
     if (zero_copy) {
         for (const u64 id : ids) {
             Core::NativeDevice::Object object;
-            if (Core::NativeDevice::Lookup(id, object) && (object.usage == 3 || (object.cpu_access & 0x20000) != 0)) {
+            if (LookupView(id, object) && (object.usage == 3 || (object.cpu_access & 0x20000) != 0)) {
                 zero_copy = false;
             }
         }
@@ -278,7 +278,7 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
             }
             for (u32 k = 0; k < ids.size() && k < 4; ++k) {
                 Core::NativeDevice::Object object;
-                if (Core::NativeDevice::Lookup(ids[k], object)) {
+                if (LookupView(ids[k], object)) {
                     who += fmt::format(" | id {:#x} kind {} usage {} bind {:#x} bytes {:#x} at {:#x}", ids[k], static_cast<u32>(object.kind), object.usage, object.bind, object.bytes, object.address);
                 }
             }
@@ -421,11 +421,11 @@ void BufferCache::Demote(VAddr begin, bool by_request) {
     Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4DemoteKept);
 }
 
-void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, bool texture) {
+void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, bool texture, u32 usage, u32 cpu_access) {
     if (!texture && bytes != 0) {
-        std::scoped_lock ordered_lock{ordered_mutex};
-        ordered_by_address[address] = {address + bytes, id};
-        ordered_by_id[id] = {address, address + bytes};
+        std::unique_lock ordered_lock{ordered_mutex};
+        ordered_by_address[address] = {address + bytes, id, usage, cpu_access};
+        ordered_by_id[id] = address;
     }
     if (!Core::NativeUpdates::B9PlaceOn() || bytes == 0) {
         return;
@@ -461,7 +461,7 @@ void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, boo
             static thread_local std::vector<u64> textures;
             parts.clear();
             textures.clear();
-            Core::NativeDevice::BuffersIn(address, bytes, parts);
+            BuffersInView(address, bytes, parts);
             (void)Core::NativeDevice::TexturesIn(address, bytes, textures);
             const bool alone = textures.empty() && std::ranges::all_of(parts, [&](const auto& part) { return part.id == id; });
             if (!alone && Core::NativeUpdates::B9AliasesOn()) {
@@ -494,7 +494,7 @@ void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, boo
 
 u64 BufferCache::BufferHolding(VAddr addr, size_t size) const {
     Core::NativeDevice::Object object;
-    if (Core::NativeDevice::ResourceAt(addr, object) && object.kind == Core::NativeDevice::Kind::Buffer && addr + size <= object.address + std::max<u64>(object.bytes, 1)) {
+    if (ResourceAtView(addr, object) && object.kind == Core::NativeDevice::Kind::Buffer && addr + size <= object.address + std::max<u64>(object.bytes, 1)) {
         return object.id;
     }
     return 0;
@@ -508,6 +508,87 @@ bool BufferCache::ZeroCopyOn() const noexcept {
     return on && !zero_copy_unavailable.load(std::memory_order_relaxed);
 }
 
+bool BufferCache::OrderedViewOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_ORDERED_VIEW");
+        // the ordered view needs the create and delete events of buffers (placement and lifetime modes of the native updates)
+        return e != nullptr && e[0] == '1' && Core::NativeUpdates::B9PlaceOn() && Core::NativeUpdates::B2NativeMode() != 0 && Core::NativeUpdates::B9LifetimeMode() != 0;
+    }();
+    return on;
+}
+
+void BufferCache::BuffersInView(VAddr address, u64 size, std::vector<Core::NativeDevice::BufferPart>& out) {
+    if (!OrderedViewOn()) {
+        Core::NativeDevice::BuffersIn(address, size, out);
+        return;
+    }
+    if (size == 0) {
+        return;
+    }
+    const VAddr end = address + size;
+    std::shared_lock lock{ordered_mutex};
+    auto it = ordered_by_address.lower_bound(end);
+    u32 below = 0; // as the live table: a few entries that start before the range are looked at
+    while (it != ordered_by_address.begin() && below < 16) {
+        --it;
+        if (it->first < address) {
+            ++below;
+        }
+        if (it->second.end <= address) {
+            continue;
+        }
+        out.push_back({it->second.id, std::max(it->first, address), std::min<VAddr>(it->second.end, end), it->second.usage, it->second.cpu_access, it->first, it->second.end});
+    }
+}
+
+bool BufferCache::ResourceAtView(VAddr address, Core::NativeDevice::Object& out) const {
+    if (!OrderedViewOn()) {
+        return Core::NativeDevice::ResourceAt(address, out);
+    }
+    std::shared_lock lock{ordered_mutex};
+    auto it = ordered_by_address.upper_bound(address);
+    if (it == ordered_by_address.begin()) {
+        return false;
+    }
+    --it;
+    if (address >= std::max(it->second.end, it->first + 1)) {
+        return false;
+    }
+    out = {};
+    out.id = it->second.id;
+    out.kind = Core::NativeDevice::Kind::Buffer;
+    out.alive = true;
+    out.usage = it->second.usage;
+    out.cpu_access = it->second.cpu_access;
+    out.address = it->first;
+    out.bytes = it->second.end - it->first;
+    return true;
+}
+
+bool BufferCache::LookupView(u64 id, Core::NativeDevice::Object& out) const {
+    if (!OrderedViewOn()) {
+        return Core::NativeDevice::Lookup(id, out);
+    }
+    std::shared_lock lock{ordered_mutex};
+    const auto by_id = ordered_by_id.find(id);
+    if (by_id == ordered_by_id.end()) {
+        return false;
+    }
+    const auto at = ordered_by_address.find(by_id->second);
+    if (at == ordered_by_address.end() || at->second.id != id) {
+        return false;
+    }
+    out = {};
+    out.id = id;
+    out.kind = Core::NativeDevice::Kind::Buffer;
+    out.alive = true;
+    out.usage = at->second.usage;
+    out.cpu_access = at->second.cpu_access;
+    out.address = at->first;
+    out.bytes = at->second.end - at->first;
+    return true;
+}
+
 void BufferCache::OrderedViewCheck(VAddr address, u64 size, bool written) {
     static const bool on = [] { const char* e = std::getenv("TLG_ORDERED_VIEW_CHECK"); return e != nullptr && e[0] == '1'; }();
     if (!on || size == 0) {
@@ -515,20 +596,20 @@ void BufferCache::OrderedViewCheck(VAddr address, u64 size, bool written) {
     }
     static thread_local std::vector<Core::NativeDevice::BufferPart> live;
     live.clear();
-    Core::NativeDevice::BuffersIn(address, size, live);
+    Core::NativeDevice::BuffersIn(address, size, live); // (always the live table here: this is the comparison)
     boost::container::small_vector<u64, 8> live_ids, ordered_ids;
     for (const auto& part : live) {
         live_ids.push_back(part.id);
     }
     {
-        std::scoped_lock lock{ordered_mutex};
+        std::shared_lock lock{ordered_mutex};
         auto it = ordered_by_address.upper_bound(address);
         if (it != ordered_by_address.begin()) {
             --it;
         }
         for (; it != ordered_by_address.end() && it->first < address + size; ++it) {
-            if (it->second.first > address) {
-                ordered_ids.push_back(it->second.second);
+            if (it->second.end > address) {
+                ordered_ids.push_back(it->second.id);
             }
         }
     }

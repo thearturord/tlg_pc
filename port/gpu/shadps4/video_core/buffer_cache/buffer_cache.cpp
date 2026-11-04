@@ -131,7 +131,7 @@ void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, st
     // B9.1: each engine buffer the bytes belong to keeps its part until its next upload (an announcement can run over several buffers)
     static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
     parts.clear();
-    Core::NativeDevice::BuffersIn(address, size, parts);
+    BuffersInView(address, size, parts);
     std::scoped_lock lock{object_dirty_mutex};
     all_object_dirty.Add(address, size); // audit: every changed byte, by address
     if (announced) {
@@ -574,7 +574,7 @@ const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanni
     VAddr lo = address, hi = address + size;
     for (u32 round = 0; round < 4; ++round) {
         parts.clear();
-        Core::NativeDevice::BuffersIn(lo, hi - lo, parts);
+        BuffersInView(lo, hi - lo, parts);
         VAddr new_lo = lo, new_hi = hi;
         for (const auto& part : parts) {
             new_lo = std::min(new_lo, part.object_begin);
@@ -649,7 +649,7 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
         // B9.3 step 2: the tracker is not kept for engine buffers: a range over several of them is answered by theirs, the bytes between them by the tracker
         static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
         parts.clear();
-        Core::NativeDevice::BuffersIn(addr, size, parts);
+        BuffersInView(addr, size, parts);
         if (parts.size() > 1 || (parts.size() == 1 && (parts[0].begin != addr || parts[0].end != addr + size))) {
             Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9CpuQueries);
             std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });
@@ -775,11 +775,11 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     if (b9 != 0) {
         static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
         parts.clear();
-        Core::NativeDevice::BuffersIn(held_lo, held_hi - held_lo, parts);
+        BuffersInView(held_lo, held_hi - held_lo, parts);
         if (parts.empty()) {
             // the walk by memory found nothing: the buffer holding the request, found the long way (the request's bytes must not be left to the tracker)
             Core::NativeDevice::Object object;
-            if (Core::NativeDevice::ResourceAt(device_addr, object) && object.kind == Core::NativeDevice::Kind::Buffer) {
+            if (ResourceAtView(device_addr, object) && object.kind == Core::NativeDevice::Kind::Buffer) {
                 const VAddr object_end = object.address + std::max<u64>(object.bytes, 1);
                 parts.push_back({object.id, held_lo, std::min<VAddr>(object_end, held_hi), object.usage, object.cpu_access, object.address, object_end});
             }
