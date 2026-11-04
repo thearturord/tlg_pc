@@ -78,7 +78,6 @@ struct Liverpool {
         CbColor7Cmask = 0xA388,
     };
 
-    Regs regs{};
     u32 index_buffer_num_indices{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
@@ -90,18 +89,6 @@ public:
 
     /// `partial`: a part of a command buffer that the game is still recording (streaming of the draws); it does not count as work submitted by the game.
     void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bool partial = false);
-    /// The register groups of the draw state: the group of a register is fixed by its index. The registers of a native record are stored by group.
-    enum RegisterGroup : u32 {
-        GroupOther,
-        GroupArguments,
-        GroupVsProgram,
-        GroupVsUserData,
-        GroupPsProgram,
-        GroupPsUserData,
-        GroupInterpolants,
-        GroupTargets,
-    };
-    static u32 RegisterGroupOf(u32 index);
     /// The GPU is idle as far as the game's own submits are concerned (work streamed ahead of the game's submit does not count).
     bool IsGpuIdleForGame() const {
         return IsGpuIdle() || stream_open.load(std::memory_order_acquire) != 0;
@@ -459,8 +446,7 @@ private:
 #endif
     s32 curr_qid{-1};
 
-    /// The draw state of the command processor (kept equal to `regs`, planning reads it), what the rasterizer reads
-    /// without the split (rebuilt from `regs` before each operation) and the raster thread's own with it.
+    /// The raster thread split of the command processor (cp_split_mode).
     bool split_active{};
     std::unique_ptr<RasterSplit> split;
     const u32 fence_wait_shortcut;

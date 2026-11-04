@@ -93,31 +93,11 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
 
 void Liverpool::ApplyStateTemplate(const Core::NativeDraw::StateTemplate& state) {
+    // G4a: the executor keeps no register file. The one state that is read back is the compute program of the graphics queue (the dispatches the command processor runs itself).
     using Core::NativeDraw::StateWrite;
     for (const StateWrite& write : state.writes) {
-        switch (write.kind) {
-        case StateWrite::ClearState:
-            regs.SetDefaults();
-            break;
-        case StateWrite::Context:
-            regs.reg_array[Regs::ContextRegWordOffset + write.reg] = write.value;
-            break;
-        case StateWrite::Sh:
-            if (write.reg >= 0x200 && write.reg <= (0x200 + sizeof(ComputeProgram) / 4)) {
-                reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state)[write.reg - 0x200] = write.value;
-            } else {
-                regs.reg_array[Regs::ShRegWordOffset + write.reg] = write.value;
-            }
-            break;
-        case StateWrite::Uconfig:
-            regs.reg_array[Regs::UconfigRegWordOffset + write.reg] = write.value;
-            break;
-        case StateWrite::NumInstances:
-            regs.num_instances.num_instances = write.value;
-            break;
-        case StateWrite::IndexType:
-            regs.index_buffer_type.raw = write.value;
-            break;
+        if (write.kind == StateWrite::Sh && write.reg >= 0x200 && write.reg <= (0x200 + sizeof(ComputeProgram) / 4)) {
+            reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state)[write.reg - 0x200] = write.value;
         }
     }
 }
@@ -278,9 +258,6 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
                 rasterizer->ClearDepthStencilTarget(inputs, db_extent);
             },
             false, false);
-        // what the SDK's clear leaves behind: all colour targets writable again, no clear bits in the depth render control
-        regs.reg_array[Regs::ContextRegWordOffset + 0x8e] = 0xf;
-        regs.reg_array[Regs::ContextRegWordOffset + 0x0] = 0;
         return;
     }
     if (draw.kind == 3 && draw.copy_bytes != 0 && asc_vqid == ~0u && Core::NativeResources::ImageCopyEnabled()) {

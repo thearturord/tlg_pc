@@ -31,7 +31,17 @@ struct TargetSet;
 
 namespace Core::NativeDraw {
 
-/// Register groups of the command processor's draw state (Liverpool::RegisterGroupOf): the registers of a record are stored by group.
+/// Register groups of the draw state: the group of a register is fixed by its index in the PS4 register file. The registers of a record are stored by group.
+enum RegisterGroup : u32 {
+    GroupOther,
+    GroupArguments,
+    GroupVsProgram,
+    GroupVsUserData,
+    GroupPsProgram,
+    GroupPsUserData,
+    GroupInterpolants,
+    GroupTargets,
+};
 constexpr u32 NumRegisterGroups = 8;
 
 /// Address of the host function registered under `name` (a PS4_SYSV_ABI function taking

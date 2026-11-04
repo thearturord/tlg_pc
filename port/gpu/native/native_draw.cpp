@@ -2446,12 +2446,12 @@ void SignRecord(NativeRecord& slot, const Signature& sig, u64 ctx) {
     };
     const u64 vs = Rd<u64>(ctx, Ctx::VertexShader);
     const u64 ps = Rd<u64>(ctx, Ctx::PixelShader);
-    slot.group_sig[AmdGpu::Liverpool::GroupVsProgram] =
+    slot.group_sig[GroupVsProgram] =
         sign({vs, Rd<u64>(ctx, Ctx::InputLayout), Rd<u64>(ctx, 0x4440), Rd<u32>(ctx, 0x4448), Rd<u64>(ctx, 0x4450)});
-    slot.group_sig[AmdGpu::Liverpool::GroupPsProgram] = sign({ps, sig.group[Targets], sig.group[States]});
-    slot.group_sig[AmdGpu::Liverpool::GroupInterpolants] = sign({vs, ps});
-    slot.group_sig[AmdGpu::Liverpool::GroupTargets] = sign({sig.group[Targets]});
-    slot.group_sig[AmdGpu::Liverpool::GroupOther] = sign({sig.group[States], sig.group[InputObjects], sig.group[Shaders], sig.group[Targets]});
+    slot.group_sig[GroupPsProgram] = sign({ps, sig.group[Targets], sig.group[States]});
+    slot.group_sig[GroupInterpolants] = sign({vs, ps});
+    slot.group_sig[GroupTargets] = sign({sig.group[Targets]});
+    slot.group_sig[GroupOther] = sign({sig.group[States], sig.group[InputObjects], sig.group[Shaders], sig.group[Targets]});
 }
 
 /// A1: census of the tagged draws by call site.
@@ -2631,7 +2631,7 @@ void GroupPackage(StatePackage& p) {
     p.lazy_ok = true;
     for (u32 i = 0; i < p.count; ++i) {
         const u32 g = table[p.regs[i].index & 0xffff];
-        if (g == AmdGpu::Liverpool::GroupVsUserData || g == AmdGpu::Liverpool::GroupPsUserData || p.regs[i].index >= 65536) {
+        if (g == GroupVsUserData || g == GroupPsUserData || p.regs[i].index >= 65536) {
             p.lazy_ok = false;
         }
         ++counts[g];
@@ -2648,8 +2648,8 @@ void GroupPackage(StatePackage& p) {
         p.grouped_regs[next[table[p.regs[i].index & 0xffff]]++] = p.regs[i];
     }
     Hasher values;
-    for (const u32 group : {static_cast<u32>(AmdGpu::Liverpool::GroupTargets), static_cast<u32>(AmdGpu::Liverpool::GroupOther),
-                            static_cast<u32>(AmdGpu::Liverpool::GroupVsProgram)}) {
+    for (const u32 group : {static_cast<u32>(GroupTargets), static_cast<u32>(GroupOther),
+                            static_cast<u32>(GroupVsProgram)}) {
         values.Add(group);
         for (u32 i = p.begin[group]; i < p.begin[group + 1]; ++i) {
             values.Add(p.grouped_regs[i].index);
@@ -4305,9 +4305,30 @@ namespace {
 const std::array<u8, 65536>& GroupTable() {
     static const auto table = [] {
         std::array<u8, 65536> t{};
-        for (u32 i = 0; i < t.size(); ++i) {
-            t[i] = static_cast<u8>(AmdGpu::Liverpool::RegisterGroupOf(i));
+        // register file word offsets of the three banks (the record's register index is the word index)
+        constexpr u32 Ctx = 0xA000, Sh = 0x2C00, Uc = 0xC000;
+        const auto set = [&](u32 base, u32 first, u32 last, u32 group) {
+            for (u32 r = first; r <= last; ++r) {
+                t[base + r] = static_cast<u8>(group);
+            }
+        };
+        set(Uc, 0x24c, 0x24d, GroupArguments);
+        for (const u32 r : {0x29eu, 0x1f9u, 0x1fau, 0x102u}) {
+            t[Ctx + r] = GroupArguments;
         }
+        set(Sh, 0x48, 0x4b, GroupVsProgram);
+        for (const u32 r : {0x207u, 0x1b1u, 0x1c3u, 0x2a8u, 0x2a9u}) {
+            t[Ctx + r] = GroupVsProgram;
+        }
+        set(Sh, 0x4c, 0x5b, GroupVsUserData);
+        set(Sh, 0x08, 0x0b, GroupPsProgram);
+        for (const u32 r : {0x1c4u, 0x1c5u, 0x1b3u, 0x1b4u, 0x1b6u, 0x1b8u, 0x203u, 0x8fu}) {
+            t[Ctx + r] = GroupPsProgram;
+        }
+        set(Sh, 0x0c, 0x1b, GroupPsUserData);
+        set(Ctx, 0x191, 0x1b0, GroupInterpolants);
+        set(Ctx, 0x000, 0x01f, GroupTargets);
+        set(Ctx, 0x318, 0x38f, GroupTargets);
         return t;
     }();
     return table;
@@ -4369,10 +4390,10 @@ static bool TakeExecDrawImpl(u64 seq, ExecDraw& out, bool typed, bool allow_lazy
         bool usable = p.count <= slot.count;
         for (u32 i = p.count; usable && i < slot.count; ++i) {
             const u32 g = table[slot.regs[i].index & 0xffff];
-            if (g == AmdGpu::Liverpool::GroupVsUserData || g == AmdGpu::Liverpool::GroupPsUserData) {
+            if (g == GroupVsUserData || g == GroupPsUserData) {
                 continue;
             }
-            if (g == AmdGpu::Liverpool::GroupTargets || g == AmdGpu::Liverpool::GroupOther || g == AmdGpu::Liverpool::GroupVsProgram) {
+            if (g == GroupTargets || g == GroupOther || g == GroupVsProgram) {
                 usable = false; // the hash of the package covers these groups
                 break;
             }
@@ -4418,8 +4439,8 @@ static bool TakeExecDrawImpl(u64 seq, ExecDraw& out, bool typed, bool allow_lazy
         }
         if (typed) {
             out.typed = true;
-            counts[AmdGpu::Liverpool::GroupVsUserData] = 0;
-            counts[AmdGpu::Liverpool::GroupPsUserData] = 0;
+            counts[GroupVsUserData] = 0;
+            counts[GroupPsUserData] = 0;
         }
         out.group_begin[0] = 0;
         for (u32 g = 0; g < NumRegisterGroups; ++g) {
@@ -4440,8 +4461,8 @@ static bool TakeExecDrawImpl(u64 seq, ExecDraw& out, bool typed, bool allow_lazy
         out.group_sig = slot.group_sig;
         // what the render target inputs of the draw come from: the values of the target, other state and vertex program groups
         Hasher values;
-        for (const u32 group : {static_cast<u32>(AmdGpu::Liverpool::GroupTargets), static_cast<u32>(AmdGpu::Liverpool::GroupOther),
-                                static_cast<u32>(AmdGpu::Liverpool::GroupVsProgram)}) {
+        for (const u32 group : {static_cast<u32>(GroupTargets), static_cast<u32>(GroupOther),
+                                static_cast<u32>(GroupVsProgram)}) {
             values.Add(group);
             for (u32 i = out.group_begin[group]; i < out.group_begin[group + 1]; ++i) {
                 values.Add(out.regs[i].index);
@@ -4472,10 +4493,8 @@ static bool TakeExecDrawImpl(u64 seq, ExecDraw& out, bool typed, bool allow_lazy
     }
     out.stage_key = 0;
     if (slot.kind <= 2 && out.grouped != 0) {
-        using Liverpool = AmdGpu::Liverpool;
         const auto& sig = out.group_sig;
-        const std::array<u32, 5> needed{Liverpool::GroupOther, Liverpool::GroupVsProgram, Liverpool::GroupPsProgram, Liverpool::GroupInterpolants,
-                                        Liverpool::GroupTargets};
+        const std::array<u32, 5> needed{GroupOther, GroupVsProgram, GroupPsProgram, GroupInterpolants, GroupTargets};
         bool known = true;
         Hasher h;
         for (const u32 group : needed) {

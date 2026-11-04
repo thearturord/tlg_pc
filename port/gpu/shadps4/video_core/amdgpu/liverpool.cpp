@@ -4,6 +4,7 @@
 #include <boost/preprocessor/stringize.hpp>
 
 #include "native/native_content.h"
+#include "native/native_wait_registers.h"
 #include "native/native_flight.h"
 #include "native/native_stream_probe.h"
 #include "native/native_timeline.h"
@@ -219,47 +220,6 @@ void Liverpool::WakeRaster() {
     }
 }
 
-
-namespace {
-constexpr u32 GroupOther = 0, GroupArguments = 1, GroupVsProgram = 2, GroupVsUserData = 3, GroupPsProgram = 4, GroupPsUserData = 5, GroupInterpolants = 6,
-              GroupTargets = 7;
-
-/// The group of a register of the draw state (only the grouping of the records' values; anything not listed is "other").
-const std::array<u8, Regs::NumRegs>& RegisterGroupTable() {
-    static const auto table = [] {
-        std::array<u8, Regs::NumRegs> t{};
-        const auto set = [&](u32 base, u32 first, u32 last, u32 group) {
-            for (u32 r = first; r <= last; ++r) {
-                t[base + r] = static_cast<u8>(group);
-            }
-        };
-        constexpr u32 Ctx = Regs::ContextRegWordOffset, Sh = Regs::ShRegWordOffset, Uc = Regs::UconfigRegWordOffset;
-        set(Uc, 0x24c, 0x24d, GroupArguments);
-        for (const u32 r : {0x29eu, 0x1f9u, 0x1fau, 0x102u}) {
-            t[Ctx + r] = GroupArguments;
-        }
-        set(Sh, 0x48, 0x4b, GroupVsProgram);
-        for (const u32 r : {0x207u, 0x1b1u, 0x1c3u, 0x2a8u, 0x2a9u}) {
-            t[Ctx + r] = GroupVsProgram;
-        }
-        set(Sh, 0x4c, 0x5b, GroupVsUserData);
-        set(Sh, 0x08, 0x0b, GroupPsProgram);
-        for (const u32 r : {0x1c4u, 0x1c5u, 0x1b3u, 0x1b4u, 0x1b6u, 0x1b8u, 0x203u, 0x8fu}) {
-            t[Ctx + r] = GroupPsProgram;
-        }
-        set(Sh, 0x0c, 0x1b, GroupPsUserData);
-        set(Ctx, 0x191, 0x1b0, GroupInterpolants);
-        set(Ctx, 0x000, 0x01f, GroupTargets);
-        set(Ctx, 0x318, 0x38f, GroupTargets);
-        return t;
-    }();
-    return table;
-}
-} // namespace
-
-u32 Liverpool::RegisterGroupOf(u32 index) {
-    return index < Regs::NumRegs ? RegisterGroupTable()[index] : static_cast<u32>(GroupOther);
-}
 
 void Liverpool::DrainRaster() {
     if (!split_active) {
@@ -592,7 +552,7 @@ Liverpool::Task Liverpool::DirectWaitAsc(const Core::NativeSync::LabelWait& wait
     FIBER_ENTER(acb_task_name[vqid]);
     const Core::NativeSync::LabelWait* wait_reg_mem = &wait_packet;
     ASSERT(!wait_reg_mem->pfp);
-    if (!wait_reg_mem->Test(regs.reg_array)) {
+    if (!wait_reg_mem->Test()) {
         using VideoCore::ReadbackStats::WaitClass;
         const u64 wait_start = VideoCore::ReadbackStats::NowNs();
         bool reported = false;
@@ -607,7 +567,7 @@ Liverpool::Task Liverpool::DirectWaitAsc(const Core::NativeSync::LabelWait& wait
                 break;
             }
             held_back |= match.satisfied;
-            if (wait_reg_mem->Test(regs.reg_array)) {
+            if (wait_reg_mem->Test()) {
                 wait_class = held_back ? WaitClass::FenceBlocked : WaitClass::Memory;
                 break;
             }
@@ -1418,7 +1378,7 @@ void Liverpool::ReportLongWait(const Core::NativeSync::LabelWait& wait_reg_mem, 
     }
     reported = true;
     const bool is_memory = wait_reg_mem.memory;
-    const u32 value = is_memory ? *wait_reg_mem.Address() : regs.reg_array[wait_reg_mem.Reg()];
+    const u32 value = is_memory ? *wait_reg_mem.Address() : Core::NativeWaitRegisters::Read(wait_reg_mem.Reg());
     std::string pending;
     {
         std::scoped_lock lk{recorded_fence_mutex};
@@ -1749,8 +1709,8 @@ Liverpool::Task Liverpool::DirectWait(const Core::NativeSync::LabelWait& wait_pa
     if (vo_port->IsVoLabel(wait_addr) && num_submits == mapped_queues[GfxQueueId].submits.size()) {
         VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::FlipSleep};
         Core::FrameTimeline::Span flip_span{Core::FrameTimeline::FlipWait};
-        vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
-    } else if (!wait_reg_mem->Test(regs.reg_array)) {
+        vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(); });
+    } else if (!wait_reg_mem->Test()) {
         using VideoCore::ReadbackStats::WaitClass;
         const u64 wait_start = VideoCore::ReadbackStats::NowNs();
         bool reported = false;
@@ -1765,7 +1725,7 @@ Liverpool::Task Liverpool::DirectWait(const Core::NativeSync::LabelWait& wait_pa
                 break;
             }
             held_back |= match.satisfied;
-            if (wait_reg_mem->Test(regs.reg_array)) {
+            if (wait_reg_mem->Test()) {
                 wait_class = held_back ? WaitClass::FenceBlocked : WaitClass::Memory;
                 break;
             }

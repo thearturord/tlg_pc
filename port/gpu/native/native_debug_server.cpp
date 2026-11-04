@@ -22,6 +22,7 @@
 #include "native/native_target_inputs.h"
 #include "native/native_debug_server.h"
 #include "native/native_log.h"
+#include "native/native_wait_registers.h"
 #include "native/native_config.h"
 #include "native/native_stream_probe.h"
 #include "native/native_flight.h"
@@ -222,7 +223,7 @@ nlohmann::json Native(const Params&) {
     j["sync_converted_sweep"] = live.sync_converted_sweep.load();
     j["sync_converted_submit"] = live.sync_converted_submit.load();
     j["sync_packets_kept"] = live.fence_packets_kept.load();
-    j["register_wait_polls"] = Core::NativeSync::RegisterWaitReport();
+    j["register_wait_polls"] = Core::NativeWaitRegisters::Report();
     j["g1_dispatch_inputs"] = Core::NativeDispatch::Report();
     j["g1_target_inputs"] = Core::NativeTarget::Report();
     j["sync_converted"] = {{"eop", live.sync_converted[1].load()}, {"release", live.sync_converted[2].load()}, {"wait", live.sync_converted[3].load()}, {"write", live.sync_converted[4].load()}, {"event", live.sync_converted[5].load()}, {"inert", live.sync_converted[6].load()}, {"dma", live.sync_converted[7].load()}, {"query", live.sync_converted[8].load()}};
