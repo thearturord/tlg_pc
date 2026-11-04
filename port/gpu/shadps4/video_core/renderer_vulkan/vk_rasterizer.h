@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "native/native_occlusion.h"
+#include "native/native_raster_host.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -46,11 +47,32 @@ class Runtime;
 struct FixedState;
 struct DrawInputs;
 
-class Rasterizer {
+class Rasterizer : public Core::RasterHost {
 public:
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
                         AmdGpu::Liverpool* liverpool);
-    ~Rasterizer();
+    ~Rasterizer() override;
+
+    // ---- Core::RasterHost (native/native_raster_host.h): the functions below with a host name are in vk_rasterizer_host.cpp; the others are the ones of this class ----
+    Core::DrawPlanPtr MakeDrawPlan(Core::DrawIndirectParams params, const FixedState& native, u64 exec_key, u64 inputs_key, const Core::NativeDraw::ExecDraw& record,
+                                   u32 index_count) override;
+    Core::DrawPlanPtr MakeExecDrawPlan(const FixedState& native, u64 exec_key, u64 inputs_key, std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data,
+                                       const Core::NativeDraw::ExecDraw& draw, u32 index_count, u32 draw_class) override;
+    Core::DrawPlanPtr MakeOperationPlan(const Core::NativeDraw::ExecDraw& draw) override;
+    Core::DispatchPlanPtr MakeDispatchPlan(const Core::NativeDispatch::DispatchInputs& cs) override;
+    u64 DrawPlanDigest(const DrawPlan& plan) override;
+    u64 DispatchPlanDigest(const DispatchPlan& plan) override;
+    void RecycleDrawPlan(Core::DrawPlanPtr&& plan) override;
+    void RecycleDispatchPlan(Core::DispatchPlanPtr&& plan) override;
+    u64 DrawPlanSeq(const DrawPlan& plan) override;
+    bool DrawPlanIsDepthOnly(const DrawPlan& plan) override;
+    void SetDrawPlanTargets(DrawPlan& plan, const std::array<AmdGpu::CbDbExtent, 8>& cb_extent, const AmdGpu::CbDbExtent& db_extent, const std::array<u64, 9>& target_resources) override;
+    const Core::NativeDispatch::DispatchInputs& DispatchPlanInputs(const DispatchPlan& plan) override;
+    void TagDispatchPlan(DispatchPlan& plan, u64 seq) override;
+    bool MarkersEnabled() const noexcept override;
+    void MarkerBegin(std::string_view text) override;
+    void MarkerEnd() override;
+    IntervalStats PublishIntervalStats() override;
 
     [[nodiscard]] Scheduler& GetScheduler() noexcept {
         return scheduler;

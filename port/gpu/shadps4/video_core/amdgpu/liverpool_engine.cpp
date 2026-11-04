@@ -53,7 +53,6 @@
 #include "video_core/thread_usage.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_fixed_state.h"
-#include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 // Engine path: member functions of an emulator class that serve the native path (moved out of native/ 2026-11-03).
 // so that the emulator files only call into native/; the class stays declared in the emulator's header until the owning plan phase
@@ -93,16 +92,6 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
 
 } // namespace AmdGpu
-
-namespace Core::NativeRasterQueue {
-void PlanDelete::operator()(Vulkan::DrawPlan* plan) const {
-    delete plan;
-}
-
-void PlanDelete::operator()(Vulkan::DispatchPlan* plan) const {
-    delete plan;
-}
-} // namespace Core::NativeRasterQueue
 
 namespace AmdGpu {
 
@@ -369,8 +358,8 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             live.exec_fallback.fetch_add(1, std::memory_order_relaxed);
             live.exec_reason[reason].fetch_add(1, std::memory_order_relaxed);
         };
-        const auto take = [&](std::unique_ptr<Vulkan::DrawPlan> plan) {
-            native_exec_plan = plan.release();
+        const auto take = [&](Core::DrawPlanPtr plan) {
+            native_exec_plan = std::move(plan);
             planned_from_record = true;
             live.exec_typed.fetch_add(1, std::memory_order_relaxed);
             if (draw.cb_extents_only) {
@@ -385,7 +374,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         if (draw.cb_extents_only) {
             // a fast clear eliminate: the operation and its render target come from the record
             if (split_active && draw.kind == 4) {
-                take(rasterizer->PlanExecOperation(draw));
+                take(rasterizer->MakeOperationPlan(draw));
             } else if (exec_on) {
                 left(5);
             }
@@ -409,11 +398,11 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
                     verify = LookupDrain(1);
                 }
                 const auto make_plan = [&] {
-                    return rasterizer->PlanExecDraw(*draw.fixed, draw.stage_key, native_inputs_key, exec_vertex_user_data,
+                    return rasterizer->MakeExecDrawPlan(*draw.fixed, draw.stage_key, native_inputs_key, exec_vertex_user_data,
                                                     exec_pixel_user_data, draw, index_count,
                                                     native_tag_pending.valid ? (native_tag_pending.meta & 0xff) : 15u);
                 };
-                std::unique_ptr<Vulkan::DrawPlan> plan;
+                Core::DrawPlanPtr plan;
                 {
                     TLG_PROF_LEVEL("front.plan_exec_draw", 2);
                     plan = make_plan();
@@ -471,9 +460,9 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
                                                                draw.other_stage, split_active, draw.stage_key));
     } else if (!planned_from_record && plannable) {
         Core::NativeDraw::Live().plan_register_free.fetch_add(1, std::memory_order_relaxed);
-        Vulkan::DrawIndirectParams params{};
+        Core::DrawIndirectParams params{};
         if (call.kind == RasterCall::Kind::DrawIndirect) {
-            params = Vulkan::DrawIndirectParams{.vertex_sgpr_offset = call.vertex_sgpr_offset, .instance_sgpr_offset = call.instance_sgpr_offset, .is_indirect = true};
+            params = Core::DrawIndirectParams{.vertex_sgpr_offset = call.vertex_sgpr_offset, .instance_sgpr_offset = call.instance_sgpr_offset, .is_indirect = true};
         }
         u32 verify;
         {
@@ -485,19 +474,19 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             Core::NativeShaderEnv::Scope shader_env{draw.vs_gnm, draw.ps_gnm, draw.fetch_object, draw.other_stage, draw.typed ? exec_vertex_user_data.data() : nullptr,
                                                     draw.typed ? exec_pixel_user_data.data() : nullptr};
             Core::NativeTargetDesc::Scope target_desc{draw.native_targets}; // E7 (TLG_TARGET_DESC_USE): PlanDraw applies the record's target description to the inputs it makes
-            auto made = rasterizer->PlanDraw(params, *native_fixed, native_exec_key, native_inputs_key, draw, index_count);
+            auto made = rasterizer->MakeDrawPlan(params, *native_fixed, native_exec_key, native_inputs_key, draw, index_count);
             if (made && native_exec_key != 0 && native_inputs_key != 0 && draw.kind <= 2 && draw.typed && !draw.other_stage && draw.bindings_complete) {
                 // F5: a learning draw (first sight of its pipeline): the pipeline and the inputs exist now, so the draw is planned from its record like every later one (the
                 // flat user data of the stages the record covers is skipped); when that is not possible the draw keeps the plan it has
-                if (auto from_record = rasterizer->PlanExecDraw(*draw.fixed, native_exec_key, native_inputs_key, exec_vertex_user_data, exec_pixel_user_data, draw, index_count,
+                if (auto from_record = rasterizer->MakeExecDrawPlan(*draw.fixed, native_exec_key, native_inputs_key, exec_vertex_user_data, exec_pixel_user_data, draw, index_count,
                                                                 native_tag_pending.valid ? (native_tag_pending.meta & 0xff) : 15u)) {
-                    rasterizer->RecyclePlan(std::move(made));
+                    rasterizer->RecycleDrawPlan(std::move(made));
                     return from_record;
                 }
             }
             return made;
         };
-        std::unique_ptr<Vulkan::DrawPlan> candidate;
+        Core::DrawPlanPtr candidate;
         {
             TLG_PROF_LEVEL("front.plan_draw_registers", 2);
             candidate = make_candidate();
@@ -512,13 +501,13 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             Core::RareEvents::Note("f3_5_draw_refused_no_plan", fmt::format("draw record {}: no plan (stage key {:#x})", draw.seq, draw.stage_key));
         }
         Core::NativeDraw::Live().state_planned.fetch_add(1, std::memory_order_relaxed);
-        native_exec_plan = candidate.release();
+        native_exec_plan = std::move(candidate);
     }
     if (!refused) {
         RasterDispatch(call);
     }
     if (native_exec_plan) {
-        rasterizer->RecyclePlan(std::unique_ptr<Vulkan::DrawPlan>{std::exchange(native_exec_plan, nullptr)});
+        rasterizer->RecycleDrawPlan(std::move(native_exec_plan));
     }
     native_inputs_key = 0;
     native_exec_key = 0;

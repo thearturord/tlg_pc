@@ -48,8 +48,6 @@
 #include "native/native_debug_server.h"
 #include "video_core/thread_usage.h"
 #include "video_core/renderdoc.h"
-#include "video_core/renderer_vulkan/vk_fixed_state.h"
-#include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 
 namespace AmdGpu {
@@ -89,15 +87,15 @@ using Core::NativeExecutorSync::NoFenceWrite;
 using Core::NativeExecutorSync::WriteFenceMemory;
 
 /// The range has no GPU mapping (so it can be written off the GPU thread).
-static std::function<bool(VAddr, u32)> NotMapped(Vulkan::Rasterizer* rasterizer) {
+static std::function<bool(VAddr, u32)> NotMapped(Core::RasterHost* rasterizer) {
     return [rasterizer](VAddr address, u32 num_bytes) { return rasterizer && !rasterizer->IsMapped(address, num_bytes); };
 }
 
-static bool TryWriteOffThread(Vulkan::Rasterizer* rasterizer, void* address, const void* data, u32 num_bytes) {
+static bool TryWriteOffThread(Core::RasterHost* rasterizer, void* address, const void* data, u32 num_bytes) {
     return Core::NativeExecutorSync::TryWriteOffThread(address, data, num_bytes, NotMapped(rasterizer));
 }
 
-static bool TryWriteFenceOffThread(Vulkan::Rasterizer* rasterizer, void* address, u64 data,
+static bool TryWriteFenceOffThread(Core::RasterHost* rasterizer, void* address, u64 data,
                                    u32 num_bytes) {
     return TryWriteOffThread(rasterizer, address, &data, num_bytes);
 }
@@ -120,7 +118,7 @@ static void RunFenceSignal(AmdGpu::Liverpool& liverpool, std::thread::id gpu_id,
 }
 
 
-void Liverpool::BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
+void Liverpool::BindRasterizer(Core::RasterHost* rasterizer_) {
     if (!rasterizer_ && split_active) {
         // The rasterizer goes away: finish what is queued and stop the raster thread first.
         DrainRaster();
@@ -143,13 +141,13 @@ u32 Liverpool::LookupDrain(u32 caller) {
     return static_cast<u32>(Core::DrainAudit::LookupBegin(caller));
 }
 
-std::unique_ptr<Vulkan::DrawPlan> Liverpool::ReplanAfterDrain(std::unique_ptr<Vulkan::DrawPlan> plan, u32 site, const std::function<std::unique_ptr<Vulkan::DrawPlan>()>& make) {
-    const u64 before = plan ? Vulkan::Rasterizer::PlanDigest(*plan) : 0;
+Core::DrawPlanPtr Liverpool::ReplanAfterDrain(Core::DrawPlanPtr plan, u32 site, const std::function<Core::DrawPlanPtr()>& make) {
+    const u64 before = plan ? rasterizer->DrawPlanDigest(*plan) : 0;
     DrainRasterWrites(site);
     auto again = make();
-    const u64 after = again ? Vulkan::Rasterizer::PlanDigest(*again) : 0;
+    const u64 after = again ? rasterizer->DrawPlanDigest(*again) : 0;
     Core::DrainAudit::NotePlanVerify(site, before == after);
-    rasterizer->RecyclePlan(std::move(plan));
+    rasterizer->RecycleDrawPlan(std::move(plan));
     return again;
 }
 
@@ -188,13 +186,13 @@ Core::NativeDispatch::DispatchInputs MakeDispatchInputs(const ComputeProgram& p)
     return in;
 }
 
-std::unique_ptr<Vulkan::DispatchPlan> Liverpool::ReplanAfterDrain(std::unique_ptr<Vulkan::DispatchPlan> plan, u32 site, const std::function<std::unique_ptr<Vulkan::DispatchPlan>()>& make) {
-    const u64 before = plan ? Vulkan::Rasterizer::PlanDigest(*plan) : 0;
+Core::DispatchPlanPtr Liverpool::ReplanAfterDrain(Core::DispatchPlanPtr plan, u32 site, const std::function<Core::DispatchPlanPtr()>& make) {
+    const u64 before = plan ? rasterizer->DispatchPlanDigest(*plan) : 0;
     DrainRasterWrites(site);
     auto again = make();
-    const u64 after = again ? Vulkan::Rasterizer::PlanDigest(*again) : 0;
+    const u64 after = again ? rasterizer->DispatchPlanDigest(*again) : 0;
     Core::DrainAudit::NotePlanVerify(site, before == after);
-    rasterizer->RecyclePlan(std::move(plan));
+    rasterizer->RecycleDispatchPlan(std::move(plan));
     return again;
 }
 
@@ -223,7 +221,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
     }
     if (Core::NativeUploads::Enabled()) {
         // N5c: the uploads the engine announced before this record are queued in front of it (one operation per record that finds some)
-        const u64 upload_seq = call.tag.valid ? call.tag.seq : (native_exec_plan ? native_exec_plan->native_seq : 0);
+        const u64 upload_seq = call.tag.valid ? call.tag.seq : (native_exec_plan ? rasterizer->DrawPlanSeq(*native_exec_plan) : 0);
         std::vector<Core::NativeUploads::Range> due;
         if (upload_seq != 0 && Core::NativeUploads::TakeDue(upload_seq, due)) {
             RasterRun([this, ranges = std::move(due)]() { rasterizer->PreSynchronize(ranges); });
@@ -250,8 +248,8 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         ++sp.stat_draws;
     }
     RasterOp op;
-    std::unique_ptr<Vulkan::DrawPlan> draw_plan; // handed to the op below (the op deletes with PlanDelete, the pool takes the default deleter)
-    std::unique_ptr<Vulkan::DispatchPlan> dispatch_plan;
+    Core::DrawPlanPtr draw_plan; // handed to the op below
+    Core::DispatchPlanPtr dispatch_plan;
     op.has_call = true;
     op.call = call;
     if (call.kind == RasterCall::Kind::DispatchDirect ||
@@ -259,42 +257,31 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         op.cs = MakeDispatchInputs(call.cs_override ? *call.cs_override : GetCsRegs());
         // The pipeline lookup runs here, on the command processor thread (stage 2 of the split).
         TLG_PROF_NAMED_LEVEL(prof_plan_dispatch, "front.plan_dispatch", 2);
-        dispatch_plan = rasterizer->PlanDispatch(op.cs);
+        dispatch_plan = rasterizer->MakeDispatchPlan(op.cs);
         if (verify == 2) {
-            dispatch_plan = ReplanAfterDrain(std::move(dispatch_plan), 0, [&] { return rasterizer->PlanDispatch(op.cs); });
+            dispatch_plan = ReplanAfterDrain(std::move(dispatch_plan), 0, [&] { return rasterizer->MakeDispatchPlan(op.cs); });
         }
         if (dispatch_plan && call.tag.valid) {
-            dispatch_plan->native_seq = call.tag.seq;
-            dispatch_plan->bindings_complete = Core::NativeDraw::TakeDispatchBindings(call.tag.seq, dispatch_plan->bindings.data(), static_cast<u32>(dispatch_plan->bindings.size()), dispatch_plan->binding_count);
+            rasterizer->TagDispatchPlan(*dispatch_plan, call.tag.seq);
         }
     } else {
-        const Vulkan::DrawIndirectParams params =
-            call.kind == RasterCall::Kind::DrawIndirect
-                ? Vulkan::DrawIndirectParams{.vertex_sgpr_offset = call.vertex_sgpr_offset,
-                                             .instance_sgpr_offset = call.instance_sgpr_offset,
-                                             .is_indirect = true}
-                : Vulkan::DrawIndirectParams{};
-        if (native_exec_plan) {
-            draw_plan.reset(std::exchange(native_exec_plan, nullptr));
-        }
+        draw_plan = std::move(native_exec_plan);
         if (draw_plan) {
-            draw_plan->cb_extent = last_cb_extent;
-            draw_plan->db_extent = last_db_extent;
-            draw_plan->target_resources = last_target_resources;
+            rasterizer->SetDrawPlanTargets(*draw_plan, last_cb_extent, last_db_extent, last_target_resources);
         }
     }
     if (rasterizer->ConstRingLevel() != 0) {
         // The queue position this operation will have, and the position the raster thread has finished (documents/tlg/pc-port-draw-pipeline-architecture.md, T1).
         rasterizer->FrontQueueOp(draw_plan.get(), dispatch_plan.get(), sp.pushed.load(std::memory_order_acquire) + 1,
-                                 sp.done.load(std::memory_order_acquire), call.tag.valid ? call.tag.seq : (draw_plan ? draw_plan->native_seq : 0),
+                                 sp.done.load(std::memory_order_acquire), call.tag.valid ? call.tag.seq : (draw_plan ? rasterizer->DrawPlanSeq(*draw_plan) : 0),
                                  call.indexed, call.index_offset);
     }
     {
         TLG_PROF_LEVEL("front.resolve_ahead", 2);
         rasterizer->ResolveAhead(draw_plan.get(), dispatch_plan.get()); // R2
     }
-    op.draw_plan.reset(draw_plan.release());
-    op.dispatch_plan.reset(dispatch_plan.release());
+    op.draw_plan = std::move(draw_plan);
+    op.dispatch_plan = std::move(dispatch_plan);
     RasterPush(std::move(op), false);
 }
 
@@ -407,8 +394,8 @@ void Liverpool::ExecuteDma(const Core::NativeSync::DmaCopy& dma) {
         return;
     }
     struct Host final : Core::NativeExecutorSync::DmaHost {
-        Vulkan::Rasterizer& rasterizer;
-        explicit Host(Vulkan::Rasterizer& r) : rasterizer{r} {}
+        Core::RasterHost& rasterizer;
+        explicit Host(Core::RasterHost& r) : rasterizer{r} {}
         void FillBuffer(u64 destination, u32 bytes, u32 fill, bool destination_is_gds) override {
             rasterizer.FillBuffer(destination, bytes, fill, destination_is_gds);
         }
@@ -486,7 +473,7 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
         }
     };
     static const Core::NativeDispatch::DispatchInputs no_program{}; // a dispatch always has a plan
-    const Core::NativeDispatch::DispatchInputs& cs_program = dispatch_plan ? dispatch_plan->cs : no_program;
+    const Core::NativeDispatch::DispatchInputs& cs_program = dispatch_plan ? rasterizer->DispatchPlanInputs(*dispatch_plan) : no_program;
     {
         TLG_PROF_NAMED_LEVEL(prof_ring, "raster.ring_use", 3);
         rasterizer->BeginRingUse(draw_plan, dispatch_plan);
@@ -589,12 +576,12 @@ void Liverpool::RasterConsumer::RunClosure(RasterOp& op) {
 }
 
 bool Liverpool::RasterConsumer::IsDepthOnly(const Vulkan::DrawPlan& plan) const {
-    return plan.fixed.NoColorTargets();
+    return owner.rasterizer->DrawPlanIsDepthOnly(plan);
 }
 
 void Liverpool::RasterConsumer::Release(RasterOp& op) {
-    owner.rasterizer->RecyclePlan(std::unique_ptr<Vulkan::DrawPlan>(op.draw_plan.release()));
-    owner.rasterizer->RecyclePlan(std::unique_ptr<Vulkan::DispatchPlan>(op.dispatch_plan.release()));
+    owner.rasterizer->RecycleDrawPlan(std::move(op.draw_plan));
+    owner.rasterizer->RecycleDispatchPlan(std::move(op.dispatch_plan));
 }
 
 void Liverpool::RasterConsumer::BatchFinished() {
@@ -607,112 +594,7 @@ void Liverpool::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 now) {
     auto& fence_latency = owner.fence_latency;
     {
             const u64 block_start = now;
-            const auto plan_stats = rasterizer->TakePlanStats();
-            const auto memo_stats = rasterizer->TakeBeginMemoStats();
-            if (rasterizer->TextureSetMemoOn()) {
-                const auto sets = rasterizer->TakeTextureSetStats();
-                Core::DebugServer::Publish("texture_set_memo", {{"hits", sets.hits}, {"recorded", sets.recorded}, {"miss_no_entry", sets.no_entry}, {"miss_generation", sets.generation},
-                                                              {"miss_image_check", sets.image_check}, {"not_eligible", sets.not_eligible}, {"note", "counts per ~5 s interval"}});
-            }
-            {
-                const auto c = rasterizer->TakeConsumerCensus();
-                nlohmann::json out = nlohmann::json::object();
-                static constexpr const char* shader_names[] = {"buffers", "buffers_ring", "buffers_special", "buffers_null", "buffers_by_engine_handle", "buffers_by_address_read_only",
-                                                               "buffers_by_address_written", "address_read_le256", "address_read_le4k", "address_read_le64k", "address_read_bigger",
-                                                               "buffer_barrier_queries", "buffer_barrier_true", "images", "images_null", "images_from_texture_set_memo",
-                                                               "images_from_lookup_cache", "images_find_image", "images_storage", "image_transits", "image_transits_true",
-                                                               "bind_resources_calls", "buffers_in_place", "buffers_resolved_ahead"};
-                for (u32 side = 0; side < 2; ++side) {
-                    nlohmann::json part = nlohmann::json::object();
-                    for (u32 k = 0; k < std::size(shader_names); ++k) {
-                        part[shader_names[k]] = c[(side ? 32 : 0) + k];
-                    }
-                    out[side ? "compute" : "graphics"] = std::move(part);
-                }
-                out["geometry"] = {{"vertex_ring", c[24]}, {"vertex_by_engine_handle", c[25]}, {"vertex_by_address", c[26]},
-                                   {"index_ring", c[27]}, {"index_by_engine_handle", c[28]}, {"index_by_address", c[29]}};
-                out["note"] = "C0 census, counts per ~5 s interval (read only)";
-                Core::DebugServer::Publish("consumer_census", std::move(out));
-                const auto r = rasterizer->TakeResolveStats();
-                Core::DebugServer::Publish("native_backend", {{"buffers_resolved_by_the_command_processor", r[0]}, {"bound_from_the_resolution", r[1]},
-                                                              {"resolution_stale_at_bind", r[2]},
-                                                              {"images", {{"record_words_resolved_by_the_command_processor", rasterizer->image_words_planned.exchange(0)},
-                                                                          }},
-                                                              {"buffer_slots", {{"new_for_stream_ring", rasterizer->slot_census[0].exchange(0)}, {"new_for_other_buffers", rasterizer->slot_census[2].exchange(0)},
-                                                                                {"hits", rasterizer->slot_census[3].exchange(0)}}},
-                                                              {"image_census", Core::NativeResources::ImageCensus()},
-                                                              {"device", Core::NativeDevice::Report()},
-                                                              {"b5_copies", {{"on_the_gpu", rasterizer->b5_copies_on_gpu.exchange(0)}, {"as_a_cpu_copy_in_ps4_memory", rasterizer->b5_copies_on_cpu.exchange(0)}}},
-                                                              {"uploads_that_kept_gpu_written_bytes", rasterizer->UploadsKeptForGpu()},
-                                                              {"b6_copy_results", {{"downloaded_b6_off", rasterizer->b6_downloads[0].exchange(0)}, {"left_on_the_gpu", rasterizer->b6_downloads[1].exchange(0)},
-                                                                                    {"downloaded_cpu_read_resource", rasterizer->b6_downloads[2].exchange(0)}, {"downloaded_no_engine_owner", rasterizer->b6_downloads[3].exchange(0)},
-                                                                                    {"downloaded_explicit_readback", rasterizer->b6_downloads[4].exchange(0)}}},
-                                                              {"b3_images", {{"by_engine_id", rasterizer->b3_stats[0].exchange(0)}, {"first_sight", rasterizer->b3_stats[1].exchange(0)},
-                                                                             {"image_changed", rasterizer->b3_stats[2].exchange(0)}}},
-                                                              {"b2_applied", Core::NativeUpdates::B2Report()},
-                                                              {"b8_images", Core::NativeUpdates::B8Report()},
-                                                              {"b9_buffers", Core::NativeUpdates::B9Report()}, {"zero_copy", rasterizer->GetBufferCache().ZeroCopyReport()}, {"bind_memo", rasterizer->GetBufferCache().BindMemoReport()},
-                                                              {"b11_clears", Core::NativeDevice::ClearReport()},
-                                                              {"b9_raw_address_shaders", {{"binds_reading_memory_by_address", rasterizer->b9_dma_binds.exchange(0)}, {"all_binds", rasterizer->b9_all_binds.exchange(0)}}},
-                                                              {"stale_why", {{"epoch", r[12]}, {"gone", r[13]}, {"not_synchronized", r[14]}, {"generation_moved", r[15]}, {"arena", r[16]}, {"tracker_dirty", r[17]}}},
-                                                              {"not_resolved", {{"no_record_entry", r[3]}, {"null_or_huge", r[4]}, {"no_engine_object", r[5]}, {"not_immutable", r[6]},
-                                                                                {"outside_the_object", r[7]}, {"not_synchronized", r[8]}, {"no_arena_yet", r[9]}, {"arena_moved", r[10]}, {"clamped", r[11]}}},
-                                                              {"note", "R2, counts per ~5 s interval"}});
-            }
-            if (Core::NativeResources::ResidentBuffersEnabled()) {
-                const auto r = Core::NativeResources::TakeResidentCounters();
-                static std::array<u64, 8> resident_total{};
-                for (u32 i = 0; i < 8; ++i) {
-                    resident_total[i] += r[i];
-                }
-                Core::DebugServer::Publish("resident_buffers",
-                                           {{"answered_without_a_synchronization", r[0]}, {"synchronized_first_use_or_after_a_write", r[1]}, {"verify_runs", r[2]},
-                                            {"verify_runs_that_found_something_to_upload_stale_answers", r[3]}, {"left_to_the_normal_path_gpu_modified", r[4]}, {"registered_buffers", r[5]},
-                                            {"dropped_by_announced_writes", r[6]}, {"dropped_by_cpu_write_faults", r[7]},
-                                            {"since_start", {{"answered_without_a_synchronization", resident_total[0]}, {"synchronized", resident_total[1]}, {"verify_runs", resident_total[2]}, {"stale_answers_found_by_verify", resident_total[3]}, {"registered_buffers", resident_total[5]}}},
-                                            {"note", "C1 / C3, counts per ~5 s interval; since_start is cumulative"}});
-            }
-            {
-                const auto& s = Vulkan::g_segment_census;
-                nlohmann::json kinds = nlohmann::json::object();
-                const char* names[3] = {"depth_only", "colour", "g_buffer_4_or_more_targets"};
-                for (u32 k = 0; k < 3; ++k) {
-                    kinds[names[k]] = {{"rendering_instances", s.segments[k].load()}, {"commands", s.commands[k].load()}, {"draws", s.draws[k].load()}, {"largest_instance_commands", s.max_commands[k].load()}};
-                }
-                Core::DebugServer::Publish("segment_census", {{"by_kind_since_start", std::move(kinds)}, {"note", "C6 census: commands and draws recorded between a begin and an end of rendering, graphics stream, counts only"}});
-            }
-            if (rasterizer->LivePlannerOn()) {
-                const auto p = rasterizer->ReadLivePlanStats();
-                Core::DebugServer::Publish("barrier_planner",
-                                           {{"queries_answered_by_the_planner", p.queries}, {"answered_true", p.answered_true}, {"misses_barrier_the_tracker_had_and_the_planner_lacked", p.planner_missed},
-                                            {"extra_barriers_the_tracker_did_not_need", p.planner_extra}, {"tracker_true_only_from_its_own_range_collapse_(mode_2)", p.tracker_collapse_only}, {"flushes", p.flushes}, {"flush_decisions_differing", p.flush_differences},
-                                            {"buffer_rebases_seen", p.rebases},
-                                            {"pipeline_barriers", {{"recorded", p.barriers_recorded}, {"memory_only", p.barriers_memory_only}, {"ending_a_render_pass", p.barriers_ending_a_pass}, {"after_compute_writes", p.barriers_from_compute_writes}}},
-                                            {"images", {{"transitions", p.image_transits}, {"barriers", p.image_barriers}, {"DIFFERENCES_from_the_image_state", p.image_differences}, {"images_planned", p.images_planned}}},
-                                            {"b10_by_object", {{"mode", rasterizer->B10Mode()}, {"queries", p.object_queries}, {"in_a_placed_buffers_own_space", p.object_space_queries},
-                                                               {"same_answer", p.object_same}, {"OBJECT_NO_ADDRESS_YES", p.object_no_address_yes}, {"object_yes_address_no", p.object_yes_address_no}}},
-                                            {"note", "L4 TLG_BARRIER_PLANNER=1, cumulative since start; the planner decides, the tracker corrects a miss"}});
-            }
-            if (rasterizer->InPlaceOn()) {
-                const auto p = rasterizer->TakeInPlaceStats();
-                Core::DebugServer::Publish("in_place_buffers",
-                                           {{"offered", p.offered}, {"bound_in_place", p.taken}, {"bytes", p.bytes},
-                                            {"refused", {{"written_by_a_shader", p.written}, {"too_large", p.too_large}, {"gpu_written_bytes", p.gpu_written}, {"image_or_metadata", p.image_or_meta},
-                                                         {"not_in_one_mapped_region_or_import_failed", p.not_in_backing}}},
-                                            {"imported", {{"bytes", p.imported_bytes}, {"chunks", p.imported_chunks}, {"failed_chunks", p.failed_chunks}}},
-                                            {"note", "counts per ~5 s interval; imported is cumulative"}});
-            }
-            if (rasterizer->ConstRingLevel() != 0) {
-                const auto ring = rasterizer->TakeRingStats();
-                Core::DebugServer::Publish(
-                    "const_ring",
-                    {{"level", rasterizer->ConstRingLevel()}, {"queued_ops", ring.queued}, {"written_buffers_noted", ring.written_buffers}, {"offered", ring.offered},
-                     {"taken", ring.taken}, {"bytes", ring.bytes}, {"bound_by_raster", ring.bound},
-                     {"refused", {{"no_sharp", ring.no_sharp}, {"written", ring.written}, {"formatted", ring.formatted}, {"too_large", ring.too_large},
-                                  {"immutable", ring.immutable}, {"gpu_modified", ring.gpu_modified}, {"pending_write", ring.pending_write},
-                                  {"ring_full", ring.ring_full}}},
-                     {"note", "counts per ~5 s interval"}});
-            }
+            const auto host_stats = rasterizer->PublishIntervalStats();
             if (sp.stat_last_log_ns != 0) {
                 Core::DebugServer::Publish(
                     "cp_split",
@@ -721,10 +603,10 @@ void Liverpool::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 now) {
                      {"write_drains", sp.stat_write_drains},
                      {"draws", sp.stat_draws},
                      {"draws_no_register_change", sp.stat_draws_no_reg_change},
-                     {"plan_draws_all_stages_same", plan_stats.draws_all_stages_same},
-                     {"plan_draws", plan_stats.draws},
-                     {"render_state_memo_hits", memo_stats.first},
-                     {"render_state_memo_misses", memo_stats.second},
+                     {"plan_draws_all_stages_same", host_stats.plan_draws_all_stages_same},
+                     {"plan_draws", host_stats.plan_draws},
+                     {"render_state_memo_hits", host_stats.memo_hits},
+                     {"render_state_memo_misses", host_stats.memo_misses},
                      {"note", "counts per ~5 s interval"}});
                 LOG_INFO(Render,
                          "CP split: {} operations, {} draws/dispatches, {} waits for guest memory "
@@ -736,8 +618,8 @@ void Liverpool::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 now) {
                          sp.stat_ops, sp.stat_calls, sp.stat_write_drains,
                          sp.stat_front_blocked.exchange(0),
                          sp.stat_raster_idle_ns.exchange(0) / 1'000'000, sp.stat_draws,
-                         sp.stat_draws_no_reg_change, plan_stats.draws_all_stages_same,
-                         plan_stats.draws, plan_stats.stages_same, plan_stats.stages);
+                         sp.stat_draws_no_reg_change, host_stats.plan_draws_all_stages_same,
+                         host_stats.plan_draws, host_stats.plan_stages_same, host_stats.plan_stages);
             }
             sp.stat_front_blocked = 0;
             sp.stat_raster_idle_ns = 0;
@@ -815,20 +697,20 @@ void Liverpool::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 now) {
                 dispatch_stats.clear();
             }
             {
-                const auto native = rasterizer->TakeNativeStats();
+                const auto& native = host_stats;
                 Core::DebugServer::Publish(
                     "native_draw_raster",
-                    {{"tagged_draws", native.tagged},
-                     {"untagged_draws", native.untagged},
-                     {"dynamic_state_skipped", native.dynamic_skipped},
-                     {"bind_pipeline_skipped", native.bind_skipped},
+                    {{"tagged_draws", native.native_tagged},
+                     {"untagged_draws", native.native_untagged},
+                     {"dynamic_state_skipped", native.native_dynamic_skipped},
+                     {"bind_pipeline_skipped", native.native_bind_skipped},
                      {"note", "counts per ~5 s interval"}});
-                if (native.tagged != 0) {
+                if (native.native_tagged != 0) {
                     LOG_INFO(Render,
                              "Native draw path: {} tagged draws, {} untagged, {} dynamic state "
                              "updates skipped, {} pipeline binds skipped",
-                             native.tagged, native.untagged, native.dynamic_skipped,
-                             native.bind_skipped);
+                             native.native_tagged, native.native_untagged, native.native_dynamic_skipped,
+                             native.native_bind_skipped);
                 }
             }
             Core::DebugServer::Publish(

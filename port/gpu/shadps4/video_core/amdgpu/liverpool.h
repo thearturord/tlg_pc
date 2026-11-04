@@ -11,6 +11,7 @@
 #include "native/native_raster_queue.h"
 #include "native/native_executor.h"
 #include "native/native_executor_sync.h"
+#include "native/native_raster_host.h"
 #include "native/native_readback_policy.h"
 
 #include <source_location>
@@ -96,7 +97,7 @@ public:
         vo_port = port;
     }
 
-    void BindRasterizer(Vulkan::Rasterizer* rasterizer_);
+    void BindRasterizer(Core::RasterHost* rasterizer_);
 
     inline ComputeProgram& GetCsRegs() {
         return cs_states[curr_qid];
@@ -158,8 +159,8 @@ private:
     /// The place of the wait before a planning: the full wait, or with TLG_DRAIN_LAZY=1 no wait (the planning's reads wait where needed, native_drain_audit.h).
     /// Returns 0, or 1 when the planning is verified by comparing the bytes it copied at its end, or 2 when it must be repeated after a full wait and compared (ReplanAfterDrain).
     u32 LookupDrain(u32 caller);
-    std::unique_ptr<Vulkan::DrawPlan> ReplanAfterDrain(std::unique_ptr<Vulkan::DrawPlan> plan, u32 site, const std::function<std::unique_ptr<Vulkan::DrawPlan>()>& make);
-    std::unique_ptr<Vulkan::DispatchPlan> ReplanAfterDrain(std::unique_ptr<Vulkan::DispatchPlan> plan, u32 site, const std::function<std::unique_ptr<Vulkan::DispatchPlan>()>& make);
+    Core::DrawPlanPtr ReplanAfterDrain(Core::DrawPlanPtr plan, u32 site, const std::function<Core::DrawPlanPtr()>& make);
+    Core::DispatchPlanPtr ReplanAfterDrain(Core::DispatchPlanPtr plan, u32 site, const std::function<Core::DispatchPlanPtr()>& make);
     /// A command processor write to guest memory, done in order with the draws.
     void CpWriteData(void* address, const u32* data, u32 data_size, u32 queue);
     void ApplyStateTemplate(const Core::NativeDraw::StateTemplate& state);
@@ -171,7 +172,7 @@ private:
     u64 native_inputs_key{};                        ///< identity of the render target inputs of the draw being dispatched (0: unknown)
     std::array<u32, 16> exec_vertex_user_data{};     ///< the typed user data of the last executed records, per stage
     std::array<u32, 16> exec_pixel_user_data{};
-    Vulkan::DrawPlan* native_exec_plan{};            ///< a draw planned from its record: RasterDispatch pushes it instead of planning
+    Core::DrawPlanPtr native_exec_plan;              ///< a draw planned from its record: RasterDispatch pushes it instead of planning
     u64 native_exec_key{}; ///< pipeline key of the draw being dispatched, from the record (0: look the pipeline up from the registers)
     const Vulkan::FixedState* native_fixed{}; ///< fixed-function state of the draw being dispatched, from the engine's objects (null: from the registers)
 
@@ -242,7 +243,7 @@ private:
     /// (then set to now): the graphics task yields so the round robin runs it. Switch: env TLG_CP_ASC_YIELD=0 turns it off.
     [[nodiscard]] bool ShouldYieldToOtherQueue(u64& last_ns);
 
-    Vulkan::Rasterizer* rasterizer{};
+    Core::RasterHost* rasterizer{};
     Libraries::VideoOut::VideoOutPort* vo_port{};
     const u32 fence_wait_shortcut;
 };

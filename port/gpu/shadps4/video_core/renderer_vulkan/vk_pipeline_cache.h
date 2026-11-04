@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "native/native_raster_host.h"
 #include "native/native_binding.h"
 #include "native/native_dispatch_inputs.h"
 #include "native/native_draw.h"
@@ -79,11 +80,7 @@ struct Program {
     }
 };
 
-struct DrawIndirectParams {
-    u16 vertex_sgpr_offset;
-    u32 instance_sgpr_offset;
-    bool is_indirect;
-};
+using DrawIndirectParams = Core::DrawIndirectParams;
 
 /// A read-only buffer of a stage that the command processor thread copied into the constant ring (documents/tlg/pc-port-draw-pipeline-architecture.md, T1).
 struct RingBinding {
