@@ -842,6 +842,7 @@ nlohmann::json ClearReport() {
 }
 
 nlohmann::json W2Report();
+nlohmann::json FreeHoldReport();
 nlohmann::json Report() {
     nlohmann::json out;
     out["enabled"] = Enabled();
@@ -860,6 +861,7 @@ nlohmann::json Report() {
         out["skin_gate"] = {{"matrix_slot_writes", skin_writes.load()}, {"writes_that_waited", skin_waits.load()}, {"submissions_waited_for", skin_waited_submissions.load()}};
         out["loader_gate"] = {{"frees_noted", gate_frees.load()}, {"allocations_checked", gate_checks.load()}, {"allocations_that_waited", gate_hits.load()}, {"submissions_waited_for", gate_waited_frames.load()}, {"submit_count", Core::NativeContent::SubmitCount()}, {"raster_done_floor", Core::NativeContent::RasterDoneSubmissions()}, {"wait_timeouts", Core::NativeContent::GateWaitTimeouts()}, {"alloc_on_recently_freed_address_without_gate_entry", gate_missed.load()}, {"of_those_free_had_no_known_size", gate_missed_unsized.load()}, {"alloc_in_the_window_of_the_free_not_waitable", gate_window_open.load()}};
         out["w2_window"] = W2Report();
+        out["free_hold"] = FreeHoldReport();
         out["deferred_frees"] = {{"held", deferred_count.load()}, {"released", deferred_released.load()}, {"forced", deferred_forced.load()}, {"max_pending", deferred_max_pending.load()}};
     }
     out["unreadable_objects"] = bad_reads.load();
@@ -955,7 +957,71 @@ u32 DeferFrames() {
     return frames;
 }
 
+// Free hold (memory-ownership-plan 0b, TLG_FREE_HOLD=1): the game frees heap blocks by frame counts and never waits for the GPU; our raster thread reads guest memory later than the
+// game's counts assume. Each Gomalloc free is held until the raster thread has finished the submission that could still read the block (the one announced after the free: draws
+// recorded before the free in the open window belong to it), then the real free runs. No game thread waits; the block returns to the heap a few submissions later.
+struct HeldFree {
+    u64 heap, address, size;
+    u64 need; // RasterDoneSubmissions() must reach this before the block is freed
+};
+std::deque<HeldFree> held_frees; // under deferred_mutex, in free order (need never decreases)
+u64 held_bytes = 0;              // under deferred_mutex (known sizes only)
+std::atomic<u64> hold_count{0}, hold_at_once{0}, hold_released{0}, hold_forced{0}, hold_max_pending{0}, hold_max_bytes{0}, hold_alloc_failed{0}, hold_alloc_failed_twice{0};
+
+bool FreeHoldOn() {
+    static const bool on = [] { const char* e = std::getenv("TLG_FREE_HOLD"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+
+/// Frees the held blocks the raster thread is done with (all of them when `all`). Any guest thread.
+void ReleaseHeld(bool all) {
+    static const u64 original = Core::GuestHooks::OriginalEntry("GomallocFree");
+    if (original == 0) {
+        return;
+    }
+    const u64 done = Core::NativeContent::RasterDoneSubmissions();
+    std::vector<HeldFree> due;
+    {
+        std::scoped_lock lock{deferred_mutex};
+        while (!held_frees.empty() && (all || held_frees.front().need <= done)) {
+            if (held_frees.front().need > done) {
+                hold_forced.fetch_add(1, std::memory_order_relaxed);
+            }
+            held_bytes -= held_frees.front().size;
+            due.push_back(held_frees.front());
+            held_frees.pop_front();
+        }
+    }
+    for (const auto& entry : due) {
+        reinterpret_cast<GuestFunction6>(original)(entry.heap, entry.address, 0, 0, 0, 0);
+        hold_released.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 } // namespace
+
+nlohmann::json FreeHoldReport() {
+    u64 pending = 0, bytes = 0, oldest_need = 0;
+    {
+        std::scoped_lock lock{deferred_mutex};
+        pending = held_frees.size();
+        bytes = held_bytes;
+        oldest_need = held_frees.empty() ? 0 : held_frees.front().need;
+    }
+    return {{"on", FreeHoldOn()},
+            {"frees_held", hold_count.load()},
+            {"frees_done_at_once_raster_already_past", hold_at_once.load()},
+            {"held_frees_released", hold_released.load()},
+            {"released_before_the_raster_thread_was_done", hold_forced.load()},
+            {"pending_now", pending},
+            {"pending_bytes_now", bytes},
+            {"max_pending", hold_max_pending.load()},
+            {"max_pending_bytes", hold_max_bytes.load()},
+            {"oldest_pending_needs_submission", oldest_need},
+            {"raster_done_floor", Core::NativeContent::RasterDoneSubmissions()},
+            {"allocation_failed_with_frees_held", hold_alloc_failed.load()},
+            {"allocation_failed_again_after_release", hold_alloc_failed_twice.load()}};
+}
 
 namespace {
 
@@ -1190,16 +1256,48 @@ u64 PS4_SYSV_ABI BeginFrameTick(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, 
     w2_in_begin_frame = true;
     const u64 result = reinterpret_cast<GuestFunction6>(original)(a0, a1, a2, a3, a4, a5);
     w2_in_begin_frame = false;
+    if (FreeHoldOn()) {
+        ReleaseHeld(false);
+    }
     return 0x8000000000000000ull | (result & 0x7fffffffffffffffull);
 }
 
 u64 PS4_SYSV_ABI GomallocAlloc(u64 heap, u64 size, u64 alignment, u64 type, u64 a4, u64 a5, u64 ret) {
     static const u64 original = Core::GuestHooks::OriginalEntry("GomallocAlloc");
-    if (!LoaderGateOn() || original == 0) {
+    const bool hold = FreeHoldOn();
+    if ((!LoaderGateOn() && !hold) || original == 0) {
         return 0; // the original runs
     }
-    const u64 result = reinterpret_cast<GuestFunction6>(original)(heap, size, alignment, type, a4, a5);
-    if (result != 0) {
+    if (hold) {
+        ReleaseHeld(false);
+    }
+    u64 result = reinterpret_cast<GuestFunction6>(original)(heap, size, alignment, type, a4, a5);
+    if (result == 0 && hold) {
+        // the heap ran dry while blocks are held: wait for the raster thread to pass the newest held free (2 s limit), release, retry; then release everything and retry once more
+        u64 newest = 0;
+        {
+            std::scoped_lock lock{deferred_mutex};
+            newest = held_frees.empty() ? 0 : held_frees.back().need;
+        }
+        newest = std::min<u64>(newest, Core::NativeContent::SubmitCount()); // never wait for a submission not announced yet (this thread may be the one that announces it)
+        if (newest != 0) {
+            hold_alloc_failed.fetch_add(1, std::memory_order_relaxed);
+            Core::NativeContent::WaitRasterSubmissions(static_cast<u32>(newest));
+            ReleaseHeld(false);
+            result = reinterpret_cast<GuestFunction6>(original)(heap, size, alignment, type, a4, a5);
+            if (result == 0) {
+                hold_alloc_failed_twice.fetch_add(1, std::memory_order_relaxed);
+                ReleaseHeld(true);
+                result = reinterpret_cast<GuestFunction6>(original)(heap, size, alignment, type, a4, a5);
+            }
+        }
+    }
+    if (hold && result != 0) {
+        const u64 block = size == 0 ? 0x40 : static_cast<u32>(static_cast<u32>(size) + 0x3f) & 0xffffffc0u;
+        std::scoped_lock lock{gate_mutex};
+        gate_block_size[result] = block;
+    }
+    if (result != 0 && LoaderGateOn()) {
         const u64 block = size == 0 ? 0x40 : static_cast<u32>(static_cast<u32>(size) + 0x3f) & 0xffffffc0u; // the allocator rounds up to 64 bytes
         {
             std::scoped_lock lock{gate_mutex};
@@ -1218,6 +1316,29 @@ u64 PS4_SYSV_ABI GomallocFree(u64 heap, u64 address, u64 a2, u64 a3, u64 a4, u64
         if (LoaderGateOn()) {
             GateNoteFree(address, ret);
         }
+    }
+    if (FreeHoldOn() && original != 0 && heap != 0 && address != 0) {
+        u64 size = 0;
+        if (!LoaderGateOn()) { // with the gate on, GateNoteFree took the size already
+            std::scoped_lock lock{gate_mutex};
+            const auto it = gate_block_size.find(address);
+            if (it != gate_block_size.end()) {
+                size = it->second;
+                gate_block_size.erase(it);
+            }
+        }
+        const u64 need = Core::NativeContent::SubmitCount() + 1;
+        if (Core::NativeContent::RasterDoneSubmissions() >= need) {
+            hold_at_once.fetch_add(1, std::memory_order_relaxed);
+            return 0; // the original runs
+        }
+        std::scoped_lock lock{deferred_mutex};
+        held_frees.push_back({heap, address, size, need});
+        held_bytes += size;
+        hold_count.fetch_add(1, std::memory_order_relaxed);
+        hold_max_pending.store(std::max<u64>(hold_max_pending.load(), held_frees.size()), std::memory_order_relaxed);
+        hold_max_bytes.store(std::max<u64>(hold_max_bytes.load(), held_bytes), std::memory_order_relaxed);
+        return 0x8000000000000000ull; // the free runs later (ReleaseHeld)
     }
     if (frames == 0 || original == 0 || heap == 0 || address == 0) {
         return 0; // the original runs
@@ -1253,6 +1374,9 @@ u64 PS4_SYSV_ABI GomallocFree(u64 heap, u64 address, u64 a2, u64 a3, u64 a4, u64
 
 void DrainDeferredFrees() {
     static const u64 original = Core::GuestHooks::OriginalEntry("GomallocFree");
+    if (FreeHoldOn()) {
+        ReleaseHeld(false);
+    }
     if (DeferFrames() == 0 || original == 0) {
         return;
     }
