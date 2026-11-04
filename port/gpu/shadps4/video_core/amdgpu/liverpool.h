@@ -9,6 +9,7 @@
 
 #include "native/native_draw_tag.h"
 #include "native/native_raster_queue.h"
+#include "native/native_executor_sync.h"
 #include "native/native_readback_policy.h"
 
 #include <source_location>
@@ -327,39 +328,9 @@ private:
     /// Wakes the raster thread (it runs SendCommand callbacks) when the split is active.
     void WakeRaster();
 
-    /// Label timeline: per fence label, the latest value a fence packet the command processor
-    /// already recorded will write, while fence writes are held back (async readback fences
-    /// write them once the GPU finished and the readbacks landed). A command stream wait only
-    /// needs its producer to be recorded ahead of it in the single Vulkan queue, not executed,
-    /// so it may pass on that value. When everything recorded has landed, guest memory is
-    /// authoritative again, and so it is as soon as someone else writes the label meanwhile.
-    struct LabelState {
-        VAddr address;
-        u32 num_bytes;
-        u32 queue; ///< Queue of the latest fence: 0 = graphics, n = compute ring n - 1.
-        u64 latest_value;
-        u64 latest_seq; ///< Order in which the fence packets were processed.
-        u64 gpu_tick;   ///< Scheduler tick holding the GPU work before the latest fence.
-        u32 pending;    ///< Recorded fences whose write hasn't landed yet.
-        bool overridden;
-        /// Guest memory before the first held back fence, then every value recorded since.
-        std::vector<u64> known_values;
-    };
-    static constexpr size_t MaxKnownLabelValues = 64;
-    struct FenceMatch {
-        bool satisfied{};
-        VAddr label_address{}; ///< The matched label and the fence recorded last for it.
-        u64 seq{};
-        u64 gpu_tick{};
-        u32 queue{};
-        u32 value{};
-        u32 initial{};
-    };
-    u64 RecordFence(VAddr address, u64 value, u32 num_bytes, u32 queue);
-    /// Raster thread: the scheduler tick holding the work before fence `seq` of a label.
-    void SetFenceTick(VAddr address, u64 seq);
-    [[nodiscard]] u64 GetFenceTick(VAddr address, u64 seq);
-    void RetireFence(VAddr address, u64 seq);
+    /// The label timeline of the recorded fences (native/native_executor_sync.h).
+    using FenceMatch = Core::NativeExecutorSync::FenceMatch;
+    Core::NativeExecutorSync::LabelTimeline label_timeline;
     FenceMatch MatchRecordedFence(const Core::NativeSync::LabelWait& wait_reg_mem);
 
     /// readback_fence_wait_shortcut: 0 = off, 1 = graphics queue waits, 2 = graphics and compute
@@ -386,21 +357,12 @@ private:
     /// fence, so it is queued behind it instead. Returns false when it can be written now.
     bool DeferWriteBehindFences(void* address, const u32* data, u32 num_bytes, u32 queue);
 
-    /// Runs `signal` once the readbacks before this fence are in guest memory, recording the
-    /// fence value (if known) in the label timeline meanwhile.
-    /// Fence latency per FenceKind (index = bit position): the time from parsing the fence packet
-    /// to the raster thread starting it ("queue"), from there to the moment its signal is about to
-    /// run, after the GPU and the readbacks ("gpu"), and the sum. Published by the debug server.
-    struct FenceLatencyStat {
-        std::atomic<u64> count{};
-        std::atomic<u64> queue_ns{};
-        std::atomic<u64> gpu_ns{};
-        std::atomic<u64> total_ns{};
-        std::atomic<u64> max_total_ns{};
-    };
-    std::array<FenceLatencyStat, VideoCore::NumFenceKinds> fence_latency;
+    /// Fence latency statistics per FenceKind (native/native_executor_sync.h).
+    Core::NativeExecutorSync::FenceLatency fence_latency;
     void NoteFenceLatency(VideoCore::FenceKind kind, u64 queue_ns, u64 gpu_ns);
 
+    /// Runs `signal` once the readbacks before this fence are in guest memory, recording the
+    /// fence value (if known) in the label timeline meanwhile.
     void SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal, bool must_sync,
                                    VAddr address, u64 value, u32 num_bytes, u32 queue,
                                    VideoCore::FenceKind kind);
@@ -466,12 +428,6 @@ private:
     bool split_active{};
     std::unique_ptr<RasterSplit> split;
     const u32 fence_wait_shortcut;
-    std::mutex recorded_fence_mutex;
-    std::vector<LabelState> label_states;
-    u64 next_fence_seq{};
-    std::unordered_set<VAddr> logged_compute_passes;
-    std::unordered_set<VAddr> logged_overrides;
-    std::unordered_set<VAddr> logged_deferred_writes;
 };
 
 } // namespace AmdGpu

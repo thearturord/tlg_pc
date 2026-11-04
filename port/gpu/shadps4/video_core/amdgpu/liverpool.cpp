@@ -91,28 +91,16 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 
-static void WriteFenceMemory(void* address, u64 data, u32 num_bytes) {
-    auto* memory = Core::Memory::Instance();
-    if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-        memcpy(address, &data, num_bytes);
-    }
+using Core::NativeExecutorSync::NoFenceWrite;
+using Core::NativeExecutorSync::WriteFenceMemory;
+
+/// The range has no GPU mapping (so it can be written off the GPU thread).
+static std::function<bool(VAddr, u32)> NotMapped(Vulkan::Rasterizer* rasterizer) {
+    return [rasterizer](VAddr address, u32 num_bytes) { return rasterizer && !rasterizer->IsMapped(address, num_bytes); };
 }
 
-static void NoFenceWrite(void*, u64, u32) {}
-
-/// Writes a fence value from outside the GPU thread. Memory without a GPU mapping is never page
-/// protected by the tracker, so it can be written directly (fence labels often live in plain
-/// game memory). Returns false when the write must be done on the GPU thread instead.
-static bool TryWriteOffThread(Vulkan::Rasterizer* rasterizer, void* address, const void* data,
-                              u32 num_bytes) {
-    if (Core::Memory::Instance()->TryWriteBacking(address, data, num_bytes)) {
-        return true;
-    }
-    if (rasterizer && !rasterizer->IsMapped(reinterpret_cast<VAddr>(address), num_bytes)) {
-        std::memcpy(address, data, num_bytes);
-        return true;
-    }
-    return false;
+static bool TryWriteOffThread(Vulkan::Rasterizer* rasterizer, void* address, const void* data, u32 num_bytes) {
+    return Core::NativeExecutorSync::TryWriteOffThread(address, data, num_bytes, NotMapped(rasterizer));
 }
 
 static bool TryWriteFenceOffThread(Vulkan::Rasterizer* rasterizer, void* address, u64 data,
@@ -469,46 +457,23 @@ Liverpool::Task Liverpool::DirectWaitAsc(const Core::NativeSync::LabelWait& wait
 }
 
 void Liverpool::ExecuteDma(const Core::NativeSync::DmaCopy& dma) {
-    using Kind = Core::NativeSync::DmaCopy::Kind;
-    if (dma.kind == Kind::Ignored || !rasterizer) {
+    if (!rasterizer || !Core::NativeExecutorSync::PrepareDma(dma)) {
         return;
     }
-    if (dma.kind == Kind::Unknown) {
-        Core::RareEvents::Note("dma_unknown_kind", "a CP DMA with a source / destination pair the game never used");
-        return;
-    }
-    if (dma.kind == Kind::FillGuest || dma.kind == Kind::GdsToMemory || dma.kind == Kind::MemoryToMemory) {
-        Core::DrainAudit::SetNextWrite(static_cast<VAddr>(dma.destination), dma.bytes);
-    } else {
-        Core::DrainAudit::SetNextWrite(Core::DrainAudit::NoGuestMemory, 0);
-    }
+    struct Host final : Core::NativeExecutorSync::DmaHost {
+        Vulkan::Rasterizer& rasterizer;
+        explicit Host(Vulkan::Rasterizer& r) : rasterizer{r} {}
+        void FillBuffer(u64 destination, u32 bytes, u32 fill, bool destination_is_gds) override {
+            rasterizer.FillBuffer(destination, bytes, fill, destination_is_gds);
+        }
+        void CopyBuffer(u64 destination, u64 source, u32 bytes, bool destination_is_gds, bool source_is_gds) override {
+            rasterizer.CopyBuffer(destination, source, bytes, destination_is_gds, source_is_gds);
+        }
+    };
     RasterRun(
         [this, dma] {
-            switch (dma.kind) {
-            case Kind::FillGds:
-                rasterizer->FillBuffer(dma.destination, dma.bytes, dma.fill, true);
-                break;
-            case Kind::MemoryToGds:
-                rasterizer->CopyBuffer(dma.destination, static_cast<VAddr>(dma.source), dma.bytes, true, false);
-                break;
-            case Kind::FillGuest:
-                rasterizer->FillBuffer(static_cast<VAddr>(dma.destination), dma.bytes, dma.fill, false);
-                break;
-            case Kind::GdsToMemory:
-                if (Core::NativeRaycast::ShadowOn()) {
-                    Core::NativeRaycast::NoteCounterCopy(dma.source, dma.destination);
-                }
-                rasterizer->CopyBuffer(static_cast<VAddr>(dma.destination), dma.source, dma.bytes, false, true);
-                break;
-            case Kind::MemoryToMemory:
-                if (Core::NativeRaycast::ShadowOn()) {
-                    Core::NativeRaycast::NoteMemoryCopy(dma.source, dma.destination, dma.bytes);
-                }
-                rasterizer->CopyBuffer(static_cast<VAddr>(dma.destination), static_cast<VAddr>(dma.source), dma.bytes, false, false);
-                break;
-            default:
-                break;
-            }
+            Host host{*rasterizer};
+            Core::NativeExecutorSync::RunDma(dma, host);
         },
         false, true);
 }
@@ -532,11 +497,8 @@ void Liverpool::CpWriteData(void* address, const u32* data, u32 data_size, u32 q
     if (!DeferWriteBehindFences(address, data, data_size, queue)) {
         Core::DrainAudit::SetNextWrite(reinterpret_cast<u64>(address), data_size);
         RasterRun(
-            [address, words = std::vector<u32>(data, data + data_size / sizeof(u32)), data_size, queue] {
-                std::memcpy(address, words.data(), data_size);
-                if (Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
-                    Core::FrameTimeline::Record(Core::FrameTimeline::LabelWrite, words[0] | (u64(queue) << 32), Core::FrameTimeline::Now(), reinterpret_cast<u64>(address));
-                }
+            [address, words = std::vector<u32>(data, data + data_size / sizeof(u32)), queue] {
+                Core::NativeExecutorSync::ApplyCpWrite(address, words, queue);
             },
             false, true);
     }
@@ -864,29 +826,7 @@ void Liverpool::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 now) {
                 Core::DebugServer::Publish("raster_idle_by_kind_of_op_that_ended_it",
                                            std::move(by_op));
             }
-            {
-                static constexpr const char* kind_names[] = {"gfx_eop", "gfx_eos", "compute_release",
-                                                             "held_write", "submit_end"};
-                nlohmann::json fences = nlohmann::json::object();
-                for (size_t i = 0; i < fence_latency.size(); ++i) {
-                    auto& stat = fence_latency[i];
-                    const u64 count = stat.count.exchange(0);
-                    const u64 queue_ns = stat.queue_ns.exchange(0);
-                    const u64 gpu_ns = stat.gpu_ns.exchange(0);
-                    const u64 total_ns = stat.total_ns.exchange(0);
-                    const u64 max_ns = stat.max_total_ns.exchange(0);
-                    if (count == 0) {
-                        continue;
-                    }
-                    fences[kind_names[i]] = {
-                        {"fences", count},
-                        {"avg_ms_parsed_to_raster_start", queue_ns / 1e6 / count},
-                        {"avg_ms_raster_start_to_signal", gpu_ns / 1e6 / count},
-                        {"avg_ms_total", total_ns / 1e6 / count},
-                        {"max_ms_total", max_ns / 1e6}};
-                }
-                Core::DebugServer::Publish("fence_latency", std::move(fences));
-            }
+            Core::DebugServer::Publish("fence_latency", owner.fence_latency.Report());
             {
                 nlohmann::json sites = nlohmann::json::object();
                 for (auto& site : sp.write_sites) {
@@ -989,126 +929,8 @@ Liverpool::~Liverpool() {
     StopRasterSplit();
 }
 
-static u64 ReadLabel(VAddr address, u32 num_bytes) {
-    u64 value{};
-    std::memcpy(&value, reinterpret_cast<const void*>(address), num_bytes);
-    return value;
-}
-
-u64 Liverpool::RecordFence(VAddr address, u64 value, u32 num_bytes, u32 queue) {
-    // Read outside the lock, see MatchRecordedFence.
-    const u64 memory = ReadLabel(address, num_bytes);
-    std::scoped_lock lk{recorded_fence_mutex};
-    const u64 seq = ++next_fence_seq;
-    // A label reused with another size: forget the old state, waits then poll memory.
-    std::erase_if(label_states, [&](const LabelState& label) {
-        return label.address < address + num_bytes && address < label.address + label.num_bytes &&
-               (label.address != address || label.num_bytes != num_bytes);
-    });
-    auto it = std::ranges::find(label_states, address, &LabelState::address);
-    if (it == label_states.end() || it->overridden) {
-        // Start tracking from what guest memory holds now.
-        if (it == label_states.end()) {
-            it = label_states.emplace(label_states.end());
-            it->address = address;
-            it->num_bytes = num_bytes;
-        }
-        it->overridden = false;
-        it->known_values.clear();
-        it->known_values.push_back(memory);
-    }
-    // Only the latest value can satisfy a later wait: the GPU runs the fences in the order they
-    // were recorded, so older values are overwritten before any later wait could observe them.
-    it->latest_value = value;
-    it->latest_seq = seq;
-    // Set by SetFenceTick once the raster thread has recorded the work before this fence.
-    it->gpu_tick = 0;
-    it->queue = queue;
-    ++it->pending;
-    if (it->known_values.size() < MaxKnownLabelValues) {
-        it->known_values.push_back(value);
-    }
-    return seq;
-}
-
-void Liverpool::SetFenceTick(VAddr address, u64 seq) {
-    const u64 tick = rasterizer ? rasterizer->CurrentTick() : 0;
-    std::scoped_lock lk{recorded_fence_mutex};
-    const auto it = std::ranges::find(label_states, address, &LabelState::address);
-    if (it != label_states.end() && it->latest_seq == seq) {
-        it->gpu_tick = tick;
-    }
-}
-
-u64 Liverpool::GetFenceTick(VAddr address, u64 seq) {
-    std::scoped_lock lk{recorded_fence_mutex};
-    const auto it = std::ranges::find(label_states, address, &LabelState::address);
-    if (it == label_states.end() || it->latest_seq < seq) {
-        return 0; // Retired: the work finished, nothing to order against.
-    }
-    return it->gpu_tick;
-}
-
-void Liverpool::RetireFence(VAddr address, u64 seq) {
-    std::scoped_lock lk{recorded_fence_mutex};
-    const auto it = std::ranges::find(label_states, address, &LabelState::address);
-    if (it == label_states.end() || it->latest_seq < seq) {
-        return;
-    }
-    if (--it->pending == 0) {
-        // Everything recorded has landed: guest memory is authoritative again.
-        label_states.erase(it);
-    }
-}
-
 Liverpool::FenceMatch Liverpool::MatchRecordedFence(const Core::NativeSync::LabelWait& wait_reg_mem) {
-    if (!wait_reg_mem.memory) {
-        return {};
-    }
-    const VAddr wait_address = wait_reg_mem.Address<VAddr>();
-    // Read outside the lock: the read may fault into a readback that waits on the thread
-    // retiring fences.
-    const u32 memory = *wait_reg_mem.Address();
-    std::scoped_lock lk{recorded_fence_mutex};
-    for (auto& label : label_states) {
-        if (wait_address < label.address ||
-            wait_address + sizeof(u32) > label.address + label.num_bytes) {
-            continue;
-        }
-        if (label.overridden) {
-            return {};
-        }
-        const u32 shift = static_cast<u32>(wait_address - label.address) * 8;
-        const auto slice = [shift](u64 value) { return static_cast<u32>(value >> shift); };
-        // Guest memory may only hold the value from before the first held back fence, or one
-        // of the recorded values. Anything else was written by someone else (typically the
-        // guest CPU resetting or releasing the label), and that write is newer than the
-        // recorded values: from now on waits on this label poll guest memory.
-        if (std::ranges::none_of(label.known_values,
-                                 [&](u64 known) { return slice(known) == memory; })) {
-            label.overridden = true;
-            if (logged_overrides.insert(label.address).second) {
-                LOG_INFO(Render,
-                         "Fence timeline: label {:#x} changed to {:#x} outside the recorded "
-                         "fences (held back value {:#x}, value before them {:#x}); waits on it "
-                         "poll memory until the next fence",
-                         label.address, memory, slice(label.latest_value),
-                         slice(label.known_values.front()));
-            }
-            return {};
-        }
-        const u32 value = slice(label.latest_value);
-        return {
-            .satisfied = wait_reg_mem.TestValue(value),
-            .label_address = label.address,
-            .seq = label.latest_seq,
-            .gpu_tick = label.gpu_tick,
-            .queue = label.queue,
-            .value = value,
-            .initial = slice(label.known_values.front()),
-        };
-    }
-    return {};
+    return label_timeline.Match(wait_reg_mem);
 }
 
 void Liverpool::OnWaitPassedOnFence(const Core::NativeSync::LabelWait& wait_reg_mem, const FenceMatch& match,
@@ -1118,72 +940,28 @@ void Liverpool::OnWaitPassedOnFence(const Core::NativeSync::LabelWait& wait_reg_
         // The fence's tick is set by an earlier operation of the raster queue, so it is known
         // when this one runs.
         RasterRun([this, address = match.label_address, seq = match.seq] {
-            if (rasterizer->CommandStreamBarrier(GetFenceTick(address, seq))) {
+            if (rasterizer->CommandStreamBarrier(label_timeline.Tick(address, seq))) {
                 VideoCore::ReadbackStats::OnStreamBarrier();
             }
         });
     }
     if (queue != GfxQueueId) {
-        const VAddr address = wait_reg_mem.Address<VAddr>();
-        // Capped: every new label address logged made the console sink about 3% of the front thread.
-        if (logged_compute_passes.size() < 64 && logged_compute_passes.insert(address).second) {
-            LOG_INFO(Render,
-                     "Fence timeline: compute ring {} passed a wait on {:#x} (func={} ref={:#x} "
-                     "mask={:#x}) with value {:#x} recorded by queue {}; memory holds {:#x}, "
-                     "held {:#x} before the fence",
-                     queue - 1, address, static_cast<u32>(wait_reg_mem.function),
-                     wait_reg_mem.ref, wait_reg_mem.mask, match.value, match.queue,
-                     *wait_reg_mem.Address(), match.initial);
-        }
+        label_timeline.NoteComputePass(wait_reg_mem, match, queue);
     }
 }
 
 void Liverpool::ReportLongWait(const Core::NativeSync::LabelWait& wait_reg_mem, const char* queue,
                                u64 wait_start, bool& reported) {
-    if (reported || VideoCore::ReadbackStats::NowNs() - wait_start < 2'000'000'000ULL) {
-        return;
-    }
-    reported = true;
-    const bool is_memory = wait_reg_mem.memory;
-    const u32 value = is_memory ? *wait_reg_mem.Address() : Core::NativeWaitRegisters::Read(wait_reg_mem.Reg());
-    std::string pending;
-    {
-        std::scoped_lock lk{recorded_fence_mutex};
-        for (const auto& label : label_states) {
-            pending +=
-                fmt::format(" [{:#x}={:#x} q{} pending={}{}]", label.address, label.latest_value,
-                            label.queue, label.pending, label.overridden ? " overridden" : "");
-        }
-    }
-    LOG_WARNING(Render,
-                "Hang check: {} queue waiting >2s on {} {:#x}: value={:#x} func={} ref={:#x} "
-                "mask={:#x}; pending fence writes:{}",
-                queue, is_memory ? "memory" : "register",
-                is_memory ? wait_reg_mem.Address<VAddr>() : VAddr{wait_reg_mem.Reg()}, value,
-                static_cast<u32>(wait_reg_mem.function), wait_reg_mem.ref,
-                wait_reg_mem.mask, pending.empty() ? " none" : pending);
+    Core::NativeExecutorSync::ReportLongWait(label_timeline, wait_reg_mem, queue, wait_start, reported);
 }
 
 void Liverpool::ReportLongSpin(const char* what, const void* address, u64 wait_start,
                                bool& reported) {
-    VideoCore::ReadbackStats::CpWaitYield(false);
-    if (reported || VideoCore::ReadbackStats::NowNs() - wait_start < 2'000'000'000ULL) {
-        return;
-    }
-    reported = true;
-    LOG_WARNING(Render, "Hang check: {} waiting >2s on {}", what, fmt::ptr(address));
+    Core::NativeExecutorSync::ReportLongSpin(what, address, wait_start, reported);
 }
 
 void Liverpool::NoteFenceLatency(VideoCore::FenceKind kind, u64 queue_ns, u64 gpu_ns) {
-    auto& stat = fence_latency[std::countr_zero(static_cast<u32>(kind)) % fence_latency.size()];
-    const u64 total = queue_ns + gpu_ns;
-    stat.count.fetch_add(1, std::memory_order_relaxed);
-    stat.queue_ns.fetch_add(queue_ns, std::memory_order_relaxed);
-    stat.gpu_ns.fetch_add(gpu_ns, std::memory_order_relaxed);
-    stat.total_ns.fetch_add(total, std::memory_order_relaxed);
-    u64 max = stat.max_total_ns.load(std::memory_order_relaxed);
-    while (total > max && !stat.max_total_ns.compare_exchange_weak(max, total)) {
-    }
+    fence_latency.Note(kind, queue_ns, gpu_ns);
 }
 
 void Liverpool::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal, bool must_sync,
@@ -1225,7 +1003,7 @@ void Liverpool::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal,
     // The label timeline is updated here, when the packet is parsed, so command stream waits
     // see the fence without waiting for the raster thread. The raster thread records the work
     // before the fence and notes its tick (SetFenceTick).
-    const u64 seq = RecordFence(address, value, num_bytes, queue);
+    const u64 seq = label_timeline.Record(address, value, num_bytes, queue);
     // CEILING TEST ONLY (TLG_CEILING_ASC_FENCE=1): the label of compute queue 1 is written as soon as the raster thread reaches it, without waiting for the
     // GPU. The results the game reads back are wrong (measuring how short the frame gets, documents/tlg/light-scene-cap-plan.md section 11).
     static const bool ceiling = [] {
@@ -1235,20 +1013,20 @@ void Liverpool::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal,
     if (ceiling && queue == 1 && (kind == VideoCore::FenceComputeRelease || kind == VideoCore::FenceHeldWrite)) {
         RasterRun(
             [this, address, seq, signal = std::move(signal), timed]() mutable {
-                SetFenceTick(address, seq);
+                label_timeline.SetTick(address, seq, rasterizer ? rasterizer->CurrentTick() : 0);
                 timed(std::move(signal))();
-                RetireFence(address, seq);
+                label_timeline.Retire(address, seq);
             },
             must_sync);
         return;
     }
     RasterRun(
         [this, address, seq, signal = std::move(signal), kind, must_sync, timed]() mutable {
-            SetFenceTick(address, seq);
+            label_timeline.SetTick(address, seq, rasterizer ? rasterizer->CurrentTick() : 0);
             rasterizer->OnFence(
                 timed([this, address, seq, signal = std::move(signal)]() mutable {
                     signal();
-                    RetireFence(address, seq);
+                    label_timeline.Retire(address, seq);
                 }),
                 kind, must_sync);
         },
@@ -1257,22 +1035,10 @@ void Liverpool::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal,
 
 bool Liverpool::DeferWriteBehindFences(void* address, const u32* data, u32 num_bytes, u32 queue) {
     const VAddr begin = reinterpret_cast<VAddr>(address);
-    {
-        std::scoped_lock lk{recorded_fence_mutex};
-        const bool held_back = std::ranges::any_of(label_states, [&](const LabelState& label) {
-            return label.pending != 0 && label.address < begin + num_bytes &&
-                   begin < label.address + label.num_bytes;
-        });
-        if (!held_back) {
-            return false;
-        }
+    if (!label_timeline.HeldBack(begin, num_bytes)) {
+        return false;
     }
-    if (logged_deferred_writes.size() < 64 && logged_deferred_writes.insert(begin).second) {
-        LOG_INFO(Render,
-                 "Fence timeline: queue {} writes {} bytes to label {:#x} while a fence write to "
-                 "it is held back; the write is queued behind it",
-                 queue, num_bytes, begin);
-    }
+    label_timeline.NoteDeferredWrite(begin, num_bytes, queue);
     std::vector<u32> words(data, data + num_bytes / sizeof(u32));
     u64 value{};
     std::memcpy(&value, words.data(), std::min<u32>(num_bytes, sizeof(u64)));
@@ -1285,10 +1051,7 @@ bool Liverpool::DeferWriteBehindFences(void* address, const u32* data, u32 num_b
             *this, gpu_id,
             [&] { return TryWriteOffThread(rasterizer, address, words.data(), size); },
             [address, words] {
-                const u32 size = static_cast<u32>(words.size() * sizeof(u32));
-                if (!Core::Memory::Instance()->TryWriteBacking(address, words.data(), size)) {
-                    std::memcpy(address, words.data(), size);
-                }
+                Core::NativeExecutorSync::WriteBackingOrMemory(address, words.data(), static_cast<u32>(words.size() * sizeof(u32)));
             });
     };
     const bool is_label = num_bytes == sizeof(u32) || num_bytes == sizeof(u64);
