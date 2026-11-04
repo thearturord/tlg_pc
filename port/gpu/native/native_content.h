@@ -46,6 +46,9 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq = 0);
 [[nodiscard]] u32 CurrentRecordSubmit();
 u64 FrameStoreServe(LateKind kind, u64 address, void* dst, u64 size);
 void NoteSubmit(const std::vector<std::pair<u64, u64>>& ranges);
+/// M3: a thread maps [address, address + size) for writing (before the write): if the memory holds a version no capture holds (a loader's write, never captured), it is kept as the retired layer's
+/// version, so a late reader of an earlier record still gets the bytes this write is about to replace. Only with `TLG_FRAME_STORE=2`.
+void NoteMapOpen(u64 address, u64 size);
 /// The frame allocator's ring (found by the engine's allocator hook).
 void SetRing(u64 begin, u64 end);
 /// F2.3 ring window shadow (`TLG_F2_RING_WINDOWS=1`, default off, read once): every allocation of the frame ring (`AllocFrameGarlic`) is a window; a newer window drops the older ones it overlaps,

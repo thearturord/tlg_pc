@@ -167,6 +167,7 @@ void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u6
     }
     // the written part: the requested size when the caller gave one, else everything the Map handed out; it is announced when the thread unmaps the resource
     const u64 written = requested_size != 0 && requested_size < size ? requested_size : size;
+    NativeContent::NoteMapOpen(address, written); // M3: before the write
     std::scoped_lock lock{open_map_mutex};
     open_maps[{ThreadKey(), resource_id}] = {address, written, ++open_map_serial, NativeDraw::NextSeq()};
     (void)usage, (void)in_ring;

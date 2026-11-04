@@ -124,6 +124,9 @@ struct LedgerRange {
     u64 stamp;
     u32 writer; ///< the writer number of the announcement that made the stamp (M0 census: who wrote the memory a late read finds changed)
     u32 submit; ///< `g_submit_count` when it was announced (M1)
+    bool rewrite; ///< M3: an earlier announced write covered some of this memory (so an older version of it existed); false: the first write the ledger saw
+    u32 prev;     ///< M3: the writer of the write this one replaced (15: none)
+    u32 prev_submit; ///< M3: `g_submit_count` when that write was announced
 };
 std::mutex g_ledger_mutex;
 std::map<u64, LedgerRange> g_ledger;
@@ -150,6 +153,9 @@ void LedgerNote(u64 begin, u64 end, u64 stamp, u32 writer) {
         u64 b, e, s;
         u32 w;
         u32 sub;
+        bool rw;
+        u32 prev;
+        u32 prev_sub;
     };
     const u32 submit_now = g_submit_count.load(std::memory_order_relaxed);
     std::vector<Seg> add;
@@ -161,25 +167,26 @@ void LedgerNote(u64 begin, u64 end, u64 stamp, u32 writer) {
     while (it != g_ledger.end() && it->first < end) {
         const u64 ob = it->first, oe = it->second.end, os = it->second.stamp;
         const u32 ow = it->second.writer, osub = it->second.submit;
+        const bool orw = it->second.rewrite;
         if (ob < begin) {
-            add.push_back({ob, begin, os, ow, osub});
+            add.push_back({ob, begin, os, ow, osub, orw, it->second.prev, it->second.prev_submit});
         }
         if (oe > end) {
-            add.push_back({end, oe, os, ow, osub});
+            add.push_back({end, oe, os, ow, osub, orw, it->second.prev, it->second.prev_submit});
         }
         const u64 x = std::max(ob, begin), y = std::min(oe, end);
         if (cursor < x) {
-            add.push_back({cursor, x, stamp, writer, submit_now});
+            add.push_back({cursor, x, stamp, writer, submit_now, false, 15u, 0u});
         }
-        add.push_back({x, y, std::max(os, stamp), stamp >= os ? writer : ow, std::max(osub, submit_now)});
+        add.push_back({x, y, std::max(os, stamp), stamp >= os ? writer : ow, std::max(osub, submit_now), true, stamp >= os ? ow : it->second.prev, stamp >= os ? osub : it->second.prev_submit});
         cursor = y;
         it = g_ledger.erase(it);
     }
     if (cursor < end) {
-        add.push_back({cursor, end, stamp, writer, submit_now});
+        add.push_back({cursor, end, stamp, writer, submit_now, false, 15u, 0u});
     }
     for (const Seg& g : add) {
-        g_ledger.emplace(g.b, LedgerRange{g.e, g.s, g.w, g.sub});
+        g_ledger.emplace(g.b, LedgerRange{g.e, g.s, g.w, g.sub, g.rw, g.prev, g.prev_sub});
         g_ledger_max_len = std::max(g_ledger_max_len, g.e - g.b);
     }
 }
@@ -189,6 +196,9 @@ struct LedgerAnswer {
     u64 covered{}; ///< bytes of the range some write touched
     u32 newest_writer{}; ///< the writer number of the write with the newest stamp
     u32 newest_submit{}; ///< the newest `g_submit_count` any write of the range was announced at (M1)
+    u32 newest_prev{15}; ///< M3: the writer the newest write replaced
+    u32 newest_prev_submit{0}; ///< M3: when that write was announced
+    u64 rewritten{}; ///< M3: bytes of the range some earlier write had covered before the newest one (the memory had an older version)
 };
 LedgerAnswer LedgerQuery(u64 begin, u64 end) {
     LedgerAnswer a;
@@ -205,8 +215,14 @@ LedgerAnswer LedgerQuery(u64 begin, u64 end) {
             if (it->second.stamp >= a.newest) {
                 a.newest = it->second.stamp;
                 a.newest_writer = it->second.writer;
+                a.newest_prev = it->second.prev;
+                a.newest_prev_submit = it->second.prev_submit;
             }
-            a.covered += std::min(end, it->second.end) - std::max(begin, it->first);
+            const u64 n = std::min(end, it->second.end) - std::max(begin, it->first);
+            a.covered += n;
+            if (it->second.rewrite) {
+                a.rewritten += n;
+            }
         }
     }
     return a;
@@ -827,12 +843,27 @@ struct FsFrame {
 std::mutex g_fs_mutex;
 std::deque<FsFrame> g_fs_frames; ///< the last FsKeep frames
 constexpr size_t FsKeep = 8;
+/// M3: the last version of a range that fell out of the window of FsKeep submissions and that no newer version in the window covers. Ranges the game rewrites rarely (a map written once and
+/// read for minutes) would otherwise leave a hole as soon as the game rewrites them while a late reader still wants the old bytes. Non-overlapping, keyed by start; a newer retired version
+/// trims the older entries it overlaps. Under g_fs_mutex.
+struct FsBaseChunk {
+    u64 end;
+    u32 index;                   ///< the submission whose capture the bytes are
+    std::shared_ptr<u8[]> owner; ///< the buffer of the captured chunk (pieces of it share it)
+    const u8* data;              ///< the byte for the entry's start
+};
+std::map<u64, FsBaseChunk> g_fs_base;
+u64 g_fs_base_bytes = 0;
+constexpr u64 FsBaseCap = 768ull << 20; ///< a retired piece that would go over this is counted and dropped
 constexpr u64 FsMaxChunk = 16ull << 20;  ///< a bigger announcement is counted and not copied
 constexpr u64 FsMaxFrame = 128ull << 20; ///< per submission
 std::atomic<u64> c_fs_submits{0}, c_fs_chunks{0}, c_fs_bytes{0}, c_fs_skipped_big{0}, c_fs_skipped_unreadable{0}, c_fs_skipped_frame_full{0}, c_fs_capture_ns{0}, c_fs_max_frame_bytes{0};
 std::atomic<u64> c_fs_live_bytes{0};
+std::atomic<u64> c_pre_calls{0}, c_pre_never_written{0}, c_pre_written_this_period{0}, c_pre_have_version{0}, c_pre_unreadable{0}, c_pre_captured{0}, c_pre_bytes{0}, c_pre_loader_bytes{0};
+std::atomic<u64> c_fs_base_bytes{0}, c_fs_base_entries{0}, c_fs_base_added_bytes{0}, c_fs_base_trimmed_bytes{0}, c_fs_base_dropped_cap_bytes{0};
 
 u32 SubmitIndexOf(u64 seq); // below
+void FsRetireLocked(FsFrame&& frame); // below
 
 struct FsKindCounters {
     std::atomic<u64> reads{0}, reads_overlapping{0}, reads_with_differences{0}, bytes_covered{0}, bytes_equal{0}, bytes_differ{0}, unreadable{0};
@@ -841,6 +872,12 @@ FsKindCounters c_fs_kind[static_cast<size_t>(LateKind::Count)];
 struct FsServeCounters {
     std::atomic<u64> reads{0}, replaced_reads{0}, replaced_bytes{0}, hole_reads{0}, hole_bytes{0}, loader_newest_reads{0};
     std::atomic<u64> hole_pieces_by_writer[16]{}, hole_bytes_by_writer[16]{};
+    std::atomic<u64> from_base_bytes{0}, from_base_replaced_bytes{0}; ///< M3: bytes served from the retired layer / of those the ones that really changed
+    std::atomic<u64> first_write_reads{0}, first_write_bytes{0};      ///< M3: bytes written after the record for the first time (no older version ever existed: nothing to keep)
+    std::atomic<u64> first_write_bytes_by_writer[16]{};
+    std::atomic<u64> born_after_bytes{0}, born_after_reads{0}; ///< M3: bytes whose replaced write was itself after the record: the memory did not hold this resource's data at the record
+    std::atomic<u64> hole_bytes_by_prev[16]{}; ///< M3: bytes of the (rewrite) holes by the writer whose version was replaced (15: none known)
+    std::atomic<u64> loader_skip_pieces{0}, loader_skip_bytes{0};     ///< M3: version pieces not served because a loader write (5, 6) came after the version and before the record
 };
 FsServeCounters c_fs_serve[static_cast<size_t>(LateKind::Count)];
 } // namespace
@@ -922,7 +959,11 @@ void NoteSubmit(const std::vector<std::pair<u64, u64>>& ranges) {
             g_fs_frames.push_back(std::move(frame));
             while (g_fs_frames.size() > FsKeep) {
                 c_fs_live_bytes.fetch_sub(g_fs_frames.front().bytes, std::memory_order_relaxed);
+                FsFrame old = std::move(g_fs_frames.front());
                 g_fs_frames.pop_front();
+                if (FrameStoreServes()) {
+                    FsRetireLocked(std::move(old)); // M3
+                }
             }
         }
         c_fs_capture_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
@@ -942,47 +983,145 @@ namespace {
 struct Cover {
     u64 b, e;
     const u8* src; ///< the store's bytes for b (valid while g_fs_mutex is held)
+    u32 index;     ///< the submission whose capture holds the bytes
+    bool base;     ///< from the retired layer
 };
 using Pieces = std::vector<std::pair<u64, u64>>;
 
-/// The pieces of [address, address + size) some version at or before `submit` covers, the newest version per byte (`out`), and the covered pieces sorted (`done`). g_fs_mutex held by the caller.
-void FsCoverLocked(u64 address, u64 size, u32 submit, std::vector<Cover>& out, Pieces& done) {
+/// The pieces of [address, address + size) some version at or before `submit` covers, the newest version per byte (`out`), and the covered pieces sorted (`done`). The window first, newest
+/// capture first, then (`with_base`) the retired layer. g_fs_mutex held by the caller.
+void FsCoverLocked(u64 address, u64 size, u32 submit, std::vector<Cover>& out, Pieces& done, bool with_base = true) {
     const u64 end = address + size;
     const u64 lo = address > FsMaxChunk ? address - FsMaxChunk : 0; // a chunk is at most FsMaxChunk long, so none that starts before `lo` reaches the range
     thread_local Pieces pieces;
+    // the part of [b, e) no newer version already decided goes to `out` (bytes for b: src), and into `done`
+    const auto take = [&](u64 b, u64 e, const u8* src, u32 index, bool base) {
+        pieces.clear();
+        u64 cursor = b;
+        for (const auto& d : done) { // what a newer version already decided is taken out
+            if (d.second <= cursor) {
+                continue;
+            }
+            if (d.first >= e) {
+                break;
+            }
+            if (d.first > cursor) {
+                pieces.emplace_back(cursor, d.first);
+            }
+            cursor = std::max(cursor, d.second);
+        }
+        if (cursor < e) {
+            pieces.emplace_back(cursor, e);
+        }
+        for (const auto& p : pieces) {
+            out.push_back({p.first, p.second, src + (p.first - b), index, base});
+            done.insert(std::lower_bound(done.begin(), done.end(), p), p);
+        }
+    };
+    // the retired layer's entries that reach the range, newest capture first: a pre-write capture (NoteMapOpen) can be newer than a frame of the window
+    thread_local std::vector<std::pair<u32, std::map<u64, FsBaseChunk>::const_iterator>> base_hits;
+    base_hits.clear();
+    if (with_base) {
+        auto it = g_fs_base.upper_bound(address);
+        if (it != g_fs_base.begin() && std::prev(it)->second.end > address) {
+            --it;
+        }
+        for (; it != g_fs_base.end() && it->first < end; ++it) {
+            if (it->second.index <= submit && std::max(address, it->first) < std::min(end, it->second.end)) {
+                base_hits.emplace_back(it->second.index, it);
+            }
+        }
+        std::sort(base_hits.begin(), base_hits.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+    }
+    size_t next_base = 0;
+    const auto take_base = [&](u32 above) { // the entries whose capture is newer than `above`
+        for (; next_base < base_hits.size() && base_hits[next_base].first > above; ++next_base) {
+            const auto it = base_hits[next_base].second;
+            const u64 b = std::max(address, it->first), e = std::min(end, it->second.end);
+            take(b, e, it->second.data + (b - it->first), it->second.index, true);
+        }
+    };
     for (auto frame = g_fs_frames.rbegin(); frame != g_fs_frames.rend(); ++frame) {
         if (frame->index > submit) {
             continue; // a later submission's capture holds writes the record's submission did not see
         }
+        take_base(frame->index);
         auto it = std::lower_bound(frame->chunks.begin(), frame->chunks.end(), lo, [](const FsChunk& c, u64 value) { return c.address < value; });
         for (; it != frame->chunks.end() && it->address < end; ++it) {
             const u64 b = std::max(address, it->address), e = std::min(end, it->address + it->size);
-            if (b >= e) {
-                continue;
-            }
-            pieces.clear();
-            u64 cursor = b;
-            for (const auto& d : done) { // what a newer version already decided is taken out
-                if (d.second <= cursor) {
-                    continue;
-                }
-                if (d.first >= e) {
-                    break;
-                }
-                if (d.first > cursor) {
-                    pieces.emplace_back(cursor, d.first);
-                }
-                cursor = std::max(cursor, d.second);
-            }
-            if (cursor < e) {
-                pieces.emplace_back(cursor, e);
-            }
-            for (const auto& p : pieces) {
-                out.push_back({p.first, p.second, it->bytes.get() + (p.first - it->address)});
-                done.insert(std::lower_bound(done.begin(), done.end(), p), p);
+            if (b < e) {
+                take(b, e, it->bytes.get() + (b - it->address), frame->index, false);
             }
         }
     }
+    take_base(0);
+}
+
+/// M3: `[b, e)` of a captured buffer becomes the retired layer's version (capture `index`) of that memory; the older retired versions of it go or shrink. g_fs_mutex held.
+void FsBaseAddLocked(u64 b, u64 e, u32 index, const std::shared_ptr<u8[]>& owner, const u8* data) {
+    if (b >= e) {
+        return;
+    }
+    auto it = g_fs_base.upper_bound(b);
+    if (it != g_fs_base.begin() && std::prev(it)->second.end > b) {
+        --it;
+    }
+    while (it != g_fs_base.end() && it->first < e) {
+        const u64 ob = it->first;
+        FsBaseChunk old = std::move(it->second);
+        it = g_fs_base.erase(it);
+        const u64 x = std::max(ob, b), y = std::min(old.end, e);
+        g_fs_base_bytes -= y - x;
+        c_fs_base_trimmed_bytes.fetch_add(y - x, std::memory_order_relaxed);
+        if (ob < b) {
+            g_fs_base.emplace(ob, FsBaseChunk{b, old.index, old.owner, old.data});
+        }
+        if (old.end > e) {
+            g_fs_base.emplace(e, FsBaseChunk{old.end, old.index, old.owner, old.data + (e - ob)});
+        }
+    }
+    if (g_fs_base_bytes + (e - b) > FsBaseCap) {
+        c_fs_base_dropped_cap_bytes.fetch_add(e - b, std::memory_order_relaxed);
+        return;
+    }
+    g_fs_base.emplace(b, FsBaseChunk{e, index, owner, data});
+    g_fs_base_bytes += e - b;
+    c_fs_base_added_bytes.fetch_add(e - b, std::memory_order_relaxed);
+}
+
+/// M3: a frame fell out of the window: what of its chunks no newer version in the window covers becomes the retired layer's version of that memory. g_fs_mutex held.
+void FsRetireLocked(FsFrame&& frame) {
+    thread_local std::vector<Cover> covers;
+    thread_local Pieces done;
+    for (FsChunk& chunk : frame.chunks) {
+        // most chunks are rewritten every frame: one newer chunk of the window holds all their bytes, nothing to keep
+        const u64 chunk_end = chunk.address + chunk.size;
+        bool superseded = false;
+        for (auto newer = g_fs_frames.rbegin(); newer != g_fs_frames.rend() && !superseded; ++newer) {
+            auto it = std::upper_bound(newer->chunks.begin(), newer->chunks.end(), chunk.address, [](u64 value, const FsChunk& c) { return value < c.address; });
+            if (it != newer->chunks.begin()) {
+                const FsChunk& c = *std::prev(it);
+                superseded = c.address + c.size >= chunk_end; // c.address <= chunk.address by the search
+            }
+        }
+        if (superseded) {
+            continue;
+        }
+        covers.clear();
+        done.clear();
+        FsCoverLocked(chunk.address, chunk.size, ~0u, covers, done, false);
+        std::shared_ptr<u8[]> owner{std::move(chunk.bytes)};
+        const auto add = [&](u64 b, u64 e) { FsBaseAddLocked(b, e, frame.index, owner, owner.get() + (b - chunk.address)); };
+        u64 cursor = chunk.address;
+        const u64 end = chunk.address + chunk.size;
+        for (const auto& d : done) {
+            add(cursor, d.first);
+            cursor = std::max(cursor, d.second);
+        }
+        add(cursor, end);
+    }
+    c_fs_base_bytes.store(g_fs_base_bytes, std::memory_order_relaxed);
+    c_fs_base_entries.store(g_fs_base.size(), std::memory_order_relaxed);
 }
 
 /// One read of the game's memory for a record of submission `submit`: what the store holds for [address, address + size) as of that submission (the newest version at or before it, per
@@ -1032,6 +1171,91 @@ void FrameStoreCompare(size_t kind, u64 address, u64 size, u32 submit) {
 
 } // namespace
 
+void NoteMapOpen(u64 address, u64 size) {
+    if (!FrameStoreServes() || address == 0 || size == 0 || size > FsMaxChunk || InRing(address, size)) {
+        return;
+    }
+    c_pre_calls.fetch_add(1, std::memory_order_relaxed);
+    const u32 now = g_submit_count.load(std::memory_order_acquire);
+    // the ledger's writes inside the range: (begin, end, submit count at the announcement, writer)
+    struct Segment {
+        u64 b, e;
+        u32 submit, writer;
+    };
+    thread_local std::vector<Segment> segments;
+    segments.clear();
+    {
+        std::scoped_lock lock{g_ledger_mutex};
+        auto it = g_ledger.upper_bound(address);
+        if (it != g_ledger.begin() && std::prev(it)->second.end > address) {
+            --it;
+        }
+        for (; it != g_ledger.end() && it->first < address + size; ++it) {
+            if (it->second.end > address) {
+                segments.push_back({std::max(address, it->first), std::min(address + size, it->second.end), it->second.submit, it->second.writer});
+            }
+        }
+    }
+    if (segments.empty()) {
+        c_pre_never_written.fetch_add(1, std::memory_order_relaxed); // the first write: no older version exists
+        return;
+    }
+    thread_local std::vector<Cover> covers;
+    thread_local Pieces done;
+    covers.clear();
+    done.clear();
+    {
+        std::scoped_lock lock{g_fs_mutex};
+        FsCoverLocked(address, size, now, covers, done);
+    }
+    for (const Segment& seg : segments) {
+        if (seg.submit >= now) {
+            c_pre_written_this_period.fetch_add(1, std::memory_order_relaxed); // written in the period now running: the capture at the next submission takes it
+            continue;
+        }
+        // the memory holds the writes up to period `seg.submit + 1`, which is capture `index`: a version of that capture or a newer one is already there, or this memory is that version
+        const u32 index = seg.submit + 1;
+        Pieces missing;
+        u64 cursor = seg.b;
+        Pieces current; // the pieces of versions at least that new, sorted
+        for (const Cover& cv : covers) {
+            if (cv.index >= index && cv.b < seg.e && cv.e > seg.b) {
+                current.emplace_back(std::max(cv.b, seg.b), std::min(cv.e, seg.e));
+            }
+        }
+        std::sort(current.begin(), current.end());
+        for (const auto& d : current) {
+            if (d.first > cursor) {
+                missing.emplace_back(cursor, d.first);
+            }
+            cursor = std::max(cursor, d.second);
+        }
+        if (cursor < seg.e) {
+            missing.emplace_back(cursor, seg.e);
+        }
+        if (missing.empty()) {
+            c_pre_have_version.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        for (const auto& [b, e] : missing) {
+            std::shared_ptr<u8[]> bytes{new u8[e - b]};
+            if (!GuardedCopy(bytes.get(), reinterpret_cast<const void*>(b), e - b)) {
+                c_pre_unreadable.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            {
+                std::scoped_lock lock{g_fs_mutex};
+                FsBaseAddLocked(b, e, index, bytes, bytes.get());
+            }
+            c_pre_captured.fetch_add(1, std::memory_order_relaxed);
+            c_pre_bytes.fetch_add(e - b, std::memory_order_relaxed);
+            if (seg.writer == 5 || seg.writer == 6) {
+                c_pre_loader_bytes.fetch_add(e - b, std::memory_order_relaxed);
+            }
+        }
+    }
+}
+
 u64 FrameStoreServe(LateKind kind, u64 address, void* dst, u64 size) {
     if (!FrameStoreServes() || size == 0 || dst == nullptr || !LedgerOn()) {
         return 0;
@@ -1048,7 +1272,7 @@ u64 FrameStoreServe(LateKind kind, u64 address, void* dst, u64 size) {
     thread_local Pieces done;
     covers.clear();
     done.clear();
-    u64 replaced = 0;
+    u64 replaced = 0, from_base = 0, from_base_replaced = 0;
     {
         std::scoped_lock lock{g_fs_mutex};
         FsCoverLocked(address, size, submit, covers, done);
@@ -1057,19 +1281,38 @@ u64 FrameStoreServe(LateKind kind, u64 address, void* dst, u64 size) {
             // dst is only written, never read: it may be video memory the CPU maps write-combined (the zero copy upload), where a read is very slow. What changed is counted against the game's memory.
             u8* at = out + (cv.b - address);
             const u64 n = cv.e - cv.b;
+            // M3: a loader write (5 buffer creation, 6 texture init: never captured) came after this version and before the record: the memory is newer than the version and right for the record
+            if (cv.base || cv.index + 2 < submit) {
+                const LedgerAnswer a = LedgerQuery(cv.b, cv.e);
+                if ((a.newest_writer == 5 || a.newest_writer == 6) && a.covered != 0 && a.newest_submit >= cv.index && a.newest_submit < submit) {
+                    c.loader_skip_pieces.fetch_add(1, std::memory_order_relaxed);
+                    c.loader_skip_bytes.fetch_add(n, std::memory_order_relaxed);
+                    continue;
+                }
+            }
             u64 first_diff = ~0ull;
             if (GuardedCompare(reinterpret_cast<const void*>(cv.b), cv.src, n, first_diff) && first_diff != ~0ull) {
                 replaced += n - first_diff; // from the first differing byte on (an upper bound)
+                if (cv.base) {
+                    from_base_replaced += n - first_diff;
+                }
+            }
+            if (cv.base) {
+                from_base += n;
             }
             std::memcpy(at, cv.src, n);
         }
+    }
+    if (from_base != 0) {
+        c.from_base_bytes.fetch_add(from_base, std::memory_order_relaxed);
+        c.from_base_replaced_bytes.fetch_add(from_base_replaced, std::memory_order_relaxed);
     }
     if (replaced != 0) {
         c.replaced_reads.fetch_add(1, std::memory_order_relaxed);
         c.replaced_bytes.fetch_add(replaced, std::memory_order_relaxed);
     }
     // what no version covers is the memory as it is now: right unless the game wrote it at or after the record's submission (a hole: the old bytes are gone)
-    u64 hole = 0;
+    u64 hole = 0, first_write = 0, born_after = 0;
     bool loader_newest = false;
     u64 cursor = address;
     const u64 end = address + size;
@@ -1079,10 +1322,25 @@ u64 FrameStoreServe(LateKind kind, u64 address, void* dst, u64 size) {
         }
         const LedgerAnswer a = LedgerQuery(b, e);
         if (a.covered != 0 && a.newest_submit >= submit) {
-            hole += e - b;
             const u32 w = std::min<u32>(a.newest_writer, 15u);
-            c.hole_pieces_by_writer[w].fetch_add(1, std::memory_order_relaxed);
-            c.hole_bytes_by_writer[w].fetch_add(e - b, std::memory_order_relaxed);
+            // M3: a write that is the first the ledger saw of this memory replaced no older version: the record cannot have used what was there before (nothing, or memory from before the ledger)
+            u64 rewrite = std::min(a.rewritten, e - b);
+            if (rewrite != 0 && a.newest_prev_submit >= submit) {
+                // the write this one replaced came after the record too: the record saw something older still (or the memory of a resource made after it)
+                born_after += rewrite;
+                rewrite = 0;
+            }
+            const u64 fresh = e - b - rewrite;
+            if (fresh != 0) {
+                first_write += fresh;
+                c.first_write_bytes_by_writer[w].fetch_add(fresh, std::memory_order_relaxed);
+            }
+            if (rewrite != 0) {
+                hole += rewrite;
+                c.hole_pieces_by_writer[w].fetch_add(1, std::memory_order_relaxed);
+                c.hole_bytes_by_writer[w].fetch_add(rewrite, std::memory_order_relaxed);
+                c.hole_bytes_by_prev[std::min<u32>(a.newest_prev, 15u)].fetch_add(rewrite, std::memory_order_relaxed);
+            }
         }
     };
     for (const auto& d : done) {
@@ -1093,6 +1351,14 @@ u64 FrameStoreServe(LateKind kind, u64 address, void* dst, u64 size) {
     if (hole != 0) {
         c.hole_reads.fetch_add(1, std::memory_order_relaxed);
         c.hole_bytes.fetch_add(hole, std::memory_order_relaxed);
+    }
+    if (born_after != 0) {
+        c.born_after_reads.fetch_add(1, std::memory_order_relaxed);
+        c.born_after_bytes.fetch_add(born_after, std::memory_order_relaxed);
+    }
+    if (first_write != 0) {
+        c.first_write_reads.fetch_add(1, std::memory_order_relaxed);
+        c.first_write_bytes.fetch_add(first_write, std::memory_order_relaxed);
     }
     if (!done.empty()) {
         const LedgerAnswer all = LedgerQuery(address, end);
@@ -1119,6 +1385,32 @@ nlohmann::json FrameStoreReport(size_t kind) {
             {"served_bytes_replaced", c_fs_serve[kind].replaced_bytes.load()},
             {"served_reads_with_a_hole", c_fs_serve[kind].hole_reads.load()},
             {"served_hole_bytes", c_fs_serve[kind].hole_bytes.load()},
+            {"served_bytes_from_the_retired_layer", c_fs_serve[kind].from_base_bytes.load()},
+            {"served_bytes_from_the_retired_layer_that_really_changed", c_fs_serve[kind].from_base_replaced_bytes.load()},
+            {"reads_with_first_writes_after_the_record", c_fs_serve[kind].first_write_reads.load()},
+            {"reads_where_the_replaced_write_was_after_the_record_too", c_fs_serve[kind].born_after_reads.load()},
+            {"bytes_where_the_replaced_write_was_after_the_record_too", c_fs_serve[kind].born_after_bytes.load()},
+            {"first_write_bytes_after_the_record", c_fs_serve[kind].first_write_bytes.load()},
+            {"first_write_bytes_by_writer", [&] {
+                 nlohmann::json j = nlohmann::json::object();
+                 for (u32 w = 0; w < 16; ++w) {
+                     if (const u64 n = c_fs_serve[kind].first_write_bytes_by_writer[w].load()) {
+                         j[std::to_string(w)] = n;
+                     }
+                 }
+                 return j;
+             }()},
+            {"hole_bytes_by_the_writer_replaced", [&] {
+                 nlohmann::json j = nlohmann::json::object();
+                 for (u32 w = 0; w < 16; ++w) {
+                     if (const u64 n = c_fs_serve[kind].hole_bytes_by_prev[w].load()) {
+                         j[std::to_string(w)] = n;
+                     }
+                 }
+                 return j;
+             }()},
+            {"version_pieces_skipped_for_a_newer_loader_write", c_fs_serve[kind].loader_skip_pieces.load()},
+            {"version_bytes_skipped_for_a_newer_loader_write", c_fs_serve[kind].loader_skip_bytes.load()},
             {"served_reads_where_a_loader_write_is_the_newest", c_fs_serve[kind].loader_newest_reads.load()},
             {"hole_pieces_by_writer", [&] {
                  nlohmann::json j = nlohmann::json::object();
@@ -1141,6 +1433,19 @@ nlohmann::json FrameStoreSummary() {
             {"bytes_captured", c_fs_bytes.load()},
             {"largest_frame_bytes", c_fs_max_frame_bytes.load()},
             {"bytes_held_now", c_fs_live_bytes.load()},
+            {"pre_write_map_opens_seen", c_pre_calls.load()},
+            {"pre_write_never_written_before", c_pre_never_written.load()},
+            {"pre_write_written_in_the_running_period", c_pre_written_this_period.load()},
+            {"pre_write_version_already_held", c_pre_have_version.load()},
+            {"pre_write_unreadable", c_pre_unreadable.load()},
+            {"pre_write_pieces_captured", c_pre_captured.load()},
+            {"pre_write_bytes_captured", c_pre_bytes.load()},
+            {"pre_write_bytes_captured_of_loader_writes", c_pre_loader_bytes.load()},
+            {"retired_layer_bytes_now", c_fs_base_bytes.load()},
+            {"retired_layer_entries_now", c_fs_base_entries.load()},
+            {"retired_layer_bytes_added", c_fs_base_added_bytes.load()},
+            {"retired_layer_bytes_trimmed_by_newer", c_fs_base_trimmed_bytes.load()},
+            {"retired_layer_bytes_dropped_for_the_cap", c_fs_base_dropped_cap_bytes.load()},
             {"skipped_over_16mb", c_fs_skipped_big.load()},
             {"skipped_frame_over_128mb", c_fs_skipped_frame_full.load()},
             {"skipped_unreadable", c_fs_skipped_unreadable.load()},
