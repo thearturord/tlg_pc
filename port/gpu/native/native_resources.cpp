@@ -538,10 +538,12 @@ void NoteTextureObject(u64 object) {
     pending_textures.push_back(object);
 }
 
-void NoteBufferDestroyed(u64 object) {
+bool NoteBufferDestroyed(u64 object) {
+    bool had_immutable_entry = false;
     {
         std::unique_lock lock{immutable_mutex};
         if (const auto it = immutable_by_object.find(object); it != immutable_by_object.end()) {
+            had_immutable_entry = true;
             it->second->alive.store(false, std::memory_order_release);
             if (const auto at = immutables.find(it->second->begin); at != immutables.end() && at->second == it->second) {
                 immutables.erase(at);
@@ -561,6 +563,7 @@ void NoteBufferDestroyed(u64 object) {
         resources_by_address.erase(it->second);
         address_by_object.erase(it);
     }
+    return had_immutable_entry;
 }
 
 void NoteBufferRequest(VAddr address, u32 size, bool written, BufferPath path, u64 uploaded) {

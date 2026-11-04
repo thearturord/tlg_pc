@@ -30,8 +30,8 @@ extern bool census_enabled;
 void NoteBufferObject(u64 object);
 /// The engine is initializing a texture (called before the initialization; the object is read on the next scan).
 void NoteTextureObject(u64 object);
-/// The engine destroys a buffer.
-void NoteBufferDestroyed(u64 object);
+/// The engine destroys a buffer. Returns true when the immutable registry held an entry for it.
+bool NoteBufferDestroyed(u64 object);
 
 void NoteBufferRequest(VAddr address, u32 size, bool written, BufferPath path, u64 uploaded);
 /// An image was (re)uploaded from guest memory.

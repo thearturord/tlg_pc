@@ -8291,6 +8291,25 @@ u64 PS4_SYSV_ABI ResourceBufferDestroyed(u64 object, u64 a1, u64 a2, u64 a3, u64
     return 0;
 }
 
+/// Deleting destructor of a buffer object (FUN_0246dc80, vtable slot 1; the hook on 0x246db40 never fires, CPU frame map section 8). Runs on the render thread in the game's delayed-delete tick
+/// (JsSwapChain_BeginFrame), just before the block goes back to Gomalloc: the immutable registry forgets the object here, so no later bind is served from a dead entry.
+/// TLG_UNREGISTER_ON_DELETE=0 turns it off (A/B). Counters in /stats `unregister_at_delete`.
+u64 PS4_SYSV_ABI ResourceBufferDeleted(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    static const bool on = [] { const char* e = std::getenv("TLG_UNREGISTER_ON_DELETE"); return e == nullptr || std::atoi(e) != 0; }();
+    static std::atomic<u64> calls{0}, had_entry{0};
+    const u64 n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (on && object != 0) {
+        if (NativeResources::NoteBufferDestroyed(object)) {
+            had_entry.fetch_add(1, std::memory_order_relaxed);
+        }
+        NativeRegistry::NoteBufferDestroyed(object);
+    }
+    if ((n & 255) == 1) {
+        Core::DebugServer::Publish("unregister_at_delete", nlohmann::json{{"enabled", on}, {"destructor_calls", n}, {"calls_with_an_immutable_entry", had_entry.load(std::memory_order_relaxed)}});
+    }
+    return 0; // the original runs
+}
+
 /// FUN_0247e510(device context): the scratch barrier unit as a function (see SweepSyncPackets): nothing to write.
 u64 PS4_SYSV_ABI SkipWaitComputeDone(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     if (ctx == 0) {
@@ -8966,6 +8985,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "resource_buffer_destroyed") {
         return reinterpret_cast<u64>(&ResourceBufferDestroyed);
+    }
+    if (name == "resource_buffer_deleted") {
+        return reinterpret_cast<u64>(&ResourceBufferDeleted);
     }
     if (name == "native_view_srv") {
         return reinterpret_cast<u64>(&NativeDevice::ViewCreatedSrv);
