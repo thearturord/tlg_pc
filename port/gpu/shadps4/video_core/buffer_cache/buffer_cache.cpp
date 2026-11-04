@@ -433,7 +433,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
         if (StreamReuseOn()) {
             const u64 tick = scheduler.CurrentTick();
             const u64 wraps = stream_buffer.WrapCount();
-            const u32 record_submit = Core::NativeContent::FrameStoreServes() ? Core::NativeContent::CurrentRecordSubmit() : 0; // M2: copies are per submission
+            // Copies are per submission, with or without the store: the game rewrites constants (camera, view) in place between submissions, a copy reused across them is stale (W0, owner play 2026-11-04:
+            // random lines on the whole screen while walking when the store did not serve; this key was tied to the store serving)
+            const u32 record_submit = Core::NativeContent::CurrentRecordSubmit();
             if (tick != reuse.tick || wraps != reuse.wraps || record_submit != reuse.submit) {
                 reuse.submit = record_submit;
                 // A new command buffer: the game may have changed the data since. A wrap of the
