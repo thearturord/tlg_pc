@@ -220,6 +220,7 @@ nlohmann::json Native(const Params&) {
     j["sync_converted_sweep"] = live.sync_converted_sweep.load();
     j["sync_converted_submit"] = live.sync_converted_submit.load();
     j["sync_packets_kept"] = live.fence_packets_kept.load();
+    j["register_wait_polls"] = Core::NativeSync::RegisterWaitReport();
     j["sync_converted"] = {{"eop", live.sync_converted[1].load()}, {"release", live.sync_converted[2].load()}, {"wait", live.sync_converted[3].load()}, {"write", live.sync_converted[4].load()}, {"event", live.sync_converted[5].load()}, {"inert", live.sync_converted[6].load()}, {"dma", live.sync_converted[7].load()}, {"query", live.sync_converted[8].load()}};
     j["sync_exec"] = {{"eop", live.sync_exec[1].load()}, {"release", live.sync_exec[2].load()}, {"wait", live.sync_exec[3].load()}, {"write", live.sync_exec[4].load()}, {"event", live.sync_exec[5].load()}, {"dma", live.sync_exec[7].load()}, {"query", live.sync_exec[8].load()}};
     j["direct_built"] = live.direct_built.load();

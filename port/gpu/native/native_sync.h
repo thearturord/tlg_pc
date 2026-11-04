@@ -136,6 +136,9 @@ constexpr u32 TypedTagMagic = 0x4E445400u; // "NDT" + kind
 /// F1.2 typed sync records: a producer (a hook on the function that writes the packet) calls `Expect` with the address of the packet it wrote and the record it built from the engine's own
 /// arguments; `ConvertSyncPacket` calls `Convert`, which rewrites the packet in place as a typed sync tag that carries the record. A packet with no record is left raw and counted (`NoteUntyped`).
 /// Report: /stats native_backend.device.sync_typed.
+/// G0 census: register number (hex) to the number of times a register WAIT_REG_MEM was tested (empty: no register wait ever ran). Report: /native register_wait_polls.
+[[nodiscard]] nlohmann::json RegisterWaitReport();
+
 namespace Typed {
 
 enum Kind : u32 { KindEop, KindRelease, KindWait, KindWrite, KindDma, KindCount };

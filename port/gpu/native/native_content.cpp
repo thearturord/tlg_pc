@@ -121,6 +121,7 @@ std::vector<nlohmann::json> g_examples_differs, g_examples_hole;
 struct LedgerRange {
     u64 end;
     u64 stamp;
+    u32 writer; ///< the writer number of the announcement that made the stamp (M0 census: who wrote the memory a late read finds changed)
 };
 std::mutex g_ledger_mutex;
 std::map<u64, LedgerRange> g_ledger;
@@ -128,7 +129,7 @@ constexpr size_t MaxLedger = 1u << 20;
 std::atomic<u64> c_ledger_notes{0}, c_ledger_overflow{0};
 u64 g_ledger_max_len = 0;
 
-void LedgerNote(u64 begin, u64 end, u64 stamp) {
+void LedgerNote(u64 begin, u64 end, u64 stamp, u32 writer) {
     std::scoped_lock lock{g_ledger_mutex};
     c_ledger_notes.fetch_add(1, std::memory_order_relaxed);
     if (g_ledger.size() >= MaxLedger) {
@@ -137,6 +138,7 @@ void LedgerNote(u64 begin, u64 end, u64 stamp) {
     }
     struct Seg {
         u64 b, e, s;
+        u32 w;
     };
     std::vector<Seg> add;
     auto it = g_ledger.upper_bound(begin);
@@ -146,25 +148,26 @@ void LedgerNote(u64 begin, u64 end, u64 stamp) {
     u64 cursor = begin;
     while (it != g_ledger.end() && it->first < end) {
         const u64 ob = it->first, oe = it->second.end, os = it->second.stamp;
+        const u32 ow = it->second.writer;
         if (ob < begin) {
-            add.push_back({ob, begin, os});
+            add.push_back({ob, begin, os, ow});
         }
         if (oe > end) {
-            add.push_back({end, oe, os});
+            add.push_back({end, oe, os, ow});
         }
         const u64 x = std::max(ob, begin), y = std::min(oe, end);
         if (cursor < x) {
-            add.push_back({cursor, x, stamp});
+            add.push_back({cursor, x, stamp, writer});
         }
-        add.push_back({x, y, std::max(os, stamp)});
+        add.push_back({x, y, std::max(os, stamp), stamp >= os ? writer : ow});
         cursor = y;
         it = g_ledger.erase(it);
     }
     if (cursor < end) {
-        add.push_back({cursor, end, stamp});
+        add.push_back({cursor, end, stamp, writer});
     }
     for (const Seg& g : add) {
-        g_ledger.emplace(g.b, LedgerRange{g.e, g.s});
+        g_ledger.emplace(g.b, LedgerRange{g.e, g.s, g.w});
         g_ledger_max_len = std::max(g_ledger_max_len, g.e - g.b);
     }
 }
@@ -172,13 +175,23 @@ void LedgerNote(u64 begin, u64 end, u64 stamp) {
 struct LedgerAnswer {
     u64 newest{}; ///< the newest stamp of any write that touched the range (0: none)
     u64 covered{}; ///< bytes of the range some write touched
+    u32 newest_writer{}; ///< the writer number of the write with the newest stamp
 };
 LedgerAnswer LedgerQuery(u64 begin, u64 end) {
     LedgerAnswer a;
     std::scoped_lock lock{g_ledger_mutex};
-    for (auto it = g_ledger.lower_bound(begin > g_ledger_max_len ? begin - g_ledger_max_len : 0); it != g_ledger.end() && it->first < end; ++it) {
+    // the ranges do not overlap and are sorted by start, so only the one before the first start above `begin` can reach into the query (the old scan from
+    // `begin - longest range` walked the whole ledger once a single long range existed: M0 asks for every buffer copy, not only for image uploads)
+    auto it = g_ledger.upper_bound(begin);
+    if (it != g_ledger.begin() && std::prev(it)->second.end > begin) {
+        --it;
+    }
+    for (; it != g_ledger.end() && it->first < end; ++it) {
         if (it->second.end > begin) {
-            a.newest = std::max(a.newest, it->second.stamp);
+            if (it->second.stamp >= a.newest) {
+                a.newest = it->second.stamp;
+                a.newest_writer = it->second.writer;
+            }
             a.covered += std::min(end, it->second.end) - std::max(begin, it->first);
         }
     }
@@ -432,7 +445,7 @@ void NoteMark(u32 writer, u64 address, u64 size) {
         return;
     }
     if (LedgerOn() && (writer == 3 || writer == 6) && !InRing(address, size)) { // writers 1, 2 and 4 are noted by Announce with their own stamp
-        LedgerNote(address, address + size, Core::NativeDraw::NextSeq());
+        LedgerNote(address, address + size, Core::NativeDraw::NextSeq(), writer);
     }
     if (!ShadowOn()) {
         return;
@@ -662,7 +675,7 @@ void Announce(u32 writer, u64 address, u64 size, u64 stamp) {
         return;
     }
     if (LedgerOn() && !InRing(address, size)) { // the frame ring is the ring swap's (stamped bytes); the ledger is for the memory outside it
-        LedgerNote(address, address + size, stamp);
+        LedgerNote(address, address + size, stamp, writer);
     }
     if (!ShadowOn()) {
         // the swap alone keeps the ring's announcements only
@@ -779,30 +792,39 @@ void NoteRingImageShape(u64 address, u64 size, u32 width, u32 height, u32 depth,
 }
 
 namespace {
-/// F2.5 (default on, `TLG_F2_LEDGER=0` off): the upload of an image outside the frame ring reads guest memory; the write ledger says whether that memory was written after the draw's record.
+/// F2.5 (default on, `TLG_F2_LEDGER=0` off) and M0 (memory-ownership-plan.md phase 0): every read of the game's memory after the frame's record was made (an image upload, a buffer
+/// copied at bind time, a constant or geometry ring copy on the command processor) asks the write ledger whether that memory was written after the record. Per kind of read.
 enum CheckClass : u32 { CheckInRing, CheckNoRecord, CheckOpenMap, CheckNeverWritten, CheckPartlyWritten, CheckWrittenUnchanged, CheckWrittenAfter, CheckClassCount };
 constexpr const char* CheckNames[CheckClassCount] = {"in_the_ring_not_checked_here", "no_draw_record_before_the_first_draw", "a_map_of_it_is_open_not_checked", "never_written_by_anything_announced",
                                                      "partly_written_none_after_the_draw", "written_none_after_the_draw", "WRITTEN_AFTER_THE_DRAW"};
-std::atomic<u64> c_check[CheckClassCount]{};
-std::atomic<u64> c_check_bytes[CheckClassCount]{};
-std::atomic<u64> c_check_after_logged{0};
+constexpr size_t LateKinds = static_cast<size_t>(LateKind::Count);
+constexpr const char* LateKindNames[LateKinds] = {"image_upload_raster_thread", "buffer_stream_copy_raster_thread", "buffer_object_copy_raster_thread", "buffer_arena_sync_raster_thread",
+                                                  "constant_ring_command_processor", "geometry_ring_command_processor"};
+std::atomic<u64> c_check[LateKinds][CheckClassCount]{};
+std::atomic<u64> c_check_bytes[LateKinds][CheckClassCount]{};
+std::atomic<u64> c_late_after_bytes_by_writer[LateKinds][16]{}; ///< bytes read late (the range was written after the record) by the writer of the newest write
+std::atomic<u64> c_late_after_by_writer[LateKinds][16]{};
+std::atomic<u32> c_late_rare_noted[LateKinds]{}; ///< rare events written per kind (the first few only; the counters carry the rest)
 std::atomic<u64> c_check_record_seen{0}, c_check_no_record_after_a_record{0};
-std::atomic<u64> c_check_margin_log2[40]{}; ///< checked uploads by log2(draw record - newest write stamp): how many records ahead of the draw the memory was last written
+std::atomic<u64> c_check_margin_log2[LateKinds][40]{}; ///< checked reads by log2(draw record - newest write stamp): how many records ahead of the draw the memory was last written
 } // namespace
 
-void CheckUploadMemory(u64 address, u64 size) {
+void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
     if (!LedgerOn() || size == 0) {
         return;
     }
+    const size_t k = static_cast<size_t>(kind);
     CheckClass cls;
     LedgerAnswer a;
-    const u64 seq = Core::NativeRegistry::CurrentDrawSeq();
+    if (seq == 0) {
+        seq = Core::NativeRegistry::CurrentDrawSeq();
+    }
     if (InRing(address, size)) {
         cls = CheckInRing;
     } else if (seq == 0) {
         cls = CheckNoRecord;
         if (c_check_record_seen.load(std::memory_order_relaxed) != 0) {
-            c_check_no_record_after_a_record.fetch_add(1, std::memory_order_relaxed); // an upload on a thread that never draws (the presenter) or after the first draw of its thread
+            c_check_no_record_after_a_record.fetch_add(1, std::memory_order_relaxed); // a read on a thread that never draws (the presenter) or after the first draw of its thread
         }
     } else if (Core::NativeUpdates::OpenMapOverlaps(address, size)) {
         cls = CheckOpenMap;
@@ -810,16 +832,25 @@ void CheckUploadMemory(u64 address, u64 size) {
         c_check_record_seen.store(1, std::memory_order_relaxed);
         a = LedgerQuery(address, address + size);
         if (a.covered != 0 && a.newest <= seq) {
-            c_check_margin_log2[std::min<u32>(39u, static_cast<u32>(std::bit_width(seq - a.newest)))].fetch_add(1, std::memory_order_relaxed);
+            c_check_margin_log2[k][std::min<u32>(39u, static_cast<u32>(std::bit_width(seq - a.newest)))].fetch_add(1, std::memory_order_relaxed);
         }
         cls = a.covered == 0 ? CheckNeverWritten : a.newest > seq ? CheckWrittenAfter : a.covered < size ? CheckPartlyWritten : CheckWrittenUnchanged;
     }
-    c_check[cls].fetch_add(1, std::memory_order_relaxed);
-    c_check_bytes[cls].fetch_add(size, std::memory_order_relaxed);
+    c_check[k][cls].fetch_add(1, std::memory_order_relaxed);
+    c_check_bytes[k][cls].fetch_add(size, std::memory_order_relaxed);
     if (cls == CheckWrittenAfter) {
-        // the game wrote this memory after the draw that uses it was recorded: the bytes the upload reads may not be the draw's, and the store keeps no bytes outside the ring
-        Core::RareEvents::Note("f25_image_memory_written_after_its_draw", fmt::format("{:#x} + {:#x}: draw record {}, newest write stamp {}", address, size, seq, a.newest));
+        // the game wrote this memory after the draw that uses it was recorded: the bytes the read finds may not be the draw's (at frames in flight 0 the game is held back, so this stays near 0)
+        const u32 writer = std::min<u32>(a.newest_writer, 15u);
+        c_late_after_by_writer[k][writer].fetch_add(1, std::memory_order_relaxed);
+        c_late_after_bytes_by_writer[k][writer].fetch_add(size, std::memory_order_relaxed);
+        if (c_late_rare_noted[k].fetch_add(1, std::memory_order_relaxed) < 3) {
+            Core::RareEvents::Note(fmt::format("m0_late_read_written_after_its_record_{}", LateKindNames[k]), fmt::format("{:#x} + {:#x}: record {}, newest write stamp {}, writer {}", address, size, seq, a.newest, a.newest_writer));
+        }
     }
+}
+
+void CheckUploadMemory(u64 address, u64 size) {
+    NoteLateRead(LateKind::ImageUpload, address, size, 0);
 }
 
 void OverlayImage(u64 address, u64 size, u8* staged) {
@@ -1234,12 +1265,35 @@ nlohmann::json Report() {
             check["ledger_ranges"] = g_ledger.size();
         }
         for (u32 c = 0; c < CheckClassCount; ++c) {
-            check["cpu_image_uploads"][CheckNames[c]] = {{"uploads", c_check[c].load()}, {"image_bytes", c_check_bytes[c].load()}};
+            check["cpu_image_uploads"][CheckNames[c]] = {{"uploads", c_check[0][c].load()}, {"image_bytes", c_check_bytes[0][c].load()}};
         }
         check["no_record_uploads_after_a_record_was_seen"] = c_check_no_record_after_a_record.load();
         for (u32 b = 0; b < 40; ++b) {
-            if (const u64 n = c_check_margin_log2[b].load(); n != 0) {
+            if (const u64 n = c_check_margin_log2[0][b].load(); n != 0) {
                 check["records_between_the_newest_write_and_the_draw_log2"][b == 0 ? "0" : fmt::format("{}..{}", 1ull << (b - 1), (1ull << b) - 1)] = n;
+            }
+        }
+        // M0: the same question for every kind of late read (reads of the game's memory after the frame's record)
+        for (size_t k = 0; k < LateKinds; ++k) {
+            auto& kj = check["m0_late_reads"][LateKindNames[k]];
+            u64 reads = 0, bytes = 0;
+            for (u32 c = 0; c < CheckClassCount; ++c) {
+                const u64 n = c_check[k][c].load(), nb = c_check_bytes[k][c].load();
+                reads += n;
+                bytes += nb;
+                kj[CheckNames[c]] = {{"reads", n}, {"bytes", nb}};
+            }
+            kj["total_reads"] = reads;
+            kj["total_bytes"] = bytes;
+            for (u32 w = 0; w < 16; ++w) {
+                if (const u64 n = c_late_after_by_writer[k][w].load()) {
+                    kj["written_after_by_writer"][std::to_string(w)] = {{"reads", n}, {"bytes", c_late_after_bytes_by_writer[k][w].load()}};
+                }
+            }
+            for (u32 b = 0; b < 40; ++b) {
+                if (const u64 n = c_check_margin_log2[k][b].load(); n != 0) {
+                    kj["records_between_the_newest_write_and_the_draw_log2"][b == 0 ? "0" : fmt::format("{}..{}", 1ull << (b - 1), (1ull << b) - 1)] = n;
+                }
             }
         }
         out["image_memory_check"] = std::move(check);

@@ -6,8 +6,10 @@ Every entry in ALLOWED_PS4 is a debt: it goes when the phase of documents/tlg/na
 named next to it is done. When the list is empty, native/ is independent of the emulation code.
 
 Run: python -I port/gpu/native/check_native_deps.py     (exit 1 on a violation, 0 otherwise)
+     --consumer-table              print the per file numbers of the consumer rule (G0)
+     --write-consumer-baseline     write consumer_rule_baseline.json (refuses to raise any number)
 """
-import os, re, sys
+import json, os, re, sys
 
 NATIVE = os.path.dirname(os.path.abspath(__file__))
 
@@ -54,6 +56,67 @@ for name in sorted(os.listdir(NATIVE)):
             continue
         if target.startswith(("core/", "video_core/", "shader_recompiler/")):
             bad.append(f"native/{name}:{number}: includes {target} (not on the allowlist)")
+
+# ---- G0 consumer rule (documents/tlg/native plan/executor-consumer-plan.md section 8) -------------------------------------------------------------------
+# The host side (shadps4/video_core/**, the emulator classes and the Vulkan consumers) may include a PS4-shaped header only where it did on the day of the
+# baseline (consumer_rule_baseline.json, written once with --write-consumer-baseline). Lists may only shrink: a new include of a PS4 header in a file, or more
+# `AmdGpu::` lines in a file than the baseline, is a violation. Direct includes only. The G phases lower the numbers; the baseline is rewritten
+# downwards (--write-consumer-baseline refuses to raise any number) after each phase, G6 ends with the recompiler boundary only.
+VIDEO_CORE = os.path.normpath(os.path.join(NATIVE, "..", "shadps4", "video_core"))
+CONSUMER_BASELINE = os.path.join(NATIVE, "consumer_rule_baseline.json")
+PS4_HEADER = re.compile(r"^(video_core/amdgpu/|shader_recompiler/|video_core/renderer_vulkan/(liverpool_to_vk|vk_fixed_state|vk_indexed_data)\.h$|core/libraries/(gnmdriver|videoout)/)")
+
+
+def scan_consumers():
+    result = {}
+    for dirpath, _, names in os.walk(VIDEO_CORE):
+        for name in names:
+            if not name.endswith((".cpp", ".h")):
+                continue
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, VIDEO_CORE).replace(os.sep, "/")
+            includes, lines = set(), 0
+            for line in open(path, encoding="utf-8", errors="replace"):
+                m = include.search(line)
+                if m and PS4_HEADER.match(m.group(1)):
+                    includes.add(m.group(1))
+                if "AmdGpu::" in line:
+                    lines += 1
+            if includes or lines:
+                result[rel] = {"includes": sorted(includes), "amdgpu_lines": lines}
+    return result
+
+
+consumers = scan_consumers()
+if "--write-consumer-baseline" in sys.argv:
+    old = json.load(open(CONSUMER_BASELINE)) if os.path.exists(CONSUMER_BASELINE) else None
+    if old is not None:
+        for rel, now in consumers.items():
+            before = old.get(rel, {"includes": [], "amdgpu_lines": 0})
+            if now["amdgpu_lines"] > before["amdgpu_lines"] or set(now["includes"]) - set(before["includes"]):
+                print(f"consumer baseline: {rel} would go up, refused (lists only shrink)")
+                sys.exit(1)
+    with open(CONSUMER_BASELINE, "w") as f:
+        json.dump(consumers, f, indent=1, sort_keys=True)
+    print(f"consumer baseline written: {len(consumers)} files, {sum(c['amdgpu_lines'] for c in consumers.values())} AmdGpu:: lines")
+    sys.exit(0)
+if os.path.exists(CONSUMER_BASELINE):
+    base = json.load(open(CONSUMER_BASELINE))
+    for rel, now in sorted(consumers.items()):
+        before = base.get(rel, {"includes": [], "amdgpu_lines": 0})
+        for target in sorted(set(now["includes"]) - set(before["includes"])):
+            bad.append(f"shadps4/video_core/{rel}: includes PS4 header {target} (not in consumer_rule_baseline.json)")
+        if now["amdgpu_lines"] > before["amdgpu_lines"]:
+            bad.append(f"shadps4/video_core/{rel}: {now['amdgpu_lines']} AmdGpu:: lines, baseline {before['amdgpu_lines']}")
+    total_now = sum(c["amdgpu_lines"] for c in consumers.values())
+    total_base = sum(c["amdgpu_lines"] for c in base.values())
+    print(f"consumer rule: {len(consumers)} files with PS4 includes or AmdGpu:: lines (baseline {len(base)}), {total_now} AmdGpu:: lines (baseline {total_base}), "
+          f"{sum(len(c['includes']) for c in consumers.values())} PS4 includes (baseline {sum(len(c['includes']) for c in base.values())})")
+else:
+    print("consumer rule: no consumer_rule_baseline.json yet (python check_native_deps.py --write-consumer-baseline)")
+if "--consumer-table" in sys.argv:
+    for rel, now in sorted(consumers.items(), key=lambda kv: -kv[1]["amdgpu_lines"]):
+        print(f"  {now['amdgpu_lines']:4d} AmdGpu:: lines  {len(now['includes']):2d} PS4 includes  {rel}")
 
 for line in bad:
     print(line)

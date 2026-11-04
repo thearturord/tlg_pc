@@ -15,6 +15,7 @@
 #include "native/native_config.h"
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
+#include "native/native_content.h"
 #include "native/native_draw_inputs.h"
 #include "native/native_light_recorder.h"
 #include "native/native_untracked_ring.h"
@@ -947,6 +948,7 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
         }
         if (!from_snapshot) {
             memory->CopySparseMemory(address, constant_ring->Data(*offset), size);
+            Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::ConstantRing, address, size, seq);
         }
         Core::DrainAudit::Copied(Core::DrainAudit::ReadRingConstant, address, constant_ring->Data(*offset), size);
         constant_ring->Flush(*offset, size);
@@ -997,6 +999,7 @@ void Rasterizer::FrontGeometryRing(DrawPlan& plan, u64 done, bool indexed, u32 i
             return;
         }
         memory->CopySparseMemory(address, constant_ring->Data(*offset), size);
+        Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::GeometryRing, address, size, plan.native_seq);
         Core::DrainAudit::Copied(kind == GeometryVertex ? Core::DrainAudit::ReadRingVertex : Core::DrainAudit::ReadRingIndex, address, constant_ring->Data(*offset), size);
         constant_ring->Flush(*offset, size);
         plan.geometry_ring.push_back({kind, static_cast<u32>(size), *offset, address});

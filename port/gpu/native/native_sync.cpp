@@ -55,11 +55,29 @@ bool LabelWait::TestValue(u32 value) const {
     return true;
 }
 
+namespace {
+/// G0 census (executor-consumer-plan.md): which registers a WAIT_REG_MEM polls. The register file the executor keeps exists for these polls only.
+std::array<std::atomic<u32>, 0xC000> register_wait_polls{};
+} // namespace
+
 bool LabelWait::Test(std::span<const u32> regs) const {
     if (memory) {
         return TestValue(*Address());
     }
+    if (reg < register_wait_polls.size()) {
+        register_wait_polls[reg].fetch_add(1, std::memory_order_relaxed);
+    }
     return TestValue(regs[reg]);
+}
+
+nlohmann::json RegisterWaitReport() {
+    nlohmann::json j = nlohmann::json::object();
+    for (size_t i = 0; i < register_wait_polls.size(); ++i) {
+        if (const u32 n = register_wait_polls[i].load(std::memory_order_relaxed)) {
+            j[fmt::format("{:#x}", i)] = n;
+        }
+    }
+    return j;
 }
 
 

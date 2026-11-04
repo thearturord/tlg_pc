@@ -29,6 +29,12 @@ namespace Core::NativeContent {
 /// reads is what the draw saw. A write after the record is counted and written to rare_events.txt (`f25_image_memory_written_after_its_draw`): the store keeps no bytes outside the ring.
 [[nodiscard]] bool LedgerOn() noexcept;
 void CheckUploadMemory(u64 address, u64 size);
+/// M0 (memory-ownership-plan.md phase 0, census of late reads): the kinds of reads of the game's memory made after a frame's record exists. The raster thread reads at bind time
+/// (image uploads, buffer copies and arena syncs), the command processor reads while it plans (constant and geometry rings).
+enum class LateKind : u32 { ImageUpload, BufferStreamCopy, BufferObjectCopy, BufferArenaSync, ConstantRing, GeometryRing, Count };
+/// A read of [address, address + size) for the operation with record number `seq` (0: the record of the calling thread's current draw): the write ledger says whether the range was written
+/// after that record. Counted per kind and by the writer of the newest write (Report: /stats native_backend.device.f2_store.image_memory_check.m0_late_reads). `TLG_F2_LEDGER=0` turns it off.
+void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq = 0);
 /// The frame allocator's ring (found by the engine's allocator hook).
 void SetRing(u64 begin, u64 end);
 /// F2.3 ring window shadow (`TLG_F2_RING_WINDOWS=1`, default off, read once): every allocation of the frame ring (`AllocFrameGarlic`) is a window; a newer window drops the older ones it overlaps,

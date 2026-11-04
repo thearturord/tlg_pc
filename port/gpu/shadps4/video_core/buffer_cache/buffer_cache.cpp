@@ -360,6 +360,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
                 const u32 gpu_writes = immutable->gpu_writes.load(std::memory_order_acquire);
                 const auto [data, at] = stream_buffer.Map(whole, instance.UniformMinAlignment());
                 memory->CopySparseMemory(immutable->begin, data, whole);
+                Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::BufferObjectCopy, immutable->begin, whole);
                 stream_buffer.Commit();
                 immutable->copy_offset = at;
                 immutable->copy_wraps = stream_buffer.WrapCount();
@@ -447,6 +448,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
         }
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
+        Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::BufferStreamCopy, device_addr, size);
         stream_buffer.Commit();
         Core::NativeResources::NoteBufferRequest(device_addr, size, false,
                                                  Core::NativeResources::BufferPath::StreamCopy, size);
@@ -480,6 +482,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
     const auto* arena = BufferFor(device_addr, size, true, is_written); // B9.4: a placed engine buffer's own Vulkan buffer, or the arena
     last_upload_bytes = 0;
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    if (last_upload_bytes != 0) {
+        Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::BufferArenaSync, device_addr, size);
+    }
     Core::NativeResources::NoteBufferRequest(device_addr, size, is_written,
                                              Core::NativeResources::BufferPath::Arena, last_upload_bytes);
     if (is_written) {
