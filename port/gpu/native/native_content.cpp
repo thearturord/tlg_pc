@@ -865,6 +865,20 @@ std::atomic<u64> c_fs_base_bytes{0}, c_fs_base_entries{0}, c_fs_base_added_bytes
 u32 SubmitIndexOf(u64 seq); // below
 void FsRetireLocked(FsFrame&& frame); // below
 
+/// M5 follow-up (`TLG_FS_RECHECK=1`): is a captured version ever wrong? A writer that announces before it writes (1 skinning, 2 lights, 4 recording stores) can have its range captured at the
+/// submission while the write is still going on: the version is then the old bytes and nothing recaptures it. Two submissions later every chunk of the frame is compared with the memory: a
+/// difference that no later announcement explains (the ledger's newest write for the range is not newer than the chunk) is such a case, or a write nobody announced.
+bool FsRecheckOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_FS_RECHECK");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    return on;
+}
+std::atomic<u64> c_recheck_chunks{0}, c_recheck_bytes{0}, c_recheck_changed_chunks{0}, c_recheck_explained{0}, c_recheck_unexplained_chunks{0}, c_recheck_unexplained_bytes{0};
+std::atomic<u64> c_recheck_unexplained_by_writer[16]{}, c_recheck_unexplained_bytes_by_writer[16]{}, c_recheck_noted[16]{};
+void FsRecheckLocked(const FsFrame& frame); // below
+
 struct FsKindCounters {
     std::atomic<u64> reads{0}, reads_overlapping{0}, reads_with_differences{0}, bytes_covered{0}, bytes_equal{0}, bytes_differ{0}, unreadable{0};
 };
@@ -969,6 +983,9 @@ void NoteSubmit(const std::vector<std::pair<u64, u64>>& ranges) {
         {
             std::scoped_lock lock{g_fs_mutex};
             c_fs_live_bytes.fetch_add(frame.bytes, std::memory_order_relaxed);
+            if (FsRecheckOn() && g_fs_frames.size() >= 2) {
+                FsRecheckLocked(g_fs_frames[g_fs_frames.size() - 2]);
+            }
             g_fs_frames.push_back(std::move(frame));
             while (g_fs_frames.size() > FsKeep) {
                 c_fs_live_bytes.fetch_sub(g_fs_frames.front().bytes, std::memory_order_relaxed);
@@ -1100,6 +1117,34 @@ void FsBaseAddLocked(u64 b, u64 e, u32 index, const std::shared_ptr<u8[]>& owner
     g_fs_base.emplace(b, FsBaseChunk{e, index, owner, data});
     g_fs_base_bytes += e - b;
     c_fs_base_added_bytes.fetch_add(e - b, std::memory_order_relaxed);
+}
+
+void FsRecheckLocked(const FsFrame& frame) {
+    for (const FsChunk& chunk : frame.chunks) {
+        c_recheck_chunks.fetch_add(1, std::memory_order_relaxed);
+        c_recheck_bytes.fetch_add(chunk.size, std::memory_order_relaxed);
+        u64 first_diff = ~0ull;
+        if (!GuardedCompare(reinterpret_cast<const void*>(chunk.address), chunk.bytes.get(), chunk.size, first_diff) || first_diff == ~0ull) {
+            continue;
+        }
+        c_recheck_changed_chunks.fetch_add(1, std::memory_order_relaxed);
+        const LedgerAnswer a = LedgerQuery(chunk.address, chunk.address + chunk.size);
+        // an announcement made after this chunk's period explains the change (announced with `submit` = index - 1 of its capture, so >= frame.index is later)
+        if (a.covered != 0 && a.newest_submit >= frame.index) {
+            c_recheck_explained.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        const u32 w = std::min<u32>(a.newest_writer, 15u);
+        c_recheck_unexplained_chunks.fetch_add(1, std::memory_order_relaxed);
+        c_recheck_unexplained_bytes.fetch_add(chunk.size - first_diff, std::memory_order_relaxed);
+        c_recheck_unexplained_by_writer[w].fetch_add(1, std::memory_order_relaxed);
+        c_recheck_unexplained_bytes_by_writer[w].fetch_add(chunk.size - first_diff, std::memory_order_relaxed);
+        if (c_recheck_noted[w].fetch_add(1, std::memory_order_relaxed) < 3) {
+            Core::RareEvents::Note(fmt::format("m5_captured_version_changed_unannounced_writer{}", w),
+                                   fmt::format("{:#x} + {:#x}: captured in submission {} (first differing byte {}), ledger: newest write in submission {} (stamp {}), writer {}", chunk.address, chunk.size, frame.index,
+                                               first_diff, a.newest_submit, a.newest, a.newest_writer));
+        }
+    }
 }
 
 /// M3: a frame fell out of the window: what of its chunks no newer version in the window covers becomes the retired layer's version of that memory. g_fs_mutex held.
@@ -1464,6 +1509,19 @@ nlohmann::json FrameStoreSummary() {
             {"bytes_captured", c_fs_bytes.load()},
             {"largest_frame_bytes", c_fs_max_frame_bytes.load()},
             {"bytes_held_now", c_fs_live_bytes.load()},
+            {"recheck", [&] {
+                 nlohmann::json j = {{"on", FsRecheckOn()}, {"chunks_compared", c_recheck_chunks.load()}, {"bytes_compared", c_recheck_bytes.load()}, {"chunks_changed_since_capture", c_recheck_changed_chunks.load()},
+                                     {"changed_and_explained_by_a_later_announcement", c_recheck_explained.load()}, {"changed_unexplained_chunks", c_recheck_unexplained_chunks.load()},
+                                     {"changed_unexplained_bytes", c_recheck_unexplained_bytes.load()}};
+                 nlohmann::json by = nlohmann::json::object();
+                 for (u32 w = 0; w < 16; ++w) {
+                     if (const u64 n = c_recheck_unexplained_by_writer[w].load()) {
+                         by[std::to_string(w)] = {{"chunks", n}, {"bytes", c_recheck_unexplained_bytes_by_writer[w].load()}};
+                     }
+                 }
+                 j["unexplained_by_newest_writer"] = by;
+                 return j;
+             }()},
             {"pre_write_map_opens_seen", c_pre_calls.load()},
             {"pre_write_never_written_before", c_pre_never_written.load()},
             {"pre_write_written_in_the_running_period", c_pre_written_this_period.load()},
