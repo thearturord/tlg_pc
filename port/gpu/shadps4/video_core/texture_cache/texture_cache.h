@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <functional>
+#include "native/native_image_index.h"
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -40,7 +42,7 @@ namespace VideoCore {
 class BufferCache;
 class ReadbackBatch;
 
-class TextureCache {
+class TextureCache : public Core::NativeImageIndex::Host {
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
     static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 3_GB;
     static constexpr s64 TARGET_GC_THRESHOLD = 8_GB;
@@ -116,46 +118,31 @@ public:
         return tile_manager;
     }
 
-    /// B8.1: the engine announced a CPU write of [addr, addr + size) (applied in order on the raster thread); the images it touches are marked, and in native mode
-    /// dirtied (`newer` false, the second application: an image the GPU wrote since is left alone)
-    void NoteAnnouncedWrite(VAddr addr, size_t size, bool newer);
-    /// B8.2: the engine deleted the texture whose memory is [address, address + bytes): its images (same memory, not bigger) are freed (`free`) or marked (audit)
-    void NoteEngineTextureDelete(u64 id, VAddr address, u64 bytes, bool free);
-    /// B8.4: the engine created a texture at [address, address + bytes): older images in that memory are unlisted (a lookup that gives one out refreshes it)
-    void NoteEngineTextureCreate(VAddr address, u64 bytes);
-    /// B8.4: the images listed for the engine textures `ids` (their own and their remembered answers) that meet [address, address + size), each once
-    void EngineImagesIn(const std::vector<u64>& ids, VAddr address, u64 size, SmallVector<ImageId, 8>& out) const;
-    /// B11: an engine clear of a texture that has no image yet; applied to its first image when the lookup lists it
-    struct EngineClear {
-        bool depth{}, fast{};
-        u32 flags{}, stencil{};
-        float value[4]{};
-        u32 mip{}, first_layer{}, layer_count{}; ///< layer_count 0: every layer
-    };
-    void SetEnginePendingClear(u64 id, const EngineClear& clear) {
-        engine_pending_clears[id] = clear;
+    /// The engine's textures and buffers and the images of this cache that belong to them (native/native_image_index.h).
+    [[nodiscard]] Core::NativeImageIndex& EngineIndex() noexcept {
+        return engine_index;
     }
+    using EngineClear = Core::NativeImageIndex::Clear;
+    using EngineAnswer = Core::NativeImageIndex::Answer;
     /// B11: the clear value of an engine color clear for `format` (integer formats take the values as integers)
     static vk::ClearValue EngineColorValue(vk::Format format, const float (&value)[4]);
-    /// B8.5: an engine buffer was created (images already in its memory join its list) / deleted (its list goes)
-    void NoteEngineBufferCreate(u64 id, VAddr address, u64 bytes);
-    void NoteEngineBufferDelete(u64 id) {
-        buffer_images.erase(id);
-        buffers_known.erase(id);
+
+    // ---- Core::NativeImageIndex::Host ----
+    bool Live(ImageId id, u64 uid) const override;
+    bool Registered(ImageId id) const override;
+    bool Overlaps(ImageId id, VAddr address, u64 size) const override;
+    u64 Uid(ImageId id) const override;
+    VAddr GuestAddress(ImageId id) const override;
+    u64 GuestSize(ImageId id) const override;
+    bool AnyImageIn(VAddr address, u64 size) override {
+        return AnyImageOverlaps(address, size);
     }
-    /// B8.5: the images the engine buffers meeting [address, address + size) list (each once); false when live buffers do not cover the range whole
-    bool BufferImagesIn(VAddr address, u64 size, SmallVector<ImageId, 8>& out);
-    /// B11: the type EngineImagesOf fills
-    static SmallVector<ImageId, 4> EngineImagesOfType();
-    /// B11: the engine texture's own images (its list, registered)
-    void EngineImagesOf(u64 id, SmallVector<ImageId, 4>& out) const {
-        if (const auto it = engine_images.find(id); it != engine_images.end()) {
-            for (const auto& [image_id, uid] : it->second) {
-                if (slot_images.IsAllocated(image_id) && slot_images[image_id].image_uid == uid && True(slot_images[image_id].flags & ImageFlagBits::Registered)) {
-                    out.push_back(image_id);
-                }
-            }
-        }
+    void ForEachImageIn(VAddr address, u64 size, const std::function<void(ImageId)>& func) override;
+    bool ClearListed(ImageId id) override;
+    Announced ApplyAnnounced(ImageId id, VAddr address, u64 size, bool newer) override;
+    void MarkDeleted(ImageId id) override;
+    void Free(ImageId id) override {
+        FreeImage(id);
     }
 
     /// Marks an image as dirty if it exists at the provided address.
@@ -466,24 +453,10 @@ private:
     BufferCache& buffer_cache;
     PageTable page_table;
     Common::SlotVector<Image> slot_images;
-    /// B8.3: the images of each engine texture (by its id; slot and uid, a stale entry is skipped), raster thread
-    std::unordered_map<u64, SmallVector<std::pair<ImageId, u64>, 2>> engine_images;
+    Core::NativeImageIndex engine_index{*this};
     /// F2.3 : the registered images that lie inside the frame ring, by address; `ring_max_size` is the largest guest size seen (bounds the scan for an overlap from the left)
     std::multimap<VAddr, ImageId> ring_images;
     u64 ring_max_size{};
-    std::unordered_map<u64, EngineClear> engine_pending_clears; ///< B11 step 6, by engine texture id
-    std::unordered_map<u64, SmallVector<std::pair<ImageId, u64>, 2>> buffer_images; ///< B8.5, by engine buffer id: the images in its memory
-    std::unordered_set<u64> buffers_known; ///< B8.5: engine buffers whose creation was handled (their memory's older images listed)
-    /// B8.4: the other answers of each engine texture's lookups (a view of another format or size, a mip or layer of a bigger image), by the request; valid while no
-    /// image was registered or removed in the range since (the event ring)
-    struct EngineAnswer {
-        u64 key{};
-        ImageId image_id{};
-        u64 uid{};
-        u64 generation{};
-        s32 mip{-1}, slice{-1};
-    };
-    std::unordered_map<u64, SmallVector<EngineAnswer, 2>> engine_answers;
     Common::SlotVector<ImageView> slot_image_views;
     Common::SlotVector<Sampler> slot_samplers;
     BlitHelper blit_helper;

@@ -203,8 +203,8 @@ bool Rasterizer::NativeClear(const Core::NativeDevice::ClearRecord& record) {
     }
     // a view of a 3D texture (slices): the whole texture
     const bool slices = resource.depth > 1 || record.layer_count == 0;
-    decltype(std::declval<VideoCore::TextureCache&>().EngineImagesOfType()) ids;
-    texture_cache.EngineImagesOf(record.resource_id, ids);
+    SmallVector<VideoCore::ImageId, 4> ids;
+    texture_cache.EngineIndex().ImagesOf(record.resource_id, ids);
     // the view's mip and layers, in every image of the texture that holds them (an image of the texture's memory with the texture's size; it may hold fewer mips
     // or layers); an image of another size at that memory is another view of it and is left alone
     boost::container::small_vector<std::pair<VideoCore::ImageId, VideoCore::SubresourceRange>, 4> targets;
@@ -230,7 +230,7 @@ bool Rasterizer::NativeClear(const Core::NativeDevice::ClearRecord& record) {
         VideoCore::TextureCache::EngineClear clear{.depth = record.kind == 1, .fast = fast_clear, .flags = record.flags, .stencil = record.stencil,
                                                    .mip = record.mip, .first_layer = slices ? 0 : record.first_layer, .layer_count = slices ? 0 : record.layer_count};
         std::memcpy(clear.value, record.value, sizeof(clear.value));
-        texture_cache.SetEnginePendingClear(record.resource_id, clear);
+        texture_cache.EngineIndex().SetPendingClear(record.resource_id, clear);
         Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeClearBeforeImage);
         Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeDone);
         ++recorded_work;
@@ -283,13 +283,13 @@ void Rasterizer::EngineObjectDeleted(u64 id, VAddr address, u64 bytes, u32 what)
         native_image_keys.erase(it);
     }
     if (what == 4) {
-        texture_cache.NoteEngineBufferDelete(id); // B8.5
+        texture_cache.EngineIndex().NoteBufferDelete(id); // B8.5
         buffer_cache.NoteEngineBufferDelete(id, address, bytes, Core::NativeUpdates::B9LifetimeMode() == 2);
         return;
     }
     if (what == 1 || what == 3) {
         // a texture with a live alias at its memory keeps its images (its lists go)
-        texture_cache.NoteEngineTextureDelete(id, address, bytes, Core::NativeUpdates::B8LifetimeMode() == 2 && what == 1);
+        texture_cache.EngineIndex().NoteTextureDelete(id, address, bytes, Core::NativeUpdates::B8LifetimeMode() == 2 && what == 1);
     }
 }
 

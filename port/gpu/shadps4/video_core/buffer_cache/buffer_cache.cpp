@@ -123,7 +123,7 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
     }
     const u32 b8 = Core::NativeUpdates::B8ImageMode();
     if (b8 != 0) {
-        texture_cache.NoteAnnouncedWrite(address, size, newer);
+        texture_cache.EngineIndex().NoteAnnouncedWrite(address, size, newer);
     }
 }
 
