@@ -51,6 +51,11 @@ void NoteSubmit(const std::vector<std::pair<u64, u64>>& ranges);
 /// M5 follow-up: the raster thread starts the record `seq` (called from `SetCurrentDraw`). The oldest submission it can still read for is the one that carries this record: a retired version
 /// stays alive as long as a newer version could not have been the one such a read picks.
 void NoteRasterRecord(u64 seq);
+/// Counter ring (native_counter_ring.h): the names of the counters `CounterSample` returns, and their values now (cumulative, same order). Per kind of late read: reads written after
+/// their record, those bytes, store reads with differences, served reads, replaced reads and bytes, hole reads and bytes, first write bytes, loader skipped bytes; then per writer 0..7 the bytes
+/// read late and the hole bytes; then the recheck's unexplained chunks.
+[[nodiscard]] const std::vector<std::string>& CounterNames();
+void CounterSample(std::vector<u64>& values);
 /// M3: a thread maps [address, address + size) for writing (before the write): if the memory holds a version no capture holds (a loader's write, never captured), it is kept as the retired layer's
 /// version, so a late reader of an earlier record still gets the bytes this write is about to replace. Only with `TLG_FRAME_STORE=2`.
 void NoteMapOpen(u64 address, u64 size);

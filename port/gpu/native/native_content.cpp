@@ -1561,6 +1561,54 @@ std::atomic<u64> c_check_record_seen{0}, c_check_no_record_after_a_record{0};
 std::atomic<u64> c_check_margin_log2[LateKinds][40]{}; ///< checked reads by log2(draw record - newest write stamp): how many records ahead of the draw the memory was last written
 } // namespace
 
+const std::vector<std::string>& CounterNames() {
+    static const std::vector<std::string> names = [] {
+        std::vector<std::string> n;
+        static constexpr const char* per_kind[] = {"written_after_reads", "written_after_bytes", "store_reads_with_differences", "served_reads", "replaced_reads", "replaced_bytes",
+                                                   "hole_reads", "hole_bytes", "first_write_bytes", "loader_skip_bytes"};
+        for (size_t k = 0; k < LateKinds; ++k) {
+            for (const char* name : per_kind) {
+                n.push_back(std::string(LateKindNames[k]) + "." + name);
+            }
+        }
+        for (u32 w = 0; w < 8; ++w) {
+            n.push_back("writer" + std::to_string(w) + ".late_bytes");
+            n.push_back("writer" + std::to_string(w) + ".hole_bytes");
+        }
+        n.push_back("recheck_unexplained_chunks");
+        return n;
+    }();
+    return names;
+}
+
+void CounterSample(std::vector<u64>& values) {
+    values.clear();
+    constexpr auto relaxed = std::memory_order_relaxed;
+    for (size_t k = 0; k < LateKinds; ++k) {
+        const auto& s = c_fs_serve[k];
+        values.push_back(c_check[k][CheckWrittenAfter].load(relaxed));
+        values.push_back(c_check_bytes[k][CheckWrittenAfter].load(relaxed));
+        values.push_back(c_fs_kind[k].reads_with_differences.load(relaxed));
+        values.push_back(s.reads.load(relaxed));
+        values.push_back(s.replaced_reads.load(relaxed));
+        values.push_back(s.replaced_bytes.load(relaxed));
+        values.push_back(s.hole_reads.load(relaxed));
+        values.push_back(s.hole_bytes.load(relaxed));
+        values.push_back(s.first_write_bytes.load(relaxed));
+        values.push_back(s.loader_skip_bytes.load(relaxed));
+    }
+    for (u32 w = 0; w < 8; ++w) {
+        u64 late = 0, hole = 0;
+        for (size_t k = 0; k < LateKinds; ++k) {
+            late += c_late_after_bytes_by_writer[k][w].load(relaxed);
+            hole += c_fs_serve[k].hole_bytes_by_writer[w].load(relaxed);
+        }
+        values.push_back(late);
+        values.push_back(hole);
+    }
+    values.push_back(c_recheck_unexplained_chunks.load(relaxed));
+}
+
 void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
     if (!LedgerOn() || size == 0) {
         return;

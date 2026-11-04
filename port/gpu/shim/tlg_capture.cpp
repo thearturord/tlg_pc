@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 
+#include "native/native_counter_ring.h"
 #include "tlg_capture.h"
 #include "native/native_light_recorder.h"
 #include <fmt/format.h>
@@ -510,6 +511,7 @@ void MonitorFrame(double mean, u64 tick) {
     if (drop > 2.0 && drop > 2.0 * spread) {
         ++monitor_dark;
         Core::LightRecorder::Dump(fmt::format("dark{}", monitor_dark).c_str(), monitor_frames - 1);
+        Core::CounterRing::Mark("dark", monitor_ticks[1]);
         LOG_WARNING(Render, "dark frame {}: monitor frame {} (tick {}) brightness {:.1f}, neighbours {:.1f} and {:.1f}", monitor_dark, monitor_frames - 1,
                     monitor_ticks[1], monitor_means[1], monitor_means[0], monitor_means[2]);
         constexpr u64 row = u64{MonitorWidth} * 4;
@@ -541,6 +543,7 @@ void MonitorFrame(double mean, u64 tick) {
                 ++bright;
                 const u64 frame = single ? monitor_frames - 1 : monitor_frames - 2;
                 Core::LightRecorder::Dump(fmt::format("bright{}", bright).c_str(), frame);
+                Core::CounterRing::Mark("bright", monitor_ticks[1]);
                 LOG_WARNING(Render, "bright frame {}: monitor frame {} ({}), brightness {:.1f}, around it {:.1f} and {:.1f}", bright, frame, single ? "one frame" : "two frames, this is the second",
                             single ? monitor_means[1] : last[2], single ? monitor_means[0] : last[0], single ? monitor_means[2] : last[3]);
             }
@@ -658,6 +661,7 @@ void Record(const Vulkan::Instance& instance, vk::CommandBuffer cmdbuf, vk::Imag
             copied = true;
         }
     }
+    Core::CounterRing::NotePresent(tick);
     if (MonitorOn()) {
         Slot* slot = nullptr;
         for (auto& s : monitor_slots) {
