@@ -22,7 +22,7 @@ extern std::atomic<bool> enabled;
 /// Called on the render thread (the thread of RenderDev::BeginRecording): announcements are counted as made on that thread or elsewhere.
 void NoteRenderThread();
 /// The engine mapped a buffer: `address` / `size` are what Map returned (the buffer's own memory, or a window of the frame ring), `memory` the buffer's own memory.
-void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u64 memory, u64 caller, u64 requested_size = 0);
+void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u64 memory, u64 caller, u64 requested_size = 0, u32 context_frame = 0, u32 resource_stamp = 0, u32 bind_flags = 0);
 /// JsDeviceContext::Unmap(context, resource, subresource) (an empty function of the engine, hooked): the writes into the memory the thread's Map of this resource handed
 /// out are finished; that range (the requested size or the whole mapped size) is announced.
 void NoteUnmap(u64 resource_id);

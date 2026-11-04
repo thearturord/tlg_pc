@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <memory>
@@ -64,13 +65,39 @@ struct OpenMap {
     u64 serial{}; ///< order in which Maps were made (FlushOpenMapsSince)
     u64 stamp{}; ///< the number the next record got when the Map was made (F2.2: a draw of an earlier record cannot depend on the write)
     bool in_ring{};
+    u64 caller{}; ///< the guest return address of the Map call (TLG_WRITER_SITES names the write site after it)
 };
 std::mutex open_map_mutex;
+std::mutex site_mutex;
+std::map<std::string, std::array<u64, 13>> map_diff; ///< caller/path -> count by (context frame - resource stamp), 12 = 12 or more (and wrap-around)
 u64 open_map_serial = 0;
 std::map<std::pair<u64, u64>, OpenMap> open_maps; ///< (thread, resource id) -> the window of the Map that has not been unmapped yet
 } // namespace
 
 void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp = 0);
+
+namespace {
+/// TLG_WRITER_SITES: sets the call site of the write a map announces: for a map into the buffer's own memory the caller (guest address in Ghidra numbering) so the late read census names it
+void SetMapSite(const OpenMap& map, bool sites_on) {
+    if (!sites_on) {
+        return;
+    }
+    if (map.in_ring) {
+        NativeContent::SetSite(NativeContent::SiteId("Map into a frame ring window"));
+        return;
+    }
+    char name[64];
+    std::snprintf(name, sizeof(name), "Map own @%llx", static_cast<unsigned long long>(map.caller - NativeDraw::ImageBase() + 0x1000000ull));
+    NativeContent::SetSite(NativeContent::SiteId(name));
+}
+bool MapSitesOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_WRITER_SITES");
+        return e != nullptr && *e != 0 && *e != '0';
+    }();
+    return on;
+}
+} // namespace
 
 void NoteRenderThread() {
     render_thread.store(std::hash<std::thread::id>{}(std::this_thread::get_id()), std::memory_order_relaxed);
@@ -85,7 +112,9 @@ void NoteRenderThread() {
         open_maps.clear();
     }
     for (const auto& [thread, map] : stale) {
+        SetMapSite(map, MapSitesOn());
         NoteWriterRangeOf(0, map.address, map.size, thread, map.stamp);
+        NativeContent::SetSite(0);
     }
     NativeUploads::PublishPending(NativeDraw::NextSeq());
 }
@@ -119,7 +148,16 @@ void NoteUnmap(u64 resource_id) {
         open_maps.erase(it);
     }
     NativeUploads::SnapshotTake(map.address, map.size, NativeDraw::NextSeq());
-    NoteWriterRange(0, map.address, map.size, map.in_ring ? "Map into a frame ring window" : "Map into the buffer's own memory");
+    char own_name[64];
+    const char* site = "Map into a frame ring window";
+    if (!map.in_ring) {
+        site = "Map into the buffer's own memory";
+        if (MapSitesOn()) {
+            std::snprintf(own_name, sizeof(own_name), "Map own @%llx", static_cast<unsigned long long>(map.caller - NativeDraw::ImageBase() + 0x1000000ull));
+            site = own_name;
+        }
+    }
+    NoteWriterRange(0, map.address, map.size, site);
 }
 
 u64 OpenMapSerial() {
@@ -142,7 +180,9 @@ void FlushOpenMapsSince(u64 serial) {
         }
     }
     for (const OpenMap& map : done) {
+        SetMapSite(map, MapSitesOn());
         NoteWriterRangeOf(0, map.address, map.size, thread, map.stamp);
+        NativeContent::SetSite(0);
     }
 }
 
@@ -156,12 +196,19 @@ bool OpenMapOverlaps(u64 address, u64 size) {
     return false;
 }
 
-void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u64 memory, u64 caller, u64 requested_size) {
-    (void)caller;
+void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u64 memory, u64 caller, u64 requested_size, u32 context_frame, u32 resource_stamp, u32 bind_flags) {
     maps.total.fetch_add(1, std::memory_order_relaxed);
     maps.by_type[map_type < 8 ? map_type : 7].fetch_add(1, std::memory_order_relaxed);
     maps.by_usage[usage < 4 ? usage : 3].fetch_add(1, std::memory_order_relaxed);
     const bool in_ring = address != memory;
+    if (MapSitesOn() && map_type >= 2 && address != 0) {
+        // the game's Map rule: ring memory when (frame - stamp) < 3, else in place. Per caller and path: how many frames since the buffer was last stamped
+        const u32 diff = context_frame - resource_stamp;
+        std::scoped_lock diff_lock{site_mutex};
+        char name[72];
+        std::snprintf(name, sizeof(name), "@%llx type%u %s bind%x usage%u", static_cast<unsigned long long>(caller - NativeDraw::ImageBase() + 0x1000000ull), map_type, in_ring ? "ring" : "inplace", bind_flags & 0xff, usage);
+        ++map_diff[name][std::min<u32>(diff, 12u)];
+    }
     (in_ring ? maps.in_ring : maps.own_memory).fetch_add(1, std::memory_order_relaxed);
     if (address == 0 || size == 0 || map_type == 1) {
         return;
@@ -170,7 +217,7 @@ void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u6
     const u64 written = requested_size != 0 && requested_size < size ? requested_size : size;
     NativeContent::NoteMapOpen(address, written); // M3: before the write
     std::scoped_lock lock{open_map_mutex};
-    open_maps[{ThreadKey(), resource_id}] = {address, written, ++open_map_serial, NativeDraw::NextSeq(), in_ring};
+    open_maps[{ThreadKey(), resource_id}] = {address, written, ++open_map_serial, NativeDraw::NextSeq(), in_ring, caller};
     (void)usage, (void)in_ring;
 }
 
@@ -179,7 +226,6 @@ struct SiteStat {
     u64 count{}, bytes{}, largest{};
     u64 by_size_log2[40]{};
 };
-std::mutex site_mutex;
 std::map<std::pair<u32, std::string>, SiteStat> site_stats;
 bool SitesOn() {
     static const bool on = [] {
@@ -487,6 +533,14 @@ nlohmann::json Report() {
     }
     if (SitesOn()) {
         std::scoped_lock lock{site_mutex};
+        for (const auto& [name, diffs] : map_diff) {
+            auto& e = j["map_frame_minus_stamp"][name];
+            for (u32 i = 0; i < 13; ++i) {
+                if (diffs[i] != 0) {
+                    e[std::to_string(i)] = diffs[i];
+                }
+            }
+        }
         auto& sites = j["writer_sites"] = nlohmann::json::object();
         for (const auto& [key, stat] : site_stats) {
             auto& e = sites[std::to_string(key.first) + " " + key.second];

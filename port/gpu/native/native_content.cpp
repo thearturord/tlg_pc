@@ -140,7 +140,7 @@ std::atomic<u64> c_ledger_notes{0}, c_ledger_overflow{0};
 u64 g_ledger_max_len = 0;
 std::vector<std::pair<u64, u64>> g_fs_pending; ///< M1: ranges announced since the last submission (only filled with the store on; under g_ledger_mutex)
 
-constexpr u32 MaxSites = 64;
+constexpr u32 MaxSites = 160;
 thread_local u32 t_site = 0;
 std::mutex g_site_mutex;
 std::vector<std::string> g_site_names{"?"};

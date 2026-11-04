@@ -6997,9 +6997,16 @@ u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4
         const u64 original_map = Core::GuestHooks::OriginalEntry("Map");
         const u64 out_map = Rd<u64>(caller_rsp, 0);
         if (original_map != 0 && out_map != 0 && (out_map & 7) == 0) {
+            // native-v3-writers (TLG_MAP_RING=1): the game's Map writes a buffer in place when the buffer was last used (stamp [resource + 0x2c]) three or more frames ago, else into frame ring memory with
+            // a GPU ordered copy at the Unmap. Dynamic shader resource / vertex buffers that the draw and dispatch bind code never stamps (frame minus stamp 12 or more in 100 % of their Maps, callers
+            // 0x1c4594d, 0x1c446f0, 0x1c55885 and more) are always written in place while the raster thread may still read them. Stamping a WRITE_DISCARD buffer as used now sends it down the ring path.
+            static const bool map_ring = [] { const char* e = std::getenv("TLG_MAP_RING"); return e != nullptr && e[0] == '1'; }();
+            if (map_ring && type == 4) {
+                Wr<u32>(resource, 0x2c, Rd<u32>(ctx, 0x47ac));
+            }
             const u64 result = reinterpret_cast<GuestMap7>(original_map)(ctx, resource, subresource, type, a4, size, out_map);
             Core::NativeUpdates::NoteMap(Rd<u64>(resource, 0x10), Core::NativeResources::ResourceUsage(resource), static_cast<u32>(type), Rd<u64>(out_map, 0),
-                                         Rd<u32>(out_map, 8), Rd<u64>(resource, 0x30), ret, size);
+                                         Rd<u32>(out_map, 8), Rd<u64>(resource, 0x30), ret, size, Rd<u32>(ctx, 0x47ac), Rd<u32>(resource, 0x2c), Rd<u32>(resource, 0x188));
             Core::NativeDevice::NoteMapped(Rd<u64>(resource, 0x10), Rd<u64>(out_map, 0), Rd<u32>(out_map, 8), static_cast<u32>(type));
             count_map(0);
             return 0x8000000000000000ull | (result & 0x7fffffffffffffffull);
