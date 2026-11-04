@@ -8,6 +8,7 @@
 
 #include "native/native_shader_env.h"
 #include "native/native_target_desc.h"
+#include "native/native_target_inputs.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_fixed_state.h"
 
@@ -26,10 +27,15 @@ const std::array<u32, AmdGpu::Regs::NumRegs>& InputWordMap() {
             }
         };
 #define TLG_INPUT_MEMBER(name) add(offsetof(AmdGpu::Regs, name), offsetof(DrawInputs, name), sizeof(DrawInputs::name))
-        TLG_INPUT_MEMBER(color_buffers);
-        TLG_INPUT_MEMBER(depth_buffer);
-        TLG_INPUT_MEMBER(depth_view);
-        TLG_INPUT_MEMBER(depth_control);
+        // G1b: the target descriptions are kept as the register words (`raw_targets`); NativeTarget::DecodeAll makes the plain members from them
+        using Core::NativeTarget::RawTargetWords;
+        const size_t raw = offsetof(DrawInputs, raw_targets);
+        static_assert(sizeof(AmdGpu::Regs::color_buffers) == sizeof(RawTargetWords::color));
+        static_assert(sizeof(AmdGpu::Regs::depth_buffer) == sizeof(RawTargetWords::depth));
+        add(offsetof(AmdGpu::Regs, color_buffers), raw + offsetof(RawTargetWords, color), sizeof(RawTargetWords::color));
+        add(offsetof(AmdGpu::Regs, depth_buffer), raw + offsetof(RawTargetWords, depth), sizeof(RawTargetWords::depth));
+        add(offsetof(AmdGpu::Regs, depth_view), raw + offsetof(RawTargetWords, depth_view), sizeof(RawTargetWords::depth_view));
+        add(offsetof(AmdGpu::Regs, depth_control), raw + offsetof(RawTargetWords, depth_control), sizeof(RawTargetWords::depth_control));
         TLG_INPUT_MEMBER(depth_htile_data_base);
         TLG_INPUT_MEMBER(depth_render_control);
         TLG_INPUT_MEMBER(depth_clear);
@@ -85,6 +91,7 @@ Vulkan::DrawInputs FromRecord(const NativeDraw::ExecDraw& draw, u32 index_count)
     Vulkan::DrawInputs in{};
     ApplyRegisters(in, draw, 0, draw.count);
     NativeTargetDesc::ApplyAtFill(in);
+    NativeTarget::DecodeAll(in);
     ApplyDrawArgs(in, draw.args);
     if (index_count != ~0u) {
         in.num_indices = index_count;
@@ -101,6 +108,7 @@ Vulkan::DrawInputs ForDepthClear(const NativeDraw::ExecDraw& draw) {
     Vulkan::DrawInputs in{};
     ApplyRegisters(in, draw, 0, draw.count);
     NativeTargetDesc::ApplyDepthClear(in, draw.native_targets); // E7 (TLG_TARGET_DESC_USE)
+    NativeTarget::DecodeDepth(in);
     return in;
 }
 
@@ -108,6 +116,7 @@ void ForEliminate(Vulkan::DrawInputs& in, const NativeDraw::ExecDraw& draw) {
     in = Vulkan::DrawInputs{};
     ApplyRegisters(in, draw, 0, draw.count);
     NativeTargetDesc::ApplyEliminate(in, draw.native_targets); // E7 (TLG_TARGET_DESC_USE)
+    NativeTarget::DecodeAll(in);
 }
 
 } // namespace Core::NativeDrawInputs

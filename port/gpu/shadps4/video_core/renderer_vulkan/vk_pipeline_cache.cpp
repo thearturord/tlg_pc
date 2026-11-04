@@ -771,8 +771,8 @@ bool PipelineCache::RefreshGraphicsKey() {
         return false; // F3.5: the key's targets are the plan's inputs (the native target description)
     }
     live.key_targets[0].fetch_add(1, std::memory_order_relaxed);
-    const AmdGpu::DepthBuffer& depth_buffer = lookup_inputs->depth_buffer;
-    const AmdGpu::ColorBuffer* color_buffers = lookup_inputs->color_buffers;
+    const Core::NativeTarget::DepthTarget& depth_buffer = lookup_inputs->depth_buffer;
+    const Core::NativeTarget::ColorTarget* color_buffers = lookup_inputs->color_buffers;
     // the export format of each target is the pixel shader's (SPI_SHADER_COL_FORMAT): from its environment
     Core::NativeShaderEnv::DrawEnv shader_env;
     const bool have_env = Core::NativeShaderEnv::Current(shader_env);
@@ -781,10 +781,10 @@ bool PipelineCache::RefreshGraphicsKey() {
     const bool db_enabled = depth_buffer.DepthValid() || depth_buffer.StencilValid();
 
     key.z_format = depth_buffer.DepthValid() ? depth_buffer.z_info.format
-                                             : AmdGpu::DepthBuffer::ZFormat::Invalid;
+                                             : Core::NativeTarget::DepthTarget::ZFormat::Invalid;
     key.stencil_format = depth_buffer.StencilValid()
                              ? depth_buffer.stencil_info.format
-                             : AmdGpu::DepthBuffer::StencilFormat::Invalid;
+                             : Core::NativeTarget::DepthTarget::StencilFormat::Invalid;
     key.depth_clamp_enable = fixed.depth_clamp;
     key.depth_clip_enable = fixed.depth_clip;
     key.negative_one_to_one = fixed.negative_one_to_one;

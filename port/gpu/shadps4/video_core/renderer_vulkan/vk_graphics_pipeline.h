@@ -48,8 +48,8 @@ struct GraphicsPipelineKey {
     std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples;
     u32 mrt_mask;
     struct {
-        AmdGpu::DepthBuffer::ZFormat z_format : 2;
-        AmdGpu::DepthBuffer::StencilFormat stencil_format : 1;
+        Core::NativeTarget::DepthTarget::ZFormat z_format : 2;
+        Core::NativeTarget::DepthTarget::StencilFormat stencil_format : 1;
         u32 depth_clamp_enable : 1;
     };
     struct {

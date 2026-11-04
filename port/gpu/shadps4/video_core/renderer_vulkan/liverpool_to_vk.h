@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "native/native_target_inputs.h"
 #include <span>
 #include "common/assert.h"
 #include "video_core/amdgpu/pixel_format.h"
@@ -17,7 +18,7 @@ namespace Vulkan::LiverpoolToVK {
 
 vk::StencilOp StencilOp(AmdGpu::StencilFunc op);
 
-vk::CompareOp CompareOp(AmdGpu::CompareFunc func);
+vk::CompareOp CompareOp(Core::NativeTarget::CompareFunc func);
 
 bool IsPrimitiveCulled(AmdGpu::PrimitiveType type);
 
@@ -65,17 +66,17 @@ struct SurfaceFormatInfo {
 std::span<const SurfaceFormatInfo> SurfaceFormats();
 
 struct DepthFormatInfo {
-    AmdGpu::DepthBuffer::ZFormat z_format;
-    AmdGpu::DepthBuffer::StencilFormat stencil_format;
+    Core::NativeTarget::DepthTarget::ZFormat z_format;
+    Core::NativeTarget::DepthTarget::StencilFormat stencil_format;
     vk::Format vk_format;
     vk::FormatFeatureFlags2 flags;
 };
 std::span<const DepthFormatInfo> DepthFormats();
 
-vk::Format DepthFormat(AmdGpu::DepthBuffer::ZFormat z_format,
-                       AmdGpu::DepthBuffer::StencilFormat stencil_format);
+vk::Format DepthFormat(Core::NativeTarget::DepthTarget::ZFormat z_format,
+                       Core::NativeTarget::DepthTarget::StencilFormat stencil_format);
 
-vk::ClearValue ColorBufferClearValue(const AmdGpu::ColorBuffer& color_buffer);
+vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& color_buffer);
 
 vk::SampleCountFlagBits NumSamples(u32 num_samples, vk::SampleCountFlags supported_flags);
 

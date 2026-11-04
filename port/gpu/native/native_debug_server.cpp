@@ -19,6 +19,7 @@
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
 #include "native/native_dispatch_inputs.h"
+#include "native/native_target_inputs.h"
 #include "native/native_debug_server.h"
 #include "native/native_log.h"
 #include "native/native_config.h"
@@ -223,6 +224,7 @@ nlohmann::json Native(const Params&) {
     j["sync_packets_kept"] = live.fence_packets_kept.load();
     j["register_wait_polls"] = Core::NativeSync::RegisterWaitReport();
     j["g1_dispatch_inputs"] = Core::NativeDispatch::Report();
+    j["g1_target_inputs"] = Core::NativeTarget::Report();
     j["sync_converted"] = {{"eop", live.sync_converted[1].load()}, {"release", live.sync_converted[2].load()}, {"wait", live.sync_converted[3].load()}, {"write", live.sync_converted[4].load()}, {"event", live.sync_converted[5].load()}, {"inert", live.sync_converted[6].load()}, {"dma", live.sync_converted[7].load()}, {"query", live.sync_converted[8].load()}};
     j["sync_exec"] = {{"eop", live.sync_exec[1].load()}, {"release", live.sync_exec[2].load()}, {"wait", live.sync_exec[3].load()}, {"write", live.sync_exec[4].load()}, {"event", live.sync_exec[5].load()}, {"dma", live.sync_exec[7].load()}, {"query", live.sync_exec[8].load()}};
     j["direct_built"] = live.direct_built.load();

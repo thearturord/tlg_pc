@@ -62,7 +62,7 @@ ImageInfo::ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group,
     UpdateSize();
 }
 
-ImageInfo::ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint) noexcept {
+ImageInfo::ImageInfo(const Core::NativeTarget::ColorTarget& buffer, AmdGpu::CbDbExtent hint) noexcept {
     props = ImageProperties{
         .is_tiled = buffer.IsTiled(),
     };
@@ -93,7 +93,7 @@ ImageInfo::ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
     alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && buffer.info.alt_tile_mode;
 }
 
-ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr htile_address,
+ImageInfo::ImageInfo(const Core::NativeTarget::DepthTarget& buffer, u32 num_slices, VAddr htile_address,
                      AmdGpu::CbDbExtent hint, bool write_buffer) noexcept {
     tile_mode = buffer.GetTileMode();
     array_mode = AmdGpu::GetArrayMode(tile_mode);
@@ -102,7 +102,7 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
     props = ImageProperties{
         .is_tiled = buffer.IsTiled(),
         .is_depth = true,
-        .has_stencil = buffer.stencil_info.format != AmdGpu::DepthBuffer::StencilFormat::Invalid,
+        .has_stencil = buffer.stencil_info.format != Core::NativeTarget::DepthTarget::StencilFormat::Invalid,
     };
     num_samples = buffer.NumSamples();
     num_bits = buffer.NumBits();

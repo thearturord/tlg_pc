@@ -1518,7 +1518,9 @@ void ApplyColour(Vulkan::DrawInputs& inputs, const TargetSet& set, Path path, u3
     PathCounters& pc = g_path[path];
     const bool verify = VerifyOn();
     for (u32 slot = first_slot; slot <= last_slot; ++slot) {
-        AmdGpu::ColorBuffer& cb = inputs.color_buffers[slot];
+        u32* const raw = inputs.raw_targets.color[slot]; // G1b: the producer works on the register words; NativeTarget::DecodeAll makes the plain target from them
+        AmdGpu::ColorBuffer cb;
+        std::memcpy(&cb, raw, sizeof(cb));
         const bool bound = ColourBound(cb);
         if (!set.colour_valid[slot]) {
             if (bound) {
@@ -1531,7 +1533,7 @@ void ApplyColour(Vulkan::DrawInputs& inputs, const TargetSet& set, Path path, u3
             continue;
         }
         u32 words[ColourWords];
-        std::memcpy(words, &cb, sizeof(words));
+        std::memcpy(words, raw, sizeof(words));
         const u32 info = words[4];
         const u32 reg0 = words[11], reg1 = words[12];
         pc.applied_colour.fetch_add(1, std::memory_order_relaxed);
@@ -1553,7 +1555,7 @@ void ApplyColour(Vulkan::DrawInputs& inputs, const TargetSet& set, Path path, u3
             }
         }
         if (!verify) {
-            std::memcpy(&cb, words, sizeof(words));
+            std::memcpy(raw, words, sizeof(words));
         }
     }
 }
@@ -1561,7 +1563,9 @@ void ApplyColour(Vulkan::DrawInputs& inputs, const TargetSet& set, Path path, u3
 void ApplyDepth(Vulkan::DrawInputs& inputs, const TargetSet& set, Path path) {
     PathCounters& pc = g_path[path];
     const bool verify = VerifyOn();
-    const bool bound = inputs.depth_buffer.DepthValid() || inputs.depth_buffer.StencilValid();
+    AmdGpu::DepthBuffer reg_depth; // G1b: the register words (`raw_targets`) are the working copy; NativeTarget::DecodeDepth makes the plain target from them
+    std::memcpy(&reg_depth, inputs.raw_targets.depth, sizeof(reg_depth));
+    const bool bound = reg_depth.DepthValid() || reg_depth.StencilValid();
     if (!set.depth_valid) {
         if (bound) {
             pc.register_without_native.fetch_add(1, std::memory_order_relaxed);
@@ -1573,8 +1577,8 @@ void ApplyDepth(Vulkan::DrawInputs& inputs, const TargetSet& set, Path path) {
         return;
     }
     u32 words[DepthWords];
-    std::memcpy(words, &inputs.depth_buffer, 8 * sizeof(u32));
-    std::memcpy(&words[8], &inputs.depth_view, sizeof(u32));
+    std::memcpy(words, inputs.raw_targets.depth, 8 * sizeof(u32));
+    words[8] = inputs.raw_targets.depth_view;
     std::memcpy(&words[9], &inputs.depth_htile_data_base, sizeof(u32));
     std::memcpy(&words[10], &inputs.depth_clear, sizeof(u32));
     words[11] = inputs.stencil_clear;
@@ -1598,8 +1602,8 @@ void ApplyDepth(Vulkan::DrawInputs& inputs, const TargetSet& set, Path path) {
         NoteWide(g_depth_clear_cases, ClearKey(path, 1, set.depth_clear_facts, reg0, reg1, d0.value, d1.value));
     }
     if (!verify) {
-        std::memcpy(&inputs.depth_buffer, words, 8 * sizeof(u32));
-        std::memcpy(&inputs.depth_view, &words[8], sizeof(u32));
+        std::memcpy(inputs.raw_targets.depth, words, 8 * sizeof(u32));
+        inputs.raw_targets.depth_view = words[8];
         std::memcpy(&inputs.depth_htile_data_base, &words[9], sizeof(u32));
         std::memcpy(&inputs.depth_clear, &words[10], sizeof(u32));
         inputs.stencil_clear = words[11];

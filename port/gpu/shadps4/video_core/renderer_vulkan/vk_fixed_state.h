@@ -5,6 +5,7 @@
 
 #include <array>
 #include <string>
+#include "native/native_target_inputs.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -117,10 +118,13 @@ struct FixedState {
 /// surface layout because the memory behind them does), the clear values of the render pass and the draw arguments. Taken from the
 /// register state when the draw is planned and carried in the plan, so the raster thread does not read the register mirror for it.
 struct DrawInputs {
-    AmdGpu::ColorBuffer color_buffers[AmdGpu::NUM_COLOR_BUFFERS];
-    AmdGpu::DepthBuffer depth_buffer;
-    AmdGpu::DepthView depth_view;
-    AmdGpu::DepthControl depth_control;
+    /// G1b: the target descriptions are plain numbers (`Core::NativeTarget`); only the producers (native_draw_inputs, native_target_desc, native_target_inputs) know the register layout.
+    /// `raw_targets` holds the record's register words they work on; `NativeTarget::DecodeAll` makes the plain members from it. F6b removes the raw words.
+    Core::NativeTarget::RawTargetWords raw_targets;
+    Core::NativeTarget::ColorTarget color_buffers[AmdGpu::NUM_COLOR_BUFFERS];
+    Core::NativeTarget::DepthTarget depth_buffer;
+    Core::NativeTarget::DepthTargetView depth_view;
+    Core::NativeTarget::DepthTargetControl depth_control;
     AmdGpu::Address depth_htile_data_base;
     AmdGpu::DepthRenderControl depth_render_control;
     float depth_clear;

@@ -13,7 +13,7 @@
 
 namespace Vulkan::LiverpoolToVK {
 
-using DepthBuffer = AmdGpu::DepthBuffer;
+using DepthBuffer = Core::NativeTarget::DepthTarget;
 
 vk::StencilOp StencilOp(AmdGpu::StencilFunc op) {
     switch (op) {
@@ -55,23 +55,23 @@ vk::StencilOp StencilOp(AmdGpu::StencilFunc op) {
     }
 }
 
-vk::CompareOp CompareOp(AmdGpu::CompareFunc func) {
+vk::CompareOp CompareOp(Core::NativeTarget::CompareFunc func) {
     switch (func) {
-    case AmdGpu::CompareFunc::Always:
+    case Core::NativeTarget::CompareFunc::Always:
         return vk::CompareOp::eAlways;
-    case AmdGpu::CompareFunc::Equal:
+    case Core::NativeTarget::CompareFunc::Equal:
         return vk::CompareOp::eEqual;
-    case AmdGpu::CompareFunc::GreaterEqual:
+    case Core::NativeTarget::CompareFunc::GreaterEqual:
         return vk::CompareOp::eGreaterOrEqual;
-    case AmdGpu::CompareFunc::Greater:
+    case Core::NativeTarget::CompareFunc::Greater:
         return vk::CompareOp::eGreater;
-    case AmdGpu::CompareFunc::LessEqual:
+    case Core::NativeTarget::CompareFunc::LessEqual:
         return vk::CompareOp::eLessOrEqual;
-    case AmdGpu::CompareFunc::Less:
+    case Core::NativeTarget::CompareFunc::Less:
         return vk::CompareOp::eLess;
-    case AmdGpu::CompareFunc::NotEqual:
+    case Core::NativeTarget::CompareFunc::NotEqual:
         return vk::CompareOp::eNotEqual;
-    case AmdGpu::CompareFunc::Never:
+    case Core::NativeTarget::CompareFunc::Never:
         return vk::CompareOp::eNever;
     default:
         UNREACHABLE();
@@ -827,7 +827,7 @@ vk::Format DepthFormat(DepthBuffer::ZFormat z_format, DepthBuffer::StencilFormat
     return format->vk_format;
 }
 
-vk::ClearValue ColorBufferClearValue(const AmdGpu::ColorBuffer& color_buffer) {
+vk::ClearValue ColorBufferClearValue(const Core::NativeTarget::ColorTarget& color_buffer) {
     const auto comp_swizzle = color_buffer.Swizzle();
     const auto format = AmdGpu::DataFormat(color_buffer.info.format);
     const auto number_type = color_buffer.GetFixedNumberFormat();

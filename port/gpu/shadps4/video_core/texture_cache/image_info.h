@@ -11,9 +11,12 @@
 #include "video_core/texture_cache/tile.h"
 #include "video_core/texture_cache/types.h"
 
+namespace Core::NativeTarget {
+struct ColorTarget;
+struct DepthTarget;
+} // namespace Core::NativeTarget
+
 namespace AmdGpu {
-struct ColorBuffer;
-struct DepthBuffer;
 struct Image;
 enum class ImageType : u64;
 } // namespace AmdGpu
@@ -53,8 +56,8 @@ u32 ImageViewInfoDiffMask(const ImageViewInfo& a, const ImageViewInfo& b) noexce
 struct ImageInfo {
     ImageInfo() = default;
     ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group, VAddr cpu_address) noexcept;
-    ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint) noexcept;
-    ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr htile_address,
+    ImageInfo(const Core::NativeTarget::ColorTarget& buffer, AmdGpu::CbDbExtent hint) noexcept;
+    ImageInfo(const Core::NativeTarget::DepthTarget& buffer, u32 num_slices, VAddr htile_address,
               AmdGpu::CbDbExtent hint, bool write_buffer = false) noexcept;
     /// F4.2: the same info from the plain description (no T# read). `is_depth` is the shader's use of the image (the host promotes the format to a depth one).
     ImageInfo(const Core::NativeDesc::ImageDesc& desc, bool is_depth) noexcept;

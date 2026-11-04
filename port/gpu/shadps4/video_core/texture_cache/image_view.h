@@ -4,15 +4,12 @@
 #pragma once
 
 #include "native/native_desc.h"
+#include "native/native_target_inputs.h"
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/types.h"
-
-namespace AmdGpu {
-struct ColorBuffer;
-}
 
 namespace Shader {
 struct ImageResource;
@@ -29,9 +26,9 @@ struct ImageViewInfo {
     ImageViewInfo() = default;
     /// F4.2: the same view info from the plain description; the three flags are the shader's use of the image (`ImageResource::is_depth`, `is_written`, `is_array`).
     ImageViewInfo(const Core::NativeDesc::ImageDesc& image, bool is_depth, bool is_written, bool is_array) noexcept;
-    ImageViewInfo(const AmdGpu::ColorBuffer& col_buffer) noexcept;
-    ImageViewInfo(const AmdGpu::DepthBuffer& depth_buffer, AmdGpu::DepthView view,
-                  AmdGpu::DepthControl ctl);
+    ImageViewInfo(const Core::NativeTarget::ColorTarget& col_buffer) noexcept;
+    ImageViewInfo(const Core::NativeTarget::DepthTarget& depth_buffer, Core::NativeTarget::DepthTargetView view,
+                  Core::NativeTarget::DepthTargetControl ctl);
 
     AmdGpu::ImageType type = AmdGpu::ImageType::Color2D;
     vk::Format format = vk::Format::eR8G8B8A8Unorm;

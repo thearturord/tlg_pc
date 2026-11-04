@@ -2721,7 +2721,7 @@ Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline
     sig.mrt_mask = key.mrt_mask;
     sig.num_samples = key.num_samples;
     sig.generation = texture_cache.ImageGeneration();
-    std::memcpy(&sig.depth_control, &regs.depth_control, sizeof(u32));
+    sig.depth_control = regs.raw_targets.depth_control; // the memo key keeps the whole register word (G1b: raw until F6b)
     sig.depth_valid = regs.depth_buffer.DepthValid();
     sig.stencil_valid = regs.depth_buffer.StencilValid();
     return sig;

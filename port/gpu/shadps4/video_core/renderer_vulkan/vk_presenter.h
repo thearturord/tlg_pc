@@ -92,7 +92,7 @@ public:
         return image;
     }
 
-    bool IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const;
+    bool IsVideoOutSurface(const Core::NativeTarget::ColorTarget& color_buffer) const;
 
     Frame* PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                         VAddr cpu_address);

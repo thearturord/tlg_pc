@@ -95,10 +95,10 @@ public:
         ImageDesc(const Core::NativeDesc::ImageDesc& image, const Shader::ImageResource& desc)
             : info{image, desc.is_depth}, view_info{image, desc.is_depth, desc.is_written, desc.is_array},
               type{desc.is_written ? BindingType::Storage : BindingType::Texture} {}
-        ImageDesc(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
+        ImageDesc(const Core::NativeTarget::ColorTarget& buffer, AmdGpu::CbDbExtent hint)
             : info{buffer, hint}, view_info{buffer}, type{BindingType::RenderTarget} {}
-        ImageDesc(const AmdGpu::DepthBuffer& buffer, AmdGpu::DepthView view,
-                  AmdGpu::DepthControl ctl, VAddr htile_address, AmdGpu::CbDbExtent hint,
+        ImageDesc(const Core::NativeTarget::DepthTarget& buffer, Core::NativeTarget::DepthTargetView view,
+                  Core::NativeTarget::DepthTargetControl ctl, VAddr htile_address, AmdGpu::CbDbExtent hint,
                   bool write_buffer = false)
             : info{buffer, view.NumSlices(), htile_address, hint, write_buffer},
               view_info{buffer, view, ctl}, type{BindingType::DepthTarget} {}

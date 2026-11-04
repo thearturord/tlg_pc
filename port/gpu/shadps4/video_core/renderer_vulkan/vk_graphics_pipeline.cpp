@@ -299,10 +299,10 @@ GraphicsPipeline::GraphicsPipeline(
         .pNext = instance.IsMixedDepthSamplesSupported() ? &mixed_samples : nullptr,
         .colorAttachmentCount = key.num_color_attachments,
         .pColorAttachmentFormats = color_formats.data(),
-        .depthAttachmentFormat = key.z_format != AmdGpu::DepthBuffer::ZFormat::Invalid
+        .depthAttachmentFormat = key.z_format != Core::NativeTarget::DepthTarget::ZFormat::Invalid
                                      ? depth_format
                                      : vk::Format::eUndefined,
-        .stencilAttachmentFormat = key.stencil_format != AmdGpu::DepthBuffer::StencilFormat::Invalid
+        .stencilAttachmentFormat = key.stencil_format != Core::NativeTarget::DepthTarget::StencilFormat::Invalid
                                        ? depth_format
                                        : vk::Format::eUndefined,
     };

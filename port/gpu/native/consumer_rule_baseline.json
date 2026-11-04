@@ -120,14 +120,14 @@
   ]
  },
  "renderer_vulkan/liverpool_to_vk.cpp": {
-  "amdgpu_lines": 353,
+  "amdgpu_lines": 342,
   "includes": [
    "video_core/amdgpu/pixel_format.h",
    "video_core/renderer_vulkan/liverpool_to_vk.h"
   ]
  },
  "renderer_vulkan/liverpool_to_vk.h": {
-  "amdgpu_lines": 32,
+  "amdgpu_lines": 26,
   "includes": [
    "video_core/amdgpu/pixel_format.h",
    "video_core/amdgpu/regs_color.h",
@@ -151,12 +151,6 @@
    "video_core/renderer_vulkan/vk_indexed_data.h"
   ]
  },
- "renderer_vulkan/vk_depth_stencil_state.h": {
-  "amdgpu_lines": 10,
-  "includes": [
-   "video_core/amdgpu/regs.h"
-  ]
- },
  "renderer_vulkan/vk_fixed_state.cpp": {
   "amdgpu_lines": 6,
   "includes": [
@@ -165,13 +159,13 @@
   ]
  },
  "renderer_vulkan/vk_fixed_state.h": {
-  "amdgpu_lines": 17,
+  "amdgpu_lines": 14,
   "includes": [
    "video_core/amdgpu/regs.h"
   ]
  },
  "renderer_vulkan/vk_graphics_pipeline.cpp": {
-  "amdgpu_lines": 6,
+  "amdgpu_lines": 4,
   "includes": [
    "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h",
    "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h",
@@ -180,7 +174,7 @@
   ]
  },
  "renderer_vulkan/vk_graphics_pipeline.h": {
-  "amdgpu_lines": 7,
+  "amdgpu_lines": 5,
   "includes": [
    "shader_recompiler/frontend/fetch_shader.h",
    "video_core/amdgpu/regs_color.h",
@@ -216,7 +210,7 @@
   ]
  },
  "renderer_vulkan/vk_pipeline_cache.cpp": {
-  "amdgpu_lines": 28,
+  "amdgpu_lines": 24,
   "includes": [
    "shader_recompiler/backend/spirv/emit_spirv.h",
    "shader_recompiler/info.h",
@@ -265,11 +259,11 @@
   ]
  },
  "renderer_vulkan/vk_presenter.cpp": {
-  "amdgpu_lines": 3,
+  "amdgpu_lines": 2,
   "includes": []
  },
  "renderer_vulkan/vk_presenter.h": {
-  "amdgpu_lines": 3,
+  "amdgpu_lines": 2,
   "includes": [
    "core/libraries/videoout/buffer.h"
   ]
@@ -333,7 +327,7 @@
   ]
  },
  "texture_cache/image_info.cpp": {
-  "amdgpu_lines": 23,
+  "amdgpu_lines": 21,
   "includes": [
    "core/libraries/videoout/buffer.h",
    "shader_recompiler/resource.h",
@@ -343,14 +337,14 @@
   ]
  },
  "texture_cache/image_info.h": {
-  "amdgpu_lines": 9,
+  "amdgpu_lines": 8,
   "includes": [
    "video_core/amdgpu/cb_db_extent.h",
    "video_core/amdgpu/tiling.h"
   ]
  },
  "texture_cache/image_view.cpp": {
-  "amdgpu_lines": 32,
+  "amdgpu_lines": 29,
   "includes": [
    "shader_recompiler/resource.h",
    "video_core/amdgpu/pixel_format.h",
@@ -359,7 +353,7 @@
   ]
  },
  "texture_cache/image_view.h": {
-  "amdgpu_lines": 5,
+  "amdgpu_lines": 2,
   "includes": [
    "video_core/amdgpu/pixel_format.h",
    "video_core/amdgpu/regs_depth.h",
@@ -387,7 +381,7 @@
   ]
  },
  "texture_cache/texture_cache.h": {
-  "amdgpu_lines": 6,
+  "amdgpu_lines": 5,
   "includes": [
    "shader_recompiler/resource.h"
   ]

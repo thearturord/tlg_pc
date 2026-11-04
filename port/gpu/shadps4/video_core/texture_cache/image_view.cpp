@@ -81,7 +81,7 @@ ImageViewInfo::ImageViewInfo(const Core::NativeDesc::ImageDesc& image, bool is_d
     }
 }
 
-ImageViewInfo::ImageViewInfo(const AmdGpu::ColorBuffer& col_buffer) noexcept {
+ImageViewInfo::ImageViewInfo(const Core::NativeTarget::ColorTarget& col_buffer) noexcept {
     range.base.layer = col_buffer.BaseSlice();
     range.extent.layers = col_buffer.NumSlices() - range.base.layer;
     type = range.extent.layers > 1 ? AmdGpu::ImageType::Color2DArray : AmdGpu::ImageType::Color2D;
@@ -89,8 +89,8 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::ColorBuffer& col_buffer) noexcept {
         Vulkan::LiverpoolToVK::SurfaceFormat(col_buffer.GetDataFmt(), col_buffer.GetNumberFmt());
 }
 
-ImageViewInfo::ImageViewInfo(const AmdGpu::DepthBuffer& depth_buffer, AmdGpu::DepthView view,
-                             AmdGpu::DepthControl ctl) {
+ImageViewInfo::ImageViewInfo(const Core::NativeTarget::DepthTarget& depth_buffer, Core::NativeTarget::DepthTargetView view,
+                             Core::NativeTarget::DepthTargetControl ctl) {
     format = Vulkan::LiverpoolToVK::DepthFormat(depth_buffer.z_info.format,
                                                 depth_buffer.stencil_info.format);
     is_storage = ctl.depth_write_enable;
