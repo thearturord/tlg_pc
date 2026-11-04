@@ -273,9 +273,12 @@ void NativeExecutor::SignalGraphicsEop(const Core::NativeSync::Fence& event_eop)
         Core::NativeFrameEvents::EndOfPipe();
     };
     const bool early = event_eop.interrupt && Core::FrameGate::EarlyInterrupt(); // M5b: the interrupt is raised by the raster thread at the frame end, not after the GPU work
-    auto signal = [this, eop = event_eop, early] {
-        const auto late_irq = [early] {
-            if (!early) {
+    const u64 ordinal = early ? Core::FrameGate::NextEarlyOrdinal() : 0;
+    auto signal = [this, eop = event_eop, early, ordinal] {
+        const auto late_irq = [early, ordinal] {
+            if (early) {
+                Core::FrameGate::EarlyGpuDone(ordinal); // the GPU is done: the interrupt is raised now if it was not yet
+            } else {
                 irq();
             }
         };
@@ -299,9 +302,9 @@ void NativeExecutor::SignalGraphicsEop(const Core::NativeSync::Fence& event_eop)
     if (event_eop.interrupt) {
         // frames in flight, game wait mode 2: the raster thread has executed everything the frame recorded (in order, before the end-of-pipe signal below)
         if (early) {
-            RasterRun([] {
+            RasterRun([ordinal] {
                 Core::FrameGate::NoteRasterReached();
-                irq(); // M5b: the frame's data is ours; the label below is written when the GPU is done
+                Core::FrameGate::EarlyFrameRecorded(ordinal); // M5b: the frame's data is ours; the interrupt comes now if the occlusion answers of earlier frames are written, else later; the label below is written when the GPU is done
             });
         } else {
             RasterRun([] { Core::FrameGate::NoteRasterReached(); });

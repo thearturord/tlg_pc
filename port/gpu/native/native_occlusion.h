@@ -31,6 +31,12 @@ namespace Core::NativeOcclusion {
 [[nodiscard]] bool Enabled() noexcept;
 /// The report of the live Queries object (or {"enabled": false})
 [[nodiscard]] nlohmann::json ReportAll();
+/// M5b (early end-of-pipe interrupt): the answers are what the game reads without waiting, so a frame's interrupt may come early only when the answers of the earlier frames are written.
+/// The raster thread calls `NoteFrameEnd` at each interrupt-carrying end of pipe; `AllAnsweredBefore` is true with no live queries object (real occlusion off).
+void NoteFrameEnd();
+[[nodiscard]] bool AllAnsweredBefore(u64 frame);
+/// Called (raster thread) after a poll wrote answers
+void SetAnswersHook(void (*hook)());
 
 class Queries {
 public:
@@ -43,6 +49,10 @@ public:
     void Close(VAddr address);
     /// Raster thread, once per submission: writes the answers of the blocks the graphics card has finished
     void Poll();
+    /// Raster thread: an interrupt-carrying end of pipe was passed, the frame's queries are all opened and closed (M5b)
+    void NoteFrameEnd();
+    /// True when every query of the frames before `frame` (counted by `NoteFrameEnd`) has its answer written
+    [[nodiscard]] bool AllAnsweredBefore(u64 frame) const;
 
     [[nodiscard]] nlohmann::json Report() const;
 
@@ -57,6 +67,7 @@ private:
     struct Slot {
         VAddr address{};
         u64 tick{};                ///< the scheduler tick that ends the query; the answer exists once the graphics card reached it
+        u64 frame{};               ///< `frames_done` when the query opened: the frame it belongs to
         enum State : u8 { Free, Open, Pending } state{Free};
     };
 
@@ -72,6 +83,7 @@ private:
     u32 open_slot{~0u};
     std::unordered_map<VAddr, Block> blocks;
     mutable std::mutex mutex;
+    std::atomic<u64> frames_done{};
     std::atomic<u64> opened{}, closed{}, seen{}, hidden{}, dropped{}, first_answers{}, not_ready{};
 };
 

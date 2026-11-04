@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -17,6 +18,8 @@
 #include "native/native_log.h"
 #include "native/native_draw.h"
 #include "native/native_frame_gate.h"
+#include "native/native_frame_events.h"
+#include "native/native_occlusion.h"
 #include "native/native_content.h"
 #include "native/native_flight.h"
 #include "native/native_prof.h"
@@ -217,6 +220,82 @@ void NoteEndOfPipe() {
 
 namespace {
 
+std::mutex early_mutex;
+u64 early_handed = 0;          // ordinals given out, under `early_mutex`
+u64 early_raised = 0;          // interrupts raised: ordinals below this are done
+std::deque<u64> early_waiting; // recorded by the raster thread, interrupt not yet raised (waiting for occlusion answers)
+std::atomic<u64> early_by_raster{0}, early_by_answers{0}, early_by_gpu{0}, early_deferred{0};
+
+/// Raises the interrupts of every frame up to `ordinal` that is still owed (once each, in order)
+void RaiseUpTo(u64 ordinal, std::atomic<u64>& counter) {
+    u64 n = 0;
+    {
+        std::scoped_lock lock{early_mutex};
+        if (ordinal + 1 <= early_raised) {
+            return;
+        }
+        n = ordinal + 1 - early_raised;
+        early_raised = ordinal + 1;
+        while (!early_waiting.empty() && early_waiting.front() <= ordinal) {
+            early_waiting.pop_front();
+        }
+    }
+    counter.fetch_add(n, std::memory_order_relaxed);
+    for (u64 i = 0; i < n; ++i) {
+        NoteEndOfPipe();
+        NativeFrameEvents::EndOfPipe();
+    }
+}
+
+/// Raster thread, after a poll wrote answers
+void RetryEarly() {
+    for (;;) {
+        u64 front = 0;
+        {
+            std::scoped_lock lock{early_mutex};
+            if (early_waiting.empty()) {
+                return;
+            }
+            front = early_waiting.front();
+        }
+        if (!NativeOcclusion::AllAnsweredBefore(front)) {
+            return;
+        }
+        RaiseUpTo(front, early_by_answers);
+    }
+}
+
+} // namespace
+
+u64 NextEarlyOrdinal() {
+    static const bool hooked = [] {
+        NativeOcclusion::SetAnswersHook(&RetryEarly);
+        return true;
+    }();
+    (void)hooked;
+    std::scoped_lock lock{early_mutex};
+    return early_handed++;
+}
+
+void EarlyFrameRecorded(u64 ordinal) {
+    NativeOcclusion::NoteFrameEnd(); // the queries opened from now on belong to the next frame
+    if (NativeOcclusion::AllAnsweredBefore(ordinal)) {
+        RaiseUpTo(ordinal, early_by_raster);
+        return;
+    }
+    early_deferred.fetch_add(1, std::memory_order_relaxed);
+    std::scoped_lock lock{early_mutex};
+    if (ordinal >= early_raised) {
+        early_waiting.push_back(ordinal);
+    }
+}
+
+void EarlyGpuDone(u64 ordinal) {
+    RaiseUpTo(ordinal, early_by_gpu);
+}
+
+namespace {
+
 /// Waits until `done()` holds (called under the mutex); false on timeout
 template <typename Done>
 bool WaitFor(Done&& done, std::atomic<u64>& count, std::atomic<u64>& total_ns, const char* what) {
@@ -300,6 +379,7 @@ nlohmann::json Status() {
     j["early_interrupt"] = EarlyInterrupt();
     j["raster_behind_at_submit"] = {{"0", raster_behind_hist[0].load()}, {"1", raster_behind_hist[1].load()}, {"2", raster_behind_hist[2].load()}, {"3_or_more", raster_behind_hist[3].load()}};
     j["ownership_eop_cap_polls"] = eop_cap_waits.load();
+    j["early_interrupts"] = {{"raised_at_raster", early_by_raster.load()}, {"raised_after_answers", early_by_answers.load()}, {"raised_by_gpu_done", early_by_gpu.load()}, {"deferred_for_occlusion", early_deferred.load()}};
     j["game_wait_mode"] = GameWaitMode();
     j["presenter_waits_own_frame"] = PresenterWaitsOwnFrame();
     {

@@ -42,6 +42,16 @@ bool GameWaitsOwnFrame();
 void NoteRasterReached();
 bool PresenterWaitsOwnFrame();
 
+/// M5b early interrupt (`TLG_OWNERSHIP_EARLY_IRQ=1`). The end-of-pipe interrupt of a frame is raised on whichever comes first: (a) the raster thread has recorded the frame and the occlusion
+/// answers of all earlier frames are written (the game reads them without waiting, so a frame it records must not see older ones than at the late interrupt: owner play 2026-11-04, black spots
+/// with real occlusion), (b) a poll wrote the answers that frame was waiting for, (c) the GPU finished the frame (the late interrupt, as before). Each frame's interrupt is raised once, in order.
+/// The number of the frame the next interrupt-carrying end of pipe belongs to (command processor thread, in order)
+u64 NextEarlyOrdinal();
+/// Raster thread: everything frame `ordinal` recorded was executed
+void EarlyFrameRecorded(u64 ordinal);
+/// Any thread: the GPU finished frame `ordinal`; raises its interrupt (and the earlier ones) if it is still waiting
+void EarlyGpuDone(u64 ordinal);
+
 /// A frame was handed to the command processor (`sceGnmSubmitAndFlipCommandBuffers`, before the submit)
 void NoteSubmitFlip();
 /// The end-of-pipe interrupt of a frame (the one the game's submit thread waits for) was raised

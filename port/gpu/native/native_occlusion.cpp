@@ -14,6 +14,7 @@ namespace {
 constexpr u64 ValidBit = 1ull << 63;
 constexpr u64 PlainlyVisible = 0x2FFFFFFull; // the difference per counter pair the made up answer had
 std::atomic<Queries*> live{nullptr};
+std::atomic<void (*)()> answers_hook{nullptr};
 } // namespace
 
 bool Enabled() noexcept {
@@ -79,6 +80,7 @@ void Queries::Open(VAddr address, u32 pairs) {
     const u32 index = next_slot;
     next_slot = (next_slot + 1) % NumSlots;
     slot.address = address;
+    slot.frame = frames_done.load(std::memory_order_acquire);
     slot.state = Slot::Open;
     open_slot = index;
     open_address = address;
@@ -107,24 +109,62 @@ void Queries::Close(VAddr address) {
 }
 
 void Queries::Poll() {
-    std::scoped_lock lock{mutex};
-    for (u32 index = 0; index < NumSlots; ++index) {
-        Slot& slot = slots[index];
-        if (slot.state != Slot::Pending || !scheduler.IsFree(slot.tick)) {
-            continue;
+    bool moved = false;
+    {
+        std::scoped_lock lock{mutex};
+        for (u32 index = 0; index < NumSlots; ++index) {
+            Slot& slot = slots[index];
+            if (slot.state != Slot::Pending || !scheduler.IsFree(slot.tick)) {
+                continue;
+            }
+            std::array<u64, 2> result{}; // the sample count, then its availability
+            const vk::Result status = instance.GetDevice().getQueryPoolResults(pool, index, 1, sizeof(result), result.data(), sizeof(result),
+                                                                               vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+            if (status != vk::Result::eSuccess || result[1] == 0) {
+                not_ready.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            slot.state = Slot::Free;
+            const bool seen_now = result[0] != 0;
+            (seen_now ? seen : hidden).fetch_add(1, std::memory_order_relaxed);
+            WriteAnswer(slot.address, seen_now);
+            moved = true;
         }
-        std::array<u64, 2> result{}; // the sample count, then its availability
-        const vk::Result status = instance.GetDevice().getQueryPoolResults(pool, index, 1, sizeof(result), result.data(), sizeof(result),
-                                                                           vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
-        if (status != vk::Result::eSuccess || result[1] == 0) {
-            not_ready.fetch_add(1, std::memory_order_relaxed);
-            continue;
-        }
-        slot.state = Slot::Free;
-        const bool seen_now = result[0] != 0;
-        (seen_now ? seen : hidden).fetch_add(1, std::memory_order_relaxed);
-        WriteAnswer(slot.address, seen_now);
     }
+    if (moved) {
+        if (const auto hook = answers_hook.load(std::memory_order_acquire)) {
+            hook(); // M5b: a frame's early interrupt may have been waiting for these answers
+        }
+    }
+}
+
+void Queries::NoteFrameEnd() {
+    frames_done.fetch_add(1, std::memory_order_acq_rel);
+}
+
+bool Queries::AllAnsweredBefore(u64 frame) const {
+    std::scoped_lock lock{mutex};
+    for (const Slot& slot : slots) {
+        if (slot.state != Slot::Free && slot.frame < frame) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void SetAnswersHook(void (*hook)()) {
+    answers_hook.store(hook, std::memory_order_release);
+}
+
+void NoteFrameEnd() {
+    if (Queries* queries = live.load(std::memory_order_acquire)) {
+        queries->NoteFrameEnd();
+    }
+}
+
+bool AllAnsweredBefore(u64 frame) {
+    Queries* queries = live.load(std::memory_order_acquire);
+    return queries == nullptr || queries->AllAnsweredBefore(frame);
 }
 
 nlohmann::json Queries::Report() const {
