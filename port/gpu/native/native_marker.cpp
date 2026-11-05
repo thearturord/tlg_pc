@@ -26,6 +26,7 @@
 #include "common/path_util.h"
 #include "native/native_debug_server.h"
 #include "native/native_flight.h"
+#include "native/native_timeline.h"
 
 #ifdef _WIN32
 extern "C" char** _environ;
@@ -314,6 +315,8 @@ void Request(u32 mode) {
         return;
     }
     Flight::Add(Flight::Mark, 0, written.load() + 1, mode);
+    // debugger mode (Shift+F5): the mark is also an event of the recording, with the presented frame count, so the report can name the frame the owner saw
+    FrameTimeline::Record(FrameTimeline::GlitchMark, DebugServer::PresentCount(), FrameTimeline::Now(), mode);
     Enqueue({mode, nullptr});
 }
 

@@ -19,6 +19,8 @@
 #include <vector>
 
 #include "native/native_counter_ring.h"
+#include "native/native_debug_server.h"
+#include "native/native_timeline.h"
 #include "native/native_resources.h"
 #include "tlg_capture.h"
 #include "native/native_light_recorder.h"
@@ -60,7 +62,8 @@ struct Slot {
     Kind kind{};
     u32 width{}, height{};
     vk::Format format{};
-    s64 pts_ms{};
+    s64 pts_ms{};     ///< video: ms since the start; debugger mode thumbnail: its id
+    u64 stamp_ns{};   ///< debugger mode thumbnail: FrameTimeline::Now() when the copy was queued
     std::string path; ///< screenshot: where the PNG goes (empty: user/screenshots)
 };
 
@@ -94,7 +97,7 @@ vk::Format small_format{};
 
 // dark frame monitor (TLG_DARK_FRAMES=1): every presented frame is shrunk to 256x144 and read back; a frame clearly darker than both neighbours
 // (the one frame "black screen" the owner sees) is logged
-constexpr u32 MonitorSlots = 8, MonitorWidth = 256, MonitorHeight = 144;
+constexpr u32 MonitorSlots = 32, MonitorWidth = 256, MonitorHeight = 144;
 std::array<Slot, MonitorSlots> monitor_slots{};
 VkImage monitor_image{};
 VmaAllocation monitor_allocation{};
@@ -104,6 +107,18 @@ std::array<double, 3> monitor_means{};
 std::array<u64, 3> monitor_ticks{};
 std::array<std::vector<u8>, 3> monitor_pixels{}; // B, G, R, A of the last three frames
 constexpr u64 MonitorPictures = 50;               // dark frames saved as pictures (the frame between its neighbours) per run
+
+// debugger mode thumbnails (Shift+F5): the monitor's 256x144 copy of every presented frame is kept in a ring of the newest frames and written at the freeze (thumbs.bin)
+std::atomic<bool> thumbs_enabled{false};
+constexpr size_t ThumbsKept = 480;
+struct Thumb {
+    u64 id;
+    u64 stamp_ns;
+    std::vector<u8> bgra;
+};
+std::mutex thumbs_mutex;
+std::deque<Thumb> thumbs;
+u64 thumb_next_id{};
 
 // writer thread
 std::mutex jobs_mutex;
@@ -442,7 +457,7 @@ void CopyToSlot(vk::CommandBuffer cmdbuf, vk::Image image, u32 width, u32 height
     cmdbuf.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, vk::Buffer{slot.buffer}, region);
 }
 
-bool MonitorOn() {
+bool MonitorEnv() {
     static const bool on = [] {
         const char* e = std::getenv("TLG_DARK_FRAMES");
         const bool v = e != nullptr && *e == '1';
@@ -452,6 +467,11 @@ bool MonitorOn() {
         return v;
     }();
     return on;
+}
+
+/// The monitor path runs for the dark frame monitor (env) and while debugger mode keeps thumbnails
+bool MonitorOn() {
+    return MonitorEnv() || thumbs_enabled.load(std::memory_order_relaxed);
 }
 
 /// Shrinks `image` (TransferSrcOptimal) into `target` and copies that into `slot`
@@ -702,6 +722,11 @@ void Record(const Vulkan::Instance& instance, vk::CommandBuffer cmdbuf, vk::Imag
             slot->width = MonitorWidth;
             slot->height = MonitorHeight;
             slot->format = format;
+            slot->pts_ms = static_cast<s64>(thumb_next_id++);
+            slot->stamp_ns = Core::FrameTimeline::Now();
+            if (thumbs_enabled.load(std::memory_order_relaxed)) {
+                Core::FrameTimeline::Record(Core::FrameTimeline::ThumbFrame, static_cast<u64>(slot->pts_ms), slot->stamp_ns, Core::DebugServer::PresentCount());
+            }
             copied = true;
         }
     }
@@ -710,6 +735,36 @@ void Record(const Vulkan::Instance& instance, vk::CommandBuffer cmdbuf, vk::Imag
         const vk::MemoryBarrier to_host{.srcAccessMask = vk::AccessFlagBits::eTransferWrite, .dstAccessMask = vk::AccessFlagBits::eHostRead};
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, to_host, {}, {});
     }
+}
+
+void SetThumbs(bool on) {
+    if (on) {
+        std::scoped_lock lock{thumbs_mutex};
+        thumbs.clear();
+    }
+    thumbs_enabled.store(on);
+}
+
+unsigned DumpThumbs(const std::string& path) {
+    std::scoped_lock lock{thumbs_mutex};
+    std::FILE* file = std::fopen(path.c_str(), "wb");
+    if (file == nullptr) {
+        return 0;
+    }
+    const char magic[8] = {'T', 'L', 'T', 'H', '0', '0', '0', '1'};
+    const u32 header[3] = {static_cast<u32>(thumbs.size()), MonitorWidth, MonitorHeight};
+    std::fwrite(magic, 1, 8, file);
+    std::fwrite(header, sizeof(u32), 3, file);
+    for (const Thumb& t : thumbs) {
+        if (t.bgra.size() != size_t{MonitorWidth} * MonitorHeight * 4) {
+            continue;
+        }
+        const u64 meta[2] = {t.id, t.stamp_ns};
+        std::fwrite(meta, sizeof(u64), 2, file);
+        std::fwrite(t.bgra.data(), 1, t.bgra.size(), file);
+    }
+    std::fclose(file);
+    return static_cast<unsigned>(thumbs.size());
 }
 
 void Poll(Vulkan::Scheduler& scheduler) {
@@ -771,7 +826,21 @@ void Poll(Vulkan::Scheduler& scheduler) {
                 break;
             }
             vmaInvalidateAllocation(vk_instance->GetAllocator(), slot->allocation, 0, VK_WHOLE_SIZE);
-            MonitorFrame(MeanBrightness(*slot), slot->tick);
+            if (thumbs_enabled.load(std::memory_order_relaxed)) {
+                Job job{.width = slot->width, .height = slot->height, .format = slot->format};
+                const u8* data = static_cast<const u8*>(slot->mapped);
+                job.pixels.assign(data, data + u64{slot->width} * slot->height * 4);
+                Thumb t{static_cast<u64>(slot->pts_ms), slot->stamp_ns, {}};
+                ToBgra(job, t.bgra);
+                std::scoped_lock lock{thumbs_mutex};
+                thumbs.push_back(std::move(t));
+                while (thumbs.size() > ThumbsKept) {
+                    thumbs.pop_front();
+                }
+            }
+            if (MonitorEnv()) {
+                MonitorFrame(MeanBrightness(*slot), slot->tick);
+            }
             slot->busy = false;
         }
     }

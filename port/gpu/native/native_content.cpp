@@ -24,6 +24,7 @@
 #ifdef TLG_PORT
 #include "tlg_toggles.h" // sigjmp_buf, tlg_setjmp, runtime_fault_recover
 #endif
+#include "native/native_byte_audit.h"
 #include "native/native_content.h"
 #include "native/native_debug_server.h"
 #include "native/native_device.h"
@@ -319,6 +320,12 @@ bool GuardedCopy(void* destination, const void* source, u64 size) {
     return RunGuarded([](void* p) { std::memcpy(static_cast<CopyJob*>(p)->destination, static_cast<CopyJob*>(p)->source, static_cast<CopyJob*>(p)->size); }, &job);
 }
 
+struct HashJob {
+    u64 address;
+    u64 count;
+    u64 chunk;
+    u32* out;
+};
 struct CompareJob {
     const void* a;
     const void* b;
@@ -326,6 +333,32 @@ struct CompareJob {
     u64 first_diff; ///< offset of the first differing byte, ~0 when equal
     u64 nonzero;    ///< CompareJob with b == nullptr: counts the non-zero bytes of a
 };
+} // namespace
+
+bool HashChunksGuarded(u64 address, u64 count, u64 chunk_bytes, u32* out) {
+    HashJob job{address, count, chunk_bytes, out};
+    return RunGuarded(
+        [](void* p) {
+            const auto& j = *static_cast<HashJob*>(p);
+            const u8* base = reinterpret_cast<const u8*>(j.address);
+            for (u64 i = 0; i < j.count; ++i) {
+                j.out[i] = static_cast<u32>(XXH3_64bits(base + i * j.chunk, j.chunk));
+            }
+        },
+        &job);
+}
+
+bool HashGuarded64(u64 address, u64 size, u64& out) {
+    struct Job {
+        u64 address, size, out;
+    } job{address, size, 0};
+    const bool ok = RunGuarded([](void* p) { auto& j = *static_cast<Job*>(p); j.out = XXH64(reinterpret_cast<const void*>(j.address), j.size, 0); }, &job);
+    out = job.out;
+    return ok;
+}
+
+namespace {
+
 bool GuardedCompare(const void* memory, const void* stored, u64 size, u64& first_diff) {
     CompareJob job{memory, stored, size, ~0ull, 0};
     const bool ok = RunGuarded(
@@ -1061,6 +1094,7 @@ void SilentHarvest(u32 index); // W1.5 census, below
 
 void NoteSubmit(const std::vector<std::pair<u64, u64>>& ranges) {
     const u32 index = g_submit_count.load(std::memory_order_relaxed) + 1;
+    Core::ByteAudit::SnapshotAtSubmit(index);
     SilentHarvest(index);
     if (FrameStoreOn()) {
         const auto start = std::chrono::steady_clock::now();
@@ -2279,6 +2313,11 @@ std::string DescribeBind() {
 } // namespace
 
 void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
+    if (Core::ByteAudit::Active()) [[unlikely]] {
+        // debugger mode: the bytes of this read against the memory hashed at the game's submit of its record (native_byte_audit.h)
+        const u64 s = seq != 0 ? seq : Core::NativeRegistry::CurrentDrawSeq();
+        Core::ByteAudit::NoteRead(address, size, s != 0 ? SubmitIndexOf(s) : 0u, LateKindNames[static_cast<size_t>(kind)], [] { return DescribeBind(); });
+    }
     if (!LedgerOn() || size == 0) {
         return;
     }

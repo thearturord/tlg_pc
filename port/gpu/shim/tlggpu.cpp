@@ -263,6 +263,7 @@ extern "C" int tlggpu_init(const TlgGpuConfig* config) {
         EmulatorSettings.LoadOverlay((dir / (MemoryPatcher::g_game_serial + ".readback.json")).string());
         Core::Marker::SetHooks({.screenshot = [](const std::string& path) { TlgCapture::RequestScreenshotTo(path); }, .toast = [](int kind) { TlgOverlay::SaveToast(kind); }});
         Core::FrameWalk::SetToastHook([](int kind) { TlgOverlay::SaveToast(kind); });
+        Core::FrameWalk::SetThumbHooks({.enable = [](bool on) { TlgCapture::SetThumbs(on); }, .dump = [](const std::string& path) { return TlgCapture::DumpThumbs(path); }});
         if (const u32 port = EmulatorSettings.GetDebugServerPort()) {
             Core::DebugServer::Start(static_cast<u16>(port));
         }

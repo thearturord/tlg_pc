@@ -10,6 +10,8 @@
 #include <xxhash.h>
 
 #include "common/types.h"
+#include "native/native_byte_audit.h"
+#include "native/native_content.h"
 #include "native/native_timeline.h"
 
 namespace Core::ResourceAudit {
@@ -39,9 +41,14 @@ inline void Note(Kind kind, u64 address, u64 size, bool written) {
     if (last_emit.size() > 400'000) {
         last_emit.clear();
     }
-    if (raster_class == 1 && kind == BufferUse && !written && address > 0x100000000ull && size <= (8u << 20)) {
+    // queue 1: read only buffers up to 8 MB; debugger mode (Shift+F5): every queue, read only buffers up to 1 MB
+    const bool hash_it = kind == BufferUse && !written && address > 0x100000000ull && ((raster_class == 1 && size <= (8u << 20)) || (ByteAudit::Active() && size <= (1u << 20)));
+    if (hash_it) {
         // does the content change from frame to frame (are the inputs of queue 1 written by the CPU every frame)?
-        FrameTimeline::Record(FrameTimeline::ResourceHash, address, now, XXH64(reinterpret_cast<const void*>(address), size, 0));
+        u64 hash = 0;
+        if (NativeContent::HashGuarded64(address, size, hash)) {
+            FrameTimeline::Record(FrameTimeline::ResourceHash, address, now, hash);
+        }
     }
     FrameTimeline::Record(FrameTimeline::ResourceUse, (address & 0xffffffffffffull) | (u64(raster_class) << 48) | (u64(kind) << 56) | (u64(written) << 63), now, size);
 }

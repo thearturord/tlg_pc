@@ -1197,7 +1197,7 @@ void SaveToastBox(SaveClock::time_point now) {
                        : toast_kind == 6 ? TL("Video saved", "Vídeo salvo")
                        : toast_kind == 7 ? TL("Marker saved", "Marcador salvo")
                        : toast_kind == 8 ? TL("Light marker saved", "Marcador leve salvo")
-                       : toast_kind == 9 ? TL("Recording frames (F5 freezes)", "Gravando quadros (F5 congela)")
+                       : toast_kind == 9 ? TL("Debugger mode on (F6 marks, F5 freezes)", "Modo depurador ligado (F6 marca, F5 congela)")
                        : toast_kind == 10 ? TL("Frozen (F5 resumes)", "Congelado (F5 retoma)")
                        : toast_kind == 11 ? TL("Resumed", "Retomado")
                                          : TL("Game saved", "Jogo salvo");

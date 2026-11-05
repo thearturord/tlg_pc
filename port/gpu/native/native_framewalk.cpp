@@ -20,11 +20,13 @@
 
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "native/native_byte_audit.h"
 #include "native/native_debug_server.h"
 #include "native/native_flight.h"
 #include "native/native_log.h"
 #include "native/native_marker.h"
 #include "native/native_timeline.h"
+#include "native/native_tsharp_watch.h"
 
 namespace Core::FrameWalk {
 
@@ -54,6 +56,7 @@ std::string last_note;
 u64 freezes = 0;
 std::jthread worker;
 void (*toast_hook)(int kind) = nullptr;
+ThumbHooks thumb_hooks;
 
 void Toast(int kind) {
     if (toast_hook != nullptr) {
@@ -112,6 +115,11 @@ void StartRecording() {
     record_tag = "fw_" + Stamp();
     if (FrameTimeline::StartCapture(3600, record_tag, true)) {
         recording_ring = true;
+        ByteAudit::Reset();
+        ByteAudit::SetActive(true);
+        if (thumb_hooks.enable != nullptr) {
+            thumb_hooks.enable(true);
+        }
         SetState(State::Recording);
         Toast(9);
         LOG_INFO(Render, "frame walk: recording into a ring ({})", record_tag);
@@ -165,6 +173,7 @@ void FreezeWorker() {
         recording_ring = false;
     }
 
+    unsigned thumbs = 0;
     const std::string stamp = Stamp();
     const auto dir = LogDir() / fmt::format("framewalk_{}", stamp);
     std::error_code ec;
@@ -173,6 +182,14 @@ void FreezeWorker() {
         WriteText(dir / "draws.json", Marker::DrawTable(static_cast<u32>(freezes + 1), FramesInDrawTable));
         WriteText(dir / "flight.json", Flight::Report(Flight::RingEvents, false, FlightMs));
         WriteText(dir / "counters.json", DebugServer::CountersSnapshot().dump(1));
+        if (timeline.empty()) {
+            // no debugger mode before the freeze: nothing to add
+        } else {
+            WriteText(dir / "byte_audit.json", ByteAudit::Report());
+            if (thumb_hooks.dump != nullptr) {
+                thumbs = thumb_hooks.dump((dir / "thumbs.bin").string());
+            }
+        }
     } catch (const std::exception& e) {
         TLG_LOG(RUNTIME, Error, "frame walk dump failed: {}", e.what());
     }
@@ -181,9 +198,16 @@ void FreezeWorker() {
     note += game_stopped ? "the game's render thread stopped at the start of a sceGnmSubmitAndFlipCommandBuffers: the last complete frame is the one before; the next frame's commands are built but not submitted\n"
                          : "WARNING: the render thread did not reach a submit within 3 s (loading? menu?), the dump was written while the game still ran\n";
     note += timeline.empty() ? "no timeline: the freeze was not preceded by Shift+F5\n" : fmt::format("timeline (ring, newest events): {}.bin / .json; read with documents/tlg/tools/framewalk_report.py\n", timeline);
+    if (!timeline.empty()) {
+        note += fmt::format("byte_audit.json: the byte audit (stale reads, write watch hits); thumbs.bin: {} thumbnails of presented frames (read with framewalk_report.py --sheet)\n", thumbs);
+    }
     note += "live reads while frozen: /memory?addr=0x..&size=N, /framewalk, /resources, /registry, /native\n";
     WriteText(dir / "note.txt", note);
     PruneOld();
+    ByteAudit::SetActive(false);
+    if (thumb_hooks.enable != nullptr) {
+        thumb_hooks.enable(false);
+    }
 
     {
         std::scoped_lock lock{mutex};
@@ -268,7 +292,18 @@ void SetToastHook(void (*toast)(int kind)) {
     toast_hook = toast;
 }
 
+void SetThumbHooks(const ThumbHooks& hooks) {
+    thumb_hooks = hooks;
+}
+
+bool DebuggerMode() {
+    return ByteAudit::Active();
+}
+
 std::string Report(const std::string& action) {
+    if (action == "audit") {
+        return ByteAudit::Report();
+    }
     if (action == "record") {
         KeyRecord();
     } else if (action == "freeze") {

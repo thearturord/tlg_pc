@@ -73,6 +73,10 @@ void SilentImageKept(u64 address, u64 size);
 [[nodiscard]] u32 CurrentRecordSubmit();
 u64 FrameStoreServe(LateKind kind, u64 address, void* dst, u64 size);
 void NoteSubmit(const std::vector<std::pair<u64, u64>>& ranges);
+/// Byte audit (native_byte_audit): the low 32 bits of XXH3 of `count` consecutive chunks of `chunk_bytes` bytes of guest memory from `address`, into `out`; false if the memory is not readable
+[[nodiscard]] bool HashChunksGuarded(u64 address, u64 count, u64 chunk_bytes, u32* out);
+/// XXH64 of `size` bytes of guest memory (resource audit); false if the memory is not readable
+[[nodiscard]] bool HashGuarded64(u64 address, u64 size, u64& out);
 /// M4: every record number below this was made for a graphics submission that has been handed to the command processor (0: none yet).
 [[nodiscard]] u64 LastSubmitStamp();
 /// M5 follow-up: the raster thread starts the record `seq` (called from `SetCurrentDraw`). The oldest submission it can still read for is the one that carries this record: a retired version

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <string>
+
 #include "common/types.h"
 
 /// Diagnostic (`TLG_TSHARP_WATCH=1`, off by default): finds the code that changes the T# a texture view keeps. A hardware write watch (debug registers, all threads) is armed on the
@@ -15,5 +17,9 @@ namespace Core::NativeTsharpWatch {
 void Arm(u64 view_object, u64 address, u32 width, u32 height);
 /// W1.5 census (`TLG_SILENT_CENSUS=1`): a write watch on the dword at `address`, whatever the switch above (four watches in all)
 void ArmAddress(u64 address, const char* tag);
+/// Debugger mode (byte audit): a write watch on the dword at `address`; the four watches are used in turn, each write caught is kept (HitsJson) and recorded as a WriterHit event
+void ArmRotating(u64 address, const char* tag);
+/// JSON array of the writes the watches caught (newest 256): address, instruction (Ghidra address), return addresses, thread
+std::string HitsJson();
 
 } // namespace Core::NativeTsharpWatch

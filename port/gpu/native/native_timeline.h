@@ -51,6 +51,11 @@ enum Type : u32 {
     ResourceHash = 34, ///< capture only, resource audit: content hash of a read-only buffer used by queue 1 when it was bound: arg = address, arg2 = XXH64 of the guest memory
     ResourceUse = 33, ///< capture only, resource audit: a buffer / image bound by the raster thread: arg = address | class << 48 (queue index, 0 graphics) | kind << 56 | written << 63, arg2 = size (core/resource_audit.h)
     GameWaitSite = 35, ///< written right after a GameWait of the same thread: arg = the guest call site (return address of the blocking import), arg2 = the object
+    // Debugger mode (Shift+F5, documents/tlg/native plan/engine/frame-walk.md): capture only
+    ResourceStale = 36, ///< the byte audit: a read found other bytes than the memory held at the game's submit of its record: arg = address of the first differing 128 byte chunk, arg2 = differing chunks << 32 | submit index
+    ThumbFrame = 37,  ///< present thread: a thumbnail of a presented frame was queued: arg = thumbnail id (matches thumbs.bin), arg2 = presented frame count
+    GlitchMark = 38,  ///< the owner pressed F6 / F7: arg = presented frame count, arg2 = mode (1 full, 2 light)
+    WriterHit = 39,   ///< a data breakpoint armed by the byte audit fired: arg = written address, arg2 = instruction rva (Ghidra address) | first return address << 32
     SchedNode = 28,   ///< a node: arg = node pointer, arg2 = 1 finished waiting node seen by a poll, 2 dispatch: 2 | state << 8 | pending << 16 | flags << 32
 };
 
