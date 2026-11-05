@@ -963,7 +963,15 @@ u32 DeferFrames() {
 struct HeldFree {
     u64 heap, address, size;
     u64 need; // RasterDoneSubmissions() must reach this before the block is freed
+    s64 due_frame; // TLG_FREE_HOLD_FRAMES: the engine frame from which on the block may go (0: no frame rule)
+    bool armed;    // the frame rule passed and need was raised to the submissions recorded by then
 };
+/// TLG_FREE_HOLD_FRAMES=N: also keep a freed block N engine frames (the game's own rule: an object lives 3 frames after its last use, but never-stamped objects are freed at once
+/// while draws the game built ahead still use them), then until the raster thread has finished everything recorded up to then
+u32 FreeHoldFrames() {
+    static const u32 n = [] { const char* e = std::getenv("TLG_FREE_HOLD_FRAMES"); return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u; }();
+    return n;
+}
 std::deque<HeldFree> held_frees; // under deferred_mutex, in free order (need never decreases)
 u64 held_bytes = 0;              // under deferred_mutex (known sizes only)
 std::atomic<u64> hold_count{0}, hold_at_once{0}, hold_released{0}, hold_forced{0}, hold_max_pending{0}, hold_max_bytes{0}, hold_alloc_failed{0}, hold_alloc_failed_twice{0};
@@ -983,8 +991,20 @@ void ReleaseHeld(bool all) {
     std::vector<HeldFree> due;
     {
         std::scoped_lock lock{deferred_mutex};
-        while (!held_frees.empty() && (all || held_frees.front().need <= done)) {
-            if (held_frees.front().need > done) {
+        const s64 frame = FreeHoldFrames() != 0 ? EngineFrame() : 0;
+        while (!held_frees.empty()) {
+            HeldFree& front = held_frees.front();
+            if (!all && front.due_frame != 0 && !front.armed) {
+                if (frame < front.due_frame) {
+                    break;
+                }
+                front.need = std::max<u64>(front.need, u64{Core::NativeContent::SubmitCount()} + 1);
+                front.armed = true;
+            }
+            if (!all && front.need > done) {
+                break;
+            }
+            if (held_frees.front().need > done || (front.due_frame != 0 && !front.armed)) {
                 hold_forced.fetch_add(1, std::memory_order_relaxed);
             }
             held_bytes -= held_frees.front().size;
@@ -1328,12 +1348,12 @@ u64 PS4_SYSV_ABI GomallocFree(u64 heap, u64 address, u64 a2, u64 a3, u64 a4, u64
             }
         }
         const u64 need = Core::NativeContent::SubmitCount() + 1;
-        if (Core::NativeContent::RasterDoneSubmissions() >= need) {
+        if (FreeHoldFrames() == 0 && Core::NativeContent::RasterDoneSubmissions() >= need) {
             hold_at_once.fetch_add(1, std::memory_order_relaxed);
             return 0; // the original runs
         }
         std::scoped_lock lock{deferred_mutex};
-        held_frees.push_back({heap, address, size, need});
+        held_frees.push_back({heap, address, size, need, FreeHoldFrames() != 0 ? EngineFrame() + FreeHoldFrames() : 0, false});
         held_bytes += size;
         hold_count.fetch_add(1, std::memory_order_relaxed);
         hold_max_pending.store(std::max<u64>(hold_max_pending.load(), held_frees.size()), std::memory_order_relaxed);
