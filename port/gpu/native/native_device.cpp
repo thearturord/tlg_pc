@@ -1031,6 +1031,7 @@ u32 FreeHoldFrames() {
     static const u32 n = [] { const char* e = std::getenv("TLG_FREE_HOLD_FRAMES"); return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u; }();
     return n;
 }
+std::atomic<u64> hold_bucket_count[6], hold_bucket_bytes[6];
 std::deque<HeldFree> held_frees; // under deferred_mutex, in free order (need never decreases)
 u64 held_bytes = 0;              // under deferred_mutex (known sizes only)
 std::atomic<u64> hold_count{0}, hold_at_once{0}, hold_released{0}, hold_forced{0}, hold_max_pending{0}, hold_max_bytes{0}, hold_alloc_failed{0}, hold_alloc_failed_twice{0}, hold_mid_released{0};
@@ -1216,6 +1217,10 @@ nlohmann::json FreeHoldReport() {
     }
     return {{"on", FreeHoldOn()},
             {"pool_stats", pools},
+            {"held_frees_by_size", {{"lt_64KB", {hold_bucket_count[0].load(), hold_bucket_bytes[0].load()}}, {"lt_1MB", {hold_bucket_count[1].load(), hold_bucket_bytes[1].load()}},
+                                    {"lt_16MB", {hold_bucket_count[2].load(), hold_bucket_bytes[2].load()}}, {"lt_64MB", {hold_bucket_count[3].load(), hold_bucket_bytes[3].load()}},
+                                    {"ge_64MB", {hold_bucket_count[4].load(), hold_bucket_bytes[4].load()}}, {"unknown_size", {hold_bucket_count[5].load(), hold_bucket_bytes[5].load()}},
+                                    {"note", "[count, bytes] of every free the hold kept since the start"}}},
             {"material_probe", {{"pressure_helper_calls", material_probe[0].load()}, {"pressure_helper_calls_with_arg_0", material_probe[1].load()}, {"pressure_helper_did_work", material_probe[2].load()},
                                 {"move_helper_calls", material_probe[3].load()}, {"move_helper_did_work", material_probe[4].load()}}},
             {"frees_held", hold_count.load()},
@@ -1318,6 +1323,12 @@ u64 PS4_SYSV_ABI GomallocFree(u64 heap, u64 address, u64 a2, u64 a3, u64 a4, u64
         std::scoped_lock lock{deferred_mutex};
         held_frees.push_back({heap, address, size, need, FreeHoldFrames() != 0 ? EngineFrame() + FreeHoldFrames() : 0, false});
         held_bytes += size;
+        {
+            // size census of the held frees (what makes up the held bytes): < 64 KB, < 1 MB, < 16 MB, < 64 MB, >= 64 MB, unknown
+            const u32 bucket = size == 0 ? 5 : size < (64u << 10) ? 0 : size < (1u << 20) ? 1 : size < (16u << 20) ? 2 : size < (64u << 20) ? 3 : 4;
+            hold_bucket_count[bucket].fetch_add(1, std::memory_order_relaxed);
+            hold_bucket_bytes[bucket].fetch_add(size, std::memory_order_relaxed);
+        }
         hold_count.fetch_add(1, std::memory_order_relaxed);
         hold_max_pending.store(std::max<u64>(hold_max_pending.load(), held_frees.size()), std::memory_order_relaxed);
         hold_max_bytes.store(std::max<u64>(hold_max_bytes.load(), held_bytes), std::memory_order_relaxed);
