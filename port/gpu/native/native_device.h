@@ -133,10 +133,6 @@ u64 PS4_SYSV_ABI BeginFrameTick(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, 
 /// native-v3-writers (`TLG_LOADER_GATE=1`): the engine's allocation (`address`, `size`; hooks AllocGarlicMemory / AllocOnionMemory) overlaps memory that was freed (hook GomallocFree) when the game
 /// had submitted `n` frames: the game thread waits until the raster thread has executed `n` frames, so the loader never overwrites memory a frame in flight still reads. Keeps normal memory reuse.
 void LoaderGateAtAllocation(u64 address, u64 size, u64 ret = 0);
-/// native-v3-writers (`TLG_SLOT_GATE=1`, mid hook `SceneGroupAdvance` at 0x1d1827d, handler `native_scene_group_advance`): the scene's per object constant slots are three groups, the engine advances
-/// the group (`(group + 1) % 3`, variable 0x69b1678) about twice per frame, so a group is written again after about 3 graphics submissions, sooner than the raster thread can be (it may lag 2 frames).
-/// When the group `new_group` is about to be written again, the game thread waits until the raster thread has finished the submissions that could still read its old contents.
-void SceneGroupAdvanced(u32 new_group);
 /// native-v3-writers (`TLG_SKIN_GATE=1`, called by the `SkinWrites` hook before the original): the skinning matrix ring has 4 slots and two passes per frame, so a slot is written again two frames
 /// after its last write. When slot `index` is about to be written, the game thread waits until the raster thread has finished the submissions that could still read its old contents.
 void SkinSlotAboutToWrite(u32 index);

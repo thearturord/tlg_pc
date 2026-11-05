@@ -8665,7 +8665,7 @@ void AnnounceSceneSlotRange(u64 frame, u32 upto, bool remember_group) {
 
 // ---- TLG_SLOT_RING=1 (memory-ownership-plan 0b, slot groups at the root) ------------------------------------------------------------------------------------------------
 // The scene's per object constant slots (three groups of 8192 slot buffers, 0x130 bytes) are written in place by FUN_01e05330 and FUN_01e07330 on the thread that fills the frame
-// data; a group comes back after 3 frames, while the raster thread (game two frames ahead) may still read it. Instead of waiting at the group switch (TLG_SLOT_GATE), each slot
+// data; a group comes back after 3 frames, while the raster thread (game two frames ahead) may still read it. Instead of waiting at the group switch (the removed TLG_SLOT_GATE), each slot
 // the call took is copied, after the call, into a fresh block of the frame ring and the slot buffer's descriptor points there (as TLG_LIGHT_RING does for the lights): the draw
 // recorded later binds the block, and the next frame's write into the slot's own memory touches nothing a frame in flight reads.
 // Check: the slots copied are compared with their memory again before the next call and at the group switch; a difference means a write after the copy (lost to the draw).
@@ -8794,12 +8794,12 @@ bool SlotRingRun(const char* name, u64 frame, u64 a1, u64 a2, u64 a3, u64 a4, u6
 } // namespace
 
 /// Mid hook at 0x1d18266 (`FUN_01d169b0`, inside `group = (group + 1) % 3`: rax holds the old group, the store comes 17 bytes later; 0x1d1827d was refused, a call follows after 4 bytes):
-/// see `NativeDevice::SceneGroupAdvanced`. The new group is computed here.
+/// the slot ring's check at the group switch (the old `TLG_SLOT_GATE` wait that stood here is gone: the slot ring copies the slots instead).
 u64 PS4_SYSV_ABI SceneGroupAdvanceHook(Core::GuestHooks::MidContext* ctx) {
+    (void)ctx;
     if (SlotRingOn()) {
         SlotRingCheck("group switch");
     }
-    NativeDevice::SceneGroupAdvanced((static_cast<u32>(ctx->rax) + 1) % 3);
     return 0;
 }
 
