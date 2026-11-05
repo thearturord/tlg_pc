@@ -5875,11 +5875,51 @@ u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64
 
 /// The game's memory setup (FUN_01dd39d0) makes its Onion and Garlic pools and sizes the Garlic pool by sceKernelIsNeoMode (2816 MB, 3328 MB on a PS4 Pro). It asks six
 /// times on the way that succeeds; those answers are yes while the setting is on.
+/// `TLG_GARLIC_POOL_MB=N` (3328 to 4096, needs garlic_pool_pro): a bigger Garlic pool than the PS4 Pro's 3328 MB, so the free hold (which keeps freed blocks back until the renderer is done) does not run the pool dry.
+/// FUN_01dd39d0 loads `MOV R15D, 0xb0000000` (01dd3a46, the base size) and the Pro size is R15 + 0x20000000; the immediate is rewritten to N MB - 0x20000000. Checked against the expected bytes first.
+void PatchGarlicPoolSize() {
+    static bool done = false;
+    if (done) {
+        return;
+    }
+    done = true;
+    const char* e = std::getenv("TLG_GARLIC_POOL_MB");
+    if (e == nullptr || *e == ' ') {
+        return;
+    }
+    const u64 mb = static_cast<u64>(std::atoll(e));
+    if (mb < 3328 || mb > 4096) {
+        LOG_WARNING(Core, "garlic pool: TLG_GARLIC_POOL_MB={} is outside 3328..4096, ignored", mb);
+        return;
+    }
+    const VAddr image = ImageBase();
+    if (image == 0) {
+        return;
+    }
+    auto* at = reinterpret_cast<u8*>(image + (0x1dd3a46 - 0x1000000));
+    static constexpr u8 expected[6] = {0x41, 0xbf, 0x00, 0x00, 0x00, 0xb0};
+    if (std::memcmp(at, expected, sizeof expected) != 0) {
+        LOG_WARNING(Core, "garlic pool: the code at the pool size immediate is not what was expected, nothing patched");
+        return;
+    }
+    const u32 base_size = static_cast<u32>(mb * 1024 * 1024 - 0x20000000ull);
+    DWORD old = 0;
+    if (!VirtualProtect(at, sizeof expected, PAGE_EXECUTE_READWRITE, &old)) {
+        LOG_WARNING(Core, "garlic pool: could not make the code writable, nothing patched");
+        return;
+    }
+    std::memcpy(at + 2, &base_size, sizeof base_size);
+    FlushInstructionCache(GetCurrentProcess(), at, sizeof expected);
+    VirtualProtect(at, sizeof expected, old, &old);
+    LOG_INFO(Core, "garlic pool: sized {} MB (PS4 Pro: 3328 MB)", mb);
+}
+
 u64 PS4_SYSV_ABI GarlicPoolPro(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     const u64 original = Core::GuestHooks::OriginalEntry("AppMemoryInit");
     if (original == 0 || EmulatorSettings.GetGarlicPoolPro() == 0) {
         return 0;
     }
+    PatchGarlicPoolSize();
     constexpr u32 NeoModeCalls = 6;
     LOG_INFO(Core, "garlic pool: the game's memory setup runs as on a PS4 Pro (3328 MB instead of 2816 MB)");
     Libraries::Kernel::SetNeoModeCalls(NeoModeCalls);
