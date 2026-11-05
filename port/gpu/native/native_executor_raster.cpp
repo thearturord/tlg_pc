@@ -672,6 +672,11 @@ void NativeExecutor::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 n
                                            std::move(by_op));
             }
             Core::DebugServer::Publish("fence_latency", owner.fence_latency.Report());
+            Core::DebugServer::Publish("raster_early_announce", {{"enabled", Core::NativeUpdates::EarlyAnnounceOn()},
+                                                               {"hoisted_closures", sp.hoist_ops.load()},
+                                                               {"picked_while_a_batch_ran", sp.hoist_picked.load()},
+                                                               {"operations_skipped_total", sp.hoist_distance.load()},
+                                                               {"time_ms", sp.hoist_ns.load() / 1.0e6}});
             {
                 nlohmann::json sites = nlohmann::json::array();
                 std::vector<std::pair<u64, std::pair<const char*, u32>>> top;

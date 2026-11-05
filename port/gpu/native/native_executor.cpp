@@ -261,7 +261,14 @@ void NativeExecutor::SubmitGfx(std::span<const u32> dcb, std::span<const u32> cc
     Core::Flight::Add(Core::Flight::SubmitBegin, 0, dcb.size(), 0); // L1
     FLIGHT_SCOPE("command processor: graphics submission");
     auto announced = Core::NativeUpdates::TakeBatch(); // B2: applied on the raster thread before this submission's work
-    Core::NativeContent::NoteSubmit(announced.first);  // M1: the frame data store (shadow) and the submission count
+    // M1: the frame data store (shadow) and the submission count
+    if (announced.ring_first.empty()) {
+        Core::NativeContent::NoteSubmit(announced.first);
+    } else {
+        auto all = announced.first;
+        all.insert(all.end(), announced.ring_first.begin(), announced.ring_first.end());
+        Core::NativeContent::NoteSubmit(all);
+    }
     const u32 submit_index = Core::NativeContent::SubmitCount();
     auto& queue = mapped_queues[GfxQueueId];
 
@@ -286,6 +293,8 @@ void NativeExecutor::SubmitGfx(std::span<const u32> dcb, std::span<const u32> cc
         if (direct) {
             direct->announced_first = std::move(announced.first);
             direct->announced_again = std::move(announced.again);
+            direct->announced_ring_first = std::move(announced.ring_first);
+            direct->announced_ring_again = std::move(announced.ring_again);
             direct->announced_deleted = std::move(announced.deleted);
         } else {
             RasterRun([batch = std::move(announced)] { Core::NativeUpdates::ApplyBatch(batch); });
@@ -322,6 +331,8 @@ void NativeExecutor::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
         if (direct) {
             direct->announced_first = std::move(announced.first);
             direct->announced_again = std::move(announced.again);
+            direct->announced_ring_first = std::move(announced.ring_first);
+            direct->announced_ring_again = std::move(announced.ring_again);
             direct->announced_deleted = std::move(announced.deleted);
         } else {
             RasterRun([batch = std::move(announced)] { Core::NativeUpdates::ApplyBatch(batch); });

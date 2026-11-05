@@ -34,7 +34,10 @@ u64 OpenMapSerial();
 void FlushOpenMapsSince(u64 serial);
 /// A hooked engine function announces the memory it is about to write (`writer` names the function: 1 skinning matrices, 2 light constants, 3 a memory copy of the command stream, 4 the BeginRecording stores, 5 buffer creation with initial data, 6 texture initialization).
 /// `site` names the call site for the census `TLG_WRITER_SITES=1` (`/stats` writer_sites: count, bytes, size classes per writer and site); it must be a string literal.
-void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site = nullptr);
+void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site = nullptr, bool ring = false);
+/// TLG_EARLY_ANNOUNCE=1: announcements of memory the engine writes fresh every frame (frame rings: light constants, skinning matrices, scene slots, Map into a ring window) are applied on the raster
+/// thread as soon as it can, not behind the graphics work queued before them (documents/tlg/native plan/engine/compute-lane-design.md section 13).
+[[nodiscard]] bool EarlyAnnounceOn() noexcept;
 /// N5h (`TLG_RING_SUPERSEDE=1`): a write that gives memory new contents supersedes what the GPU wrote there before. The announcer is told (`fn`) for: the creation of a
 /// buffer, the initialization of a texture (any thread) and the unmap of a buffer on the render thread. Safe because anything the GPU writes into that memory afterwards is
 /// issued after the announcement; marks that older GPU writes add later are only too many.
@@ -55,9 +58,10 @@ void SetApply(void (*fn)(void* context, u64 address, u64 size, bool newer), void
 /// The announcements of one submission: applied once (`first`) and the previous submission's again (`again`)
 struct Batch {
     std::vector<std::pair<u64, u64>> first, again;
+    std::vector<std::pair<u64, u64>> ring_first, ring_again; ///< the part of first / again in frame ring memory (empty unless EarlyAnnounceOn)
     std::vector<std::array<u64, 4>> deleted; ///< B8.2: engine objects deleted or created before the submission (id, memory, bytes, what: 0 view, 1 texture, 2 created texture, 3 texture with an alias)
     [[nodiscard]] bool Empty() const noexcept {
-        return first.empty() && again.empty() && deleted.empty();
+        return first.empty() && again.empty() && ring_first.empty() && ring_again.empty() && deleted.empty();
     }
 };
 /// Takes the announcements made since the last batch (B2 cutover; empty when off)

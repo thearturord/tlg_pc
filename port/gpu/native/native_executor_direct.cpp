@@ -493,8 +493,17 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
 }
 
 void NativeExecutor::QueueAnnounced(Core::NativeDirect::Buffer& direct) {
-    if (direct.announced_first.empty() && direct.announced_again.empty() && direct.announced_deleted.empty()) {
+    if (direct.announced_first.empty() && direct.announced_again.empty() && direct.announced_deleted.empty() && direct.announced_ring_first.empty() &&
+        direct.announced_ring_again.empty()) {
         return;
+    }
+    if (!direct.announced_ring_first.empty() || !direct.announced_ring_again.empty()) {
+        // TLG_EARLY_ANNOUNCE: memory the engine writes fresh every frame is announced ahead of the graphics work queued before this submission
+        Core::NativeUpdates::Batch early;
+        early.ring_first = std::move(direct.announced_ring_first);
+        early.ring_again = std::move(direct.announced_ring_again);
+        RasterMarkNextHoist();
+        RasterRun([b = std::move(early)] { Core::NativeUpdates::ApplyBatch(b); });
     }
     Core::NativeUpdates::Batch batch;
     batch.first = std::move(direct.announced_first);

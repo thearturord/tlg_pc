@@ -135,6 +135,9 @@ void Queue::Push(Op&& op, bool wait) {
         op.position = pushed.load(std::memory_order_relaxed) + 1;
         queue.push_back(std::move(op));
         queued_hint.store(static_cast<u32>(queue.size()), std::memory_order_relaxed);
+        if (queue.back().hoist) {
+            hoist_waiting.fetch_add(1, std::memory_order_acq_rel);
+        }
         if (lane_op) {
             lane_waiting.fetch_add(1, std::memory_order_acq_rel);
             lane_pushed.fetch_add(1, std::memory_order_relaxed);
@@ -163,6 +166,7 @@ void Queue::PushClosure(Common::UniqueFunction<void>&& func, bool wait, bool wri
     }
     op.lane_passable = std::exchange(next_passable, false) && lane_wide;
     op.depends_on = std::exchange(next_dependency, 0);
+    op.hoist = std::exchange(next_hoist, false);
     Push(std::move(op), wait);
 }
 
@@ -234,6 +238,7 @@ void Queue::Run(std::stop_token stoken) {
             }
             batch.swap(sp.queue);
             sp.queued_hint.store(0, std::memory_order_relaxed);
+            sp.hoist_waiting.store(0, std::memory_order_release);
             sp.lane_waiting.store(0, std::memory_order_release); // every queued lane operation is in the batch now
             if (!batch.empty()) {
                 const auto& first = batch.front();
@@ -364,7 +369,7 @@ void Queue::Run(std::stop_token stoken) {
                     lane_idx.push_back(k);
                     lane_ready.push_back(ready);
                     prev_ready = ready;
-                } else if (!batch[k].has_call && !batch[k].lane_passable) {
+                } else if (!batch[k].has_call && !batch[k].lane_passable && !batch[k].hoist) {
                     barrier_idx.push_back(k);
                     after_barrier = k + 1;
                 }
@@ -372,7 +377,45 @@ void Queue::Run(std::stop_token stoken) {
         }
         size_t lane_next = 0, barrier_next = 0;
         std::vector<Op> picked;
+        // Early announce: hoisted closures run first
+        const auto run_hoisted = [&](Op& o, u64 skipped) {
+            const u64 t0 = VideoCore::ReadbackStats::NowNs();
+            sp.hoist_ops.fetch_add(1, std::memory_order_relaxed);
+            sp.hoist_distance.fetch_add(skipped, std::memory_order_relaxed);
+            run_op(o);
+            sp.hoist_ns.fetch_add(VideoCore::ReadbackStats::NowNs() - t0, std::memory_order_relaxed);
+        };
+        bool hoisted_from_batch = false;
+        std::vector<Op> picked_hoist;
         for (u32 i = 0; i < batch.size(); ++i) {
+            if (sp.hoist_waiting.load(std::memory_order_acquire) != 0) { // hoisted closures pushed while this batch runs
+                picked_hoist.clear();
+                {
+                    std::scoped_lock lk{sp.mutex};
+                    size_t keep = 0;
+                    for (size_t k = 0; k < sp.queue.size(); ++k) {
+                        Op& o = sp.queue[k];
+                        if (o.hoist) {
+                            picked_hoist.push_back(std::move(o));
+                        } else {
+                            if (keep != k) {
+                                sp.queue[keep] = std::move(o);
+                            }
+                            ++keep;
+                        }
+                    }
+                    sp.queue.resize(keep);
+                    sp.queued_hint.store(static_cast<u32>(keep), std::memory_order_relaxed);
+                    sp.hoist_waiting.fetch_sub(static_cast<u32>(picked_hoist.size()), std::memory_order_acq_rel);
+                }
+                if (!picked_hoist.empty()) {
+                    sp.done_cv.notify_all();
+                    sp.hoist_picked.fetch_add(picked_hoist.size(), std::memory_order_relaxed);
+                    for (Op& o : picked_hoist) {
+                        run_hoisted(o, batch.size() - i);
+                    }
+                }
+            }
             if (lane_active) {
                 while (barrier_next < barrier_idx.size() && barrier_idx[barrier_next] < i) {
                     ++barrier_next;
@@ -412,7 +455,7 @@ void Queue::Run(std::stop_token stoken) {
                             if (!blocked && o.audit_class == 1 && dep_ran) {
                                 picked.push_back(std::move(o));
                             } else {
-                                if (o.audit_class == 1 || (!o.has_call && !o.lane_passable)) {
+                                if (o.audit_class == 1 || (!o.has_call && !o.lane_passable && !o.hoist)) {
                                     blocked = true; // a barrier, or a queue 1 operation that has to wait (the order of queue 1 stays)
                                 }
                                 if (keep != k) {
@@ -439,6 +482,15 @@ void Queue::Run(std::stop_token stoken) {
                 }
                 if (burst != 0) {
                     sp.lane_bursts.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (!hoisted_from_batch) { // after the first lane operations (they are ready now), before the first graphics operation
+                hoisted_from_batch = true;
+                for (u32 k = 0; k < batch.size(); ++k) {
+                    if (batch[k].hoist && !batch[k].executed) {
+                        batch[k].executed = true;
+                        run_hoisted(batch[k], k);
+                    }
                 }
             }
             if (!batch[i].executed) {

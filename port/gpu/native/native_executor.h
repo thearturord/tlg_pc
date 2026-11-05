@@ -230,6 +230,12 @@ public:
             split->MarkNextPassable();
         }
     }
+    /// The next RasterRun closure runs as early as the raster thread can (TLG_EARLY_ANNOUNCE).
+    void RasterMarkNextHoist() {
+        if (split_active && split) {
+            split->MarkNextHoist();
+        }
+    }
     void RasterPush(RasterOp&& op, bool wait);
     /// Blocks until every queued closure that writes guest memory has run.
     void DrainRasterWrites(u32 caller = 3);

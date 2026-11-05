@@ -71,6 +71,7 @@ struct Op {
     bool executed{};  ///< Lane: already run out of order from this batch (skipped when its turn comes).
     u64 pushed_ns{}; ///< Lane: when the operation entered the queue.
     u64 depends_on{}; ///< Lane: the queue position of the operation this one must run after (0 = none, ~0 = everything queued before it).
+    bool hoist{};         ///< Early announce: runs at the start of the batch / at the next operation boundary, ahead of the graphics operations queued before it.
     bool lane_passable{}; ///< Lane: a queue 1 operation may run ahead of this closure (no barrier).
     bool has_call{};
     bool writes_memory{};
@@ -131,6 +132,10 @@ public:
     /// Front thread, before the next PushClosure: the closure is no barrier for queue 1 operations (compute lane).
     void MarkNextPassable() noexcept {
         next_passable = true;
+    }
+    /// Front thread, before the next PushClosure: the closure runs as early as the raster thread can (TLG_EARLY_ANNOUNCE).
+    void MarkNextHoist() noexcept {
+        next_hoist = true;
     }
     /// Front thread, before the next PushClosure: the closure depends on the operation at `position` (compute lane).
     void SetNextDependency(u64 position) noexcept {
@@ -210,6 +215,9 @@ public:
     std::atomic<u32> queued_hint{0};   ///< Operations in `queue` (written under the mutex, read without).
     std::atomic<u64> lane_pushed{0};   ///< Queue 1 operations pushed while the lane was usable.
     bool next_passable{};   ///< front thread only
+    bool next_hoist{};      ///< front thread only
+    std::atomic<u32> hoist_waiting{0}; ///< Hoisted closures in `queue` the raster thread has not taken yet.
+    std::atomic<u64> hoist_ops{}, hoist_picked{}, hoist_ns{}, hoist_distance{}; ///< run early / of which picked from the queue while a batch ran / their time / operations they skipped
     u64 next_dependency{};  ///< front thread only
     std::atomic<u32> lane_waiting{0}; ///< Queue 1 operations in `queue` that the raster thread has not taken yet.
     std::atomic<u64> lane_ops{};      ///< Queue 1 operations run through the lane logic.

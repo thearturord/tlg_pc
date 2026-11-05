@@ -74,7 +74,7 @@ u64 open_map_serial = 0;
 std::map<std::pair<u64, u64>, OpenMap> open_maps; ///< (thread, resource id) -> the window of the Map that has not been unmapped yet
 } // namespace
 
-void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp = 0);
+void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp = 0, bool ring = false);
 
 namespace {
 /// TLG_WRITER_SITES: sets the call site of the write a map announces: for a map into the buffer's own memory the caller (guest address in Ghidra numbering) so the late read census names it
@@ -113,7 +113,7 @@ void NoteRenderThread() {
     }
     for (const auto& [thread, map] : stale) {
         SetMapSite(map, MapSitesOn());
-        NoteWriterRangeOf(0, map.address, map.size, thread, map.stamp);
+        NoteWriterRangeOf(0, map.address, map.size, thread, map.stamp, map.in_ring);
         NativeContent::SetSite(0);
     }
     NativeUploads::PublishPending(NativeDraw::NextSeq());
@@ -157,7 +157,7 @@ void NoteUnmap(u64 resource_id) {
             site = own_name;
         }
     }
-    NoteWriterRange(0, map.address, map.size, site);
+    NoteWriterRange(0, map.address, map.size, site, map.in_ring);
 }
 
 u64 OpenMapSerial() {
@@ -181,7 +181,7 @@ void FlushOpenMapsSince(u64 serial) {
     }
     for (const OpenMap& map : done) {
         SetMapSite(map, MapSitesOn());
-        NoteWriterRangeOf(0, map.address, map.size, thread, map.stamp);
+        NoteWriterRangeOf(0, map.address, map.size, thread, map.stamp, map.in_ring);
         NativeContent::SetSite(0);
     }
 }
@@ -236,7 +236,7 @@ bool SitesOn() {
 }
 } // namespace
 
-void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site) {
+void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site, bool ring) {
     if (SitesOn() && address != 0 && size != 0) {
         std::scoped_lock lock{site_mutex};
         SiteStat& stat = site_stats[{writer, site != nullptr ? site : "?"}];
@@ -250,13 +250,13 @@ void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site) {
         ++stat.by_size_log2[log];
     }
     NativeContent::SetSite(SitesOn() ? NativeContent::SiteId(site != nullptr ? site : "?") : 0);
-    NoteWriterRangeOf(writer, address, size, ThreadKey());
+    NoteWriterRangeOf(writer, address, size, ThreadKey(), 0, ring);
     NativeContent::SetSite(0);
 }
 
 namespace {
 std::mutex pending_mutex;
-std::vector<std::pair<u64, u64>> pending_ranges, applied_last;
+std::vector<std::pair<u64, u64>> pending_ranges, applied_last, pending_ring_ranges, applied_ring_last;
 std::vector<std::array<u64, 4>> pending_deleted;
 void (*delete_fn)(void*, u64, u64, u64, u32) = nullptr;
 void (*create_fn)(void*, u64, u64, u64, bool, u32, u32) = nullptr;
@@ -280,9 +280,12 @@ Batch TakeBatch() {
     }
     std::scoped_lock lock{pending_mutex};
     batch.first.swap(pending_ranges);
+    batch.ring_first.swap(pending_ring_ranges);
     batch.deleted.swap(pending_deleted);
     batch.again = applied_last;
     applied_last = batch.first;
+    batch.ring_again = applied_ring_last;
+    applied_ring_last = batch.ring_first;
     return batch;
 }
 
@@ -320,6 +323,14 @@ void NoteEngineDelete(u64 id, u64 address, u64 bytes, u32 what) {
     pending_deleted.push_back({id, address, bytes, what});
 }
 
+bool EarlyAnnounceOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_EARLY_ANNOUNCE");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
 void ApplyBatch(const Batch& batch) {
     TLG_PROF_LEVEL("updates.apply_batch", 1);
     TLG_PROF_ADD("updates.ranges_first", batch.first.size());
@@ -347,6 +358,9 @@ void ApplyBatch(const Batch& batch) {
         for (const auto& [address, size] : batch.again) {
             apply_fn(apply_context, address, size, false);
         }
+        for (const auto& [address, size] : batch.ring_again) {
+            apply_fn(apply_context, address, size, false);
+        }
     }
     TLG_PROF_LEVEL("updates.apply_first", 2);
     for (const auto& [address, size] : batch.first) {
@@ -354,7 +368,11 @@ void ApplyBatch(const Batch& batch) {
         apply_fn(apply_context, address, size, true);
         b2_applied_bytes.fetch_add(size, std::memory_order_relaxed);
     }
-    b2_applied_ranges.fetch_add(batch.first.size(), std::memory_order_relaxed);
+    for (const auto& [address, size] : batch.ring_first) {
+        apply_fn(apply_context, address, size, true);
+        b2_applied_bytes.fetch_add(size, std::memory_order_relaxed);
+    }
+    b2_applied_ranges.fetch_add(batch.first.size() + batch.ring_first.size(), std::memory_order_relaxed);
     b2_reapplied_ranges.fetch_add(batch.again.size(), std::memory_order_relaxed);
 }
 
@@ -493,13 +511,21 @@ nlohmann::json B2Report() {
             {"note", "B2, cumulative: the engine's announced CPU writes applied to the caches"}};
 }
 
-void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp) {
+namespace {
+std::array<std::atomic<u64>, 8> announced_ranges_by_writer{}, announced_bytes_by_writer{};
+} // namespace
+
+void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp, bool ring) {
     if (address == 0 || size == 0) {
         return;
     }
+    announced_ranges_by_writer[writer & 7].fetch_add(1, std::memory_order_relaxed);
+    announced_bytes_by_writer[writer & 7].fetch_add(size, std::memory_order_relaxed);
     if (B2NativeMode() != 0) {
         std::scoped_lock lock{pending_mutex};
-        pending_ranges.emplace_back(address, size);
+        // memory the engine writes fresh every frame (the frame rings): applied early on the raster thread
+        const bool fresh = EarlyAnnounceOn() && (writer == 1 || writer == 2 || writer == 4 || ring);
+        (fresh ? pending_ring_ranges : pending_ranges).emplace_back(address, size);
     }
     NativeResources::NoteAnnouncedWrite(address, size); // C1: resident buffers on those pages are not synchronized any more
     NativeUploads::Announce(writer, address, size, thread == render_thread.load(std::memory_order_relaxed), NativeDraw::NextSeq());
@@ -514,6 +540,9 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp)
 nlohmann::json Report() {
     nlohmann::json j = nlohmann::json::object();
     j["enabled"] = enabled.load();
+    for (u32 w = 0; w < 8; ++w) {
+        j["announced_by_writer"][std::to_string(w)] = {{"ranges", announced_ranges_by_writer[w].load()}, {"bytes", announced_bytes_by_writer[w].load()}};
+    }
     j["gpu_written_marks_superseded"] = {{"enabled", SupersedeEnabled()}, {"ranges", superseded_ranges.load()}, {"bytes", superseded_bytes.load()}};
     auto& m = j["maps_of_buffers"] = nlohmann::json::object();
     m["total"] = maps.total.load();
