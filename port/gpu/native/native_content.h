@@ -139,6 +139,8 @@ u64 GpuAllocationSize(u64 address);
 [[nodiscard]] u32 HeapFreeAt(u64 address);
 /// Graphics submissions announced so far (the number the newest submission has in the ledger)
 [[nodiscard]] u32 SubmitCount();
+/// The calling thread announced the newest graphics submission (NoteSubmit): it cannot wait for the next one.
+[[nodiscard]] bool IsSubmitThread();
 /// Raster thread: everything submission `index` carried was executed (called through `RasterRun`, in order behind the submission's work). Submissions that do not travel the direct path are reported
 /// at once by the submit. `RasterDoneSubmissions()` is the highest number below which every submission is done.
 void NoteRasterSubmissionDone(u32 index);

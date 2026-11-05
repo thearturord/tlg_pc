@@ -677,8 +677,14 @@ std::atomic<u32> g_done_floor{0};
 std::atomic<u64> c_done_wait_timeouts{0};
 } // namespace
 
+std::atomic<u32> g_submit_thread{0};
+
 u32 SubmitCount() {
     return g_submit_count.load(std::memory_order_acquire);
+}
+
+bool IsSubmitThread() {
+    return g_submit_thread.load(std::memory_order_relaxed) == static_cast<u32>(GetCurrentThreadId());
 }
 
 void NoteRasterSubmissionDone(u32 index) {
@@ -1208,6 +1214,7 @@ u64 LastSubmitStamp() {
 void SilentHarvest(u32 index); // W1.5 census, below
 
 void NoteSubmit(const std::vector<std::pair<u64, u64>>& ranges) {
+    g_submit_thread.store(static_cast<u32>(GetCurrentThreadId()), std::memory_order_relaxed);
     const u32 index = g_submit_count.load(std::memory_order_relaxed) + 1;
     Core::ByteAudit::SnapshotAtSubmit(index);
     SilentHarvest(index);

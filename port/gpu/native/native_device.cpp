@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -1036,6 +1038,13 @@ std::atomic<u64> hold_bucket_count[6], hold_bucket_bytes[6];
 std::atomic<u64> early_fence_counts[6]; // fences, then label writes: landed at the parse, kept (compute work with a readable result not covered), kept (switch off or no free hold)
 std::deque<HeldFree> held_frees; // under deferred_mutex, in free order (need never decreases)
 u64 held_bytes = 0;              // under deferred_mutex (known sizes only)
+std::atomic<u64> hold_unsafe_blocks{0}, hold_unsafe_bytes{0}, hold_open_waits{0}, hold_open_wait_ns{0}, hold_open_same_thread{0}, hold_open_gave_up{0};
+/// TLG_HOLD_WAIT_OPEN=1 (needs TLG_PROGRESS_WAITS=1): a dry heap whose held blocks were freed in the submission window still being built waits for the game to announce that submission
+/// (when another thread does) and for the raster thread to finish it, instead of releasing those blocks unsafely.
+bool HoldWaitOpenOn() {
+    static const bool on = [] { const char* e = std::getenv("TLG_HOLD_WAIT_OPEN"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
 std::atomic<u64> hold_count{0}, hold_at_once{0}, hold_released{0}, hold_forced{0}, hold_max_pending{0}, hold_max_bytes{0}, hold_alloc_failed{0}, hold_alloc_failed_twice{0}, hold_mid_released{0};
 
 /// TLG_FREE_HOLD_MID=1: when the heap runs dry, first free the held blocks the raster thread is done with even if their frame rule has not passed (before releasing everything)
@@ -1071,6 +1080,10 @@ void ReleaseHeld(bool all, bool ignore_frames = false) {
             }
             if (!all && front.need > done) {
                 break;
+            }
+            if (front.need > done) {
+                hold_unsafe_blocks.fetch_add(1, std::memory_order_relaxed);
+                hold_unsafe_bytes.fetch_add(front.size, std::memory_order_relaxed);
             }
             if (held_frees.front().need > done || (front.due_frame != 0 && !front.armed && !ignore_frames)) {
                 hold_forced.fetch_add(1, std::memory_order_relaxed);
@@ -1250,6 +1263,13 @@ nlohmann::json FreeHoldReport() {
             {"frees_done_at_once_raster_already_past", hold_at_once.load()},
             {"held_frees_released", hold_released.load()},
             {"released_before_the_raster_thread_was_done", hold_forced.load()},
+            {"released_with_the_raster_thread_not_done_blocks", hold_unsafe_blocks.load()},
+            {"released_with_the_raster_thread_not_done_bytes", hold_unsafe_bytes.load()},
+            {"open_window_wait_switch_on", HoldWaitOpenOn()},
+            {"open_window_waits", hold_open_waits.load()},
+            {"open_window_wait_ms", hold_open_wait_ns.load() / 1.0e6},
+            {"open_window_same_thread_no_wait", hold_open_same_thread.load()},
+            {"open_window_gave_up", hold_open_gave_up.load()},
             {"pending_now", pending},
             {"pending_bytes_now", bytes},
             {"max_pending", hold_max_pending.load()},
@@ -1314,10 +1334,65 @@ u64 PS4_SYSV_ABI GomallocAlloc(u64 heap, u64 size, u64 alignment, u64 type, u64 
                 ReleaseHeld(false, true);
                 result = reinterpret_cast<GuestFunction6>(original)(heap, size, alignment, type, a4, a5);
             }
+            bool same_thread_blocked = false;
+            const bool wait_open = HoldWaitOpenOn() && Core::NativeContent::ProgressWaitsOn();
+            // other threads keep freeing while this one waits: repeat until the held blocks are gone or nothing more can be waited for
+            for (int round = 0; wait_open && result == 0 && round < 6; ++round) {
+                u64 open_need = 0;
+                {
+                    std::scoped_lock lock{deferred_mutex};
+                    open_need = held_frees.empty() ? 0 : held_frees.back().need;
+                }
+                if (open_need > Core::NativeContent::RasterDoneSubmissions()) { // (announced since the wait above, or still open)
+                    if (open_need > Core::NativeContent::SubmitCount() && Core::NativeContent::IsSubmitThread()) {
+                        hold_open_same_thread.fetch_add(1, std::memory_order_relaxed); // this thread announces the submission: nothing to wait for
+                        same_thread_blocked = true;
+                        break;
+                    } else {
+                        const auto start = std::chrono::steady_clock::now();
+                        u32 last = Core::NativeContent::SubmitCount();
+                        auto changed_at = start;
+                        bool announced = false;
+                        for (;;) {
+                            if (Core::NativeContent::SubmitCount() >= open_need) {
+                                announced = true;
+                                break;
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            const auto now = std::chrono::steady_clock::now();
+                            if (const u32 count = Core::NativeContent::SubmitCount(); count != last) {
+                                last = count;
+                                changed_at = now;
+                            } else if (now - changed_at > std::chrono::seconds(10)) {
+                                break;
+                            }
+                        }
+                        if (announced && Core::NativeContent::WaitRasterSubmissionsProgress(static_cast<u32>(open_need), true)) {
+                            ReleaseHeld(false, true);
+                            result = reinterpret_cast<GuestFunction6>(original)(heap, size, alignment, type, a4, a5);
+                        } else {
+                            hold_open_gave_up.fetch_add(1, std::memory_order_relaxed);
+                            Core::Invariant::Hit(Core::Invariant::WaitGaveUp, open_need, Core::NativeContent::RasterDoneSubmissions(), 2);
+                            same_thread_blocked = true; // nothing more can be waited for: the old last resort applies
+                            break;
+                        }
+                        hold_open_waits.fetch_add(1, std::memory_order_relaxed);
+                        hold_open_wait_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+                    }
+                } else {
+                    ReleaseHeld(false, true); // whatever became safe meanwhile
+                    result = reinterpret_cast<GuestFunction6>(original)(heap, size, alignment, type, a4, a5);
+                    break;
+                }
+            }
             if (result == 0) {
                 hold_alloc_failed_twice.fetch_add(1, std::memory_order_relaxed);
-                Core::Invariant::Hit(Core::Invariant::HoldReleasedAll, newest, Core::NativeContent::RasterDoneSubmissions(), 0);
-                ReleaseHeld(true);
+                if (wait_open && !same_thread_blocked) {
+                    ReleaseHeld(false, true); // everything that can go safely has gone: the heap is simply full (blocks freed meanwhile by other threads are not released unsafely)
+                } else {
+                    Core::Invariant::Hit(Core::Invariant::HoldReleasedAll, newest, Core::NativeContent::RasterDoneSubmissions(), 0);
+                    ReleaseHeld(true);
+                }
                 result = reinterpret_cast<GuestFunction6>(original)(heap, size, alignment, type, a4, a5);
             }
         }
