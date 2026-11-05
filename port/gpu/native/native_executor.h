@@ -224,6 +224,12 @@ public:
     void RasterRun(Common::UniqueFunction<void>&& func, bool wait = false,
                    bool writes_memory = false,
                    std::source_location site = std::source_location::current());
+    /// The next RasterRun closure is no barrier for queue 1 operations (compute lane): nothing a queue 1 operation does depends on it unless it names it as a dependency.
+    void RasterNextPassable() {
+        if (split_active && split) {
+            split->MarkNextPassable();
+        }
+    }
     void RasterPush(RasterOp&& op, bool wait);
     /// Blocks until every queued closure that writes guest memory has run.
     void DrainRasterWrites(u32 caller = 3);
@@ -386,7 +392,7 @@ private:
 
     /// Fence latency statistics per FenceKind (native/native_executor_sync.h).
     Core::NativeExecutorSync::FenceLatency fence_latency;
-    void NoteFenceLatency(VideoCore::FenceKind kind, u64 queue_ns, u64 gpu_ns);
+    void NoteFenceLatency(VideoCore::FenceKind kind, u64 queue_ns, u64 gpu_ns, u64 front_ns = 0);
 
     /// Runs `signal` once the readbacks before this fence are in guest memory, recording the
     /// fence value (if known) in the label timeline meanwhile.
@@ -421,6 +427,8 @@ private:
     /// (up to 4 ms in the light scene, documents/tlg/light-scene-cap-plan.md). True when another queue has work and `last_ns` is at least 50 us old
     /// (then set to now): the graphics task yields so the round robin runs it. Switch: env TLG_CP_ASC_YIELD=0 turns it off.
     [[nodiscard]] bool ShouldYieldToOtherQueue(u64& last_ns);
+    u64 yield_full_pushes_seen{}; ///< front thread only: the compute lane yield (ShouldYieldToOtherQueue)
+    u32 yield_full_rounds{};
 
     /// Early compute fences: per virtual compute queue, the compute work with a result the CPU may read (anything but copies and fills) that the command processor has issued, and the
     /// part of it a landed fence covers. A fence of copies may land at the parse when issued <= covered.

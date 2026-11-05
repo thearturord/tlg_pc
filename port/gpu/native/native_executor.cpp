@@ -216,6 +216,7 @@ void NativeExecutor::Process(std::stop_token stoken) {
         if (stream_open.load(std::memory_order_acquire) != 0) {
             continue; // the frame is still being recorded: the real submit is yet to come, the GPU is not idle
         }
+RasterNextPassable();
         RasterRun([] {
             Core::FrameTimeline::Mark(Core::FrameTimeline::RasterIdleSignal);
             Core::NativeFrameEvents::GpuIdle();

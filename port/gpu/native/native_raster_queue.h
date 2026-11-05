@@ -10,6 +10,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <mutex>
 #include <source_location>
@@ -68,7 +69,9 @@ struct Call {
 
 struct Op {
     bool executed{};  ///< Lane: already run out of order from this batch (skipped when its turn comes).
-    bool lane_passable{}; ///< Lane: a queue 1 operation may run ahead of this closure (no barrier). Nothing sets it yet: the experiment (copies, fills, clears) gave no gain, see compute-lane-design.md section 10.
+    u64 pushed_ns{}; ///< Lane: when the operation entered the queue.
+    u64 depends_on{}; ///< Lane: the queue position of the operation this one must run after (0 = none, ~0 = everything queued before it).
+    bool lane_passable{}; ///< Lane: a queue 1 operation may run ahead of this closure (no barrier).
     bool has_call{};
     bool writes_memory{};
     u8 audit_class{0xff}; ///< Core::ResourceAudit: the queue whose command stream pushed this operation
@@ -125,6 +128,25 @@ public:
     /// Queues `func` (a closure) for the raster thread. `writes_memory`: the closure writes guest memory that later pipeline lookups may read (descriptor tables, shader code),
     /// so the command processor thread must not plan a draw before it has run.
     void PushClosure(Common::UniqueFunction<void>&& func, bool wait, bool writes_memory, std::source_location site);
+    /// Front thread, before the next PushClosure: the closure is no barrier for queue 1 operations (compute lane).
+    void MarkNextPassable() noexcept {
+        next_passable = true;
+    }
+    /// Front thread, before the next PushClosure: the closure depends on the operation at `position` (compute lane).
+    void SetNextDependency(u64 position) noexcept {
+        next_dependency = position;
+    }
+    /// Front thread (compute lane): the queue is nearly full, so the next graphics push may block the whole front thread (and with it every compute queue).
+    [[nodiscard]] bool NearlyFull() const noexcept {
+        return lane_on && queued_hint.load(std::memory_order_relaxed) + 8 >= MaxQueued;
+    }
+    [[nodiscard]] u64 LanePushes() const noexcept {
+        return lane_pushed.load(std::memory_order_relaxed);
+    }
+    /// The queue position of the newest operation pushed.
+    [[nodiscard]] u64 LastPosition() const noexcept {
+        return pushed.load(std::memory_order_acquire);
+    }
     /// Blocks until the raster thread has executed everything queued so far.
     void Drain();
     /// Blocks until every queued closure that writes guest memory has run.
@@ -176,6 +198,19 @@ public:
     // Compute lane (TLG_ASC_LANE=1, documents/tlg/native plan/engine/compute-lane-design.md): operations of queue 1 run ahead of the graphics operations queued before them,
     // as far as the newest graphics closure (a barrier: memory writes, announce batches, uploads, ...). The raster thread checks between operations.
     bool lane_on{};
+    bool lane_wide{};
+    // Lane timing: how long queue 1 operations sat in the queue before they ran, and how long single raster operations took.
+    std::atomic<u64> lane_age_ns[2]{};   ///< [0] hoisted out of the batch, [1] picked up while a batch ran
+    std::atomic<u64> lane_age_n[2]{};
+    std::atomic<u64> lane_age_max_ns[2]{};
+    std::atomic<u64> lane_age_over_2ms[2]{};
+    std::atomic<u64> raster_long_ops{};     ///< operations of 1 ms or more
+    std::atomic<u64> raster_long_ops_ns{};
+    std::atomic<u64> raster_longest_ns{};
+    std::atomic<u32> queued_hint{0};   ///< Operations in `queue` (written under the mutex, read without).
+    std::atomic<u64> lane_pushed{0};   ///< Queue 1 operations pushed while the lane was usable.
+    bool next_passable{};   ///< front thread only
+    u64 next_dependency{};  ///< front thread only
     std::atomic<u32> lane_waiting{0}; ///< Queue 1 operations in `queue` that the raster thread has not taken yet.
     std::atomic<u64> lane_ops{};      ///< Queue 1 operations run through the lane logic.
     std::atomic<u64> lane_hoisted{};  ///< ... of which ahead of at least one operation pushed before them.
@@ -184,6 +219,7 @@ public:
     std::atomic<u64> lane_bursts{};   ///< Groups of lane operations (one stream switch pair each).
     std::atomic<u64> lane_barrier_waits{}; ///< Boundaries where lane operations were waiting behind a graphics closure.
     std::mutex lane_block_mutex;
+    std::map<std::tuple<const char*, u32, int>, std::pair<u64, u64>> long_op_sites; ///< (file, line, call kind) of raster operations of 1 ms or more: count, total ns (under lane_block_mutex)
     std::map<std::pair<const char*, u32>, u64> lane_block_sites; ///< The closure (queueing site) that held lane operations back, how often.
     // Statistics, logged every few seconds.
     u64 stat_ops{};

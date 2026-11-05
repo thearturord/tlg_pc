@@ -204,6 +204,7 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
             } else {
                 Core::DrainAudit::SetNextWrite(draw.args_addr, draw.a1 * 4u);
             }
+            RasterNextPassable();
             RasterRun(
                 [this, destination = static_cast<VAddr>(draw.args_addr), value = draw.start_index, bytes = draw.a1 * 4u,
                  gds = draw.kind == 8] {
@@ -223,6 +224,7 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
         native_tag_pending.valid = false;
         auto clear_inputs = Core::NativeDrawInputs::ForDepthClear(draw);
         Core::NativeDraw::Live().state_planned.fetch_add(1, std::memory_order_relaxed);
+        RasterNextPassable();
         RasterRun(
             [this, extent = draw.db_extent, inputs = std::move(clear_inputs)] {
                 AmdGpu::CbDbExtent db_extent;
@@ -237,6 +239,7 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
         native_tag_pending.valid = false;
         if (rasterizer) {
             Core::DrainAudit::SetNextWrite(draw.copy_destination, draw.copy_bytes);
+            RasterNextPassable();
             RasterRun(
                 [this, destination = static_cast<VAddr>(draw.copy_destination), source = static_cast<VAddr>(draw.copy_source),
                  bytes = draw.copy_bytes] { rasterizer->CopyBuffer(destination, source, bytes, false, false); },
@@ -573,6 +576,7 @@ NativeExecutor::Task NativeExecutor::ProcessDirect(std::shared_ptr<Core::NativeD
     const auto leave_clear = [&] {
         if (in_clear) {
             Core::NativeDevice::NoteClearEntered(direct->clears[clear_at], clear_entries);
+            RasterNextPassable();
             RasterRun([this] { rasterizer->SetEngineClear(nullptr); });
             in_clear = false;
         }
@@ -589,6 +593,7 @@ NativeExecutor::Task NativeExecutor::ProcessDirect(std::shared_ptr<Core::NativeD
         if (clear_at < direct->clears.size() && entry.address >= direct->clears[clear_at].begin && !in_clear) {
             in_clear = true;
             std::fill(std::begin(clear_entries), std::end(clear_entries), 0u);
+            RasterNextPassable();
             RasterRun([this, record = direct->clears[clear_at]] { rasterizer->SetEngineClear(&record); });
         }
         if (in_clear) {
@@ -617,12 +622,14 @@ NativeExecutor::Task NativeExecutor::ProcessDirect(std::shared_ptr<Core::NativeD
                 Core::NativeFlip::Request request;
                 if (!Core::NativeFlip::Take(entry.words[2] | static_cast<u64>(entry.words[3]) << 32, request)) {
                     Core::RareEvents::Note("flip_request_gone", "the typed flip request of a tail was not in the ring when the command processor took it");
+                    RasterNextPassable();
                     RasterRun([] { Core::NativeFrameEvents::FlipReady(); });
                     break;
                 }
                 const u32 one = 1;
                 Core::NativeDisplay::Lock(request.buffer_index);                                             // the display buffer is locked
                 CpWriteData(reinterpret_cast<u64*>(request.display_label), &one, sizeof(one), GfxQueueId); // ... and its label says so
+                RasterNextPassable();
                 RasterRun([] { Core::NativeFrameEvents::FlipReady(); });                                    // the flip is ready
                 if (request.has_label) {
                     CpWriteData(reinterpret_cast<u64*>(request.label_address), &request.label_value, sizeof(u32), GfxQueueId);
@@ -687,6 +694,7 @@ NativeExecutor::Task NativeExecutor::ProcessDirect(std::shared_ptr<Core::NativeD
     leave_clear();
     if (direct->submit_index != 0) {
         // everything this submission needs on the raster thread is queued before this item: it runs after it
+        RasterNextPassable();
         RasterRun([index = direct->submit_index] { Core::NativeContent::NoteRasterSubmissionDone(index); });
     }
     FIBER_EXIT;

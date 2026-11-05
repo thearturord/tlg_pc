@@ -46,6 +46,10 @@ public:
     /// Raster thread: the scheduler tick holding the work before fence `seq` of a label.
     void SetTick(VAddr address, u64 seq, u64 tick);
     [[nodiscard]] u64 Tick(VAddr address, u64 seq);
+    /// Front thread: the raster queue position of the closure that signals fence `seq` (compute lane: operations that wait for the label run after it).
+    void SetPosition(VAddr address, u64 seq, u64 position);
+    /// The queue position a command stream wait on this label depends on: 0 = nothing queued (landed already), ~0 = unknown (everything before the wait).
+    [[nodiscard]] u64 Position(VAddr address);
     /// The write of fence `seq` landed.
     void Retire(VAddr address, u64 seq);
     /// What the timeline says about the label a wait polls (not satisfied, and no label, when the wait must poll memory).
@@ -66,6 +70,7 @@ private:
         u64 latest_value;
         u64 latest_seq; ///< Order in which the fence packets were processed.
         u64 gpu_tick;   ///< Scheduler tick holding the GPU work before the latest fence.
+        u64 gpu_position; ///< Raster queue position of the closure of the latest fence (0 until SetPosition).
         u32 pending;    ///< Recorded fences whose write hasn't landed yet.
         bool overridden;
         /// Guest memory before the first held back fence, then every value recorded since.
@@ -85,7 +90,7 @@ private:
 /// run, after the GPU and the readbacks ("gpu"), and the sum. Published by the debug server.
 class FenceLatency {
 public:
-    void Note(VideoCore::FenceKind kind, u64 queue_ns, u64 gpu_ns);
+    void Note(VideoCore::FenceKind kind, u64 queue_ns, u64 gpu_ns, u64 front_ns = 0);
     /// Per kind: counts and averages since the last report (the counters are reset).
     [[nodiscard]] nlohmann::json Report();
 
@@ -93,6 +98,7 @@ private:
     struct Stat {
         std::atomic<u64> count{};
         std::atomic<u64> queue_ns{};
+        std::atomic<u64> front_ns{}; ///< parse to the end of the push (the front thread blocked in a full queue)
         std::atomic<u64> gpu_ns{};
         std::atomic<u64> total_ns{};
         std::atomic<u64> max_total_ns{};

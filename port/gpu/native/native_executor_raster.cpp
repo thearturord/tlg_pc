@@ -302,6 +302,7 @@ void NativeExecutor::SignalGraphicsEop(const Core::NativeSync::Fence& event_eop)
     if (event_eop.interrupt) {
         // frames in flight, game wait mode 2: the raster thread has executed everything the frame recorded (in order, before the end-of-pipe signal below)
         if (early) {
+            RasterNextPassable();
             RasterRun([this, ordinal] {
                 Core::FrameGate::NoteRasterReached();
                 Core::FrameGate::EarlyFrameRecorded(ordinal); // M5b: the frame's data is ours; the interrupt comes now if the occlusion answers of earlier frames are written, else later; the label below is written when the GPU is done
@@ -313,6 +314,7 @@ void NativeExecutor::SignalGraphicsEop(const Core::NativeSync::Fence& event_eop)
                 }
             });
         } else {
+            RasterNextPassable();
             RasterRun([] { Core::FrameGate::NoteRasterReached(); });
         }
     }
@@ -434,10 +436,12 @@ void NativeExecutor::CpWriteData(void* address, const u32* data, u32 data_size, 
         }
     }
     Core::DrainAudit::SetNextWrite(reinterpret_cast<u64>(address), data_size);
+RasterNextPassable();
     RasterRun([note, address, data_size] { note(address, data_size); }, false, true);
     // Whether a fence write to the label is held back is decided here, in stream order.
     if (!DeferWriteBehindFences(address, data, data_size, queue)) {
         Core::DrainAudit::SetNextWrite(reinterpret_cast<u64>(address), data_size);
+RasterNextPassable();
         RasterRun(
             [address, words = std::vector<u32>(data, data + data_size / sizeof(u32)), queue] {
                 Core::NativeExecutorSync::ApplyCpWrite(address, words, queue);
@@ -682,6 +686,21 @@ void NativeExecutor::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 n
                     sites.push_back({{"file", top[i].second.first ? top[i].second.first : "-"}, {"line", top[i].second.second}, {"times", top[i].first}});
                 }
                 Core::DebugServer::Publish("raster_lane_blockers", sites);
+                nlohmann::json longs = nlohmann::json::array();
+                {
+                    std::scoped_lock lk{sp.lane_block_mutex};
+                    std::vector<std::pair<u64, std::tuple<const char*, u32, int>>> order;
+                    for (const auto& [site, v] : sp.long_op_sites) {
+                        order.push_back({v.second, site});
+                    }
+                    std::ranges::sort(order, std::greater<>{});
+                    for (size_t i = 0; i < order.size() && i < 12; ++i) {
+                        const auto& v = sp.long_op_sites[order[i].second];
+                        longs.push_back({{"file", std::get<0>(order[i].second) ? std::get<0>(order[i].second) : "-"}, {"line", std::get<1>(order[i].second)},
+                                         {"call_kind_plus_1", std::get<2>(order[i].second)}, {"count", v.first}, {"total_ms", v.second / 1e6}});
+                    }
+                }
+                Core::DebugServer::Publish("raster_long_ops", longs);
             }
             Core::DebugServer::Publish("raster_lane", {{"enabled", sp.lane_on},
                                                       {"usable", LaneUsable()},
@@ -691,7 +710,16 @@ void NativeExecutor::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 n
                                                       {"skipped_operations_total", sp.lane_distance.load()},
                                                       {"picked_up_while_a_batch_ran", sp.lane_pickups.load()},
                                                       {"bursts", sp.lane_bursts.load()},
-                                                      {"boundaries_waiting_behind_a_graphics_closure", sp.lane_barrier_waits.load()}});
+                                                      {"boundaries_waiting_behind_a_graphics_closure", sp.lane_barrier_waits.load()},
+                                                      {"age_ms_avg_batch", sp.lane_age_n[0] ? sp.lane_age_ns[0] / 1e6 / sp.lane_age_n[0] : 0.0},
+                                                      {"age_ms_avg_pickup", sp.lane_age_n[1] ? sp.lane_age_ns[1] / 1e6 / sp.lane_age_n[1] : 0.0},
+                                                      {"age_over_2ms_batch", sp.lane_age_over_2ms[0].load()},
+                                                      {"age_over_2ms_pickup", sp.lane_age_over_2ms[1].load()},
+                                                      {"age_max_ms_batch", sp.lane_age_max_ns[0] / 1e6},
+                                                      {"age_max_ms_pickup", sp.lane_age_max_ns[1] / 1e6},
+                                                      {"raster_ops_1ms_or_more", sp.raster_long_ops.load()},
+                                                      {"raster_ops_1ms_or_more_ms", sp.raster_long_ops_ns / 1e6},
+                                                      {"raster_longest_op_ms", sp.raster_longest_ns / 1e6}});
             {
                 nlohmann::json sites = nlohmann::json::object();
                 for (auto& site : sp.write_sites) {
@@ -802,6 +830,10 @@ void NativeExecutor::OnWaitPassedOnFence(const Core::NativeSync::LabelWait& wait
         // Recorded in order with the draws queued before and after this wait.
         // The fence's tick is set by an earlier operation of the raster queue, so it is known
         // when this one runs.
+        RasterNextPassable();
+        if (split_active && split) {
+            split->SetNextDependency(label_timeline.Position(match.label_address));
+        }
         RasterRun([this, address = match.label_address, seq = match.seq] {
             if (rasterizer->CommandStreamBarrier(label_timeline.Tick(address, seq))) {
                 VideoCore::ReadbackStats::OnStreamBarrier();
@@ -823,8 +855,8 @@ void NativeExecutor::ReportLongSpin(const char* what, const void* address, u64 w
     Core::NativeExecutorSync::ReportLongSpin(what, address, wait_start, reported);
 }
 
-void NativeExecutor::NoteFenceLatency(VideoCore::FenceKind kind, u64 queue_ns, u64 gpu_ns) {
-    fence_latency.Note(kind, queue_ns, gpu_ns);
+void NativeExecutor::NoteFenceLatency(VideoCore::FenceKind kind, u64 queue_ns, u64 gpu_ns, u64 front_ns) {
+    fence_latency.Note(kind, queue_ns, gpu_ns, front_ns);
 }
 
 void NativeExecutor::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal, bool must_sync,
@@ -837,12 +869,14 @@ void NativeExecutor::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& si
     }
     const u64 parsed_ns = VideoCore::ReadbackStats::NowNs();
     // Wraps the signal to time the fence: parsed -> started on the raster thread -> signal runs.
-    const auto timed = [this, kind, parsed_ns, queue](Common::UniqueFunction<void>&& inner) {
+    const auto pushed_at = std::make_shared<std::atomic<u64>>(0); // set when the push returned (the front thread may block in a full queue)
+    const auto timed = [this, kind, parsed_ns, queue, pushed_at](Common::UniqueFunction<void>&& inner) {
         const u64 started_ns = VideoCore::ReadbackStats::NowNs();
         return Common::UniqueFunction<void>{
-            [this, kind, parsed_ns, started_ns, queue, inner = std::move(inner)]() mutable {
+            [this, kind, parsed_ns, started_ns, queue, pushed_at, inner = std::move(inner)]() mutable {
                 const u64 now = VideoCore::ReadbackStats::NowNs();
-                NoteFenceLatency(kind, started_ns - parsed_ns, now - started_ns);
+                const u64 pushed = pushed_at->load(std::memory_order_acquire);
+                NoteFenceLatency(kind, started_ns - parsed_ns, now - started_ns, pushed != 0 && pushed < started_ns ? pushed - parsed_ns : started_ns - parsed_ns);
                 if (kind == VideoCore::FenceGfxEop) {
                     Core::FrameTimeline::Record(Core::FrameTimeline::EopSignaled, started_ns - parsed_ns, Core::FrameTimeline::Now(), now - started_ns);
                 }
@@ -856,6 +890,7 @@ void NativeExecutor::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& si
             }};
     };
     if (address == 0 || num_bytes == 0) {
+        RasterNextPassable();
         RasterRun(
             [this, signal = std::move(signal), kind, must_sync, timed]() mutable {
                 rasterizer->OnFence(timed(std::move(signal)), kind, must_sync);
@@ -867,6 +902,13 @@ void NativeExecutor::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& si
     // see the fence without waiting for the raster thread. The raster thread records the work
     // before the fence and notes its tick (SetFenceTick).
     const u64 seq = label_timeline.Record(address, value, num_bytes, queue);
+    // The raster queue position of the closure below: queue 1 operations that wait for this label run after it (RasterRun is the last push of every branch that follows).
+    const auto note_position = [&] {
+        pushed_at->store(VideoCore::ReadbackStats::NowNs(), std::memory_order_release);
+        if (split_active && split) {
+            label_timeline.SetPosition(address, seq, split->LastPosition());
+        }
+    };
     // Compute fences that only wait for copies (frame-order design V2, free-hold-fix-design.md section 10): on the console the compute queue runs beside the graphics queue, so a fence of
     // GPU to GPU copies lands in microseconds; here it queued behind the raster backlog (4 ms) and the game's PrepareMaterial spun on it. Landed at the parse instead when no compute
     // work with a result the CPU may read is still uncovered and the free hold keeps every block the game frees after the fence (the copy is queued before it, in raster order).
@@ -880,6 +922,7 @@ void NativeExecutor::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& si
             return;
         }
         // kept: the signal runs after the raster thread, and covers the compute work issued so far
+        RasterNextPassable();
         RasterRun(
             [this, address, seq, signal = std::move(signal), kind, must_sync, timed, vq, issued]() mutable {
                 label_timeline.SetTick(address, seq, rasterizer ? rasterizer->CurrentTick() : 0);
@@ -894,6 +937,7 @@ void NativeExecutor::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& si
                     kind, must_sync);
             },
             must_sync);
+        note_position();
         return;
     }
     // CEILING TEST ONLY (TLG_CEILING_ASC_FENCE=1): the label of compute queue 1 is written as soon as the raster thread reaches it, without waiting for the
@@ -903,6 +947,7 @@ void NativeExecutor::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& si
         return value != nullptr && value[0] == '1';
     }();
     if (ceiling && queue == 1 && (kind == VideoCore::FenceComputeRelease || kind == VideoCore::FenceHeldWrite)) {
+        RasterNextPassable();
         RasterRun(
             [this, address, seq, signal = std::move(signal), timed]() mutable {
                 label_timeline.SetTick(address, seq, rasterizer ? rasterizer->CurrentTick() : 0);
@@ -910,8 +955,10 @@ void NativeExecutor::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& si
                 label_timeline.Retire(address, seq);
             },
             must_sync);
+        note_position();
         return;
     }
+    RasterNextPassable();
     RasterRun(
         [this, address, seq, signal = std::move(signal), kind, must_sync, timed]() mutable {
             label_timeline.SetTick(address, seq, rasterizer ? rasterizer->CurrentTick() : 0);
@@ -923,6 +970,7 @@ void NativeExecutor::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& si
                 kind, must_sync);
         },
         must_sync);
+    note_position();
 }
 
 bool NativeExecutor::DeferWriteBehindFences(void* address, const u32* data, u32 num_bytes, u32 queue) {
@@ -959,6 +1007,20 @@ bool NativeExecutor::ShouldYieldToOtherQueue(u64& last_ns) {
     }();
     if (!enabled || num_submits.load(std::memory_order_relaxed) <= mapped_queues[GfxQueueId].submits.size()) {
         return false;
+    }
+    // Compute lane: while the raster queue is nearly full the next graphics push would block the whole front thread, and the compute queues with it. Hand over to them at once (they push
+    // up to twice the queue depth). Gives up after a number of rounds in which no queue 1 operation was pushed, so the front still blocks when the compute queues have nothing to say.
+    if (split_active && split && split->NearlyFull()) {
+        if (const u64 pushes = split->LanePushes(); pushes != yield_full_pushes_seen) {
+            yield_full_pushes_seen = pushes;
+            yield_full_rounds = 0;
+        }
+        if (yield_full_rounds < 64) {
+            ++yield_full_rounds;
+            return true;
+        }
+    } else {
+        yield_full_rounds = 0;
     }
     const u64 now = Core::FrameTimeline::Now();
     if (now - last_ns < 50'000) {

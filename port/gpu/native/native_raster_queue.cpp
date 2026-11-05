@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
+#include <optional>
+#include <utility>
 #include "native/native_raster_queue.h"
 
 #include <chrono>
@@ -27,7 +30,8 @@ void Queue::Start(Consumer& consumer_, bool verify_) {
     if (const char* e = std::getenv("TLG_RASTER_QUEUE"); e != nullptr && std::atoi(e) >= 16) {
         MaxQueued = static_cast<size_t>(std::atoi(e));
     }
-    lane_on = [] { const char* e = std::getenv("TLG_ASC_LANE"); return e != nullptr && e[0] == '1'; }();
+    lane_on = [] { const char* e = std::getenv("TLG_ASC_LANE"); return e != nullptr && (e[0] == '1' || e[0] == '2'); }();
+    lane_wide = [] { const char* e = std::getenv("TLG_ASC_LANE"); return e != nullptr && e[0] == '2'; }(); // 2: closures marked passable are no barriers
     Core::DrainAudit::SetBackend(&done, &write_done, [this](u64 position) {
         front_state.store(2, std::memory_order_relaxed);
         {
@@ -95,6 +99,7 @@ void Queue::Drain() {
 
 void Queue::Push(Op&& op, bool wait) {
     op.audit_class = Core::ResourceAudit::front_class;
+    op.pushed_ns = VideoCore::ReadbackStats::NowNs();
     const bool audit_write = op.writes_memory;
     const u32 audit_line = op.write_line;
     if (op.has_call) {
@@ -129,8 +134,10 @@ void Queue::Push(Op&& op, bool wait) {
         front_state.store(0, std::memory_order_relaxed);
         op.position = pushed.load(std::memory_order_relaxed) + 1;
         queue.push_back(std::move(op));
+        queued_hint.store(static_cast<u32>(queue.size()), std::memory_order_relaxed);
         if (lane_op) {
             lane_waiting.fetch_add(1, std::memory_order_acq_rel);
+            lane_pushed.fetch_add(1, std::memory_order_relaxed);
         }
         target = pushed.fetch_add(1, std::memory_order_acq_rel) + 1;
         if (audit_write) {
@@ -154,6 +161,8 @@ void Queue::PushClosure(Common::UniqueFunction<void>&& func, bool wait, bool wri
             op.write_file = p + 1;
         }
     }
+    op.lane_passable = std::exchange(next_passable, false) && lane_wide;
+    op.depends_on = std::exchange(next_dependency, 0);
     Push(std::move(op), wait);
 }
 
@@ -224,6 +233,7 @@ void Queue::Run(std::stop_token stoken) {
                 return;
             }
             batch.swap(sp.queue);
+            sp.queued_hint.store(0, std::memory_order_relaxed);
             sp.lane_waiting.store(0, std::memory_order_release); // every queued lane operation is in the batch now
             if (!batch.empty()) {
                 const auto& first = batch.front();
@@ -316,15 +326,47 @@ void Queue::Run(std::stop_token stoken) {
             op.closure = {};
             consumer->Release(op);
         };
-        // Compute lane: the indices of the queue 1 operations and of the graphics closures (barriers) of this batch.
+        // Compute lane (documents/tlg/native plan/engine/compute-lane-design.md): a queue 1 operation runs as soon as (a) every closure that is a barrier ahead of it ran (announce batches, uploads,
+        // frame events, ...: closures marked passable are none) and (b) the one operation it depends on ran (a wait that was passed on a recorded fence names the fence's closure), and after the
+        // queue 1 operations before it. `lane_ready[j]` is the batch index the main loop must have reached for lane operation j.
         const bool lane_active = sp.lane_on && consumer->LaneUsable();
-        std::vector<u32> lane_idx, barrier_idx;
+        const auto note_age = [&](const Op& o, int path) {
+            const u64 age = VideoCore::ReadbackStats::NowNs() - o.pushed_ns;
+            sp.lane_age_ns[path].fetch_add(age, std::memory_order_relaxed);
+            sp.lane_age_n[path].fetch_add(1, std::memory_order_relaxed);
+            if (age > 2'000'000) {
+                sp.lane_age_over_2ms[path].fetch_add(1, std::memory_order_relaxed);
+            }
+            u64 mx = sp.lane_age_max_ns[path].load(std::memory_order_relaxed);
+            while (age > mx && !sp.lane_age_max_ns[path].compare_exchange_weak(mx, age)) {
+            }
+        };
+        std::vector<u32> lane_idx, lane_ready, barrier_idx;
         if (lane_active) {
+            u32 after_barrier = 0, prev_ready = 0;
+            const auto index_of = [&](u64 position) -> std::optional<u32> {
+                const auto it = std::lower_bound(batch.begin(), batch.end(), position, [](const Op& o, u64 p) { return o.position < p; });
+                if (it == batch.end() || it->position != position) {
+                    return std::nullopt;
+                }
+                return static_cast<u32>(it - batch.begin());
+            };
             for (u32 k = 0; k < batch.size(); ++k) {
                 if (batch[k].audit_class == 1) {
+                    u32 ready = std::max(after_barrier, prev_ready);
+                    if (const u64 dep = batch[k].depends_on; dep == ~u64{0}) {
+                        ready = std::max(ready, k);
+                    } else if (dep != 0) {
+                        if (const auto j = index_of(dep); j && batch[*j].audit_class != 1) {
+                            ready = std::max(ready, *j + 1); // not found: it ran already (an earlier batch, or a queue 1 operation of this one)
+                        }
+                    }
                     lane_idx.push_back(k);
+                    lane_ready.push_back(ready);
+                    prev_ready = ready;
                 } else if (!batch[k].has_call && !batch[k].lane_passable) {
                     barrier_idx.push_back(k);
+                    after_barrier = k + 1;
                 }
             }
         }
@@ -335,43 +377,43 @@ void Queue::Run(std::stop_token stoken) {
                 while (barrier_next < barrier_idx.size() && barrier_idx[barrier_next] < i) {
                     ++barrier_next;
                 }
-                const u32 first_barrier = barrier_next < barrier_idx.size() ? barrier_idx[barrier_next] : static_cast<u32>(batch.size());
                 u64 burst = 0;
-                while (lane_next < lane_idx.size() && lane_idx[lane_next] < first_barrier) {
+                while (lane_next < lane_idx.size() && lane_ready[lane_next] <= i) {
                     const u32 k = lane_idx[lane_next++];
-                    if (batch[k].executed) {
-                        continue;
-                    }
                     if (k > i) {
                         sp.lane_hoisted.fetch_add(1, std::memory_order_relaxed);
                         sp.lane_distance.fetch_add(k - i, std::memory_order_relaxed);
                     }
                     batch[k].executed = true;
+                    note_age(batch[k], 0);
                     sp.lane_ops.fetch_add(1, std::memory_order_relaxed);
                     ++burst;
                     run_op(batch[k]);
                 }
                 if (lane_next < lane_idx.size()) {
-                    sp.lane_barrier_waits.fetch_add(1, std::memory_order_relaxed); // lane operations wait for the closure at first_barrier
-                    if (first_barrier < batch.size()) {
+                    sp.lane_barrier_waits.fetch_add(1, std::memory_order_relaxed); // lane operations wait for the operation at lane_ready - 1
+                    if (const u32 r = lane_ready[lane_next]; r > 0 && r - 1 < batch.size()) {
                         std::scoped_lock lk{sp.lane_block_mutex};
-                        ++sp.lane_block_sites[{batch[first_barrier].write_file, batch[first_barrier].write_line}];
+                        ++sp.lane_block_sites[{batch[r - 1].write_file, batch[r - 1].write_line}];
                     }
                 }
-                // Lane operations pushed while this batch runs: taken when no graphics closure is left in the batch and none precedes them in the new pushes.
-                if (barrier_next >= barrier_idx.size() && sp.lane_waiting.load(std::memory_order_acquire) != 0) {
+                // Lane operations pushed while this batch runs: taken when every queue 1 operation of the batch ran, no barrier is left in it, none precedes them in the new pushes, and
+                // the operation they depend on ran already.
+                if (barrier_next >= barrier_idx.size() && lane_next >= lane_idx.size() && sp.lane_waiting.load(std::memory_order_acquire) != 0) {
                     picked.clear();
+                    const u64 next_position = batch[i].position; // the first operation of the batch not run yet
                     {
                         std::scoped_lock lk{sp.mutex};
                         size_t keep = 0;
                         bool blocked = false;
                         for (size_t k = 0; k < sp.queue.size(); ++k) {
                             Op& o = sp.queue[k];
-                            if (!blocked && o.audit_class == 1) {
+                            const bool dep_ran = o.depends_on == 0 || (o.depends_on != ~u64{0} && o.depends_on < next_position);
+                            if (!blocked && o.audit_class == 1 && dep_ran) {
                                 picked.push_back(std::move(o));
                             } else {
-                                if (!o.has_call && o.audit_class != 1 && !o.lane_passable) {
-                                    blocked = true;
+                                if (o.audit_class == 1 || (!o.has_call && !o.lane_passable)) {
+                                    blocked = true; // a barrier, or a queue 1 operation that has to wait (the order of queue 1 stays)
                                 }
                                 if (keep != k) {
                                     sp.queue[keep] = std::move(o);
@@ -380,6 +422,7 @@ void Queue::Run(std::stop_token stoken) {
                             }
                         }
                         sp.queue.resize(keep);
+                        sp.queued_hint.store(static_cast<u32>(keep), std::memory_order_relaxed);
                         sp.lane_waiting.fetch_sub(static_cast<u32>(picked.size()), std::memory_order_acq_rel);
                     }
                     if (!picked.empty()) {
@@ -389,6 +432,7 @@ void Queue::Run(std::stop_token stoken) {
                         sp.lane_ops.fetch_add(picked.size(), std::memory_order_relaxed);
                         burst += picked.size();
                         for (Op& o : picked) {
+                            note_age(o, 1);
                             run_op(o);
                         }
                     }
@@ -398,7 +442,25 @@ void Queue::Run(std::stop_token stoken) {
                 }
             }
             if (!batch[i].executed) {
+                if (!lane_active) {
+                    run_op(batch[i]);
+                    continue;
+                }
+                const u64 t0 = VideoCore::ReadbackStats::NowNs();
                 run_op(batch[i]);
+                if (const u64 d = VideoCore::ReadbackStats::NowNs() - t0; d >= 1'000'000) {
+                    {
+                        std::scoped_lock lk{sp.lane_block_mutex};
+                        auto& entry = sp.long_op_sites[{batch[i].write_file, batch[i].write_line, batch[i].has_call ? static_cast<int>(batch[i].call.kind) + 1 : 0}];
+                        ++entry.first;
+                        entry.second += d;
+                    }
+                    sp.raster_long_ops.fetch_add(1, std::memory_order_relaxed);
+                    sp.raster_long_ops_ns.fetch_add(d, std::memory_order_relaxed);
+                    u64 mx = sp.raster_longest_ns.load(std::memory_order_relaxed);
+                    while (d > mx && !sp.raster_longest_ns.compare_exchange_weak(mx, d)) {
+                    }
+                }
             }
         }
         end_run();

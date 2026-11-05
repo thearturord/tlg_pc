@@ -56,6 +56,7 @@ u64 LabelTimeline::Record(VAddr address, u64 value, u32 num_bytes, u32 queue) {
     it->latest_seq = seq;
     // Set by SetTick once the raster thread has recorded the work before this fence.
     it->gpu_tick = 0;
+    it->gpu_position = 0;
     it->queue = queue;
     ++it->pending;
     if (it->known_values.size() < MaxKnownLabelValues) {
@@ -70,6 +71,23 @@ void LabelTimeline::SetTick(VAddr address, u64 seq, u64 tick) {
     if (it != label_states.end() && it->latest_seq == seq) {
         it->gpu_tick = tick;
     }
+}
+
+void LabelTimeline::SetPosition(VAddr address, u64 seq, u64 position) {
+    std::scoped_lock lk{mutex};
+    const auto it = std::ranges::find(label_states, address, &LabelState::address);
+    if (it != label_states.end() && it->latest_seq == seq) {
+        it->gpu_position = position;
+    }
+}
+
+u64 LabelTimeline::Position(VAddr address) {
+    std::scoped_lock lk{mutex};
+    const auto it = std::ranges::find(label_states, address, &LabelState::address);
+    if (it == label_states.end() || it->pending == 0) {
+        return 0;
+    }
+    return it->gpu_position != 0 ? it->gpu_position : ~u64{0};
 }
 
 u64 LabelTimeline::Tick(VAddr address, u64 seq) {
@@ -185,11 +203,12 @@ std::string LabelTimeline::PendingText() {
     return pending;
 }
 
-void FenceLatency::Note(VideoCore::FenceKind kind, u64 queue_ns, u64 gpu_ns) {
+void FenceLatency::Note(VideoCore::FenceKind kind, u64 queue_ns, u64 gpu_ns, u64 front_ns) {
     auto& stat = stats[std::countr_zero(static_cast<u32>(kind)) % stats.size()];
     const u64 total = queue_ns + gpu_ns;
     stat.count.fetch_add(1, std::memory_order_relaxed);
     stat.queue_ns.fetch_add(queue_ns, std::memory_order_relaxed);
+    stat.front_ns.fetch_add(front_ns, std::memory_order_relaxed);
     stat.gpu_ns.fetch_add(gpu_ns, std::memory_order_relaxed);
     stat.total_ns.fetch_add(total, std::memory_order_relaxed);
     u64 max = stat.max_total_ns.load(std::memory_order_relaxed);
@@ -205,6 +224,7 @@ nlohmann::json FenceLatency::Report() {
         auto& stat = stats[i];
         const u64 count = stat.count.exchange(0);
         const u64 queue_ns = stat.queue_ns.exchange(0);
+        const u64 front_ns = stat.front_ns.exchange(0);
         const u64 gpu_ns = stat.gpu_ns.exchange(0);
         const u64 total_ns = stat.total_ns.exchange(0);
         const u64 max_ns = stat.max_total_ns.exchange(0);
@@ -214,6 +234,7 @@ nlohmann::json FenceLatency::Report() {
         fences[kind_names[i]] = {
             {"fences", count},
             {"avg_ms_parsed_to_raster_start", queue_ns / 1e6 / count},
+            {"avg_ms_parsed_to_push_done", front_ns / 1e6 / count},
             {"avg_ms_raster_start_to_signal", gpu_ns / 1e6 / count},
             {"avg_ms_total", total_ns / 1e6 / count},
             {"max_ms_total", max_ns / 1e6}};
