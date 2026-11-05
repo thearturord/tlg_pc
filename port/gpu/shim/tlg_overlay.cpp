@@ -1197,6 +1197,9 @@ void SaveToastBox(SaveClock::time_point now) {
                        : toast_kind == 6 ? TL("Video saved", "Vídeo salvo")
                        : toast_kind == 7 ? TL("Marker saved", "Marcador salvo")
                        : toast_kind == 8 ? TL("Light marker saved", "Marcador leve salvo")
+                       : toast_kind == 9 ? TL("Recording frames (F5 freezes)", "Gravando quadros (F5 congela)")
+                       : toast_kind == 10 ? TL("Frozen (F5 resumes)", "Congelado (F5 retoma)")
+                       : toast_kind == 11 ? TL("Resumed", "Retomado")
                                          : TL("Game saved", "Jogo salvo");
     const float in = std::chrono::duration<float>(now - toast_since).count();
     const float out = std::chrono::duration<float>(toast_until - now).count();
@@ -1788,7 +1791,7 @@ void SaveToast(int kind) {
         // tlg capture (F12 / Shift+F12): its own toast, shown at once
         toast_kind = kind;
         toast_since = now;
-        toast_until = now + std::chrono::milliseconds(kind == 5 ? 5000 : 2600);
+        toast_until = now + std::chrono::milliseconds(kind == 5 ? 5000 : kind == 10 ? 8000 : 2600);
         return;
     }
     // A dialog's "saved" and the save's own unmount come together: one toast.

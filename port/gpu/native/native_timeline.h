@@ -99,14 +99,27 @@ inline std::atomic<bool> capture_active{};
 inline CapEvent* capture_events = nullptr;
 inline u64 capture_capacity = 0;
 inline std::atomic<u64> capture_count{};
+/// Ring mode (the frame walk, Shift+F5): the buffer keeps the newest events; the oldest are overwritten, so a stop shows the last seconds, not the first.
+inline std::atomic<bool> capture_ring{};
 inline void CaptureAppend(Type type, u64 arg, u64 ns, u64 arg2, u32 thread) {
     const u64 at = capture_count.fetch_add(1, std::memory_order_relaxed);
+    if (capture_ring.load(std::memory_order_relaxed)) [[unlikely]] {
+        if (capture_capacity != 0) {
+            capture_events[at % capture_capacity] = {ns, arg, arg2, static_cast<u32>(type), thread};
+        }
+        return;
+    }
     if (at < capture_capacity) {
         capture_events[at] = {ns, arg, arg2, static_cast<u32>(type), thread};
     }
 }
 /// Start a capture of `seconds` seconds into the file timeline_<tag>.bin (and .json) in the log directory. False if one is running.
-bool StartCapture(u32 seconds, const std::string& tag);
+/// `ring`: the capture runs until StopCapture and keeps the newest events (the file then has the last events in time order, "ring": true in the .json).
+bool StartCapture(u32 seconds, const std::string& tag, bool ring = false);
+/// True while a capture runs or is being written (after StopCapture it turns false when the file is complete).
+bool CaptureRunning();
+/// Path (without extension) of the last capture file written, empty if none.
+std::string CaptureLastFile();
 /// A short JSON text: whether a capture runs, events so far, the last file written.
 std::string CaptureStatus();
 /// Stop a running capture now (it is written as if its time had run out). False when none runs.

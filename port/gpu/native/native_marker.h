@@ -55,6 +55,9 @@ void SetHooks(const Hooks& hooks);
 /// Any thread (the key handler): asks for a marker. `mode` 1 full, 2 light. Returns at once.
 void Request(u32 mode);
 
+/// The draw table as JSON for the newest `frames` frames in it (the marker uses 2; the frame walk uses as many as the table holds).
+[[nodiscard]] std::string DrawTable(u32 marker, u32 frames);
+
 /// Markers written so far.
 [[nodiscard]] u32 Written();
 

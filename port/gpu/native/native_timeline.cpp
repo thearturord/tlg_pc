@@ -109,19 +109,27 @@ void WriteCapture(const std::string& tag) {
     }
     const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
     const auto base = dir / fmt::format("timeline_{}", tag);
-    const u64 count = std::min<u64>(capture_count.load(), capture_capacity);
-    const u64 lost = capture_count.load() > capture_capacity ? capture_count.load() - capture_capacity : 0;
+    const u64 total = capture_count.load();
+    const u64 count = std::min<u64>(total, capture_capacity);
+    const u64 lost = total > capture_capacity ? total - capture_capacity : 0;
+    const bool ring = capture_ring.load();
+    // ring mode that wrapped: the oldest event is at total % capacity; write it first so the file is in time order
+    const u64 first = ring && lost != 0 ? total % capture_capacity : 0;
     {
         std::ofstream out(base.string() + ".bin", std::ios::binary);
         const char magic[8] = {'T', 'L', 'T', 'L', '0', '0', '0', '1'};
         out.write(magic, 8);
         const u64 header[3] = {count, capture_start_ns, capture_end_ns};
         out.write(reinterpret_cast<const char*>(header), sizeof(header));
-        out.write(reinterpret_cast<const char*>(capture_events), static_cast<std::streamsize>(count * sizeof(CapEvent)));
+        out.write(reinterpret_cast<const char*>(capture_events + first), static_cast<std::streamsize>((count - first) * sizeof(CapEvent)));
+        if (first != 0) {
+            out.write(reinterpret_cast<const char*>(capture_events), static_cast<std::streamsize>(first * sizeof(CapEvent)));
+        }
     }
     nlohmann::json j;
     j["events"] = count;
     j["lost_events"] = lost;
+    j["ring"] = ring;
     j["start_ns"] = capture_start_ns;
     j["end_ns"] = capture_end_ns;
     j["record_bytes"] = sizeof(CapEvent);
@@ -158,10 +166,20 @@ void WriteCapture(const std::string& tag) {
 }
 } // namespace
 
-bool StartCapture(u32 seconds, const std::string& tag) {
+bool CaptureRunning() {
+    return running.load();
+}
+
+std::string CaptureLastFile() {
+    std::scoped_lock lock{capture_mutex};
+    return last_file;
+}
+
+bool StartCapture(u32 seconds, const std::string& tag, bool ring) {
     if (running.exchange(true)) {
         return false;
     }
+    capture_ring.store(ring);
     if (!capture_events) {
         capture_events = static_cast<CapEvent*>(std::calloc(CaptureCapacity, sizeof(CapEvent)));
         capture_capacity = capture_events ? CaptureCapacity : 0;
@@ -195,6 +213,7 @@ bool StartCapture(u32 seconds, const std::string& tag) {
         capture_cycles_per_ns = static_cast<double>(__rdtsc() - tsc_start) / static_cast<double>(capture_end_ns - capture_start_ns);
 #endif
         WriteCapture(tag);
+        capture_ring.store(false);
         running.store(false);
     });
     return true;

@@ -8,6 +8,7 @@
 #include "native/native_prof.h"
 #include "native/native_config.h"
 #include "native/native_stream_submit.h"
+#include "native/native_framewalk.h"
 #include "native/native_timeline.h"
 #include "native/native_draw.h"
 #include "native/native_frame_gate.h"
@@ -2544,6 +2545,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u32 workload, u32 count, u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
     LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
+    Core::FrameWalk::AtSubmit(); // the frame walk freeze (F5): the game's render thread waits here, at a frame boundary
     Core::FrameTimeline::Submitted(Core::FrameTimeline::SubmitFlip);
 
     if (count != 0) {

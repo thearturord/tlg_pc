@@ -26,6 +26,7 @@
 #include "native/native_config.h"
 #include "native/native_stream_probe.h"
 #include "native/native_flight.h"
+#include "native/native_framewalk.h"
 #include "native/native_marker.h"
 #include "native/native_invariant.h"
 #include "native/native_log.h"
@@ -691,7 +692,12 @@ void RegisterBuiltins() {
                  const u64 mode = ParseNumber(params, "mode", 1);
                  return nlohmann::json{{"folder", Core::Marker::RequestForTest(mode == 2 ? 2 : 1)}, {"markers_written", Core::Marker::Written()}};
              });
-    Register("/log_test", "(L4) ?count=100 writes that many warnings from one call site: the rate limit (10 per second per site) cuts them; answers with the counts",
+    Register("/framewalk", "(frame walk, Shift+F5 / F5) the state, the folder and timeline file of the last freeze; ?action=record|freeze|resume does what the keys do",
+             [](const Params& params) {
+                 const auto it = params.find("action");
+                 return nlohmann::json::parse(Core::FrameWalk::Report(it != params.end() ? it->second : std::string{}));
+             });
+    Register("/log_test","(L4) ?count=100 writes that many warnings from one call site: the rate limit (10 per second per site) cuts them; answers with the counts",
              [](const Params& params) {
                  const u64 count = ParseNumber(params, "count", 100);
                  const u64 written_before = Core::Log::Written(), suppressed_before = Core::Log::Suppressed();

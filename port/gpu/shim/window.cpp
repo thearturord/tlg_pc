@@ -10,6 +10,7 @@
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "native/native_framewalk.h"
 #include "native/native_marker.h"
 #include "native/native_prof.h"
 #include "native/native_stall.h"
@@ -384,6 +385,16 @@ bool WindowSDL::PollEvents() {
         if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F8 && !event.key.repeat) {
             if (!Core::Stall::Stop()) {
                 Core::Stall::Start(10, true);
+            }
+            continue;
+        }
+        // tlg: frame walk. Shift+F5 starts recording every frame event into a ring; F5 freezes the game at the next frame boundary, stops the recording and writes
+        // user/log/framewalk_<time>/ and timeline_fw_<time>.bin; the debug server then reads the live state; F5 again resumes (documents/tlg/native plan/engine/frame-walk.md).
+        if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F5 && !event.key.repeat) {
+            if ((event.key.mod & SDL_KMOD_SHIFT) != 0) {
+                Core::FrameWalk::KeyRecord();
+            } else {
+                Core::FrameWalk::KeyFreeze();
             }
             continue;
         }

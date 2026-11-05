@@ -158,14 +158,14 @@ std::string Stamp() {
     return buffer;
 }
 
-std::string DrawTableJson(u32 marker) {
+std::string DrawTableJson(u32 marker, u32 frames_wanted = FramesInDrawTable) {
     const u64 end = head.load(std::memory_order_acquire);
     const u64 first = end > TableRows ? end - TableRows : 0;
     u32 newest_frame = 0;
     for (u64 i = first; i < end; ++i) {
         newest_frame = std::max(newest_frame, rows[i & (TableRows - 1)].frame);
     }
-    const u32 oldest_frame = newest_frame >= FramesInDrawTable - 1 ? newest_frame - (FramesInDrawTable - 1) : 0;
+    const u32 oldest_frame = newest_frame >= frames_wanted - 1 ? newest_frame - (frames_wanted - 1) : 0;
     std::string out = fmt::format("{{\"marker\": {}, \"frames\": [{}, {}], \"rows_in_table\": {}, \"columns\": \"ms before the marker, seq, caller (Ghidra address), frame, kind (0 draw, 1 indirect draw, 2 dispatch, 3 indirect dispatch), "
                                   "draw class, flags (1 from a record, 2 native plan), vs or compute hash, ps hash, colour target, depth target, colour targets, width, height, count, instances\", \"rows\": [",
                                   marker, oldest_frame, newest_frame, end - first);
@@ -319,6 +319,10 @@ void Request(u32 mode) {
 
 u32 Written() {
     return written.load();
+}
+
+std::string DrawTable(u32 marker, u32 frames) {
+    return DrawTableJson(marker, frames == 0 ? 1 : frames);
 }
 
 std::string RequestForTest(u32 mode) {
