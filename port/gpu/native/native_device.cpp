@@ -424,6 +424,23 @@ bool Lookup(u64 id, Object& out) {
     return true;
 }
 
+void ViewsOf(u64 resource_object, std::vector<u64>& out, std::vector<u64>& out_uav) {
+    std::shared_lock lock{table_mutex};
+    const auto rid = id_by_object.find(resource_object);
+    if (rid == id_by_object.end()) {
+        return;
+    }
+    for (const auto& [id, o] : by_id) {
+        if (o.alive && o.resource_id == rid->second && o.object != 0) {
+            if (o.kind == Kind::ShaderResourceView) {
+                out.push_back(o.object);
+            } else if (o.kind == Kind::UnorderedAccessView) {
+                out_uav.push_back(o.object);
+            }
+        }
+    }
+}
+
 namespace {
 struct LastMap {
     u64 address, size;

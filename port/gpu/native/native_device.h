@@ -61,6 +61,8 @@ void NoteDelete(u64 object);
 
 /// The live object of an id, copied (false: unknown or deleted)
 [[nodiscard]] bool Lookup(u64 id, Object& out);
+/// The live shader resource views (`out`) and unordered access views (`out_uav`) (engine view objects) whose resource is engine object `resource_object`
+void ViewsOf(u64 resource_object, std::vector<u64>& out, std::vector<u64>& out_uav);
 /// E2 study (`TLG_DESC_CHECKS=1`): the first 0x400 bytes of the object as they were when its creation returned
 [[nodiscard]] bool RawBytes(u64 id, u8* out, size_t size);
 /// The live resource (buffer or texture) whose memory holds `address`, copied (false: none)

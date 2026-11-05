@@ -7141,7 +7141,109 @@ u64 PS4_SYSV_ABI RecordingWrites(u64 device, u64 a1, u64 a2, u64 a3, u64 a4, u64
         }
         return 0;
     });
-    return 0;
+    // TLG_RECORDING_RING=1 (memory-ownership-plan writer table): the two buffers BeginRecording fills by plain stores (+0x2830 through AsyncMap, which returns the V# address,
+    // and +0x26e0) are one buffer each; the async dispatches of the frame read them through their views. Rename for the call: the memory pointer, the buffer's V# and the
+    // V# of every view of it point at a fresh frame-ring block, the original runs, then the memory pointer is put back (the V#s keep the block until the next frame).
+    static const bool ring_on = [] { const char* e = std::getenv("TLG_RECORDING_RING"); return e != nullptr && e[0] == '1'; }();
+    static const u64 original = Core::GuestHooks::OriginalEntry("RecordingWrites");
+    if (!ring_on || original == 0) {
+        return 0;
+    }
+    struct Renamed {
+        u64 buffer, memory;
+    };
+    std::array<Renamed, 2> renamed{};
+    static std::atomic<u64> calls{0}, buffers_renamed{0}, views_renamed{0}, views_skipped{0}, declined{0}, alloc_failed{0};
+    Guarded([&]() -> u64 {
+        const VAddr base = ImageBase();
+        const u64 holder = Rd<u64>(base + 0x6b03558 - 0x1000000, 0);
+        const u64 allocator = holder != 0 ? Rd<u64>(holder, 0x10238) : 0;
+        if (allocator == 0) {
+            declined.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+        static const u64 alloc_original = Core::GuestHooks::OriginalEntry("AllocFrameGarlic");
+        const u64 alloc_entry = alloc_original != 0 ? alloc_original : base + 0x2476350 - 0x1000000;
+        u32 k = 0;
+        for (const u64 field : {u64{0x2830}, u64{0x26e0}}) {
+            const u64 buffer = Rd<u64>(device, field);
+            if (!IsHeapPointer(buffer) || Rd<u32>(buffer, 0x124) != 1) {
+                declined.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            const u64 memory = Rd<u64>(buffer, 0x30);
+            const u32 width = Rd<u32>(buffer, 0x180);
+            if (memory == 0 || width == 0 || width > (1u << 22)) {
+                declined.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            const u64 block = LockedFrameAlloc(alloc_entry, allocator, width, 0x100);
+            if (block == 0) {
+                alloc_failed.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            static std::mutex offsets_mutex;
+            static std::map<std::pair<u64, u64>, u64> offsets; // (object, V# word) -> the V#'s offset into the buffer, learned while it still points into the buffer's own memory
+            const auto point = [&](u64 object, u64 word0) {
+                // a V# at object + word0: keep its offset into the buffer, move its base onto the block. The V# keeps the previous frame's block until here, so the offset is remembered.
+                const u64 address = static_cast<u64>(Rd<u32>(object, word0)) | (static_cast<u64>(Rd<u32>(object, word0 + 4) & 0xfffu) << 32);
+                u64 offset = 0;
+                {
+                    std::scoped_lock lock{offsets_mutex};
+                    const auto it = offsets.find({object, word0});
+                    if (it != offsets.end()) {
+                        offset = it->second;
+                    } else if (address >= memory && address < memory + width) {
+                        offset = address - memory;
+                        offsets.emplace(std::make_pair(object, word0), offset);
+                    } else {
+                        return false;
+                    }
+                }
+                const u64 moved = block + offset;
+                Wr<u32>(object, word0, static_cast<u32>(moved));
+                Wr<u32>(object, word0 + 4, (Rd<u32>(object, word0 + 4) & ~0xfffu) | (static_cast<u32>(moved >> 32) & 0xfffu));
+                return true;
+            };
+            static std::mutex views_mutex;
+            static std::unordered_map<u64, std::pair<std::vector<u64>, std::vector<u64>>> views_of; // buffer -> (SRVs, UAVs), found once
+            std::pair<std::vector<u64>, std::vector<u64>> views;
+            {
+                std::scoped_lock lock{views_mutex};
+                auto& cached = views_of[buffer];
+                if (cached.first.empty() && cached.second.empty()) {
+                    NativeDevice::ViewsOf(buffer, cached.first, cached.second);
+                }
+                views = cached;
+            }
+            point(buffer, 0x60);
+            for (const u64 view : views.first) {
+                (point(view, 0x78) ? views_renamed : views_skipped).fetch_add(1, std::memory_order_relaxed);
+            }
+            for (const u64 view : views.second) {
+                (point(view, 0x74) ? views_renamed : views_skipped).fetch_add(1, std::memory_order_relaxed);
+            }
+            Wr<u64>(buffer, 0x30, block);
+            renamed[k++] = {buffer, memory};
+            buffers_renamed.fetch_add(1, std::memory_order_relaxed);
+        }
+        return 0;
+    });
+    reinterpret_cast<GuestFunction6>(original)(device, a1, a2, a3, a4, a5);
+    Guarded([&]() -> u64 {
+        for (const Renamed& r : renamed) {
+            if (r.buffer != 0) {
+                Wr<u64>(r.buffer, 0x30, r.memory);
+            }
+        }
+        return 0;
+    });
+    const u64 n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & 255) == 1) {
+        Core::DebugServer::Publish("recording_ring", {{"calls", n}, {"buffers_renamed", buffers_renamed.load()}, {"views_renamed", views_renamed.load()},
+                                                      {"views_outside_the_buffer", views_skipped.load()}, {"declined", declined.load()}, {"ring_allocation_failed", alloc_failed.load()}});
+    }
+    return 0x8000000000000000ull;
 }
 
 /// N5c: `JsDeviceContext::Unmap(context, resource, subresource)` is an empty function in the engine (one `ret`, `0x2480f80`) that cannot be displaced by a hook. Its slot
