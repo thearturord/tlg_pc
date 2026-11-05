@@ -1032,6 +1032,7 @@ u32 FreeHoldFrames() {
     return n;
 }
 std::atomic<u64> hold_bucket_count[6], hold_bucket_bytes[6];
+std::atomic<u64> early_fence_counts[6]; // fences, then label writes: landed at the parse, kept (compute work with a readable result not covered), kept (switch off or no free hold)
 std::deque<HeldFree> held_frees; // under deferred_mutex, in free order (need never decreases)
 u64 held_bytes = 0;              // under deferred_mutex (known sizes only)
 std::atomic<u64> hold_count{0}, hold_at_once{0}, hold_released{0}, hold_forced{0}, hold_max_pending{0}, hold_max_bytes{0}, hold_alloc_failed{0}, hold_alloc_failed_twice{0}, hold_mid_released{0};
@@ -1161,6 +1162,23 @@ u64 PS4_SYSV_ABI GomallocStats(u64 pool, u64 out, u64 a2, u64 a3, u64 a4, u64 a5
     return 0x8000000000000000ull;
 }
 
+/// Early compute fences (frame-order design V2): whether a fence of copy-only compute work may land at the parse. Needs TLG_FREE_HOLD=1 (the hold keeps what the game frees after the
+/// fence until the raster thread has run the queued copy) and no uncovered compute work with a CPU readable result on the queue. TLG_ASC_EARLY_FENCE=0 turns it off.
+bool EarlyFenceAllowed(bool covered, bool label_write) {
+    static const bool env_on = [] { const char* e = std::getenv("TLG_ASC_EARLY_FENCE"); return e == nullptr || e[0] != '0'; }();
+    const u32 base = label_write ? 3 : 0;
+    if (!env_on || !FreeHoldOn()) {
+        early_fence_counts[base + 2].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (!covered) {
+        early_fence_counts[base + 1].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    early_fence_counts[base].fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 /// Read only probes of the two helpers `PrepareMaterial` calls (FUN_01f7e520 = texture mip reduction under memory pressure, FUN_01f7e850 = block move on the compute queue): how often each ran
 /// and how often it did work (returned 1). Told apart: the pressure path (needs the pool figure) and the move path (needs a block in the real free list).
 std::atomic<u64> material_probe[6]; // pressure calls, pressure with arg 0, pressure did work, move calls, move did work, moves in frames where pressure did nothing
@@ -1217,6 +1235,10 @@ nlohmann::json FreeHoldReport() {
     }
     return {{"on", FreeHoldOn()},
             {"pool_stats", pools},
+            {"compute_fences", {{"landed_at_the_parse", early_fence_counts[0].load()}, {"kept_for_the_raster_thread_uncovered_compute_work", early_fence_counts[1].load()},
+                                {"kept_switch_off_or_no_free_hold", early_fence_counts[2].load()},
+                                {"label_writes_landed_at_the_parse", early_fence_counts[3].load()}, {"label_writes_kept_uncovered_compute_work", early_fence_counts[4].load()},
+                                {"label_writes_kept_switch_off_or_no_free_hold", early_fence_counts[5].load()}}},
             {"held_frees_by_size", {{"lt_64KB", {hold_bucket_count[0].load(), hold_bucket_bytes[0].load()}}, {"lt_1MB", {hold_bucket_count[1].load(), hold_bucket_bytes[1].load()}},
                                     {"lt_16MB", {hold_bucket_count[2].load(), hold_bucket_bytes[2].load()}}, {"lt_64MB", {hold_bucket_count[3].load(), hold_bucket_bytes[3].load()}},
                                     {"ge_64MB", {hold_bucket_count[4].load(), hold_bucket_bytes[4].load()}}, {"unknown_size", {hold_bucket_count[5].load(), hold_bucket_bytes[5].load()}},

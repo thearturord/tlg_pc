@@ -423,6 +423,16 @@ void NativeExecutor::CpWriteData(void* address, const u32* data, u32 data_size, 
         }
         return;
     }
+    // A label write of a compute queue behind a fence that landed at the parse (SignalFenceAfterReadbacks) lands now too, not after the raster backlog.
+    if (queue != GfxQueueId && queue - 1 < NumTotalQueues && (data_size == sizeof(u32) || data_size == sizeof(u64)) && !label_timeline.HeldBack(reinterpret_cast<VAddr>(address), data_size)) {
+        const bool covered = asc_noncopy_issued[queue - 1].load(std::memory_order_acquire) <= asc_noncopy_covered[queue - 1].load(std::memory_order_acquire);
+        if (Core::NativeDevice::EarlyFenceAllowed(covered, true) && TryWriteOffThread(rasterizer, address, data, data_size)) {
+            if (Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
+                Core::FrameTimeline::Record(Core::FrameTimeline::LabelWrite, data[0] | (u64(queue) << 32) | (u64(2) << 48), Core::FrameTimeline::Now(), reinterpret_cast<u64>(address));
+            }
+            return;
+        }
+    }
     Core::DrainAudit::SetNextWrite(reinterpret_cast<u64>(address), data_size);
     RasterRun([note, address, data_size] { note(address, data_size); }, false, true);
     // Whether a fence write to the label is held back is decided here, in stream order.
@@ -829,6 +839,35 @@ void NativeExecutor::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& si
     // see the fence without waiting for the raster thread. The raster thread records the work
     // before the fence and notes its tick (SetFenceTick).
     const u64 seq = label_timeline.Record(address, value, num_bytes, queue);
+    // Compute fences that only wait for copies (frame-order design V2, free-hold-fix-design.md section 10): on the console the compute queue runs beside the graphics queue, so a fence of
+    // GPU to GPU copies lands in microseconds; here it queued behind the raster backlog (4 ms) and the game's PrepareMaterial spun on it. Landed at the parse instead when no compute
+    // work with a result the CPU may read is still uncovered and the free hold keeps every block the game frees after the fence (the copy is queued before it, in raster order).
+    if (queue != GfxQueueId && queue - 1 < NumTotalQueues && !must_sync && (kind == VideoCore::FenceComputeRelease || kind == VideoCore::FenceHeldWrite)) {
+        const u32 vq = queue - 1;
+        const u64 issued = asc_noncopy_issued[vq].load(std::memory_order_acquire);
+        const bool covered = issued <= asc_noncopy_covered[vq].load(std::memory_order_acquire);
+        if (Core::NativeDevice::EarlyFenceAllowed(covered)) {
+            timed(std::move(signal))();
+            label_timeline.Retire(address, seq);
+            return;
+        }
+        // kept: the signal runs after the raster thread, and covers the compute work issued so far
+        RasterRun(
+            [this, address, seq, signal = std::move(signal), kind, must_sync, timed, vq, issued]() mutable {
+                label_timeline.SetTick(address, seq, rasterizer ? rasterizer->CurrentTick() : 0);
+                rasterizer->OnFence(
+                    timed([this, address, seq, vq, issued, signal = std::move(signal)]() mutable {
+                        signal();
+                        label_timeline.Retire(address, seq);
+                        u64 seen = asc_noncopy_covered[vq].load(std::memory_order_relaxed);
+                        while (seen < issued && !asc_noncopy_covered[vq].compare_exchange_weak(seen, issued, std::memory_order_release)) {
+                        }
+                    }),
+                    kind, must_sync);
+            },
+            must_sync);
+        return;
+    }
     // CEILING TEST ONLY (TLG_CEILING_ASC_FENCE=1): the label of compute queue 1 is written as soon as the raster thread reaches it, without waiting for the
     // GPU. The results the game reads back are wrong (measuring how short the frame gets, documents/tlg/light-scene-cap-plan.md section 11).
     static const bool ceiling = [] {

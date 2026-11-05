@@ -156,6 +156,9 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
         TLG_LOG(CP, Error, "native draw: the record {} is gone, a draw is lost ({})", native_tag_pending.seq, Core::NativeDraw::DescribeMissingRecord(native_tag_pending.seq));
         return;
     }
+    if (asc_vqid != ~0u && asc_vqid < NumTotalQueues && draw.kind != 10 && draw.kind != 6) {
+        asc_noncopy_issued[asc_vqid].fetch_add(1, std::memory_order_release); // a result the CPU may read (dispatch, counter read-back, ...): a fence of this queue must wait for the raster thread
+    }
     if (draw.kind == 10) {
         // memory copy: destination, source and the number of bytes travel in the record
         native_tag_pending.valid = false;

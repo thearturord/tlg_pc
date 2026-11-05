@@ -131,6 +131,9 @@ u64 PS4_SYSV_ABI GomallocAlloc(u64 heap, u64 size, u64 alignment, u64 type, u64 
 /// Hook `GomallocStats` (0x246d6e0, `native_gomalloc_stats`, read only): the pool statistics the game reads (free bytes in out[0]). Records the figure, the bytes the free hold keeps back and how
 /// often the figure is at or below the 0x11a00000 memory-pressure threshold of `PrepareMaterial`, with and without the held bytes (free_hold.pool_stats in /native).
 u64 PS4_SYSV_ABI GomallocStats(u64 pool, u64 out, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret);
+/// Early compute fences: true when a fence of copy-only compute work (`covered`: no compute work with a CPU readable result is uncovered on its queue) may land at the parse
+/// (needs TLG_FREE_HOLD=1; TLG_ASC_EARLY_FENCE=0 turns it off). Counted in free_hold.compute_fences.
+bool EarlyFenceAllowed(bool covered, bool label_write = false);
 /// Read only probes (hooks `MaterialPressure` 0x1f7e520 / `MaterialMove` 0x1f7e850, handlers `native_material_pressure` / `native_material_move`): how often the helpers of PrepareMaterial ran and did work.
 u64 PS4_SYSV_ABI MaterialPressureProbe(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret);
 u64 PS4_SYSV_ABI MaterialMoveProbe(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret);

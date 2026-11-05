@@ -421,6 +421,11 @@ private:
     /// (then set to now): the graphics task yields so the round robin runs it. Switch: env TLG_CP_ASC_YIELD=0 turns it off.
     [[nodiscard]] bool ShouldYieldToOtherQueue(u64& last_ns);
 
+    /// Early compute fences: per virtual compute queue, the compute work with a result the CPU may read (anything but copies and fills) that the command processor has issued, and the
+    /// part of it a landed fence covers. A fence of copies may land at the parse when issued <= covered.
+    std::array<std::atomic<u64>, NumTotalQueues> asc_noncopy_issued{};
+    std::array<std::atomic<u64>, NumTotalQueues> asc_noncopy_covered{};
+
     RasterHost* rasterizer{};
     VoLabels vo_labels;
     const u32 fence_wait_shortcut;

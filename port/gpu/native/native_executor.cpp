@@ -327,6 +327,9 @@ void NativeExecutor::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
         }
     }
     const bool run_direct = direct && Core::NativeDirect::ExecuteEnabled();
+    if (!run_direct && vqid < NumTotalQueues) {
+        asc_noncopy_issued[vqid].fetch_add(1, std::memory_order_release); // the walk path runs dispatches the CPU may read: no early fence behind it
+    }
     const auto& task = run_direct ? ProcessDirectAsc(direct, vqid) : ProcessCompute(acb, vqid, std::move(direct));
     Core::NativeDraw::Live().direct_executed_asc.fetch_add(run_direct ? 1 : 0, std::memory_order_relaxed);
     {
