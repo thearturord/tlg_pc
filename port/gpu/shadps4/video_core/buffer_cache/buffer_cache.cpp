@@ -102,13 +102,21 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 }
 
 void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
-    BindMemoErase(address, size);
+    {
+        TLG_PROF_LEVEL("cpuwrite.bind_memo_erase", 3);
+        BindMemoErase(address, size);
+    }
     if (newer) {
         // B2: the engine wrote these bytes after anything the GPU wrote there before (applied in order on the raster thread)
+        TLG_PROF_LEVEL("cpuwrite.supersede", 3);
         SupersedeGpuWritten(address, size);
     }
-    Core::NativeResources::NoteCpuWrite(address, size);
+    {
+        TLG_PROF_LEVEL("cpuwrite.note_resources", 3);
+        Core::NativeResources::NoteCpuWrite(address, size);
+    }
     if (Core::NativeUpdates::B9TrackerOff()) {
+        TLG_PROF_LEVEL("cpuwrite.mark_buffers", 3);
         // B9.3 step 2: the page tracker only marks what no engine buffer holds
         static thread_local std::vector<std::pair<VAddr, VAddr>> gaps;
         gaps.clear();
@@ -124,6 +132,7 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
     }
     const u32 b8 = Core::NativeUpdates::B8ImageMode();
     if (b8 != 0) {
+        TLG_PROF_LEVEL("cpuwrite.image_index", 3);
         texture_cache.EngineIndex().NoteAnnouncedWrite(address, size, newer);
     }
 }
