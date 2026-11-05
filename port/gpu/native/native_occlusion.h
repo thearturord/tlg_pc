@@ -29,6 +29,9 @@ namespace Core::NativeOcclusion {
 
 /// False when `TLG_REAL_OCCLUSION=0`
 [[nodiscard]] bool Enabled() noexcept;
+/// Diagnostic (side stream hunt): non zero while a query is begun and not yet ended; a submit in that window splits the query across command buffers.
+extern std::atomic<u32> query_open;
+void NoteSubmitDuringQuery(u32 stream_id);
 /// The report of the live Queries object (or {"enabled": false})
 [[nodiscard]] nlohmann::json ReportAll();
 /// M5b (early end-of-pipe interrupt): the answers are what the game reads without waiting, so a frame's interrupt may come early only when the answers of the earlier frames are written.
@@ -81,6 +84,8 @@ private:
     u32 next_slot{};
     VAddr open_address{};
     u32 open_slot{~0u};
+    u64 open_tick{};      ///< diagnostic (side stream hunt): the tick the query was begun in
+    bool open_side{};     ///< diagnostic: the side stream was selected when it began
     std::unordered_map<VAddr, Block> blocks;
     mutable std::mutex mutex;
     std::atomic<u64> frames_done{};

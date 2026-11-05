@@ -4,6 +4,7 @@
 #include <chrono>
 #include <thread>
 #include "native/native_flight.h"
+#include "native/native_occlusion.h"
 #include "native/native_timeline.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -448,6 +449,9 @@ void SchedulerCore::EncoderThread(std::stop_token stoken) {
 
 void SchedulerCore::SubmitExecution(SubmitInfo& info) {
     Core::Flight::Add(Core::Flight::QueueSubmit, 0, info.num_signal_semas != 0 ? info.signal_ticks[0] : 0, stream_id); // L1
+    if (Core::NativeOcclusion::query_open.load(std::memory_order_acquire) != 0) {
+        Core::NativeOcclusion::NoteSubmitDuringQuery(stream_id); // diagnostic (side stream hunt)
+    }
     // P4: the global descriptor set's new slots are written before the commands that name them are submitted, and finished slots are released
     if (IndexedData::FlushPerSubmit()) {
         if (auto* indexed = IndexedData::Get()) {

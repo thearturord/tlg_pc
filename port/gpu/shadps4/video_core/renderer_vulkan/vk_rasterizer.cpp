@@ -178,6 +178,9 @@ void Rasterizer::MaybeFlushRecorded() {
     const u32 limit =
         VideoCore::ReadbackPolicy::Get().flush_commands.load(std::memory_order_relaxed);
     if (limit != 0 && scheduler.PendingEncoderCommands() >= limit) {
+        if (Core::NativeOcclusion::query_open.load(std::memory_order_acquire) != 0) {
+            return; // a submit now would end the command buffer inside an occlusion query (begun and ended in different command buffers: invalid, device lost)
+        }
         scheduler.Flush();
     }
 }
@@ -1098,6 +1101,12 @@ void Rasterizer::SelectStream(bool side) {
     }
     // Barriers recorded so far belong to the stream being left.
     runtime.FlushBarriers();
+    // Diagnostic (side stream hunt, TLG_ASC_SERIALIZE=1): both streams are made idle at every switch, so no cross queue race can exist. A crash that stays is not a race.
+    // 1 = at both switches, 2 = only when entering the side stream (graphics results must be done before queue 1 reads them), 3 = only when leaving it.
+    static const int serialize = [] { const char* e = std::getenv("TLG_ASC_SERIALIZE"); return e != nullptr ? std::atoi(e) : 0; }();
+    if ((serialize == 1 || (serialize == 2 && side) || (serialize == 3 && !side)) && Core::NativeOcclusion::query_open.load(std::memory_order_acquire) == 0) {
+        scheduler.Finish();
+    }
     if (side) {
         const u64 now = Core::FrameTimeline::Now();
         if (now - side_last_end_ns > 3'000'000) {

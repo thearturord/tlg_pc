@@ -8,7 +8,30 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace Core::NativeOcclusion {
+
+std::atomic<u32> query_open{0};
+
+void NoteSubmitDuringQuery(u32 stream_id) {
+    static std::atomic<u32> logged{0};
+    if (stream_id != 0 || logged.fetch_add(1) >= 6) {
+        return;
+    }
+#ifdef _WIN32
+    void* frames[16]{};
+    const USHORT count = CaptureStackBackTrace(1, 16, frames, nullptr);
+    const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    std::string trace;
+    for (USHORT i = 0; i < count; ++i) {
+        trace += fmt::format(" {:x}", reinterpret_cast<uintptr_t>(frames[i]) - base);
+    }
+    LOG_ERROR(Render_Vulkan, "submit of stream {} while an occlusion query is open, thread {}, rva:{}", stream_id, GetCurrentThreadId(), trace);
+#endif
+}
 
 namespace {
 constexpr u64 ValidBit = 1ull << 63;
@@ -89,6 +112,9 @@ void Queries::Open(VAddr address, u32 pairs) {
     auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.resetQueryPool(query_pool, index, 1);
     cmdbuf.record([query_pool, index](vk::CommandBuffer c) { c.beginQuery(query_pool, index, {}); });
+    query_open.store(1, std::memory_order_release);
+    open_tick = scheduler.CurrentTick();
+    open_side = Vulkan::Scheduler::SideSelected();
     opened.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -100,7 +126,15 @@ void Queries::Close(VAddr address) {
     scheduler.EndRendering();
     const vk::QueryPool query_pool = pool;
     const u32 index = open_slot;
+    if (open_tick != scheduler.CurrentTick() || open_side != Vulkan::Scheduler::SideSelected()) {
+        static u32 logged = 0;
+        if (logged++ < 8) {
+            LOG_ERROR(Render_Vulkan, "occlusion query {} begun in tick {:#x} (side {}) is ended in tick {:#x} (side {}): the command buffer changed in between", index,
+                      open_tick, open_side, scheduler.CurrentTick(), Vulkan::Scheduler::SideSelected());
+        }
+    }
     scheduler.CommandBuffer().record([query_pool, index](vk::CommandBuffer c) { c.endQuery(query_pool, index); });
+    query_open.store(0, std::memory_order_release);
     slots[index].state = Slot::Pending;
     slots[index].tick = scheduler.CurrentTick();
     open_slot = ~0u;
