@@ -215,6 +215,10 @@ static void isa_context_regs(CONTEXT *c, IsaRegs *regs, int to_context) {
 static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
+    if (code==EXCEPTION_BREAKPOINT) {
+        uintptr_t resume;
+        if (runtime_cov_trap((uintptr_t)record->ExceptionAddress,&resume)) { info->ContextRecord->Rip=(DWORD64)resume; return EXCEPTION_CONTINUE_EXECUTION; }
+    }
     if (code==EXCEPTION_BREAKPOINT && isa_table) {
         /* An int3 ISA site: emulated here; any other breakpoint goes on to the report below. */
         IsaRegs regs;
@@ -1202,6 +1206,7 @@ int main(int argc, char **argv) {
         unsigned seconds = freeze && *freeze ? (unsigned)strtoul(freeze, NULL, 10) : 10;
         runtime_freeze_start((uintptr_t)image, round_page(size) + stub_area + red_zone_area, gpu_enabled ? seconds : 0);
     }
+    runtime_cov_init(image, (size_t)size); /* TLG_COVERAGE: function coverage of the guest code, measurement only */
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};

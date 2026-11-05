@@ -25,6 +25,8 @@ void runtime_report(void);
 void runtime_set_report_hook(void (*hook)(void));
 /* Called by every guest thread the runtime creates, before its entry (test hooks). */
 void runtime_set_thread_start_hook(void (*hook)(void));
+void runtime_cov_init(unsigned char *image, size_t image_size); /* runtime_cov.c, TLG_COVERAGE */
+int runtime_cov_trap(uintptr_t address, uintptr_t *resume);
 void runtime_finalize(void *dso);
 uintptr_t runtime_mutex_resolve(const char *name);
 void runtime_mutex_report(void);
