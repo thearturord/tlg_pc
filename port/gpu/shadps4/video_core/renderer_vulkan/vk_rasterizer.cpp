@@ -1107,7 +1107,13 @@ void Rasterizer::SelectStream(bool side) {
     if ((serialize == 1 || (serialize == 2 && side) || (serialize == 3 && !side)) && Core::NativeOcclusion::query_open.load(std::memory_order_acquire) == 0) {
         scheduler.Finish();
     }
+    // The two streams are two VkQueues: entering the side stream submits the graphics work recorded so far and the side submission waits for it, leaving it makes the next
+    // graphics submission wait for the side work (TLG_ASC_SYNC=0 turns this off, only for a comparison).
+    static const bool stream_sync = [] { const char* e = std::getenv("TLG_ASC_SYNC"); return e == nullptr || e[0] != '0'; }();
     if (side) {
+        if (stream_sync && !scheduler.OrderSideAfterGraphics(Core::NativeOcclusion::query_open.load(std::memory_order_acquire) == 0)) {
+            return; // an occlusion query is open: this operation runs on the graphics stream, the side stream is entered at a later one
+        }
         const u64 now = Core::FrameTimeline::Now();
         if (now - side_last_end_ns > 3'000'000) {
             buffer_cache.SetSideUploadEpoch(++side_epoch); // the work of the next frame: the CPU may have rewritten the inputs
@@ -1115,6 +1121,9 @@ void Rasterizer::SelectStream(bool side) {
         side_scope = std::make_unique<Scheduler::SideScope>(scheduler, true);
     } else {
         side_scope.reset();
+        if (stream_sync) {
+            scheduler.OrderGraphicsAfterSide();
+        }
         side_last_end_ns = Core::FrameTimeline::Now();
     }
 }

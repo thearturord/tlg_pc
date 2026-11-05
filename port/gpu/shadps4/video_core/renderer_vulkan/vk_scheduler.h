@@ -496,6 +496,24 @@ public:
         return &work_semaphore;
     }
 
+    /// Inter stream ordering (graphics stream and asynchronous stream are two VkQueues without any other dependency): the next submission of this stream waits
+    /// until the other stream's timeline semaphore has reached `tick`.
+    void SetPeerSemaphore(vk::Semaphore semaphore) noexcept {
+        peer_semaphore = semaphore;
+    }
+    void RaisePeerWait(u64 tick) noexcept {
+        u64 current = peer_wait_tick.load(std::memory_order_relaxed);
+        while (current < tick && !peer_wait_tick.compare_exchange_weak(current, tick, std::memory_order_acq_rel)) {
+        }
+    }
+    [[nodiscard]] vk::Semaphore SemaphoreHandle() const noexcept {
+        return work_semaphore.Handle();
+    }
+    /// Commands were recorded into the open tick that no submission has taken yet.
+    [[nodiscard]] bool OpenWork() const noexcept {
+        return !use_encoder || direct_active || PendingEncoderCommands() != 0;
+    }
+
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Will be run when submitting or calling PopPendingOperations.
     void DeferOperation(Common::UniqueFunction<void>&& func) {
@@ -571,6 +589,8 @@ private:
     vk::Queue submit_queue;
     u32 stream_id;
     Semaphore work_semaphore;
+    vk::Semaphore peer_semaphore{};            ///< the other stream's timeline semaphore
+    std::atomic<u64> peer_wait_tick{0};         ///< the next submission waits for this tick of it (0 = none)
     CommandPool command_pool;
     DynamicState dynamic_state;
     SessionFunc on_session{};
@@ -664,6 +684,36 @@ public:
     };
     [[nodiscard]] bool HasSideStream() const noexcept {
         return side != nullptr;
+    }
+    /// Raster thread, graphics stream selected, before the asynchronous stream is entered: the graphics work recorded so far is submitted and the next submission of the
+    /// asynchronous stream waits for it (queue 1 reads what the graphics stream uploaded and wrote). With `may_submit` false (an occlusion query is open: a submit would
+    /// split it) and graphics work pending nothing is done and false is returned: the caller stays on the graphics stream.
+    bool OrderSideAfterGraphics(bool may_submit) {
+        if (!side) {
+            return true;
+        }
+        if (gfx.OpenWork()) {
+            if (!may_submit) {
+                return false;
+            }
+            gfx.Flush();
+        }
+        const u64 tick = gfx.CurrentTick() - 1;
+        if (tick != 0 && !gfx.IsFree(tick)) {
+            side->RaisePeerWait(tick);
+        }
+        return true;
+    }
+    /// After the asynchronous stream was left (its work is submitted): the next graphics submission waits for it (the graphics stream reads what queue 1 wrote and may
+    /// overwrite what it read).
+    void OrderGraphicsAfterSide() {
+        if (!side) {
+            return;
+        }
+        const u64 tick = side->CurrentTick() - 1;
+        if (tick != 0 && !side->IsFree(tick)) {
+            gfx.RaisePeerWait(tick);
+        }
     }
     /// True on a thread that has the asynchronous stream selected.
     [[nodiscard]] static bool SideSelected() noexcept {

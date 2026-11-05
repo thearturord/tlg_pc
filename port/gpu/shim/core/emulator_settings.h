@@ -79,7 +79,7 @@ public:
     bool IsRenderdocEnabled() { return false; }
     bool IsShaderCollect() { return false; }
     bool IsUserfaultfdTracking() { return false; }
-    bool IsVkCrashDiagnosticEnabled() { return false; }
+    bool IsVkCrashDiagnosticEnabled() { static const auto value = Flag("TLG_VK_CRASH_DIAGNOSTIC", false); return value; }
     bool IsVkGuestMarkersEnabled() { static const auto value = Flag("TLG_VK_MARKERS", false); return value; }
     bool IsVkHostMarkersEnabled() { static const auto value = Flag("TLG_VK_MARKERS", false); return value; }
     bool IsVkValidationCoreEnabled() { return true; }

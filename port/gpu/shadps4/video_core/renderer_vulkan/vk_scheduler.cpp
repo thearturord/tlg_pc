@@ -25,7 +25,12 @@ std::mutex SchedulerLocks::submit_mutex;
 
 Scheduler::Scheduler(const Instance& instance)
     : gfx{instance, instance.GetGraphicsQueue(), 0},
-      side{instance.HasAsyncQueue() ? std::make_unique<SchedulerCore>(instance, instance.GetAsyncQueue(), 1) : nullptr} {}
+      side{instance.HasAsyncQueue() ? std::make_unique<SchedulerCore>(instance, instance.GetAsyncQueue(), 1) : nullptr} {
+    if (side) {
+        gfx.SetPeerSemaphore(side->SemaphoreHandle());
+        side->SetPeerSemaphore(gfx.SemaphoreHandle());
+    }
+}
 
 Scheduler::~Scheduler() = default;
 
@@ -451,6 +456,10 @@ void SchedulerCore::SubmitExecution(SubmitInfo& info) {
     Core::Flight::Add(Core::Flight::QueueSubmit, 0, info.num_signal_semas != 0 ? info.signal_ticks[0] : 0, stream_id); // L1
     if (Core::NativeOcclusion::query_open.load(std::memory_order_acquire) != 0) {
         Core::NativeOcclusion::NoteSubmitDuringQuery(stream_id); // diagnostic (side stream hunt)
+    }
+    // The other stream's work this submission depends on (set when the asynchronous stream was entered or left).
+    if (const u64 peer_tick = peer_wait_tick.exchange(0, std::memory_order_acq_rel); peer_tick != 0 && peer_semaphore) {
+        info.AddWait(peer_semaphore, peer_tick);
     }
     // P4: the global descriptor set's new slots are written before the commands that name them are submitted, and finished slots are released
     if (IndexedData::FlushPerSubmit()) {

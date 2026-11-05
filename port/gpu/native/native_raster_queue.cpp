@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "native/native_raster_queue.h"
 
 #include <chrono>
@@ -237,7 +238,9 @@ void Queue::Run(std::stop_token stoken) {
         };
         for (auto& op : batch) {
             Core::ResourceAudit::raster_class = op.audit_class;
-            consumer->SelectStream(op.audit_class == 1);
+            // Diagnostic (side stream hunt, TLG_ASC_SIDE_ONLY): 1 = only the dispatches of queue 1 run on the side stream, 2 = only its closures (copies, fills, fences)
+            static const int side_only = [] { const char* e = std::getenv("TLG_ASC_SIDE_ONLY"); return e != nullptr ? std::atoi(e) : 0; }();
+            consumer->SelectStream(op.audit_class == 1 && (side_only == 0 || (side_only == 1) == op.has_call));
             if (capturing) {
                 // run key: kind (bits 0-3) | the queue that pushed the operation (bits 4-7, 15 = none), so a run never mixes queues
                 const u32 kind = (op.has_call ? (op.call.kind == Call::Kind::Draw || op.call.kind == Call::Kind::DrawIndirect ? 1u : 2u) : 3u) |
