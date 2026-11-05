@@ -212,8 +212,9 @@ struct LedgerAnswer {
     u32 newest_prev_submit{0}; ///< M3: when that write was announced
     u32 newest_site{};         ///< the call site id of the newest write
     u64 rewritten{}; ///< M3: bytes of the range some earlier write had covered before the newest one (the memory had an older version)
+    u64 late_lo{~u64{0}}, late_hi{}; ///< span of the bytes whose newest write was announced at or after `min_submit` of the query (0: no query submission)
 };
-LedgerAnswer LedgerQuery(u64 begin, u64 end) {
+LedgerAnswer LedgerQuery(u64 begin, u64 end, u32 min_submit = 0) {
     LedgerAnswer a;
     std::scoped_lock lock{g_ledger_mutex};
     // the ranges do not overlap and are sorted by start, so only the one before the first start above `begin` can reach into the query (the old scan from
@@ -234,6 +235,10 @@ LedgerAnswer LedgerQuery(u64 begin, u64 end) {
             }
             const u64 n = std::min(end, it->second.end) - std::max(begin, it->first);
             a.covered += n;
+            if (min_submit != 0 && it->second.submit >= min_submit) {
+                a.late_lo = std::min(a.late_lo, std::max(begin, it->first));
+                a.late_hi = std::max(a.late_hi, std::min(end, it->second.end));
+            }
             if (it->second.rewrite) {
                 a.rewritten += n;
             }
@@ -1670,6 +1675,7 @@ std::atomic<u64> c_late_after_bytes_by_writer[LateKinds][16]{}; ///< bytes read 
 std::atomic<u64> c_late_after_by_writer[LateKinds][16]{};
 std::atomic<u64> c_late_margin[LateKinds][MaxSites][10]{}; ///< submissions between the read's record and the newest write that made it late (0..8, 9 more), by call site
 std::atomic<u64> c_late_notdone_by_site[LateKinds][MaxSites]{}; ///< late reads whose record's submission was not yet done by the marker (the ones that can be real), by newest writer site
+std::atomic<u64> c_late_overreach[LateKinds]{}; ///< not-done late reads whose newer bytes all lie past the end of the engine object the read starts in (a bind sized larger than its object: the draw does not use those bytes)
 std::atomic<u64> c_late_marker[LateKinds][3]{}; ///< late reads by the raster thread's submission-done marker: [0] the record's submission was not done, [1] done (the read came after the marker), [2] no record
 std::atomic<u64> c_late_free_class[LateKinds][MaxSites][3]{}; ///< rewritten late reads by the engine free of the address: [0] none seen, [1] freed after the record's submission, [2] freed before it
 std::atomic<u64> c_late_rewrite_by_site[LateKinds][MaxSites]{}, c_late_rewrite_bytes_by_site[LateKinds][MaxSites]{}; ///< late reads whose range had an older version before the newest write (memory reuse), and the bytes rewritten
@@ -2301,7 +2307,7 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
         cls = CheckOpenMap;
     } else {
         c_check_record_seen.store(1, std::memory_order_relaxed);
-        a = LedgerQuery(address, address + size);
+        a = LedgerQuery(address, address + size, submit);
         if (a.covered != 0 && a.newest <= seq) {
             c_check_margin_log2[k][std::min<u32>(39u, static_cast<u32>(std::bit_width(seq - a.newest)))].fetch_add(1, std::memory_order_relaxed);
         }
@@ -2327,8 +2333,21 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
         c_late_after_by_site[k][std::min<u32>(a.newest_site, MaxSites - 1)].fetch_add(1, std::memory_order_relaxed);
         {
             const size_t marker = submit == 0 ? 2 : RasterDoneSubmissions() >= submit ? 1 : 0; // SubmitIndexOf is the (1 based) submission that carries the record: done when the floor reached it (a read after that has a stale record: the raster thread is on a later task)
-            c_late_marker[k][marker].fetch_add(1, std::memory_order_relaxed);
-            if (marker == 0) {
+            bool overreach = false;
+            if (marker == 0 && submit != 0 && a.late_lo != ~u64{0}) {
+                const u64 owner_end = Core::NativeDevice::OwnerEndAt(address, submit);
+                overreach = owner_end != 0 && a.late_lo >= owner_end;
+                if (overreach) {
+                    c_late_overreach[k].fetch_add(1, std::memory_order_relaxed);
+                    static std::atomic<u32> overreach_examples{0};
+                    if (overreach_examples.fetch_add(1, std::memory_order_relaxed) < 6) {
+                        Core::RareEvents::Note("late_read_past_owner_end", fmt::format("{} {:#x} + {:#x}: the owner object ends at {:#x}, the newer bytes are {:#x}..{:#x}, record submit {}, bind: {}", LateKindNames[k], address, size,
+                                                                                        owner_end, a.late_lo, a.late_hi, submit, DescribeBind()));
+                    }
+                }
+            }
+            c_late_marker[k][overreach ? 1 : marker].fetch_add(1, std::memory_order_relaxed);
+            if (marker == 0 && !overreach) {
                 c_late_notdone_by_site[k][std::min<u32>(a.newest_site, MaxSites - 1)].fetch_add(1, std::memory_order_relaxed);
                 static std::atomic<u32> before_marker_examples{0};
                 if (before_marker_examples.fetch_add(1, std::memory_order_relaxed) < 40) {
@@ -2866,6 +2885,7 @@ nlohmann::json Report() {
             }
             kj["total_bytes"] = bytes;
             kj["late_reads_by_done_marker_not_done_done_norecord"] = {c_late_marker[k][0].load(), c_late_marker[k][1].load(), c_late_marker[k][2].load()};
+            kj["late_reads_not_done_but_newer_bytes_past_the_owner_object_end"] = c_late_overreach[k].load(); // counted in "done" above, not in "not done"
             for (u32 w = 0; w < 16; ++w) {
                 if (const u64 n = c_late_after_by_writer[k][w].load()) {
                     kj["written_after_by_writer"][std::to_string(w)] = {{"reads", n}, {"bytes", c_late_after_bytes_by_writer[k][w].load()}};

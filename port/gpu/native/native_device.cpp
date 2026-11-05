@@ -298,6 +298,23 @@ void NoteDelete(u64 object) {
     id_by_object.erase(it);
 }
 
+u64 OwnerEndAt(VAddr address, u32 submit) {
+    u64 end = 0;
+    u32 newest = 0;
+    std::shared_lock lock{table_mutex};
+    for (const auto& [id, o] : by_id) {
+        if (o.kind != Kind::Buffer || o.address == 0 || o.created_submit > submit || (o.deleted_submit != 0 && o.deleted_submit <= submit)) {
+            continue;
+        }
+        const u64 bytes = std::max<u64>(o.bytes, 1);
+        if (address >= o.address && address < o.address + bytes && o.created_submit >= newest) {
+            newest = o.created_submit;
+            end = o.address + bytes;
+        }
+    }
+    return end;
+}
+
 std::string OwnersAt(VAddr address, u64 size, u32 submit) {
     struct Hit {
         u64 id;

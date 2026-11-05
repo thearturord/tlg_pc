@@ -69,6 +69,8 @@ void ViewsOf(u64 resource_object, std::vector<u64>& out, std::vector<u64>& out_u
 /// One line for the late read samples: the resources (alive or deleted, buffers and textures) whose memory meets [address, address + size) and that were alive at graphics submission `submit`
 /// (created at or before it, deleted after it); at most 3, newest first
 [[nodiscard]] std::string OwnersAt(VAddr address, u64 size, u32 submit);
+/// The end address of the newest engine buffer alive at `submit` that contains `address` (0: none).
+[[nodiscard]] u64 OwnerEndAt(VAddr address, u32 submit);
 /// The live resource (buffer or texture) whose memory holds `address`, copied (false: none)
 [[nodiscard]] bool ResourceAt(VAddr address, Object& out);
 /// B8.4: the live textures whose memory meets [address, address + size) (ids appended to `out`); true when together they cover the whole range
