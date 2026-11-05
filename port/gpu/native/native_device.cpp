@@ -1024,7 +1024,13 @@ u32 FreeHoldFrames() {
 }
 std::deque<HeldFree> held_frees; // under deferred_mutex, in free order (need never decreases)
 u64 held_bytes = 0;              // under deferred_mutex (known sizes only)
-std::atomic<u64> hold_count{0}, hold_at_once{0}, hold_released{0}, hold_forced{0}, hold_max_pending{0}, hold_max_bytes{0}, hold_alloc_failed{0}, hold_alloc_failed_twice{0};
+std::atomic<u64> hold_count{0}, hold_at_once{0}, hold_released{0}, hold_forced{0}, hold_max_pending{0}, hold_max_bytes{0}, hold_alloc_failed{0}, hold_alloc_failed_twice{0}, hold_mid_released{0};
+
+/// TLG_FREE_HOLD_MID=1: when the heap runs dry, first free the held blocks the raster thread is done with even if their frame rule has not passed (before releasing everything)
+bool FreeHoldMidOn() {
+    static const bool on = [] { const char* e = std::getenv("TLG_FREE_HOLD_MID"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
 
 bool FreeHoldOn() {
     static const bool on = [] { const char* e = std::getenv("TLG_FREE_HOLD"); return e != nullptr && e[0] == '1'; }();
@@ -1032,7 +1038,7 @@ bool FreeHoldOn() {
 }
 
 /// Frees the held blocks the raster thread is done with (all of them when `all`). Any guest thread.
-void ReleaseHeld(bool all) {
+void ReleaseHeld(bool all, bool ignore_frames = false) {
     static const u64 original = Core::GuestHooks::OriginalEntry("GomallocFree");
     if (original == 0) {
         return;
@@ -1044,7 +1050,7 @@ void ReleaseHeld(bool all) {
         const s64 frame = FreeHoldFrames() != 0 ? EngineFrame() : 0;
         while (!held_frees.empty()) {
             HeldFree& front = held_frees.front();
-            if (!all && front.due_frame != 0 && !front.armed) {
+            if (!all && !ignore_frames && front.due_frame != 0 && !front.armed) {
                 if (frame < front.due_frame) {
                     break;
                 }
@@ -1054,8 +1060,10 @@ void ReleaseHeld(bool all) {
             if (!all && front.need > done) {
                 break;
             }
-            if (held_frees.front().need > done || (front.due_frame != 0 && !front.armed)) {
+            if (held_frees.front().need > done || (front.due_frame != 0 && !front.armed && !ignore_frames)) {
                 hold_forced.fetch_add(1, std::memory_order_relaxed);
+            } else if (ignore_frames && front.due_frame != 0 && !front.armed) {
+                hold_mid_released.fetch_add(1, std::memory_order_relaxed);
             }
             held_bytes -= held_frees.front().size;
             due.push_back(held_frees.front());
@@ -1090,7 +1098,9 @@ nlohmann::json FreeHoldReport() {
             {"oldest_pending_needs_submission", oldest_need},
             {"raster_done_floor", Core::NativeContent::RasterDoneSubmissions()},
             {"allocation_failed_with_frees_held", hold_alloc_failed.load()},
-            {"allocation_failed_again_after_release", hold_alloc_failed_twice.load()}};
+            {"allocation_failed_again_after_release", hold_alloc_failed_twice.load()},
+            {"mid_step_on", FreeHoldMidOn()},
+            {"released_by_mid_step_frame_rule_skipped", hold_mid_released.load()}};
 }
 
 namespace {
@@ -1355,6 +1365,10 @@ u64 PS4_SYSV_ABI GomallocAlloc(u64 heap, u64 size, u64 alignment, u64 type, u64 
             Core::NativeContent::WaitRasterSubmissions(static_cast<u32>(newest));
             ReleaseHeld(false);
             result = reinterpret_cast<GuestFunction6>(original)(heap, size, alignment, type, a4, a5);
+            if (result == 0 && FreeHoldMidOn()) {
+                ReleaseHeld(false, true);
+                result = reinterpret_cast<GuestFunction6>(original)(heap, size, alignment, type, a4, a5);
+            }
             if (result == 0) {
                 hold_alloc_failed_twice.fetch_add(1, std::memory_order_relaxed);
                 ReleaseHeld(true);
