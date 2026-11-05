@@ -5800,7 +5800,12 @@ u64 PS4_SYSV_ABI DynTextureFill(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, 
 /// `TLG_LIGHT_RING=1`: the frame allocator (`JsDevice_AllocFrameGarlic`, Ghidra 0x2476350) bumps its offset (`allocator + 4`) with plain reads and writes: the engine only calls it from the render thread.
 /// The light ring redirect calls it from the thread that writes the lights, so every call (the engine's own, through the hook below, and ours) takes this lock.
 bool FrameAllocLocked() {
-    static const bool on = [] { const char* e = std::getenv("TLG_LIGHT_RING"); return e != nullptr && e[0] == '1'; }();
+    // TLG_SLOT_RING=1 allocates from the slot writers' thread too
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_LIGHT_RING");
+        const char* s = std::getenv("TLG_SLOT_RING");
+        return (e != nullptr && e[0] == '1') || (s != nullptr && s[0] == '1');
+    }();
     return on;
 }
 std::mutex g_frame_alloc_mutex;
@@ -8455,9 +8460,142 @@ void AnnounceSceneSlotRange(u64 frame, u32 upto, bool remember_group) {
 }
 } // namespace
 
+// ---- TLG_SLOT_RING=1 (memory-ownership-plan 0b, slot groups at the root) ------------------------------------------------------------------------------------------------
+// The scene's per object constant slots (three groups of 8192 slot buffers, 0x130 bytes) are written in place by FUN_01e05330 and FUN_01e07330 on the thread that fills the frame
+// data; a group comes back after 3 frames, while the raster thread (game two frames ahead) may still read it. Instead of waiting at the group switch (TLG_SLOT_GATE), each slot
+// the call took is copied, after the call, into a fresh block of the frame ring and the slot buffer's descriptor points there (as TLG_LIGHT_RING does for the lights): the draw
+// recorded later binds the block, and the next frame's write into the slot's own memory touches nothing a frame in flight reads.
+// Check: the slots copied are compared with their memory again before the next call and at the group switch; a difference means a write after the copy (lost to the draw).
+namespace {
+bool SlotRingOn() {
+    static const bool on = [] { const char* e = std::getenv("TLG_SLOT_RING"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+struct SlotCopy {
+    u64 memory, block;
+    u32 size, slot;
+};
+std::mutex g_slot_ring_mutex;
+std::vector<SlotCopy> g_slot_copies; ///< slots copied since the last check (under g_slot_ring_mutex)
+std::atomic<u64> c_sr_calls{0}, c_sr_slots{0}, c_sr_bytes{0}, c_sr_skipped{0}, c_sr_alloc_failed{0}, c_sr_checked{0}, c_sr_changed{0}, c_sr_group_reset{0};
+
+void SlotRingCheck(const char* where) {
+    std::vector<SlotCopy> copies;
+    {
+        std::scoped_lock lock{g_slot_ring_mutex};
+        copies.swap(g_slot_copies);
+    }
+    for (const SlotCopy& c : copies) {
+        c_sr_checked.fetch_add(1, std::memory_order_relaxed);
+        const u8* now = reinterpret_cast<const u8*>(c.memory);
+        const u8* then = reinterpret_cast<const u8*>(c.block);
+        if (std::memcmp(now, then, c.size) == 0) {
+            continue;
+        }
+        c_sr_changed.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<u32> examples{0};
+        if (examples.fetch_add(1, std::memory_order_relaxed) < 24) {
+            u32 off = 0;
+            while (off < c.size && now[off] == then[off]) {
+                ++off;
+            }
+            Core::RareEvents::Note("slot_ring_written_after_copy", fmt::format("slot {} memory {:#x}: first differing byte at +{:#x} (checked {})", c.slot, c.memory, off, where));
+        }
+    }
+}
+
+void SlotRingCopy(u32 group, u32 first, u32 upto) {
+    const VAddr base = image_base.load(std::memory_order_relaxed);
+    if (base == 0 || group >= 3 || upto <= first || upto > 8192) {
+        return;
+    }
+    Guarded([&]() -> u64 {
+        const u64 holder = Rd<u64>(base + 0x6b03558 - 0x1000000, 0);
+        const u64 allocator = holder != 0 ? Rd<u64>(holder, 0x10238) : 0;
+        if (allocator == 0) {
+            return 0;
+        }
+        static const u64 alloc_original = Core::GuestHooks::OriginalEntry("AllocFrameGarlic");
+        const u64 alloc_entry = alloc_original != 0 ? alloc_original : base + 0x2476350 - 0x1000000;
+        const u64 ring = Rd<u64>(base + SceneSlotRingGhidra - 0x1000000, static_cast<u64>(group) * 0x18);
+        if (!IsHeapPointer(ring)) {
+            return 0;
+        }
+        std::vector<SlotCopy> made;
+        for (u32 i = first; i < upto; ++i) {
+            const u64 slot = Rd<u64>(ring, static_cast<u64>(i) * 8);
+            const u64 buffer = IsHeapPointer(slot) ? Rd<u64>(slot, 0x130) : 0;
+            if (!IsHeapPointer(buffer)) {
+                c_sr_skipped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            const u64 memory = Rd<u64>(buffer, 0x30);
+            const u32 size = Rd<u32>(buffer, 0x180);
+            if (memory == 0 || size == 0 || size > 0x1000) {
+                c_sr_skipped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            const u64 block = LockedFrameAlloc(alloc_entry, allocator, size, 0x10);
+            if (block == 0) {
+                c_sr_alloc_failed.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            std::memcpy(reinterpret_cast<void*>(block), reinterpret_cast<const void*>(memory), size);
+            Wr<u32>(buffer, 0x60, static_cast<u32>(block));
+            Wr<u32>(buffer, 0x64, static_cast<u32>(block >> 32) & 0xfffu | 0x100000u);
+            Wr<u32>(buffer, 0x6c, 0x20077facu);
+            Wr<u32>(buffer, 0x68, (size + 0xfu) >> 4);
+            const s64 version = reinterpret_cast<std::atomic<s64>*>(holder + 0x302a0)->fetch_add(1);
+            Wr<s64>(buffer, 0x160, version);
+            c_sr_slots.fetch_add(1, std::memory_order_relaxed);
+            c_sr_bytes.fetch_add(size, std::memory_order_relaxed);
+            made.push_back({memory, block, size, i});
+        }
+        std::scoped_lock lock{g_slot_ring_mutex};
+        if (g_slot_copies.size() < 20000) {
+            g_slot_copies.insert(g_slot_copies.end(), made.begin(), made.end());
+        }
+        return 0;
+    });
+    const u64 n = c_sr_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & 1023) == 1) {
+        Core::DebugServer::Publish("slot_ring", {{"calls", n}, {"slots_copied", c_sr_slots.load()}, {"bytes_copied", c_sr_bytes.load()}, {"skipped", c_sr_skipped.load()},
+                                                 {"ring_allocation_failed", c_sr_alloc_failed.load()}, {"slots_checked", c_sr_checked.load()},
+                                                 {"slots_written_after_the_copy", c_sr_changed.load()}, {"group_resets_seen", c_sr_group_reset.load()}});
+    }
+}
+
+/// Runs the slot writer `name` itself and copies the slots it took (count at frame data + 0x31ea4, same group); false: the original runs as usual
+bool SlotRingRun(const char* name, u64 frame, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
+    if (!SlotRingOn() || !IsHeapPointer(frame)) {
+        return false;
+    }
+    const u64 original = Core::GuestHooks::OriginalEntry(name);
+    const VAddr base = image_base.load(std::memory_order_relaxed);
+    if (original == 0 || base == 0) {
+        return false;
+    }
+    SlotRingCheck("next call");
+    const u32 group = Rd<u32>(base + SceneSlotGroupGhidra - 0x1000000, 0);
+    const u32 before = Rd<u32>(frame, 0x31ea4);
+    reinterpret_cast<GuestDraw6>(original)(frame, a1, a2, a3, a4, a5);
+    const u32 after = Rd<u32>(frame, 0x31ea4);
+    const u32 group_after = Rd<u32>(base + SceneSlotGroupGhidra - 0x1000000, 0);
+    if (group_after != group || after < before) {
+        c_sr_group_reset.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    SlotRingCopy(group, before, after);
+    return true;
+}
+} // namespace
+
 /// Mid hook at 0x1d18266 (`FUN_01d169b0`, inside `group = (group + 1) % 3`: rax holds the old group, the store comes 17 bytes later; 0x1d1827d was refused, a call follows after 4 bytes):
 /// see `NativeDevice::SceneGroupAdvanced`. The new group is computed here.
 u64 PS4_SYSV_ABI SceneGroupAdvanceHook(Core::GuestHooks::MidContext* ctx) {
+    if (SlotRingOn()) {
+        SlotRingCheck("group switch");
+    }
     NativeDevice::SceneGroupAdvanced((static_cast<u32>(ctx->rax) + 1) % 3);
     return 0;
 }
@@ -8471,6 +8609,9 @@ u64 PS4_SYSV_ABI SceneSlotWrites(u64 frame, u64 a1, u64 a2, u64 a3, u64 a4, u64 
             AnnounceSceneSlotRange(frame, std::min<u32>(Rd<u32>(frame, 0x31ea4) + 1, 8192), true);
             return 0;
         });
+    }
+    if (SlotRingRun("SceneSlotWrites", frame, a1, a2, a3, a4, a5)) {
+        return 0x8000000000000000ull;
     }
     return 0;
 }
@@ -8494,6 +8635,9 @@ u64 PS4_SYSV_ABI SceneSlotWritesMatrices(u64 frame, u64 kind, u64 a1, u64 a2, u6
             AnnounceSceneSlotRange(frame, std::min<u32>(Rd<u32>(frame, 0x31ea4) + 1, 8192), true);
             return 0;
         });
+    }
+    if ((kind & 0xffffffffull) != 0x14 && SlotRingRun("SceneSlotWritesMatrices", frame, kind, a1, a2, a3, a4)) {
+        return 0x8000000000000000ull;
     }
     return 0;
 }
