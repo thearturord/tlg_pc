@@ -1087,7 +1087,8 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Dis
 }
 
 void Rasterizer::SelectStream(bool side) {
-    constexpr u32 WarmupWindows = 240;
+    // TLG_ASC_WARMUP: the windows of queue 1 that stay on the graphics stream before the side stream starts (default 900: an entry at 240 windows, during the load of the scene, loses the device even with the waits)
+    static const u32 WarmupWindows = [] { const char* e = std::getenv("TLG_ASC_WARMUP"); return e != nullptr ? static_cast<u32>(std::atoi(e)) : 900u; }();
     const bool new_window = side && !side_requested;
     side_requested = side;
     if (new_window) {
@@ -1119,6 +1120,11 @@ void Rasterizer::SelectStream(bool side) {
             buffer_cache.SetSideUploadEpoch(++side_epoch); // the work of the next frame: the CPU may have rewritten the inputs
         }
         side_scope = std::make_unique<Scheduler::SideScope>(scheduler, true);
+        static bool first_entry_logged = false;
+        if (!first_entry_logged) {
+            first_entry_logged = true;
+            LOG_ERROR(Render_Vulkan, "side stream: first entry at window {}, frame {}", side_windows, Core::FrameTimeline::Now() / 1'000'000);
+        }
     } else {
         side_scope.reset();
         if (stream_sync) {
