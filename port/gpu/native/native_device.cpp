@@ -15,6 +15,8 @@
 #include <tuple>
 #include <vector>
 
+#include <fmt/format.h>
+
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "native/native_hooks.h"
@@ -159,6 +161,7 @@ void Insert(const Object& object) {
         }
     }
     by_id[object.id] = object;
+    by_id[object.id].created_submit = Core::NativeContent::SubmitCount();
     id_by_object[object.object] = object.id;
     if (object.kind >= Kind::Buffer && object.kind <= Kind::Texture3D && object.address != 0) {
         const u64 bytes = object.kind == Kind::Buffer ? std::max<u64>(object.bytes, 1) : object.bytes;
@@ -271,6 +274,7 @@ void NoteDelete(u64 object) {
     }
     if (const auto entry = by_id.find(it->second); entry != by_id.end() && entry->second.alive) {
         entry->second.alive = false;
+        entry->second.deleted_submit = std::max<u32>(1u, Core::NativeContent::SubmitCount());
         live_by_kind[static_cast<u32>(entry->second.kind)].fetch_sub(1, std::memory_order_relaxed);
         const Object& gone = entry->second;
         if (const auto at = resource_by_address.find(gone.address); at != resource_by_address.end() && at->second.id == gone.id) {
@@ -292,6 +296,35 @@ void NoteDelete(u64 object) {
         }
     }
     id_by_object.erase(it);
+}
+
+std::string OwnersAt(VAddr address, u64 size, u32 submit) {
+    struct Hit {
+        u64 id;
+        u32 created;
+        std::string text;
+    };
+    std::vector<Hit> hits;
+    {
+        std::shared_lock lock{table_mutex};
+        for (const auto& [id, o] : by_id) {
+            if (o.kind < Kind::Buffer || o.kind > Kind::Texture3D || o.address == 0 || o.created_submit > submit || (o.deleted_submit != 0 && o.deleted_submit <= submit)) {
+                continue;
+            }
+            const u64 bytes = o.kind == Kind::Buffer ? std::max<u64>(o.bytes, 1) : o.bytes;
+            if (address >= o.address + bytes || o.address >= address + size) {
+                continue;
+            }
+            hits.push_back({id, o.created_submit, fmt::format("[id {} kind {} {:#x}+{:#x} usage {} bind {:#x} created {} {}]", id, static_cast<u32>(o.kind), static_cast<u64>(o.address), bytes, o.usage, o.bind,
+                                                              o.created_submit, o.deleted_submit != 0 ? fmt::format("deleted {}", o.deleted_submit) : std::string("alive"))});
+        }
+    }
+    std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) { return a.created > b.created; });
+    std::string out;
+    for (size_t i = 0; i < hits.size() && i < 3; ++i) {
+        out += hits[i].text;
+    }
+    return out.empty() ? std::string("none") : out;
 }
 
 bool ResourceAt(VAddr address, Object& out) {

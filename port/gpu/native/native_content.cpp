@@ -2279,10 +2279,11 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
                 static std::atomic<u32> before_marker_examples{0};
                 if (before_marker_examples.fetch_add(1, std::memory_order_relaxed) < 40) {
                     Core::RareEvents::Note("late_read_before_done_marker",
-                                           fmt::format("{} {:#x} + {:#x} (rewritten {:#x}): record submit {}, raster done floor {}, submit count now {}, newest write announced at {} (site {}, writer {}), previous write at {}, freed by the engine at {}, containing freed block {}",
-                                                       LateKindNames[k], address, size, a.rewritten, submit, RasterDoneSubmissions(), g_submit_count.load(std::memory_order_relaxed), a.newest_submit,
+                                           fmt::format("{} {:#x} + {:#x} (rewritten {:#x}): record {} write stamp {}, record submit {}, raster done floor {}, submit count now {}, newest write announced at {} (site {}, writer {}), previous write at {}, freed by the engine at {}, containing freed block {}; owners at the record's submission {}; owners at the write's submission {}",
+                                                       LateKindNames[k], address, size, a.rewritten, seq, a.newest, submit, RasterDoneSubmissions(), g_submit_count.load(std::memory_order_relaxed), a.newest_submit,
                                                        a.newest_site < g_site_names.size() ? g_site_names[a.newest_site] : std::string("?"), a.newest_writer, a.newest_prev_submit, HeapFreeAt(address),
-                                                       [&] { u64 b = 0, n = 0; const u32 at = HeapFreeContaining(address, b, n); return at == 0 ? std::string("none") : fmt::format("{:#x}+{:#x} freed at {}", b, n, at); }()));
+                                                       [&] { u64 b = 0, n = 0; const u32 at = HeapFreeContaining(address, b, n); return at == 0 ? std::string("none") : fmt::format("{:#x}+{:#x} freed at {}", b, n, at); }(),
+                                                       Core::NativeDevice::OwnersAt(address, size, submit), Core::NativeDevice::OwnersAt(address, size, static_cast<u32>(a.newest_submit))));
                 }
             }
         }
