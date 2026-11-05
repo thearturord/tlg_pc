@@ -145,6 +145,15 @@ void NoteRasterSubmissionDone(u32 index);
 [[nodiscard]] u32 RasterDoneSubmissions();
 /// Blocks (up to 2 s, then gives up and counts it) until `RasterDoneSubmissions() >= target`.
 void WaitRasterSubmissions(u32 target);
+/// `TLG_PROGRESS_WAITS=1`: the waits for the raster thread (frame gate, free hold with a dry heap) have no time limit while the raster thread makes progress; they give up only after 10 s without progress.
+[[nodiscard]] bool ProgressWaitsOn();
+/// Blocks until `RasterDoneSubmissions() >= target`. progress = false: gives up after 2 s (old rule); true: only after 10 s without progress. False when it gave up.
+bool WaitRasterSubmissionsProgress(u32 target, bool progress);
+/// `TLG_RING_LAP_FENCE=1`: the game's frame ring (AllocFrameGarlic, a bump allocator that laps) hands a block out again only after the raster thread is done with the submission that carried the data
+/// written there the lap before. `RingLapNote` is called under the allocator lock for every block (returns the submission to wait for, 0 = none), `RingLapWait` outside the lock.
+[[nodiscard]] bool RingLapFenceOn();
+[[nodiscard]] u32 RingLapNote(u64 ring_base, u64 ring_size, u64 block, u64 bytes);
+void RingLapWait(u32 target);
 [[nodiscard]] u64 GateWaitTimeouts();
 /// A Map the hook saw (counted by resource kind, map type and the path taken, see Report "maps_note").
 void CountMap(u32 kind, u32 type, u32 path);

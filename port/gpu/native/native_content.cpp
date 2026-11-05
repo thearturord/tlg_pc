@@ -29,6 +29,7 @@
 #include "native/native_debug_server.h"
 #include "native/native_device.h"
 #include "native/native_draw.h"
+#include "native/native_invariant.h"
 #include "native/native_registry.h"
 #include "native/native_tsharp_watch.h"
 #include "native/native_updates.h"
@@ -702,6 +703,120 @@ void WaitRasterSubmissions(u32 target) {
     std::unique_lock lock{g_done_mutex};
     if (!g_done_changed.wait_for(lock, std::chrono::seconds(2), [target] { return g_done_floor.load(std::memory_order_acquire) >= target; })) {
         c_done_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+bool ProgressWaitsOn() {
+    static const bool on = [] { const char* e = std::getenv("TLG_PROGRESS_WAITS"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+
+bool WaitRasterSubmissionsProgress(u32 target, bool progress) {
+    std::unique_lock lock{g_done_mutex};
+    const auto reached = [target] { return g_done_floor.load(std::memory_order_acquire) >= target; };
+    if (!progress) {
+        if (g_done_changed.wait_for(lock, std::chrono::seconds(2), reached)) {
+            return true;
+        }
+        c_done_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    u32 last = g_done_floor.load(std::memory_order_acquire);
+    auto changed_at = std::chrono::steady_clock::now();
+    for (;;) {
+        if (g_done_changed.wait_for(lock, std::chrono::milliseconds(100), reached)) {
+            return true;
+        }
+        const u32 floor = g_done_floor.load(std::memory_order_acquire);
+        const auto now = std::chrono::steady_clock::now();
+        if (floor != last) {
+            last = floor;
+            changed_at = now;
+        } else if (now - changed_at > std::chrono::seconds(10)) {
+            c_done_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+}
+
+namespace {
+constexpr u32 LapSegmentShift = 18; // 256 KB segments
+std::mutex g_lap_mutex;
+struct LapState {
+    u64 base{}, size{}, last_offset{};
+    u32 lap{1};
+    std::vector<u32> lap_of, need; // per segment: the lap that last wrote there, the submission that carried the data
+} g_lap;
+std::atomic<u64> c_lap_blocks{0}, c_lap_laps{0}, c_lap_checked{0}, c_lap_waits{0}, c_lap_wait_ns{0}, c_lap_wait_ns_max{0}, c_lap_unannounced{0}, c_lap_gave_up{0}, c_lap_out_of_ring{0};
+} // namespace
+
+bool RingLapFenceOn() {
+    static const bool on = [] { const char* e = std::getenv("TLG_RING_LAP_FENCE"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+
+u32 RingLapNote(u64 ring_base, u64 ring_size, u64 block, u64 bytes) {
+    if (!RingLapFenceOn() || bytes == 0) {
+        return 0;
+    }
+    if (const u64 n = c_lap_blocks.fetch_add(1, std::memory_order_relaxed) + 1; n % 2000 == 0) {
+        Core::DebugServer::Publish("ring_lap_fence", {{"blocks_seen", n}, {"laps", c_lap_laps.load()}, {"segments_checked", c_lap_checked.load()}, {"waits", c_lap_waits.load()},
+                                                       {"wait_ms_total", c_lap_wait_ns.load() / 1.0e6}, {"wait_ms_max", c_lap_wait_ns_max.load() / 1.0e6},
+                                                       {"lap_inside_one_submission_window", c_lap_unannounced.load()}, {"gave_up_no_progress", c_lap_gave_up.load()},
+                                                       {"blocks_outside_the_ring", c_lap_out_of_ring.load()}, {"raster_waits_that_gave_up", c_done_wait_timeouts.load()}});
+    }
+    if (block < ring_base || block + bytes > ring_base + ring_size) {
+        c_lap_out_of_ring.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    std::scoped_lock lock{g_lap_mutex};
+    if (g_lap.base != ring_base || g_lap.size != ring_size) {
+        g_lap = {};
+        g_lap.base = ring_base;
+        g_lap.size = ring_size;
+        g_lap.lap = 1;
+        g_lap.lap_of.assign((ring_size >> LapSegmentShift) + 1, 0);
+        g_lap.need.assign((ring_size >> LapSegmentShift) + 1, 0);
+    }
+    const u64 offset = block - ring_base;
+    if (offset < g_lap.last_offset) {
+        ++g_lap.lap; // the bump allocator started over
+        c_lap_laps.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_lap.last_offset = offset;
+    const u32 announced = g_submit_count.load(std::memory_order_acquire);
+    const u32 carrier = announced + 1; // the submission announced next carries what the caller writes into the block
+    u32 wait_for = 0;
+    for (u64 s = offset >> LapSegmentShift; s <= (offset + bytes - 1) >> LapSegmentShift; ++s) {
+        c_lap_checked.fetch_add(1, std::memory_order_relaxed);
+        if (g_lap.lap_of[s] != g_lap.lap) {
+            wait_for = std::max(wait_for, g_lap.need[s]); // data of the lap before: its submission must be done
+            g_lap.lap_of[s] = g_lap.lap;
+        }
+        g_lap.need[s] = carrier;
+    }
+    if (wait_for > announced) {
+        c_lap_unannounced.fetch_add(1, std::memory_order_relaxed); // the lap came back inside one submission window: nothing to wait for (that thread may announce it)
+        wait_for = announced;
+    }
+    return wait_for;
+}
+
+void RingLapWait(u32 target) {
+    if (target == 0 || RasterDoneSubmissions() >= target) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const bool ok = WaitRasterSubmissionsProgress(target, true);
+    const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    c_lap_waits.fetch_add(1, std::memory_order_relaxed);
+    c_lap_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+    u64 mx = c_lap_wait_ns_max.load(std::memory_order_relaxed);
+    while (ns > mx && !c_lap_wait_ns_max.compare_exchange_weak(mx, ns)) {
+    }
+    if (!ok) {
+        c_lap_gave_up.fetch_add(1, std::memory_order_relaxed);
+        Core::Invariant::Hit(Core::Invariant::WaitGaveUp, target, RasterDoneSubmissions(), 0);
     }
 }
 
@@ -3014,6 +3129,10 @@ nlohmann::json Report() {
         }
         return out;
     }
+    out["ring_lap_fence"] = {{"on", RingLapFenceOn()}, {"progress_waits_on", ProgressWaitsOn()}, {"blocks_seen", c_lap_blocks.load()}, {"laps", c_lap_laps.load()}, {"segments_checked", c_lap_checked.load()},
+                             {"waits", c_lap_waits.load()}, {"wait_ms_total", c_lap_wait_ns.load() / 1.0e6}, {"wait_ms_max", c_lap_wait_ns_max.load() / 1.0e6},
+                             {"lap_inside_one_submission_window", c_lap_unannounced.load()}, {"gave_up_no_progress", c_lap_gave_up.load()}, {"blocks_outside_the_ring", c_lap_out_of_ring.load()},
+                             {"waits_for_the_raster_thread_that_gave_up", c_done_wait_timeouts.load()}};
     out["announced"] = {{"entries", c_announced.load()}, {"bytes", c_announced_bytes.load()}, {"skipped_writer_1_2_4", c_skip_writer.load()}, {"skipped_too_big", c_skip_big.load()},
                         {"skipped_unreadable", c_skip_unreadable.load()}, {"older_entries_replaced", c_replaced.load()}, {"evicted", c_evicted.load()}, {"evicted_bytes", c_evicted_bytes.load()}};
     nlohmann::json by_writer;

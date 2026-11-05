@@ -13,6 +13,9 @@ namespace Core::Invariant {
 
 #define TLG_INVARIANTS(X)                                                                                                                                                      \
     X(RecordOverwritten, "record_overwritten", "a record slot was reused while the command processor had not consumed the record that lived there (run ahead past the record ring)")  \
+    X(WaitGaveUp, "wait_gave_up", "a wait for the raster thread (frame ring lap fence, free hold) saw no progress for 10 s and went on (TLG_RING_LAP_FENCE / TLG_PROGRESS_WAITS)")                 \
+    X(GateGaveUp, "gate_gave_up", "the frame gate saw no progress for 10 s (TLG_PROGRESS_WAITS) or waited 2 s (old rule) and let the game go on")                                           \
+    X(HoldReleasedAll, "hold_released_all", "the free hold released every held block without the raster thread being done (heap dry, last resort)")                                        \
     X(SlowFrame, "slow_frame", "a frame took more than three times the running median (flight event only, no file)")                                                         \
     X(FrameWithoutDraws, "frame_without_draws", "a frame was presented although no draw or dispatch ran since the previous one (menus and movies count too; flight event only)")
 

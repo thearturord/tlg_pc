@@ -21,6 +21,7 @@
 #include "native/native_frame_events.h"
 #include "native/native_occlusion.h"
 #include "native/native_content.h"
+#include "native/native_invariant.h"
 #include "native/native_flight.h"
 #include "native/native_prof.h"
 
@@ -300,7 +301,28 @@ bool WaitFor(Done&& done, std::atomic<u64>& count, std::atomic<u64>& total_ns, c
     const auto start = std::chrono::steady_clock::now();
     Flight::Add(Flight::GateWaitBegin, 0, Flight::GateFrame, submitted - ended); // L1
     FLIGHT_SCOPE("waiting: the frame gate (frames in flight)");
-    const bool ok = changed.wait_for(lock, WaitLimit, done);
+    bool ok;
+    if (Core::NativeContent::ProgressWaitsOn()) {
+        // TLG_PROGRESS_WAITS=1: no time limit while the frame counters move; the game goes on only after 10 s without progress
+        u64 last = ended + raster_reached;
+        auto changed_at = std::chrono::steady_clock::now();
+        for (;;) {
+            ok = changed.wait_for(lock, std::chrono::milliseconds(200), done);
+            if (ok) {
+                break;
+            }
+            const u64 now_progress = ended + raster_reached;
+            const auto now = std::chrono::steady_clock::now();
+            if (now_progress != last) {
+                last = now_progress;
+                changed_at = now;
+            } else if (now - changed_at > std::chrono::seconds(10)) {
+                break;
+            }
+        }
+    } else {
+        ok = changed.wait_for(lock, WaitLimit, done);
+    }
     const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
     Flight::Add(Flight::GateWaitEnd, 0, Flight::GateFrame, static_cast<u64>(waited), ok ? 0 : 1); // L1
     count.fetch_add(1, std::memory_order_relaxed);
@@ -312,6 +334,7 @@ bool WaitFor(Done&& done, std::atomic<u64>& count, std::atomic<u64>& total_ns, c
                       static_cast<unsigned long long>(ended));
         lock.unlock();
         RareEvents::Note("frame_gate_timeout", detail);
+        Invariant::Hit(Invariant::GateGaveUp, submitted, ended, raster_reached);
     }
     return ok;
 }

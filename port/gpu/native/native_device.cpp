@@ -22,6 +22,7 @@
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
 #include "native/native_log.h"
+#include "native/native_invariant.h"
 #include "native/native_image_desc.h"
 #include "native/native_device.h"
 #include "native/native_resources.h"
@@ -1299,15 +1300,23 @@ u64 PS4_SYSV_ABI GomallocAlloc(u64 heap, u64 size, u64 alignment, u64 type, u64 
         newest = std::min<u64>(newest, Core::NativeContent::SubmitCount()); // never wait for a submission not announced yet (this thread may be the one that announces it)
         if (newest != 0) {
             hold_alloc_failed.fetch_add(1, std::memory_order_relaxed);
-            Core::NativeContent::WaitRasterSubmissions(static_cast<u32>(newest));
+            if (Core::NativeContent::ProgressWaitsOn()) {
+                // TLG_PROGRESS_WAITS=1: wait while the raster thread makes progress (no 2 s limit)
+                if (!Core::NativeContent::WaitRasterSubmissionsProgress(static_cast<u32>(newest), true)) {
+                    Core::Invariant::Hit(Core::Invariant::WaitGaveUp, newest, Core::NativeContent::RasterDoneSubmissions(), 1);
+                }
+            } else {
+                Core::NativeContent::WaitRasterSubmissions(static_cast<u32>(newest));
+            }
             ReleaseHeld(false);
             result = reinterpret_cast<GuestFunction6>(original)(heap, size, alignment, type, a4, a5);
-            if (result == 0 && FreeHoldMidOn()) {
+            if (result == 0 && (FreeHoldMidOn() || Core::NativeContent::ProgressWaitsOn())) { // (the game thread is here: the engine frame cannot advance, so the frame rule is dropped, the raster rule stays)
                 ReleaseHeld(false, true);
                 result = reinterpret_cast<GuestFunction6>(original)(heap, size, alignment, type, a4, a5);
             }
             if (result == 0) {
                 hold_alloc_failed_twice.fetch_add(1, std::memory_order_relaxed);
+                Core::Invariant::Hit(Core::Invariant::HoldReleasedAll, newest, Core::NativeContent::RasterDoneSubmissions(), 0);
                 ReleaseHeld(true);
                 result = reinterpret_cast<GuestFunction6>(original)(heap, size, alignment, type, a4, a5);
             }

@@ -5805,7 +5805,7 @@ bool FrameAllocLocked() {
         const char* e = std::getenv("TLG_LIGHT_RING");
         const char* s = std::getenv("TLG_SLOT_RING");
         const char* k = std::getenv("TLG_SKIN_RING");
-        return (e != nullptr && e[0] == '1') || (s != nullptr && s[0] == '1') || (k != nullptr && k[0] == '1');
+        return (e != nullptr && e[0] == '1') || (s != nullptr && s[0] == '1') || (k != nullptr && k[0] == '1') || Core::NativeContent::RingLapFenceOn();
     }();
     return on;
 }
@@ -5813,10 +5813,15 @@ std::mutex g_frame_alloc_mutex;
 
 u64 LockedFrameAlloc(u64 original, u64 allocator, u64 size, u64 alignment) {
     u64 block;
+    u32 lap_wait = 0;
     {
         std::scoped_lock lock{g_frame_alloc_mutex};
         block = reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u64)>(original)(allocator, size, alignment);
+        if (Core::NativeContent::RingLapFenceOn() && block != 0) {
+            lap_wait = Core::NativeContent::RingLapNote(Rd<u64>(allocator, 0x18), Rd<u64>(allocator, 0x0) & 0xffffffffull, block, size & 0xffffffffull);
+        }
     }
+    Core::NativeContent::RingLapWait(lap_wait); // outside the lock: the block is not written yet
     if (Core::NativeContent::ShadowOn() || Core::NativeContent::RingWindowsOn()) {
         Core::NativeContent::NoteMark(6, block, size & 0xffffffffull);
         Core::NativeContent::NoteRingWindow(block, size & 0xffffffffull);
