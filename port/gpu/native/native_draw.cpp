@@ -6891,7 +6891,7 @@ void SkinWritesAnnounce(u64 ring, u64 scene);
 // (buffer = ring + idx*8, memory pointer buffer+0x30, read once after the pick) and binds the slot's GPU view (ring + 0x20 + idx*8, buffer V# at view+0x78) for its
 // compute dispatches, all inside the one call (the native generator does the same reads). A ring of 4 with 2 passes per frame covers 2 frames only. Rename instead of
 // waiting: before the pass, the slot's memory pointer and the V# of its view and buffer point at a fresh frame-ring block, so the matrices land there and the dispatches
-// read them there; after the pass the memory pointer is put back (the engine's object stays its own). TLG_SKIN_GATE is not needed with this on.
+// read them there; after the pass the memory pointer is put back (the engine's object stays its own). (The old TLG_SKIN_GATE wait is removed.)
 namespace {
 bool SkinRingOn() {
     static const bool on = [] { const char* e = std::getenv("TLG_SKIN_RING"); return e != nullptr && e[0] == '1'; }();
@@ -6986,15 +6986,6 @@ u64 PS4_SYSV_ABI SkinWrites(u64 ring, u64 scene, u64 flag, u64 a3, u64 a4, u64 a
             SkinRingRestore(renamed);
             return 0x8000000000000000ull;
         }
-    }
-    if (IsHeapPointer(ring) && IsHeapPointer(scene)) {
-        // TLG_SKIN_GATE: the slot the original is about to write must not still be read by a frame the raster thread has not finished
-        Guarded([&]() -> u64 {
-            if (Rd<u64>(scene, 0x29e00) != 0) {
-                NativeDevice::SkinSlotAboutToWrite((Rd<u32>(ring, 0x40) + 1) & 3);
-            }
-            return 0;
-        });
     }
     if (NativeZPassGen::SkinEnabled() && IsHeapPointer(ring) && IsHeapPointer(scene)) {
         // B3: the loop is generated; the announcement of its writes stays (it reads the same objects)
