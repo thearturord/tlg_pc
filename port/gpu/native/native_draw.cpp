@@ -5804,7 +5804,8 @@ bool FrameAllocLocked() {
     static const bool on = [] {
         const char* e = std::getenv("TLG_LIGHT_RING");
         const char* s = std::getenv("TLG_SLOT_RING");
-        return (e != nullptr && e[0] == '1') || (s != nullptr && s[0] == '1');
+        const char* k = std::getenv("TLG_SKIN_RING");
+        return (e != nullptr && e[0] == '1') || (s != nullptr && s[0] == '1') || (k != nullptr && k[0] == '1');
     }();
     return on;
 }
@@ -6884,8 +6885,108 @@ u64 PS4_SYSV_ABI InstanceLoop(u64 holder, u64 scene, u64 a2, u64 a3, u64 a4, u64
 }
 
 void SkinWritesAnnounce(u64 ring, u64 scene);
+
+// ---- TLG_SKIN_RING=1 (memory-ownership-plan, dev loop table: skin matrices as a copy, not a wait) ---------------------------------------------------------------------
+// The skinning pass (FUN_01c93730, render thread, two passes per frame) picks matrix slot (ring+0x40 + 1) & 3, copies the bone matrices into the slot buffer's memory
+// (buffer = ring + idx*8, memory pointer buffer+0x30, read once after the pick) and binds the slot's GPU view (ring + 0x20 + idx*8, buffer V# at view+0x78) for its
+// compute dispatches, all inside the one call (the native generator does the same reads). A ring of 4 with 2 passes per frame covers 2 frames only. Rename instead of
+// waiting: before the pass, the slot's memory pointer and the V# of its view and buffer point at a fresh frame-ring block, so the matrices land there and the dispatches
+// read them there; after the pass the memory pointer is put back (the engine's object stays its own). TLG_SKIN_GATE is not needed with this on.
+namespace {
+bool SkinRingOn() {
+    static const bool on = [] { const char* e = std::getenv("TLG_SKIN_RING"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+std::atomic<u64> c_skr_passes{0}, c_skr_renamed{0}, c_skr_bytes{0}, c_skr_declined{0}, c_skr_alloc_failed{0};
+struct SkinRename {
+    u64 buffer{0}, memory{0};
+};
+SkinRename SkinRingRename(u64 ring, u64 scene) {
+    SkinRename r;
+    Guarded([&]() -> u64 {
+        const VAddr base = image_base.load(std::memory_order_relaxed);
+        const u64 holder = base != 0 ? Rd<u64>(base + 0x6b03558 - 0x1000000, 0) : 0;
+        const u64 allocator = holder != 0 ? Rd<u64>(holder, 0x10238) : 0;
+        const u32 index = (Rd<u32>(ring, 0x40) + 1) & 3;
+        const u64 buffer = Rd<u64>(ring, index * 8ull);
+        const u64 view = Rd<u64>(ring, 0x20 + index * 8ull);
+        if (allocator == 0 || !IsHeapPointer(buffer) || !IsHeapPointer(view)) {
+            c_skr_declined.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+        const u32 kind = Rd<u32>(view, 0x44);
+        const u64 memory = Rd<u64>(buffer, 0x30);
+        const u32 size = Rd<u32>(buffer, 0x180);
+        if ((kind != 1 && kind != 0xb) || memory == 0 || size == 0 || size > (16u << 20)) {
+            c_skr_declined.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+        // only the matrices this pass writes (64 bytes each, counted over the job list as the pass does), not the slot buffer's whole size
+        u64 matrices = 0;
+        u32 jobs = 0;
+        for (u64 node = Rd<u64>(scene, 0x29e00); node != 0 && jobs < 100000; node = Rd<u64>(node, 0), ++jobs) {
+            matrices += Rd<u32>(node, 0x50);
+        }
+        const u64 bytes = std::min<u64>(size, (std::max<u64>(matrices, 1) * 64 + 0xff) & ~u64{0xff});
+        static const u64 alloc_original = Core::GuestHooks::OriginalEntry("AllocFrameGarlic");
+        const u64 alloc_entry = alloc_original != 0 ? alloc_original : base + 0x2476350 - 0x1000000;
+        const u64 block = LockedFrameAlloc(alloc_entry, allocator, bytes, 0x100);
+        if (block == 0) {
+            c_skr_alloc_failed.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+        const u32 hi = static_cast<u32>(block >> 32) & 0xfffu;
+        Wr<u32>(view, 0x78, static_cast<u32>(block));
+        Wr<u32>(view, 0x7c, (Rd<u32>(view, 0x7c) & ~0xfffu) | hi);
+        Wr<u32>(buffer, 0x60, static_cast<u32>(block));
+        Wr<u32>(buffer, 0x64, (Rd<u32>(buffer, 0x64) & ~0xfffu) | hi);
+        const s64 version = reinterpret_cast<std::atomic<s64>*>(holder + 0x302a0)->fetch_add(1);
+        Wr<s64>(buffer, 0x160, version);
+        Wr<u64>(buffer, 0x30, block);
+        r.buffer = buffer;
+        r.memory = memory;
+        c_skr_renamed.fetch_add(1, std::memory_order_relaxed);
+        c_skr_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        return 0;
+    });
+    return r;
+}
+void SkinRingRestore(const SkinRename& r) {
+    if (r.buffer != 0) {
+        Guarded([&]() -> u64 {
+            Wr<u64>(r.buffer, 0x30, r.memory);
+            return 0;
+        });
+    }
+    const u64 n = c_skr_passes.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & 255) == 1) {
+        Core::DebugServer::Publish("skin_ring", {{"passes", n}, {"slots_renamed", c_skr_renamed.load()}, {"bytes", c_skr_bytes.load()}, {"declined", c_skr_declined.load()},
+                                                 {"ring_allocation_failed", c_skr_alloc_failed.load()}});
+    }
+}
+} // namespace
+
 u64 PS4_SYSV_ABI SkinWrites(u64 ring, u64 scene, u64 flag, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
     (void)a3, (void)a4, (void)a5, (void)ret, (void)caller_rsp;
+    if (SkinRingOn() && IsHeapPointer(ring) && IsHeapPointer(scene)) {
+        bool work = false;
+        Guarded([&]() -> u64 {
+            work = Rd<u64>(scene, 0x29e00) != 0;
+            return 0;
+        });
+        static const u64 loop_entry = Core::GuestHooks::OriginalEntry("SkinWrites");
+        if (work && loop_entry != 0) {
+            const SkinRename renamed = SkinRingRename(ring, scene);
+            if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
+                SkinWritesAnnounce(ring, scene);
+            }
+            if (!(NativeZPassGen::SkinEnabled() && NativeZPassGen::HandleSkin(ring, scene, flag, loop_entry))) {
+                reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64, u64)>(loop_entry)(ring, scene, flag);
+            }
+            SkinRingRestore(renamed);
+            return 0x8000000000000000ull;
+        }
+    }
     if (IsHeapPointer(ring) && IsHeapPointer(scene)) {
         // TLG_SKIN_GATE: the slot the original is about to write must not still be read by a frame the raster thread has not finished
         Guarded([&]() -> u64 {
