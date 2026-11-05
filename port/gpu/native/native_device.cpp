@@ -1085,9 +1085,87 @@ void ReleaseHeld(bool all, bool ignore_frames = false) {
     }
 }
 
+/// Pool statistics the game reads (hook `GomallocStats` = FUN_0246d6e0, read only): out[0] is the free bytes of the pool, `PrepareMaterial` goes down its memory-pressure path (texture
+/// mip reduction, compute copies, a spin on a compute-ring fence) when that figure is <= 0x11a00000. Recorded per pool: the figure as the game gets it, the bytes our free hold keeps
+/// back in that pool, and how often the figure is below the threshold with and without the held bytes added (frame-order design, free-hold-fix-design.md step 0).
+constexpr u64 PoolPressureThreshold = 0x11a00000;
+struct PoolStatsSlot {
+    std::atomic<u64> pool{0}, calls{0}, free_min{~0ull}, free_max{0}, free_last{0}, held_last{0}, held_max{0}, held_unknown_last{0}, below_real{0}, below_corrected{0};
+};
+PoolStatsSlot pool_stats_slots[4];
+
+PoolStatsSlot* PoolStatsSlotFor(u64 pool) {
+    for (auto& slot : pool_stats_slots) {
+        u64 expected = 0;
+        if (slot.pool.load(std::memory_order_relaxed) == pool || slot.pool.compare_exchange_strong(expected, pool) || expected == pool) {
+            return &slot;
+        }
+    }
+    return nullptr;
+}
+
 } // namespace
 
+u64 PS4_SYSV_ABI GomallocStats(u64 pool, u64 out, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    static const u64 original = Core::GuestHooks::OriginalEntry("GomallocStats");
+    if (original == 0 || pool == 0 || out == 0) {
+        return 0; // the original runs
+    }
+    reinterpret_cast<GuestFunction6>(original)(pool, out, a2, a3, a4, a5);
+    PoolStatsSlot* slot = PoolStatsSlotFor(pool);
+    if (slot != nullptr) {
+        const u64 real = Rd<u64>(out, 0);
+        u64 held = 0, unknown = 0;
+        if (FreeHoldOn()) {
+            std::scoped_lock lock{deferred_mutex};
+            for (const auto& entry : held_frees) {
+                if (entry.heap == pool) {
+                    held += entry.size;
+                    unknown += entry.size == 0 ? 1 : 0;
+                }
+            }
+        }
+        slot->calls.fetch_add(1, std::memory_order_relaxed);
+        slot->free_last.store(real, std::memory_order_relaxed);
+        slot->held_last.store(held, std::memory_order_relaxed);
+        slot->held_unknown_last.store(unknown, std::memory_order_relaxed);
+        if (real < slot->free_min.load(std::memory_order_relaxed)) {
+            slot->free_min.store(real, std::memory_order_relaxed);
+        }
+        if (real > slot->free_max.load(std::memory_order_relaxed)) {
+            slot->free_max.store(real, std::memory_order_relaxed);
+        }
+        if (held > slot->held_max.load(std::memory_order_relaxed)) {
+            slot->held_max.store(held, std::memory_order_relaxed);
+        }
+        if (real <= PoolPressureThreshold) {
+            slot->below_real.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (real + held <= PoolPressureThreshold) {
+            slot->below_corrected.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return 0x8000000000000000ull;
+}
+
 nlohmann::json FreeHoldReport() {
+    nlohmann::json pools = nlohmann::json::array();
+    for (auto& slot : pool_stats_slots) {
+        if (slot.pool.load() == 0) {
+            continue;
+        }
+        pools.push_back({{"pool", slot.pool.load()},
+                         {"stats_calls", slot.calls.load()},
+                         {"free_last", slot.free_last.load()},
+                         {"free_min", slot.free_min.load()},
+                         {"free_max", slot.free_max.load()},
+                         {"held_last", slot.held_last.load()},
+                         {"held_max", slot.held_max.load()},
+                         {"held_blocks_unknown_size_last", slot.held_unknown_last.load()},
+                         {"calls_at_or_below_threshold_as_the_game_got_it", slot.below_real.load()},
+                         {"calls_at_or_below_threshold_with_held_added", slot.below_corrected.load()},
+                         {"threshold", PoolPressureThreshold}});
+    }
     u64 pending = 0, bytes = 0, oldest_need = 0;
     {
         std::scoped_lock lock{deferred_mutex};
@@ -1096,6 +1174,7 @@ nlohmann::json FreeHoldReport() {
         oldest_need = held_frees.empty() ? 0 : held_frees.front().need;
     }
     return {{"on", FreeHoldOn()},
+            {"pool_stats", pools},
             {"frees_held", hold_count.load()},
             {"frees_done_at_once_raster_already_past", hold_at_once.load()},
             {"held_frees_released", hold_released.load()},

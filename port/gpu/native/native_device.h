@@ -128,6 +128,9 @@ void DrainDeferredFrees();
 /// Hook `GomallocAlloc` (0x248fb10, `native_gomalloc_alloc`): the engine heap's allocation (heap, size, alignment, type). With `TLG_FREE_HOLD=1` it remembers the block's size (for the held free) and, when the heap runs
 /// dry while frees are held, releases them (the old loader gate wait is removed: the free hold keeps a block out of the heap until the raster thread is done with it).
 u64 PS4_SYSV_ABI GomallocAlloc(u64 heap, u64 size, u64 alignment, u64 type, u64 a4, u64 a5, u64 ret);
+/// Hook `GomallocStats` (0x246d6e0, `native_gomalloc_stats`, read only): the pool statistics the game reads (free bytes in out[0]). Records the figure, the bytes the free hold keeps back and how
+/// often the figure is at or below the 0x11a00000 memory-pressure threshold of `PrepareMaterial`, with and without the held bytes (free_hold.pool_stats in /native).
+u64 PS4_SYSV_ABI GomallocStats(u64 pool, u64 out, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret);
 /// Hook `B0_SwapChainBeginFrame` (0x2495480, `native_begin_frame_tick`): runs the original (the game's delete tick), then releases the held frees the raster thread is done with.
 u64 PS4_SYSV_ABI BeginFrameTick(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret);
 
