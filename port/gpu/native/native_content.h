@@ -35,6 +35,26 @@ enum class LateKind : u32 { ImageUpload, BufferStreamCopy, BufferObjectCopy, Buf
 /// A read of [address, address + size) for the operation with record number `seq` (0: the record of the calling thread's current draw): the write ledger says whether the range was written
 /// after that record. Counted per kind and by the writer of the newest write (Report: /stats native_backend.device.f2_store.image_memory_check.m0_late_reads). `TLG_F2_LEDGER=0` turns it off.
 void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq = 0);
+/// What the raster thread is binding right now (set around `ObtainBuffer` by the bind sites, thread local), printed by the late read samples that fall before the done marker
+struct BindContext {
+    const char* site{};   ///< "shader binding", "vertex", "index"
+    u64 engine_id{};      ///< the buffer's engine id from the record's binding plan (0: none)
+    u64 view_id{};
+    u64 program{};        ///< the shader program hash of the stage
+    u32 stage{};
+    bool handle{};        ///< the plan's handle (registry entry) was used
+    bool written{};
+    u64 address{};
+    u64 size{};
+    u64 caller{};         ///< "other": the return address into the code that called ObtainBuffer (RVA in the sample)
+};
+[[nodiscard]] bool HasBindContext();
+/// The arena sync of the destination of a GPU buffer copy: the range is overwritten by the copy right after, so the bytes read from memory are never used; counted apart from the late reads
+/// (`f2_store.copy_destination_syncs`). `CurrentBindIsCopyDestination` is true while the bind context is the copy's destination.
+[[nodiscard]] bool CurrentBindIsCopyDestination();
+void NoteCopyDestinationSync(u64 bytes);
+void SetBindContext(const BindContext& context);
+void ClearBindContext();
 /// W1.5 census (TLG_SILENT_CENSUS=1): the raster thread copied engine buffer `key` from memory (path 0: synchronized into its arena, 1: object copy made)
 void SilentSynced(u32 path, u64 key, u64 size);
 /// a bind of [address, address + size) served from that copy without reading memory again (path 0: resident arena, 1: object copy reused); counts silent writes since the copy

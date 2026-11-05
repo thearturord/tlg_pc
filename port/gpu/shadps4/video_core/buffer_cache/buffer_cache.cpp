@@ -248,8 +248,26 @@ static bool BindMemoOn() {
     return on;
 }
 
+namespace {
+/// Names the caller of ObtainBuffer for the late read samples when the bind site did not (NativeContent::SetBindContext)
+struct BindGuard {
+    bool own;
+    BindGuard(u64 caller, VAddr address, u64 size, bool written, bool handle) : own(!Core::NativeContent::HasBindContext()) {
+        if (own) {
+            Core::NativeContent::SetBindContext({"other caller", 0, 0, 0, 0, handle, written, address, size, caller});
+        }
+    }
+    ~BindGuard() {
+        if (own) {
+            Core::NativeContent::ClearBindContext();
+        }
+    }
+};
+} // namespace
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                         Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
+    const BindGuard bind_guard{reinterpret_cast<u64>(__builtin_return_address(0)), device_addr, size, is_written, immutable_hint != nullptr};
     TLG_PROF_LEVEL("buffer.obtain", 2);
     if (is_written) {
         BindMemoErase(device_addr, size); // the GPU writes it: answers over this memory are stale
@@ -501,7 +519,11 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
     last_upload_bytes = 0;
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     if (last_upload_bytes != 0) {
-        Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::BufferArenaSync, device_addr, size);
+        if (Core::NativeContent::CurrentBindIsCopyDestination()) {
+            Core::NativeContent::NoteCopyDestinationSync(size); // the copy overwrites the whole range right after: not a read that feeds a draw
+        } else {
+            Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::BufferArenaSync, device_addr, size);
+        }
     }
     Core::NativeResources::NoteBufferRequest(device_addr, size, is_written,
                                              Core::NativeResources::BufferPath::Arena, last_upload_bytes);
@@ -560,7 +582,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForDownload(VAddr device_
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
     if (IsRegionGpuModified(device_addr, size)) {
         last_image_source_gpu = true;
-        return ObtainBuffer(device_addr, size, false);
+        Core::NativeContent::SetBindContext({"image source (GPU modified region)", 0, 0, 0, 0, false, false, device_addr, size, reinterpret_cast<u64>(__builtin_return_address(0))});
+        const auto gpu_result = ObtainBuffer(device_addr, size, false);
+        Core::NativeContent::ClearBindContext();
+        return gpu_result;
     }
     last_image_source_gpu = false;
     const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,

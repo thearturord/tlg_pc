@@ -2218,6 +2218,60 @@ nlohmann::json SilentReport() {
 }
 } // namespace
 
+namespace {
+thread_local BindContext t_bind;
+thread_local bool t_bind_set = false;
+} // namespace
+
+void SetBindContext(const BindContext& context) {
+    t_bind = context;
+    t_bind_set = true;
+}
+
+void ClearBindContext() {
+    t_bind_set = false;
+}
+
+bool HasBindContext() {
+    return t_bind_set;
+}
+
+bool CurrentBindIsCopyDestination() {
+    return t_bind_set && t_bind.site != nullptr && std::strcmp(t_bind.site, "copy destination") == 0;
+}
+
+namespace {
+std::atomic<u64> c_copy_dst_syncs{0}, c_copy_dst_bytes{0};
+} // namespace
+
+void NoteCopyDestinationSync(u64 bytes) {
+    c_copy_dst_syncs.fetch_add(1, std::memory_order_relaxed);
+    c_copy_dst_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+namespace {
+std::string DescribeBind() {
+    if (!t_bind_set) {
+        return "no bind context";
+    }
+    std::string owner = "no engine object for the id";
+    if (t_bind.engine_id != 0) {
+        Core::NativeDevice::Object o;
+        if (Core::NativeDevice::Lookup(t_bind.engine_id, o)) {
+            owner = fmt::format("engine buffer id {} alive at {:#x}+{:#x} created {}", o.id, static_cast<u64>(o.address), o.bytes, o.created_submit);
+        } else {
+            owner = fmt::format("engine id {} is not alive (deleted or unknown)", t_bind.engine_id);
+        }
+    }
+    u64 rva = 0;
+#ifdef _WIN32
+    rva = t_bind.caller != 0 ? t_bind.caller - reinterpret_cast<u64>(GetModuleHandleW(nullptr)) : 0;
+#endif
+    return fmt::format("{} {:#x}+{:#x}, view id {}, program {:#x} stage {}, via handle {}, written {}, caller rva {:#x}: {}", t_bind.site != nullptr ? t_bind.site : "?", t_bind.address, t_bind.size, t_bind.view_id,
+                       t_bind.program, t_bind.stage, t_bind.handle, t_bind.written, rva, owner);
+}
+} // namespace
+
 void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
     if (!LedgerOn() || size == 0) {
         return;
@@ -2279,11 +2333,11 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
                 static std::atomic<u32> before_marker_examples{0};
                 if (before_marker_examples.fetch_add(1, std::memory_order_relaxed) < 40) {
                     Core::RareEvents::Note("late_read_before_done_marker",
-                                           fmt::format("{} {:#x} + {:#x} (rewritten {:#x}): record {} write stamp {}, record submit {}, raster done floor {}, submit count now {}, newest write announced at {} (site {}, writer {}), previous write at {}, freed by the engine at {}, containing freed block {}; owners at the record's submission {}; owners at the write's submission {}",
+                                           fmt::format("{} {:#x} + {:#x} (rewritten {:#x}): record {} write stamp {}, record submit {}, raster done floor {}, submit count now {}, newest write announced at {} (site {}, writer {}), previous write at {}, freed by the engine at {}, containing freed block {}; owners at the record's submission {}; owners at the write's submission {}; bind: {}",
                                                        LateKindNames[k], address, size, a.rewritten, seq, a.newest, submit, RasterDoneSubmissions(), g_submit_count.load(std::memory_order_relaxed), a.newest_submit,
                                                        a.newest_site < g_site_names.size() ? g_site_names[a.newest_site] : std::string("?"), a.newest_writer, a.newest_prev_submit, HeapFreeAt(address),
                                                        [&] { u64 b = 0, n = 0; const u32 at = HeapFreeContaining(address, b, n); return at == 0 ? std::string("none") : fmt::format("{:#x}+{:#x} freed at {}", b, n, at); }(),
-                                                       Core::NativeDevice::OwnersAt(address, size, submit), Core::NativeDevice::OwnersAt(address, size, static_cast<u32>(a.newest_submit))));
+                                                       Core::NativeDevice::OwnersAt(address, size, submit), Core::NativeDevice::OwnersAt(address, size, static_cast<u32>(a.newest_submit)), DescribeBind()));
                 }
             }
         }
@@ -2848,6 +2902,8 @@ nlohmann::json Report() {
                          {"owner_less_lookups_refused_not_in_ring_or_gpu_allocation", c_ring_index[4].load()}};
     out["enabled"] = On();
     out["shadow"] = ShadowOn();
+    out["copy_destination_syncs"] = {{"syncs_with_upload", c_copy_dst_syncs.load()}, {"bytes", c_copy_dst_bytes.load()},
+                                     {"note", "arena sync of a GPU buffer copy's destination: the copy overwrites the whole range right after, so the bytes read are never used"}};
     out["compare_by_open_map"] = {{"open_map_uploads", c_cmp_open.load()}, {"open_map_differs", c_cmp_open_differs.load()}, {"no_open_map_uploads", c_cmp_closed.load()}, {"no_open_map_differs", c_cmp_closed_differs.load()}};
     out["ring_swap"] = {{"on", RingSwapOn()}, {"images_overlaid", c_ov_images.load()}, {"bytes_from_store", c_ov_bytes.load()}, {"bytes_not_covered_left_to_memory", c_ov_uncovered_bytes.load()},
                         {"images_where_store_differs_from_memory", c_ov_images_changed.load()}, {"bytes_where_store_differs_from_memory", c_ov_changed_bytes.load()},

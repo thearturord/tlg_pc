@@ -1372,8 +1372,10 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         }
         auto* vertex_handle = GeometryHandle(range.base_address, size);
         Census(vertex_handle != nullptr ? CGeometryVertexHandle : CGeometryVertexAddress);
+        Core::NativeContent::SetBindContext({"vertex", 0, 0, 0, 0, vertex_handle != nullptr, false, range.base_address, size});
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false, false, vertex_handle, NativeHandleMode() == 2);
+        Core::NativeContent::ClearBindContext();
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
         bound_buffers.emplace_back(range.buffer, range.offset, size,
                                    vk::AccessFlagBits2::eVertexAttributeRead);
@@ -1458,8 +1460,10 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
     } else if (index_buffer_size != 0) {
         auto* index_handle = GeometryHandle(index_address, index_buffer_size);
         Census(index_handle != nullptr ? CGeometryIndexHandle : CGeometryIndexAddress);
+        Core::NativeContent::SetBindContext({"index", 0, 0, 0, 0, index_handle != nullptr, false, index_address, index_buffer_size});
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(index_address, index_buffer_size, false, false, index_handle, NativeHandleMode() == 2);
+        Core::NativeContent::ClearBindContext();
         needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
         bound_buffers.emplace_back(buffer, offset, index_buffer_size,
                                    vk::AccessFlagBits2::eIndexRead);
@@ -1890,8 +1894,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                                          vsharp.num_records, vsharp.data_format, vsharp.num_format, false); // E2 census
                 }
                 Core::NativeRegistry::SetBufferWriter(stage.pgm_hash, static_cast<u32>(stage.sw_stage));
+                Core::NativeContent::SetBindContext({"shader binding", record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].id : 0,
+                                                     record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].view_id : 0, stage.pgm_hash,
+                                                     static_cast<u32>(stage.sw_stage), immutable_hint != nullptr, desc.is_written, vsharp.address, size});
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2, cp_no_object);
+                Core::NativeContent::ClearBindContext();
                 if (Core::LightRecorder::On() && !Core::LightRecorder::Recording() && draw_class_now == 0 && size <= 1024 && !desc.is_written) {
                     Core::LightRecorder::ShadowBuffer(Core::DebugServer::PresentCount(), vsharp.address, size); // a z / shadow draw's view constants candidate
                 }
@@ -3259,7 +3267,10 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             return buffer_cache.ObtainBufferForDownload(dst, num_bytes);
         }
         Core::NativeRegistry::SetBufferWriter(src, src_gds ? 103 : 100); // diagnostics: a GPU copy (source address)
-        return buffer_cache.ObtainBuffer(dst, num_bytes, true, true);
+        Core::NativeContent::SetBindContext({"copy destination", 0, 0, 0, 0, false, true, dst, num_bytes});
+        const auto copy_destination = buffer_cache.ObtainBuffer(dst, num_bytes, true, true);
+        Core::NativeContent::ClearBindContext();
+        return copy_destination;
     }();
     const vk::BufferCopy copy = {
         .srcOffset = src_offset,
