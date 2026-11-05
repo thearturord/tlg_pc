@@ -1089,7 +1089,13 @@ void ReleaseHeld(bool all, bool ignore_frames = false) {
 /// mip reduction, compute copies, a spin on a compute-ring fence) when that figure is <= 0x11a00000. Recorded per pool: the figure as the game gets it, the bytes our free hold keeps
 /// back in that pool, and how often the figure is below the threshold with and without the held bytes added (frame-order design, free-hold-fix-design.md step 0).
 constexpr u64 PoolPressureThreshold = 0x11a00000;
+/// TLG_POOL_FIGURE_FIX=0 turns the correction off (default on; it only acts while the free hold holds bytes in that pool)
+bool PoolFigureFixOn() {
+    static const bool on = [] { const char* e = std::getenv("TLG_POOL_FIGURE_FIX"); return e == nullptr || e[0] != '0'; }();
+    return on;
+}
 struct PoolStatsSlot {
+    std::atomic<u64> corrected_calls{0}, corrected_bytes_last{0};
     std::atomic<u64> pool{0}, calls{0}, free_min{~0ull}, free_max{0}, free_last{0}, held_last{0}, held_max{0}, held_unknown_last{0}, below_real{0}, below_corrected{0};
 };
 PoolStatsSlot pool_stats_slots[4];
@@ -1125,6 +1131,12 @@ u64 PS4_SYSV_ABI GomallocStats(u64 pool, u64 out, u64 a2, u64 a3, u64 a4, u64 a5
                 }
             }
         }
+        if (held != 0 && PoolFigureFixOn()) {
+            // the game must see the free figure of lockstep: a block it freed is free for it, only our raster thread still reads it
+            *reinterpret_cast<u64*>(out) = real + held;
+            slot->corrected_calls.fetch_add(1, std::memory_order_relaxed);
+            slot->corrected_bytes_last.store(held, std::memory_order_relaxed);
+        }
         slot->calls.fetch_add(1, std::memory_order_relaxed);
         slot->free_last.store(real, std::memory_order_relaxed);
         slot->held_last.store(held, std::memory_order_relaxed);
@@ -1148,6 +1160,33 @@ u64 PS4_SYSV_ABI GomallocStats(u64 pool, u64 out, u64 a2, u64 a3, u64 a4, u64 a5
     return 0x8000000000000000ull;
 }
 
+/// Read only probes of the two helpers `PrepareMaterial` calls (FUN_01f7e520 = texture mip reduction under memory pressure, FUN_01f7e850 = block move on the compute queue): how often each ran
+/// and how often it did work (returned 1). Told apart: the pressure path (needs the pool figure) and the move path (needs a block in the real free list).
+std::atomic<u64> material_probe[6]; // pressure calls, pressure with arg 0, pressure did work, move calls, move did work, moves in frames where pressure did nothing
+
+u64 PS4_SYSV_ABI MaterialPressureProbe(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    static const u64 original = Core::GuestHooks::OriginalEntry("MaterialPressure");
+    if (original == 0) {
+        return 0;
+    }
+    const u32 result = static_cast<u32>(reinterpret_cast<GuestFunction6>(original)(a0, a1, a2, a3, a4, a5));
+    material_probe[0].fetch_add(1, std::memory_order_relaxed);
+    material_probe[1].fetch_add(static_cast<u32>(a0) == 0 ? 1 : 0, std::memory_order_relaxed);
+    material_probe[2].fetch_add(result != 0 ? 1 : 0, std::memory_order_relaxed);
+    return 0x8000000000000000ull | result;
+}
+
+u64 PS4_SYSV_ABI MaterialMoveProbe(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    static const u64 original = Core::GuestHooks::OriginalEntry("MaterialMove");
+    if (original == 0) {
+        return 0;
+    }
+    const u32 result = static_cast<u32>(reinterpret_cast<GuestFunction6>(original)(a0, a1, a2, a3, a4, a5));
+    material_probe[3].fetch_add(1, std::memory_order_relaxed);
+    material_probe[4].fetch_add(result != 0 ? 1 : 0, std::memory_order_relaxed);
+    return 0x8000000000000000ull | result;
+}
+
 nlohmann::json FreeHoldReport() {
     nlohmann::json pools = nlohmann::json::array();
     for (auto& slot : pool_stats_slots) {
@@ -1156,6 +1195,8 @@ nlohmann::json FreeHoldReport() {
         }
         pools.push_back({{"pool", slot.pool.load()},
                          {"stats_calls", slot.calls.load()},
+                         {"figure_fix_on", PoolFigureFixOn()},
+                         {"calls_figure_raised_by_held_bytes", slot.corrected_calls.load()},
                          {"free_last", slot.free_last.load()},
                          {"free_min", slot.free_min.load()},
                          {"free_max", slot.free_max.load()},
@@ -1175,6 +1216,8 @@ nlohmann::json FreeHoldReport() {
     }
     return {{"on", FreeHoldOn()},
             {"pool_stats", pools},
+            {"material_probe", {{"pressure_helper_calls", material_probe[0].load()}, {"pressure_helper_calls_with_arg_0", material_probe[1].load()}, {"pressure_helper_did_work", material_probe[2].load()},
+                                {"move_helper_calls", material_probe[3].load()}, {"move_helper_did_work", material_probe[4].load()}}},
             {"frees_held", hold_count.load()},
             {"frees_done_at_once_raster_already_past", hold_at_once.load()},
             {"held_frees_released", hold_released.load()},

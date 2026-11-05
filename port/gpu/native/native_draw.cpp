@@ -9345,6 +9345,12 @@ u64 FindHandler(const std::string& name) {
     if (name == "native_gomalloc_alloc") {
         return reinterpret_cast<u64>(&NativeDevice::GomallocAlloc);
     }
+    if (name == "native_material_pressure") {
+        return reinterpret_cast<u64>(&NativeDevice::MaterialPressureProbe);
+    }
+    if (name == "native_material_move") {
+        return reinterpret_cast<u64>(&NativeDevice::MaterialMoveProbe);
+    }
     if (name == "native_gomalloc_stats") {
         return reinterpret_cast<u64>(&NativeDevice::GomallocStats);
     }
