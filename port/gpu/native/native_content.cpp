@@ -788,6 +788,7 @@ std::mutex g_gap_mutex;
 std::unordered_map<u64, u32> g_gap_last[8];
 std::mutex g_heap_free_mutex;
 std::unordered_map<u64, u32> g_heap_free_at; // engine memory frees (Gomalloc): address -> submit count
+std::map<u64, std::pair<u64, u32>> g_heap_free_blocks; ///< freed GPU allocations: start -> (size, submit count), to find the block that contains a read address
 std::atomic<u64> c_gap[8][18]{};
 } // namespace
 
@@ -2278,9 +2279,10 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
                 static std::atomic<u32> before_marker_examples{0};
                 if (before_marker_examples.fetch_add(1, std::memory_order_relaxed) < 40) {
                     Core::RareEvents::Note("late_read_before_done_marker",
-                                           fmt::format("{} {:#x} + {:#x} (rewritten {:#x}): record submit {}, raster done floor {}, submit count now {}, newest write announced at {} (site {}, writer {}), previous write at {}, freed by the engine at {}",
+                                           fmt::format("{} {:#x} + {:#x} (rewritten {:#x}): record submit {}, raster done floor {}, submit count now {}, newest write announced at {} (site {}, writer {}), previous write at {}, freed by the engine at {}, containing freed block {}",
                                                        LateKindNames[k], address, size, a.rewritten, submit, RasterDoneSubmissions(), g_submit_count.load(std::memory_order_relaxed), a.newest_submit,
-                                                       a.newest_site < g_site_names.size() ? g_site_names[a.newest_site] : std::string("?"), a.newest_writer, a.newest_prev_submit, HeapFreeAt(address)));
+                                                       a.newest_site < g_site_names.size() ? g_site_names[a.newest_site] : std::string("?"), a.newest_writer, a.newest_prev_submit, HeapFreeAt(address),
+                                                       [&] { u64 b = 0, n = 0; const u32 at = HeapFreeContaining(address, b, n); return at == 0 ? std::string("none") : fmt::format("{:#x}+{:#x} freed at {}", b, n, at); }()));
                 }
             }
         }
@@ -2323,17 +2325,38 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
 }
 
 void NoteHeapFree(u64 address) {
+    const u64 size = GpuAllocationSize(address);
     std::scoped_lock lock{g_heap_free_mutex};
     if (g_heap_free_at.size() > 400000) {
         g_heap_free_at.clear();
+        g_heap_free_blocks.clear();
     }
-    g_heap_free_at[address] = g_submit_count.load(std::memory_order_relaxed);
+    const u32 at = g_submit_count.load(std::memory_order_relaxed);
+    g_heap_free_at[address] = at;
+    if (size != 0) {
+        g_heap_free_blocks[address] = {size, at};
+    }
 }
 
 u32 HeapFreeAt(u64 address) {
     std::scoped_lock lock{g_heap_free_mutex};
     const auto it = g_heap_free_at.find(address);
     return it == g_heap_free_at.end() ? 0u : it->second;
+}
+
+u32 HeapFreeContaining(u64 address, u64& block_start, u64& block_size) {
+    std::scoped_lock lock{g_heap_free_mutex};
+    auto it = g_heap_free_blocks.upper_bound(address);
+    if (it == g_heap_free_blocks.begin()) {
+        return 0;
+    }
+    --it;
+    if (address >= it->first + it->second.first) {
+        return 0;
+    }
+    block_start = it->first;
+    block_size = it->second.first;
+    return it->second.second;
 }
 
 void CheckUploadMemory(u64 address, u64 size) {

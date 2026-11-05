@@ -107,6 +107,8 @@ void NoteCopy(u64 destination, u64 source, u64 size);
 void NoteDeleted(u64 address, u64 size);
 /// The engine's memory free (Gomalloc, hook GomallocFree) of `address` was called: remembered with the submission count (late read samples print it)
 void NoteHeapFree(u64 address);
+/// The submission count at the free of the GPU allocation that contains `address` (0: none seen), with its start and size
+[[nodiscard]] u32 HeapFreeContaining(u64 address, u64& block_start, u64& block_size);
 /// Size of the engine GPU allocation that starts at `address` (0 when unknown)
 u64 GpuAllocationSize(u64 address);
 /// The submission count at the engine's last free of exactly `address` (0: never seen)
