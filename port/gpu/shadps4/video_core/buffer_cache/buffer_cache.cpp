@@ -357,6 +357,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             // (no page of a neighbour is uploaded with it, so a page the GPU wrote elsewhere does not matter); bytes of the object the GPU wrote keep it in the arena
             u64 offset = 0;
             if (const Buffer* copy = ObjectCopy(*immutable, device_addr, offset)) {
+                Core::NativeContent::SilentResidentUse(1, immutable->begin, device_addr, size, immutable->usage); // W1.5 census
                 Core::NativeResources::NoteResident(0);
                 TLG_PROF_COUNT("buffer.uncached.object_copy_reused");
                 return {copy, offset};
@@ -370,6 +371,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
                 // M2: the bytes of the record's submission; a copy that was corrected must not be reused by a later generation's check, so it records a generation nobody has
                 const bool corrected = Core::NativeContent::FrameStoreServe(Core::NativeContent::LateKind::BufferObjectCopy, immutable->begin, data, whole) != 0;
                 Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::BufferObjectCopy, immutable->begin, whole);
+                Core::NativeContent::SilentSynced(1, immutable->begin, whole); // W1.5 census
                 stream_buffer.Commit();
                 immutable->copy_offset = at;
                 immutable->copy_wraps = stream_buffer.WrapCount();
@@ -401,6 +403,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
                     immutable->resident_epoch.store(PlacementEpoch(), std::memory_order_release);
                 }
                 Core::NativeResources::NoteImmutableHit();
+                Core::NativeContent::SilentResidentUse(0, immutable->begin, device_addr, size, immutable->usage); // W1.5 census
                 if (immutable->usage != 1) {
                     Core::NativeResources::NoteResident(0);
                 }
@@ -418,6 +421,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             const auto* arena = BufferFor(immutable->begin, immutable->end - immutable->begin);
             last_upload_bytes = 0;
             SynchronizeMemory(arena, immutable->begin, whole, false, false);
+            Core::NativeContent::SilentSynced(0, immutable->begin, whole); // W1.5 census
             // R1: the object keeps where it is resident (read by the command processor's binding resolution once `synced` is set)
             NoteResolutionUser(arena, immutable->id);
             immutable->resident_buffer.store(arena, std::memory_order_relaxed);

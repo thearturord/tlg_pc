@@ -35,6 +35,10 @@ enum class LateKind : u32 { ImageUpload, BufferStreamCopy, BufferObjectCopy, Buf
 /// A read of [address, address + size) for the operation with record number `seq` (0: the record of the calling thread's current draw): the write ledger says whether the range was written
 /// after that record. Counted per kind and by the writer of the newest write (Report: /stats native_backend.device.f2_store.image_memory_check.m0_late_reads). `TLG_F2_LEDGER=0` turns it off.
 void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq = 0);
+/// W1.5 census (TLG_SILENT_CENSUS=1): the raster thread copied engine buffer `key` from memory (path 0: synchronized into its arena, 1: object copy made)
+void SilentSynced(u32 path, u64 key, u64 size);
+/// a bind of [address, address + size) served from that copy without reading memory again (path 0: resident arena, 1: object copy reused); counts silent writes since the copy
+void SilentResidentUse(u32 path, u64 key, u64 address, u64 size, u32 usage);
 /// M1 (memory-ownership-plan.md phase 1): the frame data store, in shadow. `TLG_FRAME_STORE=1` (default off, read once): at each graphics submission the bytes of the ranges the game announced
 /// since the previous one are copied (`ranges`, the submission's `Batch::first`), stamped with the submission's index; the buffer readers compare what they find in the game's memory with the store
 /// (`m0_late_reads.<kind>.frame_store_shadow`). Nothing reads the store for rendering. Whether or not the store is on, the submission is counted (the late-read census uses it).

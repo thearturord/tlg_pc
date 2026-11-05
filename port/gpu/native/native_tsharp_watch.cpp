@@ -160,11 +160,32 @@ void Arm(u64 view_object, u64 address, u32 width, u32 height) {
     TLG_LOG(IMAGE, Error, "tsharp watch {} armed: view {:#x} dword at {:#x} = {:#x} (height {})", slot, view_object, address, value, ((value >> 14) & 0x3fff) + 1);
 }
 
+void ArmAddress(u64 address, const char* tag) {
+    // W1.5 census: a data breakpoint on any dword (logs the writing instruction and the game return addresses, Ghidra addresses)
+    address &= ~u64{3};
+    const u32 slot = g_armed.fetch_add(1);
+    if (slot >= MaxWatches) {
+        return;
+    }
+    if (!g_handler.exchange(true)) {
+        AddVectoredExceptionHandler(1, Handler);
+    }
+    Watch& w = g_watch[slot];
+    w.view_object = 0;
+    u32 value = 0;
+    std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+    w.last.store(value);
+    w.address.store(address);
+    SetDebugRegisters(slot, address);
+    TLG_LOG(IMAGE, Error, "write watch {} armed ({}): dword at {:#x} = {:#x}", slot, tag, address, value);
+}
+
 #else
 bool On() noexcept {
     return false;
 }
 void Arm(u64, u64, u32, u32) {}
+void ArmAddress(u64, const char*) {}
 #endif
 
 } // namespace Core::NativeTsharpWatch

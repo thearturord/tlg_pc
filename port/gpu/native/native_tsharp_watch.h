@@ -13,5 +13,7 @@ namespace Core::NativeTsharpWatch {
 [[nodiscard]] bool On() noexcept;
 /// A view was created: `address` is the guest address of the T# dword to watch (armed when the texture is 1920 x 1088)
 void Arm(u64 view_object, u64 address, u32 width, u32 height);
+/// W1.5 census (`TLG_SILENT_CENSUS=1`): a write watch on the dword at `address`, whatever the switch above (four watches in all)
+void ArmAddress(u64 address, const char* tag);
 
 } // namespace Core::NativeTsharpWatch

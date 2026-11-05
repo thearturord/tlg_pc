@@ -28,6 +28,7 @@
 #include "native/native_device.h"
 #include "native/native_draw.h"
 #include "native/native_registry.h"
+#include "native/native_tsharp_watch.h"
 #include "native/native_updates.h"
 
 namespace Core::NativeContent {
@@ -1829,8 +1830,177 @@ void SilentCheck(size_t k, u64 address, u64 size, u32 submit) {
     }
 }
 
+// Binds served from a copy made earlier (resident arena, reused object copy) read no memory, so no late read check sees them. If the game wrote the buffer silently after the
+// copy, the GPU draws with old bytes (a missed update, not a late read). Margin = harvest windows between the copy and the newest silent write: 1 is ambiguous (the write
+// may have landed before the copy in the same window), 2 or more is a missed update.
+std::mutex g_synced_mutex;
+std::unordered_map<u64, u32> g_synced[2]; ///< buffer key -> g_submit_count when the copy was made
+std::atomic<u64> c_rs_uses[2]{}, c_rs_no_copy_record[2]{}, c_rs_ambiguous[2]{}, c_rs_missed[2]{}, c_rs_missed_bytes[2]{}, c_rs_synced[2]{};
+std::atomic<u64> c_rs_missed_by_usage[2][4]{};
+std::unordered_map<u64, u32> g_rs_missed_buffers[2]; ///< key -> missed uses (under g_synced_mutex), for the top list
+std::unordered_map<u64, std::vector<u8>> g_synced_bytes[2]; ///< key -> the bytes at the copy (buffers up to 4 KB; under g_synced_mutex)
+std::atomic<u64> c_rs_bytes_changed[2]{}, c_rs_bytes_same[2]{}, c_rs_bytes_unknown[2]{};
+
+u32 SilentNewest(u64 address, u64 size, u64* page_out) {
+    const u64 first = address & ~u64{4095}, last = (address + size - 1) & ~u64{4095};
+    u32 newest = 0;
+    std::scoped_lock lock{g_silent_mutex};
+    if (g_silent_at.empty()) {
+        return 0;
+    }
+    u32 n = 0;
+    for (u64 page = first; page <= last && n < 1024; page += 4096, ++n) {
+        const auto it = g_silent_at.find(page);
+        if (it != g_silent_at.end() && it->second > newest) {
+            newest = it->second;
+            if (page_out != nullptr) {
+                *page_out = page;
+            }
+        }
+    }
+    return newest;
+}
+} // namespace
+
+void SilentSynced(u32 path, u64 key, u64 size) {
+    if (!SilentCensusOn() || path > 1) {
+        return;
+    }
+    c_rs_synced[path].fetch_add(1, std::memory_order_relaxed);
+    std::vector<u8> bytes;
+    if (size != 0 && size <= 4096) {
+        bytes.resize(size);
+        std::memcpy(bytes.data(), reinterpret_cast<const void*>(key), size);
+    }
+    std::scoped_lock lock{g_synced_mutex};
+    if (g_synced[path].size() > 400000) {
+        g_synced[path].clear();
+        g_synced_bytes[path].clear();
+    }
+    g_synced[path][key] = g_submit_count.load(std::memory_order_acquire);
+    if (bytes.empty()) {
+        g_synced_bytes[path].erase(key);
+    } else {
+        g_synced_bytes[path][key] = std::move(bytes);
+    }
+}
+
+void SilentResidentUse(u32 path, u64 key, u64 address, u64 size, u32 usage) {
+    if (!SilentCensusOn() || path > 1 || size == 0) {
+        return;
+    }
+    c_rs_uses[path].fetch_add(1, std::memory_order_relaxed);
+    u32 copied = 0;
+    {
+        std::scoped_lock lock{g_synced_mutex};
+        const auto it = g_synced[path].find(key);
+        if (it == g_synced[path].end()) {
+            c_rs_no_copy_record[path].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        copied = it->second;
+    }
+    u64 page = 0;
+    const u32 newest = SilentNewest(address, size, &page);
+    if (newest <= copied) {
+        return;
+    }
+    if (newest - copied == 1) {
+        c_rs_ambiguous[path].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    c_rs_missed[path].fetch_add(1, std::memory_order_relaxed);
+    c_rs_missed_bytes[path].fetch_add(size, std::memory_order_relaxed);
+    // byte check: do the bound bytes differ from the bytes at the copy (the page alone may have been written elsewhere)?
+    u32 differing = ~0u;
+    {
+        std::scoped_lock lock{g_synced_mutex};
+        const auto it = g_synced_bytes[path].find(key);
+        if (it != g_synced_bytes[path].end() && address >= key && address + size <= key + it->second.size()) {
+            differing = 0;
+            const u8* now = reinterpret_cast<const u8*>(address);
+            const u8* then = it->second.data() + (address - key);
+            for (u64 i = 0; i < size; ++i) {
+                differing += now[i] != then[i] ? 1u : 0u;
+            }
+        }
+    }
+    (differing == ~0u ? c_rs_bytes_unknown : differing == 0 ? c_rs_bytes_same : c_rs_bytes_changed)[path].fetch_add(1, std::memory_order_relaxed);
+    if (differing != ~0u && differing != 0) {
+        // name the writer: a hardware write watch on the first differing dword of this buffer (once per buffer, four in all)
+        static std::mutex armed_mutex;
+        static std::unordered_set<u64> armed;
+        u64 first_diff = 0;
+        {
+            std::scoped_lock lock{g_synced_mutex};
+            const auto it = g_synced_bytes[path].find(key);
+            if (it != g_synced_bytes[path].end()) {
+                const u8* now = reinterpret_cast<const u8*>(address);
+                const u8* then = it->second.data() + (address - key);
+                for (u64 i = 0; i < size; ++i) {
+                    if (now[i] != then[i]) {
+                        first_diff = address + i;
+                        break;
+                    }
+                }
+            }
+        }
+        bool arm = false;
+        {
+            std::scoped_lock lock{armed_mutex};
+            arm = first_diff != 0 && armed.size() < 4 && armed.insert(key).second;
+        }
+        if (arm) {
+            Core::NativeTsharpWatch::ArmAddress(first_diff, "w15 missed update");
+        }
+    }
+    c_rs_missed_by_usage[path][std::min<u32>(usage, 3u)].fetch_add(1, std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{g_synced_mutex};
+        if (g_rs_missed_buffers[path].size() < 100000) {
+            ++g_rs_missed_buffers[path][key];
+        }
+    }
+    static std::atomic<u32> examples{0};
+    if (examples.fetch_add(1, std::memory_order_relaxed) < 40) {
+        const LedgerAnswer a = LedgerQuery(page, page + 4096);
+        Core::RareEvents::Note("w15_missed_update",
+                               fmt::format("{} buffer {:#x} usage {}: bind {:#x} + {:#x} served from a copy made at submit count {}, page {:#x} silently written for submission {} (count now {}); bound bytes differing from the copy: {}; ledger of the page: covered {:#x}, newest announced at {} by writer {} site {}",
+                                           path == 0 ? "resident arena" : "object copy reused", key, usage, address, size, copied, page, newest, g_submit_count.load(std::memory_order_relaxed),
+                                           differing == ~0u ? std::string("unknown") : std::to_string(differing), a.covered,
+                                           a.newest_submit, a.newest_writer, a.newest_site < g_site_names.size() ? g_site_names[a.newest_site] : std::string("?")));
+    }
+}
+
+namespace {
 nlohmann::json SilentReport() {
     nlohmann::json out;
+    for (u32 p = 0; p < 2; ++p) {
+        nlohmann::json r;
+        r["copies_made"] = c_rs_synced[p].load();
+        r["binds_from_the_copy"] = c_rs_uses[p].load();
+        r["binds_without_a_copy_record"] = c_rs_no_copy_record[p].load();
+        r["silent_write_in_the_same_window_ambiguous"] = c_rs_ambiguous[p].load();
+        r["missed_updates_silent_write_after_the_copy"] = c_rs_missed[p].load();
+        r["missed_update_bytes"] = c_rs_missed_bytes[p].load();
+        r["missed_bound_bytes_changed_same_unknown"] = {c_rs_bytes_changed[p].load(), c_rs_bytes_same[p].load(), c_rs_bytes_unknown[p].load()};
+        r["missed_by_usage_0_1_2_3plus"] = {c_rs_missed_by_usage[p][0].load(), c_rs_missed_by_usage[p][1].load(), c_rs_missed_by_usage[p][2].load(), c_rs_missed_by_usage[p][3].load()};
+        std::vector<std::pair<u32, u64>> top;
+        {
+            std::scoped_lock lock{g_synced_mutex};
+            r["distinct_buffers_missed"] = g_rs_missed_buffers[p].size();
+            for (const auto& [key, n] : g_rs_missed_buffers[p]) {
+                top.emplace_back(n, key);
+            }
+        }
+        std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+        nlohmann::json t = nlohmann::json::array();
+        for (size_t i = 0; i < top.size() && i < 20; ++i) {
+            t.push_back({{"buffer", fmt::format("{:#x}", top[i].second)}, {"missed_binds", top[i].first}});
+        }
+        r["top_buffers"] = std::move(t);
+        out[p == 0 ? "resident_arena_binds" : "object_copy_reuse_binds"] = std::move(r);
+    }
     u64 gpu_side = 0;
     runtime_memory_census_harvest(nullptr, nullptr, &gpu_side);
     out["on"] = SilentCensusOn();
