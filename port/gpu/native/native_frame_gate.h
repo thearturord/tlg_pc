@@ -24,7 +24,7 @@ constexpr int MaxDepth = 2;
 
 /// 0, 1 or 2 (clamped), read once
 int Depth();
-/// M5: `TLG_OWNERSHIP_GATE=1` (depth 2 and `TLG_FRAME_STORE=2` needed): the game's frame slot wait counts frames the raster thread has not reached, not frames the GPU has not
+/// M5: `TLG_OWNERSHIP_GATE=1` (depth 2 needed): the game's frame slot wait counts frames the raster thread has not reached, not frames the GPU has not
 /// finished; the game's own end-of-pipe gate gets one more credit. Off by default.
 bool OwnershipGate();
 /// M5b: `TLG_OWNERSHIP_EARLY_IRQ=1` (with the ownership gate): the frame's end-of-pipe interrupt (the guest's "EOP QUEUE" event that releases the engine's submit-done thread and with it the

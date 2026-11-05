@@ -150,17 +150,14 @@ bool EarlyInterrupt() {
 
 bool OwnershipGate() {
     // M5 (memory-ownership-plan.md): the game's slot wait counts frames the raster thread has not reached (our side owns the frame's data) instead of frames the GPU has not finished.
-    // Needs depth 2 and the frame store serving the readers (TLG_FRAME_STORE=2), or the late reads would see the game's next frame.
+    // Needs depth 2. It is the pacing model of the writer patches (every per-frame writer is a copy or a rename now), not a wait that guards memory: both pacings read 0 late reads (2026-11-05).
     static const bool on = [] {
         const char* e = std::getenv("TLG_OWNERSHIP_GATE");
         if (e == nullptr || *e == '\0' || *e == '0') {
             return false;
         }
-        // W0 (memory-ownership-plan.md): TLG_WRITER_PATH_ONLY=1 lets the gate run with the store NOT serving (TLG_FRAME_STORE=1, shadow only): the writer patches have to carry the frames alone
-        const char* writer_only = std::getenv("TLG_WRITER_PATH_ONLY");
-        const bool store_free = writer_only != nullptr && writer_only[0] == '1';
-        if (GetConfig().depth < 2 || (!NativeContent::FrameStoreServes() && !store_free)) {
-            RareEvents::Note("ownership_gate_refused", "needs frames in flight 2 and TLG_FRAME_STORE=2 (or TLG_WRITER_PATH_ONLY=1)");
+        if (GetConfig().depth < 2) {
+            RareEvents::Note("ownership_gate_refused", "needs frames in flight 2");
             return false;
         }
         LOG_INFO(Core, "frame gate: ownership gate on (slot wait counts frames the raster thread has not reached)");
@@ -202,13 +199,7 @@ void NoteSubmitFlip() {
     }
     if (first && Depth() >= 2) {
         // ownership gate: the game's own gate (one end of pipe per frame) must not be the limit, the slot wait is
-        int credits = Depth() - 1;
-        if (OwnershipGate()) {
-            credits = Depth() - 1; // the engine's most is two frames ahead (3 frame contexts): 3 credits gave a black scene in the owner's play (2026-11-04)
-            if (const char* e = std::getenv("TLG_OWNERSHIP_CREDIT"); e && e[0]) { // experiment: the credits of the game's own gate with the ownership gate on
-                credits = std::clamp(std::atoi(e), 0, 4);
-            }
-        }
+        const int credits = Depth() - 1; // the engine's most is two frames ahead (3 frame contexts): 3 credits gave a black scene in the owner's play (2026-11-04)
         CreditGuestGate(credits);
     }
 }
@@ -334,14 +325,9 @@ void WaitForSlot() {
     }
     if (OwnershipGate()) {
         TLG_PROF_LEVEL("wait.frame_gate_slot_owned (game thread, ownership gate: fewer than 2 frames the raster thread has not reached)", 1);
-        // `TLG_OWNERSHIP_RASTER_LEAD=n` (experiment, native-v3-writers): how many frames the raster thread may be behind the game's submits (default: the depth, 2). The census of late reads
-        // shows the game's rings of 3 are rewritten before the raster thread has read them with a lead of 2; a lead of 1 leaves one frame of slack.
-        static const int lead = [depth] {
-            const char* e = std::getenv("TLG_OWNERSHIP_RASTER_LEAD");
-            const int v = e != nullptr ? std::atoi(e) : depth;
-            return v >= 1 && v <= depth ? v : depth;
-        }();
-        WaitFor([] {
+        // the raster thread may be at most `depth` (2) frames behind the game's submits; the game's rings of 3 are copies or renames now, so no slack frame is needed
+        const int lead = depth;
+        WaitFor([lead] {
             const bool raster_ok = submitted <= raster_reached || submitted - raster_reached < static_cast<u64>(lead);
             const bool eop_ok = submitted <= ended || submitted - ended < OwnershipEopCap;
             if (raster_ok && !eop_ok) {
