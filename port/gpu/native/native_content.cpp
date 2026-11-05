@@ -1049,8 +1049,11 @@ u64 LastSubmitStamp() {
     return g_submits.empty() ? 0 : g_submits.back().stamp;
 }
 
+void SilentHarvest(u32 index); // W1.5 census, below
+
 void NoteSubmit(const std::vector<std::pair<u64, u64>>& ranges) {
     const u32 index = g_submit_count.load(std::memory_order_relaxed) + 1;
+    SilentHarvest(index);
     if (FrameStoreOn()) {
         const auto start = std::chrono::steady_clock::now();
         std::vector<std::pair<u64, u64>> all;
@@ -1722,9 +1725,162 @@ void CounterSample(std::vector<u64>& values) {
     values.push_back(c_recheck_unexplained_chunks.load(relaxed));
 }
 
+// ---- W1.5: silent writer census (TLG_SILENT_CENSUS=1, diagnostics only) ---------------------------------------------------------------------------------------------
+// The kernel's write watch (runtime_memory.c) reports every page of GPU visible memory the game wrote; once per graphics submission the written pages are compared with
+// the ledger of announced writes. A page with no announcement in this window or the one before is a silent write (a writer nobody hooked). The raster thread's reads
+// are then checked against those pages: a read for submission S of a page silently written for a later submission is a late read the ledger cannot see.
+// Page granular: a silent write elsewhere in the page counts too (samples show the ledger's view of the page to tell).
+extern "C" uint64_t runtime_memory_census_harvest(void (*page)(uintptr_t address, void* context), void* context, uint64_t* gpu_side_resets);
+
+namespace {
+bool SilentCensusOn() noexcept {
+    static const bool on = [] { const char* e = std::getenv("TLG_SILENT_CENSUS"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+std::mutex g_silent_mutex;
+std::unordered_map<u64, u32> g_silent_at;   ///< page -> the submission its newest silent write belongs to
+std::unordered_map<u64, u32> g_silent_hits; ///< page -> windows with a silent write
+std::atomic<u64> c_sc_harvests{0}, c_sc_written{0}, c_sc_ring{0}, c_sc_announced_now{0}, c_sc_announced_before{0}, c_sc_silent{0}, c_sc_ns{0}, c_sc_max_ns{0};
+std::atomic<u64> c_sc_late[LateKinds][2]{}, c_sc_late_bytes[LateKinds][2]{}, c_sc_reads_checked{0};
+struct HarvestContext {
+    u32 index;
+    std::vector<u64> silent;
+};
+void SilentPage(uintptr_t page, void* context) {
+    auto& ctx = *static_cast<HarvestContext*>(context);
+    c_sc_written.fetch_add(1, std::memory_order_relaxed);
+    if (InRing(page, 4096)) {
+        c_sc_ring.fetch_add(1, std::memory_order_relaxed); // the frame ring: per-frame by design, the ring swap's
+        return;
+    }
+    const LedgerAnswer a = LedgerQuery(page, page + 4096);
+    // an announcement made while the count was index - 1 belongs to this window; writers that announce before they write may have announced in the window before
+    if (a.covered != 0 && a.newest_submit + 1 >= ctx.index) {
+        c_sc_announced_now.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (a.covered != 0 && a.newest_submit + 2 >= ctx.index) {
+        c_sc_announced_before.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    c_sc_silent.fetch_add(1, std::memory_order_relaxed);
+    ctx.silent.push_back(page);
+}
+} // namespace
+
+void SilentHarvest(u32 index) {
+    if (!SilentCensusOn()) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    HarvestContext ctx{index, {}};
+    runtime_memory_census_harvest(&SilentPage, &ctx, nullptr);
+    if (!ctx.silent.empty()) {
+        std::scoped_lock lock{g_silent_mutex};
+        for (const u64 page : ctx.silent) {
+            g_silent_at[page] = index;
+            ++g_silent_hits[page];
+        }
+    }
+    c_sc_harvests.fetch_add(1, std::memory_order_relaxed);
+    const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    c_sc_ns.fetch_add(ns, std::memory_order_relaxed);
+    if (ns > c_sc_max_ns.load(std::memory_order_relaxed)) {
+        c_sc_max_ns.store(ns, std::memory_order_relaxed);
+    }
+}
+
+namespace {
+void SilentCheck(size_t k, u64 address, u64 size, u32 submit) {
+    c_sc_reads_checked.fetch_add(1, std::memory_order_relaxed);
+    const u64 first = address & ~u64{4095}, last = (address + size - 1) & ~u64{4095};
+    u32 newest = 0;
+    u64 newest_page = 0, hits = 0;
+    {
+        std::scoped_lock lock{g_silent_mutex};
+        if (g_silent_at.empty()) {
+            return;
+        }
+        u32 n = 0;
+        for (u64 page = first; page <= last && n < 4096; page += 4096, ++n) {
+            const auto it = g_silent_at.find(page);
+            if (it != g_silent_at.end() && it->second > newest) {
+                newest = it->second;
+                newest_page = page;
+            }
+        }
+        if (newest != 0) {
+            hits = g_silent_hits[newest_page];
+        }
+    }
+    if (newest <= submit) {
+        return; // no silent write after the record's submission
+    }
+    const size_t marker = RasterDoneSubmissions() >= submit ? 1 : 0; // 1: stale record (the raster thread is past it)
+    c_sc_late[k][marker].fetch_add(1, std::memory_order_relaxed);
+    c_sc_late_bytes[k][marker].fetch_add(size, std::memory_order_relaxed);
+    static std::atomic<u32> examples{0};
+    if (marker == 0 && examples.fetch_add(1, std::memory_order_relaxed) < 40) {
+        const LedgerAnswer a = LedgerQuery(newest_page, newest_page + 4096);
+        Core::RareEvents::Note("w15_silent_late_read",
+                               fmt::format("{} {:#x} + {:#x}: record submit {}, page {:#x} silently written for submission {} (silent in {} windows), raster done floor {}; ledger of the page: covered {:#x}, newest announced at {} by writer {} site {}",
+                                           LateKindNames[k], address, size, submit, newest_page, newest, hits, RasterDoneSubmissions(), a.covered, a.newest_submit, a.newest_writer,
+                                           a.newest_site < g_site_names.size() ? g_site_names[a.newest_site] : std::string("?")));
+    }
+}
+
+nlohmann::json SilentReport() {
+    nlohmann::json out;
+    u64 gpu_side = 0;
+    runtime_memory_census_harvest(nullptr, nullptr, &gpu_side);
+    out["on"] = SilentCensusOn();
+    out["harvests"] = c_sc_harvests.load();
+    out["harvest_ms_total"] = c_sc_ns.load() / 1000000;
+    out["harvest_ms_max"] = static_cast<double>(c_sc_max_ns.load()) / 1e6;
+    out["pages_written"] = c_sc_written.load();
+    out["pages_in_the_frame_ring"] = c_sc_ring.load();
+    out["pages_announced_in_this_window"] = c_sc_announced_now.load();
+    out["pages_announced_in_the_window_before"] = c_sc_announced_before.load();
+    out["pages_silent"] = c_sc_silent.load();
+    out["pages_dropped_as_gpu_side_writes"] = gpu_side;
+    out["raster_reads_checked"] = c_sc_reads_checked.load();
+    for (size_t k = 0; k < LateKinds; ++k) {
+        if (c_sc_late[k][0].load() + c_sc_late[k][1].load() != 0) {
+            out["silent_late_reads"][LateKindNames[k]] = {{"before_the_done_marker", c_sc_late[k][0].load()}, {"stale_record", c_sc_late[k][1].load()},
+                                                          {"bytes_before_the_done_marker", c_sc_late_bytes[k][0].load()}};
+        }
+    }
+    std::vector<std::pair<u32, u64>> top;
+    {
+        std::scoped_lock lock{g_silent_mutex};
+        out["distinct_silent_pages"] = g_silent_hits.size();
+        for (const auto& [page, n] : g_silent_hits) {
+            top.emplace_back(n, page);
+        }
+    }
+    std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+    nlohmann::json pages = nlohmann::json::array();
+    for (size_t i = 0; i < top.size() && i < 40; ++i) {
+        const LedgerAnswer a = LedgerQuery(top[i].second, top[i].second + 4096);
+        pages.push_back({{"page", fmt::format("{:#x}", top[i].second)}, {"silent_windows", top[i].first}, {"ledger_covered", a.covered}, {"ledger_newest_writer", a.newest_writer},
+                         {"ledger_newest_site", a.newest_site < g_site_names.size() ? g_site_names[a.newest_site] : std::string("?")}, {"ledger_newest_submit", a.newest_submit},
+                         {"in_gpu_allocation", InGpuAllocation(top[i].second, 4096)}});
+    }
+    out["top_pages"] = std::move(pages);
+    return out;
+}
+} // namespace
+
 void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
     if (!LedgerOn() || size == 0) {
         return;
+    }
+    if (SilentCensusOn()) {
+        const u64 s = seq != 0 ? seq : Core::NativeRegistry::CurrentDrawSeq();
+        const u32 sub = s != 0 ? SubmitIndexOf(s) : 0;
+        if (sub != 0 && !InRing(address, size)) {
+            SilentCheck(static_cast<size_t>(kind), address, size, sub);
+        }
     }
     const size_t k = static_cast<size_t>(kind);
     CheckClass cls;
@@ -2205,6 +2361,9 @@ void CompareImage(const ImageUpload& upload) {
 
 nlohmann::json Report() {
     nlohmann::json out;
+    if (SilentCensusOn()) {
+        out["w15_silent_census"] = SilentReport();
+    }
     if (RingWindowsOn()) {
         nlohmann::json w;
         w["windows_noted"] = c_win_noted.load();

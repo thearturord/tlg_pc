@@ -164,9 +164,17 @@ static void phys_mark(uint64_t phys, uint64_t size) {
     if (!phys_used || !size) return;
     for (uint64_t c=phys/WW_CHUNK, e=(phys+size-1)/WW_CHUNK; c<=e; ++c) phys_used[c]=1;
 }
+/* W1.5 silent writer census (TLG_SILENT_CENSUS=1, diagnostics): GPU visible allocations get MEM_WRITE_WATCH again, the native side harvests the written pages
+ * once per graphics submission (runtime_memory_census_harvest) and compares them with the engine's announcements. Off: nothing changes. */
+static int census_on(void) {
+    static int on=-1;
+    if (on<0) { const char *e=getenv("TLG_SILENT_CENSUS"); on=e && e[0]=='1'; }
+    return on;
+}
+static volatile LONG64 census_gpu_side_resets;
 static int ww_map(HostRegion *r, DWORD protect) {
     uint64_t size=r->end-r->start;
-    if (!VirtualAlloc2(NULL,(void *)r->start,size,MEM_RESERVE|MEM_COMMIT|MEM_REPLACE_PLACEHOLDER,PAGE_READWRITE,NULL,0)) {
+    if (!VirtualAlloc2(NULL,(void *)r->start,size,MEM_RESERVE|MEM_COMMIT|(census_on() ? MEM_WRITE_WATCH : 0)|MEM_REPLACE_PLACEHOLDER,PAGE_READWRITE,NULL,0)) {
         fprintf(stderr,"Runtime: write watched allocation of %p failed (error %lu), mapping a view\n",(void *)r->start,GetLastError());
         return 0;
     }
@@ -179,6 +187,7 @@ static int ww_map(HostRegion *r, DWORD protect) {
     if (protect!=PAGE_READWRITE && !VirtualProtect((void *)r->start,size,protect,&old)) win_fail("VirtualProtect",r->start,size);
     r->ro=calloc(size/4096+1,1);
     if (r->ro && protect!=PAGE_READWRITE) memset(r->ro,1,size/4096+1);
+    if (census_on()) ResetWriteWatch((void *)r->start,size); /* the copy-in above is not a game write */
     printf("Runtime: write watched mapping %p, size=%" PRIu64 "\n",(void *)r->start,size);
     return 1;
 }
@@ -318,13 +327,23 @@ static HostRegion *ww_region(uintptr_t a) {
     return i<region_count && regions[i].start<=a && regions[i].mapped && regions[i].ww ? &regions[i] : NULL;
 }
 /* A write of the GPU side into a watched region: a page that is protected is lifted for the write and restored after it. */
+static void ww_census_drop(uintptr_t p0, uintptr_t p1) {
+    /* census: a write of the GPU side is ours, not the game's (a game write to the same page in this window is lost with it) */
+    if (!census_on()) return;
+    static __thread PVOID *found; static __thread size_t found_capacity;
+    size_t pages=(p1-p0)/4096;
+    if (found_capacity<pages) { free(found); found=malloc(pages*sizeof(*found)); found_capacity=found ? pages : 0; if (!found) return; }
+    ULONG_PTR count=pages; ULONG granularity=0;
+    GetWriteWatch(WRITE_WATCH_FLAG_RESET,(void *)p0,p1-p0,found,&count,&granularity);
+    InterlockedAdd64(&census_gpu_side_resets,(LONG64)pages);
+}
 static void ww_write(HostRegion *r, uintptr_t at, const unsigned char *data, uint64_t n) {
     uintptr_t p0=at&~(uintptr_t)4095, p1=(at+n+4095)&~(uintptr_t)4095;
     AcquireSRWLockShared(&ww_lock);
     int rw=r && r->ro && p0>=r->start && p1<=r->end;
     for (uintptr_t pg=p0; rw && pg<p1; pg+=4096) rw=!r->ro[(pg-r->start)>>12];
     ReleaseSRWLockShared(&ww_lock);
-    if (rw) { memcpy((void *)at,data,n); return; }
+    if (rw) { memcpy((void *)at,data,n); ww_census_drop(p0,p1); return; }
     AcquireSRWLockExclusive(&ww_lock);
     ProtRun *qruns=NULL; size_t qn=0, qcap=0;
     qn=save_protections(p0,p1,&qruns,0,&qcap);
@@ -334,6 +353,7 @@ static void ww_write(HostRegion *r, uintptr_t at, const unsigned char *data, uin
     for (size_t i=0;i<qn;++i) if (qruns[i].protect!=PAGE_READWRITE) VirtualProtect((void *)qruns[i].start,qruns[i].end-qruns[i].start,qruns[i].protect,&qold);
     free(qruns);
     ReleaseSRWLockExclusive(&ww_lock);
+    ww_census_drop(p0,p1);
 }
 static int host_unmap(uintptr_t address, uint64_t size) { carve_host(address,address+size); return 0; }
 static int host_protect(uintptr_t address, uint64_t size, int prot) {
@@ -1007,6 +1027,32 @@ int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {
     int result=covered(address,address+size,0);
     read_unlock();
     return result;
+}
+/* W1.5 census: calls page(address, context) for every 4 KiB page of a GPU visible allocation written since the last harvest and resets the bits.
+ * Returns the number of pages reported; 0 when the census is off. gpu_side_resets (optional) gets the pages dropped as GPU side writes so far. */
+uint64_t runtime_memory_census_harvest(void (*page)(uintptr_t address, void *context), void *context, uint64_t *gpu_side_resets) {
+#ifdef _WIN32
+    if (gpu_side_resets) *gpu_side_resets=(uint64_t)census_gpu_side_resets;
+    if (!census_on() || !page) return 0;
+    static PVOID *found; static size_t found_capacity; /* one harvesting thread (the game's submit) */
+    uint64_t total=0;
+    read_lock();
+    for (size_t i=0;i<region_count;++i) {
+        if (!regions[i].mapped || !regions[i].ww) continue;
+        size_t pages=(regions[i].end-regions[i].start)/4096;
+        if (found_capacity<pages) { free(found); found=malloc(pages*sizeof(*found)); found_capacity=found ? pages : 0; if (!found) break; }
+        ULONG_PTR count=pages; ULONG granularity=0;
+        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET,(void *)regions[i].start,regions[i].end-regions[i].start,found,&count,&granularity)) continue;
+        for (ULONG_PTR k=0;k<count;++k) page((uintptr_t)found[k],context);
+        total+=count;
+    }
+    read_unlock();
+    return total;
+#else
+    (void)page; (void)context;
+    if (gpu_side_resets) *gpu_side_resets=0;
+    return 0;
+#endif
 }
 void runtime_memory_report(void) {
     printf("Runtime: direct memory allocations=%zu, maps=%zu, live=%" PRIu64 ", budget=%" PRIu64 "\n",

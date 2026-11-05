@@ -23,5 +23,6 @@ int32_t* runtime_errno() { std::abort(); }
 int runtime_memory_write_backing(uintptr_t, const void*, uint64_t) { std::abort(); }
 int runtime_memory_read_backing(uintptr_t, void*, uint64_t) { std::abort(); }
 int runtime_memory_backing_window(uintptr_t, uint64_t, void**, uint64_t*, uint64_t*) { return 0; }
+uint64_t runtime_memory_census_harvest(void (*)(uintptr_t, void*), void*, uint64_t* gpu_side_resets) { if (gpu_side_resets) *gpu_side_resets = 0; return 0; }
 }
 
