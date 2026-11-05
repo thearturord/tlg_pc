@@ -83,7 +83,6 @@ std::atomic<u64> resources_noted{0}, views_noted{0}, deletes_noted{0}, deletes_u
 /// AddDelayDeleteObject (native-v3-writers): the game's own delay (frames until the object is freed) by age of the object's stamp, and the extra delay TLG_DELETE_DELAY adds
 std::atomic<u64> delay_by_age[6]{}, delay_added{0}, delay_requeued{0};
 std::atomic<u64> deferred_count{0}, deferred_released{0}, deferred_forced{0}, deferred_max_pending{0};
-std::atomic<u64> gate_frees{0}, gate_checks{0}, gate_hits{0}, gate_waited_frames{0}, gate_missed{0}, gate_missed_unsized{0}, gate_window_open{0};
 std::array<std::atomic<u64>, 9> live_by_kind{};
 
 constexpr const char* KindName(Kind kind) {
@@ -906,7 +905,6 @@ nlohmann::json ClearReport() {
             {"note", "B11 census, cumulative: the packets each engine clear writes into its command buffer; inside / outside pairs: [inside an engine clear's packets, outside]"}};
 }
 
-nlohmann::json W2Report();
 nlohmann::json FreeHoldReport();
 nlohmann::json Report() {
     nlohmann::json out;
@@ -922,8 +920,6 @@ nlohmann::json Report() {
         }
         out["delete_by_stamp_age_0_1_2_3_over_3_negative"] = std::move(ages);
         out["delete_delay_added"] = delay_added.load();
-        out["loader_gate"] = {{"frees_noted", gate_frees.load()}, {"allocations_checked", gate_checks.load()}, {"allocations_that_waited", gate_hits.load()}, {"submissions_waited_for", gate_waited_frames.load()}, {"submit_count", Core::NativeContent::SubmitCount()}, {"raster_done_floor", Core::NativeContent::RasterDoneSubmissions()}, {"wait_timeouts", Core::NativeContent::GateWaitTimeouts()}, {"alloc_on_recently_freed_address_without_gate_entry", gate_missed.load()}, {"of_those_free_had_no_known_size", gate_missed_unsized.load()}, {"alloc_in_the_window_of_the_free_not_waitable", gate_window_open.load()}};
-        out["w2_window"] = W2Report();
         out["free_hold"] = FreeHoldReport();
         out["deferred_frees"] = {{"held", deferred_count.load()}, {"released", deferred_released.load()}, {"forced", deferred_forced.load()}, {"max_pending", deferred_max_pending.load()}};
     }
@@ -1117,191 +1113,17 @@ nlohmann::json FreeHoldReport() {
 }
 
 namespace {
-
-std::mutex gate_mutex_w2;
-struct FreedRange {
-    u64 end;
-    u64 submitted; // graphics submissions announced when the memory was freed
-    u64 caller;    // W2 census: Ghidra address of the Gomalloc free's caller
-    u32 thread;    // W2 census: interned name of the freeing thread
-    bool tick;     // W2: the free ran inside JsSwapChain_BeginFrame (the game's delayed delete tick, render thread, before this frame's recording)
-};
-thread_local bool w2_in_begin_frame = false;
-std::atomic<u64> w2_window_in_tick{0}, w2_window_not_tick{0}, w2_tick_waited{0};
-bool W2TickOn() {
-    static const bool on = [] { const char* e = std::getenv("TLG_W2_TICK"); return e != nullptr && e[0] == '1'; }();
-    return on;
-}
-std::vector<std::string> w2_thread_names; // under gate_mutex
-u32 W2Thread() {
-    const std::string name = Common::GetCurrentThreadName();
-    std::scoped_lock lock{gate_mutex_w2};
-    for (u32 i = 0; i < w2_thread_names.size(); ++i) {
-        if (w2_thread_names[i] == name) {
-            return i;
-        }
-    }
-    w2_thread_names.push_back(name);
-    return static_cast<u32>(w2_thread_names.size() - 1);
-}
-struct W2Key {
-    u32 free_thread, alloc_thread;
-    u64 free_caller, alloc_caller;
-    u32 size_class; // log2 of the allocated block
-    bool operator<(const W2Key& o) const { return std::tie(free_thread, alloc_thread, free_caller, alloc_caller, size_class) < std::tie(o.free_thread, o.alloc_thread, o.free_caller, o.alloc_caller, o.size_class); }
-};
-std::map<W2Key, u64> w2_window_cases; // allocations in the open window of the free (the case that cannot be waited for)
-std::atomic<u64> w2_same_thread{0}, w2_other_thread{0};
-u64 W2Caller(u64 ret) {
-    const VAddr base = Core::NativeDraw::ImageBase();
-    return base != 0 ? ret - base + 0x1000000 : ret;
-}
 std::mutex gate_mutex;
-std::map<u64, FreedRange> gate_freed;
-std::unordered_set<u64> gate_unsized; // freed addresses whose size was unknown
-std::unordered_map<u64, u64> gate_block_size; // live engine heap blocks: address -> size (every Gomalloc allocation, while the gate is on)
-
-bool LoaderGateOn() {
-    static const bool on = [] { const char* e = std::getenv("TLG_LOADER_GATE"); return e != nullptr && e[0] == '1'; }();
-    return on;
-}
-
-void GateNoteFree(u64 address, u64 ret) {
-    u64 size = 0;
-    {
-        std::scoped_lock lock{gate_mutex};
-        const auto it = gate_block_size.find(address);
-        if (it != gate_block_size.end()) {
-            size = it->second;
-            gate_block_size.erase(it);
-        }
-    }
-    if (size == 0) {
-        std::scoped_lock lock{gate_mutex};
-        if (gate_unsized.size() > 100000) {
-            gate_unsized.clear();
-        }
-        gate_unsized.insert(address);
-        return;
-    }
-    const u64 submitted = Core::NativeContent::SubmitCount();
-    const u64 reached = Core::NativeContent::RasterDoneSubmissions();
-    std::scoped_lock lock{gate_mutex};
-    if (gate_freed.size() > 100000) {
-        for (auto it = gate_freed.begin(); it != gate_freed.end();) {
-            it = it->second.submitted <= reached ? gate_freed.erase(it) : std::next(it);
-        }
-    }
-    gate_freed[address] = {address + size, submitted, W2Caller(ret), W2Thread(), w2_in_begin_frame};
-    gate_frees.fetch_add(1, std::memory_order_relaxed);
-}
-
+std::unordered_map<u64, u64> gate_block_size; // live engine heap blocks: address -> size (every Gomalloc allocation, for the free hold)
 } // namespace
 
-nlohmann::json W2Report() {
-    // W2 census: the allocations that landed in the open window of the free (cannot be waited for), by freeing thread, allocating thread and callers (Ghidra addresses)
-    nlohmann::json cases = nlohmann::json::array();
-    std::scoped_lock lock{gate_mutex_w2};
-    std::vector<std::pair<u64, W2Key>> sorted;
-    for (const auto& [key, count] : w2_window_cases) {
-        sorted.emplace_back(count, key);
-    }
-    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-    for (size_t i = 0; i < sorted.size() && i < 40; ++i) {
-        const W2Key& k = sorted[i].second;
-        cases.push_back({{"count", sorted[i].first}, {"free_thread", k.free_thread < w2_thread_names.size() ? w2_thread_names[k.free_thread] : "?"}, {"alloc_thread", k.alloc_thread < w2_thread_names.size() ? w2_thread_names[k.alloc_thread] : "?"},
-                         {"free_caller", fmt::format("{:#x}", k.free_caller)}, {"alloc_caller", fmt::format("{:#x}", k.alloc_caller)}, {"block_log2", k.size_class}});
-    }
-    return {{"window_allocs_after_a_free_in_the_delete_tick", w2_window_in_tick.load()}, {"window_allocs_after_a_free_outside_the_tick", w2_window_not_tick.load()}, {"tick_switch_on", W2TickOn()}, {"tick_cases_made_waitable", w2_tick_waited.load()}, {"same_thread", w2_same_thread.load()}, {"other_thread", w2_other_thread.load()}, {"cases_top40", std::move(cases)}};
-}
-
-void LoaderGateAtAllocation(u64 address, u64 size, u64 ret) {
-    if (!LoaderGateOn() || address == 0 || size == 0) {
-        return;
-    }
-    gate_checks.fetch_add(1, std::memory_order_relaxed);
-    const u64 end = address + size;
-    u64 need = 0;
-    FreedRange newest_free{};
-    {
-        std::scoped_lock lock{gate_mutex};
-        auto it = gate_freed.lower_bound(address);
-        if (it != gate_freed.begin()) {
-            const auto before = std::prev(it);
-            if (before->second.end > address) {
-                it = before;
-            }
-        }
-        while (it != gate_freed.end() && it->first < end) {
-            if (it->second.end > address) {
-                if (it->second.submitted >= need) {
-                    newest_free = it->second;
-                }
-                need = std::max(need, it->second.submitted);
-                it = gate_freed.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-    if (need == 0) {
-        const u32 freed_at = Core::NativeContent::HeapFreeAt(address);
-        if (freed_at != 0 && freed_at > Core::NativeContent::RasterDoneSubmissions()) {
-            gate_missed.fetch_add(1, std::memory_order_relaxed);
-            std::scoped_lock lock{gate_mutex};
-            if (gate_unsized.contains(address)) {
-                gate_missed_unsized.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-    }
-    if (need != 0) {
-        // the free was announced at submission count `need`: draws recorded before it in that window belong to submission need + 1 (a record's submission is the first announced after it), so that one has to be
-        // done too. When it is not announced yet (count still `need`) nothing can be waited for: the loader writes before the draws leave (counted)
-        const u64 count = Core::NativeContent::SubmitCount();
-        if (need < count) {
-            need += 1;
-        } else {
-            if (newest_free.tick) {
-                w2_window_in_tick.fetch_add(1, std::memory_order_relaxed);
-                if (W2TickOn()) {
-                    // The free ran in the delete tick: the render thread was between two frames, so every draw that read the old contents was recorded before the tick and belongs to a submission
-                    // announced by then (`need`): that one can be waited for (no "+1").
-                    w2_tick_waited.fetch_add(1, std::memory_order_relaxed);
-                    goto window_done;
-                }
-            } else {
-                w2_window_not_tick.fetch_add(1, std::memory_order_relaxed);
-            }
-            gate_window_open.fetch_add(1, std::memory_order_relaxed);
-            const u32 alloc_thread = W2Thread();
-            (alloc_thread == newest_free.thread ? w2_same_thread : w2_other_thread).fetch_add(1, std::memory_order_relaxed);
-            u32 size_class = 0;
-            while ((u64{1} << (size_class + 1)) <= size) {
-                ++size_class;
-            }
-            std::scoped_lock lock{gate_mutex_w2};
-            if (w2_window_cases.size() < 4000) {
-                ++w2_window_cases[{newest_free.thread, alloc_thread, newest_free.caller, W2Caller(ret), size_class}];
-            }
-        }
-    window_done:;
-    }
-    if (need != 0 && Core::NativeContent::RasterDoneSubmissions() < need) {
-        gate_hits.fetch_add(1, std::memory_order_relaxed);
-        gate_waited_frames.fetch_add(need - Core::NativeContent::RasterDoneSubmissions(), std::memory_order_relaxed);
-        Core::NativeContent::WaitRasterSubmissions(static_cast<u32>(need));
-    }
-}
-
-/// JsSwapChain_BeginFrame (0x2495480): runs the game's delayed delete tick; the Gomalloc frees inside it carry the tick flag (W2).
+/// JsSwapChain_BeginFrame (0x2495480): runs the game's delayed delete tick, then releases the held frees the raster thread is done with.
 u64 PS4_SYSV_ABI BeginFrameTick(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64) {
     static const u64 original = Core::GuestHooks::OriginalEntry("B0_SwapChainBeginFrame");
     if (original == 0) {
         return 0;
     }
-    w2_in_begin_frame = true;
     const u64 result = reinterpret_cast<GuestFunction6>(original)(a0, a1, a2, a3, a4, a5);
-    w2_in_begin_frame = false;
     if (FreeHoldOn()) {
         ReleaseHeld(false);
     }
@@ -1311,7 +1133,7 @@ u64 PS4_SYSV_ABI BeginFrameTick(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, 
 u64 PS4_SYSV_ABI GomallocAlloc(u64 heap, u64 size, u64 alignment, u64 type, u64 a4, u64 a5, u64 ret) {
     static const u64 original = Core::GuestHooks::OriginalEntry("GomallocAlloc");
     const bool hold = FreeHoldOn();
-    if ((!LoaderGateOn() && !hold) || original == 0) {
+    if (!hold || original == 0) {
         return 0; // the original runs
     }
     if (hold) {
@@ -1347,14 +1169,6 @@ u64 PS4_SYSV_ABI GomallocAlloc(u64 heap, u64 size, u64 alignment, u64 type, u64 
         std::scoped_lock lock{gate_mutex};
         gate_block_size[result] = block;
     }
-    if (result != 0 && LoaderGateOn()) {
-        const u64 block = size == 0 ? 0x40 : static_cast<u32>(static_cast<u32>(size) + 0x3f) & 0xffffffc0u; // the allocator rounds up to 64 bytes
-        {
-            std::scoped_lock lock{gate_mutex};
-            gate_block_size[result] = block;
-        }
-        LoaderGateAtAllocation(result, block, ret);
-    }
     return 0x8000000000000000ull | (result & 0x7fffffffffffffffull);
 }
 
@@ -1363,13 +1177,10 @@ u64 PS4_SYSV_ABI GomallocFree(u64 heap, u64 address, u64 a2, u64 a3, u64 a4, u64
     const u32 frames = DeferFrames();
     if (address != 0) {
         Core::NativeContent::NoteHeapFree(address);
-        if (LoaderGateOn()) {
-            GateNoteFree(address, ret);
-        }
     }
     if (FreeHoldOn() && original != 0 && heap != 0 && address != 0) {
         u64 size = 0;
-        if (!LoaderGateOn()) { // with the gate on, GateNoteFree took the size already
+        {
             std::scoped_lock lock{gate_mutex};
             const auto it = gate_block_size.find(address);
             if (it != gate_block_size.end()) {

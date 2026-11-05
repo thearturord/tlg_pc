@@ -125,14 +125,11 @@ u64 PS4_SYSV_ABI DelayDelete(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
 /// frames so the loader cannot reuse memory a frame in flight (raster thread, up to 2 frames behind) still reads; `DrainDeferredFrees` (called at the start of every frame) frees what is due.
 u64 PS4_SYSV_ABI GomallocFree(u64 heap, u64 address, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret);
 void DrainDeferredFrees();
-/// Hook `GomallocAlloc` (0x248fb10, `native_gomalloc_alloc`): the engine heap's allocation (heap, size, alignment, type). Runs the original; with `TLG_LOADER_GATE=1` remembers the block's size and
-/// waits at once when the block lies on memory freed while the raster thread had not finished the submissions that could read it.
+/// Hook `GomallocAlloc` (0x248fb10, `native_gomalloc_alloc`): the engine heap's allocation (heap, size, alignment, type). With `TLG_FREE_HOLD=1` it remembers the block's size (for the held free) and, when the heap runs
+/// dry while frees are held, releases them (the old loader gate wait is removed: the free hold keeps a block out of the heap until the raster thread is done with it).
 u64 PS4_SYSV_ABI GomallocAlloc(u64 heap, u64 size, u64 alignment, u64 type, u64 a4, u64 a5, u64 ret);
-/// Hook `B0_SwapChainBeginFrame` (0x2495480, `native_begin_frame_tick`): runs the original and marks the Gomalloc frees inside it as the game's delete tick (W2, `TLG_W2_TICK=1`).
+/// Hook `B0_SwapChainBeginFrame` (0x2495480, `native_begin_frame_tick`): runs the original (the game's delete tick), then releases the held frees the raster thread is done with.
 u64 PS4_SYSV_ABI BeginFrameTick(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret);
-/// native-v3-writers (`TLG_LOADER_GATE=1`): the engine's allocation (`address`, `size`; hooks AllocGarlicMemory / AllocOnionMemory) overlaps memory that was freed (hook GomallocFree) when the game
-/// had submitted `n` frames: the game thread waits until the raster thread has executed `n` frames, so the loader never overwrites memory a frame in flight still reads. Keeps normal memory reuse.
-void LoaderGateAtAllocation(u64 address, u64 size, u64 ret = 0);
 
 /// B11 census: mid hooks at +6 (after the 6 bytes the B0 count hook displaced) of `JsDeviceContext::ClearRenderTargetView` (0x2483380: ctx, rtv, color[4]) and `ClearDepthStencilView` (0x24860c0: depth in
 /// xmm0, ctx, dsv, flags, stencil). They record the target and the value and bracket the packets the clear writes into the context's command buffer (its write cursor at
