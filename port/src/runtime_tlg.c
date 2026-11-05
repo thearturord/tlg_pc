@@ -162,7 +162,16 @@ static ABI int32_t ef_wait(EventFlag *ef,uint64_t pattern,uint32_t mode,uint64_t
 
 /* ---- Kernel queries ---- */
 /* Base PS4 (not Pro): 1080p output path and the 0xb0000000 GPU memory layout. */
-static ABI int32_t is_neo_mode(void) { return 0; }
+/* The game's memory setup (FUN_01dd39d0) asks six times; while the native layer's garlic_pool_pro setting is on, those answers are yes (3328 MB Garlic pool instead of 2816 MB). */
+static volatile int32_t neo_mode_calls_left;
+void runtime_set_neo_mode_calls(uint32_t calls) { __atomic_store_n(&neo_mode_calls_left,(int32_t)calls,__ATOMIC_SEQ_CST); }
+static ABI int32_t is_neo_mode(void) {
+    int32_t left=__atomic_load_n(&neo_mode_calls_left,__ATOMIC_SEQ_CST);
+    while (left>0) {
+        if (__atomic_compare_exchange_n(&neo_mode_calls_left,&left,left-1,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST)) return 1;
+    }
+    return 0;
+}
 static ABI int32_t available_flexible_memory(uint64_t *size) {
     if (!size) return KERR_EINVAL;
     *size=UINT64_C(448)*1024*1024; return 0;

@@ -26,7 +26,11 @@ struct OrbisModuleInfoForUnwind {
 s32 PS4_SYSV_ABI sceKernelIsNeoMode();
 
 /// tlg-native: the port's runtime sets up the game's memory itself (the 2816 MB Garlic pool of a base PS4), the Pro mode switch of the old emulator is a no-op.
-inline void SetNeoModeCalls(u32) {}
+}
+extern "C" void runtime_set_neo_mode_calls(unsigned calls);
+namespace Libraries::Kernel {
+/// While `calls` > 0 the game's sceKernelIsNeoMode answers are yes (PS4 Pro memory setup, see GarlicPoolPro in native_draw.cpp).
+inline void SetNeoModeCalls(u32 calls) { runtime_set_neo_mode_calls(calls); }
 
 s32 PS4_SYSV_ABI sceKernelGetCompiledSdkVersion(s32* ver);
 

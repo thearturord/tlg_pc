@@ -261,6 +261,12 @@ def attach_stdio():
             except OSError:
                 stream = None
         setattr(sys, name, stream or open(os.devnull, 'w'))
+    # The game's log can hold any byte (the pipe is read with errors='replace', so a U+FFFD can arrive); a console or inherited stream in cp1252 would crash on it.
+    for name in ('stdout', 'stderr'):
+        try:
+            getattr(sys, name).reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError, OSError):
+            pass
 
 
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)  # no console flashing for the scripts
