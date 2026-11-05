@@ -306,6 +306,10 @@ public:
     /// Leaving the asynchronous stream submits what it recorded. No effect without the second queue; the first windows stay on the graphics stream
     /// (the inputs shared with the graphics are uploaded there first).
     void SelectStream(bool side);
+    /// The asynchronous stream has started (the warm-up is over): queue 1 operations record into command buffers of their own.
+    [[nodiscard]] bool SideStreamReady() const noexcept {
+        return side_ready.load(std::memory_order_acquire);
+    }
     void OnSubmit();
 
     void ProcessDownloadImages();
@@ -503,6 +507,7 @@ private:
     std::unique_ptr<Scheduler::SideScope> side_scope;
     u32 side_windows{};
     bool side_requested{};
+    std::atomic<bool> side_ready{false};
     u64 side_epoch{1};
     u64 side_last_end_ns{};
     Runtime& runtime;

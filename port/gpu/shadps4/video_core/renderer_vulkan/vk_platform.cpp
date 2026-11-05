@@ -14,6 +14,11 @@
 #endif
 
 #include <vector>
+#include <atomic>
+#include <cstring>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
@@ -56,6 +61,22 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL DebugUtilsCallback(
     LOG_GENERIC(Common::Log::Class::Render_Vulkan, level, "{}: {}",
                 callback_data->pMessageIdName ? callback_data->pMessageIdName : "<null>",
                 callback_data->pMessage ? callback_data->pMessage : "<null>");
+#ifdef _WIN32
+    // Diagnostic: where an invalid buffer handle is recorded from (resolve the offsets with llvm-symbolizer against the exe).
+    if (callback_data->pMessageIdName && std::strstr(callback_data->pMessageIdName, "vkCmdCopyBuffer-srcBuffer-parameter")) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 3) {
+            void* frames[32]{};
+            const USHORT count = CaptureStackBackTrace(0, 32, frames, nullptr);
+            const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+            std::string trace;
+            for (USHORT i = 0; i < count; ++i) {
+                trace += fmt::format(" {:x}", reinterpret_cast<uintptr_t>(frames[i]) - base);
+            }
+            LOG_ERROR(Render_Vulkan, "invalid copy source, thread {}, rva:{}", GetCurrentThreadId(), trace);
+        }
+    }
+#endif
 
     return VK_FALSE;
 }

@@ -571,6 +571,10 @@ void NativeExecutor::RasterConsumer::SelectStream(bool second) {
     }
 }
 
+bool NativeExecutor::RasterConsumer::LaneUsable() const {
+    return owner.rasterizer != nullptr && owner.rasterizer->SideStreamReady();
+}
+
 void NativeExecutor::RasterConsumer::RunCall(RasterOp& op) {
     owner.ExecRasterCall(op.call, op.draw_plan.get(), op.dispatch_plan.get());
 }
@@ -664,6 +668,30 @@ void NativeExecutor::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 n
                                            std::move(by_op));
             }
             Core::DebugServer::Publish("fence_latency", owner.fence_latency.Report());
+            {
+                nlohmann::json sites = nlohmann::json::array();
+                std::vector<std::pair<u64, std::pair<const char*, u32>>> top;
+                {
+                    std::scoped_lock lk{sp.lane_block_mutex};
+                    for (const auto& [site, count] : sp.lane_block_sites) {
+                        top.push_back({count, site});
+                    }
+                }
+                std::ranges::sort(top, std::greater<>{});
+                for (size_t i = 0; i < top.size() && i < 12; ++i) {
+                    sites.push_back({{"file", top[i].second.first ? top[i].second.first : "-"}, {"line", top[i].second.second}, {"times", top[i].first}});
+                }
+                Core::DebugServer::Publish("raster_lane_blockers", sites);
+            }
+            Core::DebugServer::Publish("raster_lane", {{"enabled", sp.lane_on},
+                                                      {"usable", LaneUsable()},
+                                                      {"queue_limit", sp.MaxQueued},
+                                                      {"operations", sp.lane_ops.load()},
+                                                      {"hoisted", sp.lane_hoisted.load()},
+                                                      {"skipped_operations_total", sp.lane_distance.load()},
+                                                      {"picked_up_while_a_batch_ran", sp.lane_pickups.load()},
+                                                      {"bursts", sp.lane_bursts.load()},
+                                                      {"boundaries_waiting_behind_a_graphics_closure", sp.lane_barrier_waits.load()}});
             {
                 nlohmann::json sites = nlohmann::json::object();
                 for (auto& site : sp.write_sites) {

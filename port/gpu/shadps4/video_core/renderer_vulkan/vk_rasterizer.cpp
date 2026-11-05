@@ -1100,6 +1100,9 @@ void Rasterizer::SelectStream(bool side) {
     if (side && (!scheduler.HasSideStream() || side_windows <= WarmupWindows)) {
         return;
     }
+    if (side) {
+        side_ready.store(true, std::memory_order_release);
+    }
     // Barriers recorded so far belong to the stream being left.
     runtime.FlushBarriers();
     // Diagnostic (side stream hunt, TLG_ASC_SERIALIZE=1): both streams are made idle at every switch, so no cross queue race can exist. A crash that stays is not a race.

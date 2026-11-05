@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
+#include <cstring>
 #include "native/native_raster_queue.h"
 
 #include <chrono>
@@ -23,6 +24,10 @@ namespace Core::NativeRasterQueue {
 void Queue::Start(Consumer& consumer_, bool verify_) {
     consumer = &consumer_;
     verify = verify_;
+    if (const char* e = std::getenv("TLG_RASTER_QUEUE"); e != nullptr && std::atoi(e) >= 16) {
+        MaxQueued = static_cast<size_t>(std::atoi(e));
+    }
+    lane_on = [] { const char* e = std::getenv("TLG_ASC_LANE"); return e != nullptr && e[0] == '1'; }();
     Core::DrainAudit::SetBackend(&done, &write_done, [this](u64 position) {
         front_state.store(2, std::memory_order_relaxed);
         {
@@ -104,23 +109,29 @@ void Queue::Push(Op&& op, bool wait) {
     }
     ++stat_ops;
     u64 target;
+    const bool lane_op = lane_on && op.audit_class == 1 && consumer->LaneUsable();
+    // A lane operation is not held up by a full graphics queue until the queue holds twice as much.
+    const size_t limit = lane_op ? MaxQueued * 2 : MaxQueued;
     {
         std::unique_lock lk{mutex};
-        if (queue.size() >= MaxQueued) {
+        if (queue.size() >= limit) {
             stat_front_blocked.fetch_add(1, std::memory_order_relaxed);
         }
-        if (queue.size() >= MaxQueued) {
+        if (queue.size() >= limit) {
             front_state.store(3, std::memory_order_relaxed);
         }
         {
             Core::FrameTimeline::StageScope queue_full{Core::FrameTimeline::StageFrontQueueFull};
             TLG_PROF_LEVEL("wait.front_queue_full (front: the raster queue has no room)", 1);
             FLIGHT_SCOPE("front: the raster queue has no room");
-            done_cv.wait(lk, [&] { return queue.size() < MaxQueued; });
+            done_cv.wait(lk, [&] { return queue.size() < limit; });
         }
         front_state.store(0, std::memory_order_relaxed);
         op.position = pushed.load(std::memory_order_relaxed) + 1;
         queue.push_back(std::move(op));
+        if (lane_op) {
+            lane_waiting.fetch_add(1, std::memory_order_acq_rel);
+        }
         target = pushed.fetch_add(1, std::memory_order_acq_rel) + 1;
         if (audit_write) {
             Core::DrainAudit::WriteQueued(target, audit_line);
@@ -213,6 +224,7 @@ void Queue::Run(std::stop_token stoken) {
                 return;
             }
             batch.swap(sp.queue);
+            sp.lane_waiting.store(0, std::memory_order_release); // every queued lane operation is in the batch now
             if (!batch.empty()) {
                 const auto& first = batch.front();
                 const size_t kind = first.has_call ? static_cast<size_t>(first.call.kind) : 4;
@@ -236,7 +248,7 @@ void Queue::Run(std::stop_token stoken) {
             run_kind = 0;
             run_count = 0;
         };
-        for (auto& op : batch) {
+        const auto run_op = [&](Op& op) {
             Core::ResourceAudit::raster_class = op.audit_class;
             // Diagnostic (side stream hunt, TLG_ASC_SIDE_ONLY): 1 = only the dispatches of queue 1 run on the side stream, 2 = only its closures (copies, fills, fences)
             static const int side_only = [] { const char* e = std::getenv("TLG_ASC_SIDE_ONLY"); return e != nullptr ? std::atoi(e) : 0; }();
@@ -303,6 +315,91 @@ void Queue::Run(std::stop_token stoken) {
             }
             op.closure = {};
             consumer->Release(op);
+        };
+        // Compute lane: the indices of the queue 1 operations and of the graphics closures (barriers) of this batch.
+        const bool lane_active = sp.lane_on && consumer->LaneUsable();
+        std::vector<u32> lane_idx, barrier_idx;
+        if (lane_active) {
+            for (u32 k = 0; k < batch.size(); ++k) {
+                if (batch[k].audit_class == 1) {
+                    lane_idx.push_back(k);
+                } else if (!batch[k].has_call && !batch[k].lane_passable) {
+                    barrier_idx.push_back(k);
+                }
+            }
+        }
+        size_t lane_next = 0, barrier_next = 0;
+        std::vector<Op> picked;
+        for (u32 i = 0; i < batch.size(); ++i) {
+            if (lane_active) {
+                while (barrier_next < barrier_idx.size() && barrier_idx[barrier_next] < i) {
+                    ++barrier_next;
+                }
+                const u32 first_barrier = barrier_next < barrier_idx.size() ? barrier_idx[barrier_next] : static_cast<u32>(batch.size());
+                u64 burst = 0;
+                while (lane_next < lane_idx.size() && lane_idx[lane_next] < first_barrier) {
+                    const u32 k = lane_idx[lane_next++];
+                    if (batch[k].executed) {
+                        continue;
+                    }
+                    if (k > i) {
+                        sp.lane_hoisted.fetch_add(1, std::memory_order_relaxed);
+                        sp.lane_distance.fetch_add(k - i, std::memory_order_relaxed);
+                    }
+                    batch[k].executed = true;
+                    sp.lane_ops.fetch_add(1, std::memory_order_relaxed);
+                    ++burst;
+                    run_op(batch[k]);
+                }
+                if (lane_next < lane_idx.size()) {
+                    sp.lane_barrier_waits.fetch_add(1, std::memory_order_relaxed); // lane operations wait for the closure at first_barrier
+                    if (first_barrier < batch.size()) {
+                        std::scoped_lock lk{sp.lane_block_mutex};
+                        ++sp.lane_block_sites[{batch[first_barrier].write_file, batch[first_barrier].write_line}];
+                    }
+                }
+                // Lane operations pushed while this batch runs: taken when no graphics closure is left in the batch and none precedes them in the new pushes.
+                if (barrier_next >= barrier_idx.size() && sp.lane_waiting.load(std::memory_order_acquire) != 0) {
+                    picked.clear();
+                    {
+                        std::scoped_lock lk{sp.mutex};
+                        size_t keep = 0;
+                        bool blocked = false;
+                        for (size_t k = 0; k < sp.queue.size(); ++k) {
+                            Op& o = sp.queue[k];
+                            if (!blocked && o.audit_class == 1) {
+                                picked.push_back(std::move(o));
+                            } else {
+                                if (!o.has_call && o.audit_class != 1 && !o.lane_passable) {
+                                    blocked = true;
+                                }
+                                if (keep != k) {
+                                    sp.queue[keep] = std::move(o);
+                                }
+                                ++keep;
+                            }
+                        }
+                        sp.queue.resize(keep);
+                        sp.lane_waiting.fetch_sub(static_cast<u32>(picked.size()), std::memory_order_acq_rel);
+                    }
+                    if (!picked.empty()) {
+                        sp.done_cv.notify_all(); // the queue has room again
+                        sp.lane_pickups.fetch_add(picked.size(), std::memory_order_relaxed);
+                        sp.lane_hoisted.fetch_add(picked.size(), std::memory_order_relaxed);
+                        sp.lane_ops.fetch_add(picked.size(), std::memory_order_relaxed);
+                        burst += picked.size();
+                        for (Op& o : picked) {
+                            run_op(o);
+                        }
+                    }
+                }
+                if (burst != 0) {
+                    sp.lane_bursts.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (!batch[i].executed) {
+                run_op(batch[i]);
+            }
         }
         end_run();
         Core::ResourceAudit::raster_class = Core::ResourceAudit::NoClass;
@@ -310,15 +407,16 @@ void Queue::Run(std::stop_token stoken) {
         if (consumer->CallbacksPending()) {
             consumer->RunCallbacks();
         }
-        const u64 count = batch.size();
         batch.clear();
         if (const u64 now = VideoCore::ReadbackStats::NowNs();
             now - sp.stat_last_log_ns > 5'000'000'000ULL) {
             consumer->PublishIntervalStats(sp, now);
         }
         {
+            // done is the queue position up to which everything has run: lane operations taken out of order leave the queue before the graphics operations pushed ahead of
+            // them, so it is the position of the first operation still queued, minus one.
             std::scoped_lock lk{sp.mutex};
-            sp.done.fetch_add(count, std::memory_order_acq_rel);
+            sp.done.store(sp.queue.empty() ? sp.pushed.load(std::memory_order_acquire) : sp.queue.front().position - 1, std::memory_order_release);
             sp.done_cv.notify_all();
         }
         if (Idle()) {

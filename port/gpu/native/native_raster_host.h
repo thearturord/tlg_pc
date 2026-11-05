@@ -96,6 +96,7 @@ public:
 
     // ---- execution (raster) ----
     virtual void SelectStream(bool second) = 0;
+    [[nodiscard]] virtual bool SideStreamReady() const noexcept = 0;
     virtual void PreSynchronize(const std::vector<NativeUploads::Range>& ranges) = 0;
     virtual void BeginRingUse(const Vulkan::DrawPlan* draw, const Vulkan::DispatchPlan* dispatch) noexcept = 0;
     virtual void EndRingUse() noexcept = 0;

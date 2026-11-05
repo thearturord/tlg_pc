@@ -313,6 +313,7 @@ private:
         [[nodiscard]] bool CallbacksPending() const override;
         void RunCallbacks() override;
         void SelectStream(bool second) override;
+        [[nodiscard]] bool LaneUsable() const override;
         void RunCall(RasterOp& op) override;
         void RunClosure(RasterOp& op) override;
         [[nodiscard]] bool IsDepthOnly(const Vulkan::DrawPlan& plan) const override;

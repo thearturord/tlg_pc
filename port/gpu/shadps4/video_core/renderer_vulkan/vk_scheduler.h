@@ -6,6 +6,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -521,6 +522,12 @@ public:
         pending_ops.emplace(std::move(func), CurrentTick());
     }
 
+    /// Defers an operation until the gpu has reached the given tick.
+    void DeferOperation(Common::UniqueFunction<void>&& func, u64 tick) {
+        std::unique_lock lk(pending_ops_mutex);
+        pending_ops.emplace(std::move(func), tick);
+    }
+
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Runs as soon as possible in another thread.
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
@@ -811,11 +818,21 @@ public:
     [[nodiscard]] Semaphore* GetWorkSemaphore() noexcept {
         return gfx.GetWorkSemaphore();
     }
+    // With two streams, a resource freed after "the work recorded so far" must outlive the recorded work of BOTH streams: the other stream's open
+    // command list may hold the resource too (a hoisted queue 1 operation drops a buffer a graphics copy recorded earlier still names).
     void DeferOperation(Common::UniqueFunction<void>&& func) {
-        Active().DeferOperation(std::move(func));
+        if (!side) {
+            gfx.DeferOperation(std::move(func));
+            return;
+        }
+        DeferBoth(std::move(func), false);
     }
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
-        Active().DeferPriorityOperation(std::move(func));
+        if (!side) {
+            gfx.DeferPriorityOperation(std::move(func));
+            return;
+        }
+        DeferBoth(std::move(func), true);
     }
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func, u64 tick) {
         Core(tick).DeferPriorityOperation(std::move(func), tick & ~SideTag);
@@ -837,6 +854,38 @@ public:
     }
 
 private:
+    struct BothStreams {
+        std::atomic<int> remaining{2};
+        Common::UniqueFunction<void> func;
+    };
+    void DeferBoth(Common::UniqueFunction<void>&& func, bool priority) {
+        auto state = std::make_shared<BothStreams>();
+        state->func = std::move(func);
+        // one callable per stream (the function wrapper moves what it is given)
+        const auto make_part = [state] {
+            return [state] {
+                if (state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    state->func();
+                }
+            };
+        };
+        SchedulerCore& active = Active();
+        SchedulerCore& other = &active == &gfx ? *side : gfx;
+        // the other stream: its open command list (if any) is submitted by a later flush; without open work, everything it recorded is submitted already
+        const u64 other_tick = other.OpenWork() ? other.CurrentTick() : other.CurrentTick() - 1;
+        if (priority) {
+            active.DeferPriorityOperation(make_part());
+        } else {
+            active.DeferOperation(make_part());
+        }
+        if (other_tick == 0) {
+            make_part()();
+        } else if (priority) {
+            other.DeferPriorityOperation(make_part(), other_tick);
+        } else {
+            other.DeferOperation(make_part(), other_tick);
+        }
+    }
     SchedulerCore& Active() noexcept {
         return use_side && side ? *side : gfx;
     }

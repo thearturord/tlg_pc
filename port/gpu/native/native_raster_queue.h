@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <source_location>
@@ -66,6 +67,8 @@ struct Call {
 };
 
 struct Op {
+    bool executed{};  ///< Lane: already run out of order from this batch (skipped when its turn comes).
+    bool lane_passable{}; ///< Lane: a queue 1 operation may run ahead of this closure (no barrier). Nothing sets it yet: the experiment (copies, fills, clears) gave no gain, see compute-lane-design.md section 10.
     bool has_call{};
     bool writes_memory{};
     u8 audit_class{0xff}; ///< Core::ResourceAudit: the queue whose command stream pushed this operation
@@ -104,11 +107,13 @@ public:
     virtual void PublishIntervalStats(Queue& queue, u64 now_ns) = 0;
     /// After a batch was counted done: the consumer wakes whoever waits for the GPU to go idle.
     virtual void BatchFinished() = 0;
+    /// The compute lane may be used: the asynchronous stream is running (queue 1 operations then record into a command buffer of their own).
+    [[nodiscard]] virtual bool LaneUsable() const = 0;
 };
 
 class Queue {
 public:
-    static constexpr size_t MaxQueued = 256;
+    size_t MaxQueued = 256; ///< TLG_RASTER_QUEUE
 
     /// Starts the raster thread (and the housekeeping thread). `verify`: cp_split_mode 2, every operation is waited for (synchronous).
     void Start(Consumer& consumer, bool verify);
@@ -168,6 +173,18 @@ public:
         }
         return &write_sites.back();
     }
+    // Compute lane (TLG_ASC_LANE=1, documents/tlg/native plan/engine/compute-lane-design.md): operations of queue 1 run ahead of the graphics operations queued before them,
+    // as far as the newest graphics closure (a barrier: memory writes, announce batches, uploads, ...). The raster thread checks between operations.
+    bool lane_on{};
+    std::atomic<u32> lane_waiting{0}; ///< Queue 1 operations in `queue` that the raster thread has not taken yet.
+    std::atomic<u64> lane_ops{};      ///< Queue 1 operations run through the lane logic.
+    std::atomic<u64> lane_hoisted{};  ///< ... of which ahead of at least one operation pushed before them.
+    std::atomic<u64> lane_distance{}; ///< Sum of the operations they skipped.
+    std::atomic<u64> lane_pickups{};  ///< Taken from the newly pushed operations while a batch ran.
+    std::atomic<u64> lane_bursts{};   ///< Groups of lane operations (one stream switch pair each).
+    std::atomic<u64> lane_barrier_waits{}; ///< Boundaries where lane operations were waiting behind a graphics closure.
+    std::mutex lane_block_mutex;
+    std::map<std::pair<const char*, u32>, u64> lane_block_sites; ///< The closure (queueing site) that held lane operations back, how often.
     // Statistics, logged every few seconds.
     u64 stat_ops{};
     u64 stat_calls{};
