@@ -17,6 +17,7 @@
 #include <vector>
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
+#include <xxhash.h>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -1741,6 +1742,7 @@ bool SilentCensusOn() noexcept {
 std::mutex g_silent_mutex;
 std::unordered_map<u64, u32> g_silent_at;   ///< page -> the submission its newest silent write belongs to
 std::unordered_map<u64, u32> g_silent_hits; ///< page -> windows with a silent write
+std::atomic<u32> g_silent_gen{0};           ///< bumped by every harvest that found silent pages
 std::atomic<u64> c_sc_harvests{0}, c_sc_written{0}, c_sc_ring{0}, c_sc_announced_now{0}, c_sc_announced_before{0}, c_sc_silent{0}, c_sc_ns{0}, c_sc_max_ns{0};
 std::atomic<u64> c_sc_late[LateKinds][2]{}, c_sc_late_bytes[LateKinds][2]{}, c_sc_reads_checked{0};
 struct HarvestContext {
@@ -1782,6 +1784,7 @@ void SilentHarvest(u32 index) {
             g_silent_at[page] = index;
             ++g_silent_hits[page];
         }
+        g_silent_gen.fetch_add(1, std::memory_order_relaxed);
     }
     c_sc_harvests.fetch_add(1, std::memory_order_relaxed);
     const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
@@ -1972,9 +1975,182 @@ void SilentResidentUse(u32 path, u64 key, u64 address, u64 size, u32 usage) {
     }
 }
 
+// Texture cache: an image uploaded once and used again while it is not dirty reads no memory. If the game wrote its memory silently after the upload, the GPU samples old
+// texels (a missed update). The upload records the harvest count and a hash of the guest bytes; a kept use is checked once per harvest that found silent pages.
+extern "C" int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
+namespace {
+struct SilentImageRecord {
+    u64 size;
+    u32 uploaded;     ///< g_submit_count at the upload
+    u64 hash;         ///< XXH3 of the guest bytes at the upload (0: not hashed)
+    u32 checked_gen;  ///< the silent generation of the last check
+    u32 hashed_newest; ///< the newest silent window the hash was compared for
+    bool gpu_source;   ///< uploaded from GPU written memory (not checked)
+};
+std::atomic<u64> c_img_uploads_gpu{0}, c_img_size_differs{0}, c_img_gpu_source_kept{0};
+std::unordered_map<u64, u32> g_img_no_record;      ///< kept image without an upload record -> uses (under g_img_mutex)
+std::unordered_map<u64, u64> g_img_no_record_size; ///< its size
+std::mutex g_img_mutex;
+std::unordered_map<u64, SilentImageRecord> g_img_up;
+std::atomic<u64> c_img_uploads{0}, c_img_kept{0}, c_img_kept_checked{0}, c_img_no_record{0}, c_img_ambiguous{0}, c_img_flagged{0}, c_img_changed{0}, c_img_same{0}, c_img_unknown{0};
+std::unordered_map<u64, u32> g_img_changed; ///< image -> kept uses with changed bytes (under g_img_mutex)
+u64 HashGuest(u64 address, u64 size) {
+    if (size == 0 || size > (64ull << 20) || runtime_memory_is_mapped(address, size) == 0) {
+        return 0;
+    }
+    const u64 h = XXH3_64bits(reinterpret_cast<const void*>(address), size);
+    return h == 0 ? 1 : h;
+}
+} // namespace
+
+void SilentImageUploaded(u64 address, u64 size, bool gpu_source) {
+    if (!SilentCensusOn() || address == 0 || size == 0) {
+        return;
+    }
+    (gpu_source ? c_img_uploads_gpu : c_img_uploads).fetch_add(1, std::memory_order_relaxed);
+    const u64 hash = gpu_source ? 0 : HashGuest(address, size);
+    std::scoped_lock lock{g_img_mutex};
+    if (g_img_up.size() > 200000) {
+        g_img_up.clear();
+    }
+    g_img_up[address] = {size, g_submit_count.load(std::memory_order_acquire), hash, g_silent_gen.load(std::memory_order_relaxed), 0, gpu_source};
+}
+
+void SilentImageKept(u64 address, u64 size) {
+    if (!SilentCensusOn() || address == 0 || size == 0) {
+        return;
+    }
+    c_img_kept.fetch_add(1, std::memory_order_relaxed);
+    const u32 gen = g_silent_gen.load(std::memory_order_relaxed);
+    u32 uploaded = 0, hashed_newest = 0;
+    u64 hash = 0;
+    {
+        std::scoped_lock lock{g_img_mutex};
+        const auto it = g_img_up.find(address);
+        if (it == g_img_up.end() || it->second.size != size) {
+            (it == g_img_up.end() ? c_img_no_record : c_img_size_differs).fetch_add(1, std::memory_order_relaxed);
+            if (it == g_img_up.end() && g_img_no_record.size() < 50000) {
+                ++g_img_no_record[address];
+                g_img_no_record_size[address] = size;
+            }
+            return;
+        }
+        if (it->second.gpu_source) {
+            c_img_gpu_source_kept.fetch_add(1, std::memory_order_relaxed); // content made by the GPU: memory is not the source
+            return;
+        }
+        if (it->second.checked_gen == gen) {
+            return; // no new silent pages since the last check of this image
+        }
+        it->second.checked_gen = gen;
+        uploaded = it->second.uploaded;
+        hash = it->second.hash;
+        hashed_newest = it->second.hashed_newest;
+    }
+    c_img_kept_checked.fetch_add(1, std::memory_order_relaxed);
+    u64 page = 0;
+    u32 newest = 0;
+    {
+        const u64 first = address & ~u64{4095}, last = (address + size - 1) & ~u64{4095};
+        std::scoped_lock lock{g_silent_mutex};
+        for (u64 p = first; p <= last; p += 4096) {
+            const auto it = g_silent_at.find(p);
+            if (it != g_silent_at.end() && it->second > newest) {
+                newest = it->second;
+                page = p;
+            }
+        }
+    }
+    if (newest <= uploaded) {
+        return;
+    }
+    // same window as the upload: the write may have come before it; the hash (taken after the upload read) decides either way
+    (newest - uploaded == 1 ? c_img_ambiguous : c_img_flagged).fetch_add(1, std::memory_order_relaxed);
+    if (newest == hashed_newest) {
+        return; // compared already for this silent window
+    }
+    const u64 now = hash != 0 ? HashGuest(address, size) : 0;
+    {
+        std::scoped_lock lock{g_img_mutex};
+        const auto it = g_img_up.find(address);
+        if (it != g_img_up.end()) {
+            it->second.hashed_newest = newest;
+        }
+        if (hash != 0 && now != 0 && now != hash && g_img_changed.size() < 100000) {
+            ++g_img_changed[address];
+        }
+    }
+    if (hash == 0 || now == 0) {
+        c_img_unknown.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (now == hash) {
+        c_img_same.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    c_img_changed.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<u32> examples{0};
+    if (examples.fetch_add(1, std::memory_order_relaxed) < 40) {
+        const LedgerAnswer a = LedgerQuery(page, page + 4096);
+        Core::RareEvents::Note("w15_image_missed_update",
+                               fmt::format("image {:#x} + {:#x} kept since its upload at submit count {}, bytes changed (hash), page {:#x} silently written for submission {} (count now {}); ledger of the page: covered {:#x}, newest announced at {} by writer {} site {}",
+                                           address, size, uploaded, page, newest, g_submit_count.load(std::memory_order_relaxed), a.covered, a.newest_submit, a.newest_writer,
+                                           a.newest_site < g_site_names.size() ? g_site_names[a.newest_site] : std::string("?")));
+    }
+}
+
 namespace {
 nlohmann::json SilentReport() {
     nlohmann::json out;
+    {
+        nlohmann::json r;
+        r["uploads"] = c_img_uploads.load();
+        r["kept_uses"] = c_img_kept.load();
+        r["kept_uses_checked"] = c_img_kept_checked.load();
+        r["kept_without_an_upload_record"] = c_img_no_record.load();
+        r["uploads_from_gpu_written_memory"] = c_img_uploads_gpu.load();
+        r["kept_uses_of_gpu_source_images"] = c_img_gpu_source_kept.load();
+        r["kept_with_a_record_of_another_size"] = c_img_size_differs.load();
+        {
+            std::vector<std::pair<u32, u64>> nr;
+            std::scoped_lock lock{g_img_mutex};
+            r["distinct_images_without_a_record"] = g_img_no_record.size();
+            for (const auto& [a, n] : g_img_no_record) {
+                nr.emplace_back(n, a);
+            }
+            std::sort(nr.begin(), nr.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+            nlohmann::json t = nlohmann::json::array();
+            for (size_t i = 0; i < nr.size() && i < 12; ++i) {
+                t.push_back({{"image", fmt::format("{:#x}", nr[i].second)}, {"size", g_img_no_record_size[nr[i].second]}, {"uses", nr[i].first},
+                             {"in_gpu_allocation", InGpuAllocation(nr[i].second, 1)}});
+            }
+            r["top_without_a_record"] = std::move(t);
+        }
+        r["silent_write_in_the_upload_window_ambiguous"] = c_img_ambiguous.load();
+        r["flagged_silent_write_after_the_upload"] = c_img_flagged.load();
+        r["hash_compares_changed_same_unknown"] = {c_img_changed.load(), c_img_same.load(), c_img_unknown.load()};
+        std::vector<std::pair<u32, u64>> top;
+        {
+            std::scoped_lock lock{g_img_mutex};
+            r["distinct_images_changed"] = g_img_changed.size();
+            for (const auto& [a, n] : g_img_changed) {
+                top.emplace_back(n, a);
+            }
+        }
+        std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+        nlohmann::json t = nlohmann::json::array();
+        for (size_t i = 0; i < top.size() && i < 20; ++i) {
+            u64 size = 0;
+            {
+                std::scoped_lock lock{g_img_mutex};
+                const auto it = g_img_up.find(top[i].second);
+                size = it != g_img_up.end() ? it->second.size : 0;
+            }
+            t.push_back({{"image", fmt::format("{:#x}", top[i].second)}, {"size", size}, {"changed_checks", top[i].first}});
+        }
+        r["top_images"] = std::move(t);
+        out["texture_cache_kept_images"] = std::move(r);
+    }
     for (u32 p = 0; p < 2; ++p) {
         nlohmann::json r;
         r["copies_made"] = c_rs_synced[p].load();

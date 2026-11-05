@@ -1220,6 +1220,9 @@ void TextureCache::RefreshImage(Image& image, Core::ImageCaller caller) {
     // F2.4: the B8.1 verify (a hash of the guest bytes after each refresh, off by default) and the accounting of what dirtied the image are gone: an image is refreshed by the announcements and
     // the engine's own writes (E3.1: the address route found a change in 0 of 8.7 million refreshes), and the write ledger (F2.5) says whether the memory moved after the draw that reads it.
     if (False(image.flags & ImageFlagBits::Dirty)) {
+        if (False(image.flags & ImageFlagBits::GpuModified) && image.info.num_samples <= 1 && !Core::NativeContent::InRing(image.info.guest_address, image.info.guest_size)) {
+            Core::NativeContent::SilentImageKept(image.info.guest_address, image.info.guest_size); // W1.5 census (TLG_SILENT_CENSUS=1)
+        }
         return;
     }
     if (image.info.num_samples > 1) {
@@ -1280,6 +1283,9 @@ void TextureCache::RefreshImage(Image& image, Core::ImageCaller caller) {
     {
         TLG_PROF_NAMED_LEVEL(prof_upload, "texture.refresh.upload", 2);
         runtime.UploadImage(&image, buffer, image_copies);
+    }
+    if (!Core::NativeContent::InRing(image.info.guest_address, image.info.guest_size)) {
+        Core::NativeContent::SilentImageUploaded(image.info.guest_address, image.info.guest_size, BufferCache::last_image_source_gpu); // W1.5 census
     }
     Core::Flight::Add(Core::Flight::ImageRefresh, 0, image.info.guest_address, image.info.guest_size, static_cast<u8>(caller)); // L1
     Core::NativeResources::NoteImageUpload(image.info.guest_address, image.info.guest_size,
