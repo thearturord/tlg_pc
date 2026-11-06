@@ -316,17 +316,7 @@ bool Rasterizer::FilterDraw(const DrawPlan* plan) {
 std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(DrawIndirectParams params, const FixedState& native, u64 exec_key, u64 inputs_key, const Core::NativeDraw::ExecDraw& record, u32 index_count) {
     // F3.5: a draw is planned from its record, the fixed-function state built from the engine's objects, and the shader and target descriptions; no register image exists. SkipShadow draws are
     // still planned: the switch can change between the front and the raster thread.
-    std::unique_ptr<DrawPlan> plan;
-    {
-        std::scoped_lock lk{plan_pool_mutex};
-        if (!draw_plan_pool.empty()) {
-            plan = std::move(draw_plan_pool.back());
-            draw_plan_pool.pop_back();
-        }
-    }
-    if (!plan) {
-        plan = std::make_unique<DrawPlan>();
-    }
+    std::unique_ptr<DrawPlan> plan = plan_pool.TakeDraw();
     const DrawClassification no_operation{};
     plan->executed = true;
     plan->native_seq = 0;
@@ -382,17 +372,7 @@ static bool TextureIdsOn() {
     return on;
 }
 std::unique_ptr<DispatchPlan> Rasterizer::PlanDispatch(const Core::NativeDispatch::DispatchInputs& cs) {
-    std::unique_ptr<DispatchPlan> plan;
-    {
-        std::scoped_lock lk{plan_pool_mutex};
-        if (!dispatch_plan_pool.empty()) {
-            plan = std::move(dispatch_plan_pool.back());
-            dispatch_plan_pool.pop_back();
-        }
-    }
-    if (!plan) {
-        plan = std::make_unique<DispatchPlan>();
-    }
+    std::unique_ptr<DispatchPlan> plan = plan_pool.TakeDispatch();
     pipeline_cache.PlanCompute(cs, *plan);
     plan->binding_count = 0;
     plan->bindings_complete = false;

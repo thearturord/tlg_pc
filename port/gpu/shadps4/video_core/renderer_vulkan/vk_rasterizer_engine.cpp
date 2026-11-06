@@ -78,39 +78,6 @@ static u32 NativeBinderMode() {
 }
 
 namespace {
-u64 Mix(u64 h, u64 v) {
-    return (h ^ v) * 0x100000001b3ull;
-}
-
-u64 DigestStage(u64 h, const StagePlan& stage) {
-    h = Mix(h, reinterpret_cast<u64>(stage.info));
-    h = Mix(h, stage.pgm_base);
-    h = Mix(h, stage.user_data_count);
-    for (u32 i = 0; i < stage.user_data_count; ++i) {
-        h = Mix(h, stage.user_data[i]);
-    }
-    h = Mix(h, stage.flat_skipped ? 1 : 0);
-    for (const u32 word : stage.flat) {
-        h = Mix(h, word);
-    }
-    return h;
-}
-} // namespace
-
-namespace {
-void ResetStage(StagePlan& stage) {
-    stage.info = nullptr;
-    stage.ring.clear();
-    stage.user_data_count = 0;
-    stage.flat.clear();
-    stage.flat_skipped = false;
-    stage.pgm_base = 0;
-    stage.resolved.clear();
-    stage.image_words.clear();
-}
-} // namespace
-
-namespace {
 /// What a buffer resource needs from a stage to read its V#: the flattened user data and the program base, here those of a plan (the stage's Info is rewritten
 /// by the next plan while the raster thread may still be using it).
 struct PlanStageView {
@@ -301,17 +268,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
         Core::NativeDraw::Live().plan_null[1].fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
-    std::unique_ptr<DrawPlan> plan;
-    {
-        std::scoped_lock lk{plan_pool_mutex};
-        if (!draw_plan_pool.empty()) {
-            plan = std::move(draw_plan_pool.back());
-            draw_plan_pool.pop_back();
-        }
-    }
-    if (!plan) {
-        plan = std::make_unique<DrawPlan>();
-    }
+    std::unique_ptr<DrawPlan> plan = plan_pool.TakeDraw();
     plan->executed = true;
     plan->native_seq = draw.seq;
     plan->binding_count = draw.binding_count;
@@ -365,17 +322,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
 }
 
 std::unique_ptr<DrawPlan> Rasterizer::PlanExecOperation(const Core::NativeDraw::ExecDraw& draw) {
-    std::unique_ptr<DrawPlan> plan;
-    {
-        std::scoped_lock lk{plan_pool_mutex};
-        if (!draw_plan_pool.empty()) {
-            plan = std::move(draw_plan_pool.back());
-            draw_plan_pool.pop_back();
-        }
-    }
-    if (!plan) {
-        plan = std::make_unique<DrawPlan>();
-    }
+    std::unique_ptr<DrawPlan> plan = plan_pool.TakeDraw();
     plan->pipeline = nullptr;
     plan->executed = false;
     plan->op_class = static_cast<u8>(DrawClass::EliminateFastClear);
@@ -385,47 +332,19 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecOperation(const Core::NativeDraw::
 }
 
 u64 Rasterizer::PlanDigest(const DrawPlan& plan) {
-    u64 h = 0xcbf29ce484222325ull;
-    h = Mix(h, reinterpret_cast<u64>(plan.pipeline));
-    h = Mix(h, plan.op_class);
-    for (const auto& stage : plan.stages) {
-        h = DigestStage(h, stage);
-    }
-    return h;
+    return Core::NativePlan::PlanDigest(plan);
 }
 
 u64 Rasterizer::PlanDigest(const DispatchPlan& plan) {
-    return DigestStage(Mix(0xcbf29ce484222325ull, reinterpret_cast<u64>(plan.pipeline)), plan.stage);
+    return Core::NativePlan::PlanDigest(plan);
 }
 
 void Rasterizer::RecyclePlan(std::unique_ptr<DrawPlan>&& plan) {
-    if (!plan) {
-        return;
-    }
-    plan->pipeline = nullptr;
-    plan->executed = false;
-    plan->ring_end = 0;
-    for (auto& stage : plan->stages) {
-        ResetStage(stage);
-    }
-    std::scoped_lock lk{plan_pool_mutex};
-    if (draw_plan_pool.size() < 512) {
-        draw_plan_pool.push_back(std::move(plan));
-    }
+    plan_pool.Recycle(std::move(plan));
 }
 
 void Rasterizer::RecyclePlan(std::unique_ptr<DispatchPlan>&& plan) {
-    if (!plan) {
-        return;
-    }
-    plan->pipeline = nullptr;
-    plan->ring_end = 0;
-    plan->native_seq = 0;
-    ResetStage(plan->stage);
-    std::scoped_lock lk{plan_pool_mutex};
-    if (dispatch_plan_pool.size() < 512) {
-        dispatch_plan_pool.push_back(std::move(plan));
-    }
+    plan_pool.Recycle(std::move(plan));
 }
 
 /// N3 native binder switch (`TLG_NATIVE_BINDER`): 0 off, 1 the depth passes (class 0), 2 every class with a complete binding list, 3 like 2 and every descriptor is compared with

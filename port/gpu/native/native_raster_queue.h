@@ -27,9 +27,14 @@ namespace AmdGpu {
 struct ComputeProgram;
 }
 
-namespace Vulkan {
+namespace Core::NativePlan {
 struct DrawPlan;
 struct DispatchPlan;
+} // namespace Core::NativePlan
+
+namespace Vulkan {
+using Core::NativePlan::DrawPlan;
+using Core::NativePlan::DispatchPlan;
 } // namespace Vulkan
 
 namespace Core::NativeRasterQueue {

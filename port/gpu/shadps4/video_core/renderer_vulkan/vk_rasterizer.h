@@ -588,8 +588,7 @@ private:
     /// Hand recorded commands to the encoder thread every this many commands (0 = off).
     const u32 flush_commands;
     tsl::robin_map<u64, DrawInputs> exec_inputs; ///< the render target inputs of the draws planned the old way, by the identity of what they come from
-    std::mutex plan_pool_mutex;
-    std::vector<std::unique_ptr<DrawPlan>> draw_plan_pool;
+    Core::NativePlan::PlanPool plan_pool;
     struct PendingFill {
         VAddr dst{};
         u32 bytes{};
@@ -617,7 +616,6 @@ private:
     u32 draw_class_now{15}; ///< census: the draw class of the draw being bound
     u64 dispatch_caller{}; ///< diagnostics: the game call that made the dispatch being bound
     u8 clip_plane_mask{}; ///< user clip planes of the draw being bound
-    std::vector<std::unique_ptr<DispatchPlan>> dispatch_plan_pool;
     /// True if the inputs match the cached lookup; otherwise stores them for the next draw.
     template <typename... Ts>
     bool TargetInputsMatch(CachedTarget& cache, const Ts&... parts);
