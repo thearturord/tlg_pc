@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <chrono>
 #include <thread>
 #include <cstdlib>
@@ -20,6 +21,7 @@
 #include <fmt/format.h>
 
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/thread.h"
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
@@ -1038,6 +1040,12 @@ std::atomic<u64> hold_bucket_count[6], hold_bucket_bytes[6];
 std::atomic<u64> early_fence_counts[6]; // fences, then label writes: landed at the parse, kept (compute work with a readable result not covered), kept (switch off or no free hold)
 std::deque<HeldFree> held_frees; // under deferred_mutex, in free order (need never decreases)
 u64 held_bytes = 0;              // under deferred_mutex (known sizes only)
+std::atomic<u64> hold_freed_bytes_total{0}, hold_released_bytes_total{0}, hold_armed_early{0};
+/// TLG_HOLD_ARM_ALL=1: see ReleaseHeld
+bool HoldArmAllOn() {
+    static const bool on = [] { const char* e = std::getenv("TLG_HOLD_ARM_ALL"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
 std::atomic<u64> hold_unsafe_blocks{0}, hold_unsafe_bytes{0}, hold_open_waits{0}, hold_open_wait_ns{0}, hold_open_same_thread{0}, hold_open_gave_up{0};
 /// TLG_HOLD_WAIT_OPEN=1 (needs TLG_PROGRESS_WAITS=1): a dry heap whose held blocks were freed in the submission window still being built waits for the game to announce that submission
 /// (when another thread does) and for the raster thread to finish it, instead of releasing those blocks unsafely.
@@ -1069,6 +1077,22 @@ void ReleaseHeld(bool all, bool ignore_frames = false) {
     {
         std::scoped_lock lock{deferred_mutex};
         const s64 frame = FreeHoldFrames() != 0 ? EngineFrame() : 0;
+        if (HoldArmAllOn() && !all && !ignore_frames) {
+            // TLG_HOLD_ARM_ALL=1: every block whose frame rule has passed is armed now, with the same need (the submission announced next). The loop below arms ONE block per call and then waits for a
+            // submission to finish before it looks at the next one, so a burst of frees drained at one block per finished submission (hold trace 2026-11-06: 450 MB ready but held for 1000+ frames).
+            const u64 armed_need = u64{Core::NativeContent::SubmitCount()} + 1;
+            for (HeldFree& entry : held_frees) {
+                if (entry.due_frame == 0 || entry.armed) {
+                    continue;
+                }
+                if (frame < entry.due_frame) {
+                    break;
+                }
+                entry.need = std::max<u64>(entry.need, armed_need);
+                entry.armed = true;
+                hold_armed_early.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         while (!held_frees.empty()) {
             HeldFree& front = held_frees.front();
             if (!all && !ignore_frames && front.due_frame != 0 && !front.armed) {
@@ -1098,6 +1122,7 @@ void ReleaseHeld(bool all, bool ignore_frames = false) {
     for (const auto& entry : due) {
         reinterpret_cast<GuestFunction6>(original)(entry.heap, entry.address, 0, 0, 0, 0);
         hold_released.fetch_add(1, std::memory_order_relaxed);
+        hold_released_bytes_total.fetch_add(entry.size, std::memory_order_relaxed);
     }
 }
 
@@ -1266,6 +1291,8 @@ nlohmann::json FreeHoldReport() {
             {"released_with_the_raster_thread_not_done_blocks", hold_unsafe_blocks.load()},
             {"released_with_the_raster_thread_not_done_bytes", hold_unsafe_bytes.load()},
             {"open_window_wait_switch_on", HoldWaitOpenOn()},
+            {"arm_all_switch_on", HoldArmAllOn()},
+            {"blocks_armed_early_by_arm_all", hold_armed_early.load()},
             {"open_window_waits", hold_open_waits.load()},
             {"open_window_wait_ms", hold_open_wait_ns.load() / 1.0e6},
             {"open_window_same_thread_no_wait", hold_open_same_thread.load()},
@@ -1287,6 +1314,67 @@ std::mutex gate_mutex;
 std::unordered_map<u64, u64> gate_block_size; // live engine heap blocks: address -> size (every Gomalloc allocation, for the free hold)
 } // namespace
 
+
+/// `TLG_HOLD_TRACE=1`: every 250 ms one line in user/log/free_hold.csv about the held frees and why they are still held: bytes still inside the game's 3 frame rule, bytes waiting for the raster
+/// thread, bytes ready to go that nobody asked for yet (the release runs at the frame tick and at an allocation), and what was freed / released since the start.
+void HoldTraceSample() {
+    static const bool on = [] { const char* e = std::getenv("TLG_HOLD_TRACE"); return e != nullptr && e[0] == '1'; }();
+    if (!on) {
+        return;
+    }
+    static std::FILE* file = [] {
+        std::FILE* f = std::fopen((Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "free_hold.csv").string().c_str(), "w");
+        if (f != nullptr) {
+            std::fputs("t_s,engine_frame,pending_blocks,pending_mb,wait_frame_rule_mb,wait_arm_mb,wait_raster_mb,ready_mb,largest_pending_mb,oldest_age_frames,freed_mb_total,released_mb_total,raster_done,submit_count,pool_free_mb\n", f);
+        }
+        return f;
+    }();
+    static u64 last_ns = 0;
+    const u64 now_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (file == nullptr || now_ns - last_ns < 250'000'000ull) {
+        return;
+    }
+    static const u64 start_ns = now_ns;
+    last_ns = now_ns;
+    const s64 frame = EngineFrame();
+    const u64 done = Core::NativeContent::RasterDoneSubmissions();
+    u64 blocks = 0, bytes = 0, w_frame = 0, w_arm = 0, w_raster = 0, ready = 0, largest = 0;
+    s64 oldest = 0;
+    {
+        std::scoped_lock lock{deferred_mutex};
+        for (const HeldFree& h : held_frees) {
+            ++blocks;
+            bytes += h.size;
+            largest = std::max(largest, h.size);
+            const bool frame_ok = h.due_frame == 0 || frame >= h.due_frame;
+            const bool raster_ok = h.need <= done;
+            if (!frame_ok) {
+                w_frame += h.size;
+            } else if (h.due_frame != 0 && !h.armed) {
+                w_arm += h.size; // frame rule passed, not armed yet: waits for ReleaseHeld to arm it (one per call without TLG_HOLD_ARM_ALL)
+            } else if (!raster_ok) {
+                w_raster += h.size;
+            } else {
+                ready += h.size;
+            }
+            if (h.due_frame != 0) {
+                oldest = std::max<s64>(oldest, frame - (h.due_frame - static_cast<s64>(FreeHoldFrames())));
+            }
+        }
+    }
+    u64 pool_free = 0;
+    for (auto& slot : pool_stats_slots) {
+        if (slot.pool.load(std::memory_order_relaxed) != 0 && slot.free_max.load(std::memory_order_relaxed) > (1ull << 30)) {
+            pool_free = slot.free_last.load(std::memory_order_relaxed);
+        }
+    }
+    constexpr double MB = 1.0 / (1024.0 * 1024.0);
+    std::fprintf(file, "%.2f,%lld,%llu,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%lld,%.1f,%.1f,%llu,%u,%.1f\n", (now_ns - start_ns) / 1.0e9, static_cast<long long>(frame), static_cast<unsigned long long>(blocks),
+                 bytes * MB, w_frame * MB, w_arm * MB, w_raster * MB, ready * MB, largest * MB, static_cast<long long>(oldest), hold_freed_bytes_total.load() * MB, hold_released_bytes_total.load() * MB,
+                 static_cast<unsigned long long>(done), Core::NativeContent::SubmitCount(), pool_free * MB);
+    std::fflush(file);
+}
+
 /// JsSwapChain_BeginFrame (0x2495480): runs the game's delayed delete tick, then releases the held frees the raster thread is done with.
 u64 PS4_SYSV_ABI BeginFrameTick(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64) {
     static const u64 original = Core::GuestHooks::OriginalEntry("B0_SwapChainBeginFrame");
@@ -1296,6 +1384,7 @@ u64 PS4_SYSV_ABI BeginFrameTick(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, 
     const u64 result = reinterpret_cast<GuestFunction6>(original)(a0, a1, a2, a3, a4, a5);
     if (FreeHoldOn()) {
         ReleaseHeld(false);
+        HoldTraceSample();
     }
     return 0x8000000000000000ull | (result & 0x7fffffffffffffffull);
 }
@@ -1429,6 +1518,7 @@ u64 PS4_SYSV_ABI GomallocFree(u64 heap, u64 address, u64 a2, u64 a3, u64 a4, u64
         std::scoped_lock lock{deferred_mutex};
         held_frees.push_back({heap, address, size, need, FreeHoldFrames() != 0 ? EngineFrame() + FreeHoldFrames() : 0, false});
         held_bytes += size;
+        hold_freed_bytes_total.fetch_add(size, std::memory_order_relaxed);
         {
             // size census of the held frees (what makes up the held bytes): < 64 KB, < 1 MB, < 16 MB, < 64 MB, >= 64 MB, unknown
             const u32 bucket = size == 0 ? 5 : size < (64u << 10) ? 0 : size < (1u << 20) ? 1 : size < (16u << 20) ? 2 : size < (64u << 20) ? 3 : 4;
