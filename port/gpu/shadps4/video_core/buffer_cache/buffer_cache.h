@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "native/native_buffer_index.h"
 #include "native/native_device.h"
 #include "native/native_resources.h"
 #include "native/native_readback_policy.h"
@@ -254,19 +255,8 @@ private:
     /// The engine buffers as the in order create and delete events know them: the raster thread's view. The live table of the game thread is ahead of the raster thread at frames in flight 2
     /// (it has deleted what the raster thread still works on and created what it has not reached). `TLG_ORDERED_VIEW=1`: the buffer cache asks this view (BuffersInView, ResourceAtView,
     /// LookupView); otherwise it asks the live table. `TLG_ORDERED_VIEW_CHECK=1` counts the requests where the two disagree.
-    struct OrderedEntry {
-        VAddr end;
-        u64 id;
-        u32 usage, cpu_access;
-    };
-    mutable std::shared_mutex ordered_mutex;
-    std::map<VAddr, OrderedEntry> ordered_by_address; ///< begin -> entry
-    std::unordered_map<u64, VAddr> ordered_by_id;     ///< id -> begin
-    /// [written][class]: 0 same, 1 the live table has buffers the ordered view lacks (the game created them ahead), 2 the ordered view has buffers the live table lacks (the game deleted them
-    /// ahead), 3 both; and the request count
-    std::atomic<u64> ordered_counts[2][5]{};
+    Core::NativeBufferIndex::Ordered ordered; ///< G5b: the raster thread's in-order view of the engine buffers (native/native_buffer_index.h)
     void OrderedViewCheck(VAddr address, u64 size, bool written);
-    [[nodiscard]] static bool OrderedViewOn() noexcept;
     void BuffersInView(VAddr address, u64 size, std::vector<Core::NativeDevice::BufferPart>& out);
     [[nodiscard]] bool ResourceAtView(VAddr address, Core::NativeDevice::Object& out) const;
     [[nodiscard]] bool LookupView(u64 id, Core::NativeDevice::Object& out) const;

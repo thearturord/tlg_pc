@@ -42,18 +42,13 @@
 // so that the emulator files only call into native/; the class stays declared in the emulator's header until the owning plan phase
 // (documents/tlg/native plan/no-emulation-plan.md, E-1 part 2) gives the native side its own interface.
 
+// G5b: the placed blocks of the buffer cache (B9.4: one Vulkan buffer for the memory of one or a few engine buffers), their zero copy memory and the create / delete events that move them.
+// Vulkan work stays here; the raster thread's in-order table of engine buffers is `native/native_buffer_index.*`. Engine buffer ids appear here only as the keys of a block's members.
+
 namespace VideoCore {
 
 void BufferCache::NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool native) {
-    {
-        std::unique_lock ordered_lock{ordered_mutex};
-        if (const auto it = ordered_by_id.find(id); it != ordered_by_id.end()) {
-            if (const auto at = ordered_by_address.find(it->second); at != ordered_by_address.end() && at->second.id == id) {
-                ordered_by_address.erase(at);
-            }
-            ordered_by_id.erase(it);
-        }
-    }
+    ordered.Delete(id);
     Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9BuffersDeleted);
     if (Core::NativeUpdates::B9PlaceOn()) {
         // B9.4: the block that holds it loses the member; a block with no member left is freed (its contents are gone with them)
@@ -423,9 +418,7 @@ void BufferCache::Demote(VAddr begin, bool by_request) {
 
 void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, bool texture, u32 usage, u32 cpu_access) {
     if (!texture && bytes != 0) {
-        std::unique_lock ordered_lock{ordered_mutex};
-        ordered_by_address[address] = {address + bytes, id, usage, cpu_access};
-        ordered_by_id[id] = address;
+        ordered.Create(id, address, bytes, usage, cpu_access);
     }
     if (!Core::NativeUpdates::B9PlaceOn() || bytes == 0) {
         return;
@@ -508,90 +501,30 @@ bool BufferCache::ZeroCopyOn() const noexcept {
     return on && !zero_copy_unavailable.load(std::memory_order_relaxed);
 }
 
-bool BufferCache::OrderedViewOn() noexcept {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_ORDERED_VIEW");
-        // the ordered view needs the create and delete events of buffers (placement and lifetime modes of the native updates)
-        return e != nullptr && e[0] == '1' && Core::NativeUpdates::B9PlaceOn() && Core::NativeUpdates::B2NativeMode() != 0 && Core::NativeUpdates::B9LifetimeMode() != 0;
-    }();
-    return on;
-}
-
 void BufferCache::BuffersInView(VAddr address, u64 size, std::vector<Core::NativeDevice::BufferPart>& out) {
-    if (!OrderedViewOn()) {
+    if (!Core::NativeBufferIndex::Ordered::On()) {
         Core::NativeDevice::BuffersIn(address, size, out);
         return;
     }
-    if (size == 0) {
-        return;
-    }
-    const VAddr end = address + size;
-    std::shared_lock lock{ordered_mutex};
-    auto it = ordered_by_address.lower_bound(end);
-    u32 below = 0; // as the live table: a few entries that start before the range are looked at
-    while (it != ordered_by_address.begin() && below < 16) {
-        --it;
-        if (it->first < address) {
-            ++below;
-        }
-        if (it->second.end <= address) {
-            continue;
-        }
-        out.push_back({it->second.id, std::max(it->first, address), std::min<VAddr>(it->second.end, end), it->second.usage, it->second.cpu_access, it->first, it->second.end});
-    }
+    ordered.BuffersIn(address, size, out);
 }
 
 bool BufferCache::ResourceAtView(VAddr address, Core::NativeDevice::Object& out) const {
-    if (!OrderedViewOn()) {
+    if (!Core::NativeBufferIndex::Ordered::On()) {
         return Core::NativeDevice::ResourceAt(address, out);
     }
-    std::shared_lock lock{ordered_mutex};
-    auto it = ordered_by_address.upper_bound(address);
-    if (it == ordered_by_address.begin()) {
-        return false;
-    }
-    --it;
-    if (address >= std::max(it->second.end, it->first + 1)) {
-        return false;
-    }
-    out = {};
-    out.id = it->second.id;
-    out.kind = Core::NativeDevice::Kind::Buffer;
-    out.alive = true;
-    out.usage = it->second.usage;
-    out.cpu_access = it->second.cpu_access;
-    out.address = it->first;
-    out.bytes = it->second.end - it->first;
-    return true;
+    return ordered.ResourceAt(address, out);
 }
 
 bool BufferCache::LookupView(u64 id, Core::NativeDevice::Object& out) const {
-    if (!OrderedViewOn()) {
+    if (!Core::NativeBufferIndex::Ordered::On()) {
         return Core::NativeDevice::Lookup(id, out);
     }
-    std::shared_lock lock{ordered_mutex};
-    const auto by_id = ordered_by_id.find(id);
-    if (by_id == ordered_by_id.end()) {
-        return false;
-    }
-    const auto at = ordered_by_address.find(by_id->second);
-    if (at == ordered_by_address.end() || at->second.id != id) {
-        return false;
-    }
-    out = {};
-    out.id = id;
-    out.kind = Core::NativeDevice::Kind::Buffer;
-    out.alive = true;
-    out.usage = at->second.usage;
-    out.cpu_access = at->second.cpu_access;
-    out.address = at->first;
-    out.bytes = at->second.end - at->first;
-    return true;
+    return ordered.Lookup(id, out);
 }
 
 void BufferCache::OrderedViewCheck(VAddr address, u64 size, bool written) {
-    static const bool on = [] { const char* e = std::getenv("TLG_ORDERED_VIEW_CHECK"); return e != nullptr && e[0] == '1'; }();
-    if (!on || size == 0) {
+    if (!Core::NativeBufferIndex::Ordered::CheckOn() || size == 0) {
         return;
     }
     static thread_local std::vector<Core::NativeDevice::BufferPart> live;
@@ -601,26 +534,14 @@ void BufferCache::OrderedViewCheck(VAddr address, u64 size, bool written) {
     for (const auto& part : live) {
         live_ids.push_back(part.id);
     }
-    {
-        std::shared_lock lock{ordered_mutex};
-        auto it = ordered_by_address.upper_bound(address);
-        if (it != ordered_by_address.begin()) {
-            --it;
-        }
-        for (; it != ordered_by_address.end() && it->first < address + size; ++it) {
-            if (it->second.end > address) {
-                ordered_ids.push_back(it->second.id);
-            }
-        }
-    }
+    ordered.IdsIn(address, size, ordered_ids);
     std::ranges::sort(live_ids);
     std::ranges::sort(ordered_ids);
     live_ids.erase(std::unique(live_ids.begin(), live_ids.end()), live_ids.end());
     const bool extra_live = std::ranges::any_of(live_ids, [&](u64 id) { return !std::ranges::binary_search(ordered_ids, id); });
     const bool extra_ordered = std::ranges::any_of(ordered_ids, [&](u64 id) { return !std::ranges::binary_search(live_ids, id); });
     const u32 cls = extra_live ? (extra_ordered ? 3u : 1u) : (extra_ordered ? 2u : 0u);
-    ordered_counts[written ? 1 : 0][4].fetch_add(1, std::memory_order_relaxed);
-    ordered_counts[written ? 1 : 0][cls].fetch_add(1, std::memory_order_relaxed);
+    ordered.NoteCheck(written, cls);
     if (cls != 0) {
         static std::atomic<u32> noted[4]{};
         if (noted[cls].fetch_add(1, std::memory_order_relaxed) < 6) {
@@ -640,8 +561,7 @@ void BufferCache::OrderedViewCheck(VAddr address, u64 size, bool written) {
 
 nlohmann::json BufferCache::ZeroCopyReport() const {
     return {{"on", ZeroCopyOn()},
-            {"ordered_view_check", {{"read", {{"requests", ordered_counts[0][4].load()}, {"same", ordered_counts[0][0].load()}, {"live_has_more", ordered_counts[0][1].load()}, {"ordered_has_more", ordered_counts[0][2].load()}, {"both_differ", ordered_counts[0][3].load()}}},
-                                    {"written", {{"requests", ordered_counts[1][4].load()}, {"same", ordered_counts[1][0].load()}, {"live_has_more", ordered_counts[1][1].load()}, {"ordered_has_more", ordered_counts[1][2].load()}, {"both_differ", ordered_counts[1][3].load()}}}}},
+            {"ordered_view_check", ordered.CheckReport()},
             {"direct_writes", zero_copy_counts[0].load()},
             {"direct_write_ranges", zero_copy_counts[1].load()},
             {"direct_write_bytes", zero_copy_counts[2].load()},
