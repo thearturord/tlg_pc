@@ -131,16 +131,10 @@ public:
     void FrontQueueOp(DrawPlan* draw, DispatchPlan* dispatch, u64 position, u64 done, u64 seq = 0, bool indexed = false, u32 index_offset = 0);
     /// Raster thread: the plan the next draw or dispatch runs from (for the ring bindings); Stamp after it was recorded.
     void BeginRingUse(const DrawPlan* draw, const DispatchPlan* dispatch) noexcept {
-        ring_draw = draw;
-        ring_dispatch = dispatch;
+        ring_use.Begin(draw, dispatch);
     }
     void EndRingUse() noexcept;
-    struct RingStats {
-        u64 queued{}, written_buffers{}, offered{}, taken{}, bytes{};
-        u64 no_sharp{}, written{}, formatted{}, too_large{}, immutable{}, gpu_modified{}, pending_write{}, ring_full{};
-        u64 bound{};
-        u64 verified{}, differing{};
-    };
+    using RingStats = Core::NativePlan::RingStats;
     RingStats TakeRingStats() noexcept;
     /// N7.5, in place buffers (`TLG_INPLACE=1`): read-only buffers up to `TLG_INPLACE_CAP` bytes (default 16 KiB) in guest memory are bound where they are, from an import of the
     /// runtime's always read/write view of guest memory (`HostImport`), with no copy and no dirty tracking.
@@ -374,12 +368,8 @@ private:
     void FrontGeometryRing(DrawPlan& plan, u64 done, bool indexed, u32 index_offset);
     [[nodiscard]] const RingBinding* FindGeometryRing(VAddr address, u64 size, u32 kind) const noexcept;
     // Raster thread:
-    const DrawPlan* ring_draw = nullptr;
-    const DispatchPlan* ring_dispatch = nullptr;
+    Core::NativePlan::RingUse ring_use;
     const RingBinding* FindRingBinding(const Shader::Info& stage, u32 index) const noexcept;
-    std::atomic<u64> ring_queued{0}, ring_written_buffers{0}, ring_offered{0}, ring_taken{0}, ring_bytes{0};
-    std::atomic<u64> ring_no_sharp{0}, ring_written{0}, ring_formatted{0}, ring_too_large{0}, ring_immutable{0}, ring_gpu_modified{0}, ring_pending_write{0},
-        ring_full{0}, ring_bound{0};
 
     /// Render state memo (the port's `RenderStateMemo`, tlg_pc docs/parallel_gpu.md): about 90 % of the draws continue the render pass the draw before
     /// them opened. Such a draw gets that draw's render state back instead of redoing the target lookups, the layout transitions and the attachment

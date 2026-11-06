@@ -1448,9 +1448,9 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
     vk::Buffer index_buffer{};
     u64 buffer_offset{};
     const RingBinding* index_ring = index_buffer_size != 0 && !is_indirect ? FindGeometryRing(index_address, index_buffer_size, GeometryIndex) : nullptr;
-    if (index_buffer_size != 0 && !is_indirect && ring_draw != nullptr && Core::NativeUploads::RingGeometry()) {
+    if (index_buffer_size != 0 && !is_indirect && ring_use.draw != nullptr && Core::NativeUploads::RingGeometry()) {
         bool has_entry = false;
-        for (const auto& ring : ring_draw->geometry_ring) {
+        for (const auto& ring : ring_use.draw->geometry_ring) {
             has_entry |= ring.index == GeometryIndex;
         }
         Core::NativeUploads::NoteGeometry(index_ring != nullptr ? 14 : has_entry ? 15 : 29);
@@ -1667,7 +1667,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             vk::AccessFlagBits2::eShaderRead |
             (desc.is_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eNone);
         const RingBinding* ring =
-            const_ring_level >= 4 && (ring_draw || ring_dispatch) ? FindRingBinding(stage, buffer_index) : nullptr;
+            const_ring_level >= 4 && (ring_use.draw || ring_use.dispatch) ? FindRingBinding(stage, buffer_index) : nullptr;
         if (ring != nullptr && ring->formatted) {
             // N5f: a texel buffer may be the memory of an image (a surface a shader reads as a buffer, HTile, CMask): only the raster thread knows
             if (texture_cache.AnyImageOverlaps(ring->address, ring->size) || texture_cache.IsMeta(ring->address)) {
@@ -1687,7 +1687,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 push_data.AddOffset(binding.buffer, 0);
             }
             buffer_infos.emplace_back(constant_ring->Handle(), ring->offset, ring->size);
-            ring_bound.fetch_add(1, std::memory_order_relaxed);
+            ring_use.bound.fetch_add(1, std::memory_order_relaxed);
             if (Core::NativeUploads::RingPrecise() && ring->address != 0 && buffer_cache.IsRangeGpuWritten(ring->address, ring->size)) {
                 Core::NativeUploads::NoteRingPrecise(1); // the GPU wrote bytes of this range after the command processor copied it
             }

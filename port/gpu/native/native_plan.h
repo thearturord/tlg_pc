@@ -7,6 +7,7 @@
 // `PlanPool` keeps the finished plans for reuse; `PlanDigest` is the hash of what a plan holds (diagnostics and the plan cache check).
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -135,6 +136,34 @@ struct DispatchPlan {
 [[nodiscard]] u64 PlanDigest(const DispatchPlan& plan);
 /// Back to the empty state (kept capacity).
 void ResetStage(StagePlan& stage);
+
+/// Counters of the constant ring front (command processor thread) and of its use (raster thread); `RingUse::Take` reads and clears them.
+struct RingStats {
+    u64 queued{}, written_buffers{}, offered{}, taken{}, bytes{};
+    u64 no_sharp{}, written{}, formatted{}, too_large{}, immutable{}, gpu_modified{}, pending_write{}, ring_full{};
+    u64 bound{};
+    u64 verified{}, differing{};
+};
+
+/// Raster thread: the plan the next draw or dispatch runs from, for its ring bindings (set before recording, cleared after), and the ring counters.
+struct RingUse {
+    const DrawPlan* draw = nullptr;
+    const DispatchPlan* dispatch = nullptr;
+    std::atomic<u64> queued{0}, written_buffers{0}, offered{0}, taken{0}, bytes{0};
+    std::atomic<u64> no_sharp{0}, written{0}, formatted{0}, too_large{0}, immutable{0}, gpu_modified{0}, pending_write{0}, full{0}, bound{0};
+
+    void Begin(const DrawPlan* d, const DispatchPlan* c) noexcept {
+        draw = d;
+        dispatch = c;
+    }
+    /// The ring binding of the buffer `index` of the stage whose Info is `info` in the current plan (null: none).
+    [[nodiscard]] const RingBinding* Find(const Shader::Info* info, u32 index) const noexcept;
+    /// The ring copy of a vertex or index range of the current draw (null: none).
+    [[nodiscard]] const RingBinding* FindGeometry(VAddr address, u64 size, u32 kind) const noexcept;
+    /// The ring position after the current plan's copies (0: none); clears the current plan.
+    u64 End() noexcept;
+    [[nodiscard]] RingStats Take() noexcept;
+};
 
 /// Finished plans, reused by the next planning (thread safe: the raster thread gives back, the command processor thread takes).
 class PlanPool {

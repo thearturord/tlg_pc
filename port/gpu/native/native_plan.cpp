@@ -52,6 +52,67 @@ u64 PlanDigest(const DispatchPlan& plan) {
     return DigestStage(Mix(0xcbf29ce484222325ull, reinterpret_cast<u64>(plan.pipeline)), plan.stage);
 }
 
+const RingBinding* RingUse::Find(const Shader::Info* info, u32 index) const noexcept {
+    const StagePlan* plan_stage = nullptr;
+    if (draw) {
+        for (const auto& candidate : draw->stages) {
+            if (candidate.info == info) {
+                plan_stage = &candidate;
+                break;
+            }
+        }
+    } else if (dispatch && dispatch->stage.info == info) {
+        plan_stage = &dispatch->stage;
+    }
+    if (!plan_stage) {
+        return nullptr;
+    }
+    for (const auto& ring : plan_stage->ring) {
+        if (ring.index == index) {
+            return &ring;
+        }
+    }
+    return nullptr;
+}
+
+const RingBinding* RingUse::FindGeometry(VAddr address, u64 size, u32 kind) const noexcept {
+    if (draw == nullptr) {
+        return nullptr;
+    }
+    for (const auto& ring : draw->geometry_ring) {
+        if (ring.index == kind && ring.address == address && ring.size == size) {
+            return &ring;
+        }
+    }
+    return nullptr;
+}
+
+u64 RingUse::End() noexcept {
+    const u64 end = draw ? draw->ring_end : dispatch ? dispatch->ring_end : 0;
+    draw = nullptr;
+    dispatch = nullptr;
+    return end;
+}
+
+RingStats RingUse::Take() noexcept {
+    RingStats s;
+    s.queued = queued.exchange(0);
+    s.written_buffers = written_buffers.exchange(0);
+    s.offered = offered.exchange(0);
+    s.taken = taken.exchange(0);
+    s.bytes = bytes.exchange(0);
+    s.no_sharp = no_sharp.exchange(0);
+    s.written = written.exchange(0);
+    s.formatted = formatted.exchange(0);
+    s.too_large = too_large.exchange(0);
+    s.immutable = immutable.exchange(0);
+    s.gpu_modified = gpu_modified.exchange(0);
+    s.pending_write = pending_write.exchange(0);
+    s.ring_full = full.exchange(0);
+    s.bound = bound.exchange(0);
+    return s;
+}
+
 std::unique_ptr<DrawPlan> PlanPool::TakeDraw() {
     {
         std::scoped_lock lk{mutex};

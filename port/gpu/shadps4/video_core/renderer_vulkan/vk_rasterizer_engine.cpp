@@ -707,7 +707,7 @@ void Rasterizer::FrontStageNotes(StagePlan& stage, u64 position, const DrawPlan*
             continue;
         }
         NotePendingGpuWrite(vsharp.address, vsharp.size, position);
-        ring_written_buffers.fetch_add(1, std::memory_order_relaxed);
+        ring_use.written_buffers.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -722,43 +722,43 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
         const auto& desc = buffers[index];
         if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::Flatbuf && !stage.flat.empty()) {
-                ring_offered.fetch_add(1, std::memory_order_relaxed);
+                ring_use.offered.fetch_add(1, std::memory_order_relaxed);
                 const u64 size = stage.flat.size() * sizeof(u32);
                 if (const auto offset = constant_ring->Allocate(size, alignment)) {
                     std::memcpy(constant_ring->Data(*offset), stage.flat.data(), size);
                     constant_ring->Flush(*offset, size);
                     stage.ring.push_back({index, static_cast<u32>(size), *offset, 0});
-                    ring_taken.fetch_add(1, std::memory_order_relaxed);
-                    ring_bytes.fetch_add(size, std::memory_order_relaxed);
+                    ring_use.taken.fetch_add(1, std::memory_order_relaxed);
+                    ring_use.bytes.fetch_add(size, std::memory_order_relaxed);
                 } else {
-                    ring_full.fetch_add(1, std::memory_order_relaxed);
+                    ring_use.full.fetch_add(1, std::memory_order_relaxed);
                 }
             }
             continue;
         }
-        ring_offered.fetch_add(1, std::memory_order_relaxed);
+        ring_use.offered.fetch_add(1, std::memory_order_relaxed);
         if (desc.is_written) {
-            ring_written.fetch_add(1, std::memory_order_relaxed);
+            ring_use.written.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
         if (desc.is_formatted && !Core::NativeUploads::RingFormatted()) {
-            ring_formatted.fetch_add(1, std::memory_order_relaxed);
+            ring_use.formatted.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
         const auto vsharp = PlanBufferDesc(owner, stage, desc, view);
         const VAddr address = vsharp.address;
         const u64 size = vsharp.size;
         if (address == 0 || size == 0) {
-            ring_no_sharp.fetch_add(1, std::memory_order_relaxed);
+            ring_use.no_sharp.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
         if (size > VideoCore::BufferCache::StreamThreshold()) {
-            ring_too_large.fetch_add(1, std::memory_order_relaxed);
+            ring_use.too_large.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
         // An immutable engine buffer is read straight from its arena (no copy at all): the ring would make it dearer.
         if (Core::NativeResources::ImmutableResidencyEnabled() && Core::NativeResources::FindImmutable(address, size)) {
-            ring_immutable.fetch_add(1, std::memory_order_relaxed);
+            ring_use.immutable.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
         // N6a: the decisions below read the buffer cache's state of this range (GPU written, pending writes) and then its bytes; a queued write to the range changes both
@@ -766,7 +766,7 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
         if (Core::NativeUploads::RingPrecise()) {
             // N5e: the bytes decide, not the 4 KB page that holds them
             if (buffer_cache.IsRangeGpuWritten(address, size)) {
-                ring_gpu_modified.fetch_add(1, std::memory_order_relaxed);
+                ring_use.gpu_modified.fetch_add(1, std::memory_order_relaxed);
                 Core::NativeUploads::NoteRingPrecise(2);
                 continue;
             }
@@ -774,16 +774,16 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
                 Core::NativeUploads::NoteRingPrecise(0);
             }
         } else if (buffer_cache.IsRegionGpuModified(address, size)) {
-            ring_gpu_modified.fetch_add(1, std::memory_order_relaxed);
+            ring_use.gpu_modified.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
         if (PendingGpuWriteOverlaps(address, size, done)) {
-            ring_pending_write.fetch_add(1, std::memory_order_relaxed);
+            ring_use.pending_write.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
         const auto offset = constant_ring->Allocate(size, alignment);
         if (!offset) {
-            ring_full.fetch_add(1, std::memory_order_relaxed);
+            ring_use.full.fetch_add(1, std::memory_order_relaxed);
             continue; // never wait: the binding stays on the raster thread
         }
         bool from_snapshot = false;
@@ -843,8 +843,8 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
         Core::DrainAudit::Copied(Core::DrainAudit::ReadRingConstant, address, constant_ring->Data(*offset), size);
         constant_ring->Flush(*offset, size);
         stage.ring.push_back({index, static_cast<u32>(size), *offset, address, from_snapshot, desc.is_formatted});
-        ring_taken.fetch_add(1, std::memory_order_relaxed);
-        ring_bytes.fetch_add(size, std::memory_order_relaxed);
+        ring_use.taken.fetch_add(1, std::memory_order_relaxed);
+        ring_use.bytes.fetch_add(size, std::memory_order_relaxed);
     }
 }
 
@@ -984,22 +984,14 @@ void Rasterizer::FrontGeometryRing(DrawPlan& plan, u64 done, bool indexed, u32 i
 }
 
 const RingBinding* Rasterizer::FindGeometryRing(VAddr address, u64 size, u32 kind) const noexcept {
-    if (ring_draw == nullptr || const_ring_level < 4) {
-        return nullptr;
-    }
-    for (const auto& ring : ring_draw->geometry_ring) {
-        if (ring.index == kind && ring.address == address && ring.size == size) {
-            return &ring;
-        }
-    }
-    return nullptr;
+    return const_ring_level < 4 ? ring_use.FindGeometry(address, size, kind) : nullptr;
 }
 
 void Rasterizer::FrontQueueOp(DrawPlan* draw, DispatchPlan* dispatch, u64 position, u64 done, u64 seq, bool indexed, u32 index_offset) {
     if (const_ring_level == 0 || (!draw && !dispatch)) {
         return;
     }
-    ring_queued.fetch_add(1, std::memory_order_relaxed);
+    ring_use.queued.fetch_add(1, std::memory_order_relaxed);
     // First everything the plan writes (a read-only binding of the same plan may alias a written one), then the copies.
     if (draw) {
         for (auto& stage : draw->stages) {
@@ -1024,56 +1016,18 @@ void Rasterizer::FrontQueueOp(DrawPlan* draw, DispatchPlan* dispatch, u64 positi
 }
 
 const RingBinding* Rasterizer::FindRingBinding(const Shader::Info& stage, u32 index) const noexcept {
-    const StagePlan* plan_stage = nullptr;
-    if (ring_draw) {
-        for (const auto& candidate : ring_draw->stages) {
-            if (candidate.info == &stage) {
-                plan_stage = &candidate;
-                break;
-            }
-        }
-    } else if (ring_dispatch && ring_dispatch->stage.info == &stage) {
-        plan_stage = &ring_dispatch->stage;
-    }
-    if (!plan_stage) {
-        return nullptr;
-    }
-    for (const auto& ring : plan_stage->ring) {
-        if (ring.index == index) {
-            return &ring;
-        }
-    }
-    return nullptr;
+    return ring_use.Find(&stage, index);
 }
 
 void Rasterizer::EndRingUse() noexcept {
-    if (constant_ring && (ring_draw || ring_dispatch)) {
-        const u64 end = ring_draw ? ring_draw->ring_end : ring_dispatch->ring_end;
-        if (end != 0) {
-            constant_ring->Stamp(end);
-        }
+    const u64 end = ring_use.End();
+    if (constant_ring && end != 0) {
+        constant_ring->Stamp(end);
     }
-    ring_draw = nullptr;
-    ring_dispatch = nullptr;
 }
 
 Rasterizer::RingStats Rasterizer::TakeRingStats() noexcept {
-    RingStats s;
-    s.queued = ring_queued.exchange(0);
-    s.written_buffers = ring_written_buffers.exchange(0);
-    s.offered = ring_offered.exchange(0);
-    s.taken = ring_taken.exchange(0);
-    s.bytes = ring_bytes.exchange(0);
-    s.no_sharp = ring_no_sharp.exchange(0);
-    s.written = ring_written.exchange(0);
-    s.formatted = ring_formatted.exchange(0);
-    s.too_large = ring_too_large.exchange(0);
-    s.immutable = ring_immutable.exchange(0);
-    s.gpu_modified = ring_gpu_modified.exchange(0);
-    s.pending_write = ring_pending_write.exchange(0);
-    s.ring_full = ring_full.exchange(0);
-    s.bound = ring_bound.exchange(0);
-    return s;
+    return ring_use.Take();
 }
 
 void Rasterizer::OcclusionOpen(VAddr address, u32 pairs) {
