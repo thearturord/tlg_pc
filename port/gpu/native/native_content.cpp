@@ -713,7 +713,7 @@ void WaitRasterSubmissions(u32 target) {
 }
 
 bool ProgressWaitsOn() {
-    static const bool on = [] { const char* e = std::getenv("TLG_PROGRESS_WAITS"); return e != nullptr && e[0] == '1'; }();
+    static const bool on = [] { const char* e = std::getenv("TLG_PROGRESS_WAITS"); return e == nullptr || e[0] != '0'; }(); // default on since 2026-11-06, =0 turns it off
     return on;
 }
 
@@ -757,7 +757,7 @@ std::atomic<u64> c_lap_blocks{0}, c_lap_laps{0}, c_lap_checked{0}, c_lap_waits{0
 } // namespace
 
 bool RingLapFenceOn() {
-    static const bool on = [] { const char* e = std::getenv("TLG_RING_LAP_FENCE"); return e != nullptr && e[0] == '1'; }();
+    static const bool on = [] { const char* e = std::getenv("TLG_RING_LAP_FENCE"); return e == nullptr || e[0] != '0'; }(); // default on since 2026-11-06, =0 turns it off
     return on;
 }
 

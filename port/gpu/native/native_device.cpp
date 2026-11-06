@@ -1047,10 +1047,10 @@ bool HoldArmAllOn() {
     return on;
 }
 std::atomic<u64> hold_unsafe_blocks{0}, hold_unsafe_bytes{0}, hold_open_waits{0}, hold_open_wait_ns{0}, hold_open_same_thread{0}, hold_open_gave_up{0};
-/// TLG_HOLD_WAIT_OPEN=1 (needs TLG_PROGRESS_WAITS=1): a dry heap whose held blocks were freed in the submission window still being built waits for the game to announce that submission
+/// TLG_HOLD_WAIT_OPEN (default on, =0 off; needs TLG_PROGRESS_WAITS=1): a dry heap whose held blocks were freed in the submission window still being built waits for the game to announce that submission
 /// (when another thread does) and for the raster thread to finish it, instead of releasing those blocks unsafely.
 bool HoldWaitOpenOn() {
-    static const bool on = [] { const char* e = std::getenv("TLG_HOLD_WAIT_OPEN"); return e != nullptr && e[0] == '1'; }();
+    static const bool on = [] { const char* e = std::getenv("TLG_HOLD_WAIT_OPEN"); return e == nullptr || e[0] != '0'; }(); // default on since 2026-11-06, =0 turns it off
     return on;
 }
 std::atomic<u64> hold_count{0}, hold_at_once{0}, hold_released{0}, hold_forced{0}, hold_max_pending{0}, hold_max_bytes{0}, hold_alloc_failed{0}, hold_alloc_failed_twice{0}, hold_mid_released{0};
