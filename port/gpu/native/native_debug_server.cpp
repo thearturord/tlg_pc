@@ -203,7 +203,7 @@ nlohmann::json Native(const Params&) {
         j["overlay_changed_top"] = list;
     }
     j["map_native"] = {{"tried", live.map_tried.load()}, {"patched", live.map_patched.load()}, {"refused", live.map_refused.load()}, {"executed", live.map_exec.load()}};
-    j["stage_key"] = {{"hits", live.stage_key_hits.load()}, {"misses", live.stage_key_misses.load()}, {"uncached", live.stage_key_uncached.load()},
+    j["stage_key"] = {{"typed_hits", live.stage_key_typed_hits.load()}, {"learning_hits", live.stage_key_hits.load()}, {"misses", live.stage_key_misses.load()}, {"uncached", live.stage_key_uncached.load()},
                       {"audits", live.stage_key_audits.load()}, {"violations", live.stage_key_violations.load()}};
     j["draw_args"] = {{"draws_with_typed_arguments", live.draw_args_typed.load()}};
     j["exec_inputs"] = {{"typed", live.exec_typed.load()}, {"fallback", live.exec_fallback.load()}, {"fallback_learning_planned", live.plan_register_free.load()}, {"fallback_refused", live.plan_refused.load()}, 

@@ -13,12 +13,6 @@
 #include <string>
 #include <vector>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
 #include <nlohmann/json.hpp>
 #include "common/logging/log.h"
 #include "native/native_drain_audit.h"
@@ -78,9 +72,6 @@ struct State {
     std::array<std::atomic<u64>, KindCount> lazy_wait_ns_by_kind{};
     std::map<u32, std::pair<u64, u64>> lazy_by_line; // line of the write waited for -> {waits, ns}
     // verification
-    std::atomic<u64> bytes_lookups{}, bytes_copies{}, bytes_unreadable{}, bytes_stale{}, bytes_stale_near_write{};
-    std::array<std::atomic<u64>, 4> plan_lookups{}, plan_differs{};
-    std::atomic<u64> logged{0};
 };
 
 State& S() {
@@ -107,49 +98,6 @@ struct Window {
 thread_local Window window;
 thread_local u64 next_address = 0, next_bytes = 0;
 thread_local bool next_set = false;
-
-struct CopyNote {
-    Kind kind;
-    u64 address;
-    u64 bytes;
-    u64 hash;
-};
-thread_local bool verify_bytes = false;
-thread_local std::vector<CopyNote> copies;
-
-u64 Fnv(const u8* data, u64 bytes) {
-    u64 h = 0xcbf29ce484222325ull;
-    u64 i = 0;
-    for (; i + 8 <= bytes; i += 8) {
-        u64 word;
-        std::memcpy(&word, data + i, 8);
-        h = (h ^ word) * 0x100000001b3ull;
-    }
-    for (; i < bytes; ++i) {
-        h = (h ^ data[i]) * 0x100000001b3ull;
-    }
-    return h;
-}
-
-constexpr u64 HashLimit = 64 * 1024;
-
-/// Hash of guest memory [address, address + bytes) (at most the first 64 KB); false if it cannot be read.
-bool HashGuest(u64 address, u64 bytes, u64& hash) {
-#ifdef _WIN32
-    thread_local std::vector<u8> buffer;
-    const u64 n = std::min(bytes, HashLimit);
-    buffer.resize(n);
-    SIZE_T got = 0;
-    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(address), buffer.data(), n, &got) || got != n) {
-        return false;
-    }
-    hash = Fnv(buffer.data(), n);
-    return true;
-#else
-    hash = Fnv(reinterpret_cast<const u8*>(address), std::min(bytes, HashLimit));
-    return true;
-#endif
-}
 
 bool Overlaps(const PendingWrite& write, u64 address, u64 bytes) {
     if (write.address == NoGuestMemory) {
@@ -180,14 +128,6 @@ bool LazyEnabled() {
         return e == nullptr || *e == 0 || *e != '0';
     }();
     return on;
-}
-
-u32 VerifyEvery() {
-    static const u32 every = [] {
-        const char* e = std::getenv("TLG_DRAIN_VERIFY");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 0u; // off by default: the full waits of the verified plannings made the frame rate uneven
-    }();
-    return every;
 }
 
 bool Active() {
@@ -374,50 +314,14 @@ void WalkerRead(const u32* user_data, u32 count) {
     }
 }
 
-void Copied(Kind kind, u64 address, const void* copy, u64 bytes) {
-    if (!verify_bytes || bytes == 0 || copies.size() >= 512) {
-        return;
-    }
-    copies.push_back({kind, address, bytes, Fnv(static_cast<const u8*>(copy), std::min(bytes, HashLimit))});
-}
-
-Verify LookupBegin(u32 site) {
+void LookupBegin() {
     if (!LazyEnabled()) {
-        return Verify::None;
+        return;
     }
     auto& s = S();
     s.lazy_lookups.fetch_add(1, std::memory_order_relaxed);
-    const bool pending = s.done != nullptr && s.last_write_position.load(std::memory_order_acquire) > Completed(s);
-    if (pending) {
+    if (s.done != nullptr && s.last_write_position.load(std::memory_order_acquire) > Completed(s)) {
         s.lazy_lookups_with_pending.fetch_add(1, std::memory_order_relaxed);
-    }
-    const u32 every = VerifyEvery();
-    if (every == 0 || !pending) {
-        return Verify::None;
-    }
-    // the verified plannings are chosen among those that find a write pending (the others cannot show anything)
-    static std::atomic<u64> tick{0};
-    const u64 n = tick.fetch_add(1, std::memory_order_relaxed);
-    if (n % every != 0) {
-        return Verify::None;
-    }
-    (void)site;
-    if (((n / every) & 1) == 0) {
-        verify_bytes = true;
-        copies.clear();
-        return Verify::Bytes;
-    }
-    return Verify::Plan;
-}
-
-void NotePlanVerify(u32 site, bool same) {
-    auto& s = S();
-    s.plan_lookups[std::min<u32>(site, 3)].fetch_add(1, std::memory_order_relaxed);
-    if (!same) {
-        s.plan_differs[std::min<u32>(site, 3)].fetch_add(1, std::memory_order_relaxed);
-        if (s.logged.fetch_add(1) < 20) {
-            TLG_LOG(GATE, Error, "lazy drain: the plan made without waiting differs from the plan made after the full wait (site {})", site);
-        }
     }
 }
 
@@ -426,61 +330,6 @@ void LookupDone() {
         return;
     }
     auto& s = S();
-    if (verify_bytes) {
-        verify_bytes = false;
-        std::vector<PendingWrite> unfinished; // the writes this check waits for: a range that changes and lies near one of them is a missed dependency
-        if (s.done != nullptr) {
-            const u64 last = s.last_write_position.load(std::memory_order_acquire);
-            if (last > Completed(s)) {
-                {
-                    std::scoped_lock lk{s.mutex};
-                    const u64 done = Completed(s);
-                    for (auto it = s.writes.rbegin(); it != s.writes.rend() && it->position > done; ++it) {
-                        unfinished.push_back(*it);
-                    }
-                }
-                s.wait_for(last);
-            }
-        }
-        s.bytes_lookups.fetch_add(1, std::memory_order_relaxed);
-        for (const auto& note : copies) {
-            u64 now = 0;
-            s.bytes_copies.fetch_add(1, std::memory_order_relaxed);
-            if (!HashGuest(note.address, note.bytes, now)) {
-                s.bytes_unreadable.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            if (now != note.hash) {
-                s.bytes_stale.fetch_add(1, std::memory_order_relaxed);
-                const PendingWrite* nearest = nullptr;
-                u64 nearest_gap = ~0ull;
-                for (const auto& write : unfinished) {
-                    if (write.address == NoGuestMemory) {
-                        continue;
-                    }
-                    const u64 lo = write.address, hi = write.address + write.bytes;
-                    const u64 gap = note.address >= hi ? note.address - hi : lo >= note.address + note.bytes ? lo - (note.address + note.bytes) : 0;
-                    if (gap < nearest_gap) {
-                        nearest_gap = gap;
-                        nearest = &write;
-                    }
-                }
-                const bool near_write = nearest != nullptr && nearest_gap <= (64u << 10);
-                if (near_write) {
-                    s.bytes_stale_near_write.fetch_add(1, std::memory_order_relaxed);
-                }
-                if (s.logged.fetch_add(1) < 20) {
-                    if (nearest != nullptr) {
-                        TLG_LOG(GATE, Error, "lazy drain: {} copied from {:#x} ({} bytes) changed after the full wait; {} writes were unfinished, the nearest (liverpool.cpp:{}, {:#x}, {} bytes) is {} bytes away",
-                                  kind_names[note.kind], note.address, note.bytes, unfinished.size(), nearest->line, nearest->address, nearest->bytes, nearest_gap);
-                    } else {
-                        TLG_LOG(GATE, Error, "lazy drain: {} copied from {:#x} ({} bytes) changed after the full wait; no write was unfinished (changed by something else)", kind_names[note.kind], note.address, note.bytes);
-                    }
-                }
-            }
-        }
-        copies.clear();
-    }
     if (!Enabled()) {
         return;
     }
@@ -521,20 +370,6 @@ nlohmann::json Report() {
             by_kind[kind_names[k]] = {{"waits", s.lazy_waits_by_kind[k].load()}, {"ms", s.lazy_wait_ns_by_kind[k].load() / 1e6}};
         }
         lazy["waits_by_kind_of_read"] = by_kind;
-        nlohmann::json verify;
-        verify["every"] = VerifyEvery();
-        verify["bytes"] = {{"plannings_checked", s.bytes_lookups.load()},
-                           {"ranges_compared", s.bytes_copies.load()},
-                           {"unreadable", s.bytes_unreadable.load()},
-                           {"changed_after_the_full_wait", s.bytes_stale.load()},
-                           {"of_those_within_64KB_of_a_write_the_full_wait_waited_for", s.bytes_stale_near_write.load()}};
-        static constexpr const char* site_names[4] = {"dispatch / draw fallback", "executed draw", "draw from the private registers", "other"};
-        nlohmann::json plan = nlohmann::json::object();
-        for (u32 i = 0; i < 4; ++i) {
-            plan[site_names[i]] = {{"plannings_checked", s.plan_lookups[i].load()}, {"plans_that_differ", s.plan_differs[i].load()}};
-        }
-        verify["plan"] = plan;
-        lazy["verification"] = verify;
         std::scoped_lock lk{s.mutex};
         nlohmann::json by_line = nlohmann::json::object();
         for (const auto& [line, entry] : s.lazy_by_line) {

@@ -183,16 +183,6 @@ public:
     static void ApplyPlan(const DrawPlan& plan);
     static void ApplyPlan(const DispatchPlan& plan);
 
-    /// Plan statistics since the last call: stage inputs compared with the previous draw.
-    struct PlanStats {
-        u64 draws{};
-        u64 draws_all_stages_same{};
-        u64 stages{};
-        u64 stages_same{};
-    };
-    PlanStats TakePlanStats() noexcept {
-        return std::exchange(plan_stats, PlanStats{});
-    }
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule, u64>;
     Result GetProgram(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
@@ -244,8 +234,6 @@ private:
     const FixedState* lookup_fixed{};
     FixedState lookup_fixed_storage{};
     const Core::NativeDispatch::DispatchInputs* lookup_cs{};
-    PlanStats plan_stats{};
-    std::array<u64, MaxShaderStages> last_stage_hash{};
     bool lookup_pinned{}; ///< The lookup reads lookup_inputs/lookup_fixed/lookup_cs as set by the caller.
     /// cp_split_mode: the raster thread's copy of each program's Info.
     tsl::robin_map<const Shader::Info*, std::unique_ptr<Shader::Info>> raster_infos;

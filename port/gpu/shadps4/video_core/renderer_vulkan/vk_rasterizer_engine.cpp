@@ -298,6 +298,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
         RecyclePlan(std::move(plan));
         return nullptr;
     }
+    Core::NativeDraw::Live().stage_key_typed_hits.fetch_add(1, std::memory_order_relaxed);
     plan->has_handles = false;
     plan->has_geometry_handles = false;
     plan->geometry_handle_count = 0;
@@ -840,7 +841,6 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
             memory->CopySparseMemory(address, constant_ring->Data(*offset), size);
             Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::ConstantRing, address, size, seq);
         }
-        Core::DrainAudit::Copied(Core::DrainAudit::ReadRingConstant, address, constant_ring->Data(*offset), size);
         constant_ring->Flush(*offset, size);
         stage.ring.push_back({index, static_cast<u32>(size), *offset, address, from_snapshot, desc.is_formatted});
         ring_use.taken.fetch_add(1, std::memory_order_relaxed);
@@ -890,7 +890,6 @@ void Rasterizer::FrontGeometryRing(DrawPlan& plan, u64 done, bool indexed, u32 i
         }
         memory->CopySparseMemory(address, constant_ring->Data(*offset), size);
         Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::GeometryRing, address, size, plan.native_seq);
-        Core::DrainAudit::Copied(kind == GeometryVertex ? Core::DrainAudit::ReadRingVertex : Core::DrainAudit::ReadRingIndex, address, constant_ring->Data(*offset), size);
         constant_ring->Flush(*offset, size);
         plan.geometry_ring.push_back({kind, static_cast<u32>(size), *offset, address});
         Core::NativeUploads::NoteGeometry(kind == GeometryVertex ? 0 : 1);
@@ -943,9 +942,6 @@ void Rasterizer::FrontGeometryRing(DrawPlan& plan, u64 done, bool indexed, u32 i
                 Core::DrainAudit::Read(Core::DrainAudit::ReadFetch, reinterpret_cast<u64>(table + attrib.dword_offset), sizeof(words));
             }
             std::memcpy(words, table + attrib.dword_offset, sizeof(words));
-            if (attrib.sgpr_base != Shader::IR::NumScalarRegs) {
-                Core::DrainAudit::Copied(Core::DrainAudit::ReadFetch, reinterpret_cast<u64>(table + attrib.dword_offset), words, sizeof(words));
-            }
             Core::NativeDesc::BufferDesc buffer = Core::NativeDesc::BufferDescFromWords(words);
             buffer.address += attrib.inst_offset;
             if (buffer.address != 0 && buffer.size > 0) {

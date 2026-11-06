@@ -205,6 +205,18 @@ def main():
         user_dir = Path(env.get('TLG_USER_DIR', data / 'user')).resolve()
         user_dir.mkdir(parents=True, exist_ok=True)
         env.setdefault('TLG_GPU_USER_DIR', str(user_dir))
+        # The Pro memory setup (garlic_pool_pro, from the environment or an overlay file) needs 8192 MiB of direct memory; with less the game fails its
+        # memory setup, calls LoadExec and this launcher restarts it in a loop.
+        import json
+        pro = env.get('TLG_GARLIC_POOL_PRO', '') not in ('', '0')
+        for overlay in sorted((user_dir / 'custom_configs').glob('*.json')) if not pro else []:
+            try:
+                value = json.loads(overlay.read_text(encoding='utf-8-sig')).get('GPU', {}).get('garlic_pool_pro', 0)
+            except (OSError, ValueError, AttributeError):
+                continue
+            pro = pro or bool(value)
+        if pro and int(env.get('TLG_DMEM_MB', '0') or 0) < 8192:
+            env['TLG_DMEM_MB'] = '8192'
         from save_backup import backup
         try:
             if made := backup(user_dir):

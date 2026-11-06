@@ -2690,11 +2690,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
     }
     if (usable) {
-        ++begin_memo_hits;
         attachment_feedback_loop = false;
         return begin_memo.state;
     }
-    ++begin_memo_misses;
     begin_memo.valid = false;
     RenderState state = BeginRenderingFull(pipeline);
     if (!attachment_feedback_loop) {

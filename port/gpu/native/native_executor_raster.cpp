@@ -110,22 +110,12 @@ void NativeExecutor::BindRasterizer(Core::RasterHost* rasterizer_) {
     }
 }
 
-u32 NativeExecutor::LookupDrain(u32 caller) {
+void NativeExecutor::LookupDrain(u32 caller) {
     if (!Core::DrainAudit::LazyEnabled()) {
         DrainRasterWrites(caller);
-        return 0;
+        return;
     }
-    return static_cast<u32>(Core::DrainAudit::LookupBegin(caller));
-}
-
-Core::DrawPlanPtr NativeExecutor::ReplanAfterDrain(Core::DrawPlanPtr plan, u32 site, const std::function<Core::DrawPlanPtr()>& make) {
-    const u64 before = plan ? rasterizer->DrawPlanDigest(*plan) : 0;
-    DrainRasterWrites(site);
-    auto again = make();
-    const u64 after = again ? rasterizer->DrawPlanDigest(*again) : 0;
-    Core::DrainAudit::NotePlanVerify(site, before == after);
-    rasterizer->RecycleDrawPlan(std::move(plan));
-    return again;
+    Core::DrainAudit::LookupBegin();
 }
 
 static Core::NativeDispatch::DispatchInputs MakeDispatchInputs(const AmdGpu::ComputeProgram& p) {
@@ -161,16 +151,6 @@ static Core::NativeDispatch::DispatchInputs MakeDispatchInputs(const AmdGpu::Com
                        std::memcmp(in.user_data.data(), p.user_data.data(), sizeof(in.user_data)) == 0 && std::memcmp(in.words.data(), &p, sizeof(p)) == 0;
     Core::NativeDispatch::NoteChecked(equal);
     return in;
-}
-
-Core::DispatchPlanPtr NativeExecutor::ReplanAfterDrain(Core::DispatchPlanPtr plan, u32 site, const std::function<Core::DispatchPlanPtr()>& make) {
-    const u64 before = plan ? rasterizer->DispatchPlanDigest(*plan) : 0;
-    DrainRasterWrites(site);
-    auto again = make();
-    const u64 after = again ? rasterizer->DispatchPlanDigest(*again) : 0;
-    Core::DrainAudit::NotePlanVerify(site, before == after);
-    rasterizer->RecycleDispatchPlan(std::move(plan));
-    return again;
 }
 
 void NativeExecutor::RasterDispatch(const RasterCall& call_in) {
@@ -211,13 +191,12 @@ void NativeExecutor::RasterDispatch(const RasterCall& call_in) {
     auto& sp = *split;
     // The lookup below reads descriptor tables and shader code from guest memory: closures that
     // write guest memory (constant engine dumps, WriteData, DMA) must have run first. (A draw planned from its record has had this at its own planning.)
-    u32 verify = 0;
     {
         TLG_PROF_LEVEL("front.lookup_drain", 2);
         if (!Core::DrainAudit::LazyEnabled()) {
             DrainRasterWrites(0);
         } else if (native_exec_plan == nullptr) {
-            verify = LookupDrain(0);
+            LookupDrain(0);
         }
     }
     ++sp.stat_calls;
@@ -235,9 +214,6 @@ void NativeExecutor::RasterDispatch(const RasterCall& call_in) {
         // The pipeline lookup runs here, on the command processor thread (stage 2 of the split).
         TLG_PROF_NAMED_LEVEL(prof_plan_dispatch, "front.plan_dispatch", 2);
         dispatch_plan = rasterizer->MakeDispatchPlan(op.cs);
-        if (verify == 2) {
-            dispatch_plan = ReplanAfterDrain(std::move(dispatch_plan), 0, [&] { return rasterizer->MakeDispatchPlan(op.cs); });
-        }
         if (dispatch_plan && call.tag.valid) {
             rasterizer->TagDispatchPlan(*dispatch_plan, call.tag.seq);
         }
@@ -619,29 +595,21 @@ void NativeExecutor::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 n
                      {"draws_and_dispatches", sp.stat_calls},
                      {"write_drains", sp.stat_write_drains},
                      {"draws", sp.stat_draws},
-                     {"draws_no_register_change", sp.stat_draws_no_reg_change},
-                     {"plan_draws_all_stages_same", host_stats.plan_draws_all_stages_same},
-                     {"plan_draws", host_stats.plan_draws},
-                     {"render_state_memo_hits", host_stats.memo_hits},
-                     {"render_state_memo_misses", host_stats.memo_misses},
                      {"note", "counts per ~5 s interval"}});
                 LOG_INFO(Render,
                          "CP split: {} operations, {} draws/dispatches, {} waits for guest memory "
                          "writes before a pipeline lookup, front blocked on a full queue {} times, "
                          "raster thread idle {} ms, "
-                         "draws {} of which {} had no register change since the previous op, "
-                         "stage inputs same as the previous draw: draws {}/{}, stages {}/{} "
+                         "draws {}, "
                          "(since the last line)",
                          sp.stat_ops, sp.stat_calls, sp.stat_write_drains,
                          sp.stat_front_blocked.exchange(0),
-                         sp.stat_raster_idle_ns.exchange(0) / 1'000'000, sp.stat_draws,
-                         sp.stat_draws_no_reg_change, host_stats.plan_draws_all_stages_same,
-                         host_stats.plan_draws, host_stats.plan_stages_same, host_stats.plan_stages);
+                         sp.stat_raster_idle_ns.exchange(0) / 1'000'000, sp.stat_draws);
             }
             sp.stat_front_blocked = 0;
             sp.stat_raster_idle_ns = 0;
             sp.stat_ops = sp.stat_calls = sp.stat_write_drains = 0;
-            sp.stat_draws = sp.stat_draws_no_reg_change = 0;
+            sp.stat_draws = 0;
             LOG_INFO(Render,
                      "Raster thread wall time (ms per interval): draws {}, dispatches {}, memory "
                      "write closures {}, other closures (fences, submit end, flips) {}, "
@@ -732,7 +700,7 @@ void NativeExecutor::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 n
                     if (line == 0) {
                         continue;
                     }
-                    sites["liverpool.cpp:" + std::to_string(line)] = {
+                    sites["write_site_" + std::to_string(line)] = {
                         {"writes_queued", site.pushes.exchange(0)},
                         {"front_wait_ms", site.wait_ns.exchange(0) / 1'000'000}};
                 }

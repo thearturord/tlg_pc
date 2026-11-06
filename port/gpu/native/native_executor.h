@@ -348,10 +348,7 @@ private:
     void SignalGraphicsEop(const Core::NativeSync::Fence& eop);
     bool native_follow_pending{}; ///< an executed draw waits for its draw packet (index count)
     /// The place of the wait before a planning: the full wait, or with TLG_DRAIN_LAZY=1 no wait (the planning's reads wait where needed, native_drain_audit.h).
-    /// Returns 0, or 1 when the planning is verified by comparing the bytes it copied at its end, or 2 when it must be repeated after a full wait and compared (ReplanAfterDrain).
-    u32 LookupDrain(u32 caller);
-    Core::DrawPlanPtr ReplanAfterDrain(Core::DrawPlanPtr plan, u32 site, const std::function<Core::DrawPlanPtr()>& make);
-    Core::DispatchPlanPtr ReplanAfterDrain(Core::DispatchPlanPtr plan, u32 site, const std::function<Core::DispatchPlanPtr()>& make);
+    void LookupDrain(u32 caller);
     /// A command processor write to guest memory, done in order with the draws.
     void CpWriteData(void* address, const u32* data, u32 data_size, u32 queue);
     void ApplyStateTemplate(const Core::NativeDraw::StateTemplate& state);

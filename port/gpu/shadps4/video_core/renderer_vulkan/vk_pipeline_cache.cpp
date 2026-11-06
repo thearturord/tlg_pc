@@ -575,37 +575,6 @@ void PipelineCache::PlanGraphics(const FixedState& fixed, DrawIndirectParams par
             CapturePlan(plan.stages[i], RasterInfoFor(infos[i]), *infos[i]);
         }
     }
-    // Statistics: are the inputs of each stage the same as the previous draw's? (Hashing every
-    // stage's user data per draw costs the front thread time: only with cp_split_mode 2.)
-    static const bool collect_plan_stats = EmulatorSettings.GetCpSplitMode() >= 2;
-    bool all_same = true;
-    if (collect_plan_stats) {
-    for (u32 i = 0; i < MaxShaderStages; ++i) {
-        const auto& stage = plan.stages[i];
-        u64 hash = 0;
-        if (stage.info) {
-            hash = reinterpret_cast<u64>(stage.info) ^ (stage.pgm_base * 0x9e3779b97f4a7c15ull);
-            for (u32 d = 0; d < stage.user_data_count; ++d) {
-                hash = (hash ^ stage.user_data[d]) * 0x100000001b3ull;
-            }
-            for (const u32 d : stage.flat) {
-                hash = (hash ^ d) * 0x100000001b3ull;
-            }
-            ++plan_stats.stages;
-            if (hash == last_stage_hash[i]) {
-                ++plan_stats.stages_same;
-            } else {
-                all_same = false;
-            }
-        } else if (last_stage_hash[i] != 0) {
-            all_same = false;
-        }
-        last_stage_hash[i] = hash;
-    }
-    ++plan_stats.draws;
-    plan_stats.draws_all_stages_same += all_same;
-    }
-
     auto* mutable_pipeline = const_cast<GraphicsPipeline*>(pipeline);
     if (!mutable_pipeline->StagesAdopted()) {
         std::array<const Shader::Info*, Shader::MaxStageTypes> clones{};

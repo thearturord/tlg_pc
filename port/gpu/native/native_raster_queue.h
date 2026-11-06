@@ -241,7 +241,6 @@ public:
     std::atomic<u64> stat_front_blocked{}; ///< Pushes that found the queue full.
     std::atomic<u64> stat_raster_idle_ns{};
     u64 stat_draws{};
-    u64 stat_draws_no_reg_change{};
     // Raster thread wall time by kind of work (ns), logged every few seconds.
     u64 ns_draws{};
     u64 ns_depth_only_draws{}; ///< part of ns_draws spent in draws without a color target (z-prepass, shadows)

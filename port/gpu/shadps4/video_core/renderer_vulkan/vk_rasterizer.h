@@ -202,14 +202,6 @@ public:
     [[nodiscard]] bool TextureSetMemoOn() const noexcept {
         return texture_set_on;
     }
-    /// Render state memo hits and misses since the last call (raster thread).
-    std::pair<u64, u64> TakeBeginMemoStats() noexcept {
-        return {std::exchange(begin_memo_hits, 0), std::exchange(begin_memo_misses, 0)};
-    }
-
-    PipelineCache::PlanStats TakePlanStats() noexcept {
-        return pipeline_cache.TakePlanStats();
-    }
 
     void ScopeMarker(fmt::string_view fmt, fmt::format_args args, auto&& func) {
         if (host_markers_enabled) {
@@ -394,7 +386,6 @@ private:
         BeginSignature signature;
         RenderState state;
     } begin_memo;
-    u64 begin_memo_hits = 0, begin_memo_misses = 0;
     void Resolve(const DrawInputs& inputs, const AmdGpu::CbDbExtent& cb0, const AmdGpu::CbDbExtent& cb1);
     void DepthStencilCopy(const DrawInputs& inputs, const AmdGpu::CbDbExtent& db_extent, bool is_depth, bool is_stencil);
     void EliminateFastClear(const DrawInputs& inputs, const AmdGpu::CbDbExtent& cb0);

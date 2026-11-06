@@ -95,8 +95,6 @@ void Rasterizer::MarkerEnd() {
 
 Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
     IntervalStats result;
-    const auto plan_stats = TakePlanStats();
-    const auto memo_stats = TakeBeginMemoStats();
     if (TextureSetMemoOn()) {
         const auto sets = TakeTextureSetStats();
         Core::DebugServer::Publish("texture_set_memo", {{"hits", sets.hits}, {"recorded", sets.recorded}, {"miss_no_entry", sets.no_entry}, {"miss_generation", sets.generation},
@@ -202,12 +200,6 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
              {"note", "counts per ~5 s interval"}});
     }
 
-    result.plan_draws_all_stages_same = plan_stats.draws_all_stages_same;
-    result.plan_draws = plan_stats.draws;
-    result.plan_stages_same = plan_stats.stages_same;
-    result.plan_stages = plan_stats.stages;
-    result.memo_hits = memo_stats.first;
-    result.memo_misses = memo_stats.second;
     const auto native = TakeNativeStats();
     result.native_tagged = native.tagged;
     result.native_untagged = native.untagged;

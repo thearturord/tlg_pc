@@ -55,8 +55,6 @@ public:
 
     /// What the interval statistics of the host hand back to the executor (the host publishes its own part, native/native_debug_server.h).
     struct IntervalStats {
-        u64 plan_draws_all_stages_same{}, plan_draws{}, plan_stages_same{}, plan_stages{};
-        u64 memo_hits{}, memo_misses{};
         u64 native_tagged{}, native_untagged{}, native_dynamic_skipped{}, native_bind_skipped{};
     };
 

@@ -1086,12 +1086,9 @@ constexpr u64 GBufferBegin = 0x01c76710, GBufferEnd = 0x01c779a0; // DrawGBuffer
 constexpr u64 GBufferIndexedSite = 0x01c777a1, GBufferIndirectSite = 0x01c77788;
 constexpr u64 FunctionHandleLookup = 0x01c59060; // FUN_01c59060(render device, object) -> the object's render data or 0 (creates it at first use)
 
-// A3 (documents/tlg/native plan/stages/a3-engine-functions.md): FUN_01c59060 is, once the object has its render data, three reads: `data = object[7]`; when `(int)object[4]` is
-// not zero the virtual at `vtable + 0x28` is called with the object (a pending update; the value read before the call is the one returned); `data` is returned. The creation
-// of the render data (operator new, vtable 0x026e7670, FUN_01c96930, FUN_01c98930) stays the engine's. `TLG_GEN_NATIVE_LEAF=1` takes the first case natively;
-// `TLG_GEN_NATIVE_LEAF_VERIFY=N` (default 64) runs the engine's function instead for one call in N and compares its result with the native answer.
+// FUN_01c59060 is the engine's own lookup of an object's render data (creates it at first use). Calling it also sets up what two site generators need (with a native answer they
+// declined every pass, 2026-10-30), so it always runs. The native answer for the case "the object already has its render data" (three reads) was removed 2026-11-06: it was off by default.
 struct LeafStats {
-    std::atomic<u64> native{}, engine_creating{}, engine_null{}, verified{}, differing{};
     std::atomic<u64> prologue_native{}, block_compared{}, block_differing{};
 };
 LeafStats& Leaf() {
@@ -1099,41 +1096,7 @@ LeafStats& Leaf() {
     return stats;
 }
 u64 HandleLookup(u64 render_device, u64 object) {
-    static const bool native_on = [] {
-        const char* e = std::getenv("TLG_GEN_NATIVE_LEAF");
-        return e != nullptr && *e != 0 && *e != '0';
-    }();
-    static const u32 verify_every = [] {
-        const char* e = std::getenv("TLG_GEN_NATIVE_LEAF_VERIFY");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 64u; // stays on: calling the engine's own lookup also sets up what two site generators need (with 0 they decline every pass, 2026-10-30)
-    }();
-    const auto engine = [&] { return reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64)>(Global(FunctionHandleLookup))(render_device, object); };
-    if (!native_on) {
-        return engine();
-    }
-    if (object == 0) {
-        Leaf().engine_null.fetch_add(1, std::memory_order_relaxed);
-        return 0;
-    }
-    const u64 existing = R<u64>(object + 0x38);
-    if (existing == 0) {
-        Leaf().engine_creating.fetch_add(1, std::memory_order_relaxed);
-        return engine();
-    }
-    thread_local u32 counter = 0;
-    if (verify_every != 0 && (++counter % verify_every) == 0) {
-        const u64 result = engine();
-        Leaf().verified.fetch_add(1, std::memory_order_relaxed);
-        if (result != existing) {
-            Leaf().differing.fetch_add(1, std::memory_order_relaxed);
-        }
-        return result;
-    }
-    if (R<s32>(object + 0x20) != 0) {
-        reinterpret_cast<void(PS4_SYSV_ABI*)(u64)>(R<u64>(R<u64>(object) + 0x28))(object);
-    }
-    Leaf().native.fetch_add(1, std::memory_order_relaxed);
-    return existing;
+    return reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64)>(Global(FunctionHandleLookup))(render_device, object);
 }
 constexpr u64 GlobalObjectTable = 0x0689eed8;    // DAT_0689eed8
 
@@ -1537,87 +1500,10 @@ constexpr u64 ForwardBegin = 0x01c779a0, ForwardEnd = 0x01c782a0;
 constexpr u64 ForwardIndexedSite = 0x01c7819d;
 constexpr u64 FunctionForwardPrologue = 0x01c710f0; // FUN_01c710f0(renderDev, a1, a2, mode)
 constexpr u64 FunctionFindVariant = 0x01c822c0;     // FUN_01c822c0(renderDev + 1000, material, flags, 0, mesh word, &token, 0) -> variant or 0
-constexpr u64 StringTable = 0x02716230;             // PTR_DAT_02716230: 0x20 bytes per entry, the name pointer first
-
-// A3: FUN_01c822c0, the case the engine answers from `material + 0x1d0` (the variant it found last time) without touching its caches or any lock: the key is made of material
-// fields, the flags and two FNV-1a hashes of names from the string table; when the cached variant carries the same four key words it is returned. Everything else (search of the
-// engine's cache lists under its lock, creation) stays the engine's. `TLG_GEN_NATIVE_LEAF=3` (3 includes 1 and 2); verify: the engine's function is called for one hit in
-// `TLG_GEN_NATIVE_LEAF_VERIFY` and must return the same variant (it has no side effect in this case).
-u32 Fnv1a(const char* text) {
-    u32 hash = 0x811c9dc5u;
-    for (; *text != 0; ++text) {
-        hash = (static_cast<u32>(static_cast<s32>(static_cast<s8>(*text))) ^ hash) * 0x1000193u;
-    }
-    return hash;
-}
 std::atomic<u64> last_forward_ctx{0}; // study: the device context seen by the forward generator (the report lists its vtable)
-struct VariantStats {
-    std::atomic<u64> native{}, engine{}, verified{}, differing{};
-};
-VariantStats& VStats() {
-    static VariantStats stats;
-    return stats;
-}
+// FUN_01c822c0: the engine's variant search (cache lists under its lock, creation). A native answer from `material + 0x1d0` was removed 2026-11-06 (off by default).
 u64 FindVariant(u64 cache, u64 material, u32 flags, u32 flags2, u32 mesh_word, u32* token) {
-    static const bool native_on = [] {
-        const char* e = std::getenv("TLG_GEN_NATIVE_LEAF");
-        return e != nullptr && *e != 0 && std::atoi(e) >= 3;
-    }();
-    static const u32 verify_every = [] {
-        const char* e = std::getenv("TLG_GEN_NATIVE_LEAF_VERIFY");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 64u; // stays on: calling the engine's own lookup also sets up what two site generators need (with 0 they decline every pass, 2026-10-30)
-    }();
-    const auto engine = [&] { return reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u32, u32, u32, void*, u64)>(Global(FunctionFindVariant))(cache, material, flags, flags2, mesh_word, token, 0); };
-    if (!native_on) {
-        return engine();
-    }
-    const u64 cached = R<u64>(material + 0x1d0);
-    if (cached != 0) {
-        const s32 selector_164 = R<s32>(material + 0x164);
-        const bool is_default = R<u64>(material + 0x18) == R<u64>(Global(GlobalDefaultKind));
-        u32 key = flags | flags2 | (is_default ? 0x200u : 0u);
-        const s32 mode = R<s32>(material + 0x15c);
-        if (mode == 2) {
-            key = ((flags | flags2) & 0xffffff6fu) | (is_default ? 0x200u : 0u) | 0x80u;
-        } else {
-            if (mode == 4) {
-                key |= 0x20u;
-            }
-            if (mode == 3) {
-                key |= 0x8080u;
-            }
-        }
-        if (R<s32>(material + 0x158) != 0) {
-            key |= 0x20000000u;
-        }
-        u32 name_hash = 0;
-        const u64 shared = R<u64>(material + 0x48);
-        if (shared != 0) {
-            if (const u32 index = R<u32>(shared + 0x24); index != 0) {
-                if (const u64 name = R<u64>(Global(StringTable) + u64{index} * 0x20); name != 0) {
-                    name_hash = Fnv1a(reinterpret_cast<const char*>(name));
-                }
-            }
-        }
-        if (token[0] != 0) {
-            name_hash = Fnv1a(reinterpret_cast<const char*>(R<u64>(Global(StringTable) + u64{token[0]} * 0x20)));
-        }
-        if (R<s32>(cached + 0x20) == selector_164 && R<u32>(cached + 0x24) == key && R<u32>(cached + 0x28) == (mesh_word & 0xffffu) && R<u32>(cached + 0x2c) == name_hash) {
-            thread_local u32 counter = 0;
-            if (verify_every != 0 && (++counter % verify_every) == 0) {
-                const u64 result = engine();
-                VStats().verified.fetch_add(1, std::memory_order_relaxed);
-                if (result != cached) {
-                    VStats().differing.fetch_add(1, std::memory_order_relaxed);
-                }
-                return result;
-            }
-            VStats().native.fetch_add(1, std::memory_order_relaxed);
-            return cached;
-        }
-    }
-    VStats().engine.fetch_add(1, std::memory_order_relaxed);
-    return engine();
+    return reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u32, u32, u32, void*, u64)>(Global(FunctionFindVariant))(cache, material, flags, flags2, mesh_word, token, 0);
 }
 constexpr u64 FunctionHandleFree = 0x01e45a60;      // FUN_01e45a60(handle): the last reference went
 constexpr u64 HandleRefTable = 0x02716240;          // DAT_02716240: 0x20 bytes per handle, the reference count first
@@ -5161,13 +5047,9 @@ nlohmann::json Report() {
         NativeDraw::NativeListRead(list);
         out["native_list"] = std::move(list);
     }
-    out["native_handle_lookup_FUN_01c59060"] = {{"answered_natively", Leaf().native.load()}, {"engine_creates_the_render_data", Leaf().engine_creating.load()},
-                                                {"null_object", Leaf().engine_null.load()}, {"verify_calls_of_the_engine", Leaf().verified.load()},
-                                                {"forward_prologues_made_natively_live_and_shadow", Leaf().prologue_native.load()},
-                                                {"forward_prologue_blocks_compared_with_the_engines", Leaf().block_compared.load()},
-                                                {"forward_prologue_blocks_differing", Leaf().block_differing.load()}};
-    out["native_variant_find_FUN_01c822c0"] = {{"answered_natively_from_the_cached_variant", VStats().native.load()}, {"engine_calls_search_or_create", VStats().engine.load()},
-                                               {"verify_calls_of_the_engine", VStats().verified.load()}, {"verify_differences", VStats().differing.load()}};
+    out["forward_prologue_FUN_01c710f0"] = {{"made_natively_live_and_shadow", Leaf().prologue_native.load()},
+                                            {"blocks_compared_with_the_engines", Leaf().block_compared.load()},
+                                            {"blocks_differing", Leaf().block_differing.load()}};
     if (const u64 ctx = last_forward_ctx.load(); ctx != 0) {
         nlohmann::json vt = nlohmann::json::object();
         const u64 table = R<u64>(ctx);

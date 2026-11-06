@@ -364,10 +364,9 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
             } else {
                 // an inline draw has its count with the draw packet (index_count), anything else carries it in the record
                 native_inputs_key = draw.inputs_key;
-                u32 verify;
                 {
                     TLG_PROF_LEVEL("front.lookup_drain", 2);
-                    verify = LookupDrain(1);
+                    LookupDrain(1);
                 }
                 const auto make_plan = [&] {
                     return rasterizer->MakeExecDrawPlan(*draw.fixed, draw.stage_key, native_inputs_key, exec_vertex_user_data,
@@ -378,9 +377,6 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
                 {
                     TLG_PROF_LEVEL("front.plan_exec_draw", 2);
                     plan = make_plan();
-                    if (verify == 2) {
-                        plan = ReplanAfterDrain(std::move(plan), 1, make_plan);
-                    }
                 }
                 if (plan) {
                     take(std::move(plan));
@@ -436,10 +432,9 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
         if (call.kind == RasterCall::Kind::DrawIndirect) {
             params = Core::DrawIndirectParams{.vertex_sgpr_offset = call.vertex_sgpr_offset, .instance_sgpr_offset = call.instance_sgpr_offset, .is_indirect = true};
         }
-        u32 verify;
         {
             TLG_PROF_LEVEL("front.lookup_drain", 2);
-            verify = LookupDrain(2);
+            LookupDrain(2);
         }
         const auto make_candidate = [&] {
             // E1c: the shader objects of the draw, for the comparison of the translator's input with the one derived from them
@@ -462,9 +457,6 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
         {
             TLG_PROF_LEVEL("front.plan_draw_registers", 2);
             candidate = make_candidate();
-            if (verify == 2) {
-                candidate = ReplanAfterDrain(std::move(candidate), 2, make_candidate);
-            }
         }
         if (candidate == nullptr) {
             // no pipeline for the draw (a stage that does not compile, a target that cannot be bound): refused, not drawn from a register image

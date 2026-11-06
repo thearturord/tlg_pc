@@ -72,6 +72,8 @@ struct LiveCounters {
     /// cp_stage_key: draws whose pipeline came from the record's key, draws that went the full way and stored a key, draws without a key, full lookups of
     /// keyed draws (audits) and the ones that differed
     std::atomic<u64> stage_key_hits{}, stage_key_misses{}, stage_key_uncached{}, stage_key_audits{}, stage_key_violations{};
+    /// draws whose pipeline and stages came from the typed path alone (PlanGraphicsTyped, the cached stage key); the counters above only count the learning path
+    std::atomic<u64> stage_key_typed_hits{};
     /// cp_exec_inputs: draws planned from the record alone, draws that could not be (no cached inputs or pipeline yet), draws planned both ways and compared, and the ones that differed
     std::atomic<u64> exec_typed{}, exec_fallback{};
     std::atomic<u64> draw_args_typed{}; ///< E1b: draws whose arguments came from the record's typed values
