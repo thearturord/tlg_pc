@@ -39,16 +39,12 @@ bool Plausible(u64 pointer) {
 
 struct Config {
     bool on{true};
-    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_JOB_GEN_VERIFY=N)
 };
 const Config& Cfg() {
     static const Config config = [] {
         Config c;
         const char* e = std::getenv("TLG_JOB_GEN");
         c.on = e == nullptr || *e != '0'; // default on since 2026-10-27 (all native switches); TLG_JOB_GEN=0 turns it off
-        if (const char* n = std::getenv("TLG_JOB_GEN_VERIFY"); n != nullptr && *n != 0) {
-            c.verify_every = static_cast<u32>(std::atoi(n));
-        }
         return c;
     }();
     return config;
@@ -56,7 +52,7 @@ const Config& Cfg() {
 
 struct Stats {
     std::atomic<u64> iterations{0}, no_work{0}, generated{0}, declined{0}, dispatches{0};
-    std::atomic<u64> verify_iterations{0}, verify_clean{0}, verify_differences{0}, verify_raced{0}, scan_faults{0};
+    std::atomic<u64> faults_noted{0}, scan_faults{0};
     std::atomic<bool> switched_off{false};
     std::mutex mutex;
     std::map<std::string, u64> decline_reasons;
@@ -291,19 +287,8 @@ void ApplyThunk(void* p) {
     Apply(*a->first, *a->second);
 }
 
-/// A verify iteration: what the generator predicts, kept until the engine's iteration is over.
-struct Pending {
-    bool armed{false};
-    bool dispatch_seen{false};
-    Iteration it;
-    std::vector<Patch> patches;
-    u64 table[4]{};
-    std::vector<std::string> notes; // differences found at the dispatch
-};
-thread_local Pending pending;
-
 void NoteDifference(const std::string& kind, const std::string& text) {
-    S().verify_differences.fetch_add(1, std::memory_order_relaxed);
+    S().faults_noted.fetch_add(1, std::memory_order_relaxed);
     std::scoped_lock lock{S().mutex};
     ++S().difference_kinds[kind];
     if (S().samples.size() < 16) {
@@ -320,7 +305,7 @@ bool Enabled() {
 u64 PS4_SYSV_ABI JobLoopTop(GuestHooks::MidContext* c) {
     const Config& cfg = Cfg();
     Stats& s = S();
-    if (!cfg.on || s.switched_off.load(std::memory_order_relaxed) || pending.armed) {
+    if (!cfg.on || s.switched_off.load(std::memory_order_relaxed)) {
         return 0;
     }
     s.iterations.fetch_add(1, std::memory_order_relaxed);
@@ -332,27 +317,6 @@ u64 PS4_SYSV_ABI JobLoopTop(GuestHooks::MidContext* c) {
             s.no_work.fetch_add(1, std::memory_order_relaxed);
         } else {
             Decline(reason);
-        }
-        return 0;
-    }
-    const u64 eligible = s.generated.load(std::memory_order_relaxed) + s.verify_iterations.load(std::memory_order_relaxed);
-    const bool verify = cfg.verify_every != 0 && eligible % cfg.verify_every == cfg.verify_every - 1;
-    if (verify) {
-        // the engine runs this iteration; the prediction is compared with what it did (the dispatch as it is issued, the memory and the registers after the body)
-        s.verify_iterations.fetch_add(1, std::memory_order_relaxed);
-        Writer shadow{false};
-        ApplyArgs args{&it, &shadow};
-        if (!NativeDraw::GuardedCall(&ApplyThunk, &args)) {
-            s.scan_faults.fetch_add(1, std::memory_order_relaxed);
-            return 0;
-        }
-        pending.armed = true;
-        pending.dispatch_seen = false;
-        pending.it = it;
-        pending.patches = std::move(shadow.patches);
-        pending.notes.clear();
-        for (int i = 0; i < 4; ++i) {
-            pending.table[i] = it.views[i];
         }
         return 0;
     }
@@ -379,126 +343,17 @@ u64 PS4_SYSV_ABI JobLoopTop(GuestHooks::MidContext* c) {
     return Global(LoopResume);
 }
 
-u64 PS4_SYSV_ABI JobLoopBottom(GuestHooks::MidContext* c) {
-    if (!pending.armed) {
-        return 0;
-    }
-    Stats& s = S();
-    pending.armed = false;
-    bool clean = true;
-    std::vector<std::string> kinds;
-    const auto fail = [&](const char* kind, const std::string& text) {
-        clean = false;
-        kinds.push_back(kind);
-        NoteDifference(kind, text);
-    };
-    if (!pending.dispatch_seen) {
-        fail("dispatch missing", fmt::format("the engine's iteration {} issued no async dispatch", pending.it.index));
-    }
-    for (const auto& note : pending.notes) {
-        fail("dispatch", note);
-    }
-    // the memory the iteration wrote: the generator's bytes against what is there now; a mismatch is read again with a fresh prediction (the engine's other threads move the object's fields)
-    u32 memory_differences = 0;
-    std::string first_difference;
-    const auto describe = [&](const Patch& patch) {
-        const u64 from_rsp = patch.address - pending.it.rsp;
-        std::string text = from_rsp < 0x1000 ? fmt::format("rsp+{:#x}", from_rsp) : fmt::format("frame+{:#x}", patch.address - pending.it.frame);
-        text += fmt::format(" ({} bytes: expected", patch.bytes.size());
-        for (size_t i = 0; i < patch.bytes.size() && i < 8; ++i) {
-            text += fmt::format(" {:02x}", patch.bytes[i]);
-        }
-        text += ", found";
-        for (size_t i = 0; i < patch.bytes.size() && i < 8; ++i) {
-            text += fmt::format(" {:02x}", R<u8>(patch.address + i));
-        }
-        return text + ")";
-    };
-    for (const auto& patch : pending.patches) {
-        if (std::memcmp(reinterpret_cast<const void*>(patch.address), patch.bytes.data(), patch.bytes.size()) != 0) {
-            if (memory_differences++ == 0) {
-                first_difference = describe(patch);
-            }
-        }
-    }
-    if (memory_differences != 0) {
-        Iteration again;
-        const char* reason = "";
-        bool no_work = false;
-        GuestHooks::MidContext probe = *c;
-        probe.r13 = pending.it.context;
-        probe.rdi = pending.it.holder;
-        probe.r14 = pending.it.index;
-        probe.rsp = pending.it.rsp;
-        bool equal = false;
-        if (Scan(&probe, again, reason, no_work)) {
-            Writer shadow{false};
-            ApplyArgs args{&again, &shadow};
-            if (NativeDraw::GuardedCall(&ApplyThunk, &args)) {
-                equal = true;
-                for (const auto& patch : shadow.patches) {
-                    if (std::memcmp(reinterpret_cast<const void*>(patch.address), patch.bytes.data(), patch.bytes.size()) != 0) {
-                        equal = false;
-                    }
-                }
-            }
-        }
-        if (equal) {
-            s.verify_raced.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            fail("memory", fmt::format("{} of {} written ranges differ after iteration {}: first {}", memory_differences, pending.patches.size(), pending.it.index, first_difference));
-        }
-    }
-    // the registers the code after the body reads
-    if (c->r12 != pending.it.groups || c->r13 != pending.it.context || c->rbx != pending.it.context || c->r15 != pending.it.context) {
-        fail("registers", fmt::format("r12 {:#x} (expected {:#x}), r13 {:#x}, rbx {:#x}, r15 {:#x} (context {:#x})", c->r12, u64{pending.it.groups}, c->r13, c->rbx, c->r15, pending.it.context));
-    }
-    if (clean) {
-        s.verify_clean.fetch_add(1, std::memory_order_relaxed);
-    } else if (s.verify_differences.load() >= 8) {
-        s.switched_off.store(true); // a generator that differs is switched off, the engine's loop takes over
-    }
-    pending.patches.clear();
-    return 0;
-}
-
-void NoteAsyncDispatch(u64 context, u64 x, u64 y, u64 z, u64 site) {
-    if (!pending.armed || pending.dispatch_seen || context != pending.it.context) {
-        return;
-    }
-    pending.dispatch_seen = true;
-    if (x != pending.it.groups || y != 1 || z != 1) {
-        pending.notes.push_back(fmt::format("groups {} x {} x {}, expected {} x 1 x 1", x, y, z, pending.it.groups));
-    }
-    if (site != Global(DispatchSite)) {
-        pending.notes.push_back(fmt::format("call site {:#x}, expected {:#x}", site, Global(DispatchSite)));
-    }
-    // the async context's tables at the moment of the dispatch: the shader (+0x1d10) and the four constant buffers (+0x21f8 + 8)
-    if (R<u64>(context + 0x1d10) != pending.it.shader) {
-        pending.notes.push_back(fmt::format("shader {:#x}, expected {:#x}", R<u64>(context + 0x1d10), pending.it.shader));
-    }
-    for (u32 i = 0; i < 4; ++i) {
-        if (R<u64>(context + 0x21f8 + 8 + u64{i} * 8) != pending.table[i]) {
-            pending.notes.push_back(fmt::format("constant buffer {}: {:#x}, expected {:#x}", i, R<u64>(context + 0x21f8 + 8 + u64{i} * 8), pending.table[i]));
-        }
-    }
-}
-
 nlohmann::json Report() {
     Stats& s = S();
     nlohmann::json out;
     out["enabled"] = Cfg().on;
     out["switched_off"] = s.switched_off.load();
-    out["verify_every"] = Cfg().verify_every;
     out["iterations_seen"] = s.iterations.load();
     out["iterations_without_work"] = s.no_work.load();
     out["generated"] = s.generated.load();
     out["dispatches_generated"] = s.dispatches.load();
     out["declined"] = s.declined.load();
-    out["verify_iterations"] = s.verify_iterations.load();
-    out["verify_clean"] = s.verify_clean.load();
-    out["verify_with_differences"] = s.verify_differences.load();
-    out["verify_raced_memory"] = s.verify_raced.load();
+    out["faults_noted"] = s.faults_noted.load();
     out["scan_faults"] = s.scan_faults.load();
     std::scoped_lock lock{s.mutex};
     out["decline_reasons"] = s.decline_reasons;

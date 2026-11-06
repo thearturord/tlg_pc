@@ -16,10 +16,8 @@ struct MidContext;
 
 namespace Core::NativeSiteGen {
 
-/// Handler address of a site's hook by name ("site_top_0", "site_bottom_0", ...), 0 when unknown.
+/// Handler address of a site's hook by name ("site_top_0", ...), 0 when unknown.
 u64 FindHandler(const char* name);
-/// A dispatch of the async or graphics context was issued by the engine: during a verify execution it is compared with the prediction.
-void NoteDispatch(u64 context, u64 x, u64 y, u64 z, u64 site);
 /// `TLG_SITE_CENSUS=1`: counts every dispatch by its call site (the return address), told apart by who issued it (the engine's own code or a generator): `site_generators` `dispatch_census`.
 void CensusDispatch(u64 site_runtime, bool generated);
 

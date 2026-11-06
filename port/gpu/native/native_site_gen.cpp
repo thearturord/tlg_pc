@@ -39,16 +39,12 @@ bool Plausible(u64 pointer) {
 
 struct Config {
     bool on{true};
-    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_SITE_GEN_VERIFY=N)
 };
 const Config& Cfg() {
     static const Config config = [] {
         Config c;
         const char* e = std::getenv("TLG_SITE_GEN");
         c.on = e == nullptr || *e != '0'; // default on since 2026-10-27 (all native switches); TLG_SITE_GEN=0 turns the site generators off
-        if (const char* n = std::getenv("TLG_SITE_GEN_VERIFY"); n != nullptr && *n != 0) {
-            c.verify_every = static_cast<u32>(std::atoi(n));
-        }
         return c;
     }();
     return config;
@@ -139,7 +135,7 @@ struct Plan {
 };
 
 struct SiteStats {
-    std::atomic<u64> executions{0}, generated{0}, declined{0}, verify_executions{0}, verify_clean{0}, verify_differences{0}, verify_raced{0}, scan_faults{0};
+    std::atomic<u64> executions{0}, generated{0}, declined{0}, faults_noted{0}, scan_faults{0};
     std::atomic<bool> switched_off{false};
     std::mutex mutex;
     std::map<std::string, u64> decline_reasons, difference_kinds;
@@ -2319,7 +2315,7 @@ void Decline(Site& site, const char* reason) {
     ++site.stats.decline_reasons[reason];
 }
 void NoteDifference(Site& site, const std::string& kind, const std::string& text) {
-    site.stats.verify_differences.fetch_add(1, std::memory_order_relaxed);
+    site.stats.faults_noted.fetch_add(1, std::memory_order_relaxed);
     std::scoped_lock lock{site.stats.mutex};
     ++site.stats.difference_kinds[kind];
     if (site.stats.samples.size() < 12) {
@@ -2360,23 +2356,12 @@ bool Scan(Site& site, MidContext* c, Plan& plan, const char*& reason, bool& no_w
     return args.ok;
 }
 
-/// A verify execution: what the generator predicts, kept until the engine's code has run through the piece.
-struct Pending {
-    bool armed{false}, dispatch_seen{false};
-    u32 site{0}, dispatch_count{0};
-    MidContext saved{};
-    Plan plan;
-    std::vector<Patch> patches;
-    std::vector<std::string> notes;
-};
-thread_local Pending pending;
-
 template <u32 N>
 u64 PS4_SYSV_ABI Top(MidContext* c) {
     const Config& cfg = Cfg();
     Site& site = Sites()[N];
     SiteStats& s = site.stats;
-    if (!cfg.on || s.switched_off.load(std::memory_order_relaxed) || pending.armed) {
+    if (!cfg.on || s.switched_off.load(std::memory_order_relaxed)) {
         return 0;
     }
     s.executions.fetch_add(1, std::memory_order_relaxed);
@@ -2388,25 +2373,6 @@ u64 PS4_SYSV_ABI Top(MidContext* c) {
             Decline(site, reason);
         }
         return 0;
-    }
-    const u64 eligible = s.generated.load(std::memory_order_relaxed) + s.verify_executions.load(std::memory_order_relaxed);
-    if (cfg.verify_every != 0 && eligible % cfg.verify_every == cfg.verify_every - 1) {
-        s.verify_executions.fetch_add(1, std::memory_order_relaxed);
-        Writer shadow{false};
-        ApplyArgs args{&site, &plan, &shadow};
-        if (!NativeDraw::GuardedCall(&ApplyThunk, &args)) {
-            s.scan_faults.fetch_add(1, std::memory_order_relaxed);
-            return 0;
-        }
-        pending.armed = true;
-        pending.dispatch_seen = false;
-        pending.dispatch_count = 0;
-        pending.site = N;
-        pending.saved = *c;
-        pending.plan = plan;
-        pending.patches = std::move(shadow.patches);
-        pending.notes.clear();
-        return 0; // the engine runs this one
     }
     Writer live{true};
     ApplyArgs args{&site, &plan, &live};
@@ -2424,81 +2390,6 @@ u64 PS4_SYSV_ABI Top(MidContext* c) {
     c->rdx = plan.groups_y;
     c->rcx = plan.groups_z;
     return Global(site.resume_ghidra);
-}
-
-template <u32 N>
-u64 PS4_SYSV_ABI Bottom(MidContext* c) {
-    if (!pending.armed || pending.site != N) {
-        return 0;
-    }
-    Site& site = Sites()[N];
-    SiteStats& s = site.stats;
-    pending.armed = false;
-    bool clean = true;
-    const auto fail = [&](const char* kind, const std::string& text) {
-        clean = false;
-        NoteDifference(site, kind, text);
-    };
-    if (!pending.dispatch_seen) {
-        fail("dispatch missing", "the engine issued no dispatch through the piece");
-    } else if (!pending.plan.dispatches.empty() && pending.dispatch_count != pending.plan.dispatches.size()) {
-        fail("dispatch count", fmt::format("{} dispatches, expected {}", pending.dispatch_count, pending.plan.dispatches.size()));
-    }
-    for (const auto& note : pending.notes) {
-        fail("dispatch", note);
-    }
-    const auto count_differences = [](const std::vector<Patch>& patches, std::string* first) {
-        u32 differences = 0;
-        for (const auto& patch : patches) {
-            if (std::memcmp(reinterpret_cast<const void*>(patch.address), patch.bytes.data(), patch.bytes.size()) != 0) {
-                if (differences++ == 0 && first != nullptr) {
-                    std::string text = fmt::format("{:#x} ({} bytes: expected", patch.address, patch.bytes.size());
-                    for (size_t i = 0; i < patch.bytes.size() && i < 8; ++i) {
-                        text += fmt::format(" {:02x}", patch.bytes[i]);
-                    }
-                    text += ", found";
-                    for (size_t i = 0; i < patch.bytes.size() && i < 8; ++i) {
-                        text += fmt::format(" {:02x}", R<u8>(patch.address + i));
-                    }
-                    *first = text + ")";
-                }
-            }
-        }
-        return differences;
-    };
-    std::string first;
-    if (const u32 differences = count_differences(pending.patches, &first); differences != 0) {
-        // read again with a fresh prediction: a field the engine's other threads moved between the two reads is a race, not a difference
-        bool equal = false;
-        Plan again;
-        const char* reason = "";
-        bool no_work = false;
-        MidContext copy = pending.saved;
-        if (Scan(site, &copy, again, reason, no_work)) {
-            Writer shadow{false};
-            ApplyArgs args{&site, &again, &shadow};
-            if (NativeDraw::GuardedCall(&ApplyThunk, &args)) {
-                equal = count_differences(shadow.patches, nullptr) == 0;
-            }
-        }
-        if (equal) {
-            s.verify_raced.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            fail("memory", fmt::format("{} of {} written ranges differ: first {}", differences, pending.patches.size(), first));
-        }
-    }
-    for (const auto& [reg, value] : pending.plan.registers) {
-        if (RegRef(c, reg) != value) {
-            fail("registers", fmt::format("register {} holds {:#x}, expected {:#x}", reg, RegRef(c, reg), value));
-        }
-    }
-    if (clean) {
-        s.verify_clean.fetch_add(1, std::memory_order_relaxed);
-    } else if (s.verify_differences.load() >= 8) {
-        s.switched_off.store(true);
-    }
-    pending.patches.clear();
-    return 0;
 }
 
 } // namespace
@@ -2525,229 +2416,94 @@ void CensusDispatch(u64 site_runtime, bool generated) {
     ++(generated ? entry.second : entry.first);
 }
 
-void NoteDispatch(u64 context, u64 x, u64 y, u64 z, u64 site_runtime) {
-    if (!pending.armed || context != pending.plan.context) {
-        return;
-    }
-    const Plan& plan = pending.plan;
-    if (!plan.dispatches.empty()) {
-        const u32 index = pending.dispatch_count++;
-        pending.dispatch_seen = true;
-        if (index >= plan.dispatches.size()) {
-            pending.notes.push_back(fmt::format("dispatch {} is more than the {} expected", index, plan.dispatches.size()));
-            return;
-        }
-        const Expect& e = plan.dispatches[index];
-        if (x != e.x || y != e.y || z != e.z) {
-            pending.notes.push_back(fmt::format("dispatch {}: groups {} x {} x {}, expected {} x {} x {}", index, x, y, z, e.x, e.y, e.z));
-        }
-        if (site_runtime != Global(e.site)) {
-            pending.notes.push_back(fmt::format("dispatch {}: call site {:#x}, expected {:#x}", index, site_runtime, Global(e.site)));
-        }
-        for (const auto& [offset, value] : e.words) {
-            if (R<u64>(context + offset) != value) {
-                pending.notes.push_back(fmt::format("dispatch {}: context word {:#x}: {:#x}, expected {:#x}", index, offset, R<u64>(context + offset), value));
-            }
-        }
-        for (const auto& [offset, value] : e.stack) {
-            if (R<u64>(plan.rsp + offset) != value) {
-                pending.notes.push_back(fmt::format("dispatch {}: stack word {:#x}: {:#x}, expected {:#x}", index, offset, R<u64>(plan.rsp + offset), value));
-            }
-        }
-        return;
-    }
-    if (pending.dispatch_seen) {
-        return;
-    }
-    pending.dispatch_seen = true;
-    if (x != plan.groups || y != plan.groups_y || z != plan.groups_z) {
-        pending.notes.push_back(fmt::format("groups {} x {} x {}, expected {} x {} x {}", x, y, z, plan.groups, plan.groups_y, plan.groups_z));
-    }
-    if (site_runtime != Global(plan.site_ghidra)) {
-        pending.notes.push_back(fmt::format("call site {:#x}, expected {:#x}", site_runtime, Global(plan.site_ghidra)));
-    }
-    for (const auto& [offset, value] : plan.context_words) {
-        if (R<u64>(context + offset) != value) {
-            pending.notes.push_back(fmt::format("context word {:#x}: {:#x}, expected {:#x}", offset, R<u64>(context + offset), value));
-        }
-    }
-}
-
 u64 FindHandler(const char* name) {
     const std::string n{name};
     if (n == "site_top_0") {
         return reinterpret_cast<u64>(&Top<0>);
     }
-    if (n == "site_bottom_0") {
-        return reinterpret_cast<u64>(&Bottom<0>);
-    }
     if (n == "site_top_1") {
         return reinterpret_cast<u64>(&Top<1>);
-    }
-    if (n == "site_bottom_1") {
-        return reinterpret_cast<u64>(&Bottom<1>);
     }
     if (n == "site_top_2") {
         return reinterpret_cast<u64>(&Top<2>);
     }
-    if (n == "site_bottom_2") {
-        return reinterpret_cast<u64>(&Bottom<2>);
-    }
     if (n == "site_top_3") {
         return reinterpret_cast<u64>(&Top<3>);
-    }
-    if (n == "site_bottom_3") {
-        return reinterpret_cast<u64>(&Bottom<3>);
     }
     if (n == "site_top_4") {
         return reinterpret_cast<u64>(&Top<4>);
     }
-    if (n == "site_bottom_4") {
-        return reinterpret_cast<u64>(&Bottom<4>);
-    }
     if (n == "site_top_5") {
         return reinterpret_cast<u64>(&Top<5>);
-    }
-    if (n == "site_bottom_5") {
-        return reinterpret_cast<u64>(&Bottom<5>);
     }
     if (n == "site_top_6") {
         return reinterpret_cast<u64>(&Top<6>);
     }
-    if (n == "site_bottom_6") {
-        return reinterpret_cast<u64>(&Bottom<6>);
-    }
     if (n == "site_top_7") {
         return reinterpret_cast<u64>(&Top<7>);
-    }
-    if (n == "site_bottom_7") {
-        return reinterpret_cast<u64>(&Bottom<7>);
     }
     if (n == "site_top_8") {
         return reinterpret_cast<u64>(&Top<8>);
     }
-    if (n == "site_bottom_8") {
-        return reinterpret_cast<u64>(&Bottom<8>);
-    }
     if (n == "site_top_9") {
         return reinterpret_cast<u64>(&Top<9>);
-    }
-    if (n == "site_bottom_9") {
-        return reinterpret_cast<u64>(&Bottom<9>);
     }
     if (n == "site_top_10") {
         return reinterpret_cast<u64>(&Top<10>);
     }
-    if (n == "site_bottom_10") {
-        return reinterpret_cast<u64>(&Bottom<10>);
-    }
     if (n == "site_top_11") {
         return reinterpret_cast<u64>(&Top<11>);
-    }
-    if (n == "site_bottom_11") {
-        return reinterpret_cast<u64>(&Bottom<11>);
     }
     if (n == "site_top_12") {
         return reinterpret_cast<u64>(&Top<12>);
     }
-    if (n == "site_bottom_12") {
-        return reinterpret_cast<u64>(&Bottom<12>);
-    }
     if (n == "site_top_13") {
         return reinterpret_cast<u64>(&Top<13>);
-    }
-    if (n == "site_bottom_13") {
-        return reinterpret_cast<u64>(&Bottom<13>);
     }
     if (n == "site_top_14") {
         return reinterpret_cast<u64>(&Top<14>);
     }
-    if (n == "site_bottom_14") {
-        return reinterpret_cast<u64>(&Bottom<14>);
-    }
     if (n == "site_top_15") {
         return reinterpret_cast<u64>(&Top<15>);
-    }
-    if (n == "site_bottom_15") {
-        return reinterpret_cast<u64>(&Bottom<15>);
     }
     if (n == "site_top_16") {
         return reinterpret_cast<u64>(&Top<16>);
     }
-    if (n == "site_bottom_16") {
-        return reinterpret_cast<u64>(&Bottom<16>);
-    }
     if (n == "site_top_17") {
         return reinterpret_cast<u64>(&Top<17>);
-    }
-    if (n == "site_bottom_17") {
-        return reinterpret_cast<u64>(&Bottom<17>);
     }
     if (n == "site_top_18") {
         return reinterpret_cast<u64>(&Top<18>);
     }
-    if (n == "site_bottom_18") {
-        return reinterpret_cast<u64>(&Bottom<18>);
-    }
     if (n == "site_top_19") {
         return reinterpret_cast<u64>(&Top<19>);
-    }
-    if (n == "site_bottom_19") {
-        return reinterpret_cast<u64>(&Bottom<19>);
     }
     if (n == "site_top_20") {
         return reinterpret_cast<u64>(&Top<20>);
     }
-    if (n == "site_bottom_20") {
-        return reinterpret_cast<u64>(&Bottom<20>);
-    }
     if (n == "site_top_21") {
         return reinterpret_cast<u64>(&Top<21>);
-    }
-    if (n == "site_bottom_21") {
-        return reinterpret_cast<u64>(&Bottom<21>);
     }
     if (n == "site_top_22") {
         return reinterpret_cast<u64>(&Top<22>);
     }
-    if (n == "site_bottom_22") {
-        return reinterpret_cast<u64>(&Bottom<22>);
-    }
     if (n == "site_top_23") {
         return reinterpret_cast<u64>(&Top<23>);
-    }
-    if (n == "site_bottom_23") {
-        return reinterpret_cast<u64>(&Bottom<23>);
     }
     if (n == "site_top_24") {
         return reinterpret_cast<u64>(&Top<24>);
     }
-    if (n == "site_bottom_24") {
-        return reinterpret_cast<u64>(&Bottom<24>);
-    }
     if (n == "site_top_25") {
         return reinterpret_cast<u64>(&Top<25>);
-    }
-    if (n == "site_bottom_25") {
-        return reinterpret_cast<u64>(&Bottom<25>);
     }
     if (n == "site_top_26") {
         return reinterpret_cast<u64>(&Top<26>);
     }
-    if (n == "site_bottom_26") {
-        return reinterpret_cast<u64>(&Bottom<26>);
-    }
     if (n == "site_top_27") {
         return reinterpret_cast<u64>(&Top<27>);
     }
-    if (n == "site_bottom_27") {
-        return reinterpret_cast<u64>(&Bottom<27>);
-    }
     if (n == "site_top_28") {
         return reinterpret_cast<u64>(&Top<28>);
-    }
-    if (n == "site_bottom_28") {
-        return reinterpret_cast<u64>(&Bottom<28>);
     }
     return 0;
 }
@@ -2755,7 +2511,6 @@ u64 FindHandler(const char* name) {
 nlohmann::json Report() {
     nlohmann::json out;
     out["enabled"] = Cfg().on;
-    out["verify_every"] = Cfg().verify_every;
     nlohmann::json list = nlohmann::json::array();
     for (auto& site : Sites()) {
         SiteStats& s = site.stats;
@@ -2765,10 +2520,7 @@ nlohmann::json Report() {
         e["executions_seen"] = s.executions.load();
         e["generated"] = s.generated.load();
         e["declined"] = s.declined.load();
-        e["verify_executions"] = s.verify_executions.load();
-        e["verify_clean"] = s.verify_clean.load();
-        e["verify_with_differences"] = s.verify_differences.load();
-        e["verify_raced_memory"] = s.verify_raced.load();
+        e["faults_noted"] = s.faults_noted.load();
         e["scan_faults"] = s.scan_faults.load();
         std::scoped_lock lock{s.mutex};
         e["decline_reasons"] = s.decline_reasons;

@@ -6009,7 +6009,6 @@ u64 TagCompute(u64 ctx, u64 x, u64 y, u64 z, u64 ret, bool exec_capable) {
 /// dispatch and compared with the game's packets.
 u64 PS4_SYSV_ABI TagDispatchIndirect(u64 ctx, u64 buffer, u64 offset, u64 a3, u64 a4, u64 a5, u64 ret) {
     NativeSiteGen::CensusDispatch(ret, generator_issuing);
-    NativeSiteGen::NoteDispatch(ctx, buffer, offset, 0, ret); // B7: the indirect dispatch's arguments are its buffer and offset
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     const auto valid = [](u64 pointer) { return IsHeapPointer(pointer) && (pointer & 7) == 0; };
     if (ctx == 0 || !valid(buffer) ||
@@ -8180,8 +8179,6 @@ u64 PS4_SYSV_ABI MeasureExCsDepthCopy(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u
 
 u64 PS4_SYSV_ABI TagAscDispatch(u64 jcc, u64 x, u64 y, u64 z, u64 a4, u64 a5, u64 ret) {
     NativeSiteGen::CensusDispatch(ret, generator_issuing);
-    NativeJobGen::NoteAsyncDispatch(jcc, x, y, z, ret); // B7: the verify run compares the engine's dispatch with the generator's prediction
-    NativeSiteGen::NoteDispatch(jcc, x, y, z, ret);
     if (NativeZPassGen::VerifyActive()) {
         NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 4, jcc, static_cast<u32>(x), static_cast<u32>(y), static_cast<u32>(z));
     }
@@ -8193,7 +8190,6 @@ u64 PS4_SYSV_ABI TagAscDispatchRecordOnly(u64 jcc, u64 x, u64 y, u64 z, u64 a4, 
 
 u64 PS4_SYSV_ABI TagDispatch(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     NativeSiteGen::CensusDispatch(ret, generator_issuing);
-    NativeSiteGen::NoteDispatch(ctx, a1, a2, a3, ret); // B7: a verify run compares the engine's dispatch with the site generator's prediction
     if (NativeZPassGen::VerifyActive()) {
         NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 3, ctx, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a3));
     }
@@ -8204,7 +8200,6 @@ u64 PS4_SYSV_ABI TagDispatch(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u6
 /// order, so with execution the wait and its label are not needed (game-visible fences are other packets).
 u64 PS4_SYSV_ABI TagDispatchFenced(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     NativeSiteGen::CensusDispatch(ret, generator_issuing);
-    NativeSiteGen::NoteDispatch(ctx, a1, a2, a3, ret); // B7: a verify run compares the engine's dispatch with the site generator's prediction
     if (NativeZPassGen::VerifyActive()) {
         NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 3, ctx, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a3));
     }
@@ -9284,9 +9279,6 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "job_loop_top") {
         return reinterpret_cast<u64>(&NativeJobGen::JobLoopTop);
-    }
-    if (name == "job_loop_bottom") {
-        return reinterpret_cast<u64>(&NativeJobGen::JobLoopBottom);
     }
     if (name == "mid_probe_b7") {
         return reinterpret_cast<u64>(&MidProbeB7);
