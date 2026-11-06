@@ -470,6 +470,16 @@ def build_env(settings, extra=None):
     # Shaders and pipelines beside the saves (the GPU reads it when it starts; before, Linux used
     # shadPS4's ~/.local/share/shadPS4 and Windows <saves>/user).
     env['TLG_GPU_USER_DIR'] = str(gpu_user_dir())
+    # The Pro memory setup (garlic_pool_pro in the environment or an overlay file of custom_configs) needs 8192 MiB of direct memory; with less the game
+    # fails its memory setup, calls LoadExec and the game restarts in a loop.
+    pro = env.get('TLG_GARLIC_POOL_PRO', '') not in ('', '0')
+    for overlay in [] if pro else sorted((USER_DIR / 'custom_configs').glob('*.json')):
+        try:
+            pro = pro or bool(json.loads(overlay.read_text(encoding='utf-8-sig')).get('GPU', {}).get('garlic_pool_pro', 0))
+        except (OSError, ValueError, AttributeError):
+            pass
+    if pro and int(env.get('TLG_DMEM_MB', '0') or 0) < 8192:
+        env['TLG_DMEM_MB'] = '8192'
     if extra:
         env.update(extra)
     return env
