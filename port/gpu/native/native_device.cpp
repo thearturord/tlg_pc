@@ -874,6 +874,9 @@ void ReleaseHeld(bool all, bool ignore_frames = false) {
     }
     const u64 done = Core::NativeContent::RasterDoneSubmissions();
     std::vector<HeldFree> due;
+    u64 early_blocks = 0, early_bytes = 0; // blocks handed back before the game's own frame rule said so (the heap was dry)
+    s64 early_max_frames = 0;
+    s64 early_frame = 0;
     {
         std::scoped_lock lock{deferred_mutex};
         const s64 frame = FreeHoldFrames() != 0 ? EngineFrame() : 0;
@@ -913,11 +916,20 @@ void ReleaseHeld(bool all, bool ignore_frames = false) {
                 hold_forced.fetch_add(1, std::memory_order_relaxed);
             } else if (ignore_frames && front.due_frame != 0 && !front.armed) {
                 hold_mid_released.fetch_add(1, std::memory_order_relaxed);
+                ++early_blocks;
+                early_bytes += front.size;
+                early_frame = frame;
+                early_max_frames = std::max<s64>(early_max_frames, front.due_frame - frame);
             }
             held_bytes -= held_frees.front().size;
             due.push_back(held_frees.front());
             held_frees.pop_front();
         }
+    }
+    if (early_blocks != 0) {
+        // 2026-11-06 slab / white blob hunt: the heap ran dry and the game's frame rule was dropped. Compare the time of this line with the time of a glitch (auto freeze line).
+        TLG_LOG(GPU, Warn, "free hold: heap dry, {} blocks / {} MB handed back before their frame rule (up to {} frames early, engine frame {}), raster done {}, submits {}", early_blocks,
+                early_bytes >> 20, early_max_frames, early_frame, done, Core::NativeContent::SubmitCount());
     }
     for (const auto& entry : due) {
         reinterpret_cast<GuestFunction6>(original)(entry.heap, entry.address, 0, 0, 0, 0);
