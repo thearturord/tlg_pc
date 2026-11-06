@@ -4570,23 +4570,23 @@ std::atomic<u64> tags_failed{};
 std::atomic<u64> last_tag_log_ns{0};
 
 constexpr u32 ExecFlag = 1u << 16; ///< tag meta: the draw is executed from its record, the game wrote no packets for it
-struct ExecContextState {
+struct ContextState {
     u64 ctx{};
     u64 target_signature{}; ///< render targets as the game's own path last bound them
     u64 target_pointers{};  ///< view pointers whose bind side effects were applied
     u32 draws{};
 };
 
-thread_local std::array<ExecContextState, 4> exec_states;
-thread_local u32 exec_state_next;
+thread_local std::array<ContextState, 4> context_states;
+thread_local u32 context_state_next;
 
-ExecContextState& ExecState(u64 ctx) {
-    for (auto& state : exec_states) {
+ContextState& ContextStateOf(u64 ctx) {
+    for (auto& state : context_states) {
         if (state.ctx == ctx) {
             return state;
         }
     }
-    auto& state = exec_states[exec_state_next++ % exec_states.size()];
+    auto& state = context_states[context_state_next++ % context_states.size()];
     state = {};
     state.ctx = ctx;
     return state;
@@ -4623,7 +4623,7 @@ u64 TargetSignature(u64 ctx) {
 /// The game's own path runs PrepareDraw: remember the targets it bound.
 u64 PS4_SYSV_ABI PrepareNote(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     if (ctx != 0) {
-        ExecState(ctx).target_signature = TargetSignature(ctx);
+        ContextStateOf(ctx).target_signature = TargetSignature(ctx);
     }
     return 0;
 }
@@ -5505,7 +5505,7 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
         tags_written.fetch_add(1, std::memory_order_relaxed);
         Live().gfx_tags.fetch_add(1, std::memory_order_relaxed);
         if (exec) {
-            if (auto& state = ExecState(ctx); state.target_pointers != TargetPointers(ctx)) {
+            if (auto& state = ContextStateOf(ctx); state.target_pointers != TargetPointers(ctx)) {
                 state.target_pointers = TargetPointers(ctx);
                 ApplyTargetSideEffects(ctx);
             }
