@@ -2053,19 +2053,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 slot_census[3].fetch_add(1, std::memory_order_relaxed);
             }
             NoteIndexedRow(slot);
-            const u32 every = indexed->VerifyEvery();
-            if (every != 0 && indexed->stats.draws.load(std::memory_order_relaxed) % every == 0) {
-                vk::Buffer buffer_of;
-                u64 offset_of, range_of;
-                indexed->stats.verified.fetch_add(1, std::memory_order_relaxed);
-                const bool known = indexed->BufferOf(slot, buffer_of, offset_of, range_of);
-                const bool same = info.buffer ? (known && buffer_of == info.buffer && offset_of == info.offset && range_of == info.range) : slot == 0;
-                if (!same) {
-                    indexed->stats.verify_differences.fetch_add(1, std::memory_order_relaxed);
-                    LOG_ERROR(Render_Vulkan, "indexed data: slot {} does not stand for the descriptor {:#x}+{:#x}/{:#x} of the legacy binder", slot,
-                              reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)), info.offset, info.range);
-                }
-            }
             ++binding.buffer;
             continue;
         }
@@ -2271,13 +2258,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             const u32 desc_index = static_cast<u32>(&image_desc - stage.images.data());
             image_keys[desc_index] = image_desc.array_key;
             auto* indexed = IndexedData::Get();
-            const u32 every = indexed->VerifyEvery();
-            if (every != 0 && indexed->stats.draws.load(std::memory_order_relaxed) % every == 0 && tsharp.Address() != 0 && Shader::Indexed::IsIndexedImage(image_desc) &&
-                !StageFlatSkipped(stage) &&
-                Shader::Indexed::ArrayKey(image_desc, tsharp) != image_keys[desc_index]) {
-                // the shader was compiled for another kind of image than this draw's T# (the specialization of the pipeline should have told)
-                indexed->stats.key_differences.fetch_add(1, std::memory_order_relaxed);
-            }
         }
         Census(census_base + CImageTotal);
         if (tsharp.Address() == 0 || data_fmt == Ps4Layout::DataFormat::FormatInvalid) {

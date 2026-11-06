@@ -53,9 +53,6 @@ bool IndexedData::DeviceFits(const Instance& instance) {
 
 IndexedData::IndexedData(const Instance& instance_, Scheduler& scheduler_) : instance{instance_}, scheduler{scheduler_} {
     const vk::Device device = instance.GetDevice();
-    if (const char* e = std::getenv("TLG_INDEXED_VERIFY"); e != nullptr && *e != 0) {
-        verify_every = static_cast<u32>(std::atoi(e));
-    }
     auto setup = [&](u32 index, u32 binding, vk::DescriptorType type, u32 capacity, u32 runs = 0) {
         auto& t = tables[index];
         t.binding = binding;
@@ -160,9 +157,9 @@ IndexedData::IndexedData(const Instance& instance_, Scheduler& scheduler_) : ins
     FlushWrites();
     live.store(this, std::memory_order_release);
     LOG_INFO(Render_Vulkan,
-             "indexed data path: {} buffer slots, {} slots in each of {} sampled image arrays, {} in each of {} storage image arrays (the last {} for mip level runs), {} in each of {} atomic format arrays, {} sampler slots, verify one draw in {}",
+             "indexed data path: {} buffer slots, {} slots in each of {} sampled image arrays, {} in each of {} storage image arrays (the last {} for mip level runs), {} in each of {} atomic format arrays, {} sampler slots",
              Shader::Indexed::MaxBuffers, Shader::Indexed::MaxImages, Shader::Indexed::NumImageKeys, Shader::Indexed::MaxStorageImages, Shader::Indexed::NumImageKeys,
-             Shader::Indexed::RunSlots, Shader::Indexed::MaxAtomicImages, 4 * Shader::Indexed::NumAtomicFormats, Shader::Indexed::MaxSamplers, verify_every);
+             Shader::Indexed::RunSlots, Shader::Indexed::MaxAtomicImages, 4 * Shader::Indexed::NumAtomicFormats, Shader::Indexed::MaxSamplers);
 }
 
 IndexedData::~IndexedData() {

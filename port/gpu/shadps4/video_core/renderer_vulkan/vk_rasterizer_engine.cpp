@@ -755,19 +755,6 @@ void Rasterizer::NoteIndexedImage(const vk::DescriptorImageInfo& info, u32 image
     auto* indexed = IndexedData::Get();
     const u32 slot = indexed->ImageSlot(image_key, info.imageView, info.imageLayout);
     NoteIndexedRow(slot);
-    const u32 every = indexed->VerifyEvery();
-    if (every != 0 && indexed->stats.draws.load(std::memory_order_relaxed) % every == 0) {
-        indexed->stats.verified.fetch_add(1, std::memory_order_relaxed);
-        vk::ImageView view_of;
-        vk::ImageLayout layout_of;
-        const bool known = indexed->ImageOf(image_key, slot, view_of, layout_of);
-        const bool same = info.imageView ? (known && view_of == info.imageView && layout_of == info.imageLayout) : slot == 0;
-        if (!same) {
-            indexed->stats.verify_differences.fetch_add(1, std::memory_order_relaxed);
-            TLG_LOG(RASTER, Error, "indexed data: image slot {} (key {}) does not stand for the view {:#x} layout {} of the legacy binder", slot, image_key,
-                      reinterpret_cast<u64>(static_cast<VkImageView>(info.imageView)), static_cast<u32>(info.imageLayout));
-        }
-    }
 }
 
 void Rasterizer::NoteIndexedRun(const vk::DescriptorImageInfo* infos, u32 count, u32 image_key) {
@@ -778,38 +765,12 @@ void Rasterizer::NoteIndexedRun(const vk::DescriptorImageInfo* infos, u32 count,
     }
     const u32 base = all_null ? indexed->NullRun(image_key) : indexed->ImageRun(image_key, infos, count);
     NoteIndexedRow(base);
-    const u32 every = indexed->VerifyEvery();
-    if (every != 0 && indexed->stats.draws.load(std::memory_order_relaxed) % every == 0) {
-        indexed->stats.verified.fetch_add(1, std::memory_order_relaxed);
-        bool same = true;
-        for (u32 i = 0; i < count; ++i) {
-            vk::ImageView view_of;
-            vk::ImageLayout layout_of;
-            const bool known = indexed->RunOf(image_key, base, i, view_of, layout_of);
-            same &= infos[i].imageView ? (known && view_of == infos[i].imageView && layout_of == infos[i].imageLayout) : (base == indexed->NullRun(image_key) || (known && !view_of));
-        }
-        if (!same) {
-            indexed->stats.verify_differences.fetch_add(1, std::memory_order_relaxed);
-            TLG_LOG(RASTER, Error, "indexed data: the run at slot {} (key {}, {} levels) does not stand for the views of the legacy binder", base, image_key, count);
-        }
-    }
 }
 
 void Rasterizer::NoteIndexedSampler(vk::Sampler sampler) {
     auto* indexed = IndexedData::Get();
     const u32 slot = indexed->SamplerSlot(sampler);
     NoteIndexedRow(slot);
-    const u32 every = indexed->VerifyEvery();
-    if (every != 0 && indexed->stats.draws.load(std::memory_order_relaxed) % every == 0) {
-        indexed->stats.verified.fetch_add(1, std::memory_order_relaxed);
-        vk::Sampler sampler_of;
-        const bool same = indexed->SamplerOf(slot, sampler_of) && sampler_of == sampler;
-        if (!same) {
-            indexed->stats.verify_differences.fetch_add(1, std::memory_order_relaxed);
-            TLG_LOG(RASTER, Error, "indexed data: sampler slot {} does not stand for the sampler {:#x} of the legacy binder", slot,
-                      reinterpret_cast<u64>(static_cast<VkSampler>(sampler)));
-        }
-    }
 }
 
 void Rasterizer::FrontStageNotes(StagePlan& stage, u64 position, const DrawPlan* owner) {

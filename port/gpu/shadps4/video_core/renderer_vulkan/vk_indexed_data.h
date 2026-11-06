@@ -106,13 +106,10 @@ public:
     struct Stats {
         std::atomic<u64> draws{0}, rows_entries{0}, buffer_hits{0}, buffer_new{0}, buffer_freed{0}, exhausted{0}, flushes{0}, written{0}, set_binds{0};
         std::atomic<u64> image_hits{0}, image_new{0}, image_freed{0}, sampler_hits{0}, sampler_new{0}, sampler_freed{0}, run_hits{0}, run_new{0}, run_freed{0};
-        std::atomic<u64> verified{0}, verify_differences{0}, key_differences{0}, legacy_writes{0}, compute_dispatches{0}, legacy_flat{0}, legacy_clip{0}, legacy_lds{0}, legacy_images{0}, flat_dwords{0};
+        std::atomic<u64> legacy_writes{0}, compute_dispatches{0}, legacy_flat{0}, legacy_clip{0}, legacy_lds{0}, legacy_images{0}, flat_dwords{0};
         std::atomic<u32> live_buffer_slots{0}, live_image_slots{0}, live_sampler_slots{0};
     };
     Stats stats;
-    [[nodiscard]] u32 VerifyEvery() const noexcept {
-        return verify_every;
-    }
 
 private:
     struct Key {
@@ -166,7 +163,6 @@ private:
     vk::UniqueSampler default_sampler;
     vk::DescriptorSet set{};
     bool table_ready{false};
-    u32 verify_every{0}; // TLG_INDEXED_VERIFY=N: off by default since 2026-10-30
 
     std::mutex mutex;
     std::array<Table, NumTables> tables;
