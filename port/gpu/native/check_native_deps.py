@@ -13,14 +13,19 @@ import json, os, re, sys
 
 NATIVE = os.path.dirname(os.path.abspath(__file__))
 
-ALLOWED_PS4 = {
-    "video_core/amdgpu/resource.h": "by design: the shader recompiler reads T# words, so Derive writes them in the PS4 layout (pixel_format.h comes with it); goes when the recompiler interface changes",
-    "video_core/amdgpu/regs.h":"by design: bit layouts of the colour/depth target words the shader and the host format code take (ColorBuffer, DepthBuffer, DepthView, DataFormat tables); native_target_desc.cpp only",
-    "video_core/amdgpu/cb_db_extent.h": "by design: the extent hints of the targets are register words (CB/DB extent); goes with the target description (E7)",
-    "video_core/amdgpu/pm4_cmds.h": "by design: the constant engine buffer is read as PM4 packets (native_executor_direct.cpp); goes with G5",
+# G6 (2026-11-06): the list is split in two. BY_DESIGN stays for good (the recompiler boundary, the PS4 data layouts the shader reads, the Vulkan state structs). DEBT is what is
+# still open: each entry names the phase that removes it.
+ALLOWED_BY_DESIGN = {
+    "video_core/amdgpu/resource.h": "by design: the shader recompiler reads T# words, so Derive writes them in the PS4 layout (pixel_format.h comes with it); goes only if the recompiler interface changes",
+    "video_core/amdgpu/regs.h": "by design: bit layouts of the colour/depth target words the shader and the host format code take (ColorBuffer, DepthBuffer, DepthView, DataFormat tables); native_target_desc.cpp only",
     "video_core/renderer_vulkan/vk_fixed_state.h": "by design: the Vulkan fixed state struct (Vulkan terms; it includes regs.h only for NUM_VIEWPORTS and PrimitiveType)",
     "video_core/renderer_vulkan/vk_indexed_data.h": "by design: the Vulkan host class of the indexed data path (C9); native_draw.cpp only reads its counters",
 }
+ALLOWED_DEBT = {
+    "video_core/amdgpu/cb_db_extent.h": "debt: the extent hints of the targets are register words (CB/DB extent); goes when the target description carries plain extents (E7 leftover)",
+    "video_core/amdgpu/pm4_cmds.h": "debt: the constant engine buffer is read as PM4 packets (native_executor_direct.cpp); goes with G5c",
+}
+ALLOWED_PS4 = {**ALLOWED_BY_DESIGN, **ALLOWED_DEBT}
 # plain emulator infrastructure the native code shares (not GPU emulation); reviewed once, kept short
 ALLOWED_SHARED = {
     "core/memory.h", "core/guest_heap.h", "core/platform.h", "core/emulator_settings.h",  # settings and the CPU's view of PS4 memory (by design)
@@ -132,9 +137,9 @@ if "--consumer-table" in sys.argv:
 
 for line in bad:
     print(line)
-print(f"native/ includes {len(used)} of {len(ALLOWED_PS4)} allowlisted PS4 headers; {len(bad)} violation(s)")
+print(f"native/ includes {len(used)} of {len(ALLOWED_PS4)} allowlisted PS4 headers ({len(ALLOWED_BY_DESIGN)} by design, {len(ALLOWED_DEBT)} debt); {len(bad)} violation(s)")
 for target in sorted(ALLOWED_PS4):
-    print(f"  {'used  ' if target in used else 'unused'}  {target}  -> goes with {ALLOWED_PS4[target]}")
+    print(f"  {'used  ' if target in used else 'unused'}  {target}  -> {ALLOWED_PS4[target]}")
 for rel, why in RECOMPILER_BOUNDARY.items():
     print(f"  recompiler boundary {rel}  -> {why}")
 for name, owner in MEMBER_FILES.items():
