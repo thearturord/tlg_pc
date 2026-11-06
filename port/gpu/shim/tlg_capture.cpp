@@ -591,7 +591,7 @@ void AutoFreezeCheck() {
     static u64 since_freeze = 0;
     std::scoped_lock lock{thumbs_mutex};
     const size_t n = thumbs.size();
-    if (n < 3 || ++since_freeze < 8) {
+    if (n < 3 || ++since_freeze < 300) { // fades after the start or a freeze are not glitches
         return;
     }
     const auto& a = thumbs[n - 3].bgra;
@@ -610,7 +610,7 @@ void AutoFreezeCheck() {
         }
     }
     const double score = 100.0 * double(hits) / double(pixels);
-    if (score > 0.5 && score > 3.0 * average) {
+    if (score > 1.0 && score > 4.0 * average) {
         LOG_WARNING(Render, "auto freeze: thumbnail {} differs from both neighbours in {:.2f} % of the pixels (recent average {:.2f} %)", thumbs[n - 2].id, score, average);
         since_freeze = 0;
         Core::FrameWalk::KeyFreeze();
