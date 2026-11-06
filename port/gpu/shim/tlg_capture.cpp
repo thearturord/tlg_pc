@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "native/native_counter_ring.h"
+#include "native/native_framewalk.h"
 #include "native/native_debug_server.h"
 #include "native/native_timeline.h"
 #include "native/native_resources.h"
@@ -575,6 +576,49 @@ void MonitorFrame(double mean, u64 tick) {
     }
 }
 
+/// Auto freeze (`TLG_AUTO_FREEZE=1`, debugger mode on): the newest three thumbnails are compared pixel by pixel. A frame whose pixels differ by more than 8 (of 255, mean of R, G, B) from BOTH
+/// neighbours, while the neighbours agree with each other (difference under 4), is a one frame glitch (a cut or a fast move makes the neighbours differ too). More than 0.5 % of the pixels
+/// and more than three times the recent average freezes the game (the F5 freeze), so the draw table and the timeline still hold the bad frame.
+void AutoFreezeCheck() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("TLG_AUTO_FREEZE");
+        return e && *e == '1';
+    }();
+    if (!enabled || !Core::FrameWalk::DebuggerMode()) {
+        return;
+    }
+    static double average = 0.2;
+    static u64 since_freeze = 0;
+    std::scoped_lock lock{thumbs_mutex};
+    const size_t n = thumbs.size();
+    if (n < 3 || ++since_freeze < 8) {
+        return;
+    }
+    const auto& a = thumbs[n - 3].bgra;
+    const auto& b = thumbs[n - 2].bgra;
+    const auto& c = thumbs[n - 1].bgra;
+    if (a.size() != b.size() || b.size() != c.size() || a.empty()) {
+        return;
+    }
+    u64 hits = 0;
+    const size_t pixels = a.size() / 4;
+    for (size_t i = 0; i < pixels; ++i) {
+        const auto luma = [i](const std::vector<u8>& v) { return int(v[i * 4]) + int(v[i * 4 + 1]) + int(v[i * 4 + 2]); };
+        const int la = luma(a), lb = luma(b), lc = luma(c);
+        if (std::min(std::abs(lb - la), std::abs(lb - lc)) > 24 && std::abs(la - lc) < 12) {
+            ++hits;
+        }
+    }
+    const double score = 100.0 * double(hits) / double(pixels);
+    if (score > 0.5 && score > 3.0 * average) {
+        LOG_WARNING(Render, "auto freeze: thumbnail {} differs from both neighbours in {:.2f} % of the pixels (recent average {:.2f} %)", thumbs[n - 2].id, score, average);
+        since_freeze = 0;
+        Core::FrameWalk::KeyFreeze();
+    } else {
+        average = 0.95 * average + 0.05 * std::max(score, 0.05);
+    }
+}
+
 } // namespace
 
 void RequestScreenshot() {
@@ -838,6 +882,7 @@ void Poll(Vulkan::Scheduler& scheduler) {
                     thumbs.pop_front();
                 }
             }
+            AutoFreezeCheck();
             if (MonitorEnv()) {
                 MonitorFrame(MeanBrightness(*slot), slot->tick);
             }
