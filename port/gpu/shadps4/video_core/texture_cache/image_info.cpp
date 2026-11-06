@@ -160,27 +160,6 @@ Core::NativeDesc::ImageDesc ImageDescFromSharp(const AmdGpu::Image& sharp) noexc
     return d;
 }
 
-u32 ImageDescAccessorMismatch(const AmdGpu::Image& sharp, const Core::NativeDesc::ImageDesc& desc) noexcept {
-    u32 mask = 0;
-    const auto note = [&](u32 bit, bool equal) { mask |= equal ? 0u : 1u << bit; };
-    note(0, desc.NumLayers() == sharp.NumLayers());
-    note(1, desc.NumLevels() == sharp.NumLevels());
-    note(2, desc.NumSamples() == sharp.NumSamples());
-    note(3, desc.BaseType() == static_cast<u32>(sharp.GetBaseType()));
-    bool view_type = true, view_levels = true, view_layers = true;
-    for (const bool is_array : {false, true}) {
-        view_type &= desc.ViewType(is_array) == static_cast<u32>(sharp.GetViewType(is_array));
-        view_levels &= desc.NumViewLevels(is_array) == sharp.NumViewLevels(is_array);
-        view_layers &= desc.NumViewLayers(is_array) == sharp.NumViewLayers(is_array);
-    }
-    note(4, view_type);
-    note(5, view_levels);
-    note(6, view_layers);
-    note(7, desc.IsTiled() == sharp.IsTiled());
-    note(8, desc.IsVolume() == (sharp.GetBaseType() == AmdGpu::ImageType::Color3D));
-    return mask;
-}
-
 ImageInfo::ImageInfo(const Core::NativeDesc::ImageDesc& desc, bool is_depth) noexcept {
     tile_mode = static_cast<Ps4Layout::TileMode>(desc.tile_mode);
     array_mode = Ps4Layout::GetArrayMode(tile_mode);
@@ -210,35 +189,6 @@ ImageInfo::ImageInfo(const Core::NativeDesc::ImageDesc& desc, bool is_depth) noe
         alt_tile = Libraries::Kernel::sceKernelIsNeoMode();
     }
     UpdateSize();
-}
-
-u32 ImageInfoDiffMask(const ImageInfo& a, const ImageInfo& b) noexcept {
-    u32 mask = 0;
-    const auto diff = [&](u32 bit, bool different) { mask |= different ? 1u << bit : 0u; };
-    diff(0, a.props.is_volume != b.props.is_volume || a.props.is_tiled != b.props.is_tiled || a.props.is_pow2 != b.props.is_pow2 || a.props.is_block != b.props.is_block ||
-               a.props.is_depth != b.props.is_depth || a.props.has_stencil != b.props.has_stencil || a.props.is_host_2d != b.props.is_host_2d);
-    diff(1, a.pixel_format != b.pixel_format);
-    diff(2, a.type != b.type);
-    diff(3, a.resources.levels != b.resources.levels);
-    diff(4, a.resources.layers != b.resources.layers);
-    diff(5, a.size.width != b.size.width || a.size.height != b.size.height || a.size.depth != b.size.depth);
-    diff(6, a.num_bits != b.num_bits);
-    diff(7, a.num_samples != b.num_samples);
-    diff(8, a.pitch != b.pitch);
-    diff(9, a.tile_mode != b.tile_mode);
-    diff(10, a.array_mode != b.array_mode);
-    bool mips = false;
-    for (u32 m = 0; m < a.resources.levels && m < a.mips_layout.size(); ++m) {
-        mips |= std::memcmp(&a.mips_layout[m], &b.mips_layout[m], sizeof(MipInfo)) != 0;
-    }
-    diff(11, mips);
-    diff(12, a.micro_tiled_mips != b.micro_tiled_mips);
-    diff(13, a.guest_address != b.guest_address);
-    diff(14, a.guest_size != b.guest_size);
-    diff(15, a.bank_swizzle != b.bank_swizzle || a.alt_tile != b.alt_tile);
-    diff(16, a.meta_info.cmask_addr != b.meta_info.cmask_addr || a.meta_info.fmask_addr != b.meta_info.fmask_addr || a.meta_info.htile_addr != b.meta_info.htile_addr || a.stencil_addr != b.stencil_addr ||
-                 a.stencil_size != b.stencil_size);
-    return mask;
 }
 
 bool ImageInfo::IsCompatible(const ImageInfo& info) const {

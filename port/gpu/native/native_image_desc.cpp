@@ -132,44 +132,6 @@ std::array<std::array<std::string, 12>, FieldCount> g_examples; ///< the first d
 std::array<u32, FieldCount> g_example_count{};
 std::map<std::string, std::set<std::pair<u32, u32>>> g_pitches; ///< "format F tile T" -> (width, pitch) pairs seen
 
-// F4.1 plain description compare
-enum DescField : u32 {
-    DAddress, DVkFormat, DVkFormatStorage, DNumBits, DIsBlock, DType, DWidth, DHeight, DDepth, DPitch, DBaseLevel, DLastLevel, DBaseArray, DLastArray, DTileMode, DPow2Pad, DAltTile, DMinLod, DSwizzle, DescFieldCount
-};
-constexpr const char* DescFieldNames[DescFieldCount] = {"address", "vk_format", "vk_format_storage", "num_bits", "is_block", "type", "width", "height", "depth", "pitch", "base_level", "last_level",
-                                                       "base_array", "last_array", "tile_mode", "pow2_pad", "alt_tile_mode", "min_lod", "swizzle"};
-std::atomic<u64> g_dc_compared{}, g_dc_equal{}, g_dc_not_derived{}, g_dc_accessor_bad{};
-std::array<std::atomic<u64>, DescFieldCount> g_dc_differing{};
-std::array<std::atomic<u64>, 9> g_dc_accessor_differs{};
-std::array<std::vector<std::string>, DescFieldCount> g_dc_examples;
-
-std::atomic<u64> g_hi_compared{}, g_hi_equal{}, g_hi_unavailable{};
-std::array<std::atomic<u64>, 17> g_hi_info_differs{};
-std::array<std::atomic<u64>, 6> g_hi_view_differs{};
-std::vector<std::string> g_hi_examples;
-
-void DescValues(const NativeDesc::ImageDesc& d, u64 (&v)[DescFieldCount]) {
-    v[DAddress] = d.address;
-    v[DVkFormat] = d.vk_format;
-    v[DVkFormatStorage] = d.vk_format_storage;
-    v[DNumBits] = d.num_bits;
-    v[DIsBlock] = d.is_block;
-    v[DType] = d.type;
-    v[DWidth] = d.width;
-    v[DHeight] = d.height;
-    v[DDepth] = d.depth;
-    v[DPitch] = d.pitch;
-    v[DBaseLevel] = d.base_level;
-    v[DLastLevel] = d.last_level;
-    v[DBaseArray] = d.base_array;
-    v[DLastArray] = d.last_array;
-    v[DTileMode] = d.tile_mode;
-    v[DPow2Pad] = d.pow2_pad;
-    v[DAltTile] = d.alt_tile_mode;
-    v[DMinLod] = d.min_lod;
-    v[DSwizzle] = d.swizzle[0] | d.swizzle[1] << 4 | d.swizzle[2] << 8 | d.swizzle[3] << 12;
-}
-
 } // namespace
 
 /// Where a view object keeps its T#: shader resource view +0x58, unordered access view +0x54
@@ -380,219 +342,6 @@ bool Decides() noexcept {
     return on;
 }
 
-void Compare(u64 resource_id, u64 view_id, const AmdGpu::Image& actual) {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_DESC_CHECKS");
-        return e != nullptr && *e == '1';
-    }();
-    if (!on || resource_id == 0) {
-        return;
-    }
-    {
-        // the descriptor the engine keeps inside the view object (eight dwords; shader resource view +0x58, unordered access view +0x54): is it the one the record holds?
-        // `live` is read now (the raster thread, later than the record), `snapshot` is what the table kept when the creation returned
-        NativeDevice::Object v;
-        if (view_id != 0 && NativeDevice::Lookup(view_id, v) && v.object != 0 && v.has_tsharp) {
-            u32 held[8], now[8];
-            std::memcpy(held, reinterpret_cast<const void*>(v.object + HeldOffset(v.kind)), sizeof(held));
-            std::memcpy(now, &actual, sizeof(now));
-            bool same = true, snapshot_same = true;
-            for (u32 w = 0; w < 8; ++w) {
-                if (held[w] != now[w]) {
-                    same = false;
-                    g_held_word_differs[w].fetch_add(1, std::memory_order_relaxed);
-                }
-                // the address refresh edits dword 0 and the high address bits of dword 1: those two are compared without them
-                const u32 mask = w == 0 ? 0u : w == 1 ? ~0x3fu : ~0u;
-                if (((v.tsharp[w] ^ now[w]) & mask) != 0) {
-                    snapshot_same = false;
-                    g_snap_word_differs[w].fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-            (same ? g_held_equal : g_held_differ).fetch_add(1, std::memory_order_relaxed);
-            (snapshot_same ? g_snap_equal : g_snap_differ).fetch_add(1, std::memory_order_relaxed);
-        } else {
-            g_held_none.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-    AmdGpu::Image derived;
-    switch (Derive(resource_id, view_id, derived)) {
-    case Result::UnknownObject:
-        g_unknown_object.fetch_add(1, std::memory_order_relaxed);
-        return;
-    case Result::UnknownFormat: {
-        g_unknown_format.fetch_add(1, std::memory_order_relaxed);
-        NativeDevice::Object res, view;
-        if (NativeDevice::Lookup(resource_id, res) && g_logged.fetch_add(1, std::memory_order_relaxed) < 12) {
-            const bool has_view = view_id != 0 && NativeDevice::Lookup(view_id, view) && view.has_desc;
-            Core::RareEvents::Note("image_desc_unknown_format", fmt::format("engine format {} (resource {}) -> T# {}/{}", has_view ? view.desc[0] : res.format, res.format, u32(actual.data_format), u32(actual.num_format)));
-        }
-        return;
-    }
-    case Result::Derived:
-        break;
-    }
-    g_compared.fetch_add(1, std::memory_order_relaxed);
-    {
-        NativeDevice::Object r;
-        if (NativeDevice::Lookup(resource_id, r)) {
-            std::scoped_lock lock{g_mutex};
-            auto& mem = g_pitches[fmt::format("memtype kind {} bind {:#x} usage {} cpu {:#x} misc {:#x}", u32(r.kind), r.bind, r.usage, r.cpu_access, r.misc)];
-            if (mem.size() < 8) {
-                mem.insert({u32(actual.mtype) * 100 + u32(actual.mtype_l2) * 10 + u32(actual.mtype2), 0});
-            }
-            auto& set = g_pitches[fmt::format("format {} tile {}", r.format, u32(actual.tiling_index))];
-            if (set.size() < 40) {
-                set.insert({r.width, u32(actual.pitch) + 1});
-            }
-        }
-    }
-    bool differ[FieldCount] = {};
-    differ[FAddress] = derived.base_address != actual.base_address;
-    differ[FDataFormat] = derived.data_format != actual.data_format;
-    differ[FNumFormat] = derived.num_format != actual.num_format;
-    differ[FWidth] = derived.width != actual.width;
-    differ[FHeight] = derived.height != actual.height;
-    differ[FDepth] = derived.depth != actual.depth;
-    differ[FPitch] = derived.pitch != actual.pitch;
-    differ[FDstSel] = derived.dst_sel_x != actual.dst_sel_x || derived.dst_sel_y != actual.dst_sel_y || derived.dst_sel_z != actual.dst_sel_z || derived.dst_sel_w != actual.dst_sel_w;
-    differ[FBaseLevel] = derived.base_level != actual.base_level;
-    differ[FLastLevel] = derived.last_level != actual.last_level;
-    differ[FTiling] = derived.tiling_index != actual.tiling_index;
-    differ[FPow2Pad] = derived.pow2pad != actual.pow2pad;
-    differ[FType] = derived.type != actual.type;
-    differ[FBaseArray] = derived.base_array != actual.base_array;
-    differ[FLastArray] = derived.last_array != actual.last_array;
-    differ[FMemType] = derived.mtype != actual.mtype || derived.mtype_l2 != actual.mtype_l2 || derived.mtype2 != actual.mtype2 || derived.perf_modulation != actual.perf_modulation;
-    // everything the derivation leaves zero: the remaining bits of the descriptor
-    AmdGpu::Image rest = actual;
-    rest.base_address = 0, rest.data_format = 0, rest.num_format = 0, rest.width = 0, rest.height = 0, rest.depth = 0, rest.pitch = 0;
-    rest.dst_sel_x = rest.dst_sel_y = rest.dst_sel_z = rest.dst_sel_w = 0;
-    rest.perf_modulation = 0, rest.mtype = 0, rest.mtype_l2 = 0, rest.mtype2 = 0;
-    rest.base_level = rest.last_level = 0, rest.tiling_index = 0, rest.pow2pad = 0, rest.type = 0, rest.base_array = rest.last_array = 0;
-    AmdGpu::Image zero{};
-    differ[FRest] = std::memcmp(&rest, &zero, sizeof(rest)) != 0;
-    bool any = false;
-    NativeDevice::Object res_info, view_info;
-    NativeDevice::Lookup(resource_id, res_info);
-    const u64 view_object = view_id != 0 && NativeDevice::Lookup(view_id, view_info) ? view_info.object : 0;
-    const auto value = [&](u32 field, const AmdGpu::Image& image) -> u64 {
-        switch (field) {
-        case FHeight: return image.height + 1;
-        case FPitch: return image.pitch + 1;
-        case FLastArray: return image.last_array;
-        case FLastLevel: return image.last_level;
-        default: return 0;
-        }
-    };
-    for (u32 i = 0; i < FieldCount; ++i) {
-        if (differ[i]) {
-            any = true;
-            g_differing[i].fetch_add(1, std::memory_order_relaxed);
-            std::scoped_lock lock{g_mutex};
-            if (g_example_count[i] < 4 + (i == FPitch ? 8 : 0)) {
-                std::string text;
-                if (i == FMemType) {
-                    text = fmt::format("derived mtype {} l2 {} mtype2 {} actual mtype {} l2 {} mtype2 {}", u32(derived.mtype), u32(derived.mtype_l2), u32(derived.mtype2), u32(actual.mtype), u32(actual.mtype_l2), u32(actual.mtype2));
-                } else if (i == FRest) {
-                    u64 words[4];
-                    std::memcpy(words, &rest, sizeof(words));
-                    text = fmt::format("{:#x} {:#x} {:#x} {:#x}", words[0], words[1], words[2], words[3]);
-                } else {
-                    text = fmt::format("derived {} actual {}", value(i, derived), value(i, actual));
-                }
-                text += fmt::format(" (resource {}x{} mips {} layers {} depth {} bind {:#x} bytes {:#x} format {} T# type {} fmt {}/{} tile {} resource object {:#x} view object {:#x})", res_info.width, res_info.height, res_info.mips, res_info.layers, res_info.depth, res_info.bind,
-                                    res_info.bytes, res_info.format, u32(actual.type), u32(actual.data_format), u32(actual.num_format), u32(actual.tiling_index), res_info.object, view_object);
-                if (i == FHeight || i == FLastLevel) {
-                    // where the engine keeps the number: the T# words and the values in the objects as they were at creation
-                    u8 vb[0x400] = {}, rb[0x400] = {};
-                    const bool have_v = view_id != 0 && NativeDevice::RawBytes(view_id, vb, sizeof(vb));
-                    const bool have_r = NativeDevice::RawBytes(resource_id, rb, sizeof(rb));
-                    u32 words[8];
-                    std::memcpy(words, &actual, sizeof(words));
-                    text += fmt::format(" raw view {} resource {}; T# {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x};", have_v, have_r, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
-                    const auto find = [&](const u8* b, bool have, const char* name) {
-                        if (!have) {
-                            return;
-                        }
-                        for (u32 off = 0; off + 4 <= 0x400; off += 4) {
-                            u32 v;
-                            std::memcpy(&v, b + off, 4);
-                            if (i == FHeight && (v == u32(actual.height) + 1 || v == u32(actual.height)) && v > 8) {
-                                text += fmt::format(" {}+{:#x}={}", name, off, v);
-                            }
-                            for (u32 w = 0; w < 8; ++w) {
-                                if (words[w] != 0 && v == words[w] && (words[w] > 0xffff)) {
-                                    text += fmt::format(" {}+{:#x}=T#word{}", name, off, w);
-                                }
-                            }
-                        }
-                    };
-                    find(vb, have_v, "view");
-                    find(rb, have_r, "res");
-                }
-                bool seen = false;
-                for (u32 k = 0; k < g_example_count[i]; ++k) {
-                    seen |= g_examples[i][k] == text;
-                }
-                if (!seen) {
-                    g_examples[i][g_example_count[i]++] = text;
-                }
-            }
-        }
-    }
-    if (!any) {
-        g_equal.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    if (false) {
-        std::string names;
-        for (u32 i = 0; i < FieldCount; ++i) {
-            names += differ[i] ? std::string(FieldNames[i]) + " " : std::string();
-        }
-        NativeDevice::Object res;
-        NativeDevice::Lookup(resource_id, res);
-        Core::RareEvents::Note("image_desc_differs_from_t_sharp",
-                               fmt::format("{}: derived {}x{} fmt {}/{} type {} lv {}-{} arr {}-{} depth {} pitch {} pad {} tile {} sel {}{}{}{}, T# {}x{} fmt {}/{} type {} lv {}-{} arr {}-{} depth {} pitch {} pad {} tile {} sel {}{}{}{} (resource {}x{} mips {} layers {} bind {:#x})",
-                                           names, u32(derived.width) + 1, u32(derived.height) + 1, u32(derived.data_format), u32(derived.num_format), u32(derived.type), u32(derived.base_level), u32(derived.last_level),
-                                           u32(derived.base_array), u32(derived.last_array), u32(derived.depth), u32(derived.pitch), u32(derived.pow2pad), u32(derived.tiling_index), u32(derived.dst_sel_x),
-                                           u32(derived.dst_sel_y), u32(derived.dst_sel_z), u32(derived.dst_sel_w), u32(actual.width) + 1, u32(actual.height) + 1, u32(actual.data_format), u32(actual.num_format),
-                                           u32(actual.type), u32(actual.base_level), u32(actual.last_level), u32(actual.base_array), u32(actual.last_array), u32(actual.depth), u32(actual.pitch), u32(actual.pow2pad),
-                                           u32(actual.tiling_index), u32(actual.dst_sel_x), u32(actual.dst_sel_y), u32(actual.dst_sel_z), u32(actual.dst_sel_w), res.width, res.height, res.mips, res.layers, res.bind));
-    }
-}
-
-void NoteHostInfoCompare(bool available, u32 info_mask, u32 view_mask, const char* example) {
-    if (!available) {
-        g_hi_unavailable.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    g_hi_compared.fetch_add(1, std::memory_order_relaxed);
-    if (info_mask == 0 && view_mask == 0) {
-        g_hi_equal.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    for (u32 i = 0; i < g_hi_info_differs.size(); ++i) {
-        if ((info_mask >> i) & 1) {
-            g_hi_info_differs[i].fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-    for (u32 i = 0; i < g_hi_view_differs.size(); ++i) {
-        if ((view_mask >> i) & 1) {
-            g_hi_view_differs[i].fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-    std::scoped_lock lock{g_mutex};
-    if (g_hi_examples.size() < 12 && example != nullptr) {
-        const std::string text = example;
-        if (std::find(g_hi_examples.begin(), g_hi_examples.end(), text) == g_hi_examples.end()) {
-            g_hi_examples.push_back(text);
-        }
-    }
-}
-
-std::atomic<u64> g_sd_compared{}, g_sd_equal{}, g_sd_used{};
-std::vector<std::string> g_sd_examples;
 
 std::atomic<u64> g_use_served{}, g_use_unavailable{}, g_use_alt_tile{}, g_use_depth_refused{};
 
@@ -633,30 +382,6 @@ NativeDesc::SamplerDesc SamplerDescFromWords(const u32* words) noexcept {
     return d;
 }
 
-void NoteSamplerDescCompare(bool equal, const char* example) {
-    g_sd_compared.fetch_add(1, std::memory_order_relaxed);
-    if (equal) {
-        g_sd_equal.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    std::scoped_lock lock{g_mutex};
-    if (g_sd_examples.size() < 8 && example != nullptr) {
-        const std::string text = example;
-        if (std::find(g_sd_examples.begin(), g_sd_examples.end(), text) == g_sd_examples.end()) {
-            g_sd_examples.push_back(text);
-        }
-    }
-}
-
-std::atomic<u64> g_bd_compared[2]{}, g_bd_differs[2]{};
-
-void NoteBufferDescCompare(u32 where, bool equal) {
-    g_bd_compared[where & 1].fetch_add(1, std::memory_order_relaxed);
-    if (!equal) {
-        g_bd_differs[where & 1].fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
 bool FromDescOn() noexcept {
     static const bool on = [] {
         const char* e = std::getenv("TLG_IMAGE_FROM_DESC");
@@ -687,56 +412,6 @@ bool DescForBinding(u64 resource_id, u64 view_id, bool cube_to_2d_array, bool is
     }
     g_use_served.fetch_add(1, std::memory_order_relaxed);
     return true;
-}
-
-bool DescCompareOn() noexcept {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_DESC_CHECKS");
-        return e != nullptr && *e == '1';
-    }();
-    return on;
-}
-
-void CompareDesc(u64 resource_id, u64 view_id, const NativeDesc::ImageDesc& reference, u32 accessor_mismatch) {
-    NativeDesc::ImageDesc engine;
-    if (!DeriveDesc(resource_id, view_id, engine)) {
-        g_dc_not_derived.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    g_dc_compared.fetch_add(1, std::memory_order_relaxed);
-    u64 a[DescFieldCount], b[DescFieldCount];
-    DescValues(engine, a);
-    DescValues(reference, b);
-    bool any = false;
-    for (u32 i = 0; i < DescFieldCount; ++i) {
-        if (a[i] == b[i]) {
-            continue;
-        }
-        any = true;
-        g_dc_differing[i].fetch_add(1, std::memory_order_relaxed);
-        std::scoped_lock lock{g_mutex};
-        if (g_dc_examples[i].size() < 6) {
-            NativeDevice::Object res;
-            NativeDevice::Lookup(resource_id, res);
-            const std::string text = fmt::format("engine {:#x} reference {:#x} (resource {}x{} mips {} layers {} depth {} format {} bind {:#x}; reference type {} fmt {} tile {})", a[i], b[i], res.width, res.height, res.mips,
-                                                 res.layers, res.depth, res.format, res.bind, reference.type, reference.vk_format, reference.tile_mode);
-            if (std::find(g_dc_examples[i].begin(), g_dc_examples[i].end(), text) == g_dc_examples[i].end()) {
-                g_dc_examples[i].push_back(text);
-            }
-        }
-    }
-    if (accessor_mismatch != 0) {
-        any = true;
-        g_dc_accessor_bad.fetch_add(1, std::memory_order_relaxed);
-        for (u32 i = 0; i < g_dc_accessor_differs.size(); ++i) {
-            if ((accessor_mismatch >> i) & 1) {
-                g_dc_accessor_differs[i].fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-    }
-    if (!any) {
-        g_dc_equal.fetch_add(1, std::memory_order_relaxed);
-    }
 }
 
 bool DeriveSampler(u64 object, const u32* record_words, u32* out) {
@@ -826,65 +501,6 @@ bool DeriveSampler(u64 object, const u32* record_words, u32* out) {
     return true;
 }
 
-void StudySampler(u64 object, const u32* words) {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_DESC_CHECKS");
-        return e != nullptr && *e == '1';
-    }();
-    if (!on || object == 0) {
-        return;
-    }
-    const auto rd = [&](u32 off) {
-        u32 v;
-        std::memcpy(&v, reinterpret_cast<const void*>(object + off), 4);
-        return v;
-    };
-    AmdGpu::Sampler s{};
-    std::memcpy(&s, words, sizeof(s));
-    std::scoped_lock lock{g_mutex};
-    const auto note = [&](const std::string& key, const std::string& value) {
-        auto& values = g_sampler_map[key];
-        if (values.size() < 6) {
-            values.insert(value);
-        }
-    };
-    note(fmt::format("filter {:#x}", rd(0x30)), fmt::format("mag {} min {} z {} mip {} mode {}", u32(s.xy_mag_filter.Value()), u32(s.xy_min_filter.Value()), u32(s.z_filter.Value()), u32(s.mip_filter.Value()),
-                                                                u32(s.filter_mode.Value())));
-    note(fmt::format("address u {}", rd(0x34)), fmt::format("x {}", u32(s.clamp_x.Value())));
-    note(fmt::format("address v {}", rd(0x38)), fmt::format("y {}", u32(s.clamp_y.Value())));
-    note(fmt::format("address w {}", rd(0x3c)), fmt::format("z {}", u32(s.clamp_z.Value())));
-    note(fmt::format("aniso {}", rd(0x44)), fmt::format("max_aniso {} threshold {} bias {}", u32(s.max_aniso.Value()), u32(s.aniso_threshold.Value()), u32(s.aniso_bias.Value())));
-    note(fmt::format("compare {}", rd(0x48)), fmt::format("depth_compare {}", u32(s.depth_compare_func.Value())));
-    note(fmt::format("border {:#x} {:#x} {:#x} {:#x}", rd(0x4c), rd(0x50), rd(0x54), rd(0x58)), fmt::format("type {} ptr {}", u32(s.border_color_type.Value()), u32(s.border_color_ptr.Value())));
-    note("lod_bias raw", fmt::format("{:#x} -> {}", rd(0x40), u32(s.lod_bias.Value())));
-    float min_lod, max_lod;
-    const u32 min_raw = rd(0x5c), max_raw = rd(0x60);
-    std::memcpy(&min_lod, &min_raw, 4);
-    std::memcpy(&max_lod, &max_raw, 4);
-    const auto lod = [](float v) { return std::clamp<s32>(s32(v * 256.0f), 0, 0xfff); };
-    note("min_lod formula", lod(min_lod) == s32(s.min_lod.Value()) ? "clamp(v*256) equal" : fmt::format("DIFFERENT {} vs {}", lod(min_lod), u32(s.min_lod.Value())));
-    note("max_lod formula", lod(max_lod) == s32(s.max_lod.Value()) ? "clamp(v*256) equal" : fmt::format("DIFFERENT {} vs {} ({:#x})", lod(max_lod), u32(s.max_lod.Value()), max_raw));
-    AmdGpu::Sampler rest = s;
-    rest.clamp_x.Assign(AmdGpu::ClampMode{});
-    rest.clamp_y.Assign(AmdGpu::ClampMode{});
-    rest.clamp_z.Assign(AmdGpu::ClampMode{});
-    rest.max_aniso.Assign(AmdGpu::AnisoRatio{});
-    rest.depth_compare_func.Assign(AmdGpu::DepthCompare{});
-    rest.aniso_threshold.Assign(0);
-    rest.aniso_bias.Assign(0);
-    rest.filter_mode.Assign(AmdGpu::FilterMode{});
-    rest.min_lod.Assign(0);
-    rest.max_lod.Assign(0);
-    rest.lod_bias.Assign(0);
-    rest.xy_mag_filter.Assign(AmdGpu::Filter{});
-    rest.xy_min_filter.Assign(AmdGpu::Filter{});
-    rest.z_filter.Assign(0);
-    rest.mip_filter.Assign(AmdGpu::MipFilter{});
-    rest.border_color_ptr.Assign(0);
-    rest.border_color_type.Assign(AmdGpu::BorderColor{});
-    note("other bits", fmt::format("{:#x} {:#x}", rest.raw0, rest.raw1));
-}
-
 nlohmann::json Report() {
     nlohmann::json j;
     j["view_holds_the_record_descriptor"] = {{"equal", g_held_equal.load()}, {"differ", g_held_differ.load()}, {"binding_has_no_view", g_held_none.load()}};
@@ -906,23 +522,6 @@ nlohmann::json Report() {
     j["object_not_in_the_table"] = g_unknown_object.load();
     j["format_not_in_the_table"] = g_unknown_format.load();
     {
-        nlohmann::json plain = {{"compared", g_dc_compared.load()}, {"equal_in_every_field_and_accessor", g_dc_equal.load()}, {"engine_description_not_available", g_dc_not_derived.load()},
-                                {"accessor_mismatch_bindings", g_dc_accessor_bad.load()}};
-        for (u32 i = 0; i < DescFieldCount; ++i) {
-            plain["differing_fields"][DescFieldNames[i]] = g_dc_differing[i].load();
-        }
-        for (u32 i = 0; i < g_dc_accessor_differs.size(); ++i) {
-            plain["accessor_differs"][AccessorNames[i]] = g_dc_accessor_differs[i].load();
-        }
-        {
-            std::scoped_lock plain_lock{g_mutex};
-            for (u32 i = 0; i < DescFieldCount; ++i) {
-                for (const auto& text : g_dc_examples[i]) {
-                    plain["examples"][DescFieldNames[i]].push_back(text);
-                }
-            }
-        }
-        j["f4_1_plain_description"] = std::move(plain);
         {
             // F4.6: the draw code's own bits-per-element table against the console header's (-1 entries count as 0), every code of the field
             u32 differing = 0;
@@ -934,20 +533,6 @@ nlohmann::json Report() {
             }
             j["f4_6_bits_per_element_table_differs"] = differing;
         }
-        nlohmann::json host = {{"compared", g_hi_compared.load()}, {"equal_info_and_view", g_hi_equal.load()}, {"engine_description_not_available", g_hi_unavailable.load()}};
-        for (u32 i = 0; i < g_hi_info_differs.size(); ++i) {
-            host["info_differs"][InfoFieldNames[i]] = g_hi_info_differs[i].load();
-        }
-        for (u32 i = 0; i < g_hi_view_differs.size(); ++i) {
-            host["view_differs"][ViewFieldNames[i]] = g_hi_view_differs[i].load();
-        }
-        {
-            std::scoped_lock host_lock{g_mutex};
-            host["examples"] = g_hi_examples;
-        }
-        j["f4_2_host_info_from_description"] = std::move(host);
-        j["f4_1_sampler_description"] = {{"compared", g_sd_compared.load()}, {"equal", g_sd_equal.load()}, {"examples", g_sd_examples}};
-        j["f4_1_buffer_description"] = {{"binding_compared", g_bd_compared[0].load()}, {"binding_differs", g_bd_differs[0].load()}, {"vertex_compared", g_bd_compared[1].load()}, {"vertex_differs", g_bd_differs[1].load()}};
         j["f4_3_use"] = {{"on", FromDescOn()}, {"switch", "TLG_IMAGE_FROM_DESC=0 turns it off"}, {"bindings_served_from_the_description", g_use_served.load()}, {"engine_description_not_available", g_use_unavailable.load()},
                          {"alt_tile_set", g_use_alt_tile.load()}, {"depth_use_does_not_fit", g_use_depth_refused.load()}};
     }

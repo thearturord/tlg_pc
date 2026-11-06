@@ -27,19 +27,9 @@ enum class Result : u8 {
 /// F4.1: the same description as plain numbers (`native_desc.h`), from the engine's objects only (no T# word is read; the view's own copy of the descriptor at +0x58 is read as plain
 /// bits for the padded rows and the limited level count). False when the object or its format is not in the tables.
 [[nodiscard]] bool DeriveDesc(u64 resource_id, u64 view_id, NativeDesc::ImageDesc& out);
-/// `TLG_DESC_CHECKS=1`: the caller builds the reference description from the T# (`ImageDescFromSharp`) and `CompareDesc` compares it field by field with `DeriveDesc`.
-/// `accessor_mismatch` is the host side's check of the accessors of the engine's description against the T# helper functions (bit per accessor, `AccessorNames`).
-[[nodiscard]] bool DescCompareOn() noexcept;
-void CompareDesc(u64 resource_id, u64 view_id, const NativeDesc::ImageDesc& reference, u32 accessor_mismatch);
-/// the description the accessor bit names (bit order of the mask `CompareDesc` receives)
-constexpr const char* AccessorNames[] = {"NumLayers", "NumLevels", "NumSamples", "BaseType", "ViewType", "NumViewLevels", "NumViewLayers", "IsTiled", "IsVolume"};
-
 /// F4.1 samplers: the plain description of a sampler from the four S# words (bit extraction, the host mapping tables written as numbers); the host's own decode of the same words
-/// is `VideoCore::SamplerDescFromSharp`, compared in the shadow (`TLG_DESC_CHECKS=1`): `NoteSamplerDescCompare(equal)` counts, `example` names a difference.
+/// is `VideoCore::SamplerDescFromSharp`.
 [[nodiscard]] NativeDesc::SamplerDesc SamplerDescFromWords(const u32* words) noexcept;
-void NoteSamplerDescCompare(bool equal, const char* example);
-/// The same for the buffer description (`BufferDescOf` against the V# type's own accessors), counted by `where` (0 buffer binding, 1 vertex binding).
-void NoteBufferDescCompare(u32 where, bool equal);
 constexpr float SamplerDescLodScale = 1.0f / 256.0f;
 
 /// F4.3 (`TLG_IMAGE_FROM_DESC`, default on since 2026-11-03, `=0` turns it off, read once): the host builds the `ImageInfo` / `ImageViewInfo` of a sampled or stored image from the plain
@@ -49,26 +39,14 @@ constexpr float SamplerDescLodScale = 1.0f / 256.0f;
 [[nodiscard]] bool FromDescOn() noexcept;
 [[nodiscard]] bool DescForBinding(u64 resource_id, u64 view_id, bool cube_to_2d_array, bool is_depth, NativeDesc::ImageDesc& out);
 
-/// F4.2 shadow: the host `ImageInfo` / `ImageViewInfo` built from the plain description against the ones built from the T#: bit per differing field (names below).
-/// `engine_description_available` false: `DeriveDesc` had nothing for the binding (or the alternative tiling is set): counted, not compared.
-constexpr const char* InfoFieldNames[] = {"props", "pixel_format", "type", "levels", "layers", "size", "num_bits", "num_samples", "pitch", "tile_mode", "array_mode", "mips_layout", "micro_tiled_mips", "guest_address", "guest_size", "bank_swizzle_alt_tile", "meta_stencil"};
-constexpr const char* ViewFieldNames[] = {"type", "format", "range", "mapping", "min_lod", "is_storage"};
-void NoteHostInfoCompare(bool engine_description_available, u32 info_mask, u32 view_mask, const char* example);
-
 /// True: the sampler words of a record binding come from the engine's sampler object (`DeriveSampler`) and the words the engine built only verify (default; `TLG_IMAGE_DESC=0` turns it off).
 /// Images no longer have this switch: the host reads the plain description (`DescForBinding`, `TLG_IMAGE_FROM_DESC`).
 [[nodiscard]] bool Decides() noexcept;
-
-/// `TLG_DESC_CHECKS=1`: derive and compare with the T# the record holds (`actual`); counts per field.
-void Compare(u64 resource_id, u64 view_id, const AmdGpu::Image& actual);
 
 /// E2 samplers: the S# words (four dwords) of a sampler binding built from the engine's sampler object (its Direct3D style description at +0x30: filter, address modes,
 /// anisotropy, comparison, border color, level limits). False when the object holds a value the table has not met (the words the engine built then decide).
 /// Called while the object is alive (the record builder); `record_words` (or null) are compared with the result and counted.
 [[nodiscard]] bool DeriveSampler(u64 object, const u32* record_words, u32* out);
-
-/// E2 study (`TLG_DESC_CHECKS=1`): a sampler object and the four S# words the engine built from it
-void StudySampler(u64 object, const u32* words);
 
 [[nodiscard]] nlohmann::json Report();
 

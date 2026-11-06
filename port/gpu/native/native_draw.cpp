@@ -1311,9 +1311,6 @@ void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* word
     binding.table_base = static_cast<u16>(table_base);
     binding.id = last_descriptor_object.id;
     binding.view_id = last_descriptor_object.view_id;
-    if (kind == 3 && words != nullptr) {
-        Core::NativeImageDesc::StudySampler(last_descriptor_object.object, words); // E2 study
-    }
     for (u32 i = 0; i < binding.dwords; ++i) {
         binding.words[i] = words[i];
     }
@@ -2532,13 +2529,6 @@ bool NativeListOn() {
     }();
     return on;
 }
-u32 NativeListVerifyEvery() {
-    static const u32 every = [] {
-        const char* e = std::getenv("TLG_NATIVE_LIST_VERIFY");
-        return e != nullptr && *e != 0 ? static_cast<u32>(std::atoi(e)) : 0u; // off by default since 2026-10-30
-    }();
-    return every;
-}
 struct StatePackage {
     std::atomic<u64> key{0};
     std::atomic<u32> ready{0}; // 1 usable, 2 dropped by a verify difference
@@ -2556,8 +2546,7 @@ struct StatePackage {
 constexpr u32 PackageSlots = 1u << 13;
 std::unique_ptr<StatePackage[]> packages;
 std::once_flag packages_once;
-std::atomic<u64> nl_records{0}, nl_used{0}, nl_first{0}, nl_verified{0}, nl_mismatch{0}, nl_table_full{0};
-std::atomic<u32> nl_logged{0};
+std::atomic<u64> nl_records{0}, nl_used{0}, nl_first{0}, nl_table_full{0};
 
 u64 StateKeyOf(u64 ctx, const Signature& sig, u32 kind) {
     Hasher h;
@@ -2700,27 +2689,6 @@ void StorePackage(u64 key, const NativeRecord& slot) {
 }
 
 /// The package's content equals what the synthesis just produced (`slot` and the thread's synthesis outputs).
-const char* ComparePackage(const StatePackage& p, const NativeRecord& slot) {
-    if (p.count != slot.count || std::memcmp(p.regs.data(), slot.regs.data(), slot.count * sizeof(SynthReg)) != 0) {
-        return "registers";
-    }
-    if (p.flags != synth_flags || p.reason != synth_reason) {
-        return "flags";
-    }
-    if (p.cb_extent_mask != synth_cb_extent_mask || p.db_extent != synth_db_extent || p.rt_info != synth_rt_info) {
-        return "extents";
-    }
-    for (u32 i = 0; i < 8; ++i) {
-        if (((p.cb_extent_mask >> i) & 1) != 0 && p.cb_extent[i] != synth_cb_extent[i]) {
-            return "extents";
-        }
-    }
-    if (p.vs_gnm != slot.vs_gnm || p.ps_gnm != slot.ps_gnm || p.dbg_vs != dbg_vs || p.dbg_fetch != dbg_fetch || p.fetch_address != synth_fetch_address || p.synth_vs != synth_vs_gnm) {
-        return "shader pointers";
-    }
-    return nullptr;
-}
-
 /// Guest thread: builds the record of a draw. Returns its number.
 u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     PhaseClockMr mr;
@@ -2739,36 +2707,31 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     bool state_from_package = false;
     u64 package_key = 0;
     StatePackage* package = nullptr;
-    bool verify_package = false;
     if (kind <= 2 && record_sig != nullptr && NativeListOn()) {
         nl_records.fetch_add(1, std::memory_order_relaxed);
         package_key = StateKeyOf(ctx, *record_sig, kind);
         package = FindPackage(package_key);
         if (package != nullptr) {
-            thread_local u32 counter = 0;
-            verify_package = NativeListVerifyEvery() != 0 && ++counter % NativeListVerifyEvery() == 0;
-            if (!verify_package) {
-                state_from_package = true;
-                slot.count = package->count;
-                std::copy_n(package->regs.begin(), package->count, slot.regs.begin());
-                slot.vs_gnm = package->vs_gnm;
-                slot.ps_gnm = package->ps_gnm;
-                synth_flags = package->flags;
-                synth_reason = package->reason;
-                synth_cb_extent_mask = package->cb_extent_mask;
-                synth_db_extent = package->db_extent;
-                synth_rt_info = package->rt_info;
-                synth_cb_extent = package->cb_extent;
-                dbg_vs = package->dbg_vs;
-                dbg_fetch = package->dbg_fetch;
-                synth_fetch_address = package->fetch_address;
-                synth_vs_gnm = package->synth_vs;
-                if (package->lazy_ok) {
-                    slot.package = package;
-                    slot.package_for = seq;
-                }
-                nl_used.fetch_add(1, std::memory_order_relaxed);
+            state_from_package = true;
+            slot.count = package->count;
+            std::copy_n(package->regs.begin(), package->count, slot.regs.begin());
+            slot.vs_gnm = package->vs_gnm;
+            slot.ps_gnm = package->ps_gnm;
+            synth_flags = package->flags;
+            synth_reason = package->reason;
+            synth_cb_extent_mask = package->cb_extent_mask;
+            synth_db_extent = package->db_extent;
+            synth_rt_info = package->rt_info;
+            synth_cb_extent = package->cb_extent;
+            dbg_vs = package->dbg_vs;
+            dbg_fetch = package->dbg_fetch;
+            synth_fetch_address = package->fetch_address;
+            synth_vs_gnm = package->synth_vs;
+            if (package->lazy_ok) {
+                slot.package = package;
+                slot.package_for = seq;
             }
+            nl_used.fetch_add(1, std::memory_order_relaxed);
         }
     }
     if (!state_from_package) {
@@ -2777,15 +2740,6 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
             if (package == nullptr) {
                 nl_first.fetch_add(1, std::memory_order_relaxed);
                 StorePackage(package_key, slot);
-            } else if (verify_package) {
-                nl_verified.fetch_add(1, std::memory_order_relaxed);
-                if (const char* what = ComparePackage(*package, slot)) {
-                    nl_mismatch.fetch_add(1, std::memory_order_relaxed);
-                    if (nl_logged.fetch_add(1) < 12) {
-                        TLG_LOG(CP, Error, "native list: package {:#x} differs from the synthesis ({})", package_key, what);
-                    }
-                    package->ready.store(2, std::memory_order_release); // dropped: the next record of the key makes a new one
-                }
             }
         }
     }
@@ -4344,8 +4298,7 @@ const std::array<u8, 65536>& GroupTable() {
 } // namespace
 
 namespace {
-std::atomic<u64> lazy_taken{0}, lazy_declined{0}, lazy_verified{0}, lazy_differences{0}, lazy_materialized{0};
-std::atomic<u32> lazy_logged{0};
+std::atomic<u64> lazy_taken{0}, lazy_declined{0}, lazy_materialized{0};
 } // namespace
 
 static bool TakeExecDrawImpl(u64 seq, ExecDraw& out, bool typed, bool allow_lazy) {
@@ -4606,56 +4559,6 @@ bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed) {
         return ok;
     }
     lazy_taken.fetch_add(1, std::memory_order_relaxed);
-    // every Nth lazy draw is also taken the full way and compared field by field
-    thread_local u32 tick = 0;
-    const u32 every = NativeListVerifyEvery();
-    if (every == 0 || ++tick % every != 0) {
-        return ok;
-    }
-    thread_local std::unique_ptr<ExecDraw> check;
-    if (!check) {
-        check = std::make_unique<ExecDraw>();
-    }
-    *check = ExecDraw{};
-    MaterializeRegs(out);
-    if (!TakeExecDrawImpl(seq, *check, typed, false)) {
-        return ok; // the record was recycled meanwhile
-    }
-    lazy_verified.fetch_add(1, std::memory_order_relaxed);
-    const char* what = nullptr;
-    if (check->count != out.count || check->grouped != out.grouped) {
-        what = "count";
-    } else if (check->group_begin != out.group_begin) {
-        what = "group begin";
-    } else if (check->group_sig != out.group_sig) {
-        what = "group signature";
-    } else if (check->inputs_key != out.inputs_key) {
-        what = "inputs key";
-    } else if (check->stage_key != out.stage_key) {
-        what = "stage key";
-    } else if (check->typed != out.typed || check->vs_user_data_mask != out.vs_user_data_mask || check->ps_user_data_mask != out.ps_user_data_mask) {
-        what = "user data masks";
-    } else {
-        for (u32 i = 0; i < 16 && what == nullptr; ++i) {
-            if (((out.vs_user_data_mask >> i) & 1) != 0 && check->vs_user_data[i] != out.vs_user_data[i]) {
-                what = "vertex user data";
-            }
-            if (((out.ps_user_data_mask >> i) & 1) != 0 && check->ps_user_data[i] != out.ps_user_data[i]) {
-                what = "pixel user data";
-            }
-        }
-        for (u32 i = 0; i < out.count && what == nullptr; ++i) {
-            if (check->regs[i].index != out.regs[i].index || check->regs[i].value != out.regs[i].value) {
-                what = "registers";
-            }
-        }
-    }
-    if (what != nullptr) {
-        lazy_differences.fetch_add(1, std::memory_order_relaxed);
-        if (lazy_logged.fetch_add(1) < 12) {
-            TLG_LOG(CP, Error, "native list: the lazy draw {} differs from the full one ({})", seq, what);
-        }
-    }
     return ok;
 }
 
@@ -9864,14 +9767,10 @@ void NativeListRead(nlohmann::json& out) {
     out["records_with_a_state"] = nl_records.load();
     out["state_taken_from_a_package"] = nl_used.load();
     out["packages_made_at_first_sight"] = nl_first.load();
-    out["verify_runs_synthesis_compared_with_the_package"] = nl_verified.load();
-    out["verify_differences"] = nl_mismatch.load();
     out["package_table_full"] = nl_table_full.load();
     out["draws_taken_with_lazy_registers"] = lazy_taken.load();
     out["lazy_declined_for_a_register_in_a_hashed_group"] = lazy_declined.load();
     out["lazy_registers_materialized"] = lazy_materialized.load();
-    out["lazy_verify_full_take_compared"] = lazy_verified.load();
-    out["lazy_verify_differences"] = lazy_differences.load();
     {
         const auto& c = Vulkan::g_indexed_census;
         out["pipeline_stage_census"] = {{"stages", c.stages.load()}, {"mip_level_images", c.mip_run_images.load()}, {"atomic_images", c.atomic_images.load()}, {"shared_memory_buffers", c.shared_memory_buffers.load()}};

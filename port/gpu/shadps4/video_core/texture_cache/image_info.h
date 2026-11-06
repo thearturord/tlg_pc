@@ -43,15 +43,10 @@ struct ImageProperties {
 };
 
 /// F4.1: the plain description (`native/native_desc.h`) read from a T# with the emulator's own helper functions. This is the one place where the host decodes a T#: for the bindings
-/// the engine has no description for (descriptors read from guest memory) and the reference the native description is compared with.
-/// `ImageDescAccessorMismatch` checks the accessors of a description against the T# helpers (bit per accessor, `Core::NativeImageDesc::AccessorNames`) for `is_array` both ways.
+/// the engine has no description for (descriptors read from guest memory).
 Core::NativeDesc::ImageDesc ImageDescFromSharp(const AmdGpu::Image& sharp) noexcept;
-u32 ImageDescAccessorMismatch(const AmdGpu::Image& sharp, const Core::NativeDesc::ImageDesc& desc) noexcept;
 struct ImageInfo;
 struct ImageViewInfo;
-/// F4.2 shadow: bit per differing field (`Core::NativeImageDesc::InfoFieldNames` / `ViewFieldNames`) between two infos built for the same binding.
-u32 ImageInfoDiffMask(const ImageInfo& a, const ImageInfo& b) noexcept;
-u32 ImageViewInfoDiffMask(const ImageViewInfo& a, const ImageViewInfo& b) noexcept;
 
 struct ImageInfo {
     ImageInfo() = default;

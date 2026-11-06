@@ -1849,10 +1849,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
             // F4: from here on the buffer is a plain description (the descriptor type stays at the recompiler's interface above)
             const Core::NativeDesc::BufferDesc vsharp = Core::NativeDesc::BufferDescOf(chosen_sharp);
-            if (Core::NativeImageDesc::DescCompareOn()) { // F4.1 shadow: the plain decode against the V# type's own accessors
-                Core::NativeImageDesc::NoteBufferDescCompare(0, vsharp.address == chosen_sharp.base_address && vsharp.size == chosen_sharp.GetSize() && vsharp.stride == chosen_sharp.GetStride() &&
-                                                                    vsharp.num_records == chosen_sharp.num_records && vsharp.data_format == chosen_sharp.data_format && vsharp.num_format == chosen_sharp.num_format);
-            }
             if (vsharp.address == 0 || vsharp.size == 0) {
                 Census(census_base + CBufferNull);
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
@@ -1915,10 +1911,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 } else {
                     Census(census_base + CBufferAddrRead);
                     Census(census_base + (size <= 256 ? CBufferAddrReadLe256 : size <= 4096 ? CBufferAddrReadLe4k : size <= 65536 ? CBufferAddrReadLe64k : CBufferAddrReadBig));
-                }
-                if (record_binding != ~0u && binder_plan != nullptr) {
-                    Core::NativeDevice::CheckBufferSharp(binder_plan->bindings[record_binding].id, binder_plan->bindings[record_binding].view_id, vsharp.address, vsharp.stride,
-                                                         vsharp.num_records, vsharp.data_format, vsharp.num_format, false); // E2 census
                 }
                 Core::NativeRegistry::SetBufferWriter(stage.pgm_hash, static_cast<u32>(stage.sw_stage));
                 Core::NativeContent::SetBindContext({"shader binding", record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].id : 0,
@@ -2437,49 +2429,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 set_found[num_images - 1] = image_id;
             }
             auto* image = &texture_cache.GetImage(image_id);
-            if (image_from_record && i == 0) {
-                Core::NativeImageDesc::Compare(image_engine_id, image_view_id, tsharp); // E2 shadow derivation
-                if (Core::NativeImageDesc::DescCompareOn()) { // F4.1 plain description against the T# helpers
-                    const auto reference = VideoCore::ImageDescFromSharp(tsharp);
-                    Core::NativeImageDesc::CompareDesc(image_engine_id, image_view_id, reference, VideoCore::ImageDescAccessorMismatch(tsharp, reference));
-                    // F4.2 shadow: the host infos built from the engine's plain description against the ones built from the T#
-                    Core::NativeDesc::ImageDesc engine_desc;
-                    if (Core::NativeImageDesc::DeriveDesc(image_engine_id, image_view_id, engine_desc) && !engine_desc.alt_tile_mode && !image_desc.is_r128) {
-                        VideoCore::TextureCache::ImageDesc fresh(engine_desc, image_desc);
-                        finish_desc(fresh);
-                        VideoCore::TextureCache::ImageDesc from_t_sharp(VideoCore::ImageDescFromSharp(tsharp), image_desc);
-                        finish_desc(from_t_sharp);
-                        const auto& sharp_built = from_t_sharp;
-                        const u32 info_mask = VideoCore::ImageInfoDiffMask(sharp_built.info, fresh.info) | VideoCore::ImageInfoDiffMask(desc.info, sharp_built.info),
-                                  view_mask = VideoCore::ImageViewInfoDiffMask(sharp_built.view_info, fresh.view_info) | VideoCore::ImageViewInfoDiffMask(desc.view_info, sharp_built.view_info);
-                        std::string example;
-                        if ((info_mask | view_mask) != 0) {
-                            example = fmt::format("info mask {:#x} view mask {:#x}: sharp format {} {}x{} pitch {} levels {} layers {} type {} tile {}; desc format {} {}x{} pitch {} levels {} layers {} type {} tile {}", info_mask, view_mask,
-                                                  u32(desc.info.pixel_format), desc.info.size.width, desc.info.size.height, desc.info.pitch, u32(desc.info.resources.levels), u32(desc.info.resources.layers),
-                                                  u32(desc.info.type), u32(desc.info.tile_mode), u32(fresh.info.pixel_format), fresh.info.size.width, fresh.info.size.height, fresh.info.pitch,
-                                                  u32(fresh.info.resources.levels), u32(fresh.info.resources.layers), u32(fresh.info.type), u32(fresh.info.tile_mode));
-                        }
-                        Core::NativeImageDesc::NoteHostInfoCompare(true, info_mask, view_mask, example.c_str());
-                    } else {
-                        Core::NativeImageDesc::NoteHostInfoCompare(false, 0, 0, nullptr);
-                    }
-                }
-                Core::NativeDevice::CheckImageSharp(image_engine_id, image_view_id, {.data_format = u32(tsharp.GetDataFmt()),
-                                                                      .num_format = u32(tsharp.GetNumberFmt()),
-                                                                      .type = u32(tsharp.type),
-                                                                      .width = u32(tsharp.width),
-                                                                      .height = u32(tsharp.height),
-                                                                      .depth = u32(tsharp.depth),
-                                                                      .base_level = u32(tsharp.base_level),
-                                                                      .last_level = u32(tsharp.last_level),
-                                                                      .base_array = u32(tsharp.base_array),
-                                                                      .last_array = u32(tsharp.last_array),
-                                                                      .pitch = u32(tsharp.pitch),
-                                                                      .dst_sel = u32(tsharp.dst_sel_x | tsharp.dst_sel_y << 3 | tsharp.dst_sel_z << 6 | tsharp.dst_sel_w << 9),
-                                                                      .tiling_index = u32(tsharp.tiling_index),
-                                                                      .pow2pad = u32(tsharp.pow2pad),
-                                                                      .address = tsharp.Address()}); // E2 census
-            }
             {
                 // Dark / bright frame check (2026-10-29): a sampled texture served by a cache image of another address or size than the texture asked for (an overlap resolved
                 // into a view of a bigger image). Inside the frame ring this is how a new small dynamic texture (the R32F 4x4 / 16x16 the CPU writes every frame) can be read
@@ -2718,14 +2667,6 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
         // F4.1 / F4.3: the host sampler is made from the plain description of the S# words (after the shader's post operation); the shadow compares it with the emulator's own decode
         const auto from_t_sharp = VideoCore::SamplerDescFromSharp(ssharp);
         const auto from_words = Core::NativeImageDesc::SamplerDescFromWords(reinterpret_cast<const u32*>(&ssharp));
-        if (Core::NativeImageDesc::DescCompareOn()) {
-            const bool equal = std::memcmp(&from_t_sharp, &from_words, sizeof(from_words)) == 0;
-            Core::NativeImageDesc::NoteSamplerDescCompare(equal, equal ? nullptr : fmt::format("sharp: filters {}/{} mip {} addr {}/{}/{} cmp {} border {} idx {} aniso {} {} bias {} lod {}-{}; words: filters {}/{} mip {} addr {}/{}/{} cmp {} border {} idx {} aniso {} {} bias {} lod {}-{}",
-                from_t_sharp.mag_filter, from_t_sharp.min_filter, from_t_sharp.mip_mode, from_t_sharp.address_u, from_t_sharp.address_v, from_t_sharp.address_w, from_t_sharp.compare_op, from_t_sharp.border, from_t_sharp.border_index,
-                from_t_sharp.aniso_filter, from_t_sharp.max_aniso, from_t_sharp.lod_bias, from_t_sharp.min_lod, from_t_sharp.max_lod, from_words.mag_filter, from_words.min_filter, from_words.mip_mode, from_words.address_u,
-                from_words.address_v, from_words.address_w, from_words.compare_op, from_words.border, from_words.border_index, from_words.aniso_filter, from_words.max_aniso, from_words.lod_bias, from_words.min_lod,
-                from_words.max_lod).c_str());
-        }
         const auto vk_sampler = texture_cache.GetSampler(Core::NativeImageDesc::FromDescOn() ? from_words : from_t_sharp, *current_bc_base, sampler.is_depth);
         if (indexed_active && stage.indexed) {
             NoteIndexedSampler(vk_sampler);

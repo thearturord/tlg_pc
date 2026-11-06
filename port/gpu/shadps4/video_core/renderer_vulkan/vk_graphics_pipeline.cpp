@@ -446,10 +446,6 @@ void GraphicsPipeline::GetVertexInputs(
         // the one decode of the vertex descriptor: the host reads the plain description from here on
         const auto sharp = attrib.GetSharp(vs_info);
         const Core::NativeDesc::BufferDesc buffer = Core::NativeDesc::BufferDescOf(sharp);
-        if (Core::NativeImageDesc::DescCompareOn()) { // F4.1 shadow: the plain decode against the V# type's own accessors
-            Core::NativeImageDesc::NoteBufferDescCompare(1, buffer.address == sharp.base_address && buffer.size == sharp.GetSize() && buffer.stride == sharp.GetStride() &&
-                                                                buffer.num_records == sharp.num_records && buffer.data_format == sharp.data_format && buffer.num_format == sharp.num_format);
-        }
         attributes.push_back(Attribute{
             .location = semantic,
             .binding = semantic,
