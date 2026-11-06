@@ -47,7 +47,7 @@
 #include "native/native_shader_env.h"
 #include "native/native_target_desc.h"
 #include "native/native_display.h"
-#include "video_core/amdgpu/pm4_cmds.h"
+#include "native/native_ce_packet.h"
 #include "native/native_readback_policy.h"
 #include "video_core/readback_stats.h"
 #include "video_core/readback_trace.h"
@@ -227,7 +227,7 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
         RasterNextPassable();
         RasterRun(
             [this, extent = draw.db_extent, inputs = std::move(clear_inputs)] {
-                AmdGpu::CbDbExtent db_extent;
+                Core::TargetExtent db_extent;
                 db_extent.raw = extent;
                 rasterizer->ClearDepthStencilTarget(inputs, db_extent);
             },
@@ -271,7 +271,7 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
             dispatch.kind = RasterCall::Kind::DispatchIndirect;
             dispatch.args_addr = draw.args_addr;
             dispatch.offset = draw.start_index;
-            dispatch.dispatch_size = sizeof(AmdGpu::PM4CmdDispatchIndirect::GroupDimensions);
+            dispatch.dispatch_size = Core::NativeCePacket::DispatchIndirectArgsBytes;
         }
         if (asc_vqid != ~0u) {
             dispatch.asc = true;
@@ -403,7 +403,7 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
         call.indexed = true;
         call.args_addr = draw.args_addr;
         call.offset = draw.offset;
-        call.stride = sizeof(AmdGpu::DrawIndexedIndirectArgs);
+        call.stride = Core::NativeCePacket::DrawIndexedIndirectArgsBytes;
         call.max_count = 1;
         call.vertex_sgpr_offset = static_cast<u16>(draw.vertex_sgpr);
         call.instance_sgpr_offset = static_cast<u16>(draw.instance_sgpr);
@@ -518,34 +518,35 @@ void NativeExecutor::QueueAnnounced(Core::NativeDirect::Buffer& direct) {
 /// the counter packets and a NOP, 452 dwords): the constant RAM is a 48 KB heap, a dump copies a part of it to guest memory in order with the draws. The counters that order
 /// the constant engine against the draw engine need nothing here (it has finished when the entries start), so they are ignored. An opcode this does not know is a rare event.
 void NativeExecutor::ExecuteConstantEngine(std::span<const u32> ccb) {
+    namespace Ce = Core::NativeCePacket;
     while (!ccb.empty()) {
-        const auto* header = reinterpret_cast<const AmdGpu::PM4Header*>(ccb.data());
-        if (header->type != 3) {
+        const Ce::Header header = Ce::DecodeHeader(ccb.data());
+        if (header.type != 3) {
             Core::RareEvents::Note("constant_engine_not_type3", "a constant engine packet that is not type 3");
             return;
         }
-        const AmdGpu::PM4ItOpcode opcode = header->type3.opcode;
-        const u32 dwords = header->type3.NumWords() + 1; // NumWords counts the body: the header dword is one more
+        const u32 opcode = header.opcode;
+        const u32 dwords = header.dwords;
         if (dwords > ccb.size()) {
             Core::RareEvents::Note("constant_engine_bad_length", "a constant engine packet that runs past its buffer");
             return;
         }
-        Core::NativeCensus::NoteCePacket(static_cast<u32>(opcode), dwords);
+        Core::NativeCensus::NoteCePacket(opcode, dwords);
         switch (opcode) {
-        case AmdGpu::PM4ItOpcode::Nop:
-        case AmdGpu::PM4ItOpcode::IncrementCeCounter:
-        case AmdGpu::PM4ItOpcode::WaitOnDeCounterDiff:
+        case Ce::Nop:
+        case Ce::IncrementCeCounter:
+        case Ce::WaitOnDeCounterDiff:
             break;
-        case AmdGpu::PM4ItOpcode::WriteConstRam: {
-            const auto* write_const = reinterpret_cast<const AmdGpu::PM4WriteConstRam*>(header);
-            std::memcpy(cblock.constants_heap.data() + write_const->Offset(), &write_const->data, write_const->Size());
+        case Ce::WriteConstRam: {
+            const Ce::WriteConst write = Ce::DecodeWriteConst(ccb.data());
+            std::memcpy(cblock.constants_heap.data() + write.offset, write.data, write.size);
             break;
         }
-        case AmdGpu::PM4ItOpcode::DumpConstRam: {
-            const auto* dump_const = reinterpret_cast<const AmdGpu::PM4DumpConstRam*>(header);
-            void* destination = dump_const->Address<void*>();
-            const u8* source = cblock.constants_heap.data() + dump_const->Offset();
-            const u32 bytes = dump_const->Size();
+        case Ce::DumpConstRam: {
+            const Ce::DumpConst dump = Ce::DecodeDumpConst(ccb.data());
+            void* destination = reinterpret_cast<void*>(dump.address);
+            const u8* source = cblock.constants_heap.data() + dump.offset;
+            const u32 bytes = dump.size;
             if (split_active) {
                 // a command processor write to guest memory: done in order with the draws
                 Core::DrainAudit::SetNextWrite(reinterpret_cast<u64>(destination), bytes);
@@ -555,13 +556,13 @@ void NativeExecutor::ExecuteConstantEngine(std::span<const u32> ccb) {
             }
             break;
         }
-        case AmdGpu::PM4ItOpcode::IndirectBufferConst: {
-            const auto* indirect_buffer = reinterpret_cast<const AmdGpu::PM4CmdIndirectBuffer*>(header);
-            ExecuteConstantEngine({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
+        case Ce::IndirectBufferConst: {
+            const Ce::IndirectBuffer indirect = Ce::DecodeIndirectBuffer(ccb.data());
+            ExecuteConstantEngine({reinterpret_cast<const u32*>(indirect.address), indirect.dwords});
             break;
         }
         default:
-            Core::RareEvents::Note("constant_engine_opcode_" + std::to_string(static_cast<u32>(opcode)), "an opcode the constant engine buffer did not hold in the default scene");
+            Core::RareEvents::Note("constant_engine_opcode_" + std::to_string(opcode), "an opcode the constant engine buffer did not hold in the default scene");
             break;
         }
         ccb = ccb.subspan(dwords);

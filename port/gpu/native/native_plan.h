@@ -19,7 +19,7 @@
 #include "native/native_dispatch_inputs.h"
 #include "native/native_draw.h"
 #include "native/native_resources.h"
-#include "video_core/amdgpu/cb_db_extent.h"
+#include "native/native_extent.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/renderer_vulkan/vk_fixed_state.h"
 
@@ -93,8 +93,8 @@ struct DrawPlan {
     bool executed{}; ///< the draw was executed from a record: no register based classification
     u8 op_class{0xff}; ///< not 0xff: one of the game's own transition operations (Rasterizer::DrawClass) that the raster thread performs from this plan, no pipeline
     bool depth_copy{}, stencil_copy{};
-    std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent{}; ///< the extent hints of the targets when the draw was recorded
-    AmdGpu::CbDbExtent db_extent{};
+    std::array<Core::TargetExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent{}; ///< the extent hints of the targets when the draw was recorded
+    Core::TargetExtent db_extent{};
     std::array<u64, 9> target_resources{}; ///< E3: engine resource ids behind the bound color views and the depth view when the draw was recorded
     std::array<StagePlan, StageCount> stages{};
     u64 ring_end{}; ///< T1: the constant ring position after this plan's copies

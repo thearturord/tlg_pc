@@ -22,8 +22,6 @@ ALLOWED_BY_DESIGN = {
     "video_core/renderer_vulkan/vk_indexed_data.h": "by design: the Vulkan host class of the indexed data path (C9); native_draw.cpp only reads its counters",
 }
 ALLOWED_DEBT = {
-    "video_core/amdgpu/cb_db_extent.h": "debt: the extent hints of the targets are register words (CB/DB extent); goes when the target description carries plain extents (E7 leftover)",
-    "video_core/amdgpu/pm4_cmds.h": "debt: the constant engine buffer is read as PM4 packets (native_executor_direct.cpp); goes with G5c",
 }
 ALLOWED_PS4 = {**ALLOWED_BY_DESIGN, **ALLOWED_DEBT}
 # plain emulator infrastructure the native code shares (not GPU emulation); reviewed once, kept short

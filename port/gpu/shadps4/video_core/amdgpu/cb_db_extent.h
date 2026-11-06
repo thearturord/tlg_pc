@@ -3,20 +3,11 @@
 
 #pragma once
 
-#include "common/types.h"
+#include "native/native_extent.h"
 
 namespace AmdGpu {
 
-union CbDbExtent {
-    struct {
-        u16 width;
-        u16 height;
-    };
-    u32 raw;
-
-    bool Valid() const {
-        return raw != 0;
-    }
-};
+/// The type lives in native/ (plain numbers); this name stays for the host side.
+using CbDbExtent = Core::TargetExtent;
 
 } // namespace AmdGpu

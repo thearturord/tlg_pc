@@ -35,7 +35,7 @@
 #include "native/native_raster_queue.h"
 #include "native/native_readback_policy.h"
 #include "native/native_sync.h"
-#include "video_core/amdgpu/cb_db_extent.h"
+#include "native/native_extent.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/readback_stats.h"
 
@@ -111,10 +111,10 @@ public:
     ~NativeExecutor();
 
     /// What the rasterizer reads while it executes draws and dispatches (F3.5: the extent hints and the target resources; no register image).
-    [[nodiscard]] std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS>& RasterCbExtents() noexcept {
+    [[nodiscard]] std::array<Core::TargetExtent, AmdGpu::NUM_COLOR_BUFFERS>& RasterCbExtents() noexcept {
         return last_cb_extent;
     }
-    [[nodiscard]] AmdGpu::CbDbExtent& RasterDbExtent() noexcept {
+    [[nodiscard]] Core::TargetExtent& RasterDbExtent() noexcept {
         return last_db_extent;
     }
     [[nodiscard]] std::array<u64, 9>& RasterTargetResources() noexcept {
@@ -297,8 +297,8 @@ private:
     void SubmitEnd();
 
     u32 index_buffer_num_indices{};
-    std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> last_cb_extent{};
-    AmdGpu::CbDbExtent last_db_extent{};
+    std::array<Core::TargetExtent, AmdGpu::NUM_COLOR_BUFFERS> last_cb_extent{};
+    Core::TargetExtent last_db_extent{};
     std::array<u64, 9> last_target_resources{}; ///< E3: engine resource ids behind the bound color views (0..7) and the depth view (8)
 
     /// The compute register block of every queue (the dispatches the command processor runs itself read it).

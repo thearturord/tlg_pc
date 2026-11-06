@@ -14,7 +14,7 @@
 #include "native/native_draw_tag.h"
 #include "native/native_readback_policy.h"
 #include "native/native_sync.h"
-#include "video_core/amdgpu/cb_db_extent.h"
+#include "native/native_extent.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/vk_fixed_state.h"

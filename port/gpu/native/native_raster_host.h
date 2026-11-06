@@ -25,7 +25,7 @@
 #include "native/native_draw_tag.h"
 #include "native/native_raster_queue.h"
 #include "native/native_uploads.h"
-#include "video_core/amdgpu/cb_db_extent.h"
+#include "native/native_extent.h"
 #include "video_core/readback_stats.h"
 
 namespace Vulkan {
@@ -50,8 +50,8 @@ public:
     virtual ~RasterHost() = default;
 
     /// The extent hints of the eight color targets and of the depth target (register words of the PS4).
-    using ColorExtents = std::array<AmdGpu::CbDbExtent, 8>;
-    using DepthExtent = AmdGpu::CbDbExtent;
+    using ColorExtents = std::array<Core::TargetExtent, 8>;
+    using DepthExtent = Core::TargetExtent;
 
     /// What the interval statistics of the host hand back to the executor (the host publishes its own part, native/native_debug_server.h).
     struct IntervalStats {
@@ -115,7 +115,7 @@ public:
     virtual void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) = 0;
     virtual void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds, bool staging_readback = false) = 0;
     virtual bool TryClearImage(VAddr dst, u32 bytes, const u32* pattern, u32 dwords) = 0;
-    virtual void ClearDepthStencilTarget(const Vulkan::DrawInputs& inputs, const AmdGpu::CbDbExtent& db_extent) = 0;
+    virtual void ClearDepthStencilTarget(const Vulkan::DrawInputs& inputs, const Core::TargetExtent& db_extent) = 0;
     /// B11: the engine clear whose packets the raster thread is running now (null: none); the record is copied.
     virtual void SetEngineClear(const NativeDevice::ClearRecord* record) = 0;
     /// Real occlusion queries (native/native_occlusion.h).
