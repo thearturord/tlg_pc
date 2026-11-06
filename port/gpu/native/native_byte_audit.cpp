@@ -84,6 +84,20 @@ std::atomic<u64> g_last_arm_ns{0};
 std::vector<u64> g_armed_pages;
 std::mutex g_arm_mutex;
 std::unordered_map<std::string, std::pair<u64, u64>> g_stale_by_kind; ///< kind -> reads, chunks (under g_stale_mutex)
+struct KindCoverage {
+    u64 reads{}, bytes_read{}, bytes_audited{}, reads_no_submit{}, reads_no_snapshot{};
+};
+std::mutex g_cov_mutex;
+std::unordered_map<std::string, KindCoverage> g_cov_by_kind; ///< 2026-11-06: which kinds of reads the audit can and cannot see
+void NoteCoverage(const char* kind, u64 bytes_read, u64 bytes_audited, bool no_submit, bool no_snapshot) {
+    std::scoped_lock lock{g_cov_mutex};
+    KindCoverage& k = g_cov_by_kind[kind != nullptr ? kind : "?"];
+    ++k.reads;
+    k.bytes_read += bytes_read;
+    k.bytes_audited += bytes_audited;
+    k.reads_no_submit += no_submit ? 1 : 0;
+    k.reads_no_snapshot += no_snapshot ? 1 : 0;
+}
 
 void MaybeArm(u64 address, const char* kind) {
     const u64 now = Core::FrameTimeline::Now();
@@ -130,6 +144,10 @@ void Reset() {
     {
         std::scoped_lock lock{g_arm_mutex};
         g_armed_pages.clear();
+    }
+    {
+        std::scoped_lock lock{g_cov_mutex};
+        g_cov_by_kind.clear();
     }
     g_newest_snapshot.store(0);
     g_last_arm_ns.store(0);
@@ -238,13 +256,25 @@ void NoteRead(u64 address, u64 size, u32 submit, const char* kind, std::string (
     c.bytes_read.fetch_add(size, std::memory_order_relaxed);
     const u32 newest = g_newest_snapshot.load(std::memory_order_acquire);
     {
+        // 2026-11-06: a ring or an arena is filled with new data every frame, and the new part was never read before, so a snapshot of only what was read earlier never covers it. The hot
+        // range is widened to the block it lies in: 4 MB for the dynamic arenas, 64 KB for stream copies (the rest is kept as read). TLG_AUDIT_WIDEN=0 turns this off.
+        static const bool widen = [] { const char* e = std::getenv("TLG_AUDIT_WIDEN"); return e == nullptr || e[0] != '0'; }();
+        u64 hot_address = address, hot_size = size;
+        if (widen && kind != nullptr) {
+            const u64 block = std::strstr(kind, "arena_sync") != nullptr ? (4ull << 20) : std::strstr(kind, "stream_copy") != nullptr ? (64ull << 10) : 0;
+            if (block != 0) {
+                hot_address = address & ~(block - 1);
+                hot_size = ((address + size + block - 1) & ~(block - 1)) - hot_address;
+            }
+        }
         std::scoped_lock lock{g_hot_mutex};
-        Hot& h = g_hot[address];
-        h.size = std::max(h.size, size);
+        Hot& h = g_hot[hot_address];
+        h.size = std::max(h.size, hot_size);
         h.last = std::max<u32>(h.last, submit != 0 ? submit : newest + 1);
     }
     if (submit == 0) {
         c.reads_no_submit.fetch_add(1, std::memory_order_relaxed);
+        NoteCoverage(kind, size, 0, true, false);
         return;
     }
     std::shared_ptr<const Snapshot> snap;
@@ -259,6 +289,7 @@ void NoteRead(u64 address, u64 size, u32 submit, const char* kind, std::string (
     }
     if (!snap) {
         (submit > newest ? c.reads_before_snapshot : c.reads_snapshot_gone).fetch_add(1, std::memory_order_relaxed);
+        NoteCoverage(kind, size, 0, false, true);
         return;
     }
     const u64 c0 = (address + Chunk - 1) / Chunk, c1 = (address + size) / Chunk;
@@ -292,6 +323,7 @@ void NoteRead(u64 address, u64 size, u32 submit, const char* kind, std::string (
             }
         }
     }
+    NoteCoverage(kind, size, audited * Chunk, false, false);
     c.chunks_audited.fetch_add(audited, std::memory_order_relaxed);
     c.chunks_not_in_snapshot.fetch_add((c1 - c0) - audited, std::memory_order_relaxed);
     if (audited != 0) {
@@ -369,6 +401,14 @@ std::string Report() {
                             {"chunks_different", s.chunks_different},
                             {"chunks_audited", s.chunks_audited},
                             {"bind", s.bind}});
+        }
+    }
+    {
+        std::scoped_lock lock{g_cov_mutex};
+        auto& cov = j["coverage_by_read_kind"] = nlohmann::json::object();
+        for (const auto& [name, v] : g_cov_by_kind) {
+            cov[name] = {{"reads", v.reads}, {"MB_read", double(v.bytes_read) / 1048576.0}, {"MB_audited", double(v.bytes_audited) / 1048576.0}, {"audited_percent", v.bytes_read ? 100.0 * double(v.bytes_audited) / double(v.bytes_read) : 0.0},
+                         {"reads_without_submission", v.reads_no_submit}, {"reads_without_snapshot", v.reads_no_snapshot}};
         }
     }
     j["writer_hits"] = nlohmann::json::parse(Core::NativeTsharpWatch::HitsJson(), nullptr, false);
