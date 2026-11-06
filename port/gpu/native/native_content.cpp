@@ -2495,6 +2495,14 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
         {
             const size_t marker = submit == 0 ? 2 : RasterDoneSubmissions() >= submit ? 1 : 0; // SubmitIndexOf is the (1 based) submission that carries the record: done when the floor reached it (a read after that has a stale record: the raster thread is on a later task)
             bool overreach = false;
+            if (a.late_lo != ~u64{0} && (k == static_cast<size_t>(LateKind::BufferStreamCopy) || k == static_cast<size_t>(LateKind::BufferArenaSync))) {
+                // 2026-11-06: name the writer of the newer bytes. A hardware write watch (debug register) on the first newer dword catches the next write there with its instruction
+                // and return addresses (native.log "tsharp watch ... rip"); a ring or a loader rewrites the same place every lap. Twelve per run (arming stops every thread for a moment).
+                static std::atomic<u32> watches_armed{0};
+                if (watches_armed.fetch_add(1, std::memory_order_relaxed) < 12) {
+                    Core::NativeTsharpWatch::ArmRotating(a.late_lo, "late read newer bytes");
+                }
+            }
             if (marker == 0 && submit != 0 && a.late_lo != ~u64{0}) {
                 const u64 owner_end = Core::NativeDevice::OwnerEndAt(address, submit);
                 overreach = owner_end != 0 && a.late_lo >= owner_end;
