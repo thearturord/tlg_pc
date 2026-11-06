@@ -19,23 +19,19 @@ namespace Core::NativeZPassGen {
 /// `DrawZPass(render_device, desc)` was entered. Returns true when the pass is done (generated, or run by the loop through `original_loop`, the hook's original entry) and the
 /// hooked function must be skipped, false when nothing was done (the view type is not handled: the engine's loop runs).
 bool HandlePass(u64 render_device, u64 desc, u64 original_loop);
-/// N6.6, the G-buffer loop (`RenderDev_DrawGBufferPrimitives`): `TLG_GBUFFER_GEN=1`, verify one pass in `TLG_GBUFFER_GEN_VERIFY` (default 32). Same contract as HandlePass; `param7` is the
+/// N6.6, the G-buffer loop (`RenderDev_DrawGBufferPrimitives`): `TLG_GBUFFER_GEN=1`. Same contract as HandlePass; `param7` is the
 /// byte the loop takes on the stack, `original_loop` the hook's original entry.
 [[nodiscard]] bool GBufferEnabled();
 bool HandleGBuffer(u64 render_device, u64 mode, u64 list, u64 args, u64 flags, u64 query_mode, u64 param7, u64 original_loop);
-/// True while a verify pass runs the engine's loop.
-[[nodiscard]] bool VerifyActive();
-/// A draw of the engine's loop during a verify pass: `caller` is the ghidra address of the call site, kind 0 `DrawIndexedCommon`.
-void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3);
-/// N6.7, the forward loop (`RenderDev_DrawForwardPass(renderDev, a1, a2, list, mode)`): `TLG_FORWARD_GEN=1`, verify one pass in `TLG_FORWARD_GEN_VERIFY` (default 32). Same contract.
+/// N6.7, the forward loop (`RenderDev_DrawForwardPass(renderDev, a1, a2, list, mode)`): `TLG_FORWARD_GEN=1`. Same contract.
 [[nodiscard]] bool ForwardEnabled();
 bool HandleForward(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 original_loop);
 
-/// A7, the decal pass loop (`FUN_01c71680(renderDev, view, a3, a4, desc, flags, type, width, height)`): `TLG_DECAL_GEN=1`, verify one pass in `TLG_DECAL_GEN_VERIFY` (default 32). Same contract.
+/// A7, the decal pass loop (`FUN_01c71680(renderDev, view, a3, a4, desc, flags, type, width, height)`): `TLG_DECAL_GEN=1`. Same contract.
 [[nodiscard]] bool DecalEnabled();
 bool HandleDecal(u64 render_device, u64 view, u64 a3, u64 a4, u64 desc, u32 flags, s32 type, u32 width, u32 height, u64 original_loop);
 
-/// B3, the skinning loop (`FUN_01c93730(system, scene, async)`): `TLG_SKIN_GEN=1`, verify one pass in `TLG_SKIN_GEN_VERIFY` (default 32). Same contract.
+/// B3, the skinning loop (`FUN_01c93730(system, scene, async)`): `TLG_SKIN_GEN=1`. Same contract.
 [[nodiscard]] bool SkinEnabled();
 bool HandleSkin(u64 system, u64 scene, u64 async_flag, u64 original_loop);
 [[nodiscard]] bool WetEnabled();

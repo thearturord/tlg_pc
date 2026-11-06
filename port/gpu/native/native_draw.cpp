@@ -5929,9 +5929,6 @@ u64 PS4_SYSV_ABI GarlicPoolPro(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u
 }
 
 u64 PS4_SYSV_ABI TagIndexed(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    if (NativeZPassGen::VerifyActive()) {
-        NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 0, ctx, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a3));
-    }
     return Tag(ctx, a1, a2, a3, ret, 0, (a4 & 0xff) != 0, false, a4, a5);
 }
 bool ExecEligibleCompute(u64 ctx, u64 seq, u64 caller) {
@@ -8179,9 +8176,6 @@ u64 PS4_SYSV_ABI MeasureExCsDepthCopy(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u
 
 u64 PS4_SYSV_ABI TagAscDispatch(u64 jcc, u64 x, u64 y, u64 z, u64 a4, u64 a5, u64 ret) {
     NativeSiteGen::CensusDispatch(ret, generator_issuing);
-    if (NativeZPassGen::VerifyActive()) {
-        NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 4, jcc, static_cast<u32>(x), static_cast<u32>(y), static_cast<u32>(z));
-    }
     return TagAsc(jcc, x & 0xffffffff, y & 0xffffffff, z & 0xffffffff, ret);
 }
 u64 PS4_SYSV_ABI TagAscDispatchRecordOnly(u64 jcc, u64 x, u64 y, u64 z, u64 a4, u64 a5, u64 ret) {
@@ -8190,9 +8184,6 @@ u64 PS4_SYSV_ABI TagAscDispatchRecordOnly(u64 jcc, u64 x, u64 y, u64 z, u64 a4, 
 
 u64 PS4_SYSV_ABI TagDispatch(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     NativeSiteGen::CensusDispatch(ret, generator_issuing);
-    if (NativeZPassGen::VerifyActive()) {
-        NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 3, ctx, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a3));
-    }
     return TagCompute(ctx, a1, a2, a3, ret, true);
 }
 /// The fenced dispatch wrapper adds an in-stream scratch label that the dispatch writes at its end and a wait on it: a
@@ -8200,15 +8191,9 @@ u64 PS4_SYSV_ABI TagDispatch(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u6
 /// order, so with execution the wait and its label are not needed (game-visible fences are other packets).
 u64 PS4_SYSV_ABI TagDispatchFenced(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     NativeSiteGen::CensusDispatch(ret, generator_issuing);
-    if (NativeZPassGen::VerifyActive()) {
-        NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 3, ctx, static_cast<u32>(a1), static_cast<u32>(a2), static_cast<u32>(a3));
-    }
     return TagCompute(ctx, a1, a2, a3, ret, true);
 }
 u64 PS4_SYSV_ABI TagIndirect(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    if (NativeZPassGen::VerifyActive()) {
-        NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 1, ctx, a1, a2, 0);
-    }
     return Tag(ctx, a1, a2, a3, ret, 2, true);
 }
 /// PrepareDraw(ctx, 0, 1): its callers are the draw functions (hooked at their own entry) and one inlined copy of the auto
@@ -8218,9 +8203,6 @@ u64 PS4_SYSV_ABI TagIndirect(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u6
 u64 InlineAutoPrepare(u64 ctx, u32 count, u64 ret) {
     if (ctx != 0 && InlineAutoDrawTagged(count)) {
         const u32 instances = Rd<u32>(ctx, 0x4724);
-        if (NativeZPassGen::VerifyActive()) {
-            NativeZPassGen::NoteLoopDraw(ret - ImageBase() + 0x1000000, 2, ctx, count, 0, instances);
-        }
         inline_instances = instances;
         const u64 result = Tag(ctx, count, 0, 0, ret, 1, true, true);
         inline_instances = 0;

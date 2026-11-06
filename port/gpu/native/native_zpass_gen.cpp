@@ -148,7 +148,6 @@ auto Timed(CallId id, F&& body) {
 struct Config {
     bool on{false};
     std::array<bool, 16> views{};
-    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_*_GEN_VERIFY=N checks one pass in N against the engine's loop)
 };
 const Config& Cfg() {
     static const Config config = [] {
@@ -169,9 +168,6 @@ const Config& Cfg() {
                 break;
             }
             at = comma + 1;
-        }
-        if (const char* n = std::getenv("TLG_ZPASS_GEN_VERIFY"); n != nullptr && *n != 0) {
-            c.verify_every = static_cast<u32>(std::atoi(n));
         }
         return c;
     }();
@@ -1081,365 +1077,6 @@ void CheckCacheImpl(CacheArgs& args) {
     }
 }
 
-// ------------------------------------------------------------------------------------------------------------------------------- verify
-
-struct Verify {
-    std::atomic<bool> active{false};
-    // one verify pass at a time over the one shadow: taken when a pass is chosen for verify (before the shadow is built, long before `active`), given back when it is done
-    std::atomic<bool> claimed{false};
-    std::thread::id thread;
-    Target shadow;
-    size_t cursor{0}, arena_pos{0};
-    u32 view{0};
-    u64 lo{ZPassBegin}, hi{ZPassEnd}; // the call sites of the loop under verify
-    u64 ctx{0};
-    u64 rd{0};
-    u64 compared_draws{0};
-    u64 mismatches{0};
-    u64 raced{0};
-    std::vector<s16> expect;
-    std::vector<u64> owner_of; // per context byte: the material whose render object the shadow copied the byte from (0: none)
-    std::array<u8, 0x340> forward_block{}; // A3: the block the native forward prologue built in the shadow (compared with the engine's at the first draw)
-    bool forward_block_set{false};
-};
-Verify& V() {
-    static Verify verify;
-    return verify;
-}
-
-void NoteMismatch(State& s, u32 view, const std::string& kind, const std::string& detail) {
-    ++s.mismatch_kinds[kind];
-    if (s.samples.size() < 24) {
-        s.samples.push_back(fmt::format("view type {}: {}: {}", view, kind, detail));
-        TLG_LOG(GEN, Error, "cascade generator verify: view type {}: {}: {}", view, kind, detail);
-    }
-}
-
-u64 RenderDataOf(u64 render_device, u64 object);
-constexpr u64 GlobalObjectTableForRace = 0x0689eed8, GlobalContextForRace = 0x069a1b40;
-/// The byte the native resource set would put in the context byte `offset` (the texture render data slots at 0xa40 and 0x740) from the material's list as it is now, or -1. The
-/// engine's other threads swap textures of a material (streaming): shadow and loop then read the list at different times.
-int ResourceSlotByte(u64 material, u32 offset) {
-    int index = -1;
-    if (offset >= 0xa40 && offset < 0xa80) {
-        index = static_cast<int>((offset - 0xa40) / 8);
-    } else if (offset >= 0x740 && offset < 0x780) {
-        index = static_cast<int>((offset - 0x740) / 8);
-    }
-    if (index < 0) {
-        return -1;
-    }
-    const u64 table = R<u64>(Global(GlobalObjectTableForRace));
-    const u64 list = R<u64>(R<u64>(Global(GlobalContextForRace)) + 0x38);
-    u64 value = RenderDataOf(table, R<u64>(list + 0x30));
-    if (static_cast<u32>(index) < std::min<u32>(8, R<u32>(material + 0x198))) {
-        value = RenderDataOf(table, R<u64>(R<u64>(material + 400) + u64{static_cast<u32>(index)} * 8));
-        if (value == 0) {
-            value = RenderDataOf(table, R<u64>(list + 0x38));
-        }
-    }
-    return static_cast<int>((value >> ((offset & 7) * 8)) & 0xff);
-}
-
-/// The byte the render object of `material` holds now for the context byte `offset` (the block copies of FUN_01c92b60), or -1.
-int MaterialByte(u64 material, u32 offset) {
-    const u64 object = R<u64>(material + 0x38);
-    if (object == 0) {
-        return -1;
-    }
-    if (offset >= 0x980 && offset < 0x9c8 + 8) {
-        return R<u8>(object + 0x450 + (offset - 0x980));
-    }
-    if (offset >= 0x9d0 && offset < 0xa18) {
-        return R<u8>(object + 0x498 + (offset - 0x9d0));
-    }
-    if (const u64 views = R<u64>(object + 0x4f0); views != 0 && offset >= 0x790 && offset < 0x790 + R<u32>(object + 0x4f8) * 8) {
-        return R<u8>(views + (offset - 0x790));
-    }
-    if (const u64 views = R<u64>(object + 0x4e0); views != 0 && offset >= 0xb38 && offset < 0xb38 + R<u32>(object + 0x4e8) * 8) {
-        return R<u8>(views + (offset - 0xb38));
-    }
-    return -1;
-}
-
-/// Compares the writes the generator made between two draws with the live context. Writes to the same bytes inside the span are applied in order (only the last counts: a batch
-/// that draws nothing rewrites ctx + 0x580, the clear after an instanced batch overwrites the start of the table before it).
-u32 CompareDelta(State& s, Verify& v, size_t from, size_t to, u64 live_ctx, const char* where) {
-    u32 differences = 0;
-    const u8* arena = v.shadow.arena.data();
-    if (v.expect.empty()) {
-        v.expect.assign(CtxBytes, -1);
-        v.owner_of.assign(CtxBytes, 0);
-    }
-    std::vector<u32> touched;
-    std::map<u32, u8> or_bits;
-    struct SlotWord {
-        u64 expected;
-        u64 material;
-    };
-    std::map<u32, SlotWord> slot_words, table_words, batch_words;
-    struct DirectWord {
-        u64 expected;
-        u64 object;
-        u32 offset;
-    };
-    std::map<u32, DirectWord> direct_words;
-    // a word is one thing at a time: a later write of another kind replaces what an earlier one left in the other lists (the order of the writes decides)
-    const auto forget_words = [&](u32 offset, u32 bytes) {
-        for (auto* words : {&slot_words, &table_words, &batch_words}) {
-            for (auto it = words->begin(); it != words->end();) {
-                it = (it->first + 8 > offset && it->first < offset + bytes) ? words->erase(it) : std::next(it);
-            }
-        }
-        for (auto it = direct_words.begin(); it != direct_words.end();) {
-            it = (it->first + 8 > offset && it->first < offset + bytes) ? direct_words.erase(it) : std::next(it);
-        }
-    };
-    const auto forget_bytes = [&](u32 offset, u32 bytes) {
-        for (u32 i = 0; i < bytes; ++i) {
-            v.expect[offset + i] = -1;
-        }
-    };
-    size_t at = from;
-    while (at < to) {
-        u32 offset, size;
-        std::memcpy(&offset, arena + at, 4);
-        std::memcpy(&size, arena + at + 4, 4);
-        const bool is_or = (size & OrMask) != 0;
-        const u32 bytes = size & ~OrMask;
-        const u8* expected = arena + at + 8;
-        const size_t entry_at = at;
-        at += 8 + bytes;
-        if (offset + bytes > CtxBytes) {
-            continue;
-        }
-        if (is_or) {
-            or_bits[offset] |= expected[0];
-            continue;
-        }
-        if (const auto bowner = v.shadow.batch_owner_map.find(entry_at); bowner != v.shadow.batch_owner_map.end() && bytes == 8 && (offset == 0x580 || offset == 0x58 || offset == 0x288 || offset == 0x308)) {
-            u64 value = 0;
-            std::memcpy(&value, expected, 8);
-            forget_words(offset, 8);
-            forget_bytes(offset, 8);
-            batch_words[offset] = {value, bowner->second};
-            continue;
-        }
-        if (const auto downer = v.shadow.direct_owner.find(entry_at); downer != v.shadow.direct_owner.end() && bytes == 8) {
-            u64 value = 0;
-            std::memcpy(&value, expected, 8);
-            forget_words(offset, 8);
-            forget_bytes(offset, 8);
-            direct_words[offset] = {value, downer->second.first, downer->second.second};
-            continue;
-        }
-        if (const auto towner = v.shadow.table_owner.find(entry_at); towner != v.shadow.table_owner.end() && bytes == 8) {
-            u64 value = 0;
-            std::memcpy(&value, expected, 8);
-            forget_words(offset, 8);
-            forget_bytes(offset, 8);
-            table_words[offset] = {value, towner->second};
-            continue;
-        }
-        const auto owner = v.shadow.slot_owner.find(entry_at);
-        if (bytes == 8 && owner != v.shadow.slot_owner.end() && (offset == 0x290 || offset == 0x310 || offset == 0x298 || offset == 0x318)) {
-            u64 value = 0;
-            std::memcpy(&value, expected, 8);
-            forget_words(offset, 8);
-            forget_bytes(offset, 8);
-            slot_words[offset] = {value, owner->second};
-            continue;
-        }
-        const u64 material_owner = owner != v.shadow.slot_owner.end() ? owner->second : 0;
-        forget_words(offset, bytes);
-        for (u32 i = 0; i < bytes; ++i) {
-            if (v.expect[offset + i] < 0) {
-                touched.push_back(offset + i);
-            }
-            v.expect[offset + i] = expected[i];
-            v.owner_of[offset + i] = material_owner;
-        }
-    }
-    std::sort(touched.begin(), touched.end());
-    touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
-    touched.erase(std::remove_if(touched.begin(), touched.end(), [&](u32 b) { return v.expect[b] < 0; }), touched.end());
-    for (size_t i = 0; i < touched.size();) {
-        size_t j = i;
-        while (j + 1 < touched.size() && touched[j + 1] == touched[j] + 1) {
-            ++j;
-        }
-        // one run [touched[i], touched[j]]: report the first differing byte of it
-        for (size_t k = i; k <= j; ++k) {
-            const u32 at_byte = touched[k];
-            const u8 live = R<u8>(live_ctx + at_byte);
-            if (live != static_cast<u8>(v.expect[at_byte])) {
-                // the dynamic constants of a material's render object are rewritten by the engine's other threads: if the live byte is what the object holds now, shadow and loop only read at
-                // different times
-                if (const u64 material = v.owner_of[at_byte]; material != 0) {
-                    int now = MaterialByte(material, at_byte);
-                    if (now < 0) {
-                        now = ResourceSlotByte(material, at_byte);
-                    }
-                    if (now >= 0 && now == live) {
-                        ++v.raced;
-                        s.raced_words[fmt::format("view {} material block byte {:#x}", v.view, at_byte & ~7u)]++;
-                        continue;
-                    }
-                }
-                u64 a = 0, b = 0;
-                const u32 base = at_byte & ~7u;
-                std::memcpy(&a, reinterpret_cast<const void*>(live_ctx + base), 8);
-                for (u32 q = 0; q < 8; ++q) {
-                    const s16 e = v.expect[base + q];
-                    const u8 value = e >= 0 ? static_cast<u8>(e) : R<u8>(live_ctx + base + q);
-                    b |= u64{value} << (q * 8);
-                }
-                ++differences;
-                NoteMismatch(s, v.view, fmt::format("context word {:#x}", base), fmt::format("{}: the loop left {:#x}, the generator writes {:#x}", where, a, b));
-                break;
-            }
-        }
-        i = j + 1;
-    }
-    for (const u32 at_byte : touched) {
-        v.expect[at_byte] = -1;
-        v.owner_of[at_byte] = 0;
-    }
-    for (const auto& [offset, bits] : or_bits) {
-        const u8 live = R<u8>(live_ctx + offset);
-        if ((live & bits) != bits) {
-            ++differences;
-            NoteMismatch(s, v.view, fmt::format("context word {:#x}", offset), fmt::format("{}: the loop left bits {:#x}, the generator sets {:#x}", where, live, bits));
-        }
-    }
-    for (const auto& [offset, word] : batch_words) {
-        const u64 live = R<u64>(live_ctx + offset);
-        if (live == word.expected) {
-            continue;
-        }
-        // the batch level words come from the mesh render data and the pass object; the engine can replace them (a streamed index buffer) between the shadow read and the loop read
-        struct Recompute {
-            u64 batch;
-            u32 offset;
-            u64 value;
-        } recompute{word.material, offset, ~0ull};
-        NativeDraw::GuardedCall(
-            [](void* p) {
-                auto* r = static_cast<Recompute*>(p);
-                const u64 context_global = R<u64>(Global(GlobalContext));
-                const u64 default_object = R<u64>(R<u64>(context_global + 0x38) + 0x20);
-                BatchLevel now;
-                FillBatchLevel(now, r->batch, default_object);
-                r->value = r->offset == 0x580 ? now.value_580 : r->offset == 0x58 ? now.view_58 : now.pass_object_288;
-            },
-            &recompute);
-        if (live == recompute.value) {
-            ++v.raced;
-            ++s.raced_words[fmt::format("view {} {} word {:#x}", v.view, "batch", offset)];
-            continue;
-        }
-        ++differences;
-        NoteMismatch(s, v.view, fmt::format("context word {:#x}", offset), fmt::format("{}: the loop left {:#x}, the generator writes {:#x} (the batch gives {:#x} now)", where, live, word.expected, recompute.value));
-    }
-    // A8: the views of a decal's object are a ring of a few slots that the engine's writer thread advances: between the shadow read (A), the loop read (B) and the compare (A again) the object can
-    // go A, B, A. The values each such field was seen with (as the shadow expected it and as the object holds it when compared) are remembered; a loop value among them is that race
-    static thread_local std::map<u64, std::array<u64, 4>> ring_history;
-    const auto remember = [&](u64 key, u64 value) {
-        auto& h = ring_history[key];
-        for (u64 seen : h) {
-            if (seen == value) {
-                return;
-            }
-        }
-        std::rotate(h.begin(), h.begin() + 1, h.end());
-        h[3] = value;
-    };
-    const auto remembered = [&](u64 key, u64 value) {
-        const auto it = ring_history.find(key);
-        return it != ring_history.end() && std::find(it->second.begin(), it->second.end(), value) != it->second.end();
-    };
-    for (const auto& [offset, word] : direct_words) {
-        const u64 live = R<u64>(live_ctx + offset);
-        remember(word.object + word.offset, word.expected);
-        if (live == word.expected) {
-            continue;
-        }
-        // a view the engine's other threads replace in the object between the shadow read and the loop read
-        const u64 now = R<u64>(word.object + word.offset);
-        remember(word.object + word.offset, now);
-        if (live == now || (live != 0 && remembered(word.object + word.offset, live))) {
-            ++v.raced;
-            ++s.raced_words[fmt::format("view {} {} word {:#x}", v.view, "object", offset)];
-            continue;
-        }
-        // the loop can leave a copy of the view (its reader takes a snapshot while the writer thread updates the object): the same descriptor at another address
-        std::string contents;
-        bool same_contents = false;
-        if (live > 0x100000000ull && word.expected > 0x100000000ull) {
-            struct Pair {
-                u64 a, b;
-                bool same;
-                std::string text;
-            } pair{live, word.expected, false, {}};
-            NativeDraw::GuardedCall(
-                [](void* q) {
-                    auto* x = static_cast<Pair*>(q);
-                    x->same = std::memcmp(reinterpret_cast<const void*>(x->a), reinterpret_cast<const void*>(x->b), 0x40) == 0;
-                    for (u32 i = 0; i < 8; ++i) {
-                        x->text += fmt::format(" {:x}/{:x}", R<u64>(x->a + i * 8), R<u64>(x->b + i * 8));
-                    }
-                },
-                &pair);
-            same_contents = pair.same;
-            contents = pair.text;
-        }
-        if (same_contents) {
-            ++v.raced;
-            ++s.raced_words[fmt::format("view {} {} word {:#x} (copy)", v.view, "object", offset)];
-            continue;
-        }
-        ++differences;
-        NoteMismatch(s, v.view, fmt::format("context word {:#x}", offset), fmt::format("{}: the loop left {:#x}, the generator writes {:#x} (the object holds {:#x} now; loop/generator qwords{})", where, live, word.expected, now, contents));
-    }
-    for (const auto& [offset, word] : table_words) {
-        const u64 live = R<u64>(live_ctx + offset);
-        if (live == word.expected) {
-            continue;
-        }
-        // the table entry's resource view can be replaced by the engine between the shadow read and the loop read
-        const u64 holder = R<u64>(word.material + 0x38);
-        const u64 now = holder != 0 ? R<u64>(holder + 0x28) : 0;
-        if (live == now) {
-            ++v.raced;
-            ++s.raced_words[fmt::format("view {} {} word {:#x}", v.view, "table", offset)];
-            continue;
-        }
-        ++differences;
-        NoteMismatch(s, v.view, fmt::format("context word {:#x}", offset), fmt::format("{}: the loop left {:#x}, the generator writes {:#x} (the table entry holds {:#x} now)", where, live, word.expected, now));
-    }
-    for (const auto& [offset, word] : slot_words) {
-        const u64 live = R<u64>(live_ctx + offset);
-        if (live == word.expected) {
-            continue;
-        }
-        // the resource slot of a material's render object moves when the engine's writer thread advances the object's ring (the reader lock exists for it): the shadow read it before the
-        // loop ran, the loop after. If the live value is what the object holds now, the loop and the generator agree and the difference is the time between their reads.
-        const u64 object = R<u64>(word.material + 0x38);
-        const u64 index_word = R<u64>(object + 0x440);
-        const u64 index = (index_word & 0xffffffffull) * 0xb0;
-        const u64 now = (offset == 0x290 || offset == 0x310) ? R<u64>(object + 0xc0 + index) : R<u64>(object + 0x2d0 + index);
-        if (live == now) {
-            ++v.raced;
-            ++s.raced_words[fmt::format("view {} {} word {:#x}", v.view, "slot", offset)];
-            continue;
-        }
-        ++differences;
-        NoteMismatch(s, v.view, fmt::format("context word {:#x}", offset), fmt::format("{}: the loop left {:#x}, the generator writes {:#x} (the object holds {:#x} now)", where, live, word.expected, now));
-    }
-    return differences;
-}
-
-
 // ------------------------------------------------------------------------------------------------------------------------------- the G-buffer loop (N6.6)
 // RenderDev_DrawGBufferPrimitives(renderDev, mode, list, args, flags, query mode, p7), ghidra 0x01c76710. What the live scenes ask of it (audit /gbuffer): mode 0, query mode 0, the
 // flags 0x20; batches with and without an instance group, with and without a second render data (batch + 0x28); no special entries; every primitive has its variant cached behind its
@@ -1870,16 +1507,12 @@ void GenerateGBuffer(Target& t, const GPlan& plan, u32 pass_flags) {
 
 struct GConfig {
     bool on{false};
-    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_*_GEN_VERIFY=N checks one pass in N against the engine's loop)
 };
 const GConfig& GCfg() {
     static const GConfig config = [] {
         GConfig c;
         const char* e = std::getenv("TLG_GBUFFER_GEN");
         c.on = e == nullptr || *e != '0'; // default on since 2026-10-27 (the owner's play test); TLG_GBUFFER_GEN=0 turns it off
-        if (const char* n = std::getenv("TLG_GBUFFER_GEN_VERIFY"); n != nullptr && *n != 0) {
-            c.verify_every = static_cast<u32>(std::atoi(n));
-        }
         return c;
     }();
     return config;
@@ -2271,10 +1904,6 @@ void ForwardPrologueNative(Target& t, u64 rd, u64 a1, u64 a2, u32 mode) {
     if (t.live) {
         t.Set<u64>(0x13070, reinterpret_cast<u64>(block));
         t.Set<u64>(0x13048, reinterpret_cast<u64>(block));
-    } else {
-        Verify& v = V();
-        v.forward_block = local;
-        v.forward_block_set = true;
     }
     t.Set<u64>(0xa28, data5);
     t.Set<u64>(0xa30, data6);
@@ -2593,16 +2222,12 @@ void GenerateForward(Target& t, const FPlan& plan) {
 
 struct FConfig {
     bool on{false};
-    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_*_GEN_VERIFY=N checks one pass in N against the engine's loop)
 };
 const FConfig& FCfg() {
     static const FConfig config = [] {
         FConfig c;
         const char* e = std::getenv("TLG_FORWARD_GEN");
         c.on = e == nullptr || *e != '0'; // default on since 2026-10-27 (the owner's play test); TLG_FORWARD_GEN=0 turns it off
-        if (const char* n = std::getenv("TLG_FORWARD_GEN_VERIFY"); n != nullptr && *n != 0) {
-            c.verify_every = static_cast<u32>(std::atoi(n));
-        }
         return c;
     }();
     return config;
@@ -3076,16 +2701,12 @@ void GenerateDecal(Target& t, const DPlan& plan) {
 
 struct DConfig {
     bool on{false};
-    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_*_GEN_VERIFY=N checks one pass in N against the engine's loop)
 };
 const DConfig& DCfg() {
     static const DConfig config = [] {
         DConfig c;
         const char* e = std::getenv("TLG_DECAL_GEN");
         c.on = e == nullptr || *e != '0'; // default on since 2026-10-27 (the owner's play test); TLG_DECAL_GEN=0 turns it off
-        if (const char* n = std::getenv("TLG_DECAL_GEN_VERIFY"); n != nullptr && *n != 0) {
-            c.verify_every = static_cast<u32>(std::atoi(n));
-        }
         return c;
     }();
     return config;
@@ -3704,16 +3325,12 @@ void GenerateSkin(Target& t, const SkinPlan& p) {
 
 struct SConfig {
     bool on{false};
-    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_*_GEN_VERIFY=N checks one pass in N against the engine's loop)
 };
 const SConfig& SCfg() {
     static const SConfig config = [] {
         SConfig c;
         const char* e = std::getenv("TLG_SKIN_GEN");
         c.on = e == nullptr || *e != '0'; // default on since 2026-10-27 (the owner's play test); TLG_SKIN_GEN=0 turns it off
-        if (const char* n = std::getenv("TLG_SKIN_GEN_VERIFY"); n != nullptr && *n != 0) {
-            c.verify_every = static_cast<u32>(std::atoi(n));
-        }
         return c;
     }();
     return config;
@@ -4354,16 +3971,12 @@ void GenerateWet(Target& t, const WetPlan& p) {
 
 struct WConfig {
     bool on{false};
-    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_*_GEN_VERIFY=N checks one pass in N against the engine's loop)
 };
 const WConfig& WCfg() {
     static const WConfig config = [] {
         WConfig c;
         const char* e = std::getenv("TLG_WET_GEN");
         c.on = e == nullptr || *e != '0'; // default on since 2026-10-27 (the owner's play test); TLG_WET_GEN=0 turns it off
-        if (const char* n = std::getenv("TLG_WET_GEN_VERIFY"); n != nullptr && *n != 0) {
-            c.verify_every = static_cast<u32>(std::atoi(n));
-        }
         return c;
     }();
     return config;
@@ -4805,16 +4418,12 @@ void GenerateInst(Target& t, const InstPlan& p) {
 
 struct IConfig {
     bool on{false};
-    u32 verify_every{0}; // off by default since 2026-10-30 (TLG_*_GEN_VERIFY=N checks one pass in N against the engine's loop)
 };
 const IConfig& ICfg() {
     static const IConfig config = [] {
         IConfig c;
         const char* e = std::getenv("TLG_INST_GEN");
         c.on = e == nullptr || *e != '0'; // default on since 2026-10-27 (the owner's play test); TLG_INST_GEN=0 turns it off
-        if (const char* n = std::getenv("TLG_INST_GEN_VERIFY"); n != nullptr && *n != 0) {
-            c.verify_every = static_cast<u32>(std::atoi(n));
-        }
         return c;
     }();
     return config;
@@ -4839,203 +4448,7 @@ bool Enabled() {
     return Cfg().on;
 }
 
-bool VerifyActive() {
-    return V().active.load(std::memory_order_relaxed);
-}
 
-void NoteLoopDraw(u64 caller, u32 kind, u64 ctx, u64 count, u64 first, u64 a3) {
-    Verify& v = V();
-    if (!v.active.load(std::memory_order_relaxed) || caller < v.lo || caller >= v.hi || std::this_thread::get_id() != v.thread) {
-        return;
-    }
-    State& s = S();
-    std::scoped_lock lock{s.mutex};
-    const size_t k = v.cursor++;
-    ++v.compared_draws;
-    if (k >= v.shadow.marks.size()) {
-        ++v.mismatches;
-        NoteMismatch(s, v.view, "extra draw", fmt::format("the loop issued draw {} but the generator has {}", k, v.shadow.marks.size()));
-        return;
-    }
-    const Mark& mark = v.shadow.marks[k];
-    if (mark.kind != kind || mark.count != count || mark.first != first || ((kind == 0 || kind == 2) && mark.a3 != a3)) {
-        ++v.mismatches;
-        NoteMismatch(s, v.view, "draw arguments", fmt::format("draw {}: the loop kind {} {:#x} / {:#x} / {:#x}, the generator kind {} {:#x} / {:#x} / {:#x}", k, kind, count, first, a3, mark.kind, mark.count, mark.first, mark.a3));
-    }
-    if (ctx != v.ctx) {
-        ++v.mismatches;
-        NoteMismatch(s, v.view, "context", fmt::format("draw {}: another device context", k));
-        return;
-    }
-    if ((kind == 3 || kind == 4) && mark.site != 0 && mark.site != caller) {
-        ++v.mismatches;
-        NoteMismatch(s, v.view, "dispatch site", fmt::format("dispatch {}: the loop's call site {:#x}, the generator's {:#x}", k, caller, mark.site));
-    }
-    if (kind == 3 || kind == 4) {
-        // B3: a dispatch: the compute shader of the context and the constant blocks the loop updated its buffers from
-        const u32 shader_offset = kind == 4 ? 0x1d10 : 0x4670;
-        if (R<u64>(ctx + shader_offset) != mark.vertex_shader) {
-            ++v.mismatches;
-            NoteMismatch(s, v.view, "compute shader", fmt::format("draw {}: the loop {:#x}, the generator {:#x}", k, R<u64>(ctx + shader_offset), mark.vertex_shader));
-        }
-        for (const auto& [address, generated] : mark.blocks) {
-            std::vector<u8> bytes = generated;
-            if (mark.wet_kind != 0 && address == mark.wet_block) {
-                // the wet blocks are made from objects the game's thread rewrites: build the block again from them now; if the live block is what they give now, the loop and the generator
-                // read them at different times. The frame time (kind 1) is a global the main thread writes every frame: any plausible value is the loop's own read.
-                std::vector<u8> now;
-                const u64 sys = mark.wet_system;
-                if (mark.wet_kind == 1) {
-                    std::array<u8, 16> b16;
-                    WetBuildStep(sys, mark.wet_context_global, b16);
-                    now.assign(b16.begin(), b16.end());
-                } else if (mark.wet_kind == 2) {
-                    std::array<u8, 0xc0> b;
-                    WetBuildIntersect(sys, R<u64>(sys + 0x28), mark.wet_object, R<u64>(R<u64>(mark.wet_object + 0x38) + 0x28), b);
-                    now.assign(b.begin(), b.end());
-                } else {
-                    std::array<u8, 0x54> b;
-                    WetBuildForce(sys, R<u64>(sys + 0x28), mark.wet_water, b);
-                    now.assign(b.begin(), b.end());
-                }
-                const u32 n = static_cast<u32>(std::min(now.size(), bytes.size()));
-                if (std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), n) != 0 && std::memcmp(reinterpret_cast<const void*>(address), now.data(), n) == 0) {
-                    std::memcpy(bytes.data(), now.data(), n);
-                    ++v.raced;
-                    ++s_raced_wet_color;
-                } else if (mark.wet_kind == 1 && bytes.size() >= 8) {
-                    float live_time;
-                    std::memcpy(&live_time, reinterpret_cast<const void*>(address + 4), 4);
-                    if (std::isfinite(live_time) && live_time > 0.0f && live_time < 1.0f) {
-                        std::memcpy(bytes.data() + 4, &live_time, 4);
-                        ++v.raced;
-                        ++s_raced_wet_color;
-                    }
-                }
-            }
-            if (mark.flag_source != 0 && address == mark.flag_block && bytes.size() >= 0x10) {
-                // the flag in dword 3 comes from a float the main thread updates: if the live value is what the float gives now, the loop and the generator read it at different times
-                u32 live_flag = 0, generated_flag = 0;
-                std::memcpy(&live_flag, reinterpret_cast<const void*>(address + 0xc), 4);
-                std::memcpy(&generated_flag, bytes.data() + 0xc, 4);
-                const u32 now = !(R<float>(mark.flag_source) < R<float>(Global(0x024f15dc))) ? 1u : 0u;
-                if (live_flag != generated_flag && live_flag == now) {
-                    std::memcpy(bytes.data() + 0xc, &live_flag, 4);
-                    ++v.raced;
-                    ++s.raced_words[fmt::format("view {} skinning flag word {:#x}", v.view, 0xc)];
-                }
-            }
-            if (mark.flag_source != 0 && bytes.size() >= 0x208) {
-                // dword 0x204 of the skinning constants is a time float the main thread keeps updating: the loop and the generator read it at different moments (a race, counted)
-                float live_time = 0.0f, generated_time = 0.0f;
-                std::memcpy(&live_time, reinterpret_cast<const void*>(address + 0x204), 4);
-                std::memcpy(&generated_time, bytes.data() + 0x204, 4);
-                if (std::memcmp(&live_time, &generated_time, 4) != 0 && std::isfinite(live_time) && std::isfinite(generated_time)) {
-                    std::memcpy(bytes.data() + 0x204, &live_time, 4);
-                    ++v.raced;
-                    ++s.raced_words[fmt::format("view {} skinning time word {:#x}", v.view, 0x204)];
-                }
-            }
-            if (g_inst_scene_block != 0 && address == g_inst_scene_block && bytes.size() == 0x5b0) {
-                // the scene block is a copy of the scene, which the game's main thread keeps updating (times, fades): where the scene's word is no longer the one the generator copied the engine's loop
-                // copied a later value, which is a race and no difference
-                for (u32 w = 0; w < 0x5b0; w += 4) {
-                    u32 live_word = 0, generated_word = 0;
-                    std::memcpy(&live_word, reinterpret_cast<const void*>(address + w), 4);
-                    std::memcpy(&generated_word, bytes.data() + w, 4);
-                    if (live_word != generated_word && R<u32>(g_inst_scene_source + w) != generated_word) {
-                        std::memcpy(bytes.data() + w, &live_word, 4);
-                        ++v.raced;
-                        ++s.raced_words[fmt::format("view {} instancing scene block word {:#x}", v.view, w)];
-                    }
-                }
-            }
-            if (std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) != 0) {
-                u32 at = 0;
-                while (at + 4 <= bytes.size() && std::memcmp(reinterpret_cast<const void*>(address + at), bytes.data() + at, 4) == 0) {
-                    at += 4;
-                }
-                u32 a = 0, b = 0;
-                std::memcpy(&a, reinterpret_cast<const void*>(address + at), 4);
-                std::memcpy(&b, bytes.data() + at, 4);
-                ++v.mismatches;
-                std::string extra;
-                if (mark.color_block != 0 && address == mark.color_block) {
-                    const u64 sys = address - 0x130;
-                    extra = fmt::format(" (system {:#x}: +0x254 {:#x}, +0x258 {:#x}, +0x1b8 {:#x}; live lanes {:#x} {:#x} {:#x} {:#x}; generated lanes {:#x} {:#x} {:#x} {:#x})", sys, R<u32>(sys + 0x254), R<u32>(sys + 0x258), R<u32>(sys + 0x1b8),
-                                        R<u32>(address + 0x40), R<u32>(address + 0x44), R<u32>(address + 0x48), R<u32>(address + 0x4c), R<u32>(reinterpret_cast<u64>(bytes.data()) + 0x40),
-                                        R<u32>(reinterpret_cast<u64>(bytes.data()) + 0x44), R<u32>(reinterpret_cast<u64>(bytes.data()) + 0x48), R<u32>(reinterpret_cast<u64>(bytes.data()) + 0x4c));
-                }
-                NoteMismatch(s, v.view, "skinning constants", fmt::format("dispatch {}: dword {:#x} of the block at {:#x}: the loop {:#x}, the generator {:#x}{}", k, at, address, a, b, extra));
-            }
-        }
-    }
-    const u64 vs = R<u64>(ctx + 0x4698), ps = R<u64>(ctx + 0x4690);
-    if (kind != 3 && kind != 4 && (vs != mark.vertex_shader || ps != mark.pixel_shader)) {
-        ++v.mismatches;
-        NoteMismatch(s, v.view, "shader pair", fmt::format("draw {}: the loop {:#x} / {:#x}, the generator {:#x} / {:#x}", k, vs, ps, mark.vertex_shader, mark.pixel_shader));
-    }
-    if (k == 0 && v.forward_block_set && (v.view == 200 || v.view == 201)) {
-        // A3: the 0x340 byte block the engine's forward prologue put in the frame ring (ctx + 0x13048) against the one the native prologue built
-        v.forward_block_set = false;
-        const u64 block = R<u64>(ctx + 0x13048);
-        Leaf().block_compared.fetch_add(1, std::memory_order_relaxed);
-        if (block == 0 || std::memcmp(reinterpret_cast<const void*>(block), v.forward_block.data(), v.forward_block.size()) != 0) {
-            Leaf().block_differing.fetch_add(1, std::memory_order_relaxed);
-            ++v.mismatches;
-            NoteMismatch(s, v.view, "forward prologue block", fmt::format("the engine's block at {:#x} differs from the native one", block));
-        }
-    }
-    if (mark.stage >= 0) {
-        // A7: the constant block of the decal loop (renderDev + 0x3990) at this draw against the block the generator built
-        const auto& built = v.shadow.stages[static_cast<size_t>(mark.stage)];
-        const u8* now = reinterpret_cast<const u8*>(v.rd + DecalStageBase);
-        if (std::memcmp(now, built.data(), built.size()) != 0) {
-            u32 at = 0;
-            while (at + 4 <= built.size() && std::memcmp(now + at, built.data() + at, 4) == 0) {
-                at += 4;
-            }
-            u32 a = 0, b = 0;
-            std::memcpy(&a, now + at, 4);
-            std::memcpy(&b, built.data() + at, 4);
-            ++v.mismatches;
-            NoteMismatch(s, v.view, "decal constants", fmt::format("draw {}: dword {:#x} of the block: the loop {:#x}, the generator {:#x}", k, DecalStageBase + at, a, b));
-        }
-    }
-    if (mark.rs_valid) {
-        // A3: what the engine's FUN_01c92f30 left in the device before this draw against what the native resource set computed
-        RsStats().compared.fetch_add(1, std::memory_order_relaxed);
-        const u64 matrices = v.rd + 0x3790, buffer = R<u64>(v.rd + 0x3800);
-        bool same = std::memcmp(reinterpret_cast<const void*>(matrices), mark.rs_bytes.data(), mark.rs_n * 16) == 0;
-        std::string why = same ? "" : "the matrices block";
-        if (same && buffer != 0) {
-            const u64 block = u64{R<u32>(buffer + 0x60)} | (u64{R<u32>(buffer + 0x64) & 0xfffu} << 32);
-            same = R<u32>(buffer + 0x68) == ((mark.rs_size + 0xfu) >> 4) && R<u32>(buffer + 0x6c) == 0x20077facu && block != 0 &&
-                   std::memcmp(reinterpret_cast<const void*>(block), mark.rs_bytes.data(), mark.rs_n * 16) == 0;
-            why = same ? "" : "the constant buffer";
-        }
-        if (!same) {
-            RsStats().differing.fetch_add(1, std::memory_order_relaxed);
-            ++v.mismatches;
-            NoteMismatch(s, v.view, "resource set", fmt::format("draw {}: {} differs from the native one", k, why));
-        }
-    }
-    if (mark.gb_buffer != 0) {
-        // A3: the instance group's uploader buffer after the engine's FUN_01ee4e50 against the staged data the native group bind would have copied
-        GbStats().compared.fetch_add(1, std::memory_order_relaxed);
-        const u64 buffer = mark.gb_buffer;
-        const u64 block = u64{R<u32>(buffer + 0x60)} | (u64{R<u32>(buffer + 0x64) & 0xfffu} << 32);
-        const bool same = block != 0 && R<u32>(buffer + 0x6c) == 0x20077facu && R<u32>(buffer + 0x68) == ((R<u32>(buffer + 0x180) + 0xfu) >> 4) &&
-                          std::memcmp(reinterpret_cast<const void*>(block), reinterpret_cast<const void*>(mark.gb_src), mark.gb_n) == 0;
-        if (!same) {
-            GbStats().differing.fetch_add(1, std::memory_order_relaxed);
-            ++v.mismatches;
-            NoteMismatch(s, v.view, "group bind", fmt::format("draw {}: the uploader buffer differs from the staged data", k));
-        }
-    }
-    v.mismatches += CompareDelta(s, v, v.arena_pos, mark.arena_end, ctx, fmt::format("draw {}", k).c_str());
-    v.arena_pos = mark.arena_end;
-}
 
 bool HandlePass(u64 render_device, u64 desc, u64 original_loop) {
     const Config& cfg = Cfg();
@@ -5094,16 +4507,14 @@ bool HandlePass(u64 render_device, u64 desc, u64 original_loop) {
         }
     }
     ViewStats* stats = nullptr;
-    bool verify_pass = false;
     {
         std::scoped_lock lock{s.mutex};
         stats = &s.views[plan.view_type];
         if (plan.Ok()) {
             ++stats->eligible;
-            verify_pass = cfg.verify_every != 0 && stats->eligible % cfg.verify_every == cfg.verify_every - 1 && !V().claimed.exchange(true);
         }
     }
-    if (plan.Ok() && !verify_pass) {
+    if (plan.Ok()) {
         Target live;
         live.live = true;
         live.base = reinterpret_cast<u8*>(plan.ctx);
@@ -5116,65 +4527,11 @@ bool HandlePass(u64 render_device, u64 desc, u64 original_loop) {
         stats->group_batches_skipped += plan.group_batches_skipped;
         return true;
     }
-    Verify& v = V();
-    if (verify_pass) {
-        v.shadow = Target{};
-        v.shadow.live = false;
-        std::vector<u8> copy(CtxBytes);
-        std::memcpy(copy.data(), reinterpret_cast<const void*>(plan.ctx), CtxBytes);
-        v.shadow.base = copy.data();
-        Generate(v.shadow, plan);
-        v.cursor = 0;
-        v.arena_pos = 0;
-        v.view = plan.view_type;
-        v.lo = ZPassBegin;
-        v.hi = ZPassEnd;
-        v.ctx = plan.ctx;
-        v.rd = plan.render_device;
-        v.compared_draws = 0;
-        v.mismatches = 0;
-        v.raced = 0;
-        v.thread = std::this_thread::get_id();
-        const s32 draws_before = R<s32>(render_device + 0x10), triangles_before = R<s32>(render_device + 0x14);
-        v.active.store(true);
-        reinterpret_cast<Loop>(original_loop)(render_device, desc);
-        v.active.store(false);
-        std::scoped_lock lock{s.mutex};
-        // the draws the generator has and the loop did not issue, the epilogue, the counters
-        if (v.cursor < v.shadow.marks.size()) {
-            ++v.mismatches;
-            NoteMismatch(s, v.view, "missing draw", fmt::format("the generator has {} draws, the loop issued {}", v.shadow.marks.size(), v.cursor));
-        } else {
-            v.mismatches += CompareDelta(s, v, v.arena_pos, v.shadow.arena.size(), plan.ctx, "epilogue");
-        }
-        const s32 draws = R<s32>(render_device + 0x10) - draws_before;
-        const s64 triangles = R<s32>(render_device + 0x14) - triangles_before;
-        if (draws != v.shadow.draws || triangles != v.shadow.triangles) {
-            ++v.mismatches;
-            NoteMismatch(s, v.view, "counters", fmt::format("draws +{} (generator {}), triangles +{} (generator {})", draws, v.shadow.draws, triangles, v.shadow.triangles));
-        }
-        ++stats->verify_passes;
-        stats->verify_draws += v.compared_draws;
-        stats->verify_raced += v.raced;
-        stats->group_batches += plan.group_batches;
-        if (v.mismatches == 0) {
-            ++stats->verify_clean;
-        } else {
-            ++stats->verify_mismatched;
-            stats->disabled = true;
-            TLG_LOG(GEN, Error, "cascade generator: view type {} switched off, {} differences against the engine's loop", v.view, v.mismatches);
-        }
-        v.shadow = Target{};
-        v.claimed.store(false);
-    } else {
-        reinterpret_cast<Loop>(original_loop)(render_device, desc);
-    }
+    reinterpret_cast<Loop>(original_loop)(render_device, desc);
     // learn what the loop chose
     {
         std::scoped_lock lock{s.mutex};
-        if (!verify_pass) {
-            ++stats->loop_passes;
-        }
+        ++stats->loop_passes;
         if (plan.scanned && !plan.steps.empty()) {
             CacheArgs cache_args{&s, render_device};
             if (!NativeDraw::GuardedCall([](void* p) { CheckCacheImpl(*static_cast<CacheArgs*>(p)); }, &cache_args)) {
@@ -5224,13 +4581,11 @@ bool HandleGBuffer(u64 render_device, u64 mode, u64 list, u64 args, u64 flags, u
             }
         }
     }
-    bool verify_pass = false;
     if (plan.Ok()) {
         std::scoped_lock lock{s.mutex};
         ++gs.eligible;
-        verify_pass = cfg.verify_every != 0 && gs.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().claimed.exchange(true);
     }
-    if (plan.Ok() && !verify_pass) {
+    if (plan.Ok()) {
         Target live;
         live.live = true;
         live.base = reinterpret_cast<u8*>(plan.ctx);
@@ -5245,65 +4600,9 @@ bool HandleGBuffer(u64 render_device, u64 mode, u64 list, u64 args, u64 flags, u
         gs.v.group_batches += plan.group_batches;
         return true;
     }
-    Verify& v = V();
-    if (verify_pass) {
-        v.shadow = Target{};
-        v.shadow.live = false;
-        v.shadow.indexed_site = GBufferIndexedSite;
-        v.shadow.indirect_site = GBufferIndirectSite;
-        v.shadow.indexed_a4 = 0;
-        std::vector<u8> copy(CtxBytes);
-        std::memcpy(copy.data(), reinterpret_cast<const void*>(plan.ctx), CtxBytes);
-        v.shadow.base = copy.data();
-        GenerateGBuffer(v.shadow, plan, plan.flags);
-        v.cursor = 0;
-        v.arena_pos = 0;
-        v.view = 100;
-        v.lo = GBufferBegin;
-        v.hi = GBufferEnd;
-        v.ctx = plan.ctx;
-        v.rd = plan.render_device;
-        v.compared_draws = 0;
-        v.mismatches = 0;
-        v.raced = 0;
-        v.thread = std::this_thread::get_id();
-        const s32 draws_before = R<s32>(render_device + 0x10), triangles_before = R<s32>(render_device + 0x14);
-        v.active.store(true);
-        reinterpret_cast<Loop>(original_loop)(render_device, mode, list, args, flags, query_mode, param7);
-        v.active.store(false);
-        std::scoped_lock lock{s.mutex};
-        if (v.cursor < v.shadow.marks.size()) {
-            ++v.mismatches;
-            NoteMismatch(s, v.view, "missing draw", fmt::format("the generator has {} draws, the loop issued {}", v.shadow.marks.size(), v.cursor));
-        } else {
-            v.mismatches += CompareDelta(s, v, v.arena_pos, v.shadow.arena.size(), plan.ctx, "epilogue");
-        }
-        const s32 draws = R<s32>(render_device + 0x10) - draws_before;
-        const s64 triangles = R<s32>(render_device + 0x14) - triangles_before;
-        if (draws != v.shadow.draws || triangles != v.shadow.triangles) {
-            ++v.mismatches;
-            NoteMismatch(s, v.view, "counters", fmt::format("draws +{} (generator {}), triangles +{} (generator {})", draws, v.shadow.draws, triangles, v.shadow.triangles));
-        }
-        ++gs.v.verify_passes;
-        gs.v.verify_draws += v.compared_draws;
-        gs.v.verify_raced += v.raced;
-        gs.v.group_batches += plan.group_batches;
-        if (v.mismatches == 0) {
-            ++gs.v.verify_clean;
-        } else {
-            ++gs.v.verify_mismatched;
-            gs.v.disabled = true;
-            TLG_LOG(GEN, Error, "G-buffer generator switched off, {} differences against the engine's loop", v.mismatches);
-        }
-        v.shadow = Target{};
-        v.lo = ZPassBegin;
-        v.hi = ZPassEnd;
-        v.claimed.store(false);
-    } else {
-        reinterpret_cast<Loop>(original_loop)(render_device, mode, list, args, flags, query_mode, param7);
-        std::scoped_lock lock{s.mutex};
-        ++gs.v.loop_passes;
-    }
+    reinterpret_cast<Loop>(original_loop)(render_device, mode, list, args, flags, query_mode, param7);
+    std::scoped_lock lock{s.mutex};
+    ++gs.v.loop_passes;
     return true;
 }
 
@@ -5342,13 +4641,11 @@ bool HandleForward(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 or
             }
         }
     }
-    bool verify_pass = false;
     if (plan.Ok()) {
         std::scoped_lock lock{s.mutex};
         ++fs.eligible;
-        verify_pass = cfg.verify_every != 0 && fs.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().claimed.exchange(true);
     }
-    if (plan.Ok() && !verify_pass) {
+    if (plan.Ok()) {
         Target live;
         live.live = true;
         live.base = reinterpret_cast<u8*>(plan.ctx);
@@ -5361,64 +4658,9 @@ bool HandleForward(u64 render_device, u64 a1, u64 a2, u64 list, u64 mode, u64 or
         fs.v.generated_draws += plan.steps.size();
         return true;
     }
-    Verify& v = V();
-    if (verify_pass) {
-        v.shadow = Target{};
-        v.shadow.live = false;
-        v.shadow.indexed_site = ForwardIndexedSite;
-        v.shadow.indexed_a4 = 1;
-        std::vector<u8> copy(CtxBytes);
-        std::memcpy(copy.data(), reinterpret_cast<const void*>(plan.ctx), CtxBytes);
-        v.shadow.base = copy.data();
-        GenerateForward(v.shadow, plan);
-        v.cursor = 0;
-        v.arena_pos = 0;
-        v.view = 200;
-        v.lo = ForwardBegin;
-        v.hi = ForwardEnd;
-        v.ctx = plan.ctx;
-        v.rd = plan.render_device;
-        v.compared_draws = 0;
-        v.mismatches = 0;
-        v.raced = 0;
-        v.thread = std::this_thread::get_id();
-        const s32 draws_before = R<s32>(render_device + 0x10), triangles_before = R<s32>(render_device + 0x14);
-        v.active.store(true);
-        reinterpret_cast<Loop>(original_loop)(render_device, a1, a2, list, mode);
-        v.active.store(false);
-        v.forward_block_set = false;
-        std::scoped_lock lock{s.mutex};
-        if (v.cursor < v.shadow.marks.size()) {
-            ++v.mismatches;
-            NoteMismatch(s, v.view, "missing draw", fmt::format("the generator has {} draws, the loop issued {}", v.shadow.marks.size(), v.cursor));
-        } else {
-            v.mismatches += CompareDelta(s, v, v.arena_pos, v.shadow.arena.size(), plan.ctx, "epilogue");
-        }
-        const s32 draws = R<s32>(render_device + 0x10) - draws_before;
-        const s64 triangles = R<s32>(render_device + 0x14) - triangles_before;
-        if (draws != v.shadow.draws || triangles != v.shadow.triangles) {
-            ++v.mismatches;
-            NoteMismatch(s, v.view, "counters", fmt::format("draws +{} (generator {}), triangles +{} (generator {})", draws, v.shadow.draws, triangles, v.shadow.triangles));
-        }
-        ++fs.v.verify_passes;
-        fs.v.verify_draws += v.compared_draws;
-        fs.v.verify_raced += v.raced;
-        if (v.mismatches == 0) {
-            ++fs.v.verify_clean;
-        } else {
-            ++fs.v.verify_mismatched;
-            fs.v.disabled = true;
-            TLG_LOG(GEN, Error, "forward generator switched off, {} differences against the engine's loop", v.mismatches);
-        }
-        v.shadow = Target{};
-        v.lo = ZPassBegin;
-        v.hi = ZPassEnd;
-        v.claimed.store(false);
-    } else {
-        reinterpret_cast<Loop>(original_loop)(render_device, a1, a2, list, mode);
-        std::scoped_lock lock{s.mutex};
-        ++fs.v.loop_passes;
-    }
+    reinterpret_cast<Loop>(original_loop)(render_device, a1, a2, list, mode);
+    std::scoped_lock lock{s.mutex};
+    ++fs.v.loop_passes;
     return true;
 }
 
@@ -5472,13 +4714,11 @@ bool HandleDecal(u64 render_device, u64 view, u64 a3, u64 a4, u64 desc, u32 flag
         run_loop(); // the engine's function does nothing for an empty list
         return true;
     }
-    bool verify_pass = false;
     if (plan.Ok()) {
         std::scoped_lock lock{s.mutex};
         ++ds.eligible;
-        verify_pass = cfg.verify_every != 0 && ds.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().claimed.exchange(true);
     }
-    if (plan.Ok() && !verify_pass) {
+    if (plan.Ok()) {
         Target live;
         live.live = true;
         live.base = reinterpret_cast<u8*>(plan.ctx);
@@ -5489,62 +4729,9 @@ bool HandleDecal(u64 render_device, u64 view, u64 a3, u64 a4, u64 desc, u32 flag
         ds.v.generated_draws += plan.steps.size();
         return true;
     }
-    Verify& v = V();
-    if (verify_pass) {
-        v.shadow = Target{};
-        v.shadow.live = false;
-        std::vector<u8> copy(CtxBytes);
-        std::memcpy(copy.data(), reinterpret_cast<const void*>(plan.ctx), CtxBytes);
-        v.shadow.base = copy.data();
-        GenerateDecal(v.shadow, plan);
-        v.cursor = 0;
-        v.arena_pos = 0;
-        v.view = 201;
-        v.lo = DecalBegin;
-        v.hi = DecalEnd;
-        v.ctx = plan.ctx;
-        v.rd = plan.render_device;
-        v.compared_draws = 0;
-        v.mismatches = 0;
-        v.raced = 0;
-        v.thread = std::this_thread::get_id();
-        const s32 draws_before = R<s32>(render_device + 0x10), triangles_before = R<s32>(render_device + 0x14);
-        v.active.store(true);
-        run_loop();
-        v.active.store(false);
-        v.forward_block_set = false;
-        std::scoped_lock lock{s.mutex};
-        if (v.cursor < v.shadow.marks.size()) {
-            ++v.mismatches;
-            NoteMismatch(s, v.view, "missing draw", fmt::format("the generator has {} draws, the loop issued {}", v.shadow.marks.size(), v.cursor));
-        } else {
-            v.mismatches += CompareDelta(s, v, v.arena_pos, v.shadow.arena.size(), plan.ctx, "epilogue");
-        }
-        const s32 draws = R<s32>(render_device + 0x10) - draws_before;
-        const s64 triangles = R<s32>(render_device + 0x14) - triangles_before;
-        if (draws != v.shadow.draws || triangles != v.shadow.triangles) {
-            ++v.mismatches;
-            NoteMismatch(s, v.view, "counters", fmt::format("draws +{} (generator {}), triangles +{} (generator {})", draws, v.shadow.draws, triangles, v.shadow.triangles));
-        }
-        ++ds.v.verify_passes;
-        ds.v.verify_draws += v.compared_draws;
-        ds.v.verify_raced += v.raced;
-        if (v.mismatches == 0) {
-            ++ds.v.verify_clean;
-        } else {
-            ++ds.v.verify_mismatched;
-            ds.v.disabled = true;
-            TLG_LOG(GEN, Error, "decal generator switched off, {} differences against the engine's loop", v.mismatches);
-        }
-        v.shadow = Target{};
-        v.lo = ZPassBegin;
-        v.hi = ZPassEnd;
-        v.claimed.store(false);
-    } else {
-        run_loop();
-        std::scoped_lock lock{s.mutex};
-        ++ds.v.loop_passes;
-    }
+    run_loop();
+    std::scoped_lock lock{s.mutex};
+    ++ds.v.loop_passes;
     return true;
 }
 
@@ -5590,13 +4777,11 @@ bool HandleSkin(u64 system, u64 scene, u64 async_flag, u64 original_loop) {
         run_loop();
         return true;
     }
-    bool verify_pass = false;
     if (plan.Ok()) {
         std::scoped_lock lock{s.mutex};
         ++ss.eligible;
-        verify_pass = cfg.verify_every != 0 && ss.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().claimed.exchange(true);
     }
-    if (plan.Ok() && !verify_pass) {
+    if (plan.Ok()) {
         Target live;
         live.live = true;
         live.base = reinterpret_cast<u8*>(plan.ctx);
@@ -5607,54 +4792,9 @@ bool HandleSkin(u64 system, u64 scene, u64 async_flag, u64 original_loop) {
         ss.v.generated_draws += live.draws;
         return true;
     }
-    Verify& v = V();
-    if (verify_pass) {
-        v.shadow = Target{};
-        v.shadow.live = false;
-        std::vector<u8> copy(CtxBytes);
-        std::memcpy(copy.data(), reinterpret_cast<const void*>(plan.ctx), CtxBytes);
-        v.shadow.base = copy.data();
-        GenerateSkin(v.shadow, plan);
-        v.cursor = 0;
-        v.arena_pos = 0;
-        v.view = 202;
-        v.lo = SkinBegin;
-        v.hi = SkinEnd;
-        v.ctx = plan.ctx;
-        v.rd = plan.device;
-        v.compared_draws = 0;
-        v.mismatches = 0;
-        v.raced = 0;
-        v.thread = std::this_thread::get_id();
-        v.active.store(true);
-        run_loop();
-        v.active.store(false);
-        std::scoped_lock lock{s.mutex};
-        if (v.cursor < v.shadow.marks.size()) {
-            ++v.mismatches;
-            NoteMismatch(s, v.view, "missing draw", fmt::format("the generator has {} dispatches, the loop issued {}", v.shadow.marks.size(), v.cursor));
-        } else {
-            v.mismatches += CompareDelta(s, v, v.arena_pos, v.shadow.arena.size(), plan.ctx, "epilogue");
-        }
-        ++ss.v.verify_passes;
-        ss.v.verify_draws += v.compared_draws;
-        ss.v.verify_raced += v.raced;
-        if (v.mismatches == 0) {
-            ++ss.v.verify_clean;
-        } else {
-            ++ss.v.verify_mismatched;
-            ss.v.disabled = true;
-            TLG_LOG(GEN, Error, "skinning generator switched off, {} differences against the engine's loop", v.mismatches);
-        }
-        v.shadow = Target{};
-        v.lo = ZPassBegin;
-        v.hi = ZPassEnd;
-        v.claimed.store(false);
-    } else {
-        run_loop();
-        std::scoped_lock lock{s.mutex};
-        ++ss.v.loop_passes;
-    }
+    run_loop();
+    std::scoped_lock lock{s.mutex};
+    ++ss.v.loop_passes;
     return true;
 }
 
@@ -5701,13 +4841,11 @@ bool HandleWet(u64 system, u64 ctx, u64 scene, u64 original_loop) {
         run_loop();
         return true;
     }
-    bool verify_pass = false;
     if (plan.Ok()) {
         std::scoped_lock lock{s.mutex};
         ++ws.eligible;
-        verify_pass = cfg.verify_every != 0 && ws.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().claimed.exchange(true);
     }
-    if (plan.Ok() && !verify_pass) {
+    if (plan.Ok()) {
         Target live;
         live.live = true;
         live.base = reinterpret_cast<u8*>(plan.ctx);
@@ -5717,58 +4855,9 @@ bool HandleWet(u64 system, u64 ctx, u64 scene, u64 original_loop) {
         ws.v.generated_draws += live.draws;
         return true;
     }
-    Verify& v = V();
-    if (verify_pass) {
-        v.shadow = Target{};
-        v.shadow.live = false;
-        std::vector<u8> copy(CtxBytes);
-        std::memcpy(copy.data(), reinterpret_cast<const void*>(plan.ctx), CtxBytes);
-        v.shadow.base = copy.data();
-        GenerateWet(v.shadow, plan);
-        v.cursor = 0;
-        v.arena_pos = 0;
-        v.view = 203;
-        v.lo = WetBegin;
-        v.hi = WetEnd;
-        v.ctx = plan.ctx;
-        v.rd = plan.device;
-        v.compared_draws = 0;
-        v.mismatches = 0;
-        v.raced = 0;
-        v.thread = std::this_thread::get_id();
-        v.active.store(true);
-        run_loop();
-        v.active.store(false);
-        std::scoped_lock lock{s.mutex};
-        // the loop's own first test (system enabled, frame time at least 1e-5) can flip between the scan and the loop: then the loop did nothing and there is nothing to compare
-        const bool loop_ran = R<s32>(system + 0x68) != 0 && 1e-5f <= R<float>(plan.context_global + 0x19c);
-        if (!loop_ran) {
-            ++v.raced;
-        } else if (v.cursor < v.shadow.marks.size()) {
-            ++v.mismatches;
-            NoteMismatch(s, v.view, "missing draw", fmt::format("the generator has {} dispatches, the loop issued {}", v.shadow.marks.size(), v.cursor));
-        } else {
-            v.mismatches += CompareDelta(s, v, v.arena_pos, v.shadow.arena.size(), plan.ctx, "epilogue");
-        }
-        ++ws.v.verify_passes;
-        ws.v.verify_draws += v.compared_draws;
-        ws.v.verify_raced += v.raced;
-        if (v.mismatches == 0) {
-            ++ws.v.verify_clean;
-        } else {
-            ++ws.v.verify_mismatched;
-            ws.v.disabled = true;
-            TLG_LOG(GEN, Error, "wet generator switched off, {} differences against the engine's loop", v.mismatches);
-        }
-        v.shadow = Target{};
-        v.lo = ZPassBegin;
-        v.hi = ZPassEnd;
-        v.claimed.store(false);
-    } else {
-        run_loop();
-        std::scoped_lock lock{s.mutex};
-        ++ws.v.loop_passes;
-    }
+    run_loop();
+    std::scoped_lock lock{s.mutex};
+    ++ws.v.loop_passes;
     return true;
 }
 
@@ -5814,13 +4903,11 @@ bool HandleInst(u64 holder, u64 scene, u64 original_loop) {
         run_loop();
         return true;
     }
-    bool verify_pass = false;
     if (plan.Ok()) {
         std::scoped_lock lock{s.mutex};
         ++is.eligible;
-        verify_pass = cfg.verify_every != 0 && is.eligible % cfg.verify_every == cfg.verify_every - 1 && !V().claimed.exchange(true);
     }
-    if (plan.Ok() && !verify_pass) {
+    if (plan.Ok()) {
         Target live;
         live.live = true;
         live.base = reinterpret_cast<u8*>(plan.ctx);
@@ -5830,54 +4917,9 @@ bool HandleInst(u64 holder, u64 scene, u64 original_loop) {
         is.v.generated_draws += live.draws;
         return true;
     }
-    Verify& v = V();
-    if (verify_pass) {
-        v.shadow = Target{};
-        v.shadow.live = false;
-        std::vector<u8> copy(CtxBytes);
-        std::memcpy(copy.data(), reinterpret_cast<const void*>(plan.ctx), CtxBytes);
-        v.shadow.base = copy.data();
-        GenerateInst(v.shadow, plan);
-        v.cursor = 0;
-        v.arena_pos = 0;
-        v.view = 204;
-        v.lo = InstBegin;
-        v.hi = InstEnd;
-        v.ctx = plan.ctx;
-        v.rd = plan.device;
-        v.compared_draws = 0;
-        v.mismatches = 0;
-        v.raced = 0;
-        v.thread = std::this_thread::get_id();
-        v.active.store(true);
-        run_loop();
-        v.active.store(false);
-        std::scoped_lock lock{s.mutex};
-        if (v.cursor < v.shadow.marks.size()) {
-            ++v.mismatches;
-            NoteMismatch(s, v.view, "missing draw", fmt::format("the generator has {} dispatches, the loop issued {}", v.shadow.marks.size(), v.cursor));
-        } else {
-            v.mismatches += CompareDelta(s, v, v.arena_pos, v.shadow.arena.size(), plan.ctx, "epilogue");
-        }
-        ++is.v.verify_passes;
-        is.v.verify_draws += v.compared_draws;
-        is.v.verify_raced += v.raced;
-        if (v.mismatches == 0) {
-            ++is.v.verify_clean;
-        } else {
-            ++is.v.verify_mismatched;
-            is.v.disabled = true;
-            TLG_LOG(GEN, Error, "instance generator switched off, {} differences against the engine's loop", v.mismatches);
-        }
-        v.shadow = Target{};
-        v.lo = ZPassBegin;
-        v.hi = ZPassEnd;
-        v.claimed.store(false);
-    } else {
-        run_loop();
-        std::scoped_lock lock{s.mutex};
-        ++is.v.loop_passes;
-    }
+    run_loop();
+    std::scoped_lock lock{s.mutex};
+    ++is.v.loop_passes;
     return true;
 }
 
@@ -5887,7 +4929,6 @@ nlohmann::json Report() {
     const Config& cfg = Cfg();
     nlohmann::json out = nlohmann::json::object();
     out["enabled"] = cfg.on;
-    out["verify_every_n_passes"] = cfg.verify_every;
     out["job_loop"] = NativeJobGen::Report(); // B7 (core/native_job_gen.cpp)
     out["site_generators"] = NativeSiteGen::Report(); // B7 (core/native_site_gen.cpp)
     nlohmann::json views_on = nlohmann::json::array();
@@ -5910,11 +4951,6 @@ nlohmann::json Report() {
                                 {"generated_batches", v.generated_batches},
                                 {"generated_draws", v.generated_draws},
                                 {"passes_run_by_the_loop", v.loop_passes},
-                                {"verify_passes", v.verify_passes},
-                                {"verify_clean", v.verify_clean},
-                                {"verify_with_differences", v.verify_mismatched},
-                                {"verify_draws_compared", v.verify_draws},
-                                {"verify_slot_words_that_moved_between_the_shadow_read_and_the_loop_read", v.verify_raced},
                                 {"switched_off_by_verify", v.disabled},
                                 {"scan_faults", v.not_scanned},
                                 {"instance_group_batches_generated", v.group_batches},
@@ -5941,11 +4977,6 @@ nlohmann::json Report() {
                             {"generated_draws", v.generated_draws},
                             {"instance_group_batches", v.group_batches},
                             {"passes_run_by_the_loop", v.loop_passes},
-                            {"verify_passes", v.verify_passes},
-                            {"verify_clean", v.verify_clean},
-                            {"verify_with_differences", v.verify_mismatched},
-                            {"verify_draws_compared", v.verify_draws},
-                            {"verify_words_that_moved", v.verify_raced},
                             {"switched_off_by_verify", v.disabled},
                             {"scan_faults", v.not_scanned},
                             {"passes_by_mode_times_1000_plus_query_mode", gs.arguments}};
@@ -5962,11 +4993,6 @@ nlohmann::json Report() {
                              {"generated_batches", f.generated_batches},
                              {"generated_draws", f.generated_draws},
                              {"passes_run_by_the_loop", f.loop_passes},
-                             {"verify_passes", f.verify_passes},
-                             {"verify_clean", f.verify_clean},
-                             {"verify_with_differences", f.verify_mismatched},
-                             {"verify_draws_compared", f.verify_draws},
-                             {"verify_words_that_moved", f.verify_raced},
                              {"switched_off_by_verify", f.disabled},
                              {"scan_faults", f.not_scanned}};
         nlohmann::json fdeclines = nlohmann::json::object();
@@ -5983,11 +5009,6 @@ nlohmann::json Report() {
                              {"generated_batches", dj.generated_batches},
                              {"generated_draws", dj.generated_draws},
                              {"passes_run_by_the_loop", dj.loop_passes},
-                             {"verify_passes", dj.verify_passes},
-                             {"verify_clean", dj.verify_clean},
-                             {"verify_with_differences", dj.verify_mismatched},
-                             {"verify_draws_compared", dj.verify_draws},
-                             {"verify_words_that_moved", dj.verify_raced},
                              {"switched_off_by_verify", dj.disabled},
                              {"scan_faults", dj.not_scanned}};
         nlohmann::json ddeclines = nlohmann::json::object();
@@ -6003,11 +5024,6 @@ nlohmann::json Report() {
                              {"generated_passes_without_the_loop", sj.generated},
                              {"generated_dispatches", sj.generated_draws},
                              {"passes_run_by_the_loop", sj.loop_passes},
-                             {"verify_passes", sj.verify_passes},
-                             {"verify_clean", sj.verify_clean},
-                             {"verify_with_differences", sj.verify_mismatched},
-                             {"verify_dispatches_compared", sj.verify_draws},
-                             {"verify_draws_compared", sj.verify_draws},
                              {"switched_off_by_verify", sj.disabled},
                              {"scan_faults", sj.not_scanned}};
         nlohmann::json sdeclines = nlohmann::json::object();
@@ -6023,12 +5039,6 @@ nlohmann::json Report() {
                              {"generated_passes_without_the_loop", wj.generated},
                              {"generated_dispatches", wj.generated_draws},
                              {"passes_run_by_the_loop", wj.loop_passes},
-                             {"verify_passes", wj.verify_passes},
-                             {"verify_clean", wj.verify_clean},
-                             {"verify_with_differences", wj.verify_mismatched},
-                             {"verify_dispatches_compared", wj.verify_draws},
-                             {"verify_draws_compared", wj.verify_draws},
-                             {"verify_words_that_moved", wj.verify_raced},
                              {"jobs_skipped_for_render_data_created_late", wet_skipped_jobs.load()},
                              {"dispatches_by_phase", {{"elapse", wet_dispatches[0].load()}, {"intersect", wet_dispatches[1].load()}, {"force", wet_dispatches[2].load()}, {"readbacks_done_live", wet_dispatches[3].load()}}},
                              {"switched_off_by_verify", wj.disabled},
@@ -6046,12 +5056,6 @@ nlohmann::json Report() {
                                {"generated_passes_without_the_loop", ij.generated},
                                {"generated_dispatches", ij.generated_draws},
                                {"passes_run_by_the_loop", ij.loop_passes},
-                               {"verify_passes", ij.verify_passes},
-                               {"verify_clean", ij.verify_clean},
-                               {"verify_with_differences", ij.verify_mismatched},
-                               {"verify_dispatches_compared", ij.verify_draws},
-                               {"verify_draws_compared", ij.verify_draws},
-                               {"verify_words_that_moved", ij.verify_raced},
                                {"switched_off_by_verify", ij.disabled},
                                {"scan_faults", ij.not_scanned},
                                {"dispatches_by_loop", {{"loop1", inst_dispatches[0].load()}, {"loop2", inst_dispatches[1].load()}, {"loop3_counts", inst_dispatches[2].load()}, {"loop4_nine_passes", inst_dispatches[3].load()}, {"loop5", inst_dispatches[4].load()}}}};
@@ -6159,7 +5163,6 @@ nlohmann::json Report() {
     }
     out["native_handle_lookup_FUN_01c59060"] = {{"answered_natively", Leaf().native.load()}, {"engine_creates_the_render_data", Leaf().engine_creating.load()},
                                                 {"null_object", Leaf().engine_null.load()}, {"verify_calls_of_the_engine", Leaf().verified.load()},
-                                                {"verify_differences", Leaf().differing.load()},
                                                 {"forward_prologues_made_natively_live_and_shadow", Leaf().prologue_native.load()},
                                                 {"forward_prologue_blocks_compared_with_the_engines", Leaf().block_compared.load()},
                                                 {"forward_prologue_blocks_differing", Leaf().block_differing.load()}};
