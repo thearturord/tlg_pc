@@ -31,6 +31,7 @@ constexpr u32 RawFrameTimeOffset = 0x190;
 constexpr float ConsoleStep = 1.0f / 30.0f;
 
 std::atomic<u64> calls[4]{}, fallbacks{0};
+std::atomic<u32> lua_dt_bits{0}, lua_edt_bits{0};
 std::atomic<u32> last_dt_bits{0}, min_factor_bits{0x7f7fffff}, max_factor_bits{0};
 
 bool Enabled() {
@@ -60,6 +61,11 @@ float Factor() {
     }
     const float factor = dt / ConsoleStep;
     u32 bits;
+    // the two values the Lua ticks get as (dt, edt): needed to pick the input of the Lua frame factor
+    std::memcpy(&bits, reinterpret_cast<const void*>(clock + 0x19c), sizeof(bits));
+    lua_dt_bits.store(bits, std::memory_order_relaxed);
+    std::memcpy(&bits, reinterpret_cast<const void*>(clock + 0x194), sizeof(bits));
+    lua_edt_bits.store(bits, std::memory_order_relaxed);
     std::memcpy(&bits, &dt, sizeof(bits));
     last_dt_bits.store(bits, std::memory_order_relaxed);
     std::memcpy(&bits, &factor, sizeof(bits));
@@ -115,6 +121,8 @@ void Report() {
                                        {"particle_b_calls", calls[2].load()},
                                        {"particle_c_calls", calls[3].load()},
                                        {"last_raw_frame_time_s", f(last_dt_bits.load())},
+                                       {"last_lua_dt_s_clock_19c", f(lua_dt_bits.load())},
+                                       {"last_lua_edt_s_clock_194", f(lua_edt_bits.load())},
                                        {"factor_min", f(min_factor_bits.load())},
                                        {"factor_max", f(max_factor_bits.load())},
                                        {"unreadable_or_implausible_frame_time", fallbacks.load()},

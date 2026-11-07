@@ -20,6 +20,7 @@
 #include "native/native_debug_server.h"
 #include "native/native_hooks.h"
 #include "native/native_lua_dump.h"
+#include "native/native_lua_time.h"
 
 namespace Core::NativeLuaDump {
 
@@ -54,7 +55,7 @@ std::string Clean(const char* name) {
     return s;
 }
 
-u64 PS4_SYSV_ABI Dump(GuestHooks::MidContext* context) {
+u64 PS4_SYSV_ABI DumpImpl(GuestHooks::MidContext* context) {
     if (!Enabled()) {
         return 0;
     }
@@ -101,6 +102,12 @@ u64 PS4_SYSV_ABI Dump(GuestHooks::MidContext* context) {
     if (number % 50 == 0) {
         Report();
     }
+    return 0;
+}
+
+u64 PS4_SYSV_ABI Dump(GuestHooks::MidContext* context) {
+    DumpImpl(context); // the raw text first
+    NativeLuaTime::Patch(context);
     return 0;
 }
 } // namespace
