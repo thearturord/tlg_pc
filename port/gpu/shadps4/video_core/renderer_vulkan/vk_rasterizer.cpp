@@ -683,6 +683,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         }
     };
     if (Core::UiTrace::Armed()) {
+        Core::UiTrace::NoteHarvest(ui_copies_pending.size(), ui_copies_pending.empty() ? 0 : ui_copies_pending.front().tick, !ui_copies_pending.empty() && scheduler.IsFree(ui_copies_pending.front().tick), scheduler.CurrentTick());
         for (auto it = ui_copies_pending.begin(); it != ui_copies_pending.end();) {
             if (scheduler.IsFree(it->tick)) {
                 it->ref.Invalidate();
@@ -3337,6 +3338,13 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     };
     if (Core::UiTrace::Armed()) {
         Core::UiTrace::NoteCopyPath(fmt::format("gpu buffer copy (staging_readback={} explicit_readback={} src_gds={} dst_gds={})", staging_readback, explicit_readback, src_gds, dst_gds));
+    }
+    if (!dst_gds && !src_gds && !explicit_readback && num_bytes >= 16384 && num_bytes <= (256u << 10) && Core::UiTrace::Armed()) {
+        // what the source holds right before the copy (the first hop that reads zeros where the previous hop wrote text)
+        auto ref = runtime.GetStagingPool().Request(num_bytes, VideoCore::MemoryType::HostCached, 16, false);
+        const vk::BufferCopy before = {.srcOffset = src_offset, .dstOffset = ref.offset, .size = num_bytes};
+        runtime.CopyBuffer(src_buffer, ref.buffer, std::span{&before, 1});
+        ui_copies_pending.push_back({ui_copy_number, 1, ref, scheduler.CurrentTick()});
     }
     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
     if (!dst_gds && !explicit_readback && num_bytes >= 16384 && num_bytes <= (256u << 10) && Core::UiTrace::Armed()) {

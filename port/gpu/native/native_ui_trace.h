@@ -44,6 +44,8 @@ void NoteState(const std::string& text);
 void NoteCopyResult(u64 number, u32 nonzero_chunks, u64 hash, int which = 0);
 /// Raster thread: a readback of copy `number` was queued (diagnostics).
 void NoteCopyQueued(u64 number);
+/// Raster thread: state of the queued readbacks (count, tick and free state of the oldest, current tick), kept for the JSON.
+void NoteHarvest(u64 pending, u64 oldest_tick, bool oldest_free, u64 current_tick);
 /// Raster thread: the way the copy noted last was executed (image copy, GPU buffer copy, explicit readback, CPU memcpy ...).
 void NoteCopyPath(const std::string& path);
 /// Raster thread: the draw is done.
