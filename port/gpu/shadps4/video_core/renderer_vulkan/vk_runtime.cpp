@@ -147,6 +147,25 @@ void Runtime::PlanImageBarriers(VideoCore::Image* image, VideoCore::Image::Barri
     if (!image->backing) {
         return;
     }
+    // 2026-11-07 (gpu-ordering-plan step 2): a depth image is written by its render pass after the transit that made it an attachment; the planner's state does not know that,
+    // so a later layout transition got the stale source (shader read) and the layer reported WRITE_AFTER_WRITE. Every barrier that leaves a depth image waits for the depth writes.
+    // TLG_DEPTH_BARRIER_SRC=0 turns it off.
+    static const bool widen_depth_source = [] { const char* e = std::getenv("TLG_DEPTH_BARRIER_SRC"); return e == nullptr || e[0] != '0'; }();
+    const size_t first_new_barrier = barriers.size();
+    struct WidenOnExit {
+        VideoCore::Image::Barriers& barriers;
+        size_t first;
+        bool on;
+        ~WidenOnExit() {
+            if (!on) {
+                return;
+            }
+            for (size_t i = first; i < barriers.size(); ++i) {
+                barriers[i].srcStageMask |= vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests;
+                barriers[i].srcAccessMask |= vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+            }
+        }
+    } widen_guard{barriers, first_new_barrier, widen_depth_source && image->info.props.is_depth};
     const auto [it, created] = image_plan.try_emplace(ImagePlanKey(*image, image->backing->num_samples));
     live_stats.images_planned += created ? 1 : 0;
     auto& last_state = it->second.state;
@@ -346,6 +365,22 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
     // L4, images: the planner's barriers (the image's own state is not consulted)
     VideoCore::Image::Barriers planned;
     PlanImageBarriers(image, planned, dst_layout, dst_access, dst_stage, subres_range);
+    {
+        static const bool trace = [] { const char* e = std::getenv("TLG_TRACE_DISPLAY_LAYOUT"); return e != nullptr && e[0] == '1'; }();
+        static std::atomic<u32> traced{0};
+        if (trace && image->info.size.width == 3840 && !image->info.props.is_depth && image->backing && traced.load(std::memory_order_relaxed) < 1500) {
+            traced.fetch_add(1, std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan, "layout trace: image {:#x} planned {} barrier(s), partial range {}, pending queue {}{}", image->info.guest_address, planned.size(), subres_range.has_value(),
+                        image_barriers.size(), planned.empty() ? "" : [&] {
+                            std::string text;
+                            for (const auto& b : planned) {
+                                text += fmt::format(" [{} -> {} src {}/{} dst {}/{} levels {} layers {}]", vk::to_string(b.oldLayout), vk::to_string(b.newLayout), vk::to_string(b.srcStageMask),
+                                                    vk::to_string(b.srcAccessMask), vk::to_string(b.dstStageMask), vk::to_string(b.dstAccessMask), b.subresourceRange.levelCount, b.subresourceRange.layerCount);
+                            }
+                            return text;
+                        }());
+        }
+    }
     ++live_stats.image_transits;
     live_stats.image_barriers += planned.size();
     for (const auto& barrier : planned) {
@@ -987,6 +1022,19 @@ void Runtime::FlushBarriers() {
     live_stats.barriers_from_compute_writes += (memory_barrier.srcStageMask & vk::PipelineStageFlagBits2::eComputeShader) ? 1 : 0;
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
+    {
+        static const bool trace = [] { const char* e = std::getenv("TLG_TRACE_DISPLAY_LAYOUT"); return e != nullptr && e[0] == '1'; }();
+        static std::atomic<u32> traced{0};
+        if (trace && dep_info.imageMemoryBarrierCount != 0 && traced.load(std::memory_order_relaxed) < 3000) {
+            traced.fetch_add(1, std::memory_order_relaxed);
+            std::string images;
+            for (u32 i = 0; i < dep_info.imageMemoryBarrierCount; ++i) {
+                const auto& b = dep_info.pImageMemoryBarriers[i];
+                images += fmt::format(" {:#x}:{}>{}", reinterpret_cast<u64>(static_cast<VkImage>(b.image)), vk::to_string(b.oldLayout).substr(0, 5), vk::to_string(b.newLayout).substr(0, 5));
+            }
+            LOG_WARNING(Render_Vulkan, "layout trace: flush at tick {} recording {}:{}", scheduler.CurrentTick(), scheduler.IsRecordingCommands(), images);
+        }
+    }
     cmdbuf.pipelineBarrier2(dep_info);
 
     memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
