@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <unordered_set>
 #include <vector>
+#include <absl/container/btree_map.h>
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 #include <xxhash.h>
@@ -31,6 +32,7 @@
 #include "native/native_device.h"
 #include "native/native_draw.h"
 #include "native/native_invariant.h"
+#include "native/native_prof.h"
 #include "native/native_registry.h"
 #include "native/native_tsharp_watch.h"
 #include "native/native_updates.h"
@@ -137,7 +139,7 @@ struct LedgerRange {
     u32 site{};      ///< `TLG_WRITER_SITES`: the call site of the announcement that made the stamp (SiteId; 0 unknown)
 };
 std::mutex g_ledger_mutex;
-std::map<u64, LedgerRange> g_ledger;
+absl::btree_map<u64, LedgerRange> g_ledger; // (a B-tree: one note per announced write and one lookup per read, on the raster thread)
 constexpr size_t MaxLedger = 1u << 20;
 /// M2: the writers whose bytes the store keeps when it serves reads (`TLG_FRAME_STORE=2`): the ones that write every frame (0 map, 1 skinning, 2 lights, 3 command stream copy, 4 recording stores, 7 instance group upload). Buffer creation (5) and texture init (6) are the loader threads' big one-time writes.
 constexpr u32 FsServedWriters = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 7);
@@ -173,7 +175,8 @@ void LedgerNote(u64 begin, u64 end, u64 stamp, u32 writer) {
         u32 site;
     };
     const u32 submit_now = g_submit_count.load(std::memory_order_relaxed);
-    std::vector<Seg> add;
+    static thread_local std::vector<Seg> add;
+    add.clear();
     auto it = g_ledger.upper_bound(begin);
     if (it != g_ledger.begin() && std::prev(it)->second.end > begin) {
         --it;
@@ -2436,6 +2439,7 @@ std::string DescribeBind() {
 } // namespace
 
 void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
+    TLG_PROF_LEVEL("ledger.note_late_read", 3);
     if (Core::UiTrace::Active()) [[unlikely]] {
         Core::UiTrace::NoteRead(LateKindNames[static_cast<size_t>(kind)], address, size);
     }
@@ -2472,7 +2476,10 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
         cls = CheckOpenMap;
     } else {
         c_check_record_seen.store(1, std::memory_order_relaxed);
-        a = LedgerQuery(address, address + size, submit);
+        {
+            TLG_PROF_LEVEL("ledger.query", 3);
+            a = LedgerQuery(address, address + size, submit);
+        }
         if (a.covered != 0 && a.newest <= seq) {
             c_check_margin_log2[k][std::min<u32>(39u, static_cast<u32>(std::bit_width(seq - a.newest)))].fetch_add(1, std::memory_order_relaxed);
         }
@@ -2486,6 +2493,7 @@ void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
         cls = a.covered == 0 ? CheckNeverWritten : after_submit ? CheckWrittenAfter : a.covered < size ? CheckPartlyWritten : CheckWrittenUnchanged;
     }
     if (FrameStoreOn() && k != static_cast<size_t>(LateKind::ImageUpload) && submit != 0) {
+        TLG_PROF_LEVEL("ledger.framestore_compare", 3);
         FrameStoreCompare(k, address, size, submit);
     }
     c_check[k][cls].fetch_add(1, std::memory_order_relaxed);
