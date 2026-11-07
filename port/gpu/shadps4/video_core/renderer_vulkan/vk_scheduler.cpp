@@ -13,6 +13,7 @@
 #include "core/emulator_settings.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/thread_usage.h"
+#include "video_core/renderer_vulkan/vk_gpu_time.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "native/native_prof.h"
@@ -567,7 +568,26 @@ void SchedulerCore::SubmitCommandBuffers(std::span<const vk::CommandBuffer> cmd_
     if (stream_id == 0) {
         ImGui::Core::TextureManager::Submit();
     }
-    auto submit_result = submit_queue.submit(submit_info, info.fence);
+    // GPU time: a timestamp command buffer in front of and behind the submission (vk_gpu_time.h)
+    GpuTime* gpu_time = GpuTime::Get(instance);
+    GpuTime::Bracket bracket{};
+    if (gpu_time != nullptr) {
+        bracket = gpu_time->Open(stream_id);
+    }
+    std::vector<vk::CommandBuffer> bracketed;
+    vk::SubmitInfo bracketed_submit = submit_info;
+    if (bracket.begin) {
+        bracketed.reserve(cmd_buffers.size() + 2);
+        bracketed.push_back(bracket.begin);
+        bracketed.insert(bracketed.end(), cmd_buffers.begin(), cmd_buffers.end());
+        bracketed.push_back(bracket.end);
+        bracketed_submit.commandBufferCount = static_cast<u32>(bracketed.size());
+        bracketed_submit.pCommandBuffers = bracketed.data();
+    }
+    auto submit_result = submit_queue.submit(bracketed_submit, info.fence);
+    if (gpu_time != nullptr) {
+        gpu_time->Poll();
+    }
     if (submit_result == vk::Result::eErrorDeviceLost) {
         Core::Flight::Add(Core::Flight::DeviceLost, 0, info.num_signal_semas != 0 ? info.signal_ticks[0] : 0, stream_id); // L1
     }
