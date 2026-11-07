@@ -40,7 +40,7 @@ u64 chunks_seen = 0, chunks_patched = 0, rules_applied = 0, rules_mismatched = 0
 bool Enabled() {
     static const bool on = [] {
         const char* e = std::getenv("TLG_LUA_TIME");
-        return e != nullptr && e[0] == '1';
+        return e == nullptr || e[0] != '0'; // on by default; TLG_LUA_TIME=0 turns it off
     }();
     return on;
 }
