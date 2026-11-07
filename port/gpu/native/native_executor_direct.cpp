@@ -150,7 +150,12 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
     TLG_PROF_LEVEL("front.execute_native_draw", 1);
     native_exec_calls++;
     Core::NativeDraw::ExecDraw draw;
-    if (!rasterizer || !Core::NativeDraw::TakeExecDraw(native_tag_pending.seq, draw, true)) {
+    bool took_record = false;
+    if (rasterizer) {
+        TLG_PROF_LEVEL("front.take_record", 2); // D0.2: the record copy, one of the unprobed parts of the front thread's own time
+        took_record = Core::NativeDraw::TakeExecDraw(native_tag_pending.seq, draw, true);
+    }
+    if (!took_record) {
         native_tag_pending.valid = false;
         Core::NativeReadbacks::ClearPending(native_tag_pending.seq); // M4
         TLG_LOG(CP, Error, "native draw: the record {} is gone, a draw is lost ({})", native_tag_pending.seq, Core::NativeDraw::DescribeMissingRecord(native_tag_pending.seq));

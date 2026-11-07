@@ -177,6 +177,7 @@ void NativeExecutor::RasterDispatch(const RasterCall& call_in) {
         }
     }
     if (Core::NativeUploads::Enabled()) {
+        TLG_PROF_LEVEL("front.uploads_due", 2); // D0.2
         // N5c: the uploads the engine announced before this record are queued in front of it (one operation per record that finds some)
         const u64 upload_seq = call.tag.valid ? call.tag.seq : (native_exec_plan ? rasterizer->DrawPlanSeq(*native_exec_plan) : 0);
         std::vector<Core::NativeUploads::Range> due;
@@ -224,6 +225,7 @@ void NativeExecutor::RasterDispatch(const RasterCall& call_in) {
         }
     }
     if (rasterizer->ConstRingLevel() != 0) {
+        TLG_PROF_LEVEL("front.queue_op", 2); // D0.2: the constant ring copies of the plan (FrontStageNotes / FrontStageRing / FrontGeometryRing)
         // The queue position this operation will have, and the position the raster thread has finished (documents/tlg/pc-port-draw-pipeline-architecture.md, T1).
         rasterizer->FrontQueueOp(draw_plan.get(), dispatch_plan.get(), sp.pushed.load(std::memory_order_acquire) + 1,
                                  sp.done.load(std::memory_order_acquire), call.tag.valid ? call.tag.seq : (draw_plan ? rasterizer->DrawPlanSeq(*draw_plan) : 0),
