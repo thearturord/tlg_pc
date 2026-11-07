@@ -4,6 +4,8 @@
 #include "native_ui_trace.h"
 
 #include <algorithm>
+#include <array>
+#include <string_view>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -91,6 +93,8 @@ struct Copy {
     u32 src_upload_frame{};
     std::string path;
     u32 src_nonzero_chunks{};
+    std::vector<std::array<u64, 5>> srcw; ///< who wrote the source range when this copy ran: {copy number, frame, 1 = copy, overlap start, overlap size} (time correct chain)
+    int queued{0}; ///< readbacks queued for this copy (diagnostics: a result that never arrives)
 };
 constexpr size_t CopiesKept = 3000;
 
@@ -166,6 +170,15 @@ struct Shot {
 };
 std::map<u64, Shot> shots;
 constexpr size_t ProvMax = 400000;
+
+std::string SrcwJson(const Copy& c) {
+    std::string out = "[";
+    for (size_t i = 0; i < c.srcw.size(); ++i) {
+        const auto& w = c.srcw[i];
+        out += fmt::format("{}[{},{},{},\"{:x}\",{}]", i ? "," : "", w[0], w[1], w[2], w[3], w[4]);
+    }
+    return out + "]";
+}
 
 void ProvSet(u64 lo, u64 size, const Prov& p0) {
     if (size == 0) {
@@ -523,6 +536,16 @@ void NoteCopyPath(const std::string& path) {
     }
 }
 
+void NoteCopyQueued(u64 number) {
+    std::scoped_lock lock{mutex};
+    for (auto it = copies.rbegin(); it != copies.rend(); ++it) {
+        if (it->number == number) {
+            ++it->queued;
+            return;
+        }
+    }
+}
+
 u64 LastCopyNumber() {
     std::scoped_lock lock{mutex};
     return last_copy_number;
@@ -572,6 +595,20 @@ void NoteGpuCopy(u64 dst, u64 src, u64 size) {
         return;
     }
     std::scoped_lock lock{mutex};
+    std::vector<std::array<u64, 5>> srcw;
+    if (size >= 16384 && size <= (256u << 10)) {
+        auto it = prov.upper_bound(src);
+        if (it != prov.begin()) {
+            --it;
+        }
+        for (; it != prov.end() && it->first < src + size && srcw.size() < 12; ++it) {
+            if (it->second.hi > src) {
+                const u64 a = std::max(it->first, src);
+                const u64 b = std::min(it->second.hi, src + size);
+                srcw.push_back({it->second.number, it->second.frame, std::string_view(it->second.by) == "copy" ? 1u : 0u, a, b - a});
+            }
+        }
+    }
     ProvSet(dst, size, Prov{0, "copy", src, static_cast<u32>(Core::DebugServer::PresentCount()), Core::NativeRegistry::CurrentDrawSeq(),
                             Core::NativeRegistry::CurrentDrawSeq() != 0 ? Core::NativeDraw::RecordCallerGhidra(Core::NativeRegistry::CurrentDrawSeq()) : 0, write_number + 1});
     if (size < 16384) {
@@ -586,6 +623,7 @@ void NoteGpuCopy(u64 dst, u64 src, u64 size) {
     c.caller = c.seq != 0 ? Core::NativeDraw::RecordCallerGhidra(c.seq) : 0;
     c.frame = static_cast<u32>(Core::DebugServer::PresentCount());
     c.number = ++write_number;
+    c.srcw = std::move(srcw);
     if (size <= (256u << 10)) {
         c.src_hash = RangeHash(src, size, &c.src_nonzero_chunks);
         if (const auto it = uploads.find(src); it != uploads.end() && it->second.size == size) {
@@ -667,9 +705,9 @@ std::string Json() {
     out += fmt::format("],\"gpu_writes_total\":{},\"gpu_copies\":[", write_number);
     for (size_t i = 0; i < copies.size(); ++i) {
         const Copy& c = copies[i];
-        out += fmt::format("{}{{\"n\":{},\"frame\":{},\"dst\":\"{:x}\",\"src\":\"{:x}\",\"size\":{},\"seq\":{},\"caller\":\"{:x}\",\"src_hash_then\":\"{:x}\",\"src_hash_now\":\"{:x}\",\"src_nonzero_chunks\":{},\"result_nz\":{},\"result_hash\":\"{:x}\",\"src_img_nz\":{},\"src_img_hash\":\"{:x}\",\"src_upload_hash\":\"{:x}\",\"src_upload_frame\":{},\"path\":\"{}\"}}", i ? "," : "", c.number, c.frame, c.dst, c.src, c.size, c.seq, c.caller, c.src_hash, RangeHash(c.src, c.size, nullptr), c.src_nonzero_chunks,
+        out += fmt::format("{}{{\"n\":{},\"frame\":{},\"dst\":\"{:x}\",\"src\":\"{:x}\",\"size\":{},\"seq\":{},\"caller\":\"{:x}\",\"src_hash_then\":\"{:x}\",\"src_hash_now\":\"{:x}\",\"src_nonzero_chunks\":{},\"result_nz\":{},\"result_hash\":\"{:x}\",\"src_img_nz\":{},\"src_img_hash\":\"{:x}\",\"src_upload_hash\":\"{:x}\",\"src_upload_frame\":{},\"queued\":{},\"srcw\":{},\"path\":\"{}\"}}", i ? "," : "", c.number, c.frame, c.dst, c.src, c.size, c.seq, c.caller, c.src_hash, RangeHash(c.src, c.size, nullptr), c.src_nonzero_chunks,
                            copy_results.contains(c.number) ? static_cast<s64>(copy_results[c.number].nonzero_chunks) : -1, copy_results.contains(c.number) ? copy_results[c.number].hash : 0ull,
-                           copy_results.contains(c.number) ? copy_results[c.number].src_nonzero_chunks : -1, copy_results.contains(c.number) ? copy_results[c.number].src_hash : 0ull, c.src_upload_hash, c.src_upload_frame, c.path);
+                           copy_results.contains(c.number) ? copy_results[c.number].src_nonzero_chunks : -1, copy_results.contains(c.number) ? copy_results[c.number].src_hash : 0ull, c.src_upload_hash, c.src_upload_frame, c.queued, SrcwJson(c), c.path);
     }
     out += "],\"gpu_writes\":[";
     std::vector<Write> sorted(writes.begin(), writes.end());

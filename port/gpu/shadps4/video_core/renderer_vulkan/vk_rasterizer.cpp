@@ -3248,6 +3248,7 @@ bool Rasterizer::TryCopyImages(VAddr dst, VAddr src, u32 num_bytes) {
         };
         runtime.DownloadImage(&image, ref.buffer, std::span{&readback_copy, 1});
         ui_copies_pending.push_back({Core::UiTrace::LastCopyNumber(), which, ref, scheduler.CurrentTick()});
+        Core::UiTrace::NoteCopyQueued(Core::UiTrace::LastCopyNumber());
     };
     if (ui_readback) {
         ui_queue_readback(source, 1); // what the source image holds before the copy
@@ -3344,6 +3345,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         const vk::BufferCopy back = {.srcOffset = dst_offset, .dstOffset = ref.offset, .size = num_bytes};
         runtime.CopyBuffer(dst_buffer, ref.buffer, std::span{&back, 1});
         ui_copies_pending.push_back({ui_copy_number, 0, ref, scheduler.CurrentTick()});
+        Core::UiTrace::NoteCopyQueued(ui_copy_number);
     }
     if (!dst_gds && VideoCore::ReadbackPolicy::Get().dma_async.load(std::memory_order_relaxed)) {
         // B6: only where the CPU reads the result (an explicit readback, a resource the engine made for CPU reads, or memory no engine resource owns)

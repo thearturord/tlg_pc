@@ -42,6 +42,8 @@ void NoteState(const std::string& text);
 [[nodiscard]] u64 LastCopyNumber();
 /// Raster thread: what the destination of copy `number` held right after the GPU copy (read back, which = 0) or what its source image held right before it (which = 1): nonzero 64 byte chunks, hash of all bytes.
 void NoteCopyResult(u64 number, u32 nonzero_chunks, u64 hash, int which = 0);
+/// Raster thread: a readback of copy `number` was queued (diagnostics).
+void NoteCopyQueued(u64 number);
 /// Raster thread: the way the copy noted last was executed (image copy, GPU buffer copy, explicit readback, CPU memcpy ...).
 void NoteCopyPath(const std::string& path);
 /// Raster thread: the draw is done.
