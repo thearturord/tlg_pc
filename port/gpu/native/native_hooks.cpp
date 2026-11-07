@@ -621,7 +621,13 @@ u64 ExitStub(u64 exit_handler) {
     return ExitStubImpl(exit_handler);
 }
 
+static std::atomic<u64> g_eboot_base{0};
+u64 EbootBase() noexcept {
+    return g_eboot_base.load(std::memory_order_acquire);
+}
+
 void InstallForEboot(VAddr base, u64 image_size) {
+    g_eboot_base.store(base, std::memory_order_release);
     struct ReadyAtExit {
         ~ReadyAtExit() {
             hooks_ready.store(true, std::memory_order_release);

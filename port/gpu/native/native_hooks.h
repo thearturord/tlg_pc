@@ -63,6 +63,8 @@ struct MidContext {
 /// Installs the hooks listed in the configuration file into the eboot loaded at `base`.
 /// Must run before the guest starts executing.
 void InstallForEboot(VAddr base, u64 image_size);
+/// The runtime address the eboot image was loaded at (0 before InstallForEboot): ghidra address = runtime - base + 0x1000000.
+[[nodiscard]] u64 EbootBase() noexcept;
 
 /// The instruction a write fault was taken at, valid inside the fault handler (0 when unknown).
 u64 FaultRip();

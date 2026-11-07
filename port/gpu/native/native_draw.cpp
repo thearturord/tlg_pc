@@ -45,6 +45,7 @@
 #include "native/native_flight.h"
 #include "native/native_invariant.h"
 #include "native/native_job_gen.h"
+#include "native/native_game_time.h"
 #include "native/native_site_gen.h"
 #include "native/native_readbacks.h"
 #include "native/native_raycast_cpu.h"
@@ -9164,6 +9165,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "job_loop_top") {
         return reinterpret_cast<u64>(&NativeJobGen::JobLoopTop);
+    }
+    if (const u64 time_handler = NativeGameTime::FindHandler(name.c_str()); time_handler != 0) {
+        return time_handler;
     }
     if (name == "mid_probe_b7") {
         return reinterpret_cast<u64>(&MidProbeB7);
