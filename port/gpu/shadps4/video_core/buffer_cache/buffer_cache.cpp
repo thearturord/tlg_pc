@@ -280,6 +280,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const BindGuard bind_guard{reinterpret_cast<u64>(__builtin_return_address(0)), device_addr, size, is_written, immutable_hint != nullptr};
     TLG_PROF_LEVEL("buffer.obtain", 2);
     if (is_written) {
+        TLG_PROF_LEVEL("buffer.obtain.written_erase", 3);
         BindMemoErase(device_addr, size); // the GPU writes it: answers over this memory are stale
     }
     if (is_written || is_texel_buffer || size > BindMemoMax || !BindMemoOn()) {
@@ -292,15 +293,17 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         }
         return ObtainBufferUncached(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
     }
+    TLG_PROF_NAMED_LEVEL(lookup_scope, "buffer.obtain.memo_lookup", 3);
     auto& memo = bind_memos[Vulkan::Scheduler::SideSelected() ? 1 : 0];
     const u64 tick = scheduler.CurrentTick();
     if (memo.tick != tick) {
         // a new command buffer: copies in the stream buffer belong to the old one (the game may rewrite their memory between submissions); answers that name
-        // an arena or a placed buffer stay valid until a write or a move erases them (the frame has about 13 command buffers)
+        // an arena or a placed buffer stay valid until a write or a move erases them (the frame has about 13 command buffers). The entries remember their command
+        // buffer (`tick`), so no walk over the whole memo is needed here (it visited every node 13 times a frame); a stale copy entry is replaced at its next miss.
         memo.tick = tick;
-        for (auto it = memo.entries.begin(); it != memo.entries.end();) {
-            it->second.erase(std::remove_if(it->second.begin(), it->second.end(), [&](const BindMemoEntry& e) { return e.buffer == &stream_buffer; }), it->second.end());
-            it = it->second.empty() ? memo.entries.erase(it) : std::next(it);
+        if (memo.entries.size() > BindMemoMaxAddresses) {
+            memo.entries.clear();
+            bind_memo_counts[3].fetch_add(1, std::memory_order_relaxed);
         }
     }
     const u64 epoch = bind_memo_epoch.load(std::memory_order_acquire);
@@ -309,7 +312,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (const auto it = memo.entries.find(device_addr); it != memo.entries.end()) {
         for (const auto& e : it->second) {
             if (e.size == size && e.epoch == epoch && e.range_epoch == ranges && e.placement_epoch == arenas &&
-                (e.buffer != &stream_buffer || e.wraps == stream_buffer.WrapCount())) {
+                (e.buffer != &stream_buffer || (e.wraps == stream_buffer.WrapCount() && e.tick == tick))) {
                 bind_memo_counts[0].fetch_add(1, std::memory_order_relaxed);
                 TLG_PROF_COUNT("buffer.bind_memo.hit");
                 return {e.buffer, e.offset};
@@ -318,12 +321,14 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }
     bind_memo_counts[1].fetch_add(1, std::memory_order_relaxed);
     TLG_PROF_COUNT("buffer.bind_memo.miss");
+    lookup_scope.End();
     const auto result = ObtainBufferUncached(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
+    TLG_PROF_LEVEL("buffer.obtain.memo_insert", 3);
     if (memo.tick == tick) {
         auto& list = memo.entries[device_addr];
         list.erase(std::remove_if(list.begin(), list.end(), [&](const BindMemoEntry& e) { return e.size == size; }), list.end());
         // the epochs as they were before the request: anything the request itself changed makes the next one ask again
-        list.push_back({size, result.first, result.second, ranges, arenas, result.first == &stream_buffer ? stream_buffer.WrapCount() : 0, epoch});
+        list.push_back({size, result.first, result.second, ranges, arenas, result.first == &stream_buffer ? stream_buffer.WrapCount() : 0, epoch, tick});
     }
     return result;
 }

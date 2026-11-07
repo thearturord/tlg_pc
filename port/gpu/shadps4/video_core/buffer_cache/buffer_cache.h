@@ -101,6 +101,7 @@ public:
     /// Binding memo (raster thread): a read-only request of at most BindMemoMax bytes asked again in the same command buffer, with nothing written to its memory
     /// since and nothing moved, gets the same answer without the lookups and synchronization (TLG_BIND_MEMO, default on; =0 off)
     static constexpr u64 BindMemoMax = 65536;
+    static constexpr size_t BindMemoMaxAddresses = 200000; ///< the memo is cleared at a new command buffer when it holds more addresses (stale copy entries are no longer walked away)
     void BindMemoErase(VAddr address, u64 size);
     void BindMemoBump() noexcept {
         bind_memo_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -239,6 +240,7 @@ private:
         const Buffer* buffer;
         u64 offset;
         u64 range_epoch, placement_epoch, wraps, epoch;
+        u64 tick; ///< the command buffer the answer was made in (an answer that names a copy in the stream buffer is valid in that one only)
     };
     struct BindMemo {
         u64 tick{~u64{0}};
