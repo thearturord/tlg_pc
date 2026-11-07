@@ -1793,6 +1793,18 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
+    // D3 sizing (2026-11-07): the same time split by pipeline kind
+    if (stage.sw_stage == Shader::SwStage::Compute) {
+        TLG_PROF_LEVEL("raster.bind_buffers_compute", 2);
+        BindBuffersBody(stage, binding, push_data);
+    } else {
+        TLG_PROF_LEVEL("raster.bind_buffers_graphics", 2);
+        BindBuffersBody(stage, binding, push_data);
+    }
+}
+
+void Rasterizer::BindBuffersBody(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+                                 Shader::PushData& push_data) {
     TLG_PROF_LEVEL("raster.bind_buffers", 2);
     const u64 alignment = instance.StorageMinAlignment();
     const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
