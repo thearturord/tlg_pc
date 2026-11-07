@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <absl/container/btree_map.h>
 #include "native/native_buffer_index.h"
 #include "native/native_device.h"
 #include "native/native_resources.h"
@@ -244,7 +245,7 @@ private:
     };
     struct BindMemo {
         u64 tick{~u64{0}};
-        std::map<VAddr, boost::container::small_vector<BindMemoEntry, 2>> entries;
+        absl::btree_map<VAddr, boost::container::small_vector<BindMemoEntry, 2>> entries; ///< (a B-tree: the lookup per request walked a node tree of 10 000+ addresses, a cache miss per level)
     };
     std::array<BindMemo, 2> bind_memos; ///< by stream (graphics, side)
     std::atomic<u64> bind_memo_epoch{0}; ///< bumped by writes the raster thread does not see by range (faults, the command processor)
