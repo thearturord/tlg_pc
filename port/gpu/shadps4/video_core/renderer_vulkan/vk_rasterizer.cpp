@@ -621,6 +621,13 @@ struct UiShotPending {
     std::string info;
 };
 std::vector<UiShotPending> ui_shots_pending;
+/// The result of a GPU memory copy of picture size, read back right after it (UI trace)
+struct UiCopyPending {
+    u64 number{};
+    Vulkan::StagingBufferRef ref;
+    u64 tick{};
+};
+std::vector<UiCopyPending> ui_copies_pending;
 } // namespace
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
@@ -675,6 +682,26 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         }
     };
     if (Core::UiTrace::Armed()) {
+        for (auto it = ui_copies_pending.begin(); it != ui_copies_pending.end();) {
+            if (scheduler.IsFree(it->tick)) {
+                it->ref.Invalidate();
+                u32 nonzero = 0;
+                u64 hash = 1469598103934665603ull;
+                for (u64 off = 0; off < it->ref.size; off += 64) {
+                    bool any = false;
+                    for (u64 k = 0; k < 64 && off + k < it->ref.size; ++k) {
+                        const u8 b = it->ref.mapped[off + k];
+                        any |= b != 0;
+                        hash = (hash ^ b) * 1099511628211ull;
+                    }
+                    nonzero += any ? 1 : 0;
+                }
+                Core::UiTrace::NoteCopyResult(it->number, nonzero, hash);
+                it = ui_copies_pending.erase(it);
+            } else {
+                ++it;
+            }
+        }
         for (auto it = ui_shots_pending.begin(); it != ui_shots_pending.end();) {
             if (scheduler.IsFree(it->tick)) {
                 it->ref.Invalidate();
@@ -3282,6 +3309,13 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         .size = num_bytes,
     };
     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
+    if (!dst_gds && !explicit_readback && num_bytes >= 16384 && num_bytes <= (256u << 10) && Core::UiTrace::Armed()) {
+        // read back what the destination holds now (a picture of the interface text moves through copies of copies; the report shows the hop where it goes blank or wrong)
+        auto ref = runtime.GetStagingPool().Request(num_bytes, VideoCore::MemoryType::HostCached, 16, false);
+        const vk::BufferCopy back = {.srcOffset = dst_offset, .dstOffset = ref.offset, .size = num_bytes};
+        runtime.CopyBuffer(dst_buffer, ref.buffer, std::span{&back, 1});
+        ui_copies_pending.push_back({Core::UiTrace::LastCopyNumber(), ref, scheduler.CurrentTick()});
+    }
     if (!dst_gds && VideoCore::ReadbackPolicy::Get().dma_async.load(std::memory_order_relaxed)) {
         // B6: only where the CPU reads the result (an explicit readback, a resource the engine made for CPU reads, or memory no engine resource owns)
         const u32 reason = explicit_readback ? 3u : Core::NativeDevice::CpuReadReason(dst, num_bytes);

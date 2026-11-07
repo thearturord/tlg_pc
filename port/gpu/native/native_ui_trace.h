@@ -38,6 +38,10 @@ void NoteSupersede(u64 address, u64 size, u64 return_address);
 void SaveShot(u64 address, u32 frame, const u8* data, u64 size, const std::string& info);
 /// Raster thread: a line of fixed function state of the traced draw (viewport, scissor, ...). It counts as a read for the change detection.
 void NoteState(const std::string& text);
+/// Raster thread: number of the copy NoteGpuCopy noted last (to attach its result to).
+[[nodiscard]] u64 LastCopyNumber();
+/// Raster thread: what the destination of copy `number` held right after the GPU copy (read back): nonzero 64 byte chunks, hash of all bytes.
+void NoteCopyResult(u64 number, u32 nonzero_chunks, u64 hash);
 /// Raster thread: the draw is done.
 void EndDraw();
 /// Raster thread: the GPU writes a guest memory range (texture cache invalidation by an image copy / clear / memory copy / written storage buffer or image). Kept only when it overlaps an image a traced draw

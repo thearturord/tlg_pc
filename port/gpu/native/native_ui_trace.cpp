@@ -146,6 +146,12 @@ struct Upload {
     std::string page_map; ///< one character per 4 KB page: G = marked GPU written, . = not (read from guest memory)
 };
 std::map<u64, Upload> uploads;
+struct CopyResult {
+    u32 nonzero_chunks{};
+    u64 hash{};
+};
+std::map<u64, CopyResult> copy_results; ///< by copy number
+u64 last_copy_number = 0;
 struct Shot {
     u32 frame{};
     u32 last_asked{};
@@ -505,6 +511,19 @@ void SaveShot(u64 address, u32 frame, const u8* data, u64 size, const std::strin
     s.info = info;
 }
 
+u64 LastCopyNumber() {
+    std::scoped_lock lock{mutex};
+    return last_copy_number;
+}
+
+void NoteCopyResult(u64 number, u32 nonzero_chunks, u64 hash) {
+    std::scoped_lock lock{mutex};
+    copy_results[number] = CopyResult{nonzero_chunks, hash};
+    while (copy_results.size() > 6000) {
+        copy_results.erase(copy_results.begin());
+    }
+}
+
 void NoteSupersede(u64 address, u64 size, u64 return_address) {
     if (!Armed() || size == 0) {
         return;
@@ -550,6 +569,7 @@ void NoteGpuCopy(u64 dst, u64 src, u64 size) {
         return; // big copies (streaming, 33 MB per frame) are not text pictures and would push them out of the list
     }
     copies.push_back(c);
+    last_copy_number = c.number;
     while (copies.size() > CopiesKept) {
         copies.pop_front();
     }
@@ -620,7 +640,8 @@ std::string Json() {
     out += fmt::format("],\"gpu_writes_total\":{},\"gpu_copies\":[", write_number);
     for (size_t i = 0; i < copies.size(); ++i) {
         const Copy& c = copies[i];
-        out += fmt::format("{}{{\"n\":{},\"frame\":{},\"dst\":\"{:x}\",\"src\":\"{:x}\",\"size\":{},\"seq\":{},\"caller\":\"{:x}\",\"src_hash_then\":\"{:x}\",\"src_hash_now\":\"{:x}\",\"src_nonzero_chunks\":{}}}", i ? "," : "", c.number, c.frame, c.dst, c.src, c.size, c.seq, c.caller, c.src_hash, RangeHash(c.src, c.size, nullptr), c.src_nonzero_chunks);
+        out += fmt::format("{}{{\"n\":{},\"frame\":{},\"dst\":\"{:x}\",\"src\":\"{:x}\",\"size\":{},\"seq\":{},\"caller\":\"{:x}\",\"src_hash_then\":\"{:x}\",\"src_hash_now\":\"{:x}\",\"src_nonzero_chunks\":{},\"result_nz\":{},\"result_hash\":\"{:x}\"}}", i ? "," : "", c.number, c.frame, c.dst, c.src, c.size, c.seq, c.caller, c.src_hash, RangeHash(c.src, c.size, nullptr), c.src_nonzero_chunks,
+                           copy_results.contains(c.number) ? static_cast<s64>(copy_results[c.number].nonzero_chunks) : -1, copy_results.contains(c.number) ? copy_results[c.number].hash : 0ull);
     }
     out += "],\"gpu_writes\":[";
     std::vector<Write> sorted(writes.begin(), writes.end());
