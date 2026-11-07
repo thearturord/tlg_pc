@@ -267,10 +267,22 @@ void NoteRead(u64 address, u64 size, u32 submit, const char* kind, std::string (
                 hot_size = ((address + size + block - 1) & ~(block - 1)) - hot_address;
             }
         }
+        // 2026-11-07: a picture uploaded from game memory is read once per change, so the usual 8 submissions never cover the next upload of the same place (the title menu text pictures:
+        // 158 uploads, 0.0 % audited). Small uploads are pinned: their range stays in the hot set for the whole session (at most 512 of them).
+        static std::atomic<u32> pinned{0};
+        const bool pin = kind != nullptr && std::strstr(kind, "image_upload") != nullptr && size <= (256ull << 10);
         std::scoped_lock lock{g_hot_mutex};
+        const bool is_new = g_hot.find(hot_address) == g_hot.end();
         Hot& h = g_hot[hot_address];
         h.size = std::max(h.size, hot_size);
         h.last = std::max<u32>(h.last, submit != 0 ? submit : newest + 1);
+        if (pin && (h.last >= 0x7fffffffu || pinned.load(std::memory_order_relaxed) < 512)) {
+            if (h.last < 0x7fffffffu) {
+                pinned.fetch_add(1, std::memory_order_relaxed);
+            }
+            h.last = 0x7fffffffu;
+        }
+        (void)is_new;
     }
     if (submit == 0) {
         c.reads_no_submit.fetch_add(1, std::memory_order_relaxed);
