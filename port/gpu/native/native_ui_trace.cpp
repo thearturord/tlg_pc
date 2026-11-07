@@ -60,7 +60,7 @@ constexpr size_t ChangesKept = 40;
 
 /// A GPU write into the memory of an image that a traced draw sampled.
 struct Write {
-    std::string by;
+    const char* by{};
     u64 address{};
     u64 size{};
     u64 seq{};
@@ -68,9 +68,24 @@ struct Write {
     u32 frame{};
     u64 number{}; ///< running number: the order of the writes
 };
-constexpr size_t WritesKept = 600;
+constexpr size_t WritesKept = 3000;
 constexpr size_t WatchMax = 64;
+/// A memory copy of at least 64 KB (the text pictures are made by copies of 128 KB).
+struct Copy {
+    u64 dst{};
+    u64 src{};
+    u64 size{};
+    u64 seq{};
+    u64 caller{};
+    u32 frame{};
+    u64 number{};
+};
+constexpr size_t CopiesKept = 400;
+constexpr size_t RecentKept = 6000;
+std::deque<Copy> copies;
+std::deque<Write> recent; ///< every GPU write of the last moments: the writes of a copy's source happen before the copy
 std::deque<Write> writes;
+std::vector<std::pair<u64, u64>> src_watch; ///< sources of the kept copies
 std::vector<std::pair<u64, u64>> watch; ///< [address, address + size) of the images traced draws sampled
 u64 write_number = 0;
 
@@ -255,21 +270,29 @@ void NoteImage(u64 address, u64 size, const std::string& description) {
     t_draw.reads.push_back(std::move(r));
 }
 
+namespace {
+bool Overlaps(const std::vector<std::pair<u64, u64>>& list, u64 address, u64 size) {
+    for (const auto& [lo, hi] : list) {
+        if (address < hi && address + size > lo) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void KeepWrite(const Write& w) {
+    writes.push_back(w);
+    while (writes.size() > WritesKept) {
+        writes.pop_front();
+    }
+}
+} // namespace
+
 void NoteGpuWrite(const char* by, u64 address, u64 size) {
     if (!Armed() || size == 0) {
         return;
     }
     std::scoped_lock lock{mutex};
-    bool hit = false;
-    for (const auto& [lo, hi] : watch) {
-        if (address < hi && address + size > lo) {
-            hit = true;
-            break;
-        }
-    }
-    if (!hit) {
-        return;
-    }
     Write w;
     w.by = by != nullptr ? by : "?";
     w.address = address;
@@ -278,9 +301,45 @@ void NoteGpuWrite(const char* by, u64 address, u64 size) {
     w.caller = w.seq != 0 ? Core::NativeDraw::RecordCallerGhidra(w.seq) : 0;
     w.frame = static_cast<u32>(Core::DebugServer::PresentCount());
     w.number = ++write_number;
-    writes.push_back(std::move(w));
-    while (writes.size() > WritesKept) {
-        writes.pop_front();
+    if (Overlaps(watch, address, size) || Overlaps(src_watch, address, size)) {
+        KeepWrite(w);
+    } else {
+        recent.push_back(w);
+        while (recent.size() > RecentKept) {
+            recent.pop_front();
+        }
+    }
+}
+
+void NoteGpuCopy(u64 dst, u64 src, u64 size) {
+    if (!Armed() || size < 65536) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    Copy c;
+    c.dst = dst;
+    c.src = src;
+    c.size = size;
+    c.seq = Core::NativeRegistry::CurrentDrawSeq();
+    c.caller = c.seq != 0 ? Core::NativeDraw::RecordCallerGhidra(c.seq) : 0;
+    c.frame = static_cast<u32>(Core::DebugServer::PresentCount());
+    c.number = ++write_number;
+    copies.push_back(c);
+    while (copies.size() > CopiesKept) {
+        copies.pop_front();
+    }
+    const std::pair<u64, u64> range{src, src + size};
+    if (src_watch.size() < 512 && std::ranges::find(src_watch, range) == src_watch.end()) {
+        src_watch.push_back(range);
+    }
+    // the writes of the source that happened before this copy
+    for (auto it = recent.begin(); it != recent.end();) {
+        if (it->address < src + size && it->address + it->size > src) {
+            KeepWrite(*it);
+            it = recent.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
@@ -333,9 +392,16 @@ std::string Json() {
     for (size_t c = 0; c < changes.size(); ++c) {
         out += fmt::format("{}{{\"before\":{},\"after\":{}}}", c ? "," : "", FrameJson(changes[c].before), FrameJson(changes[c].after));
     }
-    out += fmt::format("],\"gpu_writes_total\":{},\"gpu_writes\":[", write_number);
-    for (size_t i = 0; i < writes.size(); ++i) {
-        const Write& w = writes[i];
+    out += fmt::format("],\"gpu_writes_total\":{},\"gpu_copies\":[", write_number);
+    for (size_t i = 0; i < copies.size(); ++i) {
+        const Copy& c = copies[i];
+        out += fmt::format("{}{{\"n\":{},\"frame\":{},\"dst\":\"{:x}\",\"src\":\"{:x}\",\"size\":{},\"seq\":{},\"caller\":\"{:x}\"}}", i ? "," : "", c.number, c.frame, c.dst, c.src, c.size, c.seq, c.caller);
+    }
+    out += "],\"gpu_writes\":[";
+    std::vector<Write> sorted(writes.begin(), writes.end());
+    std::ranges::sort(sorted, {}, &Write::number);
+    for (size_t i = 0; i < sorted.size(); ++i) {
+        const Write& w = sorted[i];
         out += fmt::format("{}{{\"n\":{},\"frame\":{},\"by\":\"{}\",\"address\":\"{:x}\",\"size\":{},\"seq\":{},\"caller\":\"{:x}\"}}", i ? "," : "", w.number, w.frame, w.by, w.address, w.size, w.seq, w.caller);
     }
     out += "],\"frames\":[";

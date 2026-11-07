@@ -3169,6 +3169,9 @@ bool Rasterizer::TryCopyImages(VAddr dst, VAddr src, u32 num_bytes) {
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds, bool staging_readback) {
+    if (!dst_gds && !src_gds) {
+        Core::UiTrace::NoteGpuCopy(dst, src, num_bytes);
+    }
     Core::ResourceAudit::Note(dst_gds ? Core::ResourceAudit::GdsFill : Core::ResourceAudit::MemoryCopyDst, dst, num_bytes, true);
     Core::ResourceAudit::Note(src_gds ? Core::ResourceAudit::GdsFill : Core::ResourceAudit::MemoryCopySrc, src, num_bytes, false);
     if (!dst_gds && !src_gds) {
