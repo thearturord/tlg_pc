@@ -126,7 +126,7 @@ u64 thumb_next_id{};
 // do not explain it by motion), that frame and its neighbours are saved as PNG into user/log/glitch_auto and the recording gets a GlitchMark (mode 3).
 // Calibrated on the 2026-11-07 pond freeze: the two slab frames scored 21.4 and 18.8, the next frame 12.9. TLG_GLITCH_AUTO=0 turns it off, TLG_GLITCH_AUTO_THRESHOLD changes 15.
 constexpr u32 FullSlots = 8;
-constexpr u32 GlitchAutoMax = 40; // sets of frames saved per run
+constexpr u32 GlitchAutoMax = 30; // sets of frames saved per run
 struct FullSlot {
     Slot slot{};
     u64 id{~u64{0}};
@@ -172,13 +172,19 @@ void FillGrid(Thumb& t) {
 /// How strongly `mid` differs in some blocks from the average of `a` and `c`, beyond what a and c differ from each other
 float GlitchScore(const Thumb& a, const Thumb& mid, const Thumb& c) {
     float best = 0.0f;
+    float motion_sum = 0.0f;
     u32 blocks = 0;
     for (size_t i = 0; i < mid.grid.size(); ++i) {
         const float dev = std::fabs(mid.grid[i] - (a.grid[i] + c.grid[i]) * 0.5f);
         const float motion = std::fabs(a.grid[i] - c.grid[i]);
+        motion_sum += motion;
         const float score = dev - 0.5f * motion;
         best = std::max(best, score);
         blocks += score > 6.0f ? 1 : 0;
+    }
+    // a fast camera turn changes everything (mean change of the neighbours 6 to 19 in 30 false hits); the two slab frames had 1.0 and 1.6
+    if (motion_sum / static_cast<float>(mid.grid.size()) > 4.0f) {
+        return 0.0f;
     }
     // a small bright thing (a butterfly) changes one or two blocks; the slab changed 7 and 11 of the 144
     return blocks >= 5 ? best : 0.0f;
