@@ -164,11 +164,25 @@ bool BufferCache::StreamWhilePassOpen(VAddr device_addr, u32 size) {
 }
 
 BufferCache::PlacedBuffer* BufferCache::PlacedAt(VAddr address, u64 size, bool written) {
+    // the last placed buffer this thread found: placed buffers do not overlap, so an address inside it has no other answer (valid until `placed` changes)
+    struct Last {
+        const BufferCache* owner{};
+        u64 version{};
+        PlacedBuffer* entry{};
+    };
+    static thread_local Last last;
+    const u64 version = placed_version.load(std::memory_order_acquire);
+    if (last.owner == this && last.version == version && address >= last.entry->begin && address < last.entry->end) {
+        return address + size <= last.entry->end + (written ? 0 : PlacedSlack) ? last.entry : nullptr;
+    }
     auto it = placed.upper_bound(address);
     if (it == placed.begin()) {
         return nullptr;
     }
     --it;
+    if (address >= it->second.begin && address < it->second.end) {
+        last = {this, version, &it->second};
+    }
     return address >= it->second.begin && address + size <= it->second.end + (written ? 0 : PlacedSlack) && address < it->second.end ? &it->second : nullptr;
 }
 
@@ -332,6 +346,7 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
     {
         std::scoped_lock lock{placed_mutex};
         placed.emplace(begin, PlacedBuffer{ids, {}, begin, end, std::move(buffer)});
+        placed_version.fetch_add(1, std::memory_order_acq_rel);
     }
     Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9Placed);
     Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedBytes, end - begin);
@@ -400,6 +415,7 @@ void BufferCache::DropPlaced(VAddr begin, const char* why) {
         ids.insert(ids.end(), it->second.users.begin(), it->second.users.end()); // every resolution that names it, members or not
         buffer = std::move(it->second.buffer);
         placed.erase(it);
+        placed_version.fetch_add(1, std::memory_order_acq_rel);
     }
     range_epoch.fetch_add(1, std::memory_order_acq_rel);
     for (const u64 id : ids) {

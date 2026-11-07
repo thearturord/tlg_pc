@@ -628,7 +628,7 @@ void NoteCpuWrite(VAddr address, u64 size) {
     {
         std::shared_lock lock{immutable_mutex};
         if (!immutables.empty()) {
-            if (ResidentBuffersEnabled()) {
+            if (census_enabled && ResidentBuffersEnabled()) { // (counters only: a second walk of the same buffers on every announced write)
                 const VAddr page_begin = address & ~VAddr{4095};
                 const VAddr page_end = (address + size + 4095) & ~VAddr{4095};
                 auto at = immutables.upper_bound(page_begin);

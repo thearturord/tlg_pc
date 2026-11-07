@@ -236,6 +236,7 @@ private:
         std::unique_ptr<Buffer> buffer;
     };
     std::map<VAddr, PlacedBuffer> placed;
+    std::atomic<u64> placed_version{1}; ///< bumped on every insert and erase of `placed` (PlacedAt keeps its last answer until then)
     struct BindMemoEntry {
         u32 size;
         const Buffer* buffer;
