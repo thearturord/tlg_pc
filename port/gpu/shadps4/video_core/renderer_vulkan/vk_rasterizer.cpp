@@ -1798,8 +1798,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         const auto src_access =
             vk::AccessFlagBits2::eShaderRead |
             (desc.is_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eNone);
-        const RingBinding* ring =
-            const_ring_level >= 4 && (ring_use.draw || ring_use.dispatch) ? FindRingBinding(stage, buffer_index) : nullptr;
+        // TLG_RING_KIND (bisect): 1 draws only, 2 dispatches only, 0 both
+        static const u32 ring_kind = [] { const char* e = std::getenv("TLG_RING_KIND"); return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u; }();
+        const RingBinding* ring = const_ring_level >= 4 && ((ring_use.draw && ring_kind != 2) || (ring_use.dispatch && ring_kind != 1)) ? FindRingBinding(stage, buffer_index) : nullptr;
         if (ring != nullptr && ring->formatted) {
             // N5f: a texel buffer may be the memory of an image (a surface a shader reads as a buffer, HTile, CMask): only the raster thread knows
             if (texture_cache.AnyImageOverlaps(ring->address, ring->size) || texture_cache.IsMeta(ring->address)) {
