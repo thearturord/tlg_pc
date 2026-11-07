@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <absl/container/btree_map.h>
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -62,7 +63,7 @@ struct AddrEntry {
     Kind kind;
     u32 usage, cpu_access;
 };
-std::map<VAddr, AddrEntry> resource_by_address;
+absl::btree_map<VAddr, AddrEntry> resource_by_address; // a B-tree: the walks by memory (BuffersIn, TexturesIn, ResourceAt) were a cache miss per level of a node tree
 
 std::atomic<u64> resources_noted{0}, views_noted{0}, deletes_noted{0}, deletes_unknown{0}, bad_reads{0};
 /// AddDelayDeleteObject (native-v3-writers): the game's own delay (frames until the object is freed) by age of the object's stamp, and the extra delay TLG_DELETE_DELAY adds
