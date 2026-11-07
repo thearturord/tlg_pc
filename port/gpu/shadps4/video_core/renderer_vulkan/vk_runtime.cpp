@@ -333,6 +333,16 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
+    {
+        // 2026-11-07 GPU ordering plan step 1 (TLG_TRACE_DISPLAY_LAYOUT=1): who moves the 4K colour images, in call order, next to the validation layer's own messages in the same log
+        static const bool trace = [] { const char* e = std::getenv("TLG_TRACE_DISPLAY_LAYOUT"); return e != nullptr && e[0] == '1'; }();
+        static std::atomic<u32> traced{0};
+        if (trace && image->info.size.width == 3840 && !image->info.props.is_depth && image->backing && traced.load(std::memory_order_relaxed) < 600) {
+            traced.fetch_add(1, std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan, "layout trace: image {:#x} {} -> {} (planner), caller {:#x}, tick {}, rendering {}", image->info.guest_address, vk::to_string(CurrentLayout(*image)),
+                        vk::to_string(dst_layout), reinterpret_cast<u64>(__builtin_return_address(0)), scheduler.CurrentTick(), scheduler.IsRendering());
+        }
+    }
     // L4, images: the planner's barriers (the image's own state is not consulted)
     VideoCore::Image::Barriers planned;
     PlanImageBarriers(image, planned, dst_layout, dst_access, dst_stage, subres_range);
