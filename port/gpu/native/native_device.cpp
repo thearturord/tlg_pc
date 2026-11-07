@@ -841,9 +841,9 @@ std::atomic<u64> early_fence_counts[6]; // fences, then label writes: landed at 
 std::deque<HeldFree> held_frees; // under deferred_mutex, in free order (need never decreases)
 u64 held_bytes = 0;              // under deferred_mutex (known sizes only)
 std::atomic<u64> hold_freed_bytes_total{0}, hold_released_bytes_total{0}, hold_armed_early{0};
-/// TLG_HOLD_ARM_ALL=1: see ReleaseHeld
+/// TLG_HOLD_ARM_ALL: see ReleaseHeld. On by default since 2026-11-07 (=0 turns it off): one block per call left 200 to 450 MB waiting and the game's Garlic heap ran dry after scene changes.
 bool HoldArmAllOn() {
-    static const bool on = [] { const char* e = std::getenv("TLG_HOLD_ARM_ALL"); return e != nullptr && e[0] == '1'; }();
+    static const bool on = [] { const char* e = std::getenv("TLG_HOLD_ARM_ALL"); return e == nullptr || e[0] != '0'; }();
     return on;
 }
 std::atomic<u64> hold_unsafe_blocks{0}, hold_unsafe_bytes{0}, hold_open_waits{0}, hold_open_wait_ns{0}, hold_open_same_thread{0}, hold_open_gave_up{0};
