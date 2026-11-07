@@ -536,10 +536,13 @@ void NoteCopyPath(const std::string& path) {
     }
 }
 
-u64 harvest_pending = 0, harvest_oldest = 0, harvest_current = 0;
+u64 harvest_pending = 0, harvest_oldest = 0, harvest_current = 0, harvest_side = 0;
+bool harvest_side_prev_free = false;
 bool harvest_oldest_free = false;
-void NoteHarvest(u64 pending, u64 oldest_tick, bool oldest_free, u64 current_tick) {
+void NoteHarvest(u64 pending, u64 oldest_tick, bool oldest_free, u64 current_tick, u64 side_tick, bool side_prev_free) {
     std::scoped_lock lock{mutex};
+    harvest_side = side_tick;
+    harvest_side_prev_free = side_prev_free;
     harvest_pending = pending;
     harvest_oldest = oldest_tick;
     harvest_oldest_free = oldest_free;
@@ -712,7 +715,7 @@ std::string Json() {
     for (size_t c = 0; c < changes.size(); ++c) {
         out += fmt::format("{}{{\"before\":{},\"after\":{}}}", c ? "," : "", FrameJson(changes[c].before), FrameJson(changes[c].after));
     }
-    out += fmt::format("],\"harvest\":{{\"pending\":{},\"oldest_tick\":{},\"oldest_free\":{},\"current_tick\":{}}},\"gpu_writes_total\":{},\"gpu_copies\":[", harvest_pending, harvest_oldest, harvest_oldest_free, harvest_current, write_number);
+    out += fmt::format("],\"harvest\":{{\"pending\":{},\"oldest_tick\":{},\"oldest_free\":{},\"current_tick\":{},\"side_tick\":{},\"side_prev_free\":{}}},\"gpu_writes_total\":{},\"gpu_copies\":[", harvest_pending, harvest_oldest, harvest_oldest_free, harvest_current, harvest_side, harvest_side_prev_free, write_number);
     for (size_t i = 0; i < copies.size(); ++i) {
         const Copy& c = copies[i];
         out += fmt::format("{}{{\"n\":{},\"frame\":{},\"dst\":\"{:x}\",\"src\":\"{:x}\",\"size\":{},\"seq\":{},\"caller\":\"{:x}\",\"src_hash_then\":\"{:x}\",\"src_hash_now\":\"{:x}\",\"src_nonzero_chunks\":{},\"result_nz\":{},\"result_hash\":\"{:x}\",\"src_img_nz\":{},\"src_img_hash\":\"{:x}\",\"src_upload_hash\":\"{:x}\",\"src_upload_frame\":{},\"queued\":{},\"srcw\":{},\"path\":\"{}\"}}", i ? "," : "", c.number, c.frame, c.dst, c.src, c.size, c.seq, c.caller, c.src_hash, RangeHash(c.src, c.size, nullptr), c.src_nonzero_chunks,

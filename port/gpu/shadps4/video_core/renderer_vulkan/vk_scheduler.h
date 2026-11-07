@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdlib>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -13,6 +14,7 @@
 #include <span>
 
 #include "common/interval_set.h"
+#include "common/logging/log.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
@@ -673,7 +675,11 @@ public:
         }
         ~SideScope() {
             if (active) {
-                if (scheduler.side->PendingEncoderCommands() != 0) {
+                // 2026-11-07: OpenWork also covers the first (direct) tick of the stream, where commands are recorded straight into the command buffer and
+                // PendingEncoderCommands() is 0: it was never submitted, so everything queue 1 recorded in that tick (the GPU memory copies of the menu text pictures)
+                // stayed unexecuted for hundreds of frames while the graphics stream read their destinations (blank text). TLG_ASC_DIRECT_FLUSH=0 restores the old condition.
+                static const bool direct_flush = [] { const char* e = std::getenv("TLG_ASC_DIRECT_FLUSH"); return e == nullptr || e[0] != '0'; }();
+                if (direct_flush ? scheduler.side->OpenWork() : scheduler.side->PendingEncoderCommands() != 0) {
                     scheduler.side->Flush();
                 }
                 Scheduler::use_side = false;
@@ -691,6 +697,16 @@ public:
     };
     [[nodiscard]] bool HasSideStream() const noexcept {
         return side != nullptr;
+    }
+    /// Diagnostics (UI trace): the side stream's open tick (0 without it) and whether the tick before it is done.
+    [[nodiscard]] u64 SideTickDiag(bool* prev_free) noexcept {
+        if (!side) {
+            *prev_free = false;
+            return 0;
+        }
+        const u64 tick = side->CurrentTick();
+        *prev_free = tick <= 1 || side->IsFree(tick - 1);
+        return tick;
     }
     /// Raster thread, graphics stream selected, before the asynchronous stream is entered: the graphics work recorded so far is submitted and the next submission of the
     /// asynchronous stream waits for it (queue 1 reads what the graphics stream uploaded and wrote). With `may_submit` false (an occlusion query is open: a submit would

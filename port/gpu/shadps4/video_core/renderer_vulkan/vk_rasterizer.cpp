@@ -683,7 +683,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         }
     };
     if (Core::UiTrace::Armed()) {
-        Core::UiTrace::NoteHarvest(ui_copies_pending.size(), ui_copies_pending.empty() ? 0 : ui_copies_pending.front().tick, !ui_copies_pending.empty() && scheduler.IsFree(ui_copies_pending.front().tick), scheduler.CurrentTick());
+        bool side_prev_free = false;
+        const u64 side_tick = scheduler.SideTickDiag(&side_prev_free);
+        Core::UiTrace::NoteHarvest(ui_copies_pending.size(), ui_copies_pending.empty() ? 0 : ui_copies_pending.front().tick, !ui_copies_pending.empty() && scheduler.IsFree(ui_copies_pending.front().tick), scheduler.CurrentTick(), side_tick, side_prev_free);
         for (auto it = ui_copies_pending.begin(); it != ui_copies_pending.end();) {
             if (scheduler.IsFree(it->tick)) {
                 it->ref.Invalidate();
