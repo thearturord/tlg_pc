@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "native/native_split_census.h"
 
 namespace Vulkan {
 
@@ -182,6 +183,7 @@ void IndexedData::SetTable(vk::Buffer buffer, u64 size_bytes) {
 }
 
 u32 IndexedData::Slot(u32 table, const Key& key, bool& made) {
+    Core::SplitCensus::Touch(Core::SplitCensus::Indexed);
     auto& t = tables[table];
     const u64 tick = scheduler.CurrentTick();
     const u32 stream = (tick & Scheduler::SideTag) != 0 ? 1u : 0u;
@@ -212,6 +214,7 @@ u32 IndexedData::Slot(u32 table, const Key& key, bool& made) {
 }
 
 u32 IndexedData::BufferSlot(vk::Buffer buffer, u64 offset, u64 range) {
+    Core::SplitCensus::Touch(Core::SplitCensus::Indexed);
     if (!buffer) {
         return 0;
     }
@@ -230,6 +233,7 @@ u32 IndexedData::BufferSlot(vk::Buffer buffer, u64 offset, u64 range) {
 }
 
 u32 IndexedData::ImageSlot(u32 image_key, vk::ImageView view, vk::ImageLayout layout) {
+    Core::SplitCensus::Touch(Core::SplitCensus::Indexed);
     if (!view || image_key >= Shader::Indexed::NumImageArrays) {
         return 0;
     }
@@ -249,6 +253,7 @@ u32 IndexedData::ImageSlot(u32 image_key, vk::ImageView view, vk::ImageLayout la
 }
 
 u32 IndexedData::SamplerSlot(vk::Sampler sampler) {
+    Core::SplitCensus::Touch(Core::SplitCensus::Indexed);
     if (!sampler) {
         return 0;
     }
@@ -271,6 +276,7 @@ u32 IndexedData::NullRun(u32 image_key) const noexcept {
 }
 
 u32 IndexedData::ImageRun(u32 image_key, const vk::DescriptorImageInfo* infos, u32 count) {
+    Core::SplitCensus::Touch(Core::SplitCensus::Indexed);
     if (image_key < Shader::Indexed::NumImageKeys || image_key >= Shader::Indexed::FirstAtomicKey || count == 0) {
         return 0;
     }

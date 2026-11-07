@@ -43,6 +43,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "native/native_split_census.h"
 
 #include <vk_mem_alloc.h>
 
@@ -109,6 +110,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 }
 
 void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
+    Core::SplitCensus::Touch(Core::SplitCensus::BufDirty);
     {
         TLG_PROF_LEVEL("cpuwrite.bind_memo_erase", 3);
         BindMemoErase(address, size);
@@ -158,6 +160,7 @@ u32 BufferCache::CanSkipIdenticalWrite(VAddr address, u64 size) {
 }
 
 void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, std::vector<std::pair<VAddr, VAddr>>* gaps) {
+    Core::SplitCensus::Touch(Core::SplitCensus::BufDirty);
     // B9.1: each engine buffer the bytes belong to keeps its part until its next upload (an announcement can run over several buffers)
     static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
     parts.clear();
@@ -322,6 +325,7 @@ static u32 BindMemoWideMode() {
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                         Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
+    Core::SplitCensus::Touch(Core::SplitCensus::BufObtain);
     const BindGuard bind_guard{reinterpret_cast<u64>(__builtin_return_address(0)), device_addr, size, is_written, immutable_hint != nullptr};
     TLG_PROF_LEVEL("buffer.obtain", 2);
     if (is_written) {
@@ -565,6 +569,7 @@ void BufferCache::RecipeEraseRange(VAddr address, u64 size) {
 }
 
 void BufferCache::BindMemoErase(VAddr address, u64 size) {
+    Core::SplitCensus::Touch(Core::SplitCensus::BufMemoErase);
     RecipeEraseRange(address, size);
     for (auto& memo : bind_memos) {
         if (memo.entries.empty()) {
@@ -873,6 +878,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForDownload(VAddr device_
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
+    Core::SplitCensus::Touch(Core::SplitCensus::BufObtain);
     if (IsRegionGpuModified(device_addr, size)) {
         last_image_source_gpu = true;
         Core::NativeContent::SetBindContext({"image source (GPU modified region)", 0, 0, 0, 0, false, false, device_addr, size, reinterpret_cast<u64>(__builtin_return_address(0))});
@@ -891,6 +897,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
 }
 
 const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanning, bool written) {
+    Core::SplitCensus::Touch(Core::SplitCensus::BufObtain);
     OrderedViewCheck(address, size, written);
     if (const PlacedBuffer* entry = PlacedAt(address, size, written)) {
         Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedServed);
@@ -1043,6 +1050,7 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 }
 
 void BufferCache::SupersedeGpuWritten(VAddr addr, size_t size) {
+    Core::SplitCensus::Touch(Core::SplitCensus::GpuRanges);
     Core::UiTrace::NoteSupersede(addr, size, reinterpret_cast<u64>(__builtin_return_address(0)));
     std::unique_lock lock{gpu_ranges_mutex};
     BindMemoBump(); // GPU written bytes change hands: memo answers are checked again
@@ -1059,6 +1067,7 @@ bool BufferCache::IsRangeGpuWritten(VAddr addr, size_t size) {
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
+    Core::SplitCensus::Touch(Core::SplitCensus::BufSync);
     TLG_PROF("buffer.synchronize");
     TLG_PROF_NAMED_LEVEL(s_placed, "buffer.sync.placed_walk", 3);
     // B9.4: a placed buffer holds [begin, end) of its block; a read into its slack must not take (and lose) the bytes of the memory after it
@@ -1367,6 +1376,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {
+    Core::SplitCensus::Touch(Core::SplitCensus::BufSync);
     if (const auto meta = texture_cache.GetMetaInfo(device_addr)) {
         if (meta->type == TextureCache::MetaType::HTile) {
             static constexpr u32 ZmaskUncompressed = 0xf;

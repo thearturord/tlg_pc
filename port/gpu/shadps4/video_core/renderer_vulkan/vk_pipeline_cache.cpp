@@ -32,6 +32,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_boundary.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "native/native_split_census.h"
 
 namespace Vulkan {
 
@@ -231,6 +232,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    Core::SplitCensus::Touch(Core::SplitCensus::Pipeline);
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::PipelineLookup};
     if (!lookup_pinned || lookup_inputs == nullptr) {
         return nullptr; // F3.5: only a plan (inputs, fixed state, shader environment) looks a graphics pipeline up
@@ -334,6 +336,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    Core::SplitCensus::Touch(Core::SplitCensus::Pipeline);
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::PipelineLookup};
     if (!lookup_pinned || lookup_cs == nullptr) {
         return nullptr; // G1: a dispatch is looked up from its plan's inputs only (it always has a plan)

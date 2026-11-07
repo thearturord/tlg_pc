@@ -11,6 +11,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "native/native_split_census.h"
 
 #include <vulkan/vulkan_format_traits.hpp>
 
@@ -988,6 +989,7 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
 }
 
 void Runtime::FlushBarriers() {
+    Core::SplitCensus::Touch(Core::SplitCensus::Barrier);
     vk::DependencyInfo dep_info{};
 
     if (memory_barrier.srcStageMask) {

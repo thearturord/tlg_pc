@@ -20,6 +20,7 @@
 #include "native/native_registry.h"
 #include "native/native_resource_audit.h"
 #include "native/native_executor.h"
+#include "native/native_split_census.h"
 #include "native/native_executor_tasks.h"
 #include "native/native_debug_server.h"
 #include "common/arch.h"
@@ -753,6 +754,7 @@ void NativeExecutor::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 n
                              native.native_bind_skipped);
                 }
             }
+            Core::SplitCensus::PublishAndReset(); // plan S0
             Core::DebugServer::Publish(
                 "raster_thread_ms",
                 {{"draws", sp.ns_draws / 1'000'000},

@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "vulkan/vulkan.hpp"
+#include "native/native_split_census.h"
 
 namespace tracy {
 class VkCtxScope;
@@ -860,6 +861,7 @@ public:
         Active().BeginSession();
     }
     vk::CommandBuffer UploadCommandBuffer() {
+        Core::SplitCensus::Touch(Core::SplitCensus::Commands);
         return Active().UploadCommandBuffer();
     }
     void SetSessionCallback(SessionFunc&& on_session) {
@@ -892,12 +894,14 @@ public:
         return Active().GetDynamicState();
     }
     CommandRecorder CommandBuffer() const {
+        Core::SplitCensus::Touch(Core::SplitCensus::Commands);
         return ActiveConst().CommandBuffer();
     }
     [[nodiscard]] bool IsRecordingCommands() const noexcept {
         return gfx.IsRecordingCommands();
     }
     vk::CommandBuffer SyncedCommandBuffer() {
+        Core::SplitCensus::Touch(Core::SplitCensus::Commands);
         return Active().SyncedCommandBuffer();
     }
     void SetEncoderMode(u32 mode) {

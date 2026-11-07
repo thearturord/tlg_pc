@@ -18,6 +18,7 @@
 #include "native/native_prof.h"
 #include "native/native_readback_policy.h"
 #include "native/native_resource_audit.h"
+#include "native/native_split_census.h"
 #include "native/native_timeline.h"
 #include "video_core/readback_stats.h"
 #include "video_core/thread_usage.h"
@@ -291,6 +292,7 @@ void Queue::Run(std::stop_token stoken) {
                 consumer->RunCallbacks();
                 sp.ns_callbacks += VideoCore::ReadbackStats::NowNs() - callback_start;
             }
+            Core::SplitCensus::Begin(); // plan S0: no-op unless TLG_SPLIT_CENSUS=1 (the mask is only read when it is on)
             const u64 op_start = VideoCore::ReadbackStats::NowNs();
             if (op.has_call) {
                 if (const u32 delay = VideoCore::ReadbackPolicy::Get().raster_delay_ns.load(std::memory_order_relaxed);
@@ -316,14 +318,21 @@ void Queue::Run(std::stop_token stoken) {
                     ++sp.n_draws;
                     sp.ns_class_draw[ClassBucket(op.audit_class)] += op_ns;
                     ++sp.n_class_draw[ClassBucket(op.audit_class)];
-                    if (op.draw_plan && consumer->IsDepthOnly(*op.draw_plan)) {
+                    const bool depth_only = op.draw_plan && consumer->IsDepthOnly(*op.draw_plan);
+                    if (depth_only) {
                         sp.ns_depth_only_draws += op_ns;
                         ++sp.n_depth_only_draws;
+                    }
+                    if (Core::SplitCensus::On()) {
+                        Core::SplitCensus::Record(depth_only ? 1 : 0, ClassBucket(op.audit_class), nullptr, 0, Core::SplitCensus::Current(), op_ns);
                     }
                 } else {
                     sp.ns_dispatches += op_ns;
                     sp.ns_class_dispatch[ClassBucket(op.audit_class)] += op_ns;
                     ++sp.n_class_dispatch[ClassBucket(op.audit_class)];
+                    if (Core::SplitCensus::On()) {
+                        Core::SplitCensus::Record(2, ClassBucket(op.audit_class), nullptr, 0, Core::SplitCensus::Current(), op_ns);
+                    }
                 }
             } else if (op.closure) {
                 consumer->RunClosure(op);
@@ -331,6 +340,13 @@ void Queue::Run(std::stop_token stoken) {
                     VideoCore::ReadbackStats::NowNs() - op_start;
                 sp.ns_class_closure[ClassBucket(op.audit_class)] += VideoCore::ReadbackStats::NowNs() - op_start;
                 ++sp.n_class_closure[ClassBucket(op.audit_class)];
+                if (Core::SplitCensus::On()) {
+                    if (op.writes_memory) {
+                        Core::SplitCensus::Touch(Core::SplitCensus::GuestWrite);
+                    }
+                    Core::SplitCensus::Record(3, ClassBucket(op.audit_class), op.write_file, op.write_line, Core::SplitCensus::Current(),
+                                              VideoCore::ReadbackStats::NowNs() - op_start);
+                }
                 if (op.writes_memory) {
                     sp.write_done.store(op.position, std::memory_order_release);
                     sp.pending_writes.fetch_sub(1, std::memory_order_acq_rel);

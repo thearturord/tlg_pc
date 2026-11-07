@@ -39,6 +39,7 @@
 #include <fmt/format.h>
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
+#include "native/native_split_census.h"
 
 namespace VideoCore {
 
@@ -617,6 +618,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id, Core:
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+    Core::SplitCensus::Touch(Core::SplitCensus::TexFind);
     TLG_PROF_LEVEL("texture.find_image", 2);
     const auto& info = desc.info;
     Core::ResourceAudit::Note(Core::ResourceAudit::ImageUse, info.guest_address, info.guest_size, desc.type == BindingType::Storage || desc.type == BindingType::RenderTarget);
@@ -1011,6 +1013,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 }
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
+    Core::SplitCensus::Touch(Core::SplitCensus::TexFind);
     SmallVector<ImageId, 4> image_ids;
     // B8.4: memory an engine texture starts at finds its images through the texture's lists; B8.5: engine buffer memory through the buffers' lists
     bool routed = false;
@@ -1064,6 +1067,7 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 }
 
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+    Core::SplitCensus::Touch(Core::SplitCensus::TexFind);
     TLG_PROF_LEVEL("texture.find_view", 3);
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
@@ -1104,6 +1108,7 @@ void TextureCache::UnregisterMeta(VAddr address, u64 owner_uid) {
 }
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
+    Core::SplitCensus::Touch(Core::SplitCensus::TexFind);
     TLG_PROF_LEVEL("texture.find_view", 3);
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
@@ -1147,6 +1152,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 }
 
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
+    Core::SplitCensus::Touch(Core::SplitCensus::TexFind);
     TLG_PROF_LEVEL("texture.find_view", 3);
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
@@ -1203,6 +1209,7 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
 }
 
 void TextureCache::RefreshImage(Image& image, Core::ImageCaller caller) {
+    Core::SplitCensus::Touch(Core::SplitCensus::TexRefresh);
     TLG_PROF_LEVEL("texture.refresh_image", 3);
     Core::NativeCensus::NoteImage(Core::NativeCensus::ImageRefresh, image.info.guest_size);
     // E3.3: the shared page edges of an image are no longer harvested here. The engine's announced writes tell when an image's content changed (E3.1 census: the harvest alone
@@ -1317,6 +1324,7 @@ void TextureCache::RefreshImage(Image& image, Core::ImageCaller caller) {
 vk::Sampler TextureCache::GetSampler(const Core::NativeDesc::SamplerDesc& sharp,
                                      AmdGpu::BorderColorBuffer border_color_base,
                                      const bool is_depth) {
+    Core::SplitCensus::Touch(Core::SplitCensus::TexSampler);
     TLG_PROF_LEVEL("texture.get_sampler", 3);
     // Compare and plain uses of one S# need separate samplers.
     const u64 hash = HashCombine(XXH3_64bits(&sharp, sizeof(sharp)), is_depth);
@@ -1346,6 +1354,7 @@ bool TextureCache::RingIndexed(VAddr address, u64 size) const {
 }
 
 void TextureCache::RegisterImage(ImageId image_id) {
+    Core::SplitCensus::Touch(Core::SplitCensus::TexRegister);
     Image& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
@@ -1384,6 +1393,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
 }
 
 void TextureCache::UnregisterImage(ImageId image_id) {
+    Core::SplitCensus::Touch(Core::SplitCensus::TexRegister);
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");

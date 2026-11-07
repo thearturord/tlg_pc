@@ -17,6 +17,7 @@
 #include "native/native_raycast_cpu.h"
 #include "native/native_timeline.h"
 #include "native/native_wait_registers.h"
+#include "native/native_split_census.h"
 
 namespace Core::NativeExecutorSync {
 
@@ -29,6 +30,7 @@ u64 ReadLabel(VAddr address, u32 num_bytes) {
 } // namespace
 
 u64 LabelTimeline::Record(VAddr address, u64 value, u32 num_bytes, u32 queue) {
+    Core::SplitCensus::Touch(Core::SplitCensus::Label);
     // Read outside the lock, see Match.
     const u64 memory = ReadLabel(address, num_bytes);
     std::scoped_lock lk{mutex};
@@ -66,6 +68,7 @@ u64 LabelTimeline::Record(VAddr address, u64 value, u32 num_bytes, u32 queue) {
 }
 
 void LabelTimeline::SetTick(VAddr address, u64 seq, u64 tick) {
+    Core::SplitCensus::Touch(Core::SplitCensus::Label);
     std::scoped_lock lk{mutex};
     const auto it = std::ranges::find(label_states, address, &LabelState::address);
     if (it != label_states.end() && it->latest_seq == seq) {
@@ -91,6 +94,7 @@ u64 LabelTimeline::Position(VAddr address) {
 }
 
 u64 LabelTimeline::Tick(VAddr address, u64 seq) {
+    Core::SplitCensus::Touch(Core::SplitCensus::Label);
     std::scoped_lock lk{mutex};
     const auto it = std::ranges::find(label_states, address, &LabelState::address);
     if (it == label_states.end() || it->latest_seq < seq) {
@@ -100,6 +104,7 @@ u64 LabelTimeline::Tick(VAddr address, u64 seq) {
 }
 
 void LabelTimeline::Retire(VAddr address, u64 seq) {
+    Core::SplitCensus::Touch(Core::SplitCensus::Label);
     std::scoped_lock lk{mutex};
     const auto it = std::ranges::find(label_states, address, &LabelState::address);
     if (it == label_states.end() || it->latest_seq < seq) {

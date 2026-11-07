@@ -35,6 +35,7 @@
 #include "native/native_registry.h"
 #include "native/native_resources.h"
 #include "native/native_readback_policy.h"
+#include "native/native_split_census.h"
 
 namespace Core::NativeResources {
 
@@ -629,6 +630,7 @@ std::array<std::atomic<u64>, 5> lift_census_faults{};
 std::array<std::atomic<u64>, 8> lift_census_by_usage_size{};
 
 void NoteCpuWrite(VAddr address, u64 size) {
+    Core::SplitCensus::Touch(Core::SplitCensus::ObjectNotes);
     {
         std::shared_lock lock{immutable_mutex};
         if (!immutables.empty()) {
@@ -950,6 +952,7 @@ std::array<u64, 8> TakeResidentCounters() {
 }
 
 void NoteAnnouncedWrite(VAddr address, u64 size) {
+    Core::SplitCensus::Touch(Core::SplitCensus::ObjectNotes);
     if (!ResidentBuffersEnabled() || size == 0) {
         return;
     }

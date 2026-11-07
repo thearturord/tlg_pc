@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "native/native_split_census.h"
 
 #include <vk_mem_alloc.h>
 
@@ -205,6 +206,7 @@ StreamBuffer::StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& 
 }
 
 bool StreamBuffer::PrepareMap(u64 size, u64 alignment, bool allow_wait) {
+    Core::SplitCensus::Touch(Core::SplitCensus::BufStream);
     if (!mapped_data.empty() && !is_coherent) {
         size = Common::AlignUp(size, non_coherent_atom_size);
         alignment =
@@ -258,6 +260,7 @@ void StreamBuffer::Commit() {
 }
 
 std::optional<u64> StreamBuffer::Reserve(u64 size, u64 alignment, bool allow_wait) {
+    Core::SplitCensus::Touch(Core::SplitCensus::BufStream);
     if (!PrepareMap(size, alignment, allow_wait)) {
         return std::nullopt;
     }

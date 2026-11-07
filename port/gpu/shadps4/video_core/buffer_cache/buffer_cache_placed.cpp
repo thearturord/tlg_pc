@@ -36,6 +36,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "native/native_split_census.h"
 
 #include <vk_mem_alloc.h>
 
@@ -211,6 +212,7 @@ bool BufferCache::PlacedMeets(VAddr address, u64 size) const {
 }
 
 const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
+    Core::SplitCensus::Touch(Core::SplitCensus::BufPlaced);
     const VAddr base = begin & ~VAddr{255};
     // zero copy: engine buffers the CPU writes (not the ones it reads back) live in video memory the CPU can write (resizable BAR), so their announced bytes
     // can be written there directly (SynchronizeMemory). A device without such memory keeps device local buffers (the GPU must not read system memory: N7.5).
@@ -399,6 +401,7 @@ void BufferCache::NoteResolutionUser(const Buffer* buffer, u64 id) {
 }
 
 void BufferCache::DropPlaced(VAddr begin, const char* why) {
+    Core::SplitCensus::Touch(Core::SplitCensus::BufPlaced);
     std::unique_ptr<Buffer> buffer;
     std::vector<u64> ids;
     VAddr dropped_begin = begin, dropped_end = begin + 1;

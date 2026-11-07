@@ -7,6 +7,7 @@
 #include "native/native_device.h"
 #include "native/native_image_index.h"
 #include "native/native_updates.h"
+#include "native/native_split_census.h"
 
 namespace Core {
 
@@ -93,6 +94,7 @@ void NativeImageIndex::ImagesIn(const std::vector<u64>& ids, VAddr address, u64 
 }
 
 u32 NativeImageIndex::AnnouncedWriteIsInert(VAddr addr, size_t size) {
+    Core::SplitCensus::Touch(Core::SplitCensus::ImageIndex);
     if (!pending_clears.empty()) {
         // only a clear that waits for a texture this memory belongs to is touched by the write (NoteAnnouncedWrite erases exactly those)
         static thread_local std::vector<u64> ids;
@@ -108,6 +110,7 @@ u32 NativeImageIndex::AnnouncedWriteIsInert(VAddr addr, size_t size) {
 }
 
 void NativeImageIndex::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
+    Core::SplitCensus::Touch(Core::SplitCensus::ImageIndex);
     if (pending_clears.empty() && !host.AnyImageIn(addr, size)) {
         return; // no image in this memory (most announcements: buffer contents); the page table answers that in a few lookups
     }
