@@ -53,7 +53,6 @@ GpuTime::GpuTime(const Instance& instance) : device{instance.GetDevice()} {
     for (u32 i = 0; i < Slots; ++i) {
         const vk::CommandBufferBeginInfo begin{};
         Check(begin_buffers[i].begin(begin));
-        begin_buffers[i].resetQueryPool(*pool, i * 2, 2);
         begin_buffers[i].writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *pool, i * 2);
         Check(begin_buffers[i].end());
         Check(end_buffers[i].begin(begin));
@@ -71,6 +70,8 @@ GpuTime::Bracket GpuTime::Open(u32 stream) {
         return {};
     }
     const u32 slot = stream * SlotsPerStream + (next_slot[stream]++ % SlotsPerStream);
+    // Reset on the host before the submit: a slot reused after a lap would otherwise still read as finished with its old stamps.
+    device.resetQueryPool(*pool, slot * 2, 2);
     pending[stream].push_back(slot);
     return {begin_buffers[slot], end_buffers[slot]};
 }
