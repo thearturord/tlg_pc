@@ -123,6 +123,24 @@ public:
     void RecipeCount(u32 index) noexcept {
         recipe_counts[index].fetch_add(1, std::memory_order_relaxed);
     }
+    /// Plan V, step V0 (`TLG_VERSION_CENSUS=1`, shadow only): the same recipes checked against the identity events (native_identity_log.h) that overlap THEIR ranges, instead of the global counters.
+    /// Content writes (`BindMemoErase` -> `RecipeEraseRange`) do not make a recipe invalid here; they are counted (`SvValidContentDirty`).
+    enum ScopedIndex : u32 {
+        SvChecked, SvNoRecipe, SvNotReusable, SvIdentityChanged, SvLogUnknown, SvValid, SvValidSame, SvValidStreamOffsetOnly, SvValidOtherDifference, SvValidContentClean,
+        SvValidContentDirty, SvValidUsesStream, SvValidStreamOtherCommandBuffer, SvInvalidButSame, SvInvalidAndDifferent, SvNoImageRanges,
+        SvKindBase = 16, // + the kind of the event that changed the recipe (native_identity_log.h), up to 8
+        SvNsValid = 24, SvNsInvalid, SvNsNoRecipe, SvNsAll, SvValidPathSwitch, SvValidDifferentSameKinds, SvCountsEnd = 40,
+    };
+    struct ScopedPrediction {
+        u32 state{0}; ///< 0 no recipe, 1 valid, 2 not reusable, 3 identity changed, 4 log overrun
+        u64 shape{}, shape_nostream{}, kind_signature{};
+        bool content_clean{false}, uses_stream{false}, other_command_buffer{false};
+    };
+    [[nodiscard]] ScopedPrediction RecipePredictScoped(u64 key, u64 tick);
+    void RecipeStoreScoped(u64 key, u64 shape_nostream, u64 kind_signature, const boost::container::small_vector<std::pair<VAddr, u32>, 4>& image_ranges, u64 identity_clock);
+    void ScopedCount(u32 index, u64 n = 1) noexcept {
+        scoped_counts[index].fetch_add(n, std::memory_order_relaxed);
+    }
     void BindMemoBump() noexcept {
         bind_memo_epoch.fetch_add(1, std::memory_order_acq_rel);
     }
@@ -280,7 +298,10 @@ private:
         RecipeEpochs epochs{};
         bool valid{false}, uses_stream{false}, reusable{false};
         boost::container::small_vector<std::pair<VAddr, u32>, 8> ranges;
+        u64 shape_nostream{}, identity_clock{}, kind_signature{}; ///< V0: the shape with the stream copies' offsets left out; the identity event clock when the draw started
+        boost::container::small_vector<std::pair<VAddr, u32>, 4> image_ranges;
     };
+    std::array<std::atomic<u64>, SvCountsEnd> scoped_counts{};
     std::unordered_map<u64, DrawRecipe> recipes;
     absl::btree_map<VAddr, boost::container::small_vector<u64, 2>> recipe_index; ///< range start -> keys of the recipes that hold a range starting there
     u64 recipe_max_len{4096};

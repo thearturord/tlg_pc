@@ -648,6 +648,9 @@ private:
     bool recipe_active{false}, recipe_reusable{true};
     VideoCore::BufferCache::RecipeEpochs recipe_epochs_at_start{};
     boost::container::small_vector<std::pair<VAddr, u32>, 8> recipe_ranges;
+    boost::container::small_vector<std::pair<VAddr, u32>, 4> recipe_image_ranges; ///< V0: the guest ranges of the images this draw bound
+    u64 recipe_identity_clock{};
+    VideoCore::BufferCache::ScopedPrediction version_prediction{};
 
     bool attachment_feedback_loop{};
     bool needs_barrier{};

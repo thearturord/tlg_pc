@@ -6,6 +6,7 @@
 #include <limits>
 #include <xxhash.h>
 #include "native/native_census.h"
+#include "native/native_identity_log.h"
 #include "native/native_ui_trace.h"
 #include "native/native_image_caller.h"
 #include "native/native_content.h"
@@ -213,6 +214,7 @@ void TextureCache::RecordImageDownloads(ReadbackBatch& batch, u32 fence_kind) {
 
 void TextureCache::NoteImageEvent(const ImageInfo& info, bool registered) noexcept {
     const u64 generation = image_generation.fetch_add(1, std::memory_order_release) + 1;
+    Core::NativeIdentity::Note(info.guest_address, info.guest_address + info.guest_size, registered ? Core::NativeIdentity::ImageRegistered : Core::NativeIdentity::ImageUnregistered);
     ImageEvent& event = image_events[generation % ImageEventRing];
     event.generation.store(0, std::memory_order_release);
     event.address.store(info.guest_address, std::memory_order_relaxed);

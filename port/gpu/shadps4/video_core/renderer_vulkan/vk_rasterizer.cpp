@@ -10,6 +10,7 @@
 #endif
 #include "common/debug.h"
 #include "native/native_debug_server.h"
+#include "native/native_identity_log.h"
 #include "native/native_image_caller.h"
 #include "native/native_content.h"
 #include "native/native_prof.h"
@@ -194,7 +195,17 @@ void Rasterizer::MaybeFlushRecorded() {
 static bool ReuseCensusOn() {
     static const bool on = [] {
         const char* e = std::getenv("TLG_REUSE_CENSUS");
-        return e != nullptr && *e == '1';
+        const char* v = std::getenv("TLG_VERSION_CENSUS");
+        return (e != nullptr && *e == '1') || (v != nullptr && *v == '1');
+    }();
+    return on;
+}
+
+/// Plan V, step V0: the recipes checked against the identity events that overlap their own ranges (buffer_cache.h `RecipePredictScoped`); implies the reuse census (the shape hash).
+static bool VersionCensusOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("TLG_VERSION_CENSUS");
+        return v != nullptr && *v == '1';
     }();
     return on;
 }
@@ -1404,7 +1415,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
     // draw recipe verify: the identity of the record and the prediction, before anything is resolved
     recipe_active = false;
     recipe_ranges.clear();
+    recipe_image_ranges.clear();
     recipe_reusable = true;
+    version_prediction = {};
     if (ReuseCensusOn() && !pipeline->IsCompute() && binder_plan != nullptr) {
         buffer_cache.RecipeCount(0);
         if (!binder_plan->bindings_complete) {
@@ -1422,6 +1435,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
             recipe_epochs_at_start = buffer_cache.RecipeEpochsNow(Core::NativeResources::ImmutableEpoch(), texture_cache.ImageGeneration());
             recipe_prediction = buffer_cache.RecipePredict(key, scheduler.CurrentTick(), recipe_epochs_at_start, recipe_stored_shape);
             recipe_active = true;
+            if (VersionCensusOn()) {
+                recipe_identity_clock = Core::NativeIdentity::Clock();
+                version_prediction = buffer_cache.RecipePredictScoped(key, scheduler.CurrentTick());
+            }
         }
     }
 
@@ -1431,6 +1448,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
     Shader::Backend::Bindings binding{};
     push_data = MakeUserData(fixed);
     clip_plane_mask = fixed ? fixed->user_clip_plane_mask : 0;
+    const bool timed_resolve = recipe_active && VersionCensusOn();
+    const auto resolve_begin = timed_resolve ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
@@ -1442,6 +1461,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
         BindTextures(*stage, binding);
         uses_dma |= stage->uses_dma;
     }
+    const u64 resolve_ns = timed_resolve ? static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - resolve_begin).count()) : 0;
 
     BindCensus(pipeline);
     if (ReuseCensusOn()) {
@@ -1518,7 +1538,73 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
             if (!recipe_reusable) {
                 buffer_cache.RecipeCount(7);
             }
+            u64 h2 = 0xcbf29ce484222325ull, kinds = 0;
+            if (VersionCensusOn()) {
+                // the same shape with the stream copies' offsets left out (a copy of an object's bytes sits at a different place in the stream buffer after every content change)
+                const auto mix2 = [&h2](u64 v) { h2 = (h2 ^ v) * 0x100000001b3ull; h2 ^= h2 >> 29; };
+                mix2(reinterpret_cast<u64>(pipeline));
+                u32 kind_index = 0;
+                for (const auto& b : buffer_infos) {
+                    const VkBuffer handle = static_cast<VkBuffer>(b.buffer);
+                    const u64 kind = handle == ring_handle ? 1 : handle == stream_handle ? 2 : 3;
+                    kinds |= kind << (2 * (kind_index++ & 31));
+                    if (handle == ring_handle) {
+                        mix2(0x52494e47ull);
+                        mix2(b.range);
+                    } else if (handle == stream_handle) {
+                        mix2(0x53545245ull);
+                        mix2(b.range);
+                    } else {
+                        mix2(reinterpret_cast<u64>(handle));
+                        mix2(b.offset);
+                        mix2(b.range);
+                    }
+                }
+                for (const auto& i : image_infos) {
+                    mix2(reinterpret_cast<u64>(static_cast<VkImageView>(i.imageView)));
+                    mix2(reinterpret_cast<u64>(static_cast<VkSampler>(i.sampler)));
+                    mix2(static_cast<u64>(i.imageLayout));
+                }
+                mix2(std::bit_cast<u32>(push_data.xoffset));
+                mix2(std::bit_cast<u32>(push_data.yoffset));
+                mix2(std::bit_cast<u32>(push_data.xscale));
+                mix2(std::bit_cast<u32>(push_data.yscale));
+                const auto& vp = version_prediction;
+                using BC = VideoCore::BufferCache;
+                if (vp.state == 0) {
+                    buffer_cache.ScopedCount(BC::SvNsNoRecipe, resolve_ns);
+                } else if (vp.state == 1) {
+                    if (h == vp.shape) {
+                        buffer_cache.ScopedCount(BC::SvValidSame);
+                    } else if (h2 == vp.shape_nostream) {
+                        buffer_cache.ScopedCount(BC::SvValidStreamOffsetOnly);
+                    } else {
+                        buffer_cache.ScopedCount(BC::SvValidOtherDifference);
+                        buffer_cache.ScopedCount(kinds != vp.kind_signature ? BC::SvValidPathSwitch : BC::SvValidDifferentSameKinds);
+                        static std::atomic<u32> logged{0};
+                        if (logged.fetch_add(1) < 8) {
+                            LOG_ERROR(Render, "version census: a recipe was valid by identity but the shape differs (key {:#x}, images {}, buffers {}, uses stream {})", recipe_key, image_infos.size(),
+                                      buffer_infos.size(), vp.uses_stream);
+                        }
+                    }
+                    buffer_cache.ScopedCount(vp.content_clean ? BC::SvValidContentClean : BC::SvValidContentDirty);
+                    if (vp.uses_stream) {
+                        buffer_cache.ScopedCount(BC::SvValidUsesStream);
+                        if (vp.other_command_buffer) {
+                            buffer_cache.ScopedCount(BC::SvValidStreamOtherCommandBuffer);
+                        }
+                    }
+                    buffer_cache.ScopedCount(BC::SvNsValid, resolve_ns);
+                } else {
+                    buffer_cache.ScopedCount(h == vp.shape ? BC::SvInvalidButSame : BC::SvInvalidAndDifferent);
+                    buffer_cache.ScopedCount(BC::SvNsInvalid, resolve_ns);
+                }
+                buffer_cache.ScopedCount(BC::SvNsAll, resolve_ns);
+            }
             buffer_cache.RecipeStore(recipe_key, h, recipe_ranges, uses_stream, recipe_reusable, scheduler.CurrentTick(), recipe_epochs_at_start);
+            if (VersionCensusOn()) {
+                buffer_cache.RecipeStoreScoped(recipe_key, h2, kinds, recipe_image_ranges, recipe_identity_clock);
+            }
             recipe_active = false;
         }
         // key census: the record's identity against the shape
@@ -2517,6 +2603,9 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set,
             continue;
         }
         auto& image = texture_cache.GetImage(entry.id);
+        if (recipe_active) {
+            recipe_image_ranges.emplace_back(image.info.guest_address, static_cast<u32>(std::min<u64>(image.info.guest_size, 0xffffffffull)));
+        }
         image.binding.is_bound = 1u;
         bound_images.emplace_back(entry.id);
         const auto new_layout = image.info.props.is_depth ? vk::ImageLayout::eDepthStencilReadOnlyOptimal : vk::ImageLayout::eShaderReadOnlyOptimal;
@@ -2939,6 +3028,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 bound_layout = runtime.CurrentLayout(image);
             }
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view, bound_layout);
+            if (recipe_active) {
+                recipe_image_ranges.emplace_back(image.info.guest_address, static_cast<u32>(std::min<u64>(image.info.guest_size, 0xffffffffull)));
+            }
             if (set_record && i < TextureSet::MaxImages) {
                 if (binding.force_general || binding.is_target || is_storage) {
                     set_record = false;

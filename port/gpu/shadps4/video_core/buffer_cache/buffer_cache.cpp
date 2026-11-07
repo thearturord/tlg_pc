@@ -13,6 +13,7 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "native/native_identity_log.h"
 #include "native/native_ui_trace.h"
 #include "native/native_config.h"
 #include "native/native_device.h"
@@ -46,6 +47,8 @@
 #include <vk_mem_alloc.h>
 
 namespace VideoCore {
+
+namespace NativeIdentity = Core::NativeIdentity;
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t NULL_INDEX_BUFFER_SIZE = 16;
@@ -472,6 +475,74 @@ void BufferCache::RecipeStore(u64 key, u64 shape, const boost::container::small_
     }
 }
 
+BufferCache::ScopedPrediction BufferCache::RecipePredictScoped(u64 key, u64 tick) {
+    ScopedPrediction out;
+    scoped_counts[SvChecked].fetch_add(1, std::memory_order_relaxed);
+    const auto it = recipes.find(key);
+    if (it == recipes.end() || it->second.identity_clock == 0) {
+        scoped_counts[SvNoRecipe].fetch_add(1, std::memory_order_relaxed);
+        return out;
+    }
+    const DrawRecipe& r = it->second;
+    out.shape = r.shape;
+    out.shape_nostream = r.shape_nostream;
+    out.kind_signature = r.kind_signature;
+    out.content_clean = r.valid; // false once a content write overlapped one of its buffer ranges since it was stored
+    out.uses_stream = r.uses_stream;
+    out.other_command_buffer = r.uses_stream && r.tick != tick;
+    if (!r.reusable) {
+        scoped_counts[SvNotReusable].fetch_add(1, std::memory_order_relaxed);
+        out.state = 2;
+        return out;
+    }
+    NativeIdentity::Kind kind{};
+    for (const auto& [address, length] : r.ranges) {
+        const auto change = NativeIdentity::ChangedSince(r.identity_clock, address, address + length, &kind);
+        if (change == NativeIdentity::Change::Unknown) {
+            scoped_counts[SvLogUnknown].fetch_add(1, std::memory_order_relaxed);
+            out.state = 4;
+            return out;
+        }
+        if (change == NativeIdentity::Change::Overlaps) {
+            scoped_counts[SvIdentityChanged].fetch_add(1, std::memory_order_relaxed);
+            scoped_counts[SvKindBase + (kind < 8 ? kind : 7)].fetch_add(1, std::memory_order_relaxed);
+            out.state = 3;
+            return out;
+        }
+    }
+    for (const auto& [address, length] : r.image_ranges) {
+        const auto change = NativeIdentity::ChangedSince(r.identity_clock, address, address + length, &kind);
+        if (change == NativeIdentity::Change::Unknown) {
+            scoped_counts[SvLogUnknown].fetch_add(1, std::memory_order_relaxed);
+            out.state = 4;
+            return out;
+        }
+        if (change == NativeIdentity::Change::Overlaps) {
+            scoped_counts[SvIdentityChanged].fetch_add(1, std::memory_order_relaxed);
+            scoped_counts[SvKindBase + (kind < 8 ? kind : 7)].fetch_add(1, std::memory_order_relaxed);
+            out.state = 3;
+            return out;
+        }
+    }
+    if (r.image_ranges.empty()) {
+        scoped_counts[SvNoImageRanges].fetch_add(1, std::memory_order_relaxed);
+    }
+    out.state = 1;
+    scoped_counts[SvValid].fetch_add(1, std::memory_order_relaxed);
+    return out;
+}
+
+void BufferCache::RecipeStoreScoped(u64 key, u64 shape_nostream, u64 kind_signature, const boost::container::small_vector<std::pair<VAddr, u32>, 4>& image_ranges, u64 identity_clock) {
+    const auto it = recipes.find(key);
+    if (it == recipes.end()) {
+        return;
+    }
+    it->second.shape_nostream = shape_nostream;
+    it->second.kind_signature = kind_signature;
+    it->second.image_ranges = image_ranges;
+    it->second.identity_clock = identity_clock;
+}
+
 void BufferCache::RecipeEraseRange(VAddr address, u64 size) {
     if (recipe_index.empty()) {
         return;
@@ -521,6 +592,26 @@ nlohmann::json BufferCache::BindMemoReport() const {
                          {"why_not_range_written", recipe_counts[10].load()}, {"why_not_unreusable", recipe_counts[11].load()}, {"why_not_memo_epoch", recipe_counts[12].load()},
                          {"why_not_range_epoch", recipe_counts[13].load()}, {"why_not_placement_epoch", recipe_counts[14].load()}, {"why_not_immutable_epoch", recipe_counts[15].load()},
                          {"why_not_image_generation", recipe_counts[16].load()}, {"why_not_other_command_buffer", recipe_counts[17].load()}}},
+            {"versions_v0", {{"draws_checked", scoped_counts[SvChecked].load()}, {"no_recipe_yet", scoped_counts[SvNoRecipe].load()}, {"not_reusable", scoped_counts[SvNotReusable].load()},
+                             {"identity_changed", scoped_counts[SvIdentityChanged].load()}, {"log_overrun", scoped_counts[SvLogUnknown].load()},
+                             {"identity_changed_by_kind", {{"buffer_placed", scoped_counts[SvKindBase + 1].load()}, {"buffer_dropped", scoped_counts[SvKindBase + 2].load()},
+                                                           {"immutable_added", scoped_counts[SvKindBase + 3].load()}, {"immutable_removed", scoped_counts[SvKindBase + 4].load()},
+                                                           {"image_registered", scoped_counts[SvKindBase + 5].load()}, {"image_unregistered", scoped_counts[SvKindBase + 6].load()},
+                                                           {"gpu_written_state", scoped_counts[SvKindBase + 7].load()}}},
+                             {"valid", scoped_counts[SvValid].load()}, {"valid_and_same_shape", scoped_counts[SvValidSame].load()},
+                             {"valid_shape_differs_only_in_stream_copy_offsets", scoped_counts[SvValidStreamOffsetOnly].load()},
+                             {"VALID_BUT_DIFFERENT_OTHERWISE_MUST_BE_0", scoped_counts[SvValidOtherDifference].load()},
+                             {"of_those_a_buffer_changed_kind_ring_stream_other", scoped_counts[SvValidPathSwitch].load()}, {"of_those_same_kinds", scoped_counts[SvValidDifferentSameKinds].load()},
+                             {"valid_content_clean", scoped_counts[SvValidContentClean].load()}, {"valid_content_dirty", scoped_counts[SvValidContentDirty].load()},
+                             {"valid_uses_stream_copy", scoped_counts[SvValidUsesStream].load()}, {"valid_stream_copy_from_other_command_buffer", scoped_counts[SvValidStreamOtherCommandBuffer].load()},
+                             {"invalid_but_shape_same", scoped_counts[SvInvalidButSame].load()}, {"invalid_and_shape_differs", scoped_counts[SvInvalidAndDifferent].load()},
+                             {"recipes_without_image_ranges", scoped_counts[SvNoImageRanges].load()},
+                             {"resolve_ms_valid_draws", scoped_counts[SvNsValid].load() / 1e6}, {"resolve_ms_invalid_draws", scoped_counts[SvNsInvalid].load() / 1e6},
+                             {"resolve_ms_no_recipe_draws", scoped_counts[SvNsNoRecipe].load() / 1e6}, {"resolve_ms_all_checked", scoped_counts[SvNsAll].load() / 1e6},
+                             {"identity_events", {{"buffer_placed", NativeIdentity::Count(NativeIdentity::BufferPlaced)}, {"buffer_dropped", NativeIdentity::Count(NativeIdentity::BufferDropped)},
+                                                  {"immutable_added", NativeIdentity::Count(NativeIdentity::ImmutableAdded)}, {"immutable_removed", NativeIdentity::Count(NativeIdentity::ImmutableRemoved)},
+                                                  {"image_registered", NativeIdentity::Count(NativeIdentity::ImageRegistered)}, {"image_unregistered", NativeIdentity::Count(NativeIdentity::ImageUnregistered)},
+                                                  {"gpu_written_state", NativeIdentity::Count(NativeIdentity::GpuWrittenState)}}}}},
             {"wide", {{"mode", BindMemoWideMode()}, {"hits_seen", bind_memo_wide_counts[5].load()}, {"answers_used", bind_memo_wide_counts[0].load()}, {"compared", bind_memo_wide_counts[1].load()},
                       {"DIFFERENT_ANSWER_MUST_BE_0", bind_memo_wide_counts[2].load()}, {"compared_stream_answers", bind_memo_wide_counts[3].load()}, {"UNCACHED_DID_WORK_MUST_BE_0", bind_memo_wide_counts[4].load()},
                       {"work_explained_by_dirt_that_lingered", bind_memo_wide_counts[20].load()}, {"CLASSIC_work_explained_by_dirt_that_lingered", bind_memo_wide_counts[30].load()},
@@ -728,6 +819,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
                                              Core::NativeResources::BufferPath::Arena, last_upload_bytes);
     if (is_written) {
         std::unique_lock lock{gpu_ranges_mutex};
+        if (!gpu_modified_ranges.Intersects(device_addr, size)) {
+            NativeIdentity::Note(device_addr, device_addr + size, NativeIdentity::GpuWrittenState);
+        }
         gpu_modified_ranges.Add(device_addr, size);
         static const bool who_on = [] { const char* e = std::getenv("TLG_GPUWRITE_WHO"); return e && e[0] == '1'; }();
         if (who_on) {
@@ -952,6 +1046,9 @@ void BufferCache::SupersedeGpuWritten(VAddr addr, size_t size) {
     Core::UiTrace::NoteSupersede(addr, size, reinterpret_cast<u64>(__builtin_return_address(0)));
     std::unique_lock lock{gpu_ranges_mutex};
     BindMemoBump(); // GPU written bytes change hands: memo answers are checked again
+    if (gpu_modified_ranges.Intersects(addr, size)) {
+        NativeIdentity::Note(addr, addr + size, NativeIdentity::GpuWrittenState);
+    }
     gpu_modified_ranges.Subtract(addr, size);
 }
 

@@ -22,6 +22,7 @@
 #include "native/native_resources.h"
 #include "native/native_resource_audit.h"
 #include "native/native_executor.h"
+#include "native/native_identity_log.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/readback_batch.h"
@@ -142,6 +143,7 @@ void BufferCache::NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool 
         {
             std::unique_lock lock{gpu_ranges_mutex};
             BindMemoBump(); // GPU written bytes change hands: memo answers are checked again
+            Core::NativeIdentity::Note(address, address + bytes, Core::NativeIdentity::GpuWrittenState);
             gpu_modified_ranges.Subtract(address, bytes);
         }
         InvalidateStreamReuse(address, bytes);
@@ -364,6 +366,7 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
         Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9GroupMembers, ids.size());
     }
     range_epoch.fetch_add(1, std::memory_order_acq_rel); // the upload memo's answers (this command buffer only) that name the arena for this memory are stale
+    Core::NativeIdentity::Note(begin, end, Core::NativeIdentity::BufferPlaced);
     for (const u64 id : ids) {
         NoteResolutionUser(dst, id);
         if (auto* object = Core::NativeResources::FindImmutableById(id)) {
@@ -398,12 +401,15 @@ void BufferCache::NoteResolutionUser(const Buffer* buffer, u64 id) {
 void BufferCache::DropPlaced(VAddr begin, const char* why) {
     std::unique_ptr<Buffer> buffer;
     std::vector<u64> ids;
+    VAddr dropped_begin = begin, dropped_end = begin + 1;
     {
         std::scoped_lock lock{placed_mutex};
         const auto it = placed.find(begin);
         if (it == placed.end()) {
             return;
         }
+        dropped_begin = it->second.begin;
+        dropped_end = it->second.end;
         static const bool who_on = [] { const char* e = std::getenv("TLG_GPUWRITE_WHO"); return e && e[0] == '1'; }();
         if (who_on) {
             u64 gpu_bytes = 0;
@@ -427,6 +433,7 @@ void BufferCache::DropPlaced(VAddr begin, const char* why) {
         placed_version.fetch_add(1, std::memory_order_acq_rel);
     }
     range_epoch.fetch_add(1, std::memory_order_acq_rel);
+    Core::NativeIdentity::Note(dropped_begin, dropped_end, Core::NativeIdentity::BufferDropped);
     for (const u64 id : ids) {
         if (auto* object = Core::NativeResources::FindImmutableById(id)) {
             object->resident_epoch.store(~u64{0}, std::memory_order_release); // its binding resolution is made again

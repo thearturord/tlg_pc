@@ -29,6 +29,7 @@
 #include "common/path_util.h"
 #include "native/native_draw.h"
 #include "native/native_frame_gate.h"
+#include "native/native_identity_log.h"
 #include "native/native_log.h"
 #include "native/native_config.h"
 #include "native/native_registry.h"
@@ -316,6 +317,7 @@ void AddImmutable(const Resource& resource) {
         it->second->alive.store(false, std::memory_order_release);
         immutable_graveyard.emplace_back(NowNs(), it->second);
         immutable_epoch.fetch_add(1, std::memory_order_release);
+        NativeIdentity::Note(it->second->begin, it->second->end, NativeIdentity::ImmutableRemoved);
     }
     immutables[entry->begin] = entry;
     immutable_by_object[entry->object] = entry;
@@ -323,6 +325,7 @@ void AddImmutable(const Resource& resource) {
         immutable_by_id[entry->id] = entry;
     }
     immutable_epoch.fetch_add(1, std::memory_order_release);
+    NativeIdentity::Note(entry->begin, entry->end, NativeIdentity::ImmutableAdded);
 }
 
 std::map<u64, std::pair<u64, u64>> texture_ranges; ///< B1 census: engine textures by address (end, id)
@@ -553,6 +556,7 @@ bool NoteBufferDestroyed(u64 object) {
             if (const auto by_id = immutable_by_id.find(it->second->id); by_id != immutable_by_id.end() && by_id->second == it->second) {
                 immutable_by_id.erase(by_id);
             }
+            NativeIdentity::Note(it->second->begin, it->second->end, NativeIdentity::ImmutableRemoved);
             immutable_by_object.erase(it);
             immutable_epoch.fetch_add(1, std::memory_order_release);
             std::erase_if(immutable_graveyard, [now](const auto& g) { return now - g.first > 5'000'000'000ull; });
