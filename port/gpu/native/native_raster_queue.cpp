@@ -24,6 +24,10 @@
 
 namespace Core::NativeRasterQueue {
 
+static u32 ClassBucket(u8 c) {
+    return c == 0xff ? 4u : c >= 3 ? 3u : c;
+}
+
 void Queue::Start(Consumer& consumer_, bool verify_) {
     consumer = &consumer_;
     verify = verify_;
@@ -310,17 +314,23 @@ void Queue::Run(std::stop_token stoken) {
                     op.call.kind == Call::Kind::DrawIndirect) {
                     sp.ns_draws += op_ns;
                     ++sp.n_draws;
+                    sp.ns_class_draw[ClassBucket(op.audit_class)] += op_ns;
+                    ++sp.n_class_draw[ClassBucket(op.audit_class)];
                     if (op.draw_plan && consumer->IsDepthOnly(*op.draw_plan)) {
                         sp.ns_depth_only_draws += op_ns;
                         ++sp.n_depth_only_draws;
                     }
                 } else {
                     sp.ns_dispatches += op_ns;
+                    sp.ns_class_dispatch[ClassBucket(op.audit_class)] += op_ns;
+                    ++sp.n_class_dispatch[ClassBucket(op.audit_class)];
                 }
             } else if (op.closure) {
                 consumer->RunClosure(op);
                 (op.writes_memory ? sp.ns_write_closures : sp.ns_other_closures) +=
                     VideoCore::ReadbackStats::NowNs() - op_start;
+                sp.ns_class_closure[ClassBucket(op.audit_class)] += VideoCore::ReadbackStats::NowNs() - op_start;
+                ++sp.n_class_closure[ClassBucket(op.audit_class)];
                 if (op.writes_memory) {
                     sp.write_done.store(op.position, std::memory_order_release);
                     sp.pending_writes.fetch_sub(1, std::memory_order_acq_rel);

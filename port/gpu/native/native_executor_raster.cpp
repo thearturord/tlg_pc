@@ -763,7 +763,19 @@ void NativeExecutor::RasterConsumer::PublishIntervalStats(RasterSplit& sp, u64 n
                  {"memory_write_closures", sp.ns_write_closures / 1'000'000},
                  {"other_closures", sp.ns_other_closures / 1'000'000},
                  {"send_command_callbacks", sp.ns_callbacks / 1'000'000},
+                 {"by_queue", [&] {
+                      nlohmann::json q = nlohmann::json::object();
+                      const char* names[5] = {"graphics_queue", "compute_queue_1", "queue_2", "queues_3_and_up", "no_queue_task"};
+                      for (u32 c = 0; c < 5; ++c) {
+                          q[names[c]] = {{"draws_ms", sp.ns_class_draw[c] / 1'000'000}, {"draws", sp.n_class_draw[c]}, {"dispatches_ms", sp.ns_class_dispatch[c] / 1'000'000},
+                                         {"dispatches", sp.n_class_dispatch[c]}, {"closures_ms", sp.ns_class_closure[c] / 1'000'000}, {"closures", sp.n_class_closure[c]}};
+                      }
+                      return q;
+                  }()},
                  {"note", "wall time per ~5 s interval"}});
+            std::fill(std::begin(sp.ns_class_draw), std::end(sp.ns_class_draw), 0), std::fill(std::begin(sp.ns_class_dispatch), std::end(sp.ns_class_dispatch), 0),
+                std::fill(std::begin(sp.ns_class_closure), std::end(sp.ns_class_closure), 0), std::fill(std::begin(sp.n_class_draw), std::end(sp.n_class_draw), 0),
+                std::fill(std::begin(sp.n_class_dispatch), std::end(sp.n_class_dispatch), 0), std::fill(std::begin(sp.n_class_closure), std::end(sp.n_class_closure), 0);
             sp.ns_draws = sp.ns_dispatches = sp.ns_write_closures = sp.ns_other_closures = 0;
             sp.ns_depth_only_draws = sp.n_draws = sp.n_depth_only_draws = 0;
             sp.ns_callbacks = 0;

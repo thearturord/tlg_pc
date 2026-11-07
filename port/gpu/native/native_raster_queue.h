@@ -250,6 +250,8 @@ public:
     u64 ns_write_closures{};
     u64 ns_other_closures{};
     u64 ns_callbacks{};
+    /// by the queue that pushed the operation (0 graphics, 1 compute queue 1, 2 queue 2, 3 queues 3 and up, 4 no queue task): wall time and count of dispatches and of closures (sizing of a lane thread, 2026-11-07)
+    u64 ns_class_dispatch[5]{}, ns_class_closure[5]{}, n_class_dispatch[5]{}, n_class_closure[5]{}, ns_class_draw[5]{}, n_class_draw[5]{};
     u64 stat_last_log_ns{};
     bool verify{}; ///< cp_split_mode 2: every operation is waited for (synchronous)
 
