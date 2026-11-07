@@ -153,26 +153,33 @@ void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, st
     for (const auto& part : parts) {
         object_dirty[part.id].Add(part.begin, part.end - part.begin);
     }
-    // the bytes no buffer holds now: the first upload of a buffer over them takes them
-    b9_unattributed.Add(address, size);
+    // the bytes no buffer holds now: the first upload of a buffer over them takes them. (Add of the whole range then Subtract of the buffers' parts, done as the same
+    // set algebra without the detour: the parts leave the set, the gaps between them join it; the detour allocated a node per write and freed it again)
+    std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });
+    boost::container::small_vector<std::pair<VAddr, VAddr>, 4> own_gaps;
+    {
+        VAddr at = address;
+        for (const auto& part : parts) {
+            if (part.begin > at) {
+                own_gaps.emplace_back(at, part.begin);
+            }
+            at = std::max(at, part.end);
+        }
+        if (at < address + size) {
+            own_gaps.emplace_back(at, address + size);
+        }
+    }
     for (const auto& part : parts) {
         b9_unattributed.Subtract(part.begin, part.end - part.begin);
+    }
+    for (const auto& [a, e] : own_gaps) {
+        b9_unattributed.Add(a, e - a);
     }
     if (!parts.empty()) {
         b9_epoch.fetch_add(1, std::memory_order_acq_rel);
     }
     if (gaps != nullptr) {
-        std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });
-        VAddr at = address;
-        for (const auto& part : parts) {
-            if (part.begin > at) {
-                gaps->emplace_back(at, part.begin);
-            }
-            at = std::max(at, part.end);
-        }
-        if (at < address + size) {
-            gaps->emplace_back(at, address + size);
-        }
+        gaps->insert(gaps->end(), own_gaps.begin(), own_gaps.end());
     }
 }
 
