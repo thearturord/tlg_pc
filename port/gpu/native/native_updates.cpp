@@ -281,6 +281,14 @@ bool ReapplyGateOn() noexcept {
     return on;
 }
 
+u32 AnnounceSkipOn() noexcept {
+    static const u32 on = [] {
+        const char* e = std::getenv("TLG_ANNOUNCE_SKIP");
+        return e != nullptr && e[0] == '1' ? 1u : 0u;
+    }();
+    return on;
+}
+
 bool ReapplyAuditOn() noexcept {
     static const bool on = [] {
         const char* e = std::getenv("TLG_REAPPLY_AUDIT");
@@ -296,6 +304,13 @@ struct FirstHash {
 };
 std::vector<FirstHash> ra_last_first;
 std::atomic<u64> ra_gate_skipped{0}, ra_gate_applied{0};
+/// TLG_ANNOUNCE_SKIP=1 (2026-11-07, default 0): a plain announced range whose bytes hash the same as when the same address and size were last announced and applied, and that no GPU
+/// write and no image overlaps, is not applied again: the caches already hold exactly those bytes (the census found 59 % of the ranges in that state). Counters below.
+std::atomic<u64> sk_considered{0}, sk_skipped{0}, sk_skipped_bytes{0}, sk_no_entry{0}, sk_changed{0}, sk_size_differs{0}, sk_unhashed{0}, sk_check_refused{0}, sk_map_cleared{0};
+std::map<u64, std::pair<u64, u64>> sk_entries; // address -> size, hash of the last applied announcement (raster thread only); ordered, so a create or delete erases only what it overlaps
+std::atomic<u64> sk_refused_clears{0}, sk_refused_gpu{0}, sk_refused_image{0}, sk_refused_tracker{0}, sk_erased_by_deletes{0};
+u32 (*skip_check_fn)(void*, u64, u64) = nullptr;
+void* skip_check_context = nullptr;
 
 void ReapplyAuditBefore(const Batch& batch) {
     std::vector<std::pair<u64, u64>> again = batch.again;
@@ -375,6 +390,11 @@ void RememberFirst(const Batch& batch) {
 }
 } // namespace
 
+
+void SetSkipCheck(u32 (*fn)(void*, u64, u64), void* context) {
+    skip_check_context = context;
+    skip_check_fn = fn;
+}
 
 void SetApply(void (*fn)(void*, u64, u64, bool), void* context) {
     apply_context = context;
@@ -495,21 +515,86 @@ void ApplyBatch(const Batch& batch) {
         again_list(batch.ring_again);
     }
     TLG_PROF_LEVEL("updates.apply_first", 2);
+    const bool skip_on = AnnounceSkipOn() != 0 && skip_check_fn != nullptr;
+    const bool hash_here = skip_on || (gate && !reapply_audit); // the hash of a range is taken before it is applied now; it is the one the next batch's gate compares against
+    static std::vector<FirstHash> next_first;
+    next_first.clear();
+    if (skip_on) {
+        if (sk_entries.size() > 2'000'000) {
+            sk_entries.clear();
+            sk_map_cleared.fetch_add(1, std::memory_order_relaxed);
+        }
+        // an engine buffer or texture was created or deleted over some bytes: what the caches hold for them is not the last announcement any more
+        for (const auto& d : batch.deleted) {
+            const u64 begin = d[1], end = d[1] + std::max<u64>(d[2], 1);
+            auto it = sk_entries.lower_bound(begin > (u64{1} << 20) ? begin - (u64{1} << 20) : 0); // an entry is at most 1 MiB long
+            while (it != sk_entries.end() && it->first < end) {
+                if (it->first + it->second.first > begin) {
+                    it = sk_entries.erase(it);
+                    sk_erased_by_deletes.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+    const auto first_one = [&](u64 address, u64 size, bool plain) {
+        FirstHash h{address, size, 0, false};
+        if (hash_here && size != 0 && size <= (u64{1} << 20)) {
+            h.ok = NativeContent::HashGuarded64(address, size, h.hash);
+        }
+        bool skipped = false;
+        if (skip_on && plain) {
+            sk_considered.fetch_add(1, std::memory_order_relaxed);
+            const auto it = sk_entries.find(address);
+            if (!h.ok) {
+                sk_unhashed.fetch_add(1, std::memory_order_relaxed);
+                if (it != sk_entries.end()) {
+                    sk_entries.erase(it);
+                }
+            } else if (it == sk_entries.end()) {
+                sk_no_entry.fetch_add(1, std::memory_order_relaxed);
+                sk_entries.emplace(address, std::pair<u64, u64>{size, h.hash});
+            } else if (it->second.first != size) {
+                sk_size_differs.fetch_add(1, std::memory_order_relaxed);
+                it->second = {size, h.hash};
+            } else if (it->second.second != h.hash) {
+                sk_changed.fetch_add(1, std::memory_order_relaxed);
+                it->second.second = h.hash;
+            } else if (const u32 verdict = skip_check_fn(skip_check_context, address, size); verdict == 0) {
+                skipped = true;
+                sk_skipped.fetch_add(1, std::memory_order_relaxed);
+                sk_skipped_bytes.fetch_add(size, std::memory_order_relaxed);
+            } else {
+                sk_check_refused.fetch_add(1, std::memory_order_relaxed);
+                (verdict == 1 ? sk_refused_gpu : verdict == 2 ? sk_refused_image : verdict == 4 ? sk_refused_clears : sk_refused_tracker).fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (!skipped) {
+            TLG_PROF_ADD("updates.bytes_first", size);
+            apply_fn(apply_context, address, size, true);
+            b2_applied_bytes.fetch_add(size, std::memory_order_relaxed);
+        }
+        if (hash_here) {
+            next_first.push_back(h);
+        }
+    };
     for (const auto& [address, size] : batch.first) {
-        TLG_PROF_ADD("updates.bytes_first", size);
-        apply_fn(apply_context, address, size, true);
-        b2_applied_bytes.fetch_add(size, std::memory_order_relaxed);
+        first_one(address, size, true);
     }
     for (const auto& [address, size] : batch.ring_first) {
-        apply_fn(apply_context, address, size, true);
-        b2_applied_bytes.fetch_add(size, std::memory_order_relaxed);
+        first_one(address, size, false);
     }
     b2_applied_ranges.fetch_add(batch.first.size() + batch.ring_first.size(), std::memory_order_relaxed);
     b2_reapplied_ranges.fetch_add(batch.again.size(), std::memory_order_relaxed);
     if (reapply_audit) {
         ReapplyAuditAfter(batch);
     } else if (gate) {
-        RememberFirst(batch);
+        if (hash_here) {
+            ra_last_first.swap(next_first);
+        } else {
+            RememberFirst(batch);
+        }
     }
 }
 
@@ -657,7 +742,11 @@ nlohmann::json B9Report() {
 
 nlohmann::json B2Report() {
     return {{"mode", B2NativeMode()}, {"announcements_applied", b2_applied_ranges.load()}, {"bytes_applied", b2_applied_bytes.load()},
-            {"announcements_applied_again", b2_reapplied_ranges.load()}, {"reapply_gate", {{"on", ReapplyGateOn()}, {"skipped_unchanged", ra_gate_skipped.load()}, {"applied_changed_or_unknown", ra_gate_applied.load()}}},
+            {"announcements_applied_again", b2_reapplied_ranges.load()}, {"announce_skip", {{"mode", AnnounceSkipOn()}, {"considered", sk_considered.load()}, {"skipped", sk_skipped.load()}, {"skipped_bytes", sk_skipped_bytes.load()}, {"no_entry", sk_no_entry.load()},
+                                    {"bytes_changed", sk_changed.load()}, {"size_differs", sk_size_differs.load()}, {"unhashed", sk_unhashed.load()}, {"same_bytes_but_check_refused", sk_check_refused.load()},
+                                    {"refused_gpu_wrote_the_range", sk_refused_gpu.load()}, {"refused_an_image_covers_it", sk_refused_image.load()}, {"refused_a_clear_waits_for_an_image", sk_refused_clears.load()}, {"refused_tracker_mode", sk_refused_tracker.load()},
+                                    {"entries_erased_by_creates_or_deletes", sk_erased_by_deletes.load()}, {"map_cleared_when_too_big", sk_map_cleared.load()}}},
+                  {"reapply_gate", {{"on", ReapplyGateOn()}, {"skipped_unchanged", ra_gate_skipped.load()}, {"applied_changed_or_unknown", ra_gate_applied.load()}}},
             {"reapply_audit", {{"on", ReapplyAuditOn()}, {"batches", ra_batches.load()}, {"misaligned_batches", ra_misaligned_batches.load()}, {"ranges_audited", ra_audited.load()}, {"unhashed", ra_unhashed.load()},
                                {"unchanged", ra_unchanged.load()}, {"changed_and_announced_again", ra_changed_announced.load()}, {"changed_nobody_announced", ra_changed_unannounced.load()},
                                {"changed_nobody_announced_bytes", ra_unannounced_bytes.load()}}},

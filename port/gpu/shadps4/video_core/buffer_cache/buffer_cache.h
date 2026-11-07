@@ -151,6 +151,8 @@ public:
     [[nodiscard]] bool NativeCpuQuery(VAddr addr, size_t size);
     /// What a CPU write of [address, address + size) means for the caches (the harvest's replay; B2: an applied announcement)
     void ApplyCpuWrite(VAddr address, u64 size, bool newer = false);
+    /// TLG_ANNOUNCE_SKIP: may an announced write with the same bytes as the last announcement of these bytes be left unapplied? Not when the GPU wrote them since or an image covers them.
+    [[nodiscard]] u32 CanSkipIdenticalWrite(VAddr address, u64 size);
     /// B9.2: the engine deleted the buffer `id` at [address, address + bytes) (raster thread, in order): its announced bytes go; in native mode also the GPU written
     /// bytes and stream copies of its memory, unless another live buffer shares the memory
     void NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool native);

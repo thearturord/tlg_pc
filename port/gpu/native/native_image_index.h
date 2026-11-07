@@ -69,6 +69,8 @@ public:
 
     /// B8.1: the engine announced a CPU write of [addr, addr + size): the images it touches are marked and dirtied.
     void NoteAnnouncedWrite(VAddr addr, size_t size, bool newer);
+    /// True when announcing a write over [addr, addr + size) would do nothing to any image: no clear waits for a first image and no image overlaps the memory.
+    [[nodiscard]] u32 AnnouncedWriteIsInert(VAddr addr, size_t size); ///< 0 inert, 1 a clear waits for a first image, 2 an image is in the memory
     /// B8.2: the engine deleted the texture whose memory is [address, address + bytes): its images (same memory, not bigger) are freed (`free`) or marked.
     void NoteTextureDelete(u64 id, VAddr address, u64 bytes, bool free);
     /// B8.4: the engine created a texture at [address, address + bytes): older images in that memory are unlisted (a lookup that gives one out refreshes it).

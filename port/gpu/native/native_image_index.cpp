@@ -92,6 +92,21 @@ void NativeImageIndex::ImagesIn(const std::vector<u64>& ids, VAddr address, u64 
     }
 }
 
+u32 NativeImageIndex::AnnouncedWriteIsInert(VAddr addr, size_t size) {
+    if (!pending_clears.empty()) {
+        // only a clear that waits for a texture this memory belongs to is touched by the write (NoteAnnouncedWrite erases exactly those)
+        static thread_local std::vector<u64> ids;
+        ids.clear();
+        NativeDevice::TexturesIn(addr, size, ids);
+        for (const u64 id : ids) {
+            if (pending_clears.count(id) != 0) {
+                return 1;
+            }
+        }
+    }
+    return host.AnyImageIn(addr, size) ? 2 : 0;
+}
+
 void NativeImageIndex::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
     if (pending_clears.empty() && !host.AnyImageIn(addr, size)) {
         return; // no image in this memory (most announcements: buffer contents); the page table answers that in a few lookups

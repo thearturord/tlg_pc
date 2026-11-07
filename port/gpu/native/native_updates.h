@@ -68,6 +68,8 @@ struct Batch {
 [[nodiscard]] Batch TakeBatch();
 /// Applies a batch (raster thread: in order with the GPU work)
 void ApplyBatch(const Batch& batch);
+/// TLG_ANNOUNCE_SKIP: the buffer cache says whether an announced range with the same bytes as last time may be left unapplied: 0 yes, 1 the GPU wrote it, 2 an image covers it, 3 not in tracker mode.
+void SetSkipCheck(u32 (*fn)(void*, u64, u64), void* context);
 [[nodiscard]] nlohmann::json B2Report();
 
 /// B8.1 (`TLG_B8_IMAGES`): 0 off, 1 audit (texture memory stays write protected; a fault that dirtied an image no announcement explains is counted), 2 native (the

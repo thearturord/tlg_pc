@@ -87,6 +87,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         [this](VAddr address, u64 size, u32 timeout_ms) { return WaitForExplicitDownloads(address, size, timeout_ms); });
     // B2 cutover: an applied announcement is a CPU write for the caches
     Core::NativeUpdates::SetApply([](void* context, u64 address, u64 size, bool newer) { static_cast<BufferCache*>(context)->ApplyCpuWrite(address, size, newer); }, this);
+    Core::NativeUpdates::SetSkipCheck([](void* context, u64 address, u64 size) -> u32 { return static_cast<BufferCache*>(context)->CanSkipIdenticalWrite(address, size); }, this);
 }
 
 BufferCache::~BufferCache() {
@@ -138,6 +139,19 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
         TLG_PROF_LEVEL("cpuwrite.image_index", 3);
         texture_cache.EngineIndex().NoteAnnouncedWrite(address, size, newer);
     }
+}
+
+u32 BufferCache::CanSkipIdenticalWrite(VAddr address, u64 size) {
+    // the apply does its work in three places, and each has to be a no-op for these bytes: the buffers (only when the engine buffers are tracked by announcements, and the GPU wrote
+    // nothing over the range, else the CPU's bytes must win again), the images (none over the range, no clear waiting) and the resident buffers (their stamps stay: same bytes)
+    if (!Core::NativeUpdates::B9TrackerOff() || Core::NativeUpdates::B8ImageMode() == 0) {
+        return 3;
+    }
+    if (IsRangeGpuWritten(address, size)) {
+        return 1;
+    }
+    const u32 inert = texture_cache.EngineIndex().AnnouncedWriteIsInert(address, size);
+    return inert == 0 ? 0 : inert == 1 ? 4 : 2;
 }
 
 void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, std::vector<std::pair<VAddr, VAddr>>* gaps) {
