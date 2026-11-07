@@ -130,6 +130,15 @@ struct Prov {
     u64 number{};
 };
 std::map<u64, Prov> prov;
+/// The last upload of every small image from guest memory: the memory hash before the bytes were read and after the upload, to compare with the memory when a draw samples the image.
+struct Upload {
+    u64 size{};
+    u64 before{};
+    u64 after{};
+    u32 frame{};
+    u32 count{};
+};
+std::map<u64, Upload> uploads;
 constexpr size_t ProvMax = 400000;
 
 void ProvSet(u64 lo, u64 size, const Prov& p0) {
@@ -336,7 +345,39 @@ void NoteRead(const char* kind, u64 address, u64 size) {
     t_draw.reads.push_back(std::move(r));
 }
 
-void NoteImage(u64 address, u64 size, const std::string& description) {
+u64 UploadHash(u64 address, u64 size) {
+    if (!Armed() || size == 0 || size > (256u << 10)) {
+        return 0;
+    }
+    return RangeHash(address, size, nullptr);
+}
+
+void NoteImageUpload(u64 address, u64 size, u64 hash_before, u64 hash_after) {
+    if (hash_before == 0 && hash_after == 0) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    Upload& u = uploads[address];
+    u.size = size;
+    u.before = hash_before;
+    u.after = hash_after;
+    u.frame = static_cast<u32>(Core::DebugServer::PresentCount());
+    ++u.count;
+}
+
+void NoteImage(u64 address, u64 size, const std::string& description0) {
+    std::string description = description0;
+    if (t_active && address != 0 && size != 0 && size <= (256u << 10)) {
+        const u64 now = RangeHash(address, size, nullptr);
+        std::scoped_lock lock{mutex};
+        if (const auto it = uploads.find(address); it != uploads.end()) {
+            const Upload& u = it->second;
+            description += fmt::format(" | uploaded {}x, last at frame {}: memory before {:x} after {:x}, memory now {:x} => {}{}", u.count, u.frame, u.before, u.after, now,
+                                       u.after == now ? "image matches memory" : "MEMORY CHANGED SINCE THE UPLOAD", u.before != u.after ? " (memory changed DURING the upload)" : "");
+        } else {
+            description += fmt::format(" | never uploaded since the trace started (memory now {:x})", now);
+        }
+    }
     if (!t_active) {
         return;
     }

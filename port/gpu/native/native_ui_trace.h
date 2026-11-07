@@ -27,6 +27,9 @@ void BeginDraw(u64 seq, u64 ps_hash, u64 vs_hash, u64 color0, u32 count, u32 ins
 void NoteRead(const char* kind, u64 address, u64 size);
 /// Raster thread: an image the traced draw samples (guest address, byte size, description: format, size, tile mode, whether it is a render target of other draws).
 void NoteImage(u64 address, u64 size, const std::string& description);
+/// Raster thread, texture cache refresh: hash of the image's guest memory (0 when not armed or bigger than 256 KB). Call before the bytes are read and after the upload, then NoteImageUpload.
+[[nodiscard]] u64 UploadHash(u64 address, u64 size);
+void NoteImageUpload(u64 address, u64 size, u64 hash_before, u64 hash_after);
 /// Raster thread: the draw is done.
 void EndDraw();
 /// Raster thread: the GPU writes a guest memory range (texture cache invalidation by an image copy / clear / memory copy / written storage buffer or image). Kept only when it overlaps an image a traced draw

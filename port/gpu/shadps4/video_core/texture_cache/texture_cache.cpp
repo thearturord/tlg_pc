@@ -1270,6 +1270,7 @@ void TextureCache::RefreshImage(Image& image, Core::ImageCaller caller) {
 
     scheduler.EndRendering();
 
+    const u64 ui_hash_before = Core::UiTrace::UploadHash(image.info.guest_address, image.info.guest_size);
     TLG_PROF_NAMED_LEVEL(prof_obtain, "texture.refresh.obtain_bytes", 2);
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
@@ -1285,6 +1286,9 @@ void TextureCache::RefreshImage(Image& image, Core::ImageCaller caller) {
     {
         TLG_PROF_NAMED_LEVEL(prof_upload, "texture.refresh.upload", 2);
         runtime.UploadImage(&image, buffer, image_copies);
+    }
+    if (ui_hash_before != 0) {
+        Core::UiTrace::NoteImageUpload(image.info.guest_address, image.info.guest_size, ui_hash_before, Core::UiTrace::UploadHash(image.info.guest_address, image.info.guest_size));
     }
     if (!Core::NativeContent::InRing(image.info.guest_address, image.info.guest_size)) {
         Core::NativeContent::SilentImageUploaded(image.info.guest_address, image.info.guest_size, BufferCache::last_image_source_gpu); // W1.5 census
