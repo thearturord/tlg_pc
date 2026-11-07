@@ -115,10 +115,74 @@ struct Thumb {
     u64 id;
     u64 stamp_ns;
     std::vector<u8> bgra;
+    std::array<float, 16 * 9> grid{}; ///< mean brightness of 16x9 blocks (the glitch detector)
 };
 std::mutex thumbs_mutex;
 std::deque<Thumb> thumbs;
 u64 thumb_next_id{};
+
+// debugger mode glitch detector (2026-11-07): the owner cannot press F6 fast enough for a one frame glitch (slab). While debugger mode runs, the newest FullSlots
+// presented frames are also kept at full size; when the thumbnail of a frame differs in a few blocks from the average of both neighbours (and the neighbours
+// do not explain it by motion), that frame and its neighbours are saved as PNG into user/log/glitch_auto and the recording gets a GlitchMark (mode 3).
+// Calibrated on the 2026-11-07 pond freeze: the two slab frames scored 21.4 and 18.8, the next frame 12.9. TLG_GLITCH_AUTO=0 turns it off, TLG_GLITCH_AUTO_THRESHOLD changes 15.
+constexpr u32 FullSlots = 8;
+constexpr u32 GlitchAutoMax = 40; // sets of frames saved per run
+struct FullSlot {
+    Slot slot{};
+    u64 id{~u64{0}};
+};
+std::array<FullSlot, FullSlots> full_slots{};
+u32 full_next{};
+u32 glitch_auto_saved{};
+u64 glitch_auto_last_id{~u64{0}};
+
+bool GlitchAutoOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_GLITCH_AUTO");
+        return e == nullptr || e[0] != '0';
+    }();
+    return on;
+}
+
+float GlitchAutoThreshold() {
+    static const float v = [] {
+        const char* e = std::getenv("TLG_GLITCH_AUTO_THRESHOLD");
+        return e != nullptr && *e != 0 ? static_cast<float>(std::atof(e)) : 15.0f;
+    }();
+    return v;
+}
+
+void FillGrid(Thumb& t) {
+    // 256x144 BGRA: 16x9 blocks of 16x16 pixels
+    constexpr u32 BlockW = 16, BlockH = 16;
+    for (u32 by = 0; by < 9; ++by) {
+        for (u32 bx = 0; bx < 16; ++bx) {
+            u32 sum = 0;
+            for (u32 y = 0; y < BlockH; ++y) {
+                const u8* row = t.bgra.data() + (size_t{by * BlockH + y} * MonitorWidth + bx * BlockW) * 4;
+                for (u32 x = 0; x < BlockW; ++x) {
+                    sum += u32{row[x * 4 + 0]} + row[x * 4 + 1] + row[x * 4 + 2];
+                }
+            }
+            t.grid[by * 16 + bx] = static_cast<float>(sum) / (3.0f * BlockW * BlockH);
+        }
+    }
+}
+
+/// How strongly `mid` differs in some blocks from the average of `a` and `c`, beyond what a and c differ from each other
+float GlitchScore(const Thumb& a, const Thumb& mid, const Thumb& c) {
+    float best = 0.0f;
+    u32 blocks = 0;
+    for (size_t i = 0; i < mid.grid.size(); ++i) {
+        const float dev = std::fabs(mid.grid[i] - (a.grid[i] + c.grid[i]) * 0.5f);
+        const float motion = std::fabs(a.grid[i] - c.grid[i]);
+        const float score = dev - 0.5f * motion;
+        best = std::max(best, score);
+        blocks += score > 6.0f ? 1 : 0;
+    }
+    // a small bright thing (a butterfly) changes one or two blocks; the slab changed 7 and 11 of the 144
+    return blocks >= 5 ? best : 0.0f;
+}
 
 // writer thread
 std::mutex jobs_mutex;
@@ -726,6 +790,19 @@ void Record(const Vulkan::Instance& instance, vk::CommandBuffer cmdbuf, vk::Imag
             slot->stamp_ns = Core::FrameTimeline::Now();
             if (thumbs_enabled.load(std::memory_order_relaxed)) {
                 Core::FrameTimeline::Record(Core::FrameTimeline::ThumbFrame, static_cast<u64>(slot->pts_ms), slot->stamp_ns, Core::DebugServer::PresentCount());
+                if (GlitchAutoOn()) {
+                    FullSlot& full = full_slots[full_next++ % FullSlots];
+                    if (EnsureSlot(full.slot, u64{width} * height * 4)) {
+                        CopyToSlot(cmdbuf, image, width, height, full.slot);
+                        full.slot.tick = tick;
+                        full.slot.width = width;
+                        full.slot.height = height;
+                        full.slot.format = format;
+                        full.id = static_cast<u64>(slot->pts_ms);
+                    } else {
+                        full.id = ~u64{0};
+                    }
+                }
             }
             copied = true;
         }
@@ -832,10 +909,47 @@ void Poll(Vulkan::Scheduler& scheduler) {
                 job.pixels.assign(data, data + u64{slot->width} * slot->height * 4);
                 Thumb t{static_cast<u64>(slot->pts_ms), slot->stamp_ns, {}};
                 ToBgra(job, t.bgra);
+                FillGrid(t);
                 std::scoped_lock lock{thumbs_mutex};
                 thumbs.push_back(std::move(t));
                 while (thumbs.size() > ThumbsKept) {
                     thumbs.pop_front();
+                }
+                if (GlitchAutoOn() && glitch_auto_saved < GlitchAutoMax && thumbs.size() >= 3) {
+                    const Thumb& c = thumbs[thumbs.size() - 1];
+                    const Thumb& m = thumbs[thumbs.size() - 2];
+                    const Thumb& a = thumbs[thumbs.size() - 3];
+                    if (a.id + 1 == m.id && m.id + 1 == c.id && m.id != glitch_auto_last_id) {
+                        const float score = GlitchScore(a, m, c);
+                        if (score > GlitchAutoThreshold()) {
+                            glitch_auto_last_id = m.id;
+                            // the full size copies of the three frames, when they are still in the ring and the GPU finished them
+                            std::string saved;
+                            const u64 presents = Core::DebugServer::PresentCount();
+                            auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "glitch_auto";
+                            std::error_code ec;
+                            std::filesystem::create_directories(dir, ec);
+                            for (const u64 want : {a.id, m.id, c.id}) {
+                                const char* role = want == a.id ? "before" : (want == m.id ? "frame" : "after");
+                                for (FullSlot& f : full_slots) {
+                                    if (f.id != want || f.slot.mapped == nullptr || !scheduler.IsFree(f.slot.tick)) {
+                                        continue;
+                                    }
+                                    vmaInvalidateAllocation(vk_instance->GetAllocator(), f.slot.allocation, 0, VK_WHOLE_SIZE);
+                                    Job full_job{.kind = Kind::Screenshot, .width = f.slot.width, .height = f.slot.height, .format = f.slot.format};
+                                    const u8* d = static_cast<const u8*>(f.slot.mapped);
+                                    full_job.pixels.assign(d, d + u64{f.slot.width} * f.slot.height * 4);
+                                    full_job.path = (dir / fmt::format("glitch{:02}_thumb{}_{}.png", glitch_auto_saved, m.id, role)).string();
+                                    saved += role;
+                                    saved += ' ';
+                                    Submit(std::move(full_job));
+                                }
+                            }
+                            Core::FrameTimeline::Record(Core::FrameTimeline::GlitchMark, presents, Core::FrameTimeline::Now(), 3);
+                            LOG_WARNING(Render, "glitch detector: thumbnail {} differs from its neighbours (score {:.1f}); saved full size: {} (user/log/glitch_auto/glitch{:02}_*)", m.id, score, saved.empty() ? std::string{"none, the frames left the ring"} : saved, glitch_auto_saved);
+                            ++glitch_auto_saved;
+                        }
+                    }
                 }
             }
             if (MonitorEnv()) {
