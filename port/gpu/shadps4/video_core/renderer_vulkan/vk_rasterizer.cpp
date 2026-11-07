@@ -624,6 +624,7 @@ std::vector<UiShotPending> ui_shots_pending;
 /// The result of a GPU memory copy of picture size, read back right after it (UI trace)
 struct UiCopyPending {
     u64 number{};
+    int which{}; ///< 0 destination after the copy, 1 source image before it
     Vulkan::StagingBufferRef ref;
     u64 tick{};
 };
@@ -696,7 +697,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
                     }
                     nonzero += any ? 1 : 0;
                 }
-                Core::UiTrace::NoteCopyResult(it->number, nonzero, hash);
+                Core::UiTrace::NoteCopyResult(it->number, nonzero, hash, it->which);
                 it = ui_copies_pending.erase(it);
             } else {
                 ++it;
@@ -3234,7 +3235,27 @@ bool Rasterizer::TryCopyImages(VAddr dst, VAddr src, u32 num_bytes) {
     // images at the destination's address in other formats are stale afterwards
     texture_cache.InvalidateMemoryFromGPU(dst, num_bytes, "an image copy");
     texture_cache.UpdateImage(src_id, Core::ImageCaller::RasterizerTryCopyImages);
+    const bool ui_readback = Core::UiTrace::Armed() && num_bytes >= 16384 && num_bytes <= (256u << 10) && a.props.is_block && !a.props.is_depth && a.resources.layers == 1;
+    const auto ui_queue_readback = [&](VideoCore::Image& image, int which) {
+        auto ref = runtime.GetStagingPool().Request(image.info.guest_size, VideoCore::MemoryType::HostCached, 16, false);
+        const vk::BufferImageCopy readback_copy = {
+            .bufferOffset = ref.offset,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {image.info.size.width, image.info.size.height, 1},
+        };
+        runtime.DownloadImage(&image, ref.buffer, std::span{&readback_copy, 1});
+        ui_copies_pending.push_back({Core::UiTrace::LastCopyNumber(), which, ref, scheduler.CurrentTick()});
+    };
+    if (ui_readback) {
+        ui_queue_readback(source, 1); // what the source image holds before the copy
+    }
     runtime.CopyImage(&source, &destination);
+    if (ui_readback) {
+        ui_queue_readback(destination, 0); // and the destination after it
+    }
     destination.flags |= VideoCore::ImageFlagBits::GpuModified;
     destination.flags &= ~VideoCore::ImageFlagBits::Dirty;
     ++recorded_work;
@@ -3314,7 +3335,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         auto ref = runtime.GetStagingPool().Request(num_bytes, VideoCore::MemoryType::HostCached, 16, false);
         const vk::BufferCopy back = {.srcOffset = dst_offset, .dstOffset = ref.offset, .size = num_bytes};
         runtime.CopyBuffer(dst_buffer, ref.buffer, std::span{&back, 1});
-        ui_copies_pending.push_back({Core::UiTrace::LastCopyNumber(), ref, scheduler.CurrentTick()});
+        ui_copies_pending.push_back({Core::UiTrace::LastCopyNumber(), 0, ref, scheduler.CurrentTick()});
     }
     if (!dst_gds && VideoCore::ReadbackPolicy::Get().dma_async.load(std::memory_order_relaxed)) {
         // B6: only where the CPU reads the result (an explicit readback, a resource the engine made for CPU reads, or memory no engine resource owns)

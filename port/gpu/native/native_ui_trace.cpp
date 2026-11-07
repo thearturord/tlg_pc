@@ -149,6 +149,8 @@ std::map<u64, Upload> uploads;
 struct CopyResult {
     u32 nonzero_chunks{};
     u64 hash{};
+    s64 src_nonzero_chunks{-1}; ///< the source image just before an image copy (-1 unknown)
+    u64 src_hash{};
 };
 std::map<u64, CopyResult> copy_results; ///< by copy number
 u64 last_copy_number = 0;
@@ -516,9 +518,18 @@ u64 LastCopyNumber() {
     return last_copy_number;
 }
 
-void NoteCopyResult(u64 number, u32 nonzero_chunks, u64 hash) {
+void NoteCopyResult(u64 number, u32 nonzero_chunks, u64 hash, int which) {
     std::scoped_lock lock{mutex};
-    copy_results[number] = CopyResult{nonzero_chunks, hash};
+    CopyResult& r = copy_results[number];
+    if (which == 1) {
+        r.src_nonzero_chunks = nonzero_chunks;
+        r.src_hash = hash;
+    } else {
+        r.nonzero_chunks = nonzero_chunks;
+        r.hash = hash;
+        if (r.src_nonzero_chunks == -1 && false) {
+        }
+    }
     while (copy_results.size() > 6000) {
         copy_results.erase(copy_results.begin());
     }
@@ -640,8 +651,9 @@ std::string Json() {
     out += fmt::format("],\"gpu_writes_total\":{},\"gpu_copies\":[", write_number);
     for (size_t i = 0; i < copies.size(); ++i) {
         const Copy& c = copies[i];
-        out += fmt::format("{}{{\"n\":{},\"frame\":{},\"dst\":\"{:x}\",\"src\":\"{:x}\",\"size\":{},\"seq\":{},\"caller\":\"{:x}\",\"src_hash_then\":\"{:x}\",\"src_hash_now\":\"{:x}\",\"src_nonzero_chunks\":{},\"result_nz\":{},\"result_hash\":\"{:x}\"}}", i ? "," : "", c.number, c.frame, c.dst, c.src, c.size, c.seq, c.caller, c.src_hash, RangeHash(c.src, c.size, nullptr), c.src_nonzero_chunks,
-                           copy_results.contains(c.number) ? static_cast<s64>(copy_results[c.number].nonzero_chunks) : -1, copy_results.contains(c.number) ? copy_results[c.number].hash : 0ull);
+        out += fmt::format("{}{{\"n\":{},\"frame\":{},\"dst\":\"{:x}\",\"src\":\"{:x}\",\"size\":{},\"seq\":{},\"caller\":\"{:x}\",\"src_hash_then\":\"{:x}\",\"src_hash_now\":\"{:x}\",\"src_nonzero_chunks\":{},\"result_nz\":{},\"result_hash\":\"{:x}\",\"src_img_nz\":{},\"src_img_hash\":\"{:x}\"}}", i ? "," : "", c.number, c.frame, c.dst, c.src, c.size, c.seq, c.caller, c.src_hash, RangeHash(c.src, c.size, nullptr), c.src_nonzero_chunks,
+                           copy_results.contains(c.number) ? static_cast<s64>(copy_results[c.number].nonzero_chunks) : -1, copy_results.contains(c.number) ? copy_results[c.number].hash : 0ull,
+                           copy_results.contains(c.number) ? copy_results[c.number].src_nonzero_chunks : -1, copy_results.contains(c.number) ? copy_results[c.number].src_hash : 0ull);
     }
     out += "],\"gpu_writes\":[";
     std::vector<Write> sorted(writes.begin(), writes.end());
