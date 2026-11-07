@@ -13,6 +13,10 @@
 
 #include <fmt/format.h>
 
+#include "native_draw.h"
+#include "native_debug_server.h"
+#include "native_registry.h"
+
 namespace Core::UiTrace {
 
 namespace {
@@ -53,6 +57,22 @@ struct Change {
     Frame after;
 };
 constexpr size_t ChangesKept = 40;
+
+/// A GPU write into the memory of an image that a traced draw sampled.
+struct Write {
+    std::string by;
+    u64 address{};
+    u64 size{};
+    u64 seq{};
+    u64 caller{};
+    u32 frame{};
+    u64 number{}; ///< running number: the order of the writes
+};
+constexpr size_t WritesKept = 600;
+constexpr size_t WatchMax = 64;
+std::deque<Write> writes;
+std::vector<std::pair<u64, u64>> watch; ///< [address, address + size) of the images traced draws sampled
+u64 write_number = 0;
 
 std::atomic<bool> armed{false};
 std::mutex mutex;
@@ -221,11 +241,47 @@ void NoteImage(u64 address, u64 size, const std::string& description) {
     if (t_draw.reads.size() >= ReadsPerDraw) {
         return;
     }
+    if (address != 0 && size != 0) {
+        std::scoped_lock lock{mutex};
+        const std::pair<u64, u64> range{address, address + size};
+        if (watch.size() < WatchMax && std::ranges::find(watch, range) == watch.end()) {
+            watch.push_back(range);
+        }
+    }
     Read r;
     r.kind = "image: " + description;
     r.address = address;
     r.size = size;
     t_draw.reads.push_back(std::move(r));
+}
+
+void NoteGpuWrite(const char* by, u64 address, u64 size) {
+    if (!Armed() || size == 0) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    bool hit = false;
+    for (const auto& [lo, hi] : watch) {
+        if (address < hi && address + size > lo) {
+            hit = true;
+            break;
+        }
+    }
+    if (!hit) {
+        return;
+    }
+    Write w;
+    w.by = by != nullptr ? by : "?";
+    w.address = address;
+    w.size = size;
+    w.seq = Core::NativeRegistry::CurrentDrawSeq();
+    w.caller = w.seq != 0 ? Core::NativeDraw::RecordCallerGhidra(w.seq) : 0;
+    w.frame = static_cast<u32>(Core::DebugServer::PresentCount());
+    w.number = ++write_number;
+    writes.push_back(std::move(w));
+    while (writes.size() > WritesKept) {
+        writes.pop_front();
+    }
 }
 
 void EndDraw() {
@@ -276,6 +332,11 @@ std::string Json() {
     out += fmt::format("],\"changes_total\":{},\"changes\":[", changes_total);
     for (size_t c = 0; c < changes.size(); ++c) {
         out += fmt::format("{}{{\"before\":{},\"after\":{}}}", c ? "," : "", FrameJson(changes[c].before), FrameJson(changes[c].after));
+    }
+    out += fmt::format("],\"gpu_writes_total\":{},\"gpu_writes\":[", write_number);
+    for (size_t i = 0; i < writes.size(); ++i) {
+        const Write& w = writes[i];
+        out += fmt::format("{}{{\"n\":{},\"frame\":{},\"by\":\"{}\",\"address\":\"{:x}\",\"size\":{},\"seq\":{},\"caller\":\"{:x}\"}}", i ? "," : "", w.number, w.frame, w.by, w.address, w.size, w.seq, w.caller);
     }
     out += "],\"frames\":[";
     for (size_t f = 0; f < frames.size(); ++f) {

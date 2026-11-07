@@ -29,6 +29,9 @@ void NoteRead(const char* kind, u64 address, u64 size);
 void NoteImage(u64 address, u64 size, const std::string& description);
 /// Raster thread: the draw is done.
 void EndDraw();
+/// Raster thread: the GPU writes a guest memory range (texture cache invalidation by an image copy / clear / memory copy / written storage buffer or image). Kept only when it overlaps an image a traced draw
+/// has sampled: these are the writers of the title menu text pictures (they are all zero in guest memory, the GPU makes them).
+void NoteGpuWrite(const char* by, u64 address, u64 size);
 
 /// The kept frames as JSON.
 [[nodiscard]] std::string Json();

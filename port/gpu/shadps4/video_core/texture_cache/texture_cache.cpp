@@ -6,6 +6,7 @@
 #include <limits>
 #include <xxhash.h>
 #include "native/native_census.h"
+#include "native/native_ui_trace.h"
 #include "native/native_image_caller.h"
 #include "native/native_content.h"
 #include "native/native_debug_server.h"
@@ -278,6 +279,7 @@ void TextureCache::TouchFoundImage(ImageId image_id) {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, const char* by) {
+    Core::UiTrace::NoteGpuWrite(by, address, max_size);
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Only consider images that match base address.
         // TODO: Maybe also consider subresources

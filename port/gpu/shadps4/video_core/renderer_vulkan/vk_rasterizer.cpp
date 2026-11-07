@@ -2510,6 +2510,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
+            if (is_storage) {
+                Core::UiTrace::NoteGpuWrite("a storage image binding", image.info.guest_address, image.info.guest_size);
+            }
             if (Core::UiTrace::Active()) {
                 Core::UiTrace::NoteImage(image.info.guest_address, image.info.guest_size,
                                          fmt::format("{} {}x{} {} target={} storage={} bound_layout={}", vk::to_string(image.info.pixel_format), image.info.size.width, image.info.size.height,
