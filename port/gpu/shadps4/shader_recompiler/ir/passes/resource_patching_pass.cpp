@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <limits>
+#include "shader_recompiler/footprint.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/ir_emitter.h"
@@ -633,10 +634,79 @@ IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, const In
     return buffer_offset;
 }
 
+/// tlg shader footprint (footprint.h): the bytes of the buffer record this access can touch
+u32 FootprintAccessBytes(IR::Opcode op) {
+    using O = IR::Opcode;
+    switch (op) {
+    case O::LoadBufferU8:
+    case O::StoreBufferU8:
+        return 1;
+    case O::LoadBufferU16:
+    case O::StoreBufferU16:
+        return 2;
+    case O::LoadBufferU32x2:
+    case O::LoadBufferF32x2:
+    case O::StoreBufferU32x2:
+    case O::StoreBufferF32x2:
+    case O::LoadBufferU64:
+    case O::StoreBufferU64:
+    case O::BufferAtomicIAdd64:
+    case O::BufferAtomicSMin64:
+    case O::BufferAtomicUMin64:
+    case O::BufferAtomicSMax64:
+    case O::BufferAtomicUMax64:
+        return 8;
+    case O::LoadBufferU32x3:
+    case O::LoadBufferF32x3:
+    case O::StoreBufferU32x3:
+    case O::StoreBufferF32x3:
+        return 12;
+    case O::LoadBufferU32x4:
+    case O::LoadBufferF32x4:
+    case O::StoreBufferU32x4:
+    case O::StoreBufferF32x4:
+    case O::LoadBufferFormatF32: // up to four components of an element of its own format
+    case O::StoreBufferFormatF32:
+        return 16;
+    default:
+        return 4;
+    }
+}
+
+void NoteFootprint(const Info& info, u32 binding, const BufferResource& res, const IR::Inst& inst) {
+    const IR::Opcode op = inst.GetOpcode();
+    u32 lo = 0;
+    bool dynamic = false;
+    u32 bytes = FootprintAccessBytes(op);
+    const bool const_buffer = op == IR::Opcode::ReadConstBuffer;
+    if (const_buffer) {
+        const IR::Value dwords = inst.Arg(1); // flat constant buffer reads: the address is in dwords
+        if (dwords.IsImmediate()) {
+            lo = dwords.U32() * 4;
+        } else {
+            dynamic = true;
+        }
+    } else {
+        const auto inst_info = inst.Flags<IR::BufferInstInfo>();
+        lo = static_cast<u32>(inst_info.inst_offset.Value());
+        const IR::U32 soffset = IR::GetBufferSOffsetArg(&inst);
+        if (soffset.IsImmediate()) {
+            lo += soffset.U32();
+        } else {
+            dynamic = true;
+        }
+        dynamic |= inst_info.voffset_enable.Value() != 0;
+    }
+    const bool in_user_data = (res.sharp_fetch.load_mask & 1) != 0;
+    Footprint::NoteBufferAccess(info, binding, in_user_data ? res.sharp_fetch.offsets[0] : 0, in_user_data, lo, bytes, dynamic, IsBufferStore(inst) || IsBufferAtomic(inst),
+                                op == IR::Opcode::LoadBufferFormatF32 || op == IR::Opcode::StoreBufferFormatF32, const_buffer);
+}
+
 void PatchBufferArgs(IR::Inst& inst, Info& info) {
     const auto handle = inst.Arg(0);
     const auto buffer_res = info.buffers[handle.U32()];
     const auto buffer = buffer_res.GetSharp(info);
+    NoteFootprint(info, handle.U32(), buffer_res, inst);
 
     // Address of constant buffer reads can be calculated at IR emission time.
     if (inst.GetOpcode() == IR::Opcode::ReadConstBuffer) {

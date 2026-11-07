@@ -4,6 +4,7 @@
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
+#include "shader_recompiler/footprint.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/frontend/translate/translate.h"
@@ -1199,6 +1200,8 @@ void Translator::EmitFetch(const GcnInst& inst) {
 
         // Read the V# of the attribute to figure out component number and type.
         const auto buffer = attrib.GetSharp(info);
+        Footprint::NoteVertexAttribute(info, semantic, attrib.sgpr_base, attrib.dword_offset, attrib.num_elements, buffer.stride,
+                                       AmdGpu::NumBitsPerElement(buffer.GetDataFmt()) / 8, static_cast<u32>(attrib.instance_data));
         const auto values =
             ir.CompositeConstruct(ir.GetAttribute(attr, 0), ir.GetAttribute(attr, 1),
                                   ir.GetAttribute(attr, 2), ir.GetAttribute(attr, 3));

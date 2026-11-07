@@ -45,6 +45,7 @@
 #include "native/native_entry_dump.h"
 #include "video_core/renderdoc.h"
 #include "native/native_readbacks.h"
+#include "shader_recompiler/footprint.h"
 #include "native/native_raycast_cpu.h"
 #include "native/native_prof.h"
 #include "native/native_stall.h"
@@ -600,7 +601,12 @@ void RegisterBuiltins() {
              });
     Register("/readbacks", "explicit readbacks, step 1: destinations of the engine's copy / counter read-back records, AsyncMap ranges, CPU read faults",
              [](const Params&) { return Core::NativeReadbacks::Report(); });
-    Register("/raycast", "CPU port of the ray against triangle shader (0xe15f3156), shadow compare against the GPU result (TLG_RAYCAST_SHADOW=1)",
+    Register("/shader_footprint", "?hash=<hex part of the program hash> (empty: all): per shader, the bytes of each buffer it can read or write (constant offsets, dynamic count) and its vertex attributes; only shaders recompiled in this run",
+             [](const Params& params) {
+                 const auto it = params.find("hash");
+                 return Shader::Footprint::Report(it == params.end() ? std::string{} : it->second);
+             });
+    Register("/raycast","CPU port of the ray against triangle shader (0xe15f3156), shadow compare against the GPU result (TLG_RAYCAST_SHADOW=1)",
              [](const Params&) { auto j = Core::NativeRaycast::Report(); j["skin"] = Core::NativeSkinCpu::Report(); return j; });
     Register("/stall_capture", "?seconds=10 starts the stall profiler (the same as F8); without arguments it shows whether it runs",
              [](const Params& params) {
