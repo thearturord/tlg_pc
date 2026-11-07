@@ -497,6 +497,7 @@ void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, boo
                         all_object_dirty.Add(address, bytes);
                     }
                 }
+                BindMemoErase(address, bytes); // D4: the new buffer's first upload must not be skipped by a memo answer
                 b9_epoch.fetch_add(1, std::memory_order_acq_rel);
                 if (auto* object = Core::NativeResources::FindImmutableById(id)) {
                     object->resident_buffer.store(entry.buffer.get(), std::memory_order_relaxed);

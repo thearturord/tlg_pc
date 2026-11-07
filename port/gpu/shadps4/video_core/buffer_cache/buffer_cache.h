@@ -102,6 +102,8 @@ public:
     /// Binding memo (raster thread): a read-only request of at most BindMemoMax bytes asked again in the same command buffer, with nothing written to its memory
     /// since and nothing moved, gets the same answer without the lookups and synchronization (TLG_BIND_MEMO, default on; =0 off)
     static constexpr u64 BindMemoMax = 65536;
+    /// D4 (`TLG_BIND_MEMO_WIDE`, see BindMemoWideMode in the .cpp): read-only texel buffers and read-only requests up to this size use the memo too
+    static constexpr u64 BindMemoWideMax = u64{1} << 17; // 128 KiB: an erase looks back this far in the tree, a 16 MiB bound made every erase walk thousands of entries (measured 1.2 ms per frame)
     static constexpr size_t BindMemoMaxAddresses = 200000; ///< the memo is cleared at a new command buffer when it holds more addresses (stale copy entries are no longer walked away)
     void BindMemoErase(VAddr address, u64 size);
     void BindMemoBump() noexcept {
@@ -201,6 +203,9 @@ private:
     /// Bytes the last SynchronizeMemory of this thread copied from guest memory (resource census).
     static inline thread_local u64 last_upload_bytes{};
 public:
+    /// D4 sizing: the upload counter of this thread, to attribute bytes to the binding kind that caused them.
+    static void UploadBytesReset() noexcept { last_upload_bytes = 0; }
+    [[nodiscard]] static u64 UploadBytes() noexcept { return last_upload_bytes; }
     /// True when the last ObtainBufferForImage of this thread read GPU written memory (the data came from the arena, not from guest memory).
     static inline thread_local bool last_image_source_gpu{};
 private:
@@ -243,14 +248,18 @@ private:
         u64 offset;
         u64 range_epoch, placement_epoch, wraps, epoch;
         u64 tick; ///< the command buffer the answer was made in (an answer that names a copy in the stream buffer is valid in that one only)
+        bool texel{false};
+        bool lingered{false}; ///< verify mode only: announced bytes were still pending over the range right after the call that made the entry (they were taken another way)
     };
     struct BindMemo {
         u64 tick{~u64{0}};
+        u64 max_size{BindMemoMax}; ///< the largest request ever stored: a write erases the entries that start up to this far before it
         absl::btree_map<VAddr, boost::container::small_vector<BindMemoEntry, 2>> entries; ///< (a B-tree: the lookup per request walked a node tree of 10 000+ addresses, a cache miss per level)
     };
     std::array<BindMemo, 2> bind_memos; ///< by stream (graphics, side)
     std::atomic<u64> bind_memo_epoch{0}; ///< bumped by writes the raster thread does not see by range (faults, the command processor)
     std::array<std::atomic<u64>, 4> bind_memo_counts{}; ///< hits, misses, entries erased by writes, memo cleared
+    std::array<std::atomic<u64>, 32> bind_memo_wide_counts{}; // [0..9] widened class, [10..19] the classic class (same meaning, mode 1 only) ///< widened class: answers used, compared (mode 1), different answer, stream answers, uncached call did work, hits seen
     std::pair<const Buffer*, u64> ObtainBufferUncached(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                        Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object);
     // zero copy (TLG_ZERO_COPY=1, zero-copy-dynamic-buffers.md): counters

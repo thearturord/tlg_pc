@@ -2111,8 +2111,31 @@ void Rasterizer::BindBuffersBody(const Shader::Info& stage, Shader::Backend::Bin
                 Core::NativeContent::SetBindContext({"shader binding", record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].id : 0,
                                                      record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].view_id : 0, stage.pgm_hash,
                                                      static_cast<u32>(stage.sw_stage), immutable_hint != nullptr, desc.is_written, vsharp.address, size});
-                const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-                    vsharp.address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2, cp_no_object);
+                // D4 sizing (2026-11-07): the same call, timed by what kind of binding it serves
+                const auto [buffer, offset] = [&] {
+                    VideoCore::BufferCache::UploadBytesReset();
+                    if (immutable_hint != nullptr) {
+                        TLG_PROF_LEVEL("bind.obtain_by_handle", 3);
+                        if (stage.sw_stage == Shader::SwStage::Compute) {
+                            if (desc.is_written) { TLG_PROF_COUNT("bind.handle.compute.written"); } else if (desc.is_formatted) { TLG_PROF_COUNT("bind.handle.compute.texel"); } else { TLG_PROF_COUNT("bind.handle.compute.plain"); }
+                        } else {
+                            if (desc.is_written) { TLG_PROF_COUNT("bind.handle.graphics.written"); } else if (desc.is_formatted) { TLG_PROF_COUNT("bind.handle.graphics.texel"); } else { TLG_PROF_COUNT("bind.handle.graphics.plain"); }
+                        }
+                        const auto r = buffer_cache.ObtainBuffer(vsharp.address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2, cp_no_object);
+                        if (stage.sw_stage == Shader::SwStage::Compute) { TLG_PROF_ADD("bind.uploaded_bytes_compute_handle", VideoCore::BufferCache::UploadBytes()); } else { TLG_PROF_ADD("bind.uploaded_bytes_graphics_handle", VideoCore::BufferCache::UploadBytes()); }
+                        return r;
+                    } else if (desc.is_written) {
+                        TLG_PROF_LEVEL("bind.obtain_by_address_written", 3);
+                        const auto r = buffer_cache.ObtainBuffer(vsharp.address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2, cp_no_object);
+                        if (stage.sw_stage == Shader::SwStage::Compute) { TLG_PROF_ADD("bind.uploaded_bytes_compute_addr_written", VideoCore::BufferCache::UploadBytes()); } else { TLG_PROF_ADD("bind.uploaded_bytes_graphics_addr_written", VideoCore::BufferCache::UploadBytes()); }
+                        return r;
+                    } else {
+                        TLG_PROF_LEVEL("bind.obtain_by_address_read", 3);
+                        const auto r = buffer_cache.ObtainBuffer(vsharp.address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2, cp_no_object);
+                        if (stage.sw_stage == Shader::SwStage::Compute) { TLG_PROF_ADD("bind.uploaded_bytes_compute_addr_read", VideoCore::BufferCache::UploadBytes()); } else { TLG_PROF_ADD("bind.uploaded_bytes_graphics_addr_read", VideoCore::BufferCache::UploadBytes()); }
+                        return r;
+                    }
+                }();
                 Core::NativeContent::ClearBindContext();
                 if (Core::LightRecorder::On() && !Core::LightRecorder::Recording() && draw_class_now == 0 && size <= 1024 && !desc.is_written) {
                     Core::LightRecorder::ShadowBuffer(Core::DebugServer::PresentCount(), vsharp.address, size); // a z / shadow draw's view constants candidate

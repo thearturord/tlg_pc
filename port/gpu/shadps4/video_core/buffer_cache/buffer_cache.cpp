@@ -97,6 +97,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
     if (Core::NativeUpdates::B9TrackerOff()) {
         // a CPU change found without an announcement (a write fault, a decoder writing memory): the engine buffers it meets take it too
         Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9OtherChanges);
+        BindMemoBump(); // D4: an unannounced write (any thread) did not reach the memo before: every answer is checked again
         MarkBuffersChanged(device_addr, size, false, nullptr);
     }
     // E4: no GPU bytes are flushed to guest memory here (the fault readback is gone: no page is ever made unreadable)
@@ -291,6 +292,17 @@ struct BindGuard {
 };
 } // namespace
 
+/// D4 `TLG_BIND_MEMO_WIDE` (default 0): 1 the memo also answers read-only texel buffers and read-only requests over BindMemoMax (up to BindMemoWideMax), but the uncached answer is
+/// used and the two are compared, plus whether the uncached call did any work a memo hit would have skipped (counted); 2 the memo answer is used. Written requests never use
+/// the memo: they mark the bytes GPU written, which is state, not a lookup.
+static u32 BindMemoWideMode() {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_BIND_MEMO_WIDE");
+        return e != nullptr && *e >= '0' && *e <= '2' ? static_cast<u32>(*e - '0') : 0u;
+    }();
+    return mode;
+}
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                         Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
     const BindGuard bind_guard{reinterpret_cast<u64>(__builtin_return_address(0)), device_addr, size, is_written, immutable_hint != nullptr};
@@ -299,7 +311,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         TLG_PROF_LEVEL("buffer.obtain.written_erase", 3);
         BindMemoErase(device_addr, size); // the GPU writes it: answers over this memory are stale
     }
-    if (is_written || is_texel_buffer || size > BindMemoMax || !BindMemoOn()) {
+    const u32 wide_mode = BindMemoWideMode();
+    const bool wide_class = wide_mode != 0 && !is_written && (is_texel_buffer || size > BindMemoMax) && size <= BindMemoWideMax;
+    if (is_written || ((is_texel_buffer || size > BindMemoMax) && !wide_class) || !BindMemoOn()) {
         if (is_written) {
             TLG_PROF_COUNT("buffer.request.written");
         } else if (is_texel_buffer) {
@@ -327,8 +341,52 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const u64 arenas = PlacementEpoch();
     if (const auto it = memo.entries.find(device_addr); it != memo.entries.end()) {
         for (const auto& e : it->second) {
-            if (e.size == size && e.epoch == epoch && e.range_epoch == ranges && e.placement_epoch == arenas &&
+            if (e.size == size && e.texel == is_texel_buffer && e.epoch == epoch && e.range_epoch == ranges && e.placement_epoch == arenas &&
                 (e.buffer != &stream_buffer || (e.wraps == stream_buffer.WrapCount() && e.tick == tick))) {
+                if (wide_class || wide_mode == 1) {
+                    const u32 cb = wide_class ? 0u : 10u; // counter base: widened class or classic class
+                    bind_memo_wide_counts[cb + 5].fetch_add(1, std::memory_order_relaxed);
+                    if (wide_class) {
+                        TLG_PROF_COUNT("buffer.bind_memo.wide_hit");
+                    }
+                    if (wide_mode == 1) {
+                        // verify: the uncached answer decides; the memo's is compared, and so is whether the uncached call did anything a hit would have skipped
+                        const auto* list = scheduler.CommandBuffer().List();
+                        const u64 commands_before = list != nullptr ? list->Size() : 0;
+                        UploadBytesReset();
+                        const bool cpu_modified_before = IsRegionCpuModified(device_addr, size);
+                        const bool tracker_before = NativeCpuQuery(device_addr, size);
+                        const auto answer = ObtainBufferUncached(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
+                        const u64 commands_after = list != nullptr ? list->Size() : 0;
+                        bind_memo_wide_counts[cb + 1].fetch_add(1, std::memory_order_relaxed);
+                        const bool stream = e.buffer == &stream_buffer;
+                        if (stream) {
+                            bind_memo_wide_counts[cb + 3].fetch_add(1, std::memory_order_relaxed);
+                        }
+                        if (answer.first != e.buffer || (!stream && answer.second != e.offset)) {
+                            bind_memo_wide_counts[cb + 2].fetch_add(1, std::memory_order_relaxed);
+                            static std::atomic<u32> logged{0};
+                            if (logged.fetch_add(1) < 8) {
+                                LOG_ERROR(Render, "bind memo (wide) answered {:p}+{:#x}, the uncached answer is {:p}+{:#x} for {:#x}+{:#x} (texel {})", static_cast<const void*>(e.buffer), e.offset,
+                                          static_cast<const void*>(answer.first), answer.second, device_addr, size, is_texel_buffer);
+                            }
+                        }
+                        if ((UploadBytes() != 0 || commands_after != commands_before) && e.lingered) {
+                            bind_memo_wide_counts[cb + 20].fetch_add(1, std::memory_order_relaxed); // explained: the entry was made with announced bytes still pending over it
+                        } else if (UploadBytes() != 0 || commands_after != commands_before) {
+                            bind_memo_wide_counts[cb + 4].fetch_add(1, std::memory_order_relaxed);
+                            bind_memo_wide_counts[cb + (cpu_modified_before ? 6 : 7)].fetch_add(1, std::memory_order_relaxed);
+                            bind_memo_wide_counts[cb + (tracker_before ? 8 : 9)].fetch_add(1, std::memory_order_relaxed);
+                            static std::atomic<u32> logged_work{0};
+                            if (logged_work.fetch_add(1) < 8) {
+                                LOG_ERROR(Render, "bind memo (wide) would have skipped work: {:#x}+{:#x} (texel {}) uploaded {} bytes, {} commands", device_addr, size, is_texel_buffer, UploadBytes(),
+                                          commands_after - commands_before);
+                            }
+                        }
+                        return answer;
+                    }
+                    bind_memo_wide_counts[cb + 0].fetch_add(1, std::memory_order_relaxed);
+                }
                 bind_memo_counts[0].fetch_add(1, std::memory_order_relaxed);
                 TLG_PROF_COUNT("buffer.bind_memo.hit");
                 return {e.buffer, e.offset};
@@ -342,9 +400,11 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     TLG_PROF_LEVEL("buffer.obtain.memo_insert", 3);
     if (memo.tick == tick) {
         auto& list = memo.entries[device_addr];
-        list.erase(std::remove_if(list.begin(), list.end(), [&](const BindMemoEntry& e) { return e.size == size; }), list.end());
+        list.erase(std::remove_if(list.begin(), list.end(), [&](const BindMemoEntry& e) { return e.size == size && e.texel == is_texel_buffer; }), list.end());
         // the epochs as they were before the request: anything the request itself changed makes the next one ask again
-        list.push_back({size, result.first, result.second, ranges, arenas, result.first == &stream_buffer ? stream_buffer.WrapCount() : 0, epoch, tick});
+        list.push_back({size, result.first, result.second, ranges, arenas, result.first == &stream_buffer ? stream_buffer.WrapCount() : 0, epoch, tick, is_texel_buffer,
+                        BindMemoWideMode() == 1 && IsRegionCpuModified(device_addr, size)});
+        memo.max_size = std::max<u64>(memo.max_size, size);
     }
     return result;
 }
@@ -354,7 +414,7 @@ void BufferCache::BindMemoErase(VAddr address, u64 size) {
         if (memo.entries.empty()) {
             continue;
         }
-        auto it = memo.entries.lower_bound(address >= BindMemoMax ? address - BindMemoMax : 0);
+        auto it = memo.entries.lower_bound(address >= memo.max_size ? address - memo.max_size : 0);
         while (it != memo.entries.end() && it->first < address + size) {
             it->second.erase(std::remove_if(it->second.begin(), it->second.end(), [&](const BindMemoEntry& e) { return it->first + e.size > address; }), it->second.end());
             if (it->second.empty()) {
@@ -368,7 +428,14 @@ void BufferCache::BindMemoErase(VAddr address, u64 size) {
 }
 
 nlohmann::json BufferCache::BindMemoReport() const {
-    return {{"on", BindMemoOn()}, {"hits", bind_memo_counts[0].load()}, {"misses", bind_memo_counts[1].load()}, {"addresses_erased_by_writes", bind_memo_counts[2].load()}};
+    return {{"on", BindMemoOn()}, {"hits", bind_memo_counts[0].load()}, {"misses", bind_memo_counts[1].load()}, {"addresses_erased_by_writes", bind_memo_counts[2].load()},
+            {"wide", {{"mode", BindMemoWideMode()}, {"hits_seen", bind_memo_wide_counts[5].load()}, {"answers_used", bind_memo_wide_counts[0].load()}, {"compared", bind_memo_wide_counts[1].load()},
+                      {"DIFFERENT_ANSWER_MUST_BE_0", bind_memo_wide_counts[2].load()}, {"compared_stream_answers", bind_memo_wide_counts[3].load()}, {"UNCACHED_DID_WORK_MUST_BE_0", bind_memo_wide_counts[4].load()},
+                      {"work_explained_by_dirt_that_lingered", bind_memo_wide_counts[20].load()}, {"CLASSIC_work_explained_by_dirt_that_lingered", bind_memo_wide_counts[30].load()},
+                      {"CLASSIC_hits_seen", bind_memo_wide_counts[15].load()}, {"CLASSIC_DIFFERENT_ANSWER_MUST_BE_0", bind_memo_wide_counts[12].load()}, {"CLASSIC_UNCACHED_DID_WORK_MUST_BE_0", bind_memo_wide_counts[14].load()},
+                      {"CLASSIC_work_with_cpu_modified_true_before", bind_memo_wide_counts[16].load()},
+                      {"work_with_cpu_modified_true_before", bind_memo_wide_counts[6].load()}, {"work_with_cpu_modified_false_before", bind_memo_wide_counts[7].load()},
+                      {"work_with_any_announced_dirty_before", bind_memo_wide_counts[8].load()}, {"work_with_none_announced_before", bind_memo_wide_counts[9].load()}}}};
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
