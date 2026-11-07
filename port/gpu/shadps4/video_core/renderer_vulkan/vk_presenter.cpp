@@ -449,6 +449,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
                             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
             runtime.FlushBarriers();
+            draw_scheduler.SyncedCommandBuffer(); // replay the flushed barrier into cmdbuf before the direct commands
             DumpRaw(instance, draw_scheduler, cmdbuf, image.GetImage(),
                     vk::ImageLayout::eTransferSrcOptimal, image.info.size.width,
                     image.info.size.height, "display", frame_dump_index);
@@ -459,6 +460,13 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                         vk::PipelineStageFlagBits2::eFragmentShader,
                         vk::AccessFlagBits2::eShaderRead);
         runtime.FlushBarriers();
+        // 2026-11-07 (gpu-ordering-plan step 1): with command recording the flushed barrier sits in the recorded list, but the passes below
+        // record straight into cmdbuf, so the display image was sampled before its layout change (validation: layout mismatch on all three
+        // 4K display buffers). Replay the list now so the barrier comes first. TLG_PRESENT_BARRIER_REPLAY=0 turns it off.
+        static const bool replay = [] { const char* e = std::getenv("TLG_PRESENT_BARRIER_REPLAY"); return e == nullptr || e[0] != '0'; }();
+        if (replay) {
+            draw_scheduler.SyncedCommandBuffer();
+        }
     }
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
 
