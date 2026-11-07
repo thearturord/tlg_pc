@@ -540,7 +540,9 @@ void NoteCopyResult(u64 number, u32 nonzero_chunks, u64 hash, int which) {
         if (r.src_nonzero_chunks == -1 && false) {
         }
     }
-    while (copy_results.size() > 6000) {
+    // keep a result as long as its copy is kept (the copies list holds the newest CopiesKept copies): dropping by count lost the results of the older hops of a chain
+    const u64 oldest_copy = copies.empty() ? 0 : copies.front().number;
+    while (!copy_results.empty() && (copy_results.begin()->first < oldest_copy || copy_results.size() > 40000)) {
         copy_results.erase(copy_results.begin());
     }
 }
@@ -699,7 +701,7 @@ std::string Json() {
                 first = false;
                 u64 lo = r.address, size = r.size;
                 bool firstc = true;
-                for (int level = 0; level < 8 && size != 0; ++level) {
+                for (int level = 0; level < 40 && size != 0; ++level) {
                     u64 next_src = 0;
                     auto it = prov.upper_bound(lo);
                     if (it != prov.begin()) {
