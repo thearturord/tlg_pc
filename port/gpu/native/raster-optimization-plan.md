@@ -122,3 +122,19 @@ Shadow census (`TLG_BIND_CENSUS=1`, `Rasterizer::BindCensus`, logged as "bind ce
 ## Result 2026-11-07: phase 1 step 1, the re-apply is gated by a hash (`TLG_REAPPLY`, default on, =0 old behaviour)
 
 Audit (`TLG_REAPPLY_AUDIT=1`, headless default scene, depth 1): of 4.35 M ranges that came back for their second application, **99.90% had the same memory as at the first application**; 0.02% changed and the newer batch announced the same bytes again; **0.078% (3,401 ranges, 20 MB) changed with nobody announcing them: those are what the second application exists for (an announcer that fires before its write), so it cannot simply be dropped.** Step taken instead: the memory of every range is hashed when applied first and again when it comes back; only a changed range (or one that cannot be hashed, over 1 MB, or a batch whose lists do not line up) is applied the second time. Result in the same run: 4,346,213 second applications skipped, 7,005 applied. Raster thread busy time per frame 33.15 to 26.54 ms (one capture each, headless, 26.0 to 30.3 fps); `cpuwrite.*` calls per frame 3,100 to 1,548. Counters: `/stats native_backend.b2_applied.reapply_gate`. Not play-tested yet.
+
+## Result 2026-11-07: state of the raster thread after the first optimization round (branch `tlg-optimize`)
+
+Headless, real depth-1 setup (`Play TLG writers depth 1.cmd` switches), default scene. Raster thread busy time per frame: **33.15 ms at the start, 24.5 to 25.4 ms now** (frame 31 to 32 ms, 31 to 33 fps; the game's own frame is not the limit). Changes, newest last:
+
+1. Buffer index as a sorted array (binary search) instead of `std::map`; empty `Subtract` calls skipped.
+2. Bind memo: per-entry command buffer tick instead of a walk of the whole memo at each command buffer.
+3. B-tree maps for the bind memo and the live resource table.
+4. Re-apply of announced writes gated by a hash (4.35 M of 4.35 M second applications skipped, 7,005 applied). `TLG_REAPPLY=0` turns it off.
+5. Texture set memo on by default (`TLG_TEXTURE_SET_MEMO=0` off).
+6. The census walk in `NoteCpuWrite` runs only when the census is on; `PlacedAt` keeps its last answer per thread (valid until the placed table changes).
+7. `MarkBuffersChanged`: the unattributed set is updated as set algebra (parts leave, gaps join) without adding the whole range and removing it again (1.17 to 0.96 us per call).
+
+Dead end: a draw binding cache (97% of binds copy into the stream ring, the descriptors differ from the previous frame in every case).
+
+What is left is flat: 12.8 k buffer lookups per frame (`buffer.obtain` 3.0 ms own, `bind_buffers` 2.7, `part.stream` 1.9 for 5.8 k small copies, `mark_buffers` 1.5, `texture.slow_path` 1.6, `sync.upload` 1.3, the rest each under 1 ms). Sampling profile: the boost interval sets (`gpu_modified_ranges`, `object_dirty`, `b9_unattributed`, `all_object_dirty`) are about 6% inclusive, xxhash 2.6%, memcpy 2.7%. A further large cut needs a structural change (fewer lookups per draw, or the apply of announced writes off the raster thread), not more micro-steps. Single captures vary by up to 3x per probe: compare only A/B in the same session.
