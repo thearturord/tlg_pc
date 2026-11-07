@@ -20,6 +20,12 @@ bool g_on = [] {
     return e != nullptr && e[0] == '1';
 }();
 thread_local u32 t_mask = 0;
+thread_local u32 t_phase = 0;
+thread_local u32 t_touch[8][32]{};
+thread_local u64 t_phase_at = 0;
+thread_local u64 t_phase_ns[PhaseCount]{};
+thread_local u32 t_phase_scopes[PhaseCount]{};
+thread_local u32 t_counts[PhaseCount][CounterCount]{};
 
 namespace {
 
@@ -30,6 +36,7 @@ struct MaskStat {
 struct Group {
     u64 n{};
     u64 ns{};
+    u64 phase_ns[PhaseCount]{};
     std::map<u32, MaskStat> masks;
 };
 
@@ -42,6 +49,11 @@ constexpr const char* ClassNames[5] = {"graphics_queue", "compute_queue_1", "que
 std::map<std::tuple<u32, u32, const char*, u32>, Group> groups;
 u64 total_ns = 0;
 u64 total_n = 0;
+u64 phase_total_ns[4][PhaseCount]{};   ///< by kind (draw, depth-only draw, dispatch, closure), corrected for timer cost
+u64 phase_announce_closure_ns[PhaseCount]{};
+u64 scopes_total = 0;
+u64 touch_by_phase[8][32]{};
+u64 counts_by_phase[PhaseCount][CounterCount]{};
 u64 ns_by_cache_class[BitCount]{};      ///< time of operations that touched the class (an operation counts for every class it touched)
 u64 ns_no_cache = 0;                    ///< operations that touched no cache class
 u64 ns_one_cache = 0;                   ///< operations that touched exactly one cache class
@@ -79,6 +91,38 @@ void Record(u32 kind, u32 queue_class, const char* file, u32 line, u32 mask, u64
     MaskStat& m = group.masks[mask];
     ++m.n;
     m.ns += ns;
+    // the phases of this operation (the census ran Begin() before it): charge the tail to the running phase, take the timer cost off
+    {
+        const u64 now = PhaseNow();
+        t_phase_ns[t_phase] += now - t_phase_at;
+        static const double per_scope = [] {
+            // cost of one scope (two clock reads and the bookkeeping), measured here once
+            const u64 t0 = PhaseNow();
+            for (int i = 0; i < 100000; ++i) {
+                PhaseScope s{PhaseMixed};
+            }
+            const u64 t1 = PhaseNow();
+            return static_cast<double>(t1 - t0) / 100000.0;
+        }();
+        for (u32 i = 0; i < PhaseCount; ++i) {
+            const double cost = per_scope * t_phase_scopes[i];
+            const u64 corrected = t_phase_ns[i] > cost ? static_cast<u64>(t_phase_ns[i] - cost) : 0;
+            group.phase_ns[i] += corrected;
+            if (kind == 3 && t_phase_ns[PhaseAnnounce] != 0) {
+                phase_announce_closure_ns[i] += corrected;
+            }
+            phase_total_ns[kind][i] += corrected;
+            scopes_total += t_phase_scopes[i];
+            for (u32 b = 0; b < BitCount; ++b) {
+                touch_by_phase[i][b] += t_touch[i][b];
+                t_touch[i][b] = 0;
+            }
+            for (u32 c = 0; c < CounterCount; ++c) {
+                counts_by_phase[i][c] += t_counts[i][c];
+                t_counts[i][c] = 0;
+            }
+        }
+    }
     ++total_n;
     total_ns += ns;
     ns_by_kind[kind] += ns;
@@ -121,6 +165,45 @@ void PublishAndReset() {
         kinds[KindNames[k]] = {{"ms", ns_by_kind[k] / 1e6}, {"ms_no_cache", ns_no_cache_by_kind[k] / 1e6}};
     }
     out["by_kind"] = kinds;
+    {
+        static const char* PhaseNames[PhaseCount] = {"record_rest", "buf_resolve", "img_resolve", "img_refresh", "upload", "barrier_flush", "bind_glue", "announce"};
+        static const char* CounterNames[CounterCount] = {"barrier_query", "tick_is_free", "tick_current", "gpu_written_check", "image_overlap"};
+        json phases = json::object();
+        for (u32 k = 0; k < 4; ++k) {
+            json row = json::object();
+            for (u32 i = 0; i < PhaseCount; ++i) {
+                row[PhaseNames[i]] = phase_total_ns[k][i] / 1e6;
+            }
+            phases[KindNames[k]] = row;
+        }
+        json announce = json::object();
+        for (u32 i = 0; i < PhaseCount; ++i) {
+            announce[PhaseNames[i]] = phase_announce_closure_ns[i] / 1e6;
+        }
+        phases["closures_that_ran_an_announce_batch"] = announce;
+        json counts = json::object();
+        for (u32 i = 0; i < PhaseCount; ++i) {
+            json row = json::object();
+            for (u32 c = 0; c < CounterCount; ++c) {
+                row[CounterNames[c]] = counts_by_phase[i][c];
+            }
+            counts[PhaseNames[i]] = row;
+        }
+        json touches = json::object();
+        for (u32 i = 0; i < PhaseCount; ++i) {
+            json row = json::object();
+            for (u32 b = 0; b < BitCount; ++b) {
+                if (touch_by_phase[i][b] != 0) {
+                    row[BitNames[b]] = touch_by_phase[i][b];
+                }
+            }
+            touches[PhaseNames[i]] = row;
+        }
+        out["class_touches_by_phase"] = touches;
+        out["phase_ms_exclusive"] = phases;
+        out["phase_scopes_total"] = scopes_total;
+        out["calls_by_phase_they_were_made_in"] = counts;
+    }
     json classes = json::object();
     for (u32 c = 0; c < 5; ++c) {
         json row = json::object();
@@ -164,6 +247,11 @@ void PublishAndReset() {
     out["groups"] = list;
     Core::DebugServer::Publish("split_census", std::move(out));
     groups.clear();
+    std::fill(&phase_total_ns[0][0], &phase_total_ns[0][0] + 4 * PhaseCount, 0);
+    std::fill(std::begin(phase_announce_closure_ns), std::end(phase_announce_closure_ns), 0);
+    std::fill(&counts_by_phase[0][0], &counts_by_phase[0][0] + PhaseCount * CounterCount, 0);
+    scopes_total = 0;
+    std::fill(&touch_by_phase[0][0], &touch_by_phase[0][0] + 8 * 32, 0);
     total_ns = total_n = ns_no_cache = ns_one_cache = 0;
     std::fill(std::begin(ns_by_cache_class), std::end(ns_by_cache_class), 0);
     std::fill(std::begin(ns_no_cache_by_kind), std::end(ns_no_cache_by_kind), 0);

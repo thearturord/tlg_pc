@@ -943,6 +943,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
+    Core::SplitCensus::Count(Core::SplitCensus::CtBarrierQuery);
     // B10: the planner by object answers (a placed engine buffer in its own offset space, the arena by guest address)
     u64 begin = 0;
     auto& space = live_object.buffers[LiveObjectSpace(handle, offset, begin)];
@@ -989,6 +990,7 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
 }
 
 void Runtime::FlushBarriers() {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseBarrier};
     Core::SplitCensus::Touch(Core::SplitCensus::Barrier);
     vk::DependencyInfo dep_info{};
 

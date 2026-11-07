@@ -56,6 +56,7 @@
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_engine.h"
 #include "native/native_census.h"
+#include "native/native_split_census.h"
 
 namespace Vulkan {
 
@@ -1696,6 +1697,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
 }
 
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
     TLG_PROF_LEVEL("raster.bind_vertex_buffers", 2);
     const auto& regs = *draw_inputs;
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
@@ -1818,6 +1820,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 }
 
 void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
     TLG_PROF_LEVEL("raster.bind_index_buffer", 2);
     const auto& regs = *draw_inputs;
 
@@ -2064,6 +2067,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 
 void Rasterizer::BindBuffersBody(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                                  Shader::PushData& push_data) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
     TLG_PROF_LEVEL("raster.bind_buffers", 2);
     const u64 alignment = instance.StorageMinAlignment();
     const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
@@ -2630,6 +2634,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set,
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
     TLG_PROF_LEVEL("raster.bind_textures", 2);
     const u32 first_image_idx = image_infos.size();
     const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
@@ -3108,6 +3113,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 }
 
 void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
     TLG_PROF_LEVEL("raster.bind_samplers", 2);
     for (const auto& sampler : stage.samplers) {
         AmdGpu::Sampler ssharp;

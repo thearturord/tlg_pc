@@ -27,6 +27,7 @@
 #include "native/native_image_caller.h"
 #include "native/native_content.h"
 #include "native/native_prof.h"
+#include "native/native_split_census.h"
 
 namespace Core::NativeUpdates {
 
@@ -460,6 +461,7 @@ bool EarlyAnnounceOn() noexcept {
 }
 
 void ApplyBatch(const Batch& batch) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseAnnounce};
     TLG_PROF_LEVEL("updates.apply_batch", 1);
     TLG_PROF_ADD("updates.ranges_first", batch.first.size());
     TLG_PROF_ADD("updates.ranges_again", batch.again.size());

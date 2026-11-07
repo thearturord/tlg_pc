@@ -618,6 +618,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id, Core:
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseImgResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::TexFind);
     TLG_PROF_LEVEL("texture.find_image", 2);
     const auto& info = desc.info;
@@ -1013,6 +1014,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 }
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseImgResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::TexFind);
     SmallVector<ImageId, 4> image_ids;
     // B8.4: memory an engine texture starts at finds its images through the texture's lists; B8.5: engine buffer memory through the buffers' lists
@@ -1067,6 +1069,7 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 }
 
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseImgResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::TexFind);
     TLG_PROF_LEVEL("texture.find_view", 3);
     Image& image = slot_images[image_id];
@@ -1108,6 +1111,7 @@ void TextureCache::UnregisterMeta(VAddr address, u64 owner_uid) {
 }
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseImgResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::TexFind);
     TLG_PROF_LEVEL("texture.find_view", 3);
     Image& image = slot_images[image_id];
@@ -1152,6 +1156,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 }
 
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseImgResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::TexFind);
     TLG_PROF_LEVEL("texture.find_view", 3);
     Image& image = slot_images[image_id];
@@ -1209,6 +1214,7 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
 }
 
 void TextureCache::RefreshImage(Image& image, Core::ImageCaller caller) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseImgRefresh};
     Core::SplitCensus::Touch(Core::SplitCensus::TexRefresh);
     TLG_PROF_LEVEL("texture.refresh_image", 3);
     Core::NativeCensus::NoteImage(Core::NativeCensus::ImageRefresh, image.info.guest_size);
@@ -1324,6 +1330,7 @@ void TextureCache::RefreshImage(Image& image, Core::ImageCaller caller) {
 vk::Sampler TextureCache::GetSampler(const Core::NativeDesc::SamplerDesc& sharp,
                                      AmdGpu::BorderColorBuffer border_color_base,
                                      const bool is_depth) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseImgResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::TexSampler);
     TLG_PROF_LEVEL("texture.get_sampler", 3);
     // Compare and plain uses of one S# need separate samplers.

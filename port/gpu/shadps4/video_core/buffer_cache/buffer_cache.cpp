@@ -325,6 +325,7 @@ static u32 BindMemoWideMode() {
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                         Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseBufResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::BufObtain);
     const BindGuard bind_guard{reinterpret_cast<u64>(__builtin_return_address(0)), device_addr, size, is_written, immutable_hint != nullptr};
     TLG_PROF_LEVEL("buffer.obtain", 2);
@@ -878,6 +879,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForDownload(VAddr device_
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseBufResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::BufObtain);
     if (IsRegionGpuModified(device_addr, size)) {
         last_image_source_gpu = true;
@@ -897,6 +899,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
 }
 
 const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanning, bool written) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseBufResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::BufObtain);
     OrderedViewCheck(address, size, written);
     if (const PlacedBuffer* entry = PlacedAt(address, size, written)) {
@@ -1061,12 +1064,14 @@ void BufferCache::SupersedeGpuWritten(VAddr addr, size_t size) {
 }
 
 bool BufferCache::IsRangeGpuWritten(VAddr addr, size_t size) {
+    Core::SplitCensus::Count(Core::SplitCensus::CtGpuWrittenCheck);
     std::shared_lock lock{gpu_ranges_mutex};
     return gpu_modified_ranges.Intersects(addr, size);
 }
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseBufResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::BufSync);
     TLG_PROF("buffer.synchronize");
     TLG_PROF_NAMED_LEVEL(s_placed, "buffer.sync.placed_walk", 3);
@@ -1322,6 +1327,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     }
     s_ann.End();
     TLG_PROF_NAMED_LEVEL(s_up, "buffer.sync.upload", 3);
+    Core::SplitCensus::PhaseScope upload_phase{Core::SplitCensus::PhaseUpload};
     last_upload_bytes += total_size_bytes;
     Core::NativeUploads::NoteUploaded(total_size_bytes);
     if (Core::NativeUploads::Enabled()) {
@@ -1376,6 +1382,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseBufResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::BufSync);
     if (const auto meta = texture_cache.GetMetaInfo(device_addr)) {
         if (meta->type == TextureCache::MetaType::HTile) {

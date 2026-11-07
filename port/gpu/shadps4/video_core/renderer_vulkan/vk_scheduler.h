@@ -564,11 +564,13 @@ public:
 
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
+        Core::SplitCensus::Count(Core::SplitCensus::CtTickCurrent);
         return work_semaphore.CurrentTick();
     }
 
     /// Returns true when a tick has been triggered by the GPU.
     [[nodiscard]] bool IsFree(u64 tick) noexcept {
+        Core::SplitCensus::Count(Core::SplitCensus::CtTickIsFree);
         if (work_semaphore.IsFree(tick)) {
             return true;
         }

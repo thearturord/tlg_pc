@@ -28,6 +28,7 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/sampler.h"
 #include "video_core/texture_cache/tile_manager.h"
+#include "native/native_split_census.h"
 
 namespace Core {
 class NativeExecutor;
@@ -344,6 +345,7 @@ public:
 
     /// True when a cached image covers any byte of [address, address + size) (raster thread). `ForEachImageWithAddress` only finds images that start exactly at an address.
     [[nodiscard]] bool AnyImageOverlaps(VAddr address, size_t size) {
+    Core::SplitCensus::Count(Core::SplitCensus::CtImageOverlap);
         const u64 last_page = (address + size - 1) >> Traits::PAGE_BITS;
         for (u64 page = address >> Traits::PAGE_BITS; page <= last_page; ++page) {
             const auto it = page_table.find(page);
