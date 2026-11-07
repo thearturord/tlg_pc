@@ -1316,6 +1316,55 @@ bool Rasterizer::StageFlatSkipped(const Shader::Info& stage) const {
     return binder_plan != nullptr && binder_plan->any_flat_skipped && index < MaxShaderStages && binder_plan->stages[index].flat_skipped;
 }
 
+/// Draw binding cache, step 0 (TLG_BIND_CENSUS=1, raster-optimization-plan.md phase 2): would a cache of what a draw's buffer bindings produced hit, and would it be right?
+/// The Nth use of a pipeline in a frame is taken as "the same draw" as the Nth use in the previous frame; the descriptors it got (buffer handle, offset, range) are hashed and compared
+/// with what that draw got the last time. Same: a cache keyed by the draw's inputs could have answered. Different: the answer moved (a copy in the stream ring, a new upload). Counts
+/// are split by whether any buffer of the draw is a stream ring copy (those move every command buffer by design). Logged every 20000 binds.
+void Rasterizer::BindCensus(const Pipeline* pipeline) {
+    static const bool on = [] { const char* e = std::getenv("TLG_BIND_CENSUS"); return e != nullptr && e[0] == '1'; }();
+    if (!on) {
+        return;
+    }
+    static thread_local u64 frame = ~0ull;
+    static thread_local std::unordered_map<u64, u32> ordinals;
+    static thread_local std::unordered_map<u64, std::pair<u64, u64>> last; // key -> (hash, frame)
+    static thread_local u64 counts[2][4]{};                                  // [has stream copy][new, same as last frame, different, no buffers]
+    static thread_local u64 total = 0;
+    const u64 now = Core::DebugServer::PresentCount();
+    if (now != frame) {
+        frame = now;
+        ordinals.clear();
+    }
+    const u32 ordinal = ordinals[reinterpret_cast<u64>(pipeline)]++;
+    const u64 key = reinterpret_cast<u64>(pipeline) * 0x9E3779B97F4A7C15ull ^ (u64{ordinal} * 0xC2B2AE3D27D4EB4Full);
+    const VkBuffer stream = static_cast<VkBuffer>(buffer_cache.GetStreamBuffer().Handle());
+    u64 h = 0xcbf29ce484222325ull;
+    bool has_stream = false;
+    for (const auto& info : buffer_infos) {
+        const u64 raw = reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer));
+        has_stream |= static_cast<VkBuffer>(info.buffer) == stream;
+        h = (h ^ raw) * 0x100000001b3ull;
+        h = (h ^ info.offset) * 0x100000001b3ull;
+        h = (h ^ info.range) * 0x100000001b3ull;
+    }
+    const u32 split = has_stream ? 1 : 0;
+    if (buffer_infos.empty()) {
+        ++counts[split][3];
+    } else if (const auto [it, inserted] = last.try_emplace(key, std::pair<u64, u64>{h, now}); inserted) {
+        ++counts[split][0];
+    } else {
+        ++counts[split][it->second.first == h ? 1 : 2];
+        it->second = {h, now};
+    }
+    if (++total % 20000 == 0) {
+        LOG_WARNING(Render_Vulkan, "bind census: plain draws new {} same {} different {} none {} | with stream copies new {} same {} different {} none {}", counts[0][0], counts[0][1], counts[0][2],
+                 counts[0][3], counts[1][0], counts[1][1], counts[1][2], counts[1][3]);
+        if (last.size() > 200000) {
+            last.clear();
+        }
+    }
+}
+
 bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed) {
     TLG_PROF_LEVEL("raster.bind_resources", 2);
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
@@ -1349,6 +1398,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
         uses_dma |= stage->uses_dma;
     }
 
+    BindCensus(pipeline);
     if (uses_dma) {
         b9_dma_binds.fetch_add(1, std::memory_order_relaxed); // E4: a shader that reads memory by a raw PS4 address (TLG_DIRECT_MEMORY_ACCESS, off): there is no address mirror to serve it
     }

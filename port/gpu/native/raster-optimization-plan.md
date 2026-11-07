@@ -109,3 +109,12 @@ Do this only if phases 1 to 3 do not reach 16.6 ms.
 2. Shift+F9 baseline before the change, then with the switch on; read the raster thread's busy time and the probes the phase targets.
 3. A cutscene and a loading screen with the switch on (verify modes must report no differences).
 4. The owner plays; then the switch becomes the default and the old path is removed.
+
+## Result 2026-11-07: phase 2 (the draw binding cache) would not hit; do phase 1 first
+
+Shadow census (`TLG_BIND_CENSUS=1`, `Rasterizer::BindCensus`, logged as "bind census" every 20000 binds; the Nth use of a pipeline in a frame is taken as the same draw as the Nth use in the previous frame; the descriptors it got are hashed and compared with the last time). Headless default scene, depth 1, 3.13 M binds:
+
+* **97% of the binds (3.04 M) include a copy in the stream ring, and their descriptors differ from the previous frame's in every case (3,038,688 different, 0 same).** The ring offset moves with every command buffer by design, so a cache of "what the bind produced" cannot be reused; the work it would skip (the copy and the offset) is the work that has to be done.
+* Only 2.4% of the binds (74 k) are plain bindings with the same descriptors as last time, 0.4% differ, 0.4% have no buffers.
+* So the 12,800 lookups per frame are not repeats of an answer; they are small per-draw constants (2,000 stream copies per frame, 0.76 MB) and arena synchronizations (2,400 per frame, 10 MB). What can still be cut is the cost per request (done in part: sorted buffer index, no walk of the memo at each command buffer, no empty subtractions) and the bookkeeping around the apply (phase 1: about 7 ms per frame in `cpuwrite.*`, 21% of the busy time).
+* Profile of the raster thread, 2026-11-07 (headless, real depth-1 setup, 33 ms busy per frame): `buffer.obtain` tree about 12 ms, `cpuwrite.*` about 7 ms, `bind_textures` 3.8 to 4.6 ms. Single captures vary by up to 3x per probe; compare only A/B in the same session.

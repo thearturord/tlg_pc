@@ -460,6 +460,7 @@ private:
     bool BindTexturesFromSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count,
                              Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline, const FixedState* fixed = nullptr);
+    void BindCensus(const Pipeline* pipeline);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false);
