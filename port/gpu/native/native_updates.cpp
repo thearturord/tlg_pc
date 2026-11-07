@@ -477,7 +477,12 @@ void ApplyBatch(const Batch& batch) {
                     const FirstHash& before = ra_last_first[index];
                     ++index;
                     u64 now = 0;
-                    if (before.ok && before.address == address && before.size == size && NativeContent::HashGuarded64(address, size, now) && now == before.hash) {
+                    bool unchanged = false;
+                    {
+                        TLG_PROF_LEVEL("updates.again_hash", 3); // D2: the hash that decides whether a range is applied a second time
+                        unchanged = before.ok && before.address == address && before.size == size && NativeContent::HashGuarded64(address, size, now) && now == before.hash;
+                    }
+                    if (unchanged) {
                         ra_gate_skipped.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }

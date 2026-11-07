@@ -142,7 +142,11 @@ void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, st
     // B9.1: each engine buffer the bytes belong to keeps its part until its next upload (an announcement can run over several buffers)
     static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
     parts.clear();
-    BuffersInView(address, size, parts);
+    {
+        TLG_PROF_LEVEL("cpuwrite.mark.buffers_in_view", 3); // D2: the address to buffer ids resolution
+        BuffersInView(address, size, parts);
+    }
+    TLG_PROF_NAMED_LEVEL(dirty_scope, "cpuwrite.mark.object_dirty", 3);
     std::scoped_lock lock{object_dirty_mutex};
     all_object_dirty.Add(address, size); // audit: every changed byte, by address
     if (announced) {
@@ -153,6 +157,8 @@ void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, st
     for (const auto& part : parts) {
         object_dirty[part.id].Add(part.begin, part.end - part.begin);
     }
+    dirty_scope.End();
+    TLG_PROF_NAMED_LEVEL(gaps_scope, "cpuwrite.mark.unattributed", 3);
     // the bytes no buffer holds now: the first upload of a buffer over them takes them. (Add of the whole range then Subtract of the buffers' parts, done as the same
     // set algebra without the detour: the parts leave the set, the gaps between them join it; the detour allocated a node per write and freed it again)
     std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });
