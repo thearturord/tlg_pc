@@ -699,6 +699,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     }
     TLG_PROF_NAMED_LEVEL(prof_inputs, "raster.plan_inputs", 3);
     const FixedState& fixed = plan->fixed;
+    if (Core::UiTrace::Active()) {
+        for (u32 i = 0; i < fixed.viewport_count; ++i) {
+            const auto& v = fixed.viewports[i];
+            const auto& sc = fixed.scissors[i];
+            Core::UiTrace::NoteState(fmt::format("viewport {} x={} y={} w={} h={} depth {}..{}; scissor x={} y={} w={} h={}; clip_disabled={} viewport_empty={}", i, v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth,
+                                                 sc.offset.x, sc.offset.y, sc.extent.width, sc.extent.height, fixed.clip_disabled, fixed.viewport_empty));
+        }
+    }
     draw_inputs = &plan->inputs;
     prof_inputs.End();
     current_bc_base = &draw_inputs->ta_bc_base;

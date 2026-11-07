@@ -36,6 +36,8 @@ void NoteSupersede(u64 address, u64 size, u64 return_address);
 [[nodiscard]] bool WantsShot(u64 address, u32 frame);
 /// Raster thread: the read back bytes of the image as the GPU holds them (raw blocks of a compressed image) are saved to user/log/ui_shots/shot_<address>.bin.
 void SaveShot(u64 address, u32 frame, const u8* data, u64 size, const std::string& info);
+/// Raster thread: a line of fixed function state of the traced draw (viewport, scissor, ...). It counts as a read for the change detection.
+void NoteState(const std::string& text);
 /// Raster thread: the draw is done.
 void EndDraw();
 /// Raster thread: the GPU writes a guest memory range (texture cache invalidation by an image copy / clear / memory copy / written storage buffer or image). Kept only when it overlaps an image a traced draw

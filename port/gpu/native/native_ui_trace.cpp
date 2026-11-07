@@ -382,6 +382,21 @@ void NoteImageUpload(u64 address, u64 size, u64 hash_before, u64 hash_after, boo
     ++u.count;
 }
 
+void NoteState(const std::string& text) {
+    if (!t_active) {
+        return;
+    }
+    ++t_draw.reads_total;
+    if (t_draw.reads.size() >= ReadsPerDraw) {
+        return;
+    }
+    Read r;
+    r.kind = "state: " + text;
+    r.hash = Fnv(reinterpret_cast<const u8*>(text.data()), text.size());
+    r.size = text.size();
+    t_draw.reads.push_back(std::move(r));
+}
+
 void NoteImage(u64 address, u64 size, const std::string& description0) {
     std::string description = description0;
     if (t_active && address != 0 && size != 0 && size <= (256u << 10)) {
