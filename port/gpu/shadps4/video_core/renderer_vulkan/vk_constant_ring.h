@@ -10,6 +10,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <optional>
 
 #include "common/assert.h"
@@ -21,7 +22,11 @@ namespace Vulkan {
 
 class ConstantRing {
 public:
-    static constexpr u64 Capacity = 32ull << 20;
+    /// 32 MB; TLG_RING_MB changes it (bisect: a lap that reuses a region the GPU still reads would stop happening in a big ring)
+    static inline const u64 Capacity = [] {
+        const char* e = std::getenv("TLG_RING_MB");
+        return (e != nullptr && std::atoi(e) > 0 ? static_cast<u64>(std::atoi(e)) : 32ull) << 20;
+    }();
 
     ConstantRing(const Instance& instance, Scheduler& scheduler_)
         : scheduler{scheduler_}, buffer{instance, 0, Capacity, VideoCore::MemoryType::Stream, "constant ring"} {

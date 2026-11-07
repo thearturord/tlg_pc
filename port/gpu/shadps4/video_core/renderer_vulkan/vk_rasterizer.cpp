@@ -1805,6 +1805,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         // kind 3: draws and the dispatches whose stage is not indexed
         const bool dispatch_ok = ring_use.dispatch && (ring_kind == 0 || ring_kind == 2 || (ring_kind == 3 && !(indexed_active && stage.indexed)));
         const RingBinding* ring = const_ring_level >= 4 && ((ring_use.draw && ring_kind != 2) || dispatch_ok) ? FindRingBinding(stage, buffer_index) : nullptr;
+        if (ring != nullptr && desc.IsSpecial() && indexed_active && stage.indexed) {
+            // an indexed stage has no binding for its flat user data buffer (the shader reads the descriptor words from the row): a ring copy of it would write a binding the layout does not have
+            ring = nullptr;
+        }
         if (ring != nullptr && ring->formatted) {
             // N5f: a texel buffer may be the memory of an image (a surface a shader reads as a buffer, HTile, CMask): only the raster thread knows
             if (texture_cache.AnyImageOverlaps(ring->address, ring->size) || texture_cache.IsMeta(ring->address)) {
@@ -1825,6 +1829,59 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
             buffer_infos.emplace_back(constant_ring->Handle(), ring->offset, ring->size);
             ring_use.bound.fetch_add(1, std::memory_order_relaxed);
+            static const bool ring_verify = [] { const char* e = std::getenv("TLG_RING_VERIFY"); return e != nullptr && e[0] == '1'; }();
+            if (ring_verify && !desc.IsSpecial()) {
+                // bisect: the descriptor the raster thread's own path would choose against the one the command processor copied for
+                AmdGpu::Buffer own_sharp;
+                bool own_record = false;
+                if (binder_plan != nullptr && desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
+                    u32 record_binding = ~0u;
+                    if (const u32* words = BinderWords(stage, desc.sharp_fetch.offsets[0], 4, 1, &record_binding)) {
+                        own_sharp = desc.FromWords(words, stage);
+                        own_record = true;
+                    }
+                }
+                if (!own_record) {
+                    own_sharp = desc.GetSharp(stage);
+                }
+                const Core::NativeDesc::BufferDesc own = Core::NativeDesc::BufferDescOf(own_sharp);
+                static std::atomic<u64> sharp_checked[2]{}, sharp_differ[2]{};
+                static std::atomic<u32> sharp_logged{0};
+                const u32 kind = ring_use.dispatch ? 1u : 0u;
+                sharp_checked[kind].fetch_add(1, std::memory_order_relaxed);
+                if (own.address != ring->address || own.size != ring->size) {
+                    sharp_differ[kind].fetch_add(1, std::memory_order_relaxed);
+                    if (sharp_logged.fetch_add(1) < 40) {
+                        LOG_WARNING(Render_Vulkan, "ring verify sharp: {} stage {:#x} buffer {} ring {:#x}+{:#x} own {:#x}+{:#x} (from record {}); differ {}/{} of {}/{} (draw/dispatch)", kind ? "dispatch" : "draw",
+                                    stage.pgm_hash, buffer_index, ring->address, ring->size, own.address, own.size, own_record, sharp_differ[0].load(), sharp_differ[1].load(),
+                                    sharp_checked[0].load(), sharp_checked[1].load());
+                    }
+                }
+            }
+            if (ring_verify && ring->address != 0 && memory->IsValidMapping(ring->address, ring->size)) {
+                // bisect: the ring copy (made by the command processor) against guest memory now (what the raster thread's own copy would read)
+                std::vector<u8> now(ring->size);
+                memory->CopySparseMemory(ring->address, now.data(), ring->size);
+                static std::atomic<u64> checked[2]{}, differ[2]{};
+                static std::atomic<u32> logged{0};
+                const u32 kind = ring_use.dispatch ? 1u : 0u;
+                const u64 n_checked = checked[kind].fetch_add(1, std::memory_order_relaxed) + 1;
+                if ((n_checked & (n_checked - 1)) == 0) {
+                    LOG_WARNING(Render_Vulkan, "ring verify: {} checked {} differ {}", kind ? "dispatch" : "draw", n_checked, differ[kind].load());
+                }
+                if (std::memcmp(now.data(), constant_ring->Data(ring->offset), ring->size) != 0) {
+                    differ[kind].fetch_add(1, std::memory_order_relaxed);
+                    if (logged.fetch_add(1) < 40) {
+                        size_t first = 0;
+                        while (first < ring->size && now[first] == constant_ring->Data(ring->offset)[first]) {
+                            ++first;
+                        }
+                        LOG_WARNING(Render_Vulkan, "ring verify: {} stage {:#x} buffer {} addr {:#x}+{:#x} differs at +{:#x} (ring {:#x}, memory {:#x}); checked {}/{} differ {}/{} (draw/dispatch)",
+                                    kind ? "dispatch" : "draw", stage.pgm_hash, buffer_index, ring->address, ring->size, first, constant_ring->Data(ring->offset)[first], now[first],
+                                    checked[0].load(), checked[1].load(), differ[0].load(), differ[1].load());
+                    }
+                }
+            }
             if (Core::NativeUploads::RingPrecise() && ring->address != 0 && buffer_cache.IsRangeGpuWritten(ring->address, ring->size)) {
                 Core::NativeUploads::NoteRingPrecise(1); // the GPU wrote bytes of this range after the command processor copied it
             }
