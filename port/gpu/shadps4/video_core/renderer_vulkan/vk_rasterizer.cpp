@@ -2510,6 +2510,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
+            if (Core::UiTrace::Active()) {
+                Core::UiTrace::NoteImage(image.info.guest_address, image.info.guest_size,
+                                         fmt::format("{} {}x{} {} target={} storage={} bound_layout={}", vk::to_string(image.info.pixel_format), image.info.size.width, image.info.size.height,
+                                                     AmdGpu::NameOf(image.info.tile_mode), binding.is_target, is_storage, vk::to_string(transit_layout)));
+            }
 
             vk::ImageLayout bound_layout = transit_layout;
             if (!image.backing || !runtime.PlannerDecidesLayouts()) {

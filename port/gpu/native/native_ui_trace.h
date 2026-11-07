@@ -25,6 +25,8 @@ void Arm(bool on, const std::string& ps_list = {});
 void BeginDraw(u64 seq, u64 ps_hash, u64 vs_hash, u64 color0, u32 count, u32 instances, u32 caller, u32 frame);
 /// Raster thread: a read of guest memory by the traced draw.
 void NoteRead(const char* kind, u64 address, u64 size);
+/// Raster thread: an image the traced draw samples (guest address, byte size, description: format, size, tile mode, whether it is a render target of other draws).
+void NoteImage(u64 address, u64 size, const std::string& description);
 /// Raster thread: the draw is done.
 void EndDraw();
 

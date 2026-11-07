@@ -60,6 +60,8 @@ std::vector<u32> ps_filter;
 std::deque<Frame> frames;
 std::deque<Change> changes;
 u64 changes_total = 0;
+u32 stable_run = 0;
+constexpr u32 StableFrames = 20;
 thread_local bool t_active = false;
 thread_local Draw t_draw;
 thread_local u32 t_frame = 0;
@@ -211,6 +213,21 @@ void NoteRead(const char* kind, u64 address, u64 size) {
     t_draw.reads.push_back(std::move(r));
 }
 
+void NoteImage(u64 address, u64 size, const std::string& description) {
+    if (!t_active) {
+        return;
+    }
+    ++t_draw.reads_total;
+    if (t_draw.reads.size() >= ReadsPerDraw) {
+        return;
+    }
+    Read r;
+    r.kind = "image: " + description;
+    r.address = address;
+    r.size = size;
+    t_draw.reads.push_back(std::move(r));
+}
+
 void EndDraw() {
     if (!t_active) {
         return;
@@ -222,12 +239,22 @@ void EndDraw() {
         if (frames.size() >= 2) {
             const Frame& done = frames[frames.size() - 1];
             const Frame& prev = frames[frames.size() - 2];
-            if (done.frame == prev.frame + 1 && Signature(done) != Signature(prev)) {
-                ++changes_total;
-                changes.push_back(Change{prev, done});
-                while (changes.size() > ChangesKept) {
-                    changes.pop_front();
+            if (done.frame == prev.frame + 1) {
+                if (Signature(done) == Signature(prev)) {
+                    ++stable_run;
+                } else {
+                    // only a change out of a steady menu counts: screen transitions change every frame and would fill the log
+                    if (stable_run >= StableFrames) {
+                        ++changes_total;
+                        changes.push_back(Change{prev, done});
+                        while (changes.size() > ChangesKept) {
+                            changes.pop_front();
+                        }
+                    }
+                    stable_run = 0;
                 }
+            } else {
+                stable_run = 0;
             }
         }
         frames.push_back(Frame{t_frame, {}});
