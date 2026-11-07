@@ -641,6 +641,14 @@ private:
     Pipeline::DescriptorWrites set_writes;
     Shader::PushData push_data;
 
+    /// draw recipe verify (graphics draws): the identity of the record, the prediction made at the start of BindResources, the guest ranges the buffers came from
+    u64 recipe_key{};
+    u32 recipe_prediction{0};
+    u64 recipe_stored_shape{};
+    bool recipe_active{false}, recipe_reusable{true};
+    VideoCore::BufferCache::RecipeEpochs recipe_epochs_at_start{};
+    boost::container::small_vector<std::pair<VAddr, u32>, 8> recipe_ranges;
+
     bool attachment_feedback_loop{};
     bool needs_barrier{};
 };

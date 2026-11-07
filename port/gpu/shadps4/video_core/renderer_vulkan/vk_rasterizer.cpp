@@ -190,6 +190,15 @@ void Rasterizer::MaybeFlushRecorded() {
     }
 }
 
+/// The measuring of draw reuse (repeat census, key census, recipe verify) costs a hash and a map lookup per draw: off unless asked (2026-11-07, closed as a measurement).
+static bool ReuseCensusOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_REUSE_CENSUS");
+        return e != nullptr && *e == '1';
+    }();
+    return on;
+}
+
 u64 Rasterizer::CurrentTick() const noexcept {
     return scheduler.CurrentTick();
 }
@@ -1392,6 +1401,30 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
     indexed_row_size = 0;
     Census((fixed != nullptr ? 0u : 32u) + CBindResources);
 
+    // draw recipe verify: the identity of the record and the prediction, before anything is resolved
+    recipe_active = false;
+    recipe_ranges.clear();
+    recipe_reusable = true;
+    if (ReuseCensusOn() && !pipeline->IsCompute() && binder_plan != nullptr) {
+        buffer_cache.RecipeCount(0);
+        if (!binder_plan->bindings_complete) {
+            buffer_cache.RecipeCount(1);
+        } else {
+            u64 key = reinterpret_cast<u64>(pipeline) * 0x9E3779B97F4A7C15ull;
+            for (u32 bi = 0; bi < binder_plan->binding_count; ++bi) {
+                const auto& rb = binder_plan->bindings[bi];
+                key = (key ^ (u64{rb.stage} | u64{rb.kind} << 8 | u64{rb.offset} << 16 | u64{rb.slot} << 32)) * 0x100000001b3ull;
+                key = (key ^ rb.id) * 0x100000001b3ull;
+                key = (key ^ rb.view_id) * 0x100000001b3ull;
+                key ^= key >> 31;
+            }
+            recipe_key = key;
+            recipe_epochs_at_start = buffer_cache.RecipeEpochsNow(Core::NativeResources::ImmutableEpoch(), texture_cache.ImageGeneration());
+            recipe_prediction = buffer_cache.RecipePredict(key, scheduler.CurrentTick(), recipe_epochs_at_start, recipe_stored_shape);
+            recipe_active = true;
+        }
+    }
+
     bool uses_dma = false;
 
     // Bind resource buffers and textures.
@@ -1411,6 +1444,139 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
     }
 
     BindCensus(pipeline);
+    if (ReuseCensusOn()) {
+        // reuse census (counts only): the shape of this draw, with the ring normalized
+        static thread_local std::unordered_set<u64> seen_previous, seen_this;
+        static thread_local u64 frame = ~u64{0};
+        const u64 now = Core::DebugServer::PresentCount();
+        if (now != frame) {
+            seen_previous.swap(seen_this);
+            seen_this.clear();
+            frame = now;
+        }
+        u64 h = 0xcbf29ce484222325ull;
+        const auto mix = [&h](u64 v) { h = (h ^ v) * 0x100000001b3ull; h ^= h >> 29; };
+        mix(reinterpret_cast<u64>(pipeline));
+        u32 rings = 0, others = 0;
+        const VkBuffer ring_handle = constant_ring ? static_cast<VkBuffer>(constant_ring->Handle()) : VK_NULL_HANDLE;
+        for (const auto& b : buffer_infos) {
+            if (static_cast<VkBuffer>(b.buffer) == ring_handle) {
+                mix(0x52494e47ull);
+                mix(b.range);
+                ++rings;
+            } else {
+                mix(reinterpret_cast<u64>(static_cast<VkBuffer>(b.buffer)));
+                mix(b.offset);
+                mix(b.range);
+                ++others;
+            }
+        }
+        for (const auto& i : image_infos) {
+            mix(reinterpret_cast<u64>(static_cast<VkImageView>(i.imageView)));
+            mix(reinterpret_cast<u64>(static_cast<VkSampler>(i.sampler)));
+            mix(static_cast<u64>(i.imageLayout));
+        }
+        mix(std::bit_cast<u32>(push_data.xoffset));
+        mix(std::bit_cast<u32>(push_data.yoffset));
+        mix(std::bit_cast<u32>(push_data.xscale));
+        mix(std::bit_cast<u32>(push_data.yscale));
+        const u32 k = pipeline->IsCompute() ? 1u : 0u;
+        auto& c = g_repeat_census;
+        c.total[k].fetch_add(1, std::memory_order_relaxed);
+        c.ring_bindings[k].fetch_add(rings, std::memory_order_relaxed);
+        c.other_buffers[k].fetch_add(others, std::memory_order_relaxed);
+        c.images[k].fetch_add(image_infos.size(), std::memory_order_relaxed);
+        bool repeated = true;
+        if (seen_previous.count(h) != 0) {
+            c.in_previous_frame[k].fetch_add(1, std::memory_order_relaxed);
+        } else if (seen_this.count(h) != 0) {
+            c.in_this_frame[k].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            c.new_shape[k].fetch_add(1, std::memory_order_relaxed);
+            repeated = false;
+        }
+        if (repeated) {
+            c.repeat_ring_bindings[k].fetch_add(rings, std::memory_order_relaxed);
+            c.repeat_other_buffers[k].fetch_add(others, std::memory_order_relaxed);
+            c.repeat_images[k].fetch_add(image_infos.size(), std::memory_order_relaxed);
+        }
+        seen_this.insert(h);
+        if (recipe_active) {
+            bool uses_stream = false;
+            const VkBuffer stream_handle = static_cast<VkBuffer>(buffer_cache.GetStreamBuffer().Handle());
+            for (const auto& b : buffer_infos) {
+                uses_stream |= static_cast<VkBuffer>(b.buffer) == stream_handle;
+            }
+            const bool same = recipe_prediction != 0 && recipe_stored_shape == h;
+            if (recipe_prediction == 0) {
+                buffer_cache.RecipeCount(2);
+            } else if (recipe_prediction == 1) {
+                buffer_cache.RecipeCount(same ? 3 : 4);
+            } else {
+                buffer_cache.RecipeCount(same ? 5 : 6);
+            }
+            if (!recipe_reusable) {
+                buffer_cache.RecipeCount(7);
+            }
+            buffer_cache.RecipeStore(recipe_key, h, recipe_ranges, uses_stream, recipe_reusable, scheduler.CurrentTick(), recipe_epochs_at_start);
+            recipe_active = false;
+        }
+        // key census: the record's identity against the shape
+        {
+            auto& kc = g_key_census;
+            kc.total[k].fetch_add(1, std::memory_order_relaxed);
+            const DrawPlan* record_plan = binder_plan != nullptr ? binder_plan : nullptr;
+            if (record_plan == nullptr || !record_plan->bindings_complete) {
+                kc.no_record[k].fetch_add(1, std::memory_order_relaxed);
+            } else {
+                kc.keyed[k].fetch_add(1, std::memory_order_relaxed);
+                struct Seen {
+                    u64 shape, buffers_hash, images_hash;
+                };
+                static thread_local std::unordered_map<u64, Seen> by_key;
+                if (by_key.size() > 400000) {
+                    by_key.clear();
+                }
+                u64 key = reinterpret_cast<u64>(pipeline) * 0x9E3779B97F4A7C15ull;
+                for (u32 bi = 0; bi < record_plan->binding_count; ++bi) {
+                    const auto& rb = record_plan->bindings[bi];
+                    key = (key ^ (u64{rb.stage} | u64{rb.kind} << 8 | u64{rb.offset} << 16 | u64{rb.slot} << 32)) * 0x100000001b3ull;
+                    key = (key ^ rb.id) * 0x100000001b3ull;
+                    key = (key ^ rb.view_id) * 0x100000001b3ull;
+                    key ^= key >> 31;
+                }
+                u64 hb = 0xcbf29ce484222325ull, hi = 0xcbf29ce484222325ull;
+                for (const auto& b : buffer_infos) {
+                    if (static_cast<VkBuffer>(b.buffer) == ring_handle) {
+                        hb = (hb ^ (0x52494e47ull + b.range)) * 0x100000001b3ull;
+                    } else {
+                        hb = (hb ^ reinterpret_cast<u64>(static_cast<VkBuffer>(b.buffer))) * 0x100000001b3ull;
+                        hb = (hb ^ b.offset) * 0x100000001b3ull;
+                        hb = (hb ^ b.range) * 0x100000001b3ull;
+                    }
+                }
+                for (const auto& i : image_infos) {
+                    hi = (hi ^ reinterpret_cast<u64>(static_cast<VkImageView>(i.imageView))) * 0x100000001b3ull;
+                    hi = (hi ^ reinterpret_cast<u64>(static_cast<VkSampler>(i.sampler))) * 0x100000001b3ull;
+                    hi = (hi ^ static_cast<u64>(i.imageLayout)) * 0x100000001b3ull;
+                }
+                const auto it = by_key.find(key);
+                if (it == by_key.end()) {
+                    by_key.emplace(key, Seen{h, hb, hi});
+                } else {
+                    kc.key_seen[k].fetch_add(1, std::memory_order_relaxed);
+                    if (it->second.shape == h) {
+                        kc.same_shape[k].fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        kc.other_shape[k].fetch_add(1, std::memory_order_relaxed);
+                        const bool b_differs = it->second.buffers_hash != hb, i_differs = it->second.images_hash != hi;
+                        (b_differs && i_differs ? kc.differ_both : b_differs ? kc.differ_buffers_only : kc.differ_images_only)[k].fetch_add(1, std::memory_order_relaxed);
+                    }
+                    it->second = Seen{h, hb, hi};
+                }
+            }
+        }
+    }
     if (uses_dma) {
         b9_dma_binds.fetch_add(1, std::memory_order_relaxed); // E4: a shader that reads memory by a raw PS4 address (TLG_DIRECT_MEMORY_ACCESS, off): there is no address mirror to serve it
     }
@@ -1985,6 +2151,7 @@ void Rasterizer::BindBuffersBody(const Shader::Info& stage, Shader::Backend::Bin
                         buffer_infos.emplace_back(copy->Handle(), offset_aligned, r.size + adjust);
                         Census(census_base + CBufferResolved);
                         resolve_stats.hits.fetch_add(1, std::memory_order_relaxed);
+                        recipe_ranges.emplace_back(r.address, r.size);
                         goto buffer_bound;
                     }
                     const bool ready = object->alive.load(std::memory_order_acquire) && object->synced.load(std::memory_order_acquire); // the arena fields are stored before `synced`
@@ -2003,6 +2170,7 @@ void Rasterizer::BindBuffersBody(const Shader::Info& stage, Shader::Backend::Bin
                         }
                         Census(census_base + CBufferResolved);
                         resolve_stats.hits.fetch_add(1, std::memory_order_relaxed);
+                        recipe_ranges.emplace_back(r.address, r.size);
                         goto buffer_bound;
                     }
                     // why: 0 epoch, 1 gone, 2 not synchronized, 3 generation moved, 4 arena, 5 tracker dirty
@@ -2137,6 +2305,10 @@ void Rasterizer::BindBuffersBody(const Shader::Info& stage, Shader::Backend::Bin
                     }
                 }();
                 Core::NativeContent::ClearBindContext();
+                recipe_ranges.emplace_back(vsharp.address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
+                if (desc.is_written || size > 262144) {
+                    recipe_reusable = false;
+                }
                 if (Core::LightRecorder::On() && !Core::LightRecorder::Recording() && draw_class_now == 0 && size <= 1024 && !desc.is_written) {
                     Core::LightRecorder::ShadowBuffer(Core::DebugServer::PresentCount(), vsharp.address, size); // a z / shadow draw's view constants candidate
                 }

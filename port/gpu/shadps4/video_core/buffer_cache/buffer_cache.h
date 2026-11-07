@@ -106,6 +106,23 @@ public:
     static constexpr u64 BindMemoWideMax = u64{1} << 17; // 128 KiB: an erase looks back this far in the tree, a 16 MiB bound made every erase walk thousands of entries (measured 1.2 ms per frame)
     static constexpr size_t BindMemoMaxAddresses = 200000; ///< the memo is cleared at a new command buffer when it holds more addresses (stale copy entries are no longer walked away)
     void BindMemoErase(VAddr address, u64 size);
+
+    /// Draw recipes (verify stage, raster thread only): the resolved shape of a graphics draw by the identity of its record, with the guest ranges its buffers came from. A recipe
+    /// is predicted valid while no write overlapped one of its ranges (the invalidation the bind memo uses), the epochs are the same, and (when it names a copy in the stream
+    /// buffer) the command buffer is the same. Nothing is reused yet: the caller resolves as usual and compares.
+    struct RecipeEpochs {
+        u64 memo{}, range{}, placement{}, immutable{}, image{};
+        bool operator==(const RecipeEpochs&) const = default;
+    };
+    [[nodiscard]] RecipeEpochs RecipeEpochsNow(u64 immutable_epoch, u64 image_generation) const noexcept {
+        return {bind_memo_epoch.load(std::memory_order_acquire), range_epoch.load(std::memory_order_acquire), PlacementEpoch(), immutable_epoch, image_generation};
+    }
+    /// 0 no recipe for the key, 1 predicted valid, 2 predicted invalid (`shape` is the stored one in both of the last cases).
+    [[nodiscard]] u32 RecipePredict(u64 key, u64 tick, const RecipeEpochs& now, u64& shape);
+    void RecipeStore(u64 key, u64 shape, const boost::container::small_vector<std::pair<VAddr, u32>, 8>& ranges, bool uses_stream, bool reusable, u64 tick, const RecipeEpochs& at_start);
+    void RecipeCount(u32 index) noexcept {
+        recipe_counts[index].fetch_add(1, std::memory_order_relaxed);
+    }
     void BindMemoBump() noexcept {
         bind_memo_epoch.fetch_add(1, std::memory_order_acq_rel);
     }
@@ -256,6 +273,17 @@ private:
         u64 max_size{BindMemoMax}; ///< the largest request ever stored: a write erases the entries that start up to this far before it
         absl::btree_map<VAddr, boost::container::small_vector<BindMemoEntry, 2>> entries; ///< (a B-tree: the lookup per request walked a node tree of 10 000+ addresses, a cache miss per level)
     };
+    struct DrawRecipe {
+        u64 shape{}, tick{};
+        RecipeEpochs epochs{};
+        bool valid{false}, uses_stream{false}, reusable{false};
+        boost::container::small_vector<std::pair<VAddr, u32>, 8> ranges;
+    };
+    std::unordered_map<u64, DrawRecipe> recipes;
+    absl::btree_map<VAddr, boost::container::small_vector<u64, 2>> recipe_index; ///< range start -> keys of the recipes that hold a range starting there
+    u64 recipe_max_len{4096};
+    std::array<std::atomic<u64>, 24> recipe_counts{};
+    void RecipeEraseRange(VAddr address, u64 size);
     std::array<BindMemo, 2> bind_memos; ///< by stream (graphics, side)
     std::atomic<u64> bind_memo_epoch{0}; ///< bumped by writes the raster thread does not see by range (faults, the command processor)
     std::array<std::atomic<u64>, 4> bind_memo_counts{}; ///< hits, misses, entries erased by writes, memo cleared

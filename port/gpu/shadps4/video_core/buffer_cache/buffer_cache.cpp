@@ -409,7 +409,78 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     return result;
 }
 
+u32 BufferCache::RecipePredict(u64 key, u64 tick, const RecipeEpochs& now, u64& shape) {
+    const auto it = recipes.find(key);
+    if (it == recipes.end()) {
+        return 0;
+    }
+    const DrawRecipe& r = it->second;
+    shape = r.shape;
+    RecipeEpochs a = r.epochs, b = now;
+    a.memo = b.memo = 0; // the global memo epoch is bumped by every command processor write: measured as a gate it voids 98 % of the recipes, so it is left out here and the compare shows what that costs
+    const bool ok = r.valid && r.reusable && a == b && (!r.uses_stream || r.tick == tick);
+    if (!ok) {
+        // why not: every reason that applies is counted (a prediction can fail for several)
+        recipe_counts[10 + 0].fetch_add(!r.valid, std::memory_order_relaxed);
+        recipe_counts[10 + 1].fetch_add(!r.reusable, std::memory_order_relaxed);
+        recipe_counts[10 + 2].fetch_add(r.epochs.memo != now.memo, std::memory_order_relaxed);
+        recipe_counts[10 + 3].fetch_add(r.epochs.range != now.range, std::memory_order_relaxed);
+        recipe_counts[10 + 4].fetch_add(r.epochs.placement != now.placement, std::memory_order_relaxed);
+        recipe_counts[10 + 5].fetch_add(r.epochs.immutable != now.immutable, std::memory_order_relaxed);
+        recipe_counts[10 + 6].fetch_add(r.epochs.image != now.image, std::memory_order_relaxed);
+        recipe_counts[10 + 7].fetch_add(r.uses_stream && r.tick != tick, std::memory_order_relaxed);
+    }
+    return ok ? 1 : 2;
+}
+
+void BufferCache::RecipeStore(u64 key, u64 shape, const boost::container::small_vector<std::pair<VAddr, u32>, 8>& ranges, bool uses_stream, bool reusable, u64 tick, const RecipeEpochs& at_start) {
+    if (recipes.size() > 100000) {
+        recipes.clear();
+        recipe_index.clear();
+    }
+    DrawRecipe& r = recipes[key];
+    const bool same_ranges = r.ranges.size() == ranges.size() && std::equal(r.ranges.begin(), r.ranges.end(), ranges.begin());
+    r.shape = shape;
+    r.tick = tick;
+    r.epochs = at_start;
+    r.uses_stream = uses_stream;
+    r.reusable = reusable;
+    r.valid = true;
+    if (!same_ranges) {
+        r.ranges = ranges;
+        for (const auto& [a, n] : ranges) {
+            recipe_max_len = std::max<u64>(recipe_max_len, n);
+            auto& list = recipe_index[a];
+            if (std::find(list.begin(), list.end(), key) == list.end()) {
+                list.push_back(key);
+            }
+        }
+    }
+}
+
+void BufferCache::RecipeEraseRange(VAddr address, u64 size) {
+    if (recipe_index.empty()) {
+        return;
+    }
+    auto it = recipe_index.lower_bound(address >= recipe_max_len ? address - recipe_max_len : 0);
+    for (; it != recipe_index.end() && it->first < address + size; ++it) {
+        for (const u64 key : it->second) {
+            const auto r = recipes.find(key);
+            if (r == recipes.end() || !r->second.valid) {
+                continue;
+            }
+            for (const auto& [a, n] : r->second.ranges) {
+                if (a < address + size && address < a + n) {
+                    r->second.valid = false;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 void BufferCache::BindMemoErase(VAddr address, u64 size) {
+    RecipeEraseRange(address, size);
     for (auto& memo : bind_memos) {
         if (memo.entries.empty()) {
             continue;
@@ -429,6 +500,13 @@ void BufferCache::BindMemoErase(VAddr address, u64 size) {
 
 nlohmann::json BufferCache::BindMemoReport() const {
     return {{"on", BindMemoOn()}, {"hits", bind_memo_counts[0].load()}, {"misses", bind_memo_counts[1].load()}, {"addresses_erased_by_writes", bind_memo_counts[2].load()},
+            {"recipes", {{"graphics_draws_checked", recipe_counts[0].load()}, {"no_key", recipe_counts[1].load()}, {"no_recipe_yet", recipe_counts[2].load()},
+                         {"predicted_valid_and_same", recipe_counts[3].load()}, {"PREDICTED_VALID_BUT_DIFFERENT_MUST_BE_0", recipe_counts[4].load()},
+                         {"predicted_invalid_and_same", recipe_counts[5].load()}, {"predicted_invalid_and_different", recipe_counts[6].load()},
+                         {"not_reusable_ranges_or_written", recipe_counts[7].load()}, {"recipes_held", recipes.size()},
+                         {"why_not_range_written", recipe_counts[10].load()}, {"why_not_unreusable", recipe_counts[11].load()}, {"why_not_memo_epoch", recipe_counts[12].load()},
+                         {"why_not_range_epoch", recipe_counts[13].load()}, {"why_not_placement_epoch", recipe_counts[14].load()}, {"why_not_immutable_epoch", recipe_counts[15].load()},
+                         {"why_not_image_generation", recipe_counts[16].load()}, {"why_not_other_command_buffer", recipe_counts[17].load()}}},
             {"wide", {{"mode", BindMemoWideMode()}, {"hits_seen", bind_memo_wide_counts[5].load()}, {"answers_used", bind_memo_wide_counts[0].load()}, {"compared", bind_memo_wide_counts[1].load()},
                       {"DIFFERENT_ANSWER_MUST_BE_0", bind_memo_wide_counts[2].load()}, {"compared_stream_answers", bind_memo_wide_counts[3].load()}, {"UNCACHED_DID_WORK_MUST_BE_0", bind_memo_wide_counts[4].load()},
                       {"work_explained_by_dirt_that_lingered", bind_memo_wide_counts[20].load()}, {"CLASSIC_work_explained_by_dirt_that_lingered", bind_memo_wide_counts[30].load()},

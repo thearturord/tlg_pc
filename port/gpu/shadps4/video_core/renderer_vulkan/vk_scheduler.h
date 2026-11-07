@@ -413,6 +413,21 @@ struct PassChangeCensus {
 };
 inline PassChangeCensus g_pass_changes;
 
+/// Reuse of draw preparation, census only (2026-11-07): how often the resolved shape of a draw (pipeline, buffer and image descriptors with the constant ring normalized to its
+/// size, the push constants) was already seen in the previous frame or earlier in this one. Index 0 draws, 1 dispatches.
+struct RepeatCensus {
+    std::atomic<u64> total[2]{}, in_previous_frame[2]{}, in_this_frame[2]{}, new_shape[2]{};
+    std::atomic<u64> ring_bindings[2]{}, other_buffers[2]{}, images[2]{}; ///< sums, to read the dependency count per draw
+    std::atomic<u64> repeat_ring_bindings[2]{}, repeat_other_buffers[2]{}, repeat_images[2]{}; ///< the same sums over the draws that repeated
+};
+inline RepeatCensus g_repeat_census;
+/// Is the record's identity (pipeline plus the engine ids of the bound resources) enough to know the resolved shape? Per kind (0 draws, 1 dispatches).
+struct KeyCensus {
+    std::atomic<u64> total[2]{}, no_record[2]{}, keyed[2]{}, key_seen[2]{}, same_shape[2]{}, other_shape[2]{};
+    std::atomic<u64> differ_buffers_only[2]{}, differ_images_only[2]{}, differ_both[2]{};
+};
+inline KeyCensus g_key_census;
+
 /// One command stream: ticks (timeline semaphore), command lists, encoder thread, priority operation thread, one VkQueue.
 /// Scheduler (below) owns the graphics stream and, with TLG_ASC_QUEUE=1, a second one for the asynchronous compute queue 1.
 class SchedulerCore : public SchedulerLocks {

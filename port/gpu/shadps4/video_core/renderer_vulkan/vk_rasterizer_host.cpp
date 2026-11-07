@@ -198,10 +198,30 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
                 changes.push_back({{"difference_mask", m}, {"draws_that_ended_a_pass", n}});
             }
         }
+        nlohmann::json repeat = nlohmann::json::object();
+        {
+            const auto& r = Vulkan::g_repeat_census;
+            const char* names[2] = {"draws", "dispatches"};
+            for (u32 k = 0; k < 2; ++k) {
+                repeat[names[k]] = {{"total", r.total[k].load()}, {"shape_seen_in_previous_frame", r.in_previous_frame[k].load()}, {"shape_seen_earlier_this_frame", r.in_this_frame[k].load()}, {"new_shape", r.new_shape[k].load()},
+                                    {"ring_bindings", r.ring_bindings[k].load()}, {"other_buffers", r.other_buffers[k].load()}, {"images", r.images[k].load()},
+                                    {"repeated_draws_ring_bindings", r.repeat_ring_bindings[k].load()}, {"repeated_draws_other_buffers", r.repeat_other_buffers[k].load()}, {"repeated_draws_images", r.repeat_images[k].load()}};
+            }
+        }
+        nlohmann::json key_census = nlohmann::json::object();
+        {
+            const auto& r = Vulkan::g_key_census;
+            const char* names[2] = {"draws", "dispatches"};
+            for (u32 k = 0; k < 2; ++k) {
+                key_census[names[k]] = {{"total", r.total[k].load()}, {"no_complete_record", r.no_record[k].load()}, {"keyed", r.keyed[k].load()}, {"key_seen_before", r.key_seen[k].load()},
+                                        {"same_shape_as_last_time", r.same_shape[k].load()}, {"other_shape", r.other_shape[k].load()}, {"differ_in_buffers_only", r.differ_buffers_only[k].load()},
+                                        {"differ_in_images_only", r.differ_images_only[k].load()}, {"differ_in_both", r.differ_both[k].load()}};
+            }
+        }
         const auto& sp = Vulkan::g_same_pass_flushes;
         nlohmann::json same_pass = {{"flushes_that_end_a_pass_the_draw_would_keep", sp.flushes.load()}, {"image_barriers_in_them", sp.image_barriers.load()}, {"with_a_memory_barrier", sp.with_memory_barrier.load()},
                                     {"flushes_with_a_pass_open_where_the_draw_changes_pass_anyway", sp.other_pass_changes.load()}, {"note", "Rasterizer::Draw only, other callers count as 'anyway'"}};
-        Core::DebugServer::Publish("segment_census", {{"by_kind_since_start", std::move(kinds)}, {"flush_in_same_pass", std::move(same_pass)}, {"pass_state_differences", std::move(changes)}, {"image_barriers_with_a_pass_open_by_layouts", std::move(layouts)}, {"ended_by_caller_since_start", std::move(cuts)}, {"flush_barriers_with_a_pass_open_by_caller", std::move(flush_cuts)}, {"note", "C6 census: commands and draws recorded between a begin and an end of rendering, graphics stream, counts only"}});
+        Core::DebugServer::Publish("segment_census", {{"by_kind_since_start", std::move(kinds)}, {"flush_in_same_pass", std::move(same_pass)}, {"draw_shape_repeat", std::move(repeat)}, {"draw_key_census", std::move(key_census)}, {"pass_state_differences", std::move(changes)}, {"image_barriers_with_a_pass_open_by_layouts", std::move(layouts)}, {"ended_by_caller_since_start", std::move(cuts)}, {"flush_barriers_with_a_pass_open_by_caller", std::move(flush_cuts)}, {"note", "C6 census: commands and draws recorded between a begin and an end of rendering, graphics stream, counts only"}});
     }
     if (LivePlannerOn()) {
         const auto p = ReadLivePlanStats();
