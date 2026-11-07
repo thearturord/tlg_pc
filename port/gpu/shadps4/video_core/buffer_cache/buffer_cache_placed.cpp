@@ -106,6 +106,13 @@ void BufferCache::NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool 
         if (const auto it = object_dirty.find(id); it != object_dirty.end()) {
             if (!it->second.m_ranges_set.empty()) {
                 Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9DeletedPending);
+                if (Core::NativeUpdates::LeanDirtyMode() != 0) {
+                    // D2: the bytes a deleted buffer was announced but never uploaded stay announced for whatever owns the memory next (the by-address set kept them)
+                    it->second.ForEach([&](u64 a, u64 e) {
+                        b9_unattributed.Add(a, e - a);
+                        Core::NativeUpdates::NoteB9(Core::NativeUpdates::LeanMoved, e - a);
+                    });
+                }
             }
             object_dirty.erase(it);
         }
@@ -336,7 +343,9 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
         }
         for (const auto& [a, n] : rest) {
             b9_unattributed.Subtract(a, n);
-            all_object_dirty.Subtract(a, n);
+            if (Core::NativeUpdates::LeanDirtyMode() != 2) {
+                all_object_dirty.Subtract(a, n);
+            }
         }
     }
     // the placed buffers inside are replaced (freed after the GPU is done, the copies above included)
@@ -484,7 +493,9 @@ void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, boo
                     // the block holds older bytes there (a deleted member's, a gap's): the new buffer's first upload takes all of its memory, as a placement would
                     std::scoped_lock lock{object_dirty_mutex};
                     object_dirty[id].Add(address, bytes);
-                    all_object_dirty.Add(address, bytes);
+                    if (Core::NativeUpdates::LeanDirtyMode() != 2) {
+                        all_object_dirty.Add(address, bytes);
+                    }
                 }
                 b9_epoch.fetch_add(1, std::memory_order_acq_rel);
                 if (auto* object = Core::NativeResources::FindImmutableById(id)) {

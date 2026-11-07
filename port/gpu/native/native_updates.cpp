@@ -613,6 +613,14 @@ void NoteB9(B9Count what, u64 n) noexcept {
     b9_counts[what].fetch_add(n, std::memory_order_relaxed);
 }
 
+u32 LeanDirtyMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_LEAN_DIRTY");
+        return e != nullptr && e[0] >= '0' && e[0] <= '2' ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
+
 nlohmann::json B9Report() {
     const auto c = [](B9Count what) { return b9_counts[what].load(std::memory_order_relaxed); };
     return {{"mode", B9BufferMode()},
@@ -639,6 +647,7 @@ nlohmann::json B9Report() {
                           {"with_gpu_written_bytes", c(B9DeletedGpuWritten)}, {"memory_shared_with_a_live_buffer", c(B9DeletedAlias)},
                           {"gpu_written_bytes_dropped", c(B9DeletedGpuDropped)}}},
             {"e4_no_arena", {{"announced_uploads_bytes", c(E4AnnouncedUploads)}, {"blocks_freed_with_foreign_gpu_bytes", c(E4FreedWithForeignGpu)}, {"foreign_gpu_bytes", c(E4FreedForeignGpuBytes)}, {"gpu_bytes_lost_at_placement", c(E4GpuBytesLost)}, {"pseudo_placements", c(E4PseudoPlaced)}, {"pseudo_ring", c(E4PseudoRing)}, {"demotes_kept", c(E4DemoteKept)}}},
+            {"lean_dirty", {{"mode", LeanDirtyMode()}, {"answers_compared", c(LeanChecked)}, {"LEAN_MISSING_BYTES_MUST_BE_0", c(LeanMissing)}, {"lean_extra_bytes", c(LeanExtra)}, {"bytes_moved_from_deleted_buffers", c(LeanMoved)}}},
             {"note", "B9.1, cumulative: engine buffers uploaded by their announced bytes instead of the page tracker's pages"}};
 }
 

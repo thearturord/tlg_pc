@@ -260,6 +260,10 @@ enum B9Count : u32 {
     E4FreedForeignGpuBytes, ///< E4: those bytes
     E4GpuBytesLost,        ///< E4: GPU written bytes a new placement found in no placed buffer
     E4AnnouncedUploads, ///< E4: bytes of unowned memory uploaded from the announced set
+    LeanChecked,        ///< D2 (`TLG_LEAN_DIRTY=1`): answers compared between the by-address audit set and the unattributed set alone
+    LeanMissing,        ///< ... the audit set had announced bytes the lean set did not (a stale answer if the audit set were dropped: must stay 0)
+    LeanExtra,          ///< ... the lean set had bytes the audit set did not (an over-upload, safe)
+    LeanMoved,          ///< bytes a deleted buffer left behind, moved to the unattributed set
     B9Counts,
 };
 void NoteB9(B9Count what, u64 n = 1) noexcept;
@@ -267,6 +271,11 @@ void NoteB9(B9Count what, u64 n = 1) noexcept;
     return true; // E4: memory no engine buffer owns is a pseudo resource, there is no arena to fall back to
 }
 [[nodiscard]] nlohmann::json B9Report();
+
+/// D2 (`TLG_LEAN_DIRTY`): 0 keeps `all_object_dirty`, the by-address copy of every announced byte, as the answer for memory no engine buffer holds (today's behaviour);
+/// 1 keeps it and compares each of its answers with the one the unattributed set alone gives (counters `Lean*`); 2 does not keep it (a deleted buffer's pending bytes move to
+/// the unattributed set instead).
+[[nodiscard]] u32 LeanDirtyMode() noexcept;
 
 nlohmann::json Report();
 

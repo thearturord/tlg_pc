@@ -23,6 +23,7 @@
 #include "native/native_image_caller.h"
 #include "native/native_flight.h"
 #include "native/native_prof.h"
+#include "native/native_debug_server.h"
 
 #include "native/native_resources.h"
 #include "native/native_resource_audit.h"
@@ -148,7 +149,9 @@ void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, st
     }
     TLG_PROF_NAMED_LEVEL(dirty_scope, "cpuwrite.mark.object_dirty", 3);
     std::scoped_lock lock{object_dirty_mutex};
-    all_object_dirty.Add(address, size); // audit: every changed byte, by address
+    if (Core::NativeUpdates::LeanDirtyMode() != 2) {
+        all_object_dirty.Add(address, size); // audit: every changed byte, by address
+    }
     if (announced) {
         Core::NativeUpdates::NoteB9(parts.empty() ? Core::NativeUpdates::B9AnnouncedNoBuffer
                                     : parts.size() == 1 && parts[0].begin == address && parts[0].end == address + size ? Core::NativeUpdates::B9AnnouncedOnBuffer
@@ -717,7 +720,20 @@ const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanni
 bool BufferCache::NativeCpuQuery(VAddr addr, size_t size) {
     // E4: memory no engine buffer answers for: changed when announced bytes of it were not uploaded yet
     std::scoped_lock lock{object_dirty_mutex};
-    return all_object_dirty.Intersects(addr, size) || b9_unattributed.Intersects(addr, size);
+    const u32 lean = Core::NativeUpdates::LeanDirtyMode();
+    if (lean == 2) {
+        return b9_unattributed.Intersects(addr, size);
+    }
+    const bool unattributed = b9_unattributed.Intersects(addr, size);
+    const bool answer = all_object_dirty.Intersects(addr, size) || unattributed;
+    if (lean == 1) {
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::LeanChecked);
+        if (answer && !unattributed) {
+            Core::NativeUpdates::NoteB9(Core::NativeUpdates::LeanMissing, size);
+            Core::RareEvents::Note("d2_lean_cpu_query_missing", fmt::format("{:#x}+{:#x}", addr, size));
+        }
+    }
+    return answer;
 }
 
 bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
@@ -893,8 +909,10 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                     b9_unattributed.Subtract(part.begin, part.end - part.begin);
                 }
             }
-            for (const auto& [a, n] : b9_pieces) {
-                all_object_dirty.Subtract(a, n);
+            if (Core::NativeUpdates::LeanDirtyMode() != 2) {
+                for (const auto& [a, n] : b9_pieces) {
+                    all_object_dirty.Subtract(a, n);
+                }
             }
         }
         Core::NativeUpdates::NoteB9(b9_object != 0 ? Core::NativeUpdates::B9SyncByObject : Core::NativeUpdates::B9SyncNoObject);
@@ -917,9 +935,56 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         boost::container::small_vector<std::pair<u64, u64>, 8> from_announced;
         {
             std::scoped_lock lock{object_dirty_mutex};
-            all_object_dirty.ForEachInRange(x, xn, [&](u64 lo, u64 e) { from_announced.emplace_back(lo, e - lo); });
+            const u32 lean = Core::NativeUpdates::LeanDirtyMode();
+            if (lean == 2) {
+                b9_unattributed.ForEachInRange(x, xn, [&](u64 lo, u64 e) { from_announced.emplace_back(lo, e - lo); });
+            } else {
+                all_object_dirty.ForEachInRange(x, xn, [&](u64 lo, u64 e) { from_announced.emplace_back(lo, e - lo); });
+                if (lean == 1) {
+                    // compare with the unattributed set alone: every byte of the audit set must be in it (missing = stale if the audit set were dropped)
+                    boost::container::small_vector<std::pair<u64, u64>, 8> lean_pieces;
+                    b9_unattributed.ForEachInRange(x, xn, [&](u64 lo, u64 e) { lean_pieces.emplace_back(lo, e - lo); });
+                    const auto covered = [](const auto& list, u64 lo, u64 n) {
+                        u64 at = lo;
+                        for (const auto& [a, an] : list) { // (merged, sorted, disjoint)
+                            if (a + an <= at) {
+                                continue;
+                            }
+                            if (a > at) {
+                                break;
+                            }
+                            at = a + an;
+                            if (at >= lo + n) {
+                                break;
+                            }
+                        }
+                        return at >= lo + n;
+                    };
+                    u64 missing = 0, extra = 0;
+                    for (const auto& [lo, n] : from_announced) {
+                        if (!covered(lean_pieces, lo, n)) {
+                            missing += n;
+                        }
+                    }
+                    for (const auto& [lo, n] : lean_pieces) {
+                        if (!covered(from_announced, lo, n)) {
+                            extra += n;
+                        }
+                    }
+                    Core::NativeUpdates::NoteB9(Core::NativeUpdates::LeanChecked);
+                    if (missing != 0) {
+                        Core::NativeUpdates::NoteB9(Core::NativeUpdates::LeanMissing, missing);
+                        Core::RareEvents::Note("d2_lean_take_announced_missing", fmt::format("{:#x}+{:#x}: {} bytes", x, xn, missing));
+                    }
+                    if (extra != 0) {
+                        Core::NativeUpdates::NoteB9(Core::NativeUpdates::LeanExtra, extra);
+                    }
+                }
+            }
             for (const auto& [lo, n] : from_announced) {
-                all_object_dirty.Subtract(lo, n);
+                if (lean != 2) {
+                    all_object_dirty.Subtract(lo, n);
+                }
                 b9_unattributed.Subtract(lo, n);
             }
         }
