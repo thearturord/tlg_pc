@@ -14,6 +14,7 @@
 
 #include <fmt/format.h>
 
+#include "native_content.h"
 #include "native_draw.h"
 #include "native_debug_server.h"
 #include "native_registry.h"
@@ -80,8 +81,36 @@ struct Copy {
     u64 caller{};
     u32 frame{};
     u64 number{};
+    u64 src_hash{}; ///< hash of the source memory when the raster thread took the copy (0: unreadable)
+    u32 src_nonzero_chunks{};
 };
-constexpr size_t CopiesKept = 400;
+constexpr size_t CopiesKept = 3000;
+
+/// Hash of a guest range in 64 byte chunks (HashChunksGuarded) folded into one value; nonzero chunk count in `nonzero`.
+u64 RangeHash(u64 address, u64 size, u32* nonzero) {
+    const u64 chunks = size / 64;
+    std::vector<u32> hashes(chunks);
+    if (chunks == 0 || !Core::NativeContent::HashChunksGuarded(address, chunks, 64, hashes.data())) {
+        return 0;
+    }
+    static u32 zero_hash = 0;
+    static bool zero_known = false;
+    if (!zero_known) {
+        std::vector<u8> z(64, 0);
+        Core::NativeContent::HashChunksGuarded(reinterpret_cast<u64>(z.data()), 1, 64, &zero_hash);
+        zero_known = true;
+    }
+    u64 h = 1469598103934665603ull;
+    u32 nz = 0;
+    for (const u32 v : hashes) {
+        h = (h ^ v) * 1099511628211ull;
+        nz += v != zero_hash ? 1 : 0;
+    }
+    if (nonzero != nullptr) {
+        *nonzero = nz;
+    }
+    return h;
+}
 constexpr size_t RecentKept = 6000;
 std::deque<Copy> copies;
 std::deque<Write> recent; ///< every GPU write of the last moments: the writes of a copy's source happen before the copy
@@ -380,7 +409,7 @@ void NoteGpuCopy(u64 dst, u64 src, u64 size) {
     std::scoped_lock lock{mutex};
     ProvSet(dst, size, Prov{0, "copy", src, static_cast<u32>(Core::DebugServer::PresentCount()), Core::NativeRegistry::CurrentDrawSeq(),
                             Core::NativeRegistry::CurrentDrawSeq() != 0 ? Core::NativeDraw::RecordCallerGhidra(Core::NativeRegistry::CurrentDrawSeq()) : 0, write_number + 1});
-    if (size < 65536) {
+    if (size < 16384) {
         ++write_number;
         return;
     }
@@ -392,6 +421,11 @@ void NoteGpuCopy(u64 dst, u64 src, u64 size) {
     c.caller = c.seq != 0 ? Core::NativeDraw::RecordCallerGhidra(c.seq) : 0;
     c.frame = static_cast<u32>(Core::DebugServer::PresentCount());
     c.number = ++write_number;
+    if (size <= (256u << 10)) {
+        c.src_hash = RangeHash(src, size, &c.src_nonzero_chunks);
+    } else {
+        return; // big copies (streaming, 33 MB per frame) are not text pictures and would push them out of the list
+    }
     copies.push_back(c);
     while (copies.size() > CopiesKept) {
         copies.pop_front();
@@ -463,7 +497,7 @@ std::string Json() {
     out += fmt::format("],\"gpu_writes_total\":{},\"gpu_copies\":[", write_number);
     for (size_t i = 0; i < copies.size(); ++i) {
         const Copy& c = copies[i];
-        out += fmt::format("{}{{\"n\":{},\"frame\":{},\"dst\":\"{:x}\",\"src\":\"{:x}\",\"size\":{},\"seq\":{},\"caller\":\"{:x}\"}}", i ? "," : "", c.number, c.frame, c.dst, c.src, c.size, c.seq, c.caller);
+        out += fmt::format("{}{{\"n\":{},\"frame\":{},\"dst\":\"{:x}\",\"src\":\"{:x}\",\"size\":{},\"seq\":{},\"caller\":\"{:x}\",\"src_hash_then\":\"{:x}\",\"src_hash_now\":\"{:x}\",\"src_nonzero_chunks\":{}}}", i ? "," : "", c.number, c.frame, c.dst, c.src, c.size, c.seq, c.caller, c.src_hash, RangeHash(c.src, c.size, nullptr), c.src_nonzero_chunks);
     }
     out += "],\"gpu_writes\":[";
     std::vector<Write> sorted(writes.begin(), writes.end());
