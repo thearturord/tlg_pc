@@ -47,10 +47,19 @@ struct Frame {
     std::vector<Draw> draws;
 };
 
+/// A change between two consecutive frames of traced draws (the title menu is static, so a change is what the owner sees as a glitch). The colour block (160 bytes: the blinking text) is left out of the comparison.
+struct Change {
+    Frame before;
+    Frame after;
+};
+constexpr size_t ChangesKept = 40;
+
 std::atomic<bool> armed{false};
 std::mutex mutex;
 std::vector<u32> ps_filter;
 std::deque<Frame> frames;
+std::deque<Change> changes;
+u64 changes_total = 0;
 thread_local bool t_active = false;
 thread_local Draw t_draw;
 thread_local u32 t_frame = 0;
@@ -61,6 +70,37 @@ u64 Fnv(const u8* data, u64 size) {
         h = (h ^ data[i]) * 1099511628211ull;
     }
     return h;
+}
+
+std::vector<u64> Signature(const Frame& f) {
+    std::vector<u64> sig;
+    for (const Draw& d : f.draws) {
+        u64 h = 1469598103934665603ull ^ d.count ^ (d.reads_total * 131ull);
+        for (const Read& r : d.reads) {
+            if (r.size == 160) {
+                continue;
+            }
+            h = (h ^ r.hash ^ r.size) * 1099511628211ull;
+        }
+        sig.push_back(h);
+    }
+    return sig;
+}
+
+std::string FrameJson(const Frame& fr) {
+    std::string out = fmt::format("{{\"frame\":{},\"draws\":[", fr.frame);
+    for (size_t d = 0; d < fr.draws.size(); ++d) {
+        const Draw& dr = fr.draws[d];
+        out += fmt::format("{}{{\"seq\":{},\"ps\":\"{:x}\",\"vs\":\"{:x}\",\"rt0\":\"{:x}\",\"count\":{},\"instances\":{},\"caller\":\"{:x}\",\"reads_total\":{},\"reads\":[", d ? "," : "", dr.seq, dr.ps, dr.vs,
+                           dr.color0, dr.count, dr.instances, dr.caller, dr.reads_total);
+        for (size_t i = 0; i < dr.reads.size(); ++i) {
+            const Read& r = dr.reads[i];
+            out += fmt::format("{}{{\"kind\":\"{}\",\"address\":\"{:x}\",\"size\":{},\"hash\":\"{:016x}\",\"hex\":\"{}\",\"floats\":\"{}\"}}", i ? "," : "", r.kind, r.address, r.size, r.hash, r.hex, r.floats);
+        }
+        out += "]}";
+    }
+    out += "]}";
+    return out;
 }
 
 bool EnvOn() {
@@ -178,6 +218,18 @@ void EndDraw() {
     t_active = false;
     std::scoped_lock lock{mutex};
     if (frames.empty() || frames.back().frame != t_frame) {
+        // the newest frame is complete: compare it with the one before
+        if (frames.size() >= 2) {
+            const Frame& done = frames[frames.size() - 1];
+            const Frame& prev = frames[frames.size() - 2];
+            if (done.frame == prev.frame + 1 && Signature(done) != Signature(prev)) {
+                ++changes_total;
+                changes.push_back(Change{prev, done});
+                while (changes.size() > ChangesKept) {
+                    changes.pop_front();
+                }
+            }
+        }
         frames.push_back(Frame{t_frame, {}});
         while (frames.size() > FramesKept) {
             frames.pop_front();
@@ -194,21 +246,13 @@ std::string Json() {
     for (size_t i = 0; i < ps_filter.size(); ++i) {
         out += fmt::format("{}\"{:x}\"", i ? "," : "", ps_filter[i]);
     }
+    out += fmt::format("],\"changes_total\":{},\"changes\":[", changes_total);
+    for (size_t c = 0; c < changes.size(); ++c) {
+        out += fmt::format("{}{{\"before\":{},\"after\":{}}}", c ? "," : "", FrameJson(changes[c].before), FrameJson(changes[c].after));
+    }
     out += "],\"frames\":[";
     for (size_t f = 0; f < frames.size(); ++f) {
-        const Frame& fr = frames[f];
-        out += fmt::format("{}{{\"frame\":{},\"draws\":[", f ? "," : "", fr.frame);
-        for (size_t d = 0; d < fr.draws.size(); ++d) {
-            const Draw& dr = fr.draws[d];
-            out += fmt::format("{}{{\"seq\":{},\"ps\":\"{:x}\",\"vs\":\"{:x}\",\"rt0\":\"{:x}\",\"count\":{},\"instances\":{},\"caller\":\"{:x}\",\"reads_total\":{},\"reads\":[", d ? "," : "", dr.seq, dr.ps, dr.vs, dr.color0,
-                               dr.count, dr.instances, dr.caller, dr.reads_total);
-            for (size_t i = 0; i < dr.reads.size(); ++i) {
-                const Read& r = dr.reads[i];
-                out += fmt::format("{}{{\"kind\":\"{}\",\"address\":\"{:x}\",\"size\":{},\"hash\":\"{:016x}\",\"hex\":\"{}\",\"floats\":\"{}\"}}", i ? "," : "", r.kind, r.address, r.size, r.hash, r.hex, r.floats);
-            }
-            out += "]}";
-        }
-        out += "]}";
+        out += (f ? "," : "") + FrameJson(frames[f]);
     }
     out += "]}";
     return out;
