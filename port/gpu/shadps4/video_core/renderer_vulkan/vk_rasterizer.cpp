@@ -117,6 +117,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     }
     scheduler.SetEncoderMode(EmulatorSettings.GetCpEncoderMode());
     memory->SetRasterizer(this);
+    // default 4 since 2026-11-07 (owner play good, draws only: see TLG_RING_KIND); TLG_CONST_RING=0 turns the ring off
+    const_ring_level = 4;
     if (const char* env = std::getenv("TLG_CONST_RING")) {
         const_ring_level = static_cast<u32>(std::clamp(std::atoi(env), 0, 4));
     }
@@ -1799,7 +1801,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             vk::AccessFlagBits2::eShaderRead |
             (desc.is_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eNone);
         // TLG_RING_KIND (bisect): 1 draws only, 2 dispatches only, 0 both
-        static const u32 ring_kind = [] { const char* e = std::getenv("TLG_RING_KIND"); return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u; }();
+        static const u32 ring_kind = [] { const char* e = std::getenv("TLG_RING_KIND"); return e != nullptr ? static_cast<u32>(std::atoi(e)) : 1u; }(); // default 1: dispatches crash the device (phase4-prepare-draws-plan.md)
         const RingBinding* ring = const_ring_level >= 4 && ((ring_use.draw && ring_kind != 2) || (ring_use.dispatch && ring_kind != 1)) ? FindRingBinding(stage, buffer_index) : nullptr;
         if (ring != nullptr && ring->formatted) {
             // N5f: a texel buffer may be the memory of an image (a surface a shader reads as a buffer, HTile, CMask): only the raster thread knows
