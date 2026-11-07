@@ -407,6 +407,11 @@ struct SamePassFlushCensus {
     std::atomic<u64> flushes{}, image_barriers{}, with_memory_barrier{}, other_pass_changes{};
 };
 inline SamePassFlushCensus g_same_pass_flushes;
+/// How the render state of consecutive draws differs when a draw ends the open pass (index = difference mask, see `PassStateDifference`; 0x100 = no pass open), with the draws the ended pass held.
+struct PassChangeCensus {
+    std::atomic<u64> count[0x200]{}, draws_held[0x200]{};
+};
+inline PassChangeCensus g_pass_changes;
 
 /// One command stream: ticks (timeline semaphore), command lists, encoder thread, priority operation thread, one VkQueue.
 /// Scheduler (below) owns the graphics stream and, with TLG_ASC_QUEUE=1, a second one for the asynchronous compute queue 1.
@@ -438,6 +443,27 @@ public:
     /// True when `BeginRendering(new_state)` would keep the open pass (census only).
     [[nodiscard]] bool WouldContinuePass(const RenderState& new_state) const noexcept {
         return is_rendering && render_state == new_state;
+    }
+
+    /// Census only: which parts of the open pass's state differ from `s` (bit 0 colour count, 1 size or layers, 2 colour view, 3 colour layout or clear, 4 depth view, 5 depth layout,
+    /// 6 depth or stencil clear flags, 7 clear value); 0x100 when no pass is open.
+    [[nodiscard]] u32 PassStateDifference(const RenderState& s) const noexcept {
+        if (!is_rendering) {
+            return 0x100;
+        }
+        const RenderState& o = render_state;
+        u32 m = 0;
+        m |= o.num_color_attachments != s.num_color_attachments ? 1u : 0u;
+        m |= (o.width != s.width || o.height != s.height || o.num_layers != s.num_layers) ? 2u : 0u;
+        for (u32 i = 0; i < 8; ++i) {
+            m |= o.color_attachments[i].image_view != s.color_attachments[i].image_view ? 4u : 0u;
+            m |= (o.color_attachments[i].image_layout != s.color_attachments[i].image_layout || o.color_attachments[i].is_clear != s.color_attachments[i].is_clear) ? 8u : 0u;
+        }
+        m |= o.depth_stencil_attachment.image_view != s.depth_stencil_attachment.image_view ? 16u : 0u;
+        m |= o.depth_stencil_attachment.image_layout != s.depth_stencil_attachment.image_layout ? 32u : 0u;
+        m |= o.depth_stencil_attachment.is_clear != s.depth_stencil_attachment.is_clear ? 64u : 0u;
+        m |= o.depth_stencil_attachment.clear_value != s.depth_stencil_attachment.clear_value ? 128u : 0u;
+        return m;
     }
 
     /// Ends current rendering scope.
@@ -808,6 +834,9 @@ public:
     /// True when `BeginRendering(new_state)` would keep the open pass (census only).
     [[nodiscard]] bool WouldContinuePass(const RenderState& new_state) {
         return Active().WouldContinuePass(new_state);
+    }
+    [[nodiscard]] u32 PassStateDifference(const RenderState& s) {
+        return Active().PassStateDifference(s);
     }
     void EndRendering() {
         Active().EndRendering();

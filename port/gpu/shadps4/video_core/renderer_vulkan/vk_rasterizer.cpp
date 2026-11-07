@@ -773,6 +773,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     geometry_plan = nullptr;
 
     const bool pass_barrier = needs_barrier;
+    {
+        const u32 diff = scheduler.PassStateDifference(state);
+        if (diff != 0) {
+            g_pass_changes.count[diff].fetch_add(1, std::memory_order_relaxed);
+            g_pass_changes.draws_held[diff].fetch_add(0, std::memory_order_relaxed);
+        }
+    }
     if (needs_barrier) {
         TLG_PROF_LEVEL("raster.flush_barriers", 2);
         t_flush_in_same_pass = scheduler.WouldContinuePass(state);
