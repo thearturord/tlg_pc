@@ -12,7 +12,12 @@
 #include <mutex>
 #include <vector>
 
+#include <filesystem>
+#include <fstream>
+
 #include <fmt/format.h>
+
+#include "common/path_util.h"
 
 #include "native_content.h"
 #include "native_draw.h"
@@ -141,6 +146,14 @@ struct Upload {
     std::string page_map; ///< one character per 4 KB page: G = marked GPU written, . = not (read from guest memory)
 };
 std::map<u64, Upload> uploads;
+struct Shot {
+    u32 frame{};
+    u32 last_asked{};
+    u64 size{};
+    std::string file;
+    std::string info;
+};
+std::map<u64, Shot> shots;
 constexpr size_t ProvMax = 400000;
 
 void ProvSet(u64 lo, u64 size, const Prov& p0) {
@@ -447,6 +460,36 @@ void NoteGpuWrite(const char* by, u64 address, u64 size) {
     }
 }
 
+bool WantsShot(u64 address, u32 frame) {
+    if (!t_active) {
+        return false;
+    }
+    std::scoped_lock lock{mutex};
+    Shot& s = shots[address];
+    if (s.last_asked != 0 && frame < s.last_asked + 20) {
+        return false;
+    }
+    s.last_asked = frame == 0 ? 1 : frame;
+    return true;
+}
+
+void SaveShot(u64 address, u32 frame, const u8* data, u64 size, const std::string& info) {
+    const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "ui_shots";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::string file = fmt::format("shot_{:x}.bin", address);
+    {
+        std::ofstream out(dir / file, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+    }
+    std::scoped_lock lock{mutex};
+    Shot& s = shots[address];
+    s.frame = frame;
+    s.size = size;
+    s.file = file;
+    s.info = info;
+}
+
 void NoteSupersede(u64 address, u64 size, u64 return_address) {
     if (!Armed() || size == 0) {
         return;
@@ -570,6 +613,17 @@ std::string Json() {
     for (size_t i = 0; i < sorted.size(); ++i) {
         const Write& w = sorted[i];
         out += fmt::format("{}{{\"n\":{},\"frame\":{},\"by\":\"{}\",\"address\":\"{:x}\",\"size\":{},\"seq\":{},\"caller\":\"{:x}\"}}", i ? "," : "", w.number, w.frame, w.by, w.address, w.size, w.seq, w.caller);
+    }
+    out += "],\"shots\":[";
+    {
+        bool first_shot = true;
+        for (const auto& [address, sh] : shots) {
+            if (sh.file.empty()) {
+                continue;
+            }
+            out += fmt::format("{}{{\"address\":\"{:x}\",\"frame\":{},\"size\":{},\"file\":\"ui_shots/{}\",\"info\":\"{}\"}}", first_shot ? "" : ",", address, sh.frame, sh.size, sh.file, sh.info);
+            first_shot = false;
+        }
     }
     out += "],\"provenance\":[";
     if (!frames.empty()) {

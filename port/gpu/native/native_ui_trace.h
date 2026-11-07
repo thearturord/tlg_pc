@@ -32,6 +32,10 @@ void NoteImage(u64 address, u64 size, const std::string& description);
 void NoteImageUpload(u64 address, u64 size, u64 hash_before, u64 hash_after, bool source_gpu, const std::string& gpu_page_map);
 /// Anyone: the buffer cache drops the "GPU wrote these bytes" mark of a range (the next upload of an image there reads guest memory instead of the GPU's data).
 void NoteSupersede(u64 address, u64 size, u64 return_address);
+/// Raster thread: a traced draw samples this image: true when its GPU content should be read back now (once per address every 20 frames).
+[[nodiscard]] bool WantsShot(u64 address, u32 frame);
+/// Raster thread: the read back bytes of the image as the GPU holds them (raw blocks of a compressed image) are saved to user/log/ui_shots/shot_<address>.bin.
+void SaveShot(u64 address, u32 frame, const u8* data, u64 size, const std::string& info);
 /// Raster thread: the draw is done.
 void EndDraw();
 /// Raster thread: the GPU writes a guest memory range (texture cache invalidation by an image copy / clear / memory copy / written storage buffer or image). Kept only when it overlaps an image a traced draw

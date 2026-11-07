@@ -48,6 +48,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
@@ -610,6 +611,18 @@ static void NoteMarkerRow(u8 kind, u8 draw_class, const Pipeline* pipeline, u64 
     Core::Marker::NoteRow(row);
 }
 
+namespace {
+/// UI trace image read backs (debugging): the GPU content of the interface text pictures, read back to host memory a few frames apart. Raster thread only.
+struct UiShotPending {
+    u64 address{};
+    Vulkan::StagingBufferRef ref;
+    u64 tick{};
+    u32 frame{};
+    std::string info;
+};
+std::vector<UiShotPending> ui_shots_pending;
+} // namespace
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseDraw, engine_clear_on);
     if (SkipForEngineClear() && plan != nullptr) {
@@ -662,6 +675,15 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         }
     };
     if (Core::UiTrace::Armed()) {
+        for (auto it = ui_shots_pending.begin(); it != ui_shots_pending.end();) {
+            if (scheduler.IsFree(it->tick)) {
+                it->ref.Invalidate();
+                Core::UiTrace::SaveShot(it->address, it->frame, it->ref.mapped, it->ref.size, it->info);
+                it = ui_shots_pending.erase(it);
+            } else {
+                ++it;
+            }
+        }
         constexpr u32 FragmentStage = static_cast<u32>(Shader::SwStage::Fragment);
         constexpr u32 VertexStage = static_cast<u32>(Shader::SwStage::Vertex);
         const auto trace_stages = pipeline->GetStages();
@@ -2512,6 +2534,23 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image.usage.texture |= !is_storage;
             if (is_storage) {
                 Core::UiTrace::NoteGpuWrite("a storage image binding", image.info.guest_address, image.info.guest_size);
+            }
+            if (Core::UiTrace::Active() && !is_storage && image.info.props.is_block && !image.info.props.is_depth && image.info.guest_size <= (256u << 10) && image.info.resources.layers == 1 &&
+                image.info.resources.levels >= 1 && Core::UiTrace::WantsShot(image.info.guest_address, static_cast<u32>(Core::DebugServer::PresentCount()))) {
+                // read back the GPU's copy of this picture (raw compressed blocks of mip 0): the freeze report compares it with the guest memory
+                auto ref = runtime.GetStagingPool().Request(image.info.guest_size, VideoCore::MemoryType::HostCached, 16, false);
+                const vk::BufferImageCopy shot_copy = {
+                    .bufferOffset = ref.offset,
+                    .bufferRowLength = 0,
+                    .bufferImageHeight = 0,
+                    .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
+                    .imageOffset = {0, 0, 0},
+                    .imageExtent = {image.info.size.width, image.info.size.height, 1},
+                };
+                runtime.DownloadImage(&image, ref.buffer, std::span{&shot_copy, 1});
+                needs_barrier |= transit(&image, transit_layout, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
+                ui_shots_pending.push_back({image.info.guest_address, ref, scheduler.CurrentTick(), static_cast<u32>(Core::DebugServer::PresentCount()),
+                                            fmt::format("{} {}x{}", vk::to_string(image.info.pixel_format), image.info.size.width, image.info.size.height)});
             }
             if (Core::UiTrace::Active()) {
                 Core::UiTrace::NoteImage(image.info.guest_address, image.info.guest_size,
