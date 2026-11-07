@@ -3270,6 +3270,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     if (!dst_gds && !src_gds) {
         Core::UiTrace::NoteGpuCopy(dst, src, num_bytes);
     }
+    const u64 ui_copy_number = Core::UiTrace::LastCopyNumber(); // taken now: work in between must not change which copy a result belongs to
     Core::ResourceAudit::Note(dst_gds ? Core::ResourceAudit::GdsFill : Core::ResourceAudit::MemoryCopyDst, dst, num_bytes, true);
     Core::ResourceAudit::Note(src_gds ? Core::ResourceAudit::GdsFill : Core::ResourceAudit::MemoryCopySrc, src, num_bytes, false);
     if (!dst_gds && !src_gds) {
@@ -3342,7 +3343,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         auto ref = runtime.GetStagingPool().Request(num_bytes, VideoCore::MemoryType::HostCached, 16, false);
         const vk::BufferCopy back = {.srcOffset = dst_offset, .dstOffset = ref.offset, .size = num_bytes};
         runtime.CopyBuffer(dst_buffer, ref.buffer, std::span{&back, 1});
-        ui_copies_pending.push_back({Core::UiTrace::LastCopyNumber(), 0, ref, scheduler.CurrentTick()});
+        ui_copies_pending.push_back({ui_copy_number, 0, ref, scheduler.CurrentTick()});
     }
     if (!dst_gds && VideoCore::ReadbackPolicy::Get().dma_async.load(std::memory_order_relaxed)) {
         // B6: only where the CPU reads the result (an explicit readback, a resource the engine made for CPU reads, or memory no engine resource owns)
