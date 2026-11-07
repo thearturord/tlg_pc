@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -88,6 +89,64 @@ std::deque<Write> writes;
 std::vector<std::pair<u64, u64>> src_watch; ///< sources of the kept copies
 std::vector<std::pair<u64, u64>> watch; ///< [address, address + size) of the images traced draws sampled
 u64 write_number = 0;
+
+/// Provenance (2026-11-07): who made the memory of every range the GPU wrote last: [lo, hi) -> writer. Ranges never overlap. A copy names its source, so the chain image <- copy <- source <- ... can be followed.
+struct Prov {
+    u64 hi{};
+    const char* by{};
+    u64 src{}; ///< for a copy: the source address (0 otherwise)
+    u32 frame{};
+    u64 seq{};
+    u64 caller{};
+    u64 number{};
+};
+std::map<u64, Prov> prov;
+constexpr size_t ProvMax = 400000;
+
+void ProvSet(u64 lo, u64 size, const Prov& p0) {
+    if (size == 0) {
+        return;
+    }
+    if (prov.size() > ProvMax) {
+        prov.clear();
+    }
+    const u64 hi = lo + size;
+    auto it = prov.upper_bound(lo);
+    if (it != prov.begin()) {
+        auto prev = std::prev(it);
+        if (prev->second.hi > lo) {
+            Prov tail = prev->second;
+            const u64 prev_lo = prev->first;
+            const bool has_tail = tail.hi > hi;
+            prev->second.hi = lo;
+            if (prev_lo == lo) {
+                prov.erase(prev);
+            }
+            if (has_tail) {
+                if (tail.src != 0) {
+                    tail.src += hi - prev_lo;
+                }
+                prov[hi] = tail;
+            }
+        }
+    }
+    it = prov.lower_bound(lo);
+    while (it != prov.end() && it->first < hi) {
+        if (it->second.hi > hi) {
+            Prov rest = it->second;
+            if (rest.src != 0) {
+                rest.src += hi - it->first;
+            }
+            it = prov.erase(it);
+            prov[hi] = rest;
+            break;
+        }
+        it = prov.erase(it);
+    }
+    Prov p = p0;
+    p.hi = hi;
+    prov[lo] = p;
+}
 
 std::atomic<bool> armed{false};
 std::mutex mutex;
@@ -301,6 +360,9 @@ void NoteGpuWrite(const char* by, u64 address, u64 size) {
     w.caller = w.seq != 0 ? Core::NativeDraw::RecordCallerGhidra(w.seq) : 0;
     w.frame = static_cast<u32>(Core::DebugServer::PresentCount());
     w.number = ++write_number;
+    if (std::strstr(w.by, "copy") == nullptr) {
+        ProvSet(address, size, Prov{0, w.by, 0, w.frame, w.seq, w.caller, w.number});
+    }
     if (Overlaps(watch, address, size) || Overlaps(src_watch, address, size)) {
         KeepWrite(w);
     } else {
@@ -312,10 +374,16 @@ void NoteGpuWrite(const char* by, u64 address, u64 size) {
 }
 
 void NoteGpuCopy(u64 dst, u64 src, u64 size) {
-    if (!Armed() || size < 65536) {
+    if (!Armed() || size < 4096) {
         return;
     }
     std::scoped_lock lock{mutex};
+    ProvSet(dst, size, Prov{0, "copy", src, static_cast<u32>(Core::DebugServer::PresentCount()), Core::NativeRegistry::CurrentDrawSeq(),
+                            Core::NativeRegistry::CurrentDrawSeq() != 0 ? Core::NativeDraw::RecordCallerGhidra(Core::NativeRegistry::CurrentDrawSeq()) : 0, write_number + 1});
+    if (size < 65536) {
+        ++write_number;
+        return;
+    }
     Copy c;
     c.dst = dst;
     c.src = src;
@@ -403,6 +471,47 @@ std::string Json() {
     for (size_t i = 0; i < sorted.size(); ++i) {
         const Write& w = sorted[i];
         out += fmt::format("{}{{\"n\":{},\"frame\":{},\"by\":\"{}\",\"address\":\"{:x}\",\"size\":{},\"seq\":{},\"caller\":\"{:x}\"}}", i ? "," : "", w.number, w.frame, w.by, w.address, w.size, w.seq, w.caller);
+    }
+    out += "],\"provenance\":[";
+    if (!frames.empty()) {
+        bool first = true;
+        for (size_t d = 0; d < frames.back().draws.size(); ++d) {
+            for (const Read& r : frames.back().draws[d].reads) {
+                if (r.kind.rfind("image", 0) != 0) {
+                    continue;
+                }
+                out += fmt::format("{}{{\"draw\":{},\"image\":\"{:x}\",\"size\":{},\"chain\":[", first ? "" : ",", d, r.address, r.size);
+                first = false;
+                u64 lo = r.address, size = r.size;
+                bool firstc = true;
+                for (int level = 0; level < 8 && size != 0; ++level) {
+                    u64 next_src = 0;
+                    auto it = prov.upper_bound(lo);
+                    if (it != prov.begin()) {
+                        --it;
+                    }
+                    for (; it != prov.end() && it->first < lo + size; ++it) {
+                        if (it->second.hi <= lo) {
+                            continue;
+                        }
+                        const u64 a = std::max(it->first, lo);
+                        const u64 b = std::min(it->second.hi, lo + size);
+                        out += fmt::format("{}{{\"level\":{},\"range\":\"{:x}+{}\",\"by\":\"{}\",\"src\":\"{:x}\",\"frame\":{},\"seq\":{},\"caller\":\"{:x}\",\"n\":{}}}", firstc ? "" : ",", level, a, b - a, it->second.by,
+                                           it->second.src != 0 ? it->second.src + (a - it->first) : 0, it->second.frame, it->second.seq, it->second.caller, it->second.number);
+                        firstc = false;
+                        if (it->second.src != 0 && next_src == 0) {
+                            next_src = it->second.src + (a - it->first);
+                            size = b - a;
+                        }
+                    }
+                    if (next_src == 0) {
+                        break;
+                    }
+                    lo = next_src;
+                }
+                out += "]}";
+            }
+        }
     }
     out += "],\"frames\":[";
     for (size_t f = 0; f < frames.size(); ++f) {
