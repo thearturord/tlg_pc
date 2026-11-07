@@ -705,7 +705,7 @@ u64 ImageBase() noexcept {
 u32 LeanDirtyMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_LEAN_DIRTY");
-        return e != nullptr && e[0] >= '0' && e[0] <= '2' ? static_cast<u32>(e[0] - '0') : 0u;
+        return e != nullptr && e[0] >= '0' && e[0] <= '2' ? static_cast<u32>(e[0] - '0') : 2u; // default 2 since 2026-11-07 (owner); =0 is the old audit set, =1 verifies
     }();
     return mode;
 }
