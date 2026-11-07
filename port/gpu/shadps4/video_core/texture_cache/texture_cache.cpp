@@ -1288,7 +1288,12 @@ void TextureCache::RefreshImage(Image& image, Core::ImageCaller caller) {
         runtime.UploadImage(&image, buffer, image_copies);
     }
     if (ui_hash_before != 0) {
-        Core::UiTrace::NoteImageUpload(image.info.guest_address, image.info.guest_size, ui_hash_before, Core::UiTrace::UploadHash(image.info.guest_address, image.info.guest_size));
+        std::string page_map;
+        for (u64 off = 0; off < image.info.guest_size; off += 4096) {
+            page_map += buffer_cache.IsRegionGpuModified(image.info.guest_address + off, std::min<u64>(4096, image.info.guest_size - off)) ? 'G' : '.';
+        }
+        Core::UiTrace::NoteImageUpload(image.info.guest_address, image.info.guest_size, ui_hash_before, Core::UiTrace::UploadHash(image.info.guest_address, image.info.guest_size),
+                                       BufferCache::last_image_source_gpu, page_map);
     }
     if (!Core::NativeContent::InRing(image.info.guest_address, image.info.guest_size)) {
         Core::NativeContent::SilentImageUploaded(image.info.guest_address, image.info.guest_size, BufferCache::last_image_source_gpu); // W1.5 census

@@ -29,7 +29,9 @@ void NoteRead(const char* kind, u64 address, u64 size);
 void NoteImage(u64 address, u64 size, const std::string& description);
 /// Raster thread, texture cache refresh: hash of the image's guest memory (0 when not armed or bigger than 256 KB). Call before the bytes are read and after the upload, then NoteImageUpload.
 [[nodiscard]] u64 UploadHash(u64 address, u64 size);
-void NoteImageUpload(u64 address, u64 size, u64 hash_before, u64 hash_after);
+void NoteImageUpload(u64 address, u64 size, u64 hash_before, u64 hash_after, bool source_gpu, const std::string& gpu_page_map);
+/// Anyone: the buffer cache drops the "GPU wrote these bytes" mark of a range (the next upload of an image there reads guest memory instead of the GPU's data).
+void NoteSupersede(u64 address, u64 size, u64 return_address);
 /// Raster thread: the draw is done.
 void EndDraw();
 /// Raster thread: the GPU writes a guest memory range (texture cache invalidation by an image copy / clear / memory copy / written storage buffer or image). Kept only when it overlaps an image a traced draw

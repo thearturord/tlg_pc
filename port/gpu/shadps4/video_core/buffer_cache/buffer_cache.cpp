@@ -13,6 +13,7 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "native/native_ui_trace.h"
 #include "native/native_config.h"
 #include "native/native_device.h"
 #include "native/native_draw.h"
@@ -745,6 +746,7 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 }
 
 void BufferCache::SupersedeGpuWritten(VAddr addr, size_t size) {
+    Core::UiTrace::NoteSupersede(addr, size, reinterpret_cast<u64>(__builtin_return_address(0)));
     std::unique_lock lock{gpu_ranges_mutex};
     BindMemoBump(); // GPU written bytes change hands: memo answers are checked again
     gpu_modified_ranges.Subtract(addr, size);

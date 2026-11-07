@@ -137,6 +137,8 @@ struct Upload {
     u64 after{};
     u32 frame{};
     u32 count{};
+    bool source_gpu{};
+    std::string page_map; ///< one character per 4 KB page: G = marked GPU written, . = not (read from guest memory)
 };
 std::map<u64, Upload> uploads;
 constexpr size_t ProvMax = 400000;
@@ -352,12 +354,14 @@ u64 UploadHash(u64 address, u64 size) {
     return RangeHash(address, size, nullptr);
 }
 
-void NoteImageUpload(u64 address, u64 size, u64 hash_before, u64 hash_after) {
+void NoteImageUpload(u64 address, u64 size, u64 hash_before, u64 hash_after, bool source_gpu, const std::string& gpu_page_map) {
     if (hash_before == 0 && hash_after == 0) {
         return;
     }
     std::scoped_lock lock{mutex};
     Upload& u = uploads[address];
+    u.source_gpu = source_gpu;
+    u.page_map = gpu_page_map;
     u.size = size;
     u.before = hash_before;
     u.after = hash_after;
@@ -372,7 +376,7 @@ void NoteImage(u64 address, u64 size, const std::string& description0) {
         std::scoped_lock lock{mutex};
         if (const auto it = uploads.find(address); it != uploads.end()) {
             const Upload& u = it->second;
-            description += fmt::format(" | uploaded {}x, last at frame {}: memory before {:x} after {:x}, memory now {:x} => {}{}", u.count, u.frame, u.before, u.after, now,
+            description += fmt::format(" | uploaded {}x, last at frame {} from {} [{}]: memory before {:x} after {:x}, memory now {:x} => {}{}", u.count, u.frame, u.source_gpu ? "the GPU's data" : "GUEST MEMORY", u.page_map, u.before, u.after, now,
                                        u.after == now ? "image matches memory" : "MEMORY CHANGED SINCE THE UPLOAD", u.before != u.after ? " (memory changed DURING the upload)" : "");
         } else {
             description += fmt::format(" | never uploaded since the trace started (memory now {:x})", now);
@@ -440,6 +444,26 @@ void NoteGpuWrite(const char* by, u64 address, u64 size) {
         while (recent.size() > RecentKept) {
             recent.pop_front();
         }
+    }
+}
+
+void NoteSupersede(u64 address, u64 size, u64 return_address) {
+    if (!Armed() || size == 0) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    Prov p{0, "GPU mark dropped (superseded)", 0, static_cast<u32>(Core::DebugServer::PresentCount()), Core::NativeRegistry::CurrentDrawSeq(), return_address, ++write_number};
+    ProvSet(address, size, p);
+    Write w;
+    w.by = p.by;
+    w.address = address;
+    w.size = size;
+    w.seq = p.seq;
+    w.caller = return_address;
+    w.frame = p.frame;
+    w.number = p.number;
+    if (Overlaps(watch, address, size) || Overlaps(src_watch, address, size)) {
+        KeepWrite(w);
     }
 }
 
