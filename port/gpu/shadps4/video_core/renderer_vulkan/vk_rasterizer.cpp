@@ -14,6 +14,7 @@
 #include "native/native_content.h"
 #include "native/native_prof.h"
 #include "native/native_marker.h"
+#include "native/native_ui_trace.h"
 #include "native/native_config.h"
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
@@ -651,6 +652,25 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     if (!pipeline) {
         return;
     }
+    // UI draw trace (native_ui_trace.h): the guest reads of the interface text draws are kept; EndDraw runs when this function returns
+    struct UiTraceScope {
+        bool on;
+        ~UiTraceScope() {
+            if (on) {
+                Core::UiTrace::EndDraw();
+            }
+        }
+    };
+    if (Core::UiTrace::Armed()) {
+        constexpr u32 FragmentStage = static_cast<u32>(Shader::SwStage::Fragment);
+        constexpr u32 VertexStage = static_cast<u32>(Shader::SwStage::Vertex);
+        const auto trace_stages = pipeline->GetStages();
+        const u64 trace_ps = trace_stages.size() > FragmentStage && trace_stages[FragmentStage] != nullptr ? trace_stages[FragmentStage]->pgm_hash : 0;
+        const u64 trace_vs = trace_stages.size() > VertexStage && trace_stages[VertexStage] != nullptr ? trace_stages[VertexStage]->pgm_hash : 0;
+        Core::UiTrace::BeginDraw(plan->native_seq, trace_ps, trace_vs, plan->inputs.color_buffers[0].Address(), plan->inputs.num_indices, plan->inputs.num_instances.NumInstances(),
+                                 plan->native_seq != 0 ? static_cast<u32>(Core::NativeDraw::RecordCallerGhidra(plan->native_seq)) : 0, static_cast<u32>(Core::DebugServer::PresentCount()));
+    }
+    const UiTraceScope ui_trace_scope{Core::UiTrace::Active()};
     if (Core::LightRecorder::On()) {
         const u32 draw_class = tag.valid ? (tag.meta & 0xff) : 15u;
         Core::LightRecorder::FrameOp(Core::DebugServer::PresentCount(), draw_class < 5 ? draw_class + 1 : 6, reinterpret_cast<u64>(pipeline), texture_cache.ImageGeneration());

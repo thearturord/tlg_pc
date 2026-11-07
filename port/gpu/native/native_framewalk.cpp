@@ -25,6 +25,7 @@
 #include "native/native_flight.h"
 #include "native/native_log.h"
 #include "native/native_marker.h"
+#include "native/native_ui_trace.h"
 #include "native/native_timeline.h"
 #include "native/native_tsharp_watch.h"
 
@@ -180,6 +181,9 @@ void FreezeWorker() {
     std::filesystem::create_directories(dir, ec);
     try {
         WriteText(dir / "draws.json", Marker::DrawTable(static_cast<u32>(freezes + 1), FramesInDrawTable));
+        if (Core::UiTrace::Armed()) {
+            WriteText(dir / "uitrace.json", Core::UiTrace::Json());
+        }
         WriteText(dir / "flight.json", Flight::Report(Flight::RingEvents, false, FlightMs));
         WriteText(dir / "counters.json", DebugServer::CountersSnapshot().dump(1));
         if (timeline.empty()) {

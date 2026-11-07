@@ -28,6 +28,7 @@
 #include "native/native_flight.h"
 #include "native/native_framewalk.h"
 #include "native/native_marker.h"
+#include "native/native_ui_trace.h"
 #include "native/native_invariant.h"
 #include "native/native_log.h"
 #include "native/native_timeline.h"
@@ -605,6 +606,15 @@ void RegisterBuiltins() {
              [](const Params& params) {
                  const auto it = params.find("hash");
                  return Shader::Footprint::Report(it == params.end() ? std::string{} : it->second);
+             });
+    Register("/uitrace", "?arm=1&ps=<hex,hex> arms the UI draw trace (default pixel program bb4d66bf, the title menu text), ?arm=0 stops it; answers with the kept frames: each traced draw with the guest memory it read (address, size, hash, first 64 bytes as hex and floats)",
+             [](const Params& params) {
+                 const auto arm = params.find("arm");
+                 if (arm != params.end()) {
+                     const auto ps = params.find("ps");
+                     Core::UiTrace::Arm(arm->second != "0", ps == params.end() ? std::string{} : ps->second);
+                 }
+                 return nlohmann::json::parse(Core::UiTrace::Json());
              });
     Register("/raycast","CPU port of the ray against triangle shader (0xe15f3156), shadow compare against the GPU result (TLG_RAYCAST_SHADOW=1)",
              [](const Params&) { auto j = Core::NativeRaycast::Report(); j["skin"] = Core::NativeSkinCpu::Report(); return j; });

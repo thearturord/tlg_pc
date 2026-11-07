@@ -25,6 +25,7 @@
 #include "tlg_toggles.h" // sigjmp_buf, tlg_setjmp, runtime_fault_recover
 #endif
 #include "native/native_byte_audit.h"
+#include "native/native_ui_trace.h"
 #include "native/native_content.h"
 #include "native/native_debug_server.h"
 #include "native/native_device.h"
@@ -2435,6 +2436,9 @@ std::string DescribeBind() {
 } // namespace
 
 void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
+    if (Core::UiTrace::Active()) [[unlikely]] {
+        Core::UiTrace::NoteRead(LateKindNames[static_cast<size_t>(kind)], address, size);
+    }
     if (Core::ByteAudit::Active()) [[unlikely]] {
         // debugger mode: the bytes of this read against the memory hashed at the game's submit of its record (native_byte_audit.h)
         const u64 s = seq != 0 ? seq : Core::NativeRegistry::CurrentDrawSeq();
