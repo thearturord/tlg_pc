@@ -1020,6 +1020,19 @@ void Runtime::FlushBarriers() {
     live_stats.barriers_memory_only += dep_info.imageMemoryBarrierCount == 0 ? 1 : 0;
     live_stats.barriers_ending_a_pass += scheduler.IsRendering() ? 1 : 0;
     live_stats.barriers_from_compute_writes += (memory_barrier.srcStageMask & vk::PipelineStageFlagBits2::eComputeShader) ? 1 : 0;
+    if (scheduler.IsRendering()) {
+        g_flush_cuts.Note(reinterpret_cast<u64>(__builtin_return_address(0)), dep_info.imageMemoryBarrierCount, dep_info.memoryBarrierCount == 0);
+        if (t_flush_in_same_pass) {
+            g_same_pass_flushes.flushes.fetch_add(1, std::memory_order_relaxed);
+            g_same_pass_flushes.image_barriers.fetch_add(dep_info.imageMemoryBarrierCount, std::memory_order_relaxed);
+            g_same_pass_flushes.with_memory_barrier.fetch_add(dep_info.memoryBarrierCount != 0 ? 1 : 0, std::memory_order_relaxed);
+            for (const auto& b : image_barriers) {
+                g_flush_cut_layouts.Note(0x1000000u | (static_cast<u32>(b.oldLayout) & 0xfff) << 12 | (static_cast<u32>(b.newLayout) & 0xfff), 0, false);
+            }
+        } else {
+            g_same_pass_flushes.other_pass_changes.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
     {

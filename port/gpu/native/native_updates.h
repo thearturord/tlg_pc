@@ -277,6 +277,9 @@ void NoteB9(B9Count what, u64 n = 1) noexcept;
 /// the unattributed set instead).
 [[nodiscard]] u32 LeanDirtyMode() noexcept;
 
+/// Load address of the executable (for turning code addresses in diagnostics into offsets).
+[[nodiscard]] u64 ImageBase() noexcept;
+
 nlohmann::json Report();
 
 } // namespace Core::NativeUpdates

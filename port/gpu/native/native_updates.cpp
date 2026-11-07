@@ -613,6 +613,10 @@ void NoteB9(B9Count what, u64 n) noexcept {
     b9_counts[what].fetch_add(n, std::memory_order_relaxed);
 }
 
+u64 ImageBase() noexcept {
+    return reinterpret_cast<u64>(GetModuleHandleW(nullptr));
+}
+
 u32 LeanDirtyMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_LEAN_DIRTY");

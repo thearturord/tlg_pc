@@ -775,7 +775,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     const bool pass_barrier = needs_barrier;
     if (needs_barrier) {
         TLG_PROF_LEVEL("raster.flush_barriers", 2);
+        t_flush_in_same_pass = scheduler.WouldContinuePass(state);
         runtime.FlushBarriers();
+        t_flush_in_same_pass = false;
     }
 
     pipeline->BindResources(set_writes, push_data);

@@ -373,6 +373,41 @@ struct SegmentCensus {
 };
 inline SegmentCensus g_segment_census;
 
+/// C6 step 1 census: who ended the rendering instances. Keyed by the return address of `SchedulerCore::EndRendering` (the calling function once the wrapper is inlined), counts the
+/// instances ended there and the draws they held. Counts only, a small open-addressed table.
+struct CutReasonCensus {
+    static constexpr u32 kSlots = 256;
+    std::atomic<u64> address[kSlots]{}, instances[kSlots]{}, draws[kSlots]{}, colour_instances[kSlots]{};
+    void Note(u64 caller, u64 instance_draws, bool depth_only) noexcept {
+        u32 i = static_cast<u32>((caller >> 4) * 0x9E3779B1u) % kSlots;
+        for (u32 probe = 0; probe < kSlots; ++probe, i = (i + 1) % kSlots) {
+            u64 expected = address[i].load(std::memory_order_relaxed);
+            if (expected == 0 && address[i].compare_exchange_strong(expected, caller, std::memory_order_relaxed)) {
+                expected = caller;
+            }
+            if (expected == caller) {
+                instances[i].fetch_add(1, std::memory_order_relaxed);
+                draws[i].fetch_add(instance_draws, std::memory_order_relaxed);
+                if (!depth_only) {
+                    colour_instances[i].fetch_add(1, std::memory_order_relaxed);
+                }
+                return;
+            }
+        }
+    }
+};
+inline CutReasonCensus g_cut_reasons;
+/// The same, one level up: who called `Runtime::FlushBarriers` while a pass was open (fields: instances = flushes, draws = image barriers in them, colour_instances = flushes with a memory barrier).
+inline CutReasonCensus g_flush_cuts;
+/// The image barriers inside those flushes, keyed by (old layout, new layout) of each (instances = barriers, draws = unused 0).
+inline CutReasonCensus g_flush_cut_layouts;
+/// Set by `Rasterizer::Draw` around its flush: the open pass would have been kept (same render state) but the flush ends it. Those are the cuts a hoist could save.
+inline thread_local bool t_flush_in_same_pass = false;
+struct SamePassFlushCensus {
+    std::atomic<u64> flushes{}, image_barriers{}, with_memory_barrier{}, other_pass_changes{};
+};
+inline SamePassFlushCensus g_same_pass_flushes;
+
 /// One command stream: ticks (timeline semaphore), command lists, encoder thread, priority operation thread, one VkQueue.
 /// Scheduler (below) owns the graphics stream and, with TLG_ASC_QUEUE=1, a second one for the asynchronous compute queue 1.
 class SchedulerCore : public SchedulerLocks {
@@ -399,6 +434,11 @@ public:
 
     /// Starts a new rendering scope with provided state.
     void BeginRendering(const RenderState& new_state);
+
+    /// True when `BeginRendering(new_state)` would keep the open pass (census only).
+    [[nodiscard]] bool WouldContinuePass(const RenderState& new_state) const noexcept {
+        return is_rendering && render_state == new_state;
+    }
 
     /// Ends current rendering scope.
     void EndRendering();
@@ -764,6 +804,10 @@ public:
     }
     void BeginRendering(const RenderState& new_state) {
         Active().BeginRendering(new_state);
+    }
+    /// True when `BeginRendering(new_state)` would keep the open pass (census only).
+    [[nodiscard]] bool WouldContinuePass(const RenderState& new_state) {
+        return Active().WouldContinuePass(new_state);
     }
     void EndRendering() {
         Active().EndRendering();

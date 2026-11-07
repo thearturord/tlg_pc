@@ -165,7 +165,36 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
         for (u32 k = 0; k < 3; ++k) {
             kinds[names[k]] = {{"rendering_instances", s.segments[k].load()}, {"commands", s.commands[k].load()}, {"draws", s.draws[k].load()}, {"largest_instance_commands", s.max_commands[k].load()}};
         }
-        Core::DebugServer::Publish("segment_census", {{"by_kind_since_start", std::move(kinds)}, {"note", "C6 census: commands and draws recorded between a begin and an end of rendering, graphics stream, counts only"}});
+        nlohmann::json cuts = nlohmann::json::array();
+        const u64 base = Core::NativeUpdates::ImageBase();
+        for (u32 i = 0; i < Vulkan::CutReasonCensus::kSlots; ++i) {
+            const u64 a = Vulkan::g_cut_reasons.address[i].load();
+            if (a != 0) {
+                char rva[24];
+                std::snprintf(rva, sizeof(rva), "%llx", static_cast<unsigned long long>(a - base));
+                cuts.push_back({{"caller_rva", rva}, {"instances", Vulkan::g_cut_reasons.instances[i].load()}, {"colour_instances", Vulkan::g_cut_reasons.colour_instances[i].load()}, {"draws", Vulkan::g_cut_reasons.draws[i].load()}});
+            }
+        }
+        nlohmann::json flush_cuts = nlohmann::json::array();
+        for (u32 i = 0; i < Vulkan::CutReasonCensus::kSlots; ++i) {
+            const u64 a = Vulkan::g_flush_cuts.address[i].load();
+            if (a != 0) {
+                char rva[24];
+                std::snprintf(rva, sizeof(rva), "%llx", static_cast<unsigned long long>(a - base));
+                flush_cuts.push_back({{"caller_rva", rva}, {"flushes", Vulkan::g_flush_cuts.instances[i].load()}, {"image_barriers", Vulkan::g_flush_cuts.draws[i].load()}, {"with_memory_barrier", Vulkan::g_flush_cuts.colour_instances[i].load()}});
+            }
+        }
+        nlohmann::json layouts = nlohmann::json::array();
+        for (u32 i = 0; i < Vulkan::CutReasonCensus::kSlots; ++i) {
+            const u64 a = Vulkan::g_flush_cut_layouts.address[i].load();
+            if (a != 0) {
+                layouts.push_back({{"old_layout", (a >> 12) & 0xfff}, {"new_layout", a & 0xfff}, {"barriers", Vulkan::g_flush_cut_layouts.instances[i].load()}});
+            }
+        }
+        const auto& sp = Vulkan::g_same_pass_flushes;
+        nlohmann::json same_pass = {{"flushes_that_end_a_pass_the_draw_would_keep", sp.flushes.load()}, {"image_barriers_in_them", sp.image_barriers.load()}, {"with_a_memory_barrier", sp.with_memory_barrier.load()},
+                                    {"flushes_with_a_pass_open_where_the_draw_changes_pass_anyway", sp.other_pass_changes.load()}, {"note", "Rasterizer::Draw only, other callers count as 'anyway'"}};
+        Core::DebugServer::Publish("segment_census", {{"by_kind_since_start", std::move(kinds)}, {"flush_in_same_pass", std::move(same_pass)}, {"image_barriers_with_a_pass_open_by_layouts", std::move(layouts)}, {"ended_by_caller_since_start", std::move(cuts)}, {"flush_barriers_with_a_pass_open_by_caller", std::move(flush_cuts)}, {"note", "C6 census: commands and draws recorded between a begin and an end of rendering, graphics stream, counts only"}});
     }
     if (LivePlannerOn()) {
         const auto p = ReadLivePlanStats();

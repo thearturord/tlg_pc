@@ -132,6 +132,7 @@ void SchedulerCore::EndRendering() {
         g_segment_census.segments[kind].fetch_add(1, std::memory_order_relaxed);
         g_segment_census.commands[kind].fetch_add(commands, std::memory_order_relaxed);
         g_segment_census.draws[kind].fetch_add(list->Draws() - segment_begin_draws, std::memory_order_relaxed);
+        g_cut_reasons.Note(reinterpret_cast<u64>(__builtin_return_address(0)), list->Draws() - segment_begin_draws, kind == 0);
         u64 seen = g_segment_census.max_commands[kind].load(std::memory_order_relaxed);
         while (commands > seen && !g_segment_census.max_commands[kind].compare_exchange_weak(seen, commands, std::memory_order_relaxed)) {
         }
