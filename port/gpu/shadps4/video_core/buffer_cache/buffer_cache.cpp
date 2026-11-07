@@ -356,6 +356,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
     // An immutable engine buffer (see NativeResources::ImmutableBuffer): after one synchronization of the whole buffer it is
     // read straight from the arena.
     // known_no_object (R2): the command processor's lookup by address found no engine object and none was registered since
+    TLG_PROF_NAMED_LEVEL(imm_scope, "buffer.part.immutable", 3);
     if (!is_written && !is_texel_buffer && !known_no_object && Core::NativeResources::ImmutableResidencyEnabled()) {
         Core::NativeResources::ImmutableBuffer* immutable = nullptr;
         if (immutable_hint != nullptr) {
@@ -464,7 +465,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             return {arena, arena->Offset(device_addr)};
         }
     }
+    imm_scope.End();
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
+    TLG_PROF_NAMED_LEVEL(stream_scope, "buffer.part.stream", 3);
     if (!is_written && ((size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) || (!is_texel_buffer && StreamWhilePassOpen(device_addr, size)))) {
         // Stream copies are at most STREAM_THRESHOLD bytes, so the size fits in the low 16 bits.
         const u64 reuse_key = (device_addr << 16) | size;
@@ -506,6 +509,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
         TLG_PROF_ADD("buffer.uncached.stream_copy (sum = bytes)", size);
         return {&stream_buffer, offset};
     }
+    stream_scope.End();
+    TLG_PROF_NAMED_LEVEL(memo_scope, "buffer.part.arena_memo", 3);
     const bool memoizable = !is_texel_buffer;
     ObtainMemo* memo = nullptr;
     u64 epoch_before = 0;
@@ -525,9 +530,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
         }
 
     }
+    memo_scope.End();
+    TLG_PROF_NAMED_LEVEL(for_scope, "buffer.part.buffer_for", 3);
     const auto* arena = BufferFor(device_addr, size, true, is_written); // B9.4: a placed engine buffer's own Vulkan buffer, or the arena
+    for_scope.End();
     last_upload_bytes = 0;
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    TLG_PROF_NAMED_LEVEL(post_scope, "buffer.part.after_sync", 3);
     if (last_upload_bytes != 0) {
         if (Core::NativeContent::CurrentBindIsCopyDestination()) {
             Core::NativeContent::NoteCopyDestinationSync(size); // the copy overwrites the whole range right after: not a read that feeds a draw
@@ -616,6 +625,7 @@ const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanni
     if (!demote_spanning && PlacedMeets(address, size)) {
         return nullptr; // a range over placed buffers' edges is left to their own requests
     }
+    TLG_PROF_LEVEL("buffer.bufferfor.slow_block", 3);
     // the block the request needs: the engine buffers it meets and the placed buffers it meets, grown until no buffer reaches over its edges
     static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
     static thread_local std::vector<u64> textures;
@@ -760,6 +770,7 @@ bool BufferCache::IsRangeGpuWritten(VAddr addr, size_t size) {
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
     TLG_PROF("buffer.synchronize");
+    TLG_PROF_NAMED_LEVEL(s_placed, "buffer.sync.placed_walk", 3);
     // B9.4: a placed buffer holds [begin, end) of its block; a read into its slack must not take (and lose) the bytes of the memory after it
     VAddr held_lo = device_addr, held_hi = device_addr + size;
     {
@@ -779,6 +790,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             return false;
         }
     }
+    s_placed.End();
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
     const auto add_piece = [&](u64 addr, u64 copy_size) {
@@ -817,6 +829,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     };
     // B9.1: an upload over engine buffers: their announced bytes against the page tracker's ranges (B9.4 step 2: a request may cover several buffers of a block;
     // the bytes between them, which no buffer holds, keep the tracker)
+    TLG_PROF_NAMED_LEVEL(s_b9, "buffer.sync.b9_dirty", 3);
     const u32 b9 = Core::NativeUpdates::B9BufferMode();
     u64 b9_object = 0; // the first engine buffer the request meets (0: none)
     boost::container::small_vector<std::pair<u64, u64>, 8> b9_pieces;
@@ -848,12 +861,19 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             }
             std::scoped_lock lock{object_dirty_mutex};
             for (const auto& part : parts) {
+                // (a subtraction only where the walk found bytes: with nothing in the range it changes nothing, and it is the costly half of the call)
                 if (const auto it = object_dirty.find(part.id); it != object_dirty.end()) {
+                    const size_t before = b9_pieces.size();
                     it->second.ForEachInRange(part.begin, part.end - part.begin, [&](u64 a, u64 e) { b9_pieces.emplace_back(a, e - a); }); // (start, end) pairs
-                    it->second.Subtract(part.begin, part.end - part.begin);
+                    if (b9_pieces.size() != before) {
+                        it->second.Subtract(part.begin, part.end - part.begin);
+                    }
                 }
+                const size_t before_unattributed = b9_pieces.size();
                 b9_unattributed.ForEachInRange(part.begin, part.end - part.begin, [&](u64 a, u64 e) { b9_pieces.emplace_back(a, e - a); });
-                b9_unattributed.Subtract(part.begin, part.end - part.begin);
+                if (b9_pieces.size() != before_unattributed) {
+                    b9_unattributed.Subtract(part.begin, part.end - part.begin);
+                }
             }
             for (const auto& [a, n] : b9_pieces) {
                 all_object_dirty.Subtract(a, n);
@@ -861,6 +881,8 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
         Core::NativeUpdates::NoteB9(b9_object != 0 ? Core::NativeUpdates::B9SyncByObject : Core::NativeUpdates::B9SyncNoObject);
     }
+    s_b9.End();
+    TLG_PROF_NAMED_LEVEL(s_ann, "buffer.sync.announced", 3);
     // the parts of [addr, addr + n) between the engine buffers of the request (they keep the tracker's copies in native mode)
     const auto for_each_gap = [&](u64 addr, u64 n, auto&& fn) {
         for (const auto& [g, gn] : b9_gaps) {
@@ -950,6 +972,8 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             add_copy(a, n);
         }
     }
+    s_ann.End();
+    TLG_PROF_NAMED_LEVEL(s_up, "buffer.sync.upload", 3);
     last_upload_bytes += total_size_bytes;
     Core::NativeUploads::NoteUploaded(total_size_bytes);
     if (Core::NativeUploads::Enabled()) {

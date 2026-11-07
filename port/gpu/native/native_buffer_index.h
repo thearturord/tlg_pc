@@ -11,7 +11,6 @@
 // Thread: writes from the raster thread (in order events); reads from any thread (shared lock).
 
 #include <atomic>
-#include <map>
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
@@ -48,13 +47,18 @@ public:
     [[nodiscard]] nlohmann::json CheckReport() const;
 
 private:
-    struct Entry {
+    /// One buffer. The table is a sorted array, not a tree: the set of buffers changes about 40 times a second and is asked about 13,000 times per frame, and the walk down a
+    /// tree (a cache miss per node) was the largest single cost of the buffer lookups (profile 2026-11-07).
+    struct Item {
+        VAddr begin;
         VAddr end;
         u64 id;
         u32 usage, cpu_access;
     };
+    /// Index of the first item whose begin is >= `address`.
+    [[nodiscard]] size_t LowerBound(VAddr address) const noexcept;
     mutable std::shared_mutex mutex;
-    std::map<VAddr, Entry> by_address;         ///< begin -> entry
+    std::vector<Item> items;                   ///< sorted by begin
     std::unordered_map<u64, VAddr> by_id;      ///< id -> begin
     std::atomic<u64> counts[2][5]{};           ///< [written][class 0..3, 4 = requests]
 };

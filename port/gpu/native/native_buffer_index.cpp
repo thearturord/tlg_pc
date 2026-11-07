@@ -27,17 +27,28 @@ bool Ordered::CheckOn() noexcept {
     return on;
 }
 
+size_t Ordered::LowerBound(VAddr address) const noexcept {
+    return static_cast<size_t>(std::lower_bound(items.begin(), items.end(), address, [](const Item& item, VAddr a) { return item.begin < a; }) - items.begin());
+}
+
 void Ordered::Create(u64 id, VAddr address, u64 bytes, u32 usage, u32 cpu_access) {
     std::unique_lock lock{mutex};
-    by_address[address] = {address + bytes, id, usage, cpu_access};
+    const size_t at = LowerBound(address);
+    const Item item{address, address + bytes, id, usage, cpu_access};
+    if (at < items.size() && items[at].begin == address) {
+        items[at] = item; // (as the tree did: the same begin replaces the entry)
+    } else {
+        items.insert(items.begin() + static_cast<std::ptrdiff_t>(at), item);
+    }
     by_id[id] = address;
 }
 
 void Ordered::Delete(u64 id) {
     std::unique_lock lock{mutex};
     if (const auto it = by_id.find(id); it != by_id.end()) {
-        if (const auto at = by_address.find(it->second); at != by_address.end() && at->second.id == id) {
-            by_address.erase(at);
+        const size_t at = LowerBound(it->second);
+        if (at < items.size() && items[at].begin == it->second && items[at].id == id) {
+            items.erase(items.begin() + static_cast<std::ptrdiff_t>(at));
         }
         by_id.erase(it);
     }
@@ -49,38 +60,42 @@ void Ordered::BuffersIn(VAddr address, u64 size, std::vector<NativeDevice::Buffe
     }
     const VAddr end = address + size;
     std::shared_lock lock{mutex};
-    auto it = by_address.lower_bound(end);
+    size_t at = LowerBound(end);
     u32 below = 0; // as the live table: a few entries that start before the range are looked at
-    while (it != by_address.begin() && below < 16) {
-        --it;
-        if (it->first < address) {
+    while (at != 0 && below < 16) {
+        const Item& item = items[--at];
+        if (item.begin < address) {
             ++below;
         }
-        if (it->second.end <= address) {
+        if (item.end <= address) {
             continue;
         }
-        out.push_back({it->second.id, std::max(it->first, address), std::min<VAddr>(it->second.end, end), it->second.usage, it->second.cpu_access, it->first, it->second.end});
+        out.push_back({item.id, std::max(item.begin, address), std::min<VAddr>(item.end, end), item.usage, item.cpu_access, item.begin, item.end});
     }
 }
 
 bool Ordered::ResourceAt(VAddr address, NativeDevice::Object& out) const {
     std::shared_lock lock{mutex};
-    auto it = by_address.upper_bound(address);
-    if (it == by_address.begin()) {
+    // the last item with begin <= address
+    size_t at = LowerBound(address);
+    if (at < items.size() && items[at].begin == address) {
+        ++at;
+    }
+    if (at == 0) {
         return false;
     }
-    --it;
-    if (address >= std::max(it->second.end, it->first + 1)) {
+    const Item& item = items[at - 1];
+    if (address >= std::max(item.end, item.begin + 1)) {
         return false;
     }
     out = {};
-    out.id = it->second.id;
+    out.id = item.id;
     out.kind = NativeDevice::Kind::Buffer;
     out.alive = true;
-    out.usage = it->second.usage;
-    out.cpu_access = it->second.cpu_access;
-    out.address = it->first;
-    out.bytes = it->second.end - it->first;
+    out.usage = item.usage;
+    out.cpu_access = item.cpu_access;
+    out.address = item.begin;
+    out.bytes = item.end - item.begin;
     return true;
 }
 
@@ -90,30 +105,34 @@ bool Ordered::Lookup(u64 id, NativeDevice::Object& out) const {
     if (by == by_id.end()) {
         return false;
     }
-    const auto at = by_address.find(by->second);
-    if (at == by_address.end() || at->second.id != id) {
+    const size_t at = LowerBound(by->second);
+    if (at >= items.size() || items[at].begin != by->second || items[at].id != id) {
         return false;
     }
+    const Item& item = items[at];
     out = {};
     out.id = id;
     out.kind = NativeDevice::Kind::Buffer;
     out.alive = true;
-    out.usage = at->second.usage;
-    out.cpu_access = at->second.cpu_access;
-    out.address = at->first;
-    out.bytes = at->second.end - at->first;
+    out.usage = item.usage;
+    out.cpu_access = item.cpu_access;
+    out.address = item.begin;
+    out.bytes = item.end - item.begin;
     return true;
 }
 
 void Ordered::IdsIn(VAddr address, u64 size, boost::container::small_vector<u64, 8>& out) const {
     std::shared_lock lock{mutex};
-    auto it = by_address.upper_bound(address);
-    if (it != by_address.begin()) {
-        --it;
+    size_t at = LowerBound(address);
+    if (at < items.size() && items[at].begin == address) {
+        ++at; // upper bound
     }
-    for (; it != by_address.end() && it->first < address + size; ++it) {
-        if (it->second.end > address) {
-            out.push_back(it->second.id);
+    if (at != 0) {
+        --at;
+    }
+    for (; at < items.size() && items[at].begin < address + size; ++at) {
+        if (items[at].end > address) {
+            out.push_back(items[at].id);
         }
     }
 }
