@@ -3256,6 +3256,9 @@ bool Rasterizer::TryCopyImages(VAddr dst, VAddr src, u32 num_bytes) {
     if (ui_readback) {
         ui_queue_readback(destination, 0); // and the destination after it
     }
+    if (Core::UiTrace::Armed()) {
+        Core::UiTrace::NoteCopyPath(fmt::format("image copy (readback {})", ui_readback ? "queued" : "not queued"));
+    }
     destination.flags |= VideoCore::ImageFlagBits::GpuModified;
     destination.flags &= ~VideoCore::ImageFlagBits::Dirty;
     ++recorded_work;
@@ -3294,6 +3297,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             buffer_cache.NoteCpGuestWrite(dst, num_bytes);
             b5_copies_on_cpu.fetch_add(1, std::memory_order_relaxed);
+            Core::UiTrace::NoteCopyPath("cpu memcpy");
             return;
         }
     }
@@ -3329,6 +3333,9 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         .dstOffset = dst_offset,
         .size = num_bytes,
     };
+    if (Core::UiTrace::Armed()) {
+        Core::UiTrace::NoteCopyPath(fmt::format("gpu buffer copy (staging_readback={} explicit_readback={} src_gds={} dst_gds={})", staging_readback, explicit_readback, src_gds, dst_gds));
+    }
     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
     if (!dst_gds && !explicit_readback && num_bytes >= 16384 && num_bytes <= (256u << 10) && Core::UiTrace::Armed()) {
         // read back what the destination holds now (a picture of the interface text moves through copies of copies; the report shows the hop where it goes blank or wrong)

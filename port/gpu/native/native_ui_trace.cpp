@@ -87,6 +87,9 @@ struct Copy {
     u32 frame{};
     u64 number{};
     u64 src_hash{}; ///< hash of the source memory when the raster thread took the copy (0: unreadable)
+    u64 src_upload_hash{}; ///< hash of the memory the last image upload at the source address read (0: never uploaded)
+    u32 src_upload_frame{};
+    std::string path;
     u32 src_nonzero_chunks{};
 };
 constexpr size_t CopiesKept = 3000;
@@ -513,6 +516,13 @@ void SaveShot(u64 address, u32 frame, const u8* data, u64 size, const std::strin
     s.info = info;
 }
 
+void NoteCopyPath(const std::string& path) {
+    std::scoped_lock lock{mutex};
+    if (!copies.empty() && copies.back().number == last_copy_number) {
+        copies.back().path = path;
+    }
+}
+
 u64 LastCopyNumber() {
     std::scoped_lock lock{mutex};
     return last_copy_number;
@@ -576,6 +586,10 @@ void NoteGpuCopy(u64 dst, u64 src, u64 size) {
     c.number = ++write_number;
     if (size <= (256u << 10)) {
         c.src_hash = RangeHash(src, size, &c.src_nonzero_chunks);
+        if (const auto it = uploads.find(src); it != uploads.end() && it->second.size == size) {
+            c.src_upload_hash = it->second.after;
+            c.src_upload_frame = it->second.frame;
+        }
     } else {
         return; // big copies (streaming, 33 MB per frame) are not text pictures and would push them out of the list
     }
@@ -651,9 +665,9 @@ std::string Json() {
     out += fmt::format("],\"gpu_writes_total\":{},\"gpu_copies\":[", write_number);
     for (size_t i = 0; i < copies.size(); ++i) {
         const Copy& c = copies[i];
-        out += fmt::format("{}{{\"n\":{},\"frame\":{},\"dst\":\"{:x}\",\"src\":\"{:x}\",\"size\":{},\"seq\":{},\"caller\":\"{:x}\",\"src_hash_then\":\"{:x}\",\"src_hash_now\":\"{:x}\",\"src_nonzero_chunks\":{},\"result_nz\":{},\"result_hash\":\"{:x}\",\"src_img_nz\":{},\"src_img_hash\":\"{:x}\"}}", i ? "," : "", c.number, c.frame, c.dst, c.src, c.size, c.seq, c.caller, c.src_hash, RangeHash(c.src, c.size, nullptr), c.src_nonzero_chunks,
+        out += fmt::format("{}{{\"n\":{},\"frame\":{},\"dst\":\"{:x}\",\"src\":\"{:x}\",\"size\":{},\"seq\":{},\"caller\":\"{:x}\",\"src_hash_then\":\"{:x}\",\"src_hash_now\":\"{:x}\",\"src_nonzero_chunks\":{},\"result_nz\":{},\"result_hash\":\"{:x}\",\"src_img_nz\":{},\"src_img_hash\":\"{:x}\",\"src_upload_hash\":\"{:x}\",\"src_upload_frame\":{},\"path\":\"{}\"}}", i ? "," : "", c.number, c.frame, c.dst, c.src, c.size, c.seq, c.caller, c.src_hash, RangeHash(c.src, c.size, nullptr), c.src_nonzero_chunks,
                            copy_results.contains(c.number) ? static_cast<s64>(copy_results[c.number].nonzero_chunks) : -1, copy_results.contains(c.number) ? copy_results[c.number].hash : 0ull,
-                           copy_results.contains(c.number) ? copy_results[c.number].src_nonzero_chunks : -1, copy_results.contains(c.number) ? copy_results[c.number].src_hash : 0ull);
+                           copy_results.contains(c.number) ? copy_results[c.number].src_nonzero_chunks : -1, copy_results.contains(c.number) ? copy_results[c.number].src_hash : 0ull, c.src_upload_hash, c.src_upload_frame, c.path);
     }
     out += "],\"gpu_writes\":[";
     std::vector<Write> sorted(writes.begin(), writes.end());
