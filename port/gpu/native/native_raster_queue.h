@@ -108,6 +108,8 @@ public:
     virtual void RunCall(Op& op) = 0;
     /// Executes a closure operation: the consumer invalidates what it caches, then calls `op.closure`.
     virtual void RunClosure(Op& op) = 0;
+    /// The raster thread has nothing queued and is about to wait.
+    virtual void Idle() {}
     /// True when the draw's plan has no colour target (z-prepass, shadows): counted apart in the statistics.
     [[nodiscard]] virtual bool IsDepthOnly(const Vulkan::DrawPlan& plan) const = 0;
     /// After an operation: the plans go back to the consumer's pool.

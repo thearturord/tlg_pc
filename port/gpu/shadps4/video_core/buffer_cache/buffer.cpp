@@ -227,6 +227,12 @@ bool StreamBuffer::PrepareMap(u64 size, u64 alignment, bool allow_wait) {
     }
 
     if (offset + size > this->size_bytes) {
+        if (ring_id == 1 && VideoCore::RecordQueue::Enabled()) {
+            // P3e.4b: the resolve ring wraps: copies in it are read by draws that wait in the record queue, and its watches carry the tick of the time they were written.
+            // Record those draws, then wait for everything recorded so far (once per lap of 128 MB).
+            VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::Other);
+            scheduler.Wait(scheduler.CurrentTick());
+        }
         // The buffer would overflow, save the amount of used watches and reset the state.
         invalidation_mark = current_watch_cursor;
         current_watch_cursor = 0;

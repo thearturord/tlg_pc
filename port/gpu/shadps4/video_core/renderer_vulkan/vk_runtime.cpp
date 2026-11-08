@@ -265,9 +265,9 @@ u64 Runtime::LiveObjectSpace(const VideoCore::Buffer* handle, u64 offset, u64& b
         {
             // P3c oracle: a buffer the record side uses for an operation was asked for by the resolve side in that operation (or the one before: bound buffers released at its end)
             static std::atomic<u64> uses{0}, unannounced{0}, never{0};
-            const u64 seq = VideoCore::OpSequence::resolving.load(std::memory_order_relaxed);
+            const u64 seq = VideoCore::OpSequence::recording != 0 ? VideoCore::OpSequence::recording : VideoCore::OpSequence::resolving.load(std::memory_order_relaxed);
             const u64 n = uses.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (handle->resolve_use_seq != seq && handle->resolve_prev_seq != seq) {
+            if (handle->resolve_use_seq != seq && handle->resolve_prev_seq != seq && VideoCore::RecordQueue::Lag() == 0) {
                 const u64 k = unannounced.fetch_add(1, std::memory_order_relaxed);
                 static const bool split_only = [] { const char* e = std::getenv("TLG_SPLIT_BIND"); return e != nullptr && std::atoi(e) == 1; }();
                 if (split_only && k < 5) {
@@ -399,6 +399,7 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
 bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
+    VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::Transit);
     if (VideoCore::HalfPhase::current == VideoCore::HalfPhase::Resolve) {
         VideoCore::ResolveCommands::Run(); // P3d: what was queued comes first
         Core::NativeOcclusion::NoteCrossing("Transit (layout state) in a resolve half");
@@ -919,6 +920,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         return;
     }
     ASSERT_MSG(!image->info.props.is_depth, "Swapping samples is only valid for color images");
+    VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::Backing);
     if (VideoCore::HalfPhase::current == VideoCore::HalfPhase::Resolve) {
         VideoCore::ResolveCommands::Run();
         Core::NativeOcclusion::NoteCrossing("backing swap (SetBackingSamples) in a resolve half");

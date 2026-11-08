@@ -580,6 +580,10 @@ private:
     /// P3e.4: the record half of a whole graphics draw: the stage records, the render pass, vertex and index buffers, the barrier flush, the pipeline's descriptors, the dynamic
     /// state, the draw call and the access notes. Inputs only from `job`; the members it writes are the ones listed under "recorder-owned" below.
     void RecordDraw(DrawJob& job);
+    static std::vector<std::unique_ptr<DrawJob>>& DrawJobPool();
+    std::unique_ptr<DrawJob> TakeDrawJob();
+    void RunDrawJob(std::unique_ptr<DrawJob>&& job);
+    void MaybeFlushRecordedBody();
     /// The measuring and the indexed descriptor table that follow the stage records in `BindResources`.
     void FinishBindResources(const Pipeline* pipeline, bool uses_dma, u64 resolve_ns);
     bool BindResources(const Pipeline* pipeline, const FixedState* fixed = nullptr, DrawJob* draw_job = nullptr);
@@ -600,6 +604,7 @@ private:
             vk::ImageLayout new_layout{};
         };
         RenderState state;
+        bool feedback_loop{false}; ///< P3e.4b: what `attachment_feedback_loop` was when the resolve half finished (the member is rewritten by the next draw's resolve)
         std::array<Target, AmdGpu::NUM_COLOR_BUFFERS> color{};
         std::array<bool, AmdGpu::NUM_COLOR_BUFFERS> color_used{};
         Target depth{};
@@ -768,6 +773,7 @@ private:
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     /// tlg C9: the draw's row of slot numbers (the indexed buffers of the stages, in the order of the shaders' resources)
     bool indexed_active{false};
+    bool record_indexed_active{false}; ///< P3e.4b: the same, as the record half sees it (the resolve half moves on to the next draw's pipeline before the record half of this one runs)
     /// Puts the slot of one descriptor into the draw's row.
     void NoteIndexedRow(u32 slot);
     /// The dwords of a stage's flat user data go into the row (as many as the shader reserved), zero padded.

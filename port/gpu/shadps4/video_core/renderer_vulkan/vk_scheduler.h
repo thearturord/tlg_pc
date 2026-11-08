@@ -856,25 +856,30 @@ public:
     }
 
     void Flush(SubmitInfo& info) {
+        VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::SchedulerApi);
         Active().Flush(info);
     }
     void Flush() {
+        VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::SchedulerApi);
         Active().Flush();
     }
     /// Waits for everything submitted on both streams.
     void Finish() {
+        VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::SchedulerApi);
         gfx.Finish();
         if (side) {
             side->Finish();
         }
     }
     void Wait(u64 tick) {
+        // (no Guard: a wait is for an older tick, and it is called under the locks of the rings, which a draw that waits would take again)
         Core(tick).Wait(tick & ~SideTag);
     }
     void PopPendingOperations() {
         Active().PopPendingOperations();
     }
     void BeginRendering(const RenderState& new_state) {
+        VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::SchedulerApi);
         Active().BeginRendering(new_state);
     }
     /// True when `BeginRendering(new_state)` would keep the open pass (census only).
@@ -885,13 +890,16 @@ public:
         return Active().PassStateDifference(s);
     }
     void EndRendering() {
+        VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::SchedulerApi);
         Active().EndRendering();
     }
     void BeginSession() {
+        VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::SchedulerApi);
         Active().BeginSession();
     }
     vk::CommandBuffer UploadCommandBuffer() {
         Core::SplitCensus::Touch(Core::SplitCensus::Commands);
+        VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::SchedulerApi);
         return Active().UploadCommandBuffer();
     }
     void SetSessionCallback(SessionFunc&& on_session) {
@@ -925,6 +933,7 @@ public:
     }
     CommandRecorder CommandBuffer() const {
         Core::SplitCensus::Touch(Core::SplitCensus::Commands);
+        VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::Commands); // P3e.4b: draws that wait are recorded first
         if (VideoCore::HalfPhase::current == VideoCore::HalfPhase::Resolve) {
             VideoCore::ResolveCommands::Run(); // P3d: what was queued comes first
             Core::NativeOcclusion::NoteCrossing("commands recorded in a resolve half");
@@ -936,6 +945,7 @@ public:
     }
     vk::CommandBuffer SyncedCommandBuffer() {
         Core::SplitCensus::Touch(Core::SplitCensus::Commands);
+        VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::SchedulerApi);
         return Active().SyncedCommandBuffer();
     }
     void SetEncoderMode(u32 mode) {
@@ -948,6 +958,7 @@ public:
         return ActiveConst().PendingEncoderCommands();
     }
     void SyncEncoder() {
+        VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::SchedulerApi);
         Active().SyncEncoder();
     }
     [[nodiscard]] u64 CurrentTick() const noexcept {
@@ -990,6 +1001,7 @@ public:
     // With two streams, a resource freed after "the work recorded so far" must outlive the recorded work of BOTH streams: the other stream's open
     // command list may hold the resource too (a hoisted queue 1 operation drops a buffer a graphics copy recorded earlier still names).
     void DeferOperation(Common::UniqueFunction<void>&& func) {
+        VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::SchedulerDefer); // "after the work recorded so far" includes the draws that wait
         if (!side) {
             gfx.DeferOperation(std::move(func));
             return;
@@ -997,6 +1009,7 @@ public:
         DeferBoth(std::move(func), false);
     }
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
+        VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::SchedulerDefer);
         if (!side) {
             gfx.DeferPriorityOperation(std::move(func));
             return;
@@ -1004,6 +1017,7 @@ public:
         DeferBoth(std::move(func), true);
     }
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func, u64 tick) {
+        VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::SchedulerDefer);
         Core(tick).DeferPriorityOperation(std::move(func), tick & ~SideTag);
     }
     [[nodiscard]] bool PriorityOperationsNeedSubmit() const noexcept {

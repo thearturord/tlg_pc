@@ -182,6 +182,14 @@ enum CensusKind : u32 {
 } // namespace
 
 void Rasterizer::MaybeFlushRecorded() {
+    if (VideoCore::RecordQueue::Enabled() && !VideoCore::RecordQueue::jobs.empty()) {
+        VideoCore::RecordQueue::Post([this] { MaybeFlushRecordedBody(); }); // after the draws that wait
+        return;
+    }
+    MaybeFlushRecordedBody();
+}
+
+void Rasterizer::MaybeFlushRecordedBody() {
     TLG_PROF_LEVEL("raster.flush_recorded", 3);
     const u32 limit =
         VideoCore::ReadbackPolicy::Get().flush_commands.load(std::memory_order_relaxed);
@@ -325,6 +333,16 @@ bool Rasterizer::FilterDraw(const DrawPlan* plan) {
                 LOG_WARNING(Render_Vulkan, "split bind: per 5 s {} engine operations that resolve and record together (eliminate {} (the ones with a clear to record, so far: {} of {}), fmask {}, resolve {}, depth copy {}, depth clear {}), {} normal draws", barrier_ops,
                             class_counts[static_cast<size_t>(DrawClass::EliminateFastClear)], g_eliminate_with_clear.load(), g_eliminate_total.load(), class_counts[static_cast<size_t>(DrawClass::FmaskDecompress)], class_counts[static_cast<size_t>(DrawClass::Resolve)],
                             class_counts[static_cast<size_t>(DrawClass::DepthStencilCopy)], class_counts[static_cast<size_t>(DrawClass::DepthClear)], class_counts[static_cast<size_t>(DrawClass::Normal)]);
+            }
+            if (last_log_ns != 0 && VideoCore::RecordQueue::Enabled()) {
+                std::string why;
+                for (u32 i = 0; i < VideoCore::RecordQueue::ReasonCount; ++i) {
+                    if (const u64 n = VideoCore::RecordQueue::drains[i].load(); n != 0) {
+                        why += fmt::format(" {} {} ({} draws)", VideoCore::RecordQueue::names[i], n, VideoCore::RecordQueue::drained_jobs[i].load());
+                    }
+                }
+                LOG_WARNING(Render_Vulkan, "split bind queue (lag {}): {} jobs posted, {} run, deepest {}; drains so far:{}", VideoCore::RecordQueue::Lag(), VideoCore::RecordQueue::posted.load(),
+                            VideoCore::RecordQueue::ran.load(), VideoCore::RecordQueue::max_depth.load(), why);
             }
             class_counts = {};
             last_log_ns = now;
@@ -768,6 +786,7 @@ struct Rasterizer::DrawJob {
     u64 tag_k2{0};
     u32 draw_class{15};
     u64 call_seq{0};
+    std::vector<Common::UniqueFunction<void>> pre; ///< P3e.4b: the record work the resolve half queued for this draw (image uploads, copies), run before everything else of it
 };
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
@@ -898,13 +917,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     binder_plan = NativeBinderFor(plan, tag.valid ? (tag.meta & 0xff) : 15u);
     draw_class_now = tag.valid ? (tag.meta & 0xff) : 15u;
     resolved_draw = binder_plan == plan ? plan : nullptr;
-    DrawJob job;
+    std::unique_ptr<DrawJob> job_owner;
     if (hoisted) {
-        job.plan = plan;
-        job.indexed = is_indexed;
-        job.index_offset = index_offset;
+        job_owner = TakeDrawJob();
+        job_owner->plan = plan;
+        job_owner->indexed = is_indexed;
+        job_owner->index_offset = index_offset;
     }
-    const bool bound = BindResources(pipeline, &fixed, hoisted ? &job : nullptr);
+    const bool bound = BindResources(pipeline, &fixed, job_owner.get());
     resolved_draw = nullptr;
     binder_plan = nullptr;
     draw_class_now = 15;
@@ -912,6 +932,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         return;
     }
     if (hoisted) {
+        DrawJob& job = *job_owner;
         job.pipeline = pipeline;
         job.fixed = fixed;
         job.num_indices = regs.num_indices;
@@ -920,7 +941,24 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         job.tag_k2 = tag.k2;
         job.draw_class = tag.valid ? (tag.meta & 0xff) : 15u;
         job.call_seq = call_seq;
-        RecordDraw(job);
+        // what the record half needs from outside the job is read from these (markers, traces): a draw that is traced is recorded now
+        NoteMarkerRow(0, job.draw_class, pipeline, plan != nullptr ? plan->native_seq : 0, draw_inputs, job.num_indices, job.num_instances); // the glitch marker's row: plain data of the resolve half, in draw order
+        const bool diagnostics_now = host_markers_enabled || Core::UiTrace::Active() || Core::LightRecorder::On();
+        if (diagnostics_now && VideoCore::RecordQueue::Enabled()) {
+            static std::atomic<u64> refused{0};
+            if (refused.fetch_add(1) == 0) {
+                LOG_WARNING(Render_Vulkan, "split bind queue: a draw is recorded at once because of diagnostics (host markers {}, UiTrace {}, LightRecorder {})", host_markers_enabled, Core::UiTrace::Active(),
+                            Core::LightRecorder::On());
+            }
+        }
+        if (VideoCore::RecordQueue::Enabled() && !diagnostics_now) {
+            job.pre = std::move(VideoCore::ResolveCommands::pending);
+            VideoCore::ResolveCommands::pending.clear();
+            VideoCore::RecordQueue::Post([this, owned = std::move(job_owner)]() mutable { RunDrawJob(std::move(owned)); });
+        } else {
+            VideoCore::RecordQueue::Drain(VideoCore::RecordQueue::Diagnostics);
+            RunDrawJob(std::move(job_owner));
+        }
         ResetImageBindings(); // the resolve half's flags: the old ResetBindings cleared them between the barrier notes and the access notes, nothing in between reads them
         return;
     }
@@ -1742,7 +1780,7 @@ void Rasterizer::FinishBindResources(const Pipeline* pipeline, bool uses_dma, u6
     }
     b9_all_binds.fetch_add(1, std::memory_order_relaxed);
 
-    if (indexed_active) {
+    if (record_indexed_active) {
         // tlg C9: the plain bindings are the ones that got a write; the guest buffers are named by the draw's row, copied into the stream buffer the global set's table binding covers
         set_writes.resize(set_write_index);
         auto* indexed = IndexedData::Get();
@@ -1771,7 +1809,9 @@ void Rasterizer::FinishBindResources(const Pipeline* pipeline, bool uses_dma, u6
 bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed, DrawJob* draw_job) {
     TLG_PROF_LEVEL("raster.bind_resources", 2);
     VideoCore::OpSequence::resolving.fetch_add(1, std::memory_order_acq_rel); // P3c: a new operation (a draw or a dispatch)
-    VideoCore::ResolveCommands::Run();
+    if (draw_job == nullptr || !VideoCore::RecordQueue::Enabled()) {
+        VideoCore::ResolveCommands::Run();
+    }
     {
         ComputeImageOp image_op;
         if (MatchComputeImageCopy(pipeline, image_op) || IsComputeMetaClear(pipeline) || MatchComputeImageClear(pipeline, image_op)) {
@@ -1788,12 +1828,16 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
     }
     NoteRecordedStateDiagnostics();
 
-    set_write_index = 0;
-    set_writes.clear();
-    buffer_infos.clear();
-    image_infos.clear();
     indexed_active = pipeline->IsIndexed();
-    indexed_row_size = 0;
+    if (draw_job == nullptr) {
+        // (a draw job's record half starts these empty itself: they belong to the record side)
+        set_write_index = 0;
+        set_writes.clear();
+        buffer_infos.clear();
+        image_infos.clear();
+        record_indexed_active = indexed_active;
+        indexed_row_size = 0;
+    }
     Census((fixed != nullptr ? 0u : 32u) + CBindResources);
 
     // draw recipe verify: the identity of the record and the prediction, before anything is resolved
@@ -1830,7 +1874,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
 
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
-    push_data = MakeUserData(fixed);
+    const Shader::PushData first_push = MakeUserData(fixed);
+    if (draw_job == nullptr) {
+        push_data = first_push;
+    }
     clip_plane_mask = fixed ? fixed->user_clip_plane_mask : 0;
     const bool timed_resolve = recipe_active && VersionCensusOn();
     const auto resolve_begin = timed_resolve ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1863,10 +1910,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
             }
         }
         if (draw_job != nullptr) {
-            draw_job->push_data = push_data;
+            draw_job->push_data = first_push;
             draw_job->indexed_active = indexed_active;
             draw_job->uses_dma = uses_dma;
-            draw_job->feedback_loop = attachment_feedback_loop;
+            draw_job->feedback_loop = draw_job->render.feedback_loop;
             draw_job->resolve_ns = timed_resolve ? static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - resolve_begin).count()) : 0;
             draw_job->op_seq = VideoCore::OpSequence::resolving.load(std::memory_order_acquire);
             return true;
@@ -2339,6 +2386,41 @@ void Rasterizer::RecordIndexBuffer(IndexBind& ib, VideoCore::BufferCache::Upload
     }
 }
 
+std::vector<std::unique_ptr<Rasterizer::DrawJob>>& Rasterizer::DrawJobPool() {
+    static thread_local std::vector<std::unique_ptr<DrawJob>> pool;
+    return pool;
+}
+
+std::unique_ptr<Rasterizer::DrawJob> Rasterizer::TakeDrawJob() {
+    auto& pool = DrawJobPool();
+    if (pool.empty()) {
+        return std::make_unique<DrawJob>();
+    }
+    std::unique_ptr<DrawJob> job = std::move(pool.back());
+    pool.pop_back();
+    DrawJob* raw = job.get();
+    std::destroy_at(raw);
+    std::construct_at(raw);
+    return job;
+}
+
+void Rasterizer::RunDrawJob(std::unique_ptr<DrawJob>&& job) {
+    auto& pool = DrawJobPool();
+    if (!job->pre.empty()) {
+        VideoCore::HalfPhase::Scope scope{VideoCore::HalfPhase::Record};
+        for (auto& work : job->pre) {
+            work();
+        }
+        job->pre.clear();
+    }
+    VideoCore::OpSequence::recording = job->op_seq;
+    RecordDraw(*job);
+    VideoCore::OpSequence::recording = 0;
+    if (pool.size() < 64) {
+        pool.push_back(std::move(job));
+    }
+}
+
 void Rasterizer::RecordDraw(DrawJob& d) {
     TLG_PROF_LEVEL("raster.record_draw_all", 2);
     const GraphicsPipeline* pipeline = d.pipeline;
@@ -2349,7 +2431,7 @@ void Rasterizer::RecordDraw(DrawJob& d) {
     buffer_infos.clear();
     image_infos.clear();
     indexed_row_size = 0;
-    indexed_active = d.indexed_active;
+    record_indexed_active = d.indexed_active;
     push_data = d.push_data;
     attachment_feedback_loop = d.feedback_loop;
     {
@@ -2400,7 +2482,6 @@ void Rasterizer::RecordDraw(DrawJob& d) {
         scheduler.BeginRendering(state);
     }
 
-    NoteMarkerRow(0, d.draw_class, pipeline, d.plan != nullptr ? d.plan->native_seq : 0, draw_inputs, d.num_indices, d.num_instances);
     const auto cmdbuf = scheduler.CommandBuffer();
     {
         TLG_PROF_LEVEL("raster.record_draw", 2);
@@ -3698,14 +3779,14 @@ void Rasterizer::RecordBufferBindings(const Shader::Info& stage, Shader::Backend
                 needs_barrier = true;
             }
         }
-        if (indexed_active && stage.indexed && Shader::Indexed::IsIndexedBufferType(desc.buffer_type)) {
+        if (record_indexed_active && stage.indexed && Shader::Indexed::IsIndexedBufferType(desc.buffer_type)) {
             // a slot made by the resolve pass, or (a stream ring copy: its offset is only known here) made now
             const u32 slot = out.has_slot ? out.slot : BufferSlotCounted(buffer_infos.back());
             NoteIndexedRow(slot);
             ++binding.buffer;
             continue;
         }
-        if (indexed_active && stage.indexed) {
+        if (record_indexed_active && stage.indexed) {
             auto& st = IndexedData::Get()->stats;
             (desc.buffer_type == Shader::BufferType::Flatbuf ? st.legacy_flat : desc.buffer_type == Shader::BufferType::ClipPlanes ? st.legacy_clip : st.legacy_lds).fetch_add(1, std::memory_order_relaxed);
         }
@@ -4886,7 +4967,7 @@ void Rasterizer::RecordTextures(const Shader::Info& stage, Shader::Backend::Bind
             image_infos.emplace_back(VK_NULL_HANDLE, tb.view, runtime.CurrentLayout(image));
         }
         for (u32 i = 0; i < count; ++i) {
-            if (indexed_active && stage.indexed && Shader::Indexed::IsIndexedImage(stage.images[i])) {
+            if (record_indexed_active && stage.indexed && Shader::Indexed::IsIndexedImage(stage.images[i])) {
                 NoteIndexedImage(image_infos[first_image_idx + i], stage.images[i].array_key);
                 continue;
             }
@@ -4978,7 +5059,7 @@ void Rasterizer::RecordTextures(const Shader::Info& stage, Shader::Backend::Bind
     u32 image_desc_idx = 0;
     for (u32 array_size : r.array_sizes) {
         const bool is_storage = r.binds[image_binding_idx].is_storage;
-        if (indexed_active && stage.indexed && Shader::Indexed::IsIndexedImage(stage.images[image_desc_idx])) {
+        if (record_indexed_active && stage.indexed && Shader::Indexed::IsIndexedImage(stage.images[image_desc_idx])) {
             if (stage.images[image_desc_idx].is_atomic) {
                 Core::RareEvents::Note("c9_atomic_image", fmt::format("shader {:#x} ({}): atomic image in array key {} (format {})", stage.pgm_hash, static_cast<u32>(stage.sw_stage), r.image_keys[image_desc_idx],
                                                                        (r.image_keys[image_desc_idx] - Shader::Indexed::FirstAtomicKey) / 4));
@@ -4996,7 +5077,7 @@ void Rasterizer::RecordTextures(const Shader::Info& stage, Shader::Backend::Bind
             continue;
         }
         ++image_desc_idx;
-        if (indexed_active && stage.indexed) {
+        if (record_indexed_active && stage.indexed) {
             IndexedData::Get()->stats.legacy_images.fetch_add(1, std::memory_order_relaxed);
         }
         auto& set_write = set_writes[set_write_index++];
@@ -5216,7 +5297,7 @@ void Rasterizer::RecordSamplers(const Shader::Info& stage, Shader::Backend::Bind
     VideoCore::ResolveCommands::Run();
     // Plan S step P2: the record half (descriptor infos, writes, the indexed row)
     for (u32 i = 0; i < count; ++i) {
-        if (indexed_active && stage.indexed) {
+        if (record_indexed_active && stage.indexed) {
             NoteIndexedSampler(samplers[i]);
             continue;
         }
@@ -5609,6 +5690,7 @@ void Rasterizer::ResolveRenderTargets(const GraphicsPipeline* pipeline, RenderRe
     if (state.num_layers == std::numeric_limits<u16>::max()) {
         state.num_layers = 1;
     }
+    r.feedback_loop = attachment_feedback_loop;
 }
 
 

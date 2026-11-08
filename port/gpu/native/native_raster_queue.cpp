@@ -220,6 +220,7 @@ void Queue::Run(std::stop_token stoken) {
             }
             applied_core = wanted;
         }
+        consumer->Idle();
         {
             const u64 idle_start = VideoCore::ReadbackStats::NowNs();
             const u8 front_state_at_idle = sp.front_state.load(std::memory_order_relaxed);

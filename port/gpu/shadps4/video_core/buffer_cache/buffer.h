@@ -86,6 +86,7 @@ struct UniqueBuffer {
 struct OpSequence {
     static inline std::atomic<u64> resolving{1};
     static inline std::atomic<u64> retired{0};
+    static inline thread_local u64 recording{0}; ///< P3e.4b: the operation the record half is running (0: none; a queued draw is recorded after the resolve side moved on)
 };
 
 struct Buffer {

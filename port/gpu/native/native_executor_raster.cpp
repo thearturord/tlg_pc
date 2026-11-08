@@ -3,6 +3,7 @@
 // The executor's raster side (G4e; the code of Liverpool::liverpool.cpp, unchanged except for the names): queueing draws and dispatches for the raster thread, running
 // them there through the rasterizer host (native/native_raster_host.h), the fences and the waits of the command stream, the command processor's own writes and copies.
 
+#include "video_core/half_phase.h"
 #include <algorithm>
 #include <cstring>
 #include <functional>
@@ -470,6 +471,9 @@ void NativeExecutor::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan*
         TLG_PROF_NAMED_LEVEL(prof_ring, "raster.ring_use", 3);
         rasterizer->BeginRingUse(draw_plan, dispatch_plan);
     }
+    if (c.kind != RasterCall::Kind::Draw) {
+        VideoCore::RecordQueue::Drain(VideoCore::RecordQueue::NonDraw); // P3e.4b: a dispatch records its own commands and reads the state the draws that wait leave
+    }
     switch (c.kind) {
     case RasterCall::Kind::Draw:
         rasterizer->SetNativeTag(c.tag);
@@ -540,11 +544,16 @@ void NativeExecutor::RasterConsumer::ThreadStarted() {
     owner.gpu_id = std::this_thread::get_id();
 }
 
+void NativeExecutor::RasterConsumer::Idle() {
+    VideoCore::RecordQueue::Drain(VideoCore::RecordQueue::Idle); // nothing is waiting for the raster thread: what waits in the queue is recorded now
+}
+
 bool NativeExecutor::RasterConsumer::CallbacksPending() const {
     return owner.num_commands != 0;
 }
 
 void NativeExecutor::RasterConsumer::RunCallbacks() {
+    VideoCore::RecordQueue::Drain(VideoCore::RecordQueue::Callbacks);
     owner.ProcessCommands();
 }
 
@@ -563,6 +572,7 @@ void NativeExecutor::RasterConsumer::RunCall(RasterOp& op) {
 }
 
 void NativeExecutor::RasterConsumer::RunClosure(RasterOp& op) {
+    VideoCore::RecordQueue::Drain(VideoCore::RecordQueue::Closure); // P3e.4b: a closure (fence, flip, copy, readback) sees every draw before it recorded
     owner.rasterizer->NativeInvalidate();
     {
         TLG_PROF_NAMED_LEVEL(prof_closure, "raster.op.closure", 1);

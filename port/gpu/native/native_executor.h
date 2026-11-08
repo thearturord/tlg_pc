@@ -328,6 +328,7 @@ private:
         [[nodiscard]] bool LaneUsable() const override;
         void RunCall(RasterOp& op) override;
         void RunClosure(RasterOp& op) override;
+        void Idle() override;
         [[nodiscard]] bool IsDepthOnly(const Vulkan::DrawPlan& plan) const override;
         void Release(RasterOp& op) override;
         void PublishIntervalStats(RasterSplit& queue, u64 now_ns) override;

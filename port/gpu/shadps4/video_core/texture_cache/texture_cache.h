@@ -436,6 +436,7 @@ private:
 
     /// Removes image from the cache and schedules it for deletion.
     void FreeImage(ImageId image_id) {
+        VideoCore::RecordQueue::Guard(VideoCore::RecordQueue::FreeImage); // P3e.4b: so may a draw that waits
         VideoCore::ResolveCommands::Run(); // P3d: queued work may name this image
         {
             std::scoped_lock lk{slot_images[image_id].mutex};
