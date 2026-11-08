@@ -7,6 +7,7 @@
 #include <absl/container/btree_map.h>
 #include "native/native_buffer_index.h"
 #include "native/native_device.h"
+#include "native/native_ring_mirror.h"
 #include "native/native_resources.h"
 #include "native/native_readback_policy.h"
 
@@ -233,6 +234,9 @@ public:
     /// A guest memory write by the command processor (WriteData, occlusion results, DMA...).
     /// Drops reusable stream copies it overlaps.
     void NoteCpGuestWrite(VAddr device_addr, u64 size) {
+        if (Core::RingMirror::Mode() >= 2) {
+            Core::RingMirror::NoteHostWrite(device_addr, size);
+        }
         BindMemoBump(); // the command processor's writes (any thread): every memo answer is checked again
         if (StreamReuseOn()) {
             InvalidateStreamReuse(device_addr, size);

@@ -31,6 +31,10 @@ void CheckWindow(VAddr lo, VAddr hi, const std::pair<u64, u64>* announced, size_
 
 /// An announcement was applied for [address, size): blocks that were found different and are inside it are explained (announced late: the window was read between the write and its announcement).
 void NoteAnnounced(VAddr address, u64 size);
+/// At announcement time (the writing thread): the writer tag (writer id, +8 without a site name) of the ring blocks the range covers, remembered per block to classify the blocks that are never announced.
+void NoteWriter(VAddr address, u64 size, u32 tag);
+/// The port itself wrote guest memory (the command processor's WriteData labels, fills): not a game write, nothing to announce, and no shader reads it. The shadow takes the bytes when a window that holds them is read.
+void NoteHostWrite(VAddr address, u64 size);
 
 [[nodiscard]] nlohmann::json Report();
 

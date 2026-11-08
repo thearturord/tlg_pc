@@ -10,6 +10,10 @@
 #include <cstring>
 #include <chrono>
 #include <mutex>
+#include <bit>
+#include <functional>
+#include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -37,11 +41,40 @@ constexpr u64 Block = 64;
 /// blocks found different and not announced since (block index in the ring -> milliseconds since the start when first found)
 std::unordered_map<u32, u32> suspects;
 std::atomic<u64> suspects_cancelled{0}, suspects_found{0}, never_announced_total{0};
-std::vector<u64> never_announced_samples; // ring offsets of the first blocks retired without an announcement
+std::vector<u64> never_announced_samples;
+std::vector<u8> writer_of_block;                 // tag + 1 of the newest announcement over each 64 byte block of the ring (0: none yet)
+std::unordered_map<u32, u64> retired_classes;    // (own tag + 1) | (previous block's) << 8 | (next block's) << 16 -> blocks
+std::vector<std::string> retired_dumps;
+std::vector<std::pair<u64, u64>> host_pending; // guest memory the port wrote itself (command processor labels), taken into the shadow at the next window that holds them
+std::atomic<u64> host_write_calls{0}, host_write_bytes_taken{0};
+std::vector<u32> ann_start_of_block, ann_end_of_block; // byte offsets in the ring of the newest announcement over each block
+std::unordered_map<std::string, u64> retired_relations; // ring offsets of the first blocks retired without an announcement
 u32 NowMs() {
     static const auto t0 = std::chrono::steady_clock::now();
     return static_cast<u32>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
 }
+
+
+/// Mode 4, the sampled write trace: one page in eight of the ring is read only (the eighth rotates every 4 s); the first write to such a page is logged (address, instruction, the
+/// game code addresses on the stack) and the page given back. 300 ms later the log entry is judged: was the block announced around that time (`ann_time_of_block`)? Writes that were not
+/// are grouped by instruction and caller.
+struct TraceFault {
+    u64 address, rip;
+    u32 ms, thread;
+    u64 frames[3];
+};
+constexpr size_t FaultCap = 1u << 16;
+std::vector<TraceFault> trace_faults_log;
+std::atomic<u64> trace_head{0};
+u64 trace_eval = 0;
+std::unique_ptr<std::atomic<u8>[]> trace_prot;
+size_t trace_pages = 0;
+std::atomic<VAddr> trace_start{0};
+std::vector<u32> ann_time_of_block;
+std::atomic<u64> trace_faults{0}, trace_covered{0}, trace_ambiguous{0}, trace_uncovered{0}, trace_lost{0};
+std::unordered_map<std::string, std::pair<u64, std::vector<u64>>> trace_uncovered_by_site;
+u32 trace_phase = 0, trace_rotated_ms = 0, trace_evaluated_ms = 0;
+u32 steady_sweeps = 0; // consecutive sweeps with few retiring blocks (the level is not loading any more)
 
 /// The writer probe (mode 3). Lock free on the fault side: a table of the pages made read only and a table of what wrote into them.
 constexpr size_t ProbePages = 64, ProbeWriters = 64;
@@ -62,6 +95,33 @@ LONG CALLBACK ProbeHandler(PEXCEPTION_POINTERS info) {
     }
     const u64 address = info->ExceptionRecord->ExceptionInformation[1];
     const u64 page = address & ~u64{4095};
+    {
+        const VAddr ts = trace_start.load(std::memory_order_acquire);
+        if (ts != 0 && address >= ts && address < ts + trace_pages * 4096) {
+            const size_t idx = (address - ts) >> 12;
+            if (trace_prot[idx].exchange(0) == 1) {
+                DWORD old;
+                VirtualProtect(reinterpret_cast<void*>(address & ~u64{4095}), 4096, PAGE_READWRITE, &old);
+                const u64 slot = trace_head.fetch_add(1, std::memory_order_relaxed);
+                TraceFault& f = trace_faults_log[slot % FaultCap];
+                f.address = address;
+                f.rip = info->ContextRecord->Rip;
+                f.ms = NowMs();
+                f.thread = GetCurrentThreadId();
+                f.frames[0] = f.frames[1] = f.frames[2] = 0;
+                const u64 base = NativeDraw::ImageBase();
+                const u64* stack = reinterpret_cast<const u64*>(info->ContextRecord->Rsp);
+                size_t n = 0;
+                for (size_t i = 0; i < 48 && n < 3; ++i) {
+                    if (stack[i] >= base && stack[i] - base < 0x4000000) {
+                        f.frames[n++] = stack[i] - base + 0x1000000;
+                    }
+                }
+                trace_faults.fetch_add(1, std::memory_order_relaxed);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+    }
     for (size_t slot_index = 0; slot_index < probe_pages.size(); ++slot_index) {
         auto& slot = probe_pages[slot_index];
         u64 expected = page;
@@ -129,6 +189,84 @@ void ProbeProtect(VAddr address) {
 #endif
 }
 
+
+/// Mode 4, called with the mutex held on the raster thread: rotates the sampled pages and judges the faults that are 300 ms old.
+void TraceStep(u32 now) {
+#ifdef _WIN32
+    if (shadow_start == 0) {
+        return;
+    }
+    if (trace_pages == 0 && steady_sweeps < 3) {
+        return; // (protecting the ring while a level loads fails the load)
+    }
+    if (trace_pages == 0) {
+        trace_pages = (shadow_end - shadow_start) >> 12;
+        trace_prot = std::make_unique<std::atomic<u8>[]>(trace_pages);
+        trace_faults_log.resize(FaultCap);
+        ann_time_of_block.assign((shadow_end - shadow_start) / Block + 1, 0);
+        if (!probe_installed.exchange(true)) {
+            AddVectoredExceptionHandler(1, ProbeHandler);
+        }
+        trace_start.store(shadow_start, std::memory_order_release);
+        trace_rotated_ms = now - 100000; // rotate at once
+    }
+    if (now - trace_rotated_ms > 4000) {
+        trace_rotated_ms = now;
+        for (size_t i = 0; i < trace_pages; ++i) {
+            if (trace_prot[i].exchange(0) == 1) {
+                DWORD old;
+                VirtualProtect(reinterpret_cast<void*>(shadow_start + (i << 12)), 4096, PAGE_READWRITE, &old);
+            }
+        }
+        trace_phase = (trace_phase + 1) & 7;
+        for (size_t i = trace_phase; i < trace_pages; i += 8) {
+            trace_prot[i].store(1);
+            DWORD old;
+            if (!VirtualProtect(reinterpret_cast<void*>(shadow_start + (i << 12)), 4096, PAGE_READONLY, &old)) {
+                trace_prot[i].store(0);
+            }
+        }
+    }
+    if (now - trace_evaluated_ms > 200) {
+        trace_evaluated_ms = now;
+        const u64 head = trace_head.load(std::memory_order_acquire);
+        if (head - trace_eval > FaultCap) {
+            trace_lost.fetch_add(head - trace_eval - FaultCap, std::memory_order_relaxed);
+            trace_eval = head - FaultCap;
+        }
+        const u64 image_base = NativeDraw::ImageBase();
+        while (trace_eval < head) {
+            const TraceFault& f = trace_faults_log[trace_eval % FaultCap];
+            if (now - f.ms < 300) {
+                break;
+            }
+            ++trace_eval;
+            if (f.address < shadow_start || f.address >= shadow_end) {
+                continue;
+            }
+            const u64 block = (f.address - shadow_start) / Block;
+            const u32 t = block < ann_time_of_block.size() ? ann_time_of_block[block] : 0;
+            if (t != 0 && t + 300 >= f.ms && t <= f.ms + 300) {
+                trace_covered.fetch_add(1, std::memory_order_relaxed);
+            } else if (t > f.ms + 300) {
+                trace_ambiguous.fetch_add(1, std::memory_order_relaxed); // the block was announced again later (next lap): cannot tell
+            } else {
+                trace_uncovered.fetch_add(1, std::memory_order_relaxed);
+                const bool game = f.rip >= image_base && f.rip - image_base < 0x4000000;
+                const std::string key = fmt::format("rip {:#x}{} frames {:#x} {:#x} {:#x}", game ? f.rip - image_base + 0x1000000 : f.rip, game ? " (game)" : " (host)", f.frames[0], f.frames[1], f.frames[2]);
+                auto& entry = trace_uncovered_by_site[key];
+                ++entry.first;
+                if (entry.second.size() < 3) {
+                    entry.second.push_back(f.address - shadow_start);
+                }
+            }
+        }
+    }
+#else
+    (void)now;
+#endif
+}
+
 } // namespace
 
 u32 Mode() noexcept {
@@ -151,6 +289,9 @@ void Fill(VAddr start, VAddr end) {
     shadow_start = start;
     shadow_end = end;
     suspects.clear();
+    writer_of_block.assign((end - start) / Block + 1, 0);
+    ann_start_of_block.assign((end - start) / Block + 1, 0);
+    ann_end_of_block.assign((end - start) / Block + 1, 0);
     fills.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -172,10 +313,37 @@ void CheckWindow(VAddr lo, VAddr hi, const std::pair<u64, u64>* announced, size_
             for (const auto& [block, found] : suspects) {
                 retiring += now - found > 5000;
             }
-            const bool steady = retiring <= 400; // (the burst while a level loads is not probed: a protected page that the loader writes through a system call would fail it)
+            const bool steady = retiring <= 400;
+            steady_sweeps = steady && now > 20000 ? steady_sweeps + 1 : 0; // (the burst while a level loads is not probed: a protected page that the loader writes through a system call would fail it)
             for (auto it = suspects.begin(); it != suspects.end();) {
                 if (now - it->second > 5000) {
                     never_announced_total.fetch_add(1, std::memory_order_relaxed);
+                    if (now > 40000) {
+                        const u32 b = it->first;
+                        const u32 own = b < writer_of_block.size() ? writer_of_block[b] : 0, prev = b > 0 && b - 1 < writer_of_block.size() ? writer_of_block[b - 1] : 0, next = b + 1 < writer_of_block.size() ? writer_of_block[b + 1] : 0;
+                        ++retired_classes[own | (prev << 8) | (next << 16)];
+                        {
+                            const u64 at = u64{b} * Block;
+                            const bool has_prev = b > 0 && b - 1 < ann_end_of_block.size() && ann_end_of_block[b - 1] != 0;
+                            const bool has_next = b + 1 < ann_start_of_block.size() && ann_end_of_block[b + 1] != 0;
+                            const bool tail = has_prev && ann_end_of_block[b - 1] == at;
+                            const bool head = has_next && ann_start_of_block[b + 1] == at + Block;
+                            const u64 prev_len = has_prev ? ann_end_of_block[b - 1] - ann_start_of_block[b - 1] : 0;
+                            const u64 own_len = ann_end_of_block[b] != 0 ? ann_end_of_block[b] - ann_start_of_block[b] : 0;
+                            const std::string key = fmt::format("{}{} prev tag {} len<2^{} own tag {} len<2^{}", tail ? "TAIL " : "", head ? "HEAD " : "", has_prev ? int(prev) - 1 : -1, std::bit_width(prev_len), own ? int(own) - 1 : -1, std::bit_width(own_len));
+                            ++retired_relations[key];
+                        }
+                        if (retired_dumps.size() < 12) {
+                            const u8* g = reinterpret_cast<const u8*>(shadow_start + u64{b} * Block);
+                            std::string hex;
+                            bool zero = true;
+                            for (u32 i = 0; i < Block; ++i) {
+                                hex += fmt::format("{:02x}", g[i]);
+                                zero &= g[i] == 0;
+                            }
+                            retired_dumps.push_back(fmt::format("ring {:#x} own {} prev {} next {} zero {}: {}", u64{b} * Block, own, prev, next, zero, hex));
+                        }
+                    }
                     if (Mode() == 3 && steady && probe_protected.load(std::memory_order_relaxed) < 400) {
                         ProbeProtect(shadow_start + u64{it->first} * Block);
                     }
@@ -189,6 +357,9 @@ void CheckWindow(VAddr lo, VAddr hi, const std::pair<u64, u64>* announced, size_
             }
         }
     }
+    if (Mode() == 4) {
+        TraceStep(NowMs());
+    }
     // the mirror takes the announced bytes of the window...
     for (size_t i = 0; i < count; ++i) {
         const VAddr a = std::max<VAddr>(announced[i].first, lo);
@@ -197,6 +368,21 @@ void CheckWindow(VAddr lo, VAddr hi, const std::pair<u64, u64>* announced, size_
             std::memcpy(shadow.data() + (a - shadow_start), reinterpret_cast<const void*>(a), e - a);
             announced_taken.fetch_add(e - a, std::memory_order_relaxed);
         }
+    }
+    // the bytes the port wrote itself (labels): taken as they are
+    for (size_t i = 0; i < host_pending.size();) {
+        const auto [ha, hn] = host_pending[i];
+        const VAddr a = std::max<VAddr>(ha, lo), e = std::min<VAddr>(ha + hn, hi);
+        if (a < e) {
+            std::memcpy(shadow.data() + (a - shadow_start), reinterpret_cast<const void*>(a), e - a);
+            host_write_bytes_taken.fetch_add(e - a, std::memory_order_relaxed);
+            if (a == ha && e == ha + hn) {
+                host_pending[i] = host_pending.back();
+                host_pending.pop_back();
+                continue;
+            }
+        }
+        ++i;
     }
     // ...and what the window holds now must be what the mirror holds: a difference is a write nobody announced
     const u8* const guest = reinterpret_cast<const u8*>(lo);
@@ -228,6 +414,34 @@ void CheckWindow(VAddr lo, VAddr hi, const std::pair<u64, u64>* announced, size_
                                                                           lo + first_bad, lo + first_bad - shadow_start));
         }
     }
+}
+
+void NoteWriter(VAddr address, u64 size, u32 tag) {
+    std::scoped_lock lock{mutex};
+    if (shadow_start == 0 || address + size <= shadow_start || address >= shadow_end) {
+        return;
+    }
+    const VAddr a = std::max<VAddr>(address, shadow_start), e = std::min<VAddr>(address + size, shadow_end);
+    for (u64 block = (a - shadow_start) / Block; block <= (e - 1 - shadow_start) / Block && block < writer_of_block.size(); ++block) {
+        writer_of_block[block] = static_cast<u8>(tag + 1);
+        if (block < ann_time_of_block.size()) {
+            ann_time_of_block[block] = std::max<u32>(NowMs(), 1);
+        }
+        ann_start_of_block[block] = static_cast<u32>(a - shadow_start);
+        ann_end_of_block[block] = static_cast<u32>(e - shadow_start);
+    }
+}
+
+void NoteHostWrite(VAddr address, u64 size) {
+    std::scoped_lock lock{mutex};
+    if (shadow_start == 0 || address + size <= shadow_start || address >= shadow_end) {
+        return;
+    }
+    host_write_calls.fetch_add(1, std::memory_order_relaxed);
+    if (host_pending.size() > 200000) {
+        host_pending.erase(host_pending.begin(), host_pending.begin() + 100000);
+    }
+    host_pending.emplace_back(address, size);
 }
 
 void NoteAnnounced(VAddr address, u64 size) {
@@ -288,6 +502,37 @@ nlohmann::json Report() {
             {"suspect_blocks_open", open},
             {"NEVER_ANNOUNCED_BLOCKS_OLDER_3S_MUST_BE_0", old},
             {"NEVER_ANNOUNCED_BLOCKS_RETIRED", never_announced_total.load()},
+            {"retired_classes", [] {
+                 std::scoped_lock lock{mutex};
+                 std::vector<std::pair<u64, u32>> v;
+                 for (const auto& [k, n] : retired_classes) {
+                     v.emplace_back(n, k);
+                 }
+                 std::sort(v.begin(), v.end(), std::greater<>());
+                 nlohmann::json j = nlohmann::json::array();
+                 for (size_t i = 0; i < v.size() && i < 14; ++i) {
+                     const u32 k = v[i].second;
+                     j.push_back(fmt::format("{} blocks: own tag {} prev {} next {} (tag+1, 0 none)", v[i].first, (k & 255), (k >> 8) & 255, (k >> 16) & 255));
+                 }
+                 return j;
+             }()},
+            {"retired_relations", [] {
+                 std::scoped_lock lock{mutex};
+                 std::vector<std::pair<u64, std::string>> v;
+                 for (const auto& [k, n] : retired_relations) {
+                     v.emplace_back(n, k);
+                 }
+                 std::sort(v.begin(), v.end(), std::greater<>());
+                 nlohmann::json j = nlohmann::json::array();
+                 for (size_t i = 0; i < v.size() && i < 16; ++i) {
+                     j.push_back(fmt::format("{} blocks: {}", v[i].first, v[i].second));
+                 }
+                 return j;
+             }()},
+            {"retired_dumps", [] {
+                 std::scoped_lock lock{mutex};
+                 return nlohmann::json(retired_dumps);
+             }()},
             {"never_announced_offsets", [] {
                  std::scoped_lock lock{mutex};
                  nlohmann::json j = nlohmann::json::array();
@@ -297,6 +542,20 @@ nlohmann::json Report() {
                  return j;
              }()},
             {"never_announced_runs", runs},
+            {"host_writes", {{"calls", host_write_calls.load()}, {"bytes_taken_into_shadow", host_write_bytes_taken.load()}}},
+            {"write_trace", [] {
+                 std::scoped_lock lock{mutex};
+                 nlohmann::json j = {{"faults", trace_faults.load()}, {"announced_around_the_write", trace_covered.load()}, {"announced_again_later_cannot_tell", trace_ambiguous.load()}, {"NOT_ANNOUNCED", trace_uncovered.load()}, {"log_overflow_lost", trace_lost.load()}, {"sites", nlohmann::json::array()}};
+                 std::vector<std::pair<u64, std::string>> v;
+                 for (const auto& [k, e] : trace_uncovered_by_site) {
+                     v.emplace_back(e.first, k + fmt::format(" ring offsets {:#x} {:#x} {:#x}", e.second.size() > 0 ? e.second[0] : 0, e.second.size() > 1 ? e.second[1] : 0, e.second.size() > 2 ? e.second[2] : 0));
+                 }
+                 std::sort(v.begin(), v.end(), std::greater<>());
+                 for (size_t i = 0; i < v.size() && i < 20; ++i) {
+                     j["sites"].push_back(fmt::format("{} writes: {}", v[i].first, v[i].second));
+                 }
+                 return j;
+             }()},
             {"writer_probe", [] {
                  nlohmann::json j = {{"pages_protected", probe_protected.load()}, {"faults", probe_faults.load()}, {"writers", nlohmann::json::array()}};
                  for (const auto& w : probe_writers) {
