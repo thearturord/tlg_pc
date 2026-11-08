@@ -577,6 +577,11 @@ private:
     static bool RenderStateMemoEnabled();
     void ResolveDrawJob(const GraphicsPipeline* pipeline, DrawJob& job);
     RenderState RecordDrawJob(DrawJob& job);
+    /// P3e.4: the record half of a whole graphics draw: the stage records, the render pass, vertex and index buffers, the barrier flush, the pipeline's descriptors, the dynamic
+    /// state, the draw call and the access notes. Inputs only from `job`; the members it writes are the ones listed under "recorder-owned" below.
+    void RecordDraw(DrawJob& job);
+    /// The measuring and the indexed descriptor table that follow the stage records in `BindResources`.
+    void FinishBindResources(const Pipeline* pipeline, bool uses_dma, u64 resolve_ns);
     bool BindResources(const Pipeline* pipeline, const FixedState* fixed = nullptr, DrawJob* draw_job = nullptr);
     void BindCensus(const Pipeline* pipeline);
     static void NoteRecordedStateDiagnostics();
@@ -602,7 +607,7 @@ private:
     RenderState BeginRenderingLegacy(const GraphicsPipeline* pipeline);
     void ResolveRenderTargets(const GraphicsPipeline* pipeline, RenderResolved& r);
     RenderState RecordRenderTargets(RenderResolved& r);
-    void RecordBufferAccess(bool is_compute);
+    void RecordBufferAccess(bool is_compute, u64 op_sequence = 0);
 
     /// P3e.3: the game's own compute copies and clears of images. The resolve half decides (`Match*`: which images, which values), the record half issues the command (`RunComputeImageOp`).
     struct ComputeImageOp {
@@ -627,7 +632,9 @@ private:
         u64 k2{};
         const GraphicsPipeline* pipeline{};
         u64 tick{};
+        u64 seq{}; ///< P3e.4: the call number of that draw (`draw_call_seq`)
     } native_last{};
+    u64 draw_call_seq{}; ///< P3e.4: counts every call of `Draw`; only the very next call may reuse `native_last`
     NativeStats native_stats{};
 
     const Instance& instance;
@@ -799,6 +806,12 @@ private:
 
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+    // Plan S step P3e.4: who owns which member (checked by scratchpad/audit_members.py: each name against the functions that mention it).
+    //   recorder-owned (only Record*, RecordDraw, FinishBindResources, the legacy Bind* paths and the non-draw operations behind a drain): needs_barrier, bound_buffers,
+    //     set_writes, set_write_index, buffer_infos, image_infos, indexed_row, indexed_row_size, recorded_work, last_barrier_work, native_last, push_data (a copy per draw),
+    //     indexed_active (read by Record*: a recorder copy is needed before the thread)
+    //   resolver-owned: bound_images, clip_plane_mask, indexed_active (read by Resolve*), cb_descs, db_desc, rt_cache, texture_lookup_cache, native_images, draw_call_seq
+    //   carried by the job: push_data's first value, attachment_feedback_loop (written by ResolveRenderTargets, read by UpdateColorBlendingState)
 };
 
 } // namespace Vulkan

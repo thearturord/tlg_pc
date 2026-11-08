@@ -752,6 +752,22 @@ struct Rasterizer::DrawJob {
     VideoCore::BufferCache::UploadSink index_uploads;
     u32 vertex_offset{0}; ///< P3e.3: read from the shader info in the resolve half (the next draw's plan rewrites it)
     u32 instance_offset{0};
+    // P3e.4: the rest of what the record half of a draw needs
+    const GraphicsPipeline* pipeline{nullptr};
+    boost::container::small_vector<StageResolved, 6> stages;
+    Shader::PushData push_data{};
+    bool indexed_active{false};
+    bool uses_dma{false};
+    bool feedback_loop{false};
+    u64 resolve_ns{0};
+    u64 op_seq{0};
+    FixedState fixed;
+    u32 num_indices{0};
+    u32 num_instances{0};
+    bool use_tag{false};
+    u64 tag_k2{0};
+    u32 draw_class{15};
+    u64 call_seq{0};
 };
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
@@ -780,8 +796,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     }
     const bool use_tag =
         tag.valid;
+    // Plan S step P3e.2/4: with the split on (and the render state memo off) the render pass, the vertex buffers and the index buffer are resolved together with the stages
+    // and the whole record half is one function (`RecordDraw`); then the "same as the previous draw" notes live on the record side and are keyed by the call number
+    const bool hoisted = SplitBindMode() == 1 && !RenderStateMemoEnabled();
+    const u64 call_seq = ++draw_call_seq;
     const NativeLast last = native_last;
-    native_last.valid = false;
+    if (!hoisted) {
+        native_last.valid = false;
+    }
     if (tag.valid) {
         ++native_stats.tagged;
     } else {
@@ -868,7 +890,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     current_db_extent = plan ? &plan->db_extent : &executor->RasterDbExtent();
     current_target_resources = plan ? &plan->target_resources : &executor->RasterTargetResources();
     const auto& regs = *draw_inputs;
-    const bool same_cmdbuf = use_tag && last.valid && last.tick == scheduler.CurrentTick();
+    const bool same_cmdbuf = !hoisted && use_tag && last.valid && last.tick == scheduler.CurrentTick();
     const bool same_pipeline = same_cmdbuf && last.pipeline == pipeline;
     const bool same_dynamic_state = same_pipeline && last.k2 == tag.k2;
 
@@ -876,9 +898,6 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     binder_plan = NativeBinderFor(plan, tag.valid ? (tag.meta & 0xff) : 15u);
     draw_class_now = tag.valid ? (tag.meta & 0xff) : 15u;
     resolved_draw = binder_plan == plan ? plan : nullptr;
-    // Plan S step P3e.2: with the split on (and the render state memo off) the render pass, the vertex buffers and the index buffer are resolved together with the stages
-    // and recorded after them, in the order the old code bound them
-    const bool hoisted = SplitBindMode() == 1 && !RenderStateMemoEnabled();
     DrawJob job;
     if (hoisted) {
         job.plan = plan;
@@ -892,10 +911,21 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     if (!bound) {
         return;
     }
-    RenderState state;
     if (hoisted) {
-        state = RecordDrawJob(job);
-    } else {
+        job.pipeline = pipeline;
+        job.fixed = fixed;
+        job.num_indices = regs.num_indices;
+        job.num_instances = regs.num_instances.NumInstances();
+        job.use_tag = use_tag;
+        job.tag_k2 = tag.k2;
+        job.draw_class = tag.valid ? (tag.meta & 0xff) : 15u;
+        job.call_seq = call_seq;
+        RecordDraw(job);
+        ResetImageBindings(); // the resolve half's flags: the old ResetBindings cleared them between the barrier notes and the access notes, nothing in between reads them
+        return;
+    }
+    RenderState state;
+    {
         geometry_plan = plan;
         state = BeginRendering(pipeline);
 
@@ -932,8 +962,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         scheduler.BeginRendering(state);
     }
 
-    const auto [vertex_offset, instance_offset] = hoisted ? std::pair<u32, u32>{job.vertex_offset, job.instance_offset}
-                                                          : GetDrawOffsets(regs, pipeline->GetStage(Shader::SwStage::Vertex), pipeline->GetFetchShader());
+    const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, pipeline->GetStage(Shader::SwStage::Vertex), pipeline->GetFetchShader());
 
     NoteMarkerRow(0, tag.valid ? (tag.meta & 0xff) : 15u, pipeline, plan != nullptr ? plan->native_seq : 0, draw_inputs, regs.num_indices, regs.num_instances.NumInstances());
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -1508,126 +1537,7 @@ void Rasterizer::BindCensus(const Pipeline* pipeline) {
     }
 }
 
-bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed, DrawJob* draw_job) {
-    TLG_PROF_LEVEL("raster.bind_resources", 2);
-    VideoCore::OpSequence::resolving.fetch_add(1, std::memory_order_acq_rel); // P3c: a new operation (a draw or a dispatch)
-    VideoCore::ResolveCommands::Run();
-    {
-        ComputeImageOp image_op;
-        if (MatchComputeImageCopy(pipeline, image_op) || IsComputeMetaClear(pipeline) || MatchComputeImageClear(pipeline, image_op)) {
-            if (image_op.kind != ComputeImageOp::None) {
-                static std::atomic<u64> image_ops{0};
-                const u64 n = image_ops.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (SplitBindMode() == 1 && (n & (n - 1)) == 0) {
-                    LOG_WARNING(Render_Vulkan, "split bind: {} compute image copies/clears (record work decided in the resolve half, run in the record half)", n);
-                }
-                RunComputeImageOp(image_op);
-            }
-            return false;
-        }
-    }
-    NoteRecordedStateDiagnostics();
-
-    set_write_index = 0;
-    set_writes.clear();
-    buffer_infos.clear();
-    image_infos.clear();
-    indexed_active = pipeline->IsIndexed();
-    indexed_row_size = 0;
-    Census((fixed != nullptr ? 0u : 32u) + CBindResources);
-
-    // draw recipe verify: the identity of the record and the prediction, before anything is resolved
-    recipe_active = false;
-    recipe_ranges.clear();
-    recipe_image_ranges.clear();
-    recipe_reusable = true;
-    version_prediction = {};
-    if (ReuseCensusOn() && !pipeline->IsCompute() && binder_plan != nullptr) {
-        buffer_cache.RecipeCount(0);
-        if (!binder_plan->bindings_complete) {
-            buffer_cache.RecipeCount(1);
-        } else {
-            u64 key = reinterpret_cast<u64>(pipeline) * 0x9E3779B97F4A7C15ull;
-            for (u32 bi = 0; bi < binder_plan->binding_count; ++bi) {
-                const auto& rb = binder_plan->bindings[bi];
-                key = (key ^ (u64{rb.stage} | u64{rb.kind} << 8 | u64{rb.offset} << 16 | u64{rb.slot} << 32)) * 0x100000001b3ull;
-                key = (key ^ rb.id) * 0x100000001b3ull;
-                key = (key ^ rb.view_id) * 0x100000001b3ull;
-                key ^= key >> 31;
-            }
-            recipe_key = key;
-            recipe_epochs_at_start = buffer_cache.RecipeEpochsNow(Core::NativeResources::ImmutableEpoch(), texture_cache.ImageGeneration());
-            recipe_prediction = buffer_cache.RecipePredict(key, scheduler.CurrentTick(), recipe_epochs_at_start, recipe_stored_shape);
-            recipe_active = true;
-            if (VersionCensusOn()) {
-                recipe_identity_clock = Core::NativeIdentity::Clock();
-                version_prediction = buffer_cache.RecipePredictScoped(key, scheduler.CurrentTick());
-            }
-        }
-    }
-
-    bool uses_dma = false;
-
-    // Bind resource buffers and textures.
-    Shader::Backend::Bindings binding{};
-    push_data = MakeUserData(fixed);
-    clip_plane_mask = fixed ? fixed->user_clip_plane_mask : 0;
-    const bool timed_resolve = recipe_active && VersionCensusOn();
-    const auto resolve_begin = timed_resolve ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    if (SplitBindMode() == 1) {
-        // Plan S step P3e.1: the whole draw is resolved first (every stage: buffers, images, samplers), then recorded. What the resolve loop leaves is plain data per stage
-        // (`StageResolved`): the unit a resolver thread would hand to the recorder.
-        boost::container::small_vector<StageResolved, 6> jobs;
-        {
-            Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
-            TLG_PROF_LEVEL("raster.resolve_stages", 2);
-            for (const auto* stage : pipeline->GetStages()) {
-                if (!stage) {
-                    continue;
-                }
-                StageResolved& job = jobs.emplace_back();
-                job.stage = stage;
-                job.buffers.resize(stage->buffers.size());
-                const u64 alignment = instance.StorageMinAlignment();
-                const u32 census_base = stage->sw_stage == Shader::SwStage::Compute ? 32u : 0u;
-                for (u32 i = 0; i < job.buffers.size(); ++i) {
-                    ResolveBufferBinding(*stage, i, alignment, census_base, job.buffers[i]);
-                }
-                ResolveTextures(*stage, job.textures);
-                ResolveSamplers(*stage, job.samplers);
-            }
-            if (draw_job != nullptr) {
-                ResolveDrawJob(static_cast<const GraphicsPipeline*>(pipeline), *draw_job);
-            }
-        }
-        {
-            Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
-            TLG_PROF_LEVEL("raster.record_stages", 2);
-            for (StageResolved& job : jobs) {
-                const Shader::Info& stage = *job.stage;
-                set_writes.resize(set_writes.size() + stage.buffers.size() + stage.images.size() + stage.samplers.size());
-                const u64 alignment = instance.StorageMinAlignment();
-                const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
-                RecordBufferBindings(stage, binding, push_data, job.buffers.data(), static_cast<u32>(job.buffers.size()), alignment, census_base);
-                RecordTextures(stage, binding, job.textures);
-                RecordSamplers(stage, binding, job.samplers.data(), static_cast<u32>(job.samplers.size()));
-                uses_dma |= stage.uses_dma;
-            }
-        }
-    } else
-    for (const auto* stage : pipeline->GetStages()) {
-        if (!stage) {
-            continue;
-        }
-        set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
-                          stage->samplers.size());
-        BindBuffers(*stage, binding, push_data);
-        const u32 images_before = static_cast<u32>(image_infos.size());
-        BindTextures(*stage, binding);
-        uses_dma |= stage->uses_dma;
-    }
-    const u64 resolve_ns = timed_resolve ? static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - resolve_begin).count()) : 0;
-
+void Rasterizer::FinishBindResources(const Pipeline* pipeline, bool uses_dma, u64 resolve_ns) {
     BindCensus(pipeline);
     if (ReuseCensusOn()) {
         // reuse census (counts only): the shape of this draw, with the ring normalized
@@ -1856,6 +1766,139 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
         }
     }
 
+}
+
+bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed, DrawJob* draw_job) {
+    TLG_PROF_LEVEL("raster.bind_resources", 2);
+    VideoCore::OpSequence::resolving.fetch_add(1, std::memory_order_acq_rel); // P3c: a new operation (a draw or a dispatch)
+    VideoCore::ResolveCommands::Run();
+    {
+        ComputeImageOp image_op;
+        if (MatchComputeImageCopy(pipeline, image_op) || IsComputeMetaClear(pipeline) || MatchComputeImageClear(pipeline, image_op)) {
+            if (image_op.kind != ComputeImageOp::None) {
+                static std::atomic<u64> image_ops{0};
+                const u64 n = image_ops.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (SplitBindMode() == 1 && (n & (n - 1)) == 0) {
+                    LOG_WARNING(Render_Vulkan, "split bind: {} compute image copies/clears (record work decided in the resolve half, run in the record half)", n);
+                }
+                RunComputeImageOp(image_op);
+            }
+            return false;
+        }
+    }
+    NoteRecordedStateDiagnostics();
+
+    set_write_index = 0;
+    set_writes.clear();
+    buffer_infos.clear();
+    image_infos.clear();
+    indexed_active = pipeline->IsIndexed();
+    indexed_row_size = 0;
+    Census((fixed != nullptr ? 0u : 32u) + CBindResources);
+
+    // draw recipe verify: the identity of the record and the prediction, before anything is resolved
+    recipe_active = false;
+    recipe_ranges.clear();
+    recipe_image_ranges.clear();
+    recipe_reusable = true;
+    version_prediction = {};
+    if (ReuseCensusOn() && !pipeline->IsCompute() && binder_plan != nullptr) {
+        buffer_cache.RecipeCount(0);
+        if (!binder_plan->bindings_complete) {
+            buffer_cache.RecipeCount(1);
+        } else {
+            u64 key = reinterpret_cast<u64>(pipeline) * 0x9E3779B97F4A7C15ull;
+            for (u32 bi = 0; bi < binder_plan->binding_count; ++bi) {
+                const auto& rb = binder_plan->bindings[bi];
+                key = (key ^ (u64{rb.stage} | u64{rb.kind} << 8 | u64{rb.offset} << 16 | u64{rb.slot} << 32)) * 0x100000001b3ull;
+                key = (key ^ rb.id) * 0x100000001b3ull;
+                key = (key ^ rb.view_id) * 0x100000001b3ull;
+                key ^= key >> 31;
+            }
+            recipe_key = key;
+            recipe_epochs_at_start = buffer_cache.RecipeEpochsNow(Core::NativeResources::ImmutableEpoch(), texture_cache.ImageGeneration());
+            recipe_prediction = buffer_cache.RecipePredict(key, scheduler.CurrentTick(), recipe_epochs_at_start, recipe_stored_shape);
+            recipe_active = true;
+            if (VersionCensusOn()) {
+                recipe_identity_clock = Core::NativeIdentity::Clock();
+                version_prediction = buffer_cache.RecipePredictScoped(key, scheduler.CurrentTick());
+            }
+        }
+    }
+
+    bool uses_dma = false;
+
+    // Bind resource buffers and textures.
+    Shader::Backend::Bindings binding{};
+    push_data = MakeUserData(fixed);
+    clip_plane_mask = fixed ? fixed->user_clip_plane_mask : 0;
+    const bool timed_resolve = recipe_active && VersionCensusOn();
+    const auto resolve_begin = timed_resolve ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (SplitBindMode() == 1) {
+        // Plan S step P3e.1: the whole draw is resolved first (every stage: buffers, images, samplers), then recorded. What the resolve loop leaves is plain data per stage
+        // (`StageResolved`): the unit a resolver thread would hand to the recorder. With a `DrawJob` (P3e.4) the records are left to `RecordDraw`.
+        boost::container::small_vector<StageResolved, 6> local_jobs;
+        auto& jobs = draw_job != nullptr ? draw_job->stages : local_jobs;
+        {
+            Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
+            TLG_PROF_LEVEL("raster.resolve_stages", 2);
+            for (const auto* stage : pipeline->GetStages()) {
+                if (!stage) {
+                    continue;
+                }
+                StageResolved& job = jobs.emplace_back();
+                job.stage = stage;
+                job.buffers.resize(stage->buffers.size());
+                const u64 alignment = instance.StorageMinAlignment();
+                const u32 census_base = stage->sw_stage == Shader::SwStage::Compute ? 32u : 0u;
+                for (u32 i = 0; i < job.buffers.size(); ++i) {
+                    ResolveBufferBinding(*stage, i, alignment, census_base, job.buffers[i]);
+                }
+                ResolveTextures(*stage, job.textures);
+                ResolveSamplers(*stage, job.samplers);
+                uses_dma |= stage->uses_dma;
+            }
+            if (draw_job != nullptr) {
+                ResolveDrawJob(static_cast<const GraphicsPipeline*>(pipeline), *draw_job);
+            }
+        }
+        if (draw_job != nullptr) {
+            draw_job->push_data = push_data;
+            draw_job->indexed_active = indexed_active;
+            draw_job->uses_dma = uses_dma;
+            draw_job->feedback_loop = attachment_feedback_loop;
+            draw_job->resolve_ns = timed_resolve ? static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - resolve_begin).count()) : 0;
+            draw_job->op_seq = VideoCore::OpSequence::resolving.load(std::memory_order_acquire);
+            return true;
+        }
+        {
+            Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
+            TLG_PROF_LEVEL("raster.record_stages", 2);
+            for (StageResolved& job : jobs) {
+                const Shader::Info& stage = *job.stage;
+                set_writes.resize(set_writes.size() + stage.buffers.size() + stage.images.size() + stage.samplers.size());
+                const u64 alignment = instance.StorageMinAlignment();
+                const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
+                RecordBufferBindings(stage, binding, push_data, job.buffers.data(), static_cast<u32>(job.buffers.size()), alignment, census_base);
+                RecordTextures(stage, binding, job.textures);
+                RecordSamplers(stage, binding, job.samplers.data(), static_cast<u32>(job.samplers.size()));
+            }
+        }
+    } else
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
+                          stage->samplers.size());
+        BindBuffers(*stage, binding, push_data);
+        const u32 images_before = static_cast<u32>(image_infos.size());
+        BindTextures(*stage, binding);
+        uses_dma |= stage->uses_dma;
+    }
+    const u64 resolve_ns = timed_resolve ? static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - resolve_begin).count()) : 0;
+
+    FinishBindResources(pipeline, uses_dma, resolve_ns);
     return true;
 }
 
@@ -2296,6 +2339,92 @@ void Rasterizer::RecordIndexBuffer(IndexBind& ib, VideoCore::BufferCache::Upload
     }
 }
 
+void Rasterizer::RecordDraw(DrawJob& d) {
+    TLG_PROF_LEVEL("raster.record_draw_all", 2);
+    const GraphicsPipeline* pipeline = d.pipeline;
+    const FixedState& fixed = d.fixed;
+    // the per-draw state of the record side starts empty; what the resolve half decided comes from the job
+    set_write_index = 0;
+    set_writes.clear();
+    buffer_infos.clear();
+    image_infos.clear();
+    indexed_row_size = 0;
+    indexed_active = d.indexed_active;
+    push_data = d.push_data;
+    attachment_feedback_loop = d.feedback_loop;
+    {
+        Shader::Backend::Bindings binding{};
+        Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
+        TLG_PROF_LEVEL("raster.record_stages", 2);
+        for (StageResolved& job : d.stages) {
+            const Shader::Info& stage = *job.stage;
+            set_writes.resize(set_writes.size() + stage.buffers.size() + stage.images.size() + stage.samplers.size());
+            const u64 alignment = instance.StorageMinAlignment();
+            const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
+            RecordBufferBindings(stage, binding, push_data, job.buffers.data(), static_cast<u32>(job.buffers.size()), alignment, census_base);
+            RecordTextures(stage, binding, job.textures);
+            RecordSamplers(stage, binding, job.samplers.data(), static_cast<u32>(job.samplers.size()));
+        }
+    }
+    FinishBindResources(pipeline, d.uses_dma, d.resolve_ns);
+    const RenderState state = RecordDrawJob(d);
+
+    // the previous draw's notes: valid for the very next call of Draw, in the same command buffer
+    const NativeLast last = native_last;
+    const bool same_cmdbuf = d.use_tag && last.valid && last.seq + 1 == d.call_seq && last.tick == scheduler.CurrentTick();
+    const bool same_pipeline = same_cmdbuf && last.pipeline == pipeline;
+    const bool same_dynamic_state = same_pipeline && last.k2 == d.tag_k2;
+
+    {
+        const u32 diff = scheduler.PassStateDifference(state);
+        if (diff != 0) {
+            g_pass_changes.count[diff].fetch_add(1, std::memory_order_relaxed);
+            g_pass_changes.draws_held[diff].fetch_add(0, std::memory_order_relaxed);
+        }
+    }
+    if (needs_barrier) {
+        TLG_PROF_LEVEL("raster.flush_barriers", 2);
+        t_flush_in_same_pass = scheduler.WouldContinuePass(state);
+        runtime.FlushBarriers();
+        t_flush_in_same_pass = false;
+    }
+
+    pipeline->BindResources(set_writes, push_data);
+    if (same_dynamic_state) {
+        ++native_stats.dynamic_skipped;
+    } else {
+        UpdateDynamicState(pipeline, d.indexed, fixed);
+    }
+    {
+        TLG_PROF_LEVEL("sched.begin_rendering", 3);
+        scheduler.BeginRendering(state);
+    }
+
+    NoteMarkerRow(0, d.draw_class, pipeline, d.plan != nullptr ? d.plan->native_seq : 0, draw_inputs, d.num_indices, d.num_instances);
+    const auto cmdbuf = scheduler.CommandBuffer();
+    {
+        TLG_PROF_LEVEL("raster.record_draw", 2);
+        if (same_pipeline) {
+            ++native_stats.bind_skipped;
+        } else {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+        }
+
+        if (d.indexed) {
+            cmdbuf.drawIndexed(d.num_indices, d.num_instances, 0, s32(d.vertex_offset), d.instance_offset);
+        } else {
+            cmdbuf.draw(d.num_indices, d.num_instances, d.vertex_offset, d.instance_offset);
+        }
+    }
+    DebugState.IncDrawCall();
+    scheduler.NoteDraw();
+    ++recorded_work;
+
+    VideoCore::ResolveCommands::Run();
+    RecordBufferAccess(false, d.op_seq);
+    native_last = d.use_tag ? NativeLast{.valid = true, .k2 = d.tag_k2, .pipeline = pipeline, .tick = scheduler.CurrentTick(), .seq = d.call_seq} : NativeLast{};
+}
+
 bool Rasterizer::RenderStateMemoEnabled() {
     // Off by default until it is checked in play (documents/tlg/pc-port-draw-pipeline-architecture.md): TLG_RENDER_STATE_MEMO=1 turns it on.
     static const bool enabled = [] {
@@ -2382,7 +2511,7 @@ void Rasterizer::ResetImageBindings() {
     bound_images.clear();
 }
 
-void Rasterizer::RecordBufferAccess(bool is_compute) {
+void Rasterizer::RecordBufferAccess(bool is_compute, u64 op_sequence) {
     // record side: the barrier plan learns what this draw reads and writes; the draw's own barrier flag ends here
     for (const auto [buffer, offset, size, src_access] : bound_buffers) {
         if (buffer_cache.IsStreamBuffer(buffer) && !(src_access & vk::AccessFlagBits2::eShaderWrite)) {
@@ -2395,7 +2524,7 @@ void Rasterizer::RecordBufferAccess(bool is_compute) {
     bound_buffers.clear();
     needs_barrier = false;
     // P3c: everything the operation resolved is recorded now
-    VideoCore::OpSequence::retired.store(VideoCore::OpSequence::resolving.load(std::memory_order_acquire), std::memory_order_release);
+    VideoCore::OpSequence::retired.store(op_sequence != 0 ? op_sequence : VideoCore::OpSequence::resolving.load(std::memory_order_acquire), std::memory_order_release);
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
