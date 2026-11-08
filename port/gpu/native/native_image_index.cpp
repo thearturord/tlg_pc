@@ -110,10 +110,12 @@ u32 NativeImageIndex::AnnouncedWriteIsInert(VAddr addr, size_t size) {
     return host.AnyImageIn(addr, size) ? 2 : 0;
 }
 
-void NativeImageIndex::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
+u32 NativeImageIndex::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
     Core::SplitCensus::Touch(Core::SplitCensus::ImageIndex);
-    if (pending_clears.empty() && !host.AnyImageIn(addr, size)) {
-        return; // no image in this memory (most announcements: buffer contents); the page table answers that in a few lookups
+    const bool clears = !pending_clears.empty();
+    const bool any_image = !clears && host.AnyImageIn(addr, size);
+    if (!clears && !any_image) {
+        return 0; // no image in this memory (most announcements: buffer contents); the page table answers that in a few lookups
     }
     N0::SetEffect(N0::EffImage);
     SmallVector<ImageId, 8> image_ids;
@@ -122,10 +124,11 @@ void NativeImageIndex::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
     static thread_local std::vector<u64> ids;
     ids.clear();
     const bool covered_by_textures = NativeDevice::TexturesIn(addr, size, ids);
+    bool touched = any_image; // an image or a waiting clear really was in the range
     if (!pending_clears.empty()) {
         // B11: a CPU write to a texture whose clear waits for its first image comes after the clear: the clear is gone
         for (const u64 id : ids) {
-            pending_clears.erase(id);
+            touched |= pending_clears.erase(id) != 0;
         }
     }
     if (covered_by_textures) {
@@ -143,15 +146,18 @@ void NativeImageIndex::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
         case Host::Announced::NotOverlapping:
             break;
         case Host::Announced::KeptForGpu:
+            touched = true;
             // the GPU wrote the image after the first application: its bytes are newer than the CPU's
             NativeUpdates::NoteB8(NativeUpdates::B8AnnouncedOnImage);
             NativeUpdates::NoteB8(NativeUpdates::B8KeptForGpu);
             break;
         case Host::Announced::Dirtied:
+            touched = true;
             NativeUpdates::NoteB8(NativeUpdates::B8AnnouncedOnImage);
             break;
         }
     }
+    return touched ? 1u : 2u;
 }
 
 void NativeImageIndex::NoteTextureDelete(u64 id, VAddr address, u64 bytes, bool free) {

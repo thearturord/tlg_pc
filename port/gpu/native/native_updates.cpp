@@ -240,9 +240,23 @@ bool SitesOn() {
 
 namespace {
 thread_local u8 t_announce_site_class = 0; // N1: 8 while NoteWriterRange runs for a caller that gave no site name
+thread_local u64 t_announce_object = 0;    // N1.2: the engine buffer id the caller named
+std::array<std::atomic<u64>, BufferIdCounts> buffer_id_counts{};
 } // namespace
 
-void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site, bool ring) {
+u32 BufferIdMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_BUFFER_ID");
+        return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u;
+    }();
+    return mode;
+}
+
+void NoteBufferId(BufferIdCount what) {
+    buffer_id_counts[what].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site, bool ring, u64 object) {
     if (SitesOn() && address != 0 && size != 0) {
         std::scoped_lock lock{site_mutex};
         SiteStat& stat = site_stats[{writer, site != nullptr ? site : "?"}];
@@ -257,21 +271,23 @@ void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site, bool r
     }
     NativeContent::SetSite(SitesOn() ? NativeContent::SiteId(site != nullptr ? site : "?") : 0);
     t_announce_site_class = site == nullptr ? 8 : 0;
+    t_announce_object = object;
     NoteWriterRangeOf(writer, address, size, ThreadKey(), 0, ring);
     t_announce_site_class = 0;
+    t_announce_object = 0;
     NativeContent::SetSite(0);
 }
 
 namespace {
 std::mutex pending_mutex;
 std::vector<std::pair<u64, u64>> pending_ranges, applied_last, pending_ring_ranges, applied_ring_last;
-std::vector<u8> pending_writers, applied_last_writers, pending_ring_writers, applied_ring_last_writers; // N1: the writer of each range above
+std::vector<Tag> pending_writers, applied_last_writers, pending_ring_writers, applied_ring_last_writers; // N1: the writer (N1.2: and the buffer id) of each range above
 std::vector<std::array<u64, 4>> pending_deleted;
 void (*delete_fn)(void*, u64, u64, u64, u32) = nullptr;
 void (*create_fn)(void*, u64, u64, u64, bool, u32, u32) = nullptr;
 void* create_context = nullptr;
 void* delete_context = nullptr;
-void (*apply_fn)(void*, u64, u64, bool) = nullptr;
+void (*apply_fn)(void*, u64, u64, bool, u64) = nullptr;
 void* apply_context = nullptr;
 std::atomic<u64> b2_applied_ranges{0}, b2_applied_bytes{0}, b2_reapplied_ranges{0};
 /// TLG_REAPPLY_AUDIT=1 (raster-optimization-plan.md phase 1): does the second application of a range ever matter? The memory of each range is hashed when it is applied first and again
@@ -426,7 +442,7 @@ void SetSkipCheck(u32 (*fn)(void*, u64, u64), void* context) {
     skip_check_fn = fn;
 }
 
-void SetApply(void (*fn)(void*, u64, u64, bool), void* context) {
+void SetApply(void (*fn)(void*, u64, u64, bool, u64), void* context) {
     apply_context = context;
     apply_fn = fn;
 }
@@ -530,10 +546,11 @@ void ApplyBatch(const Batch& batch) {
         size_t index = 0;
         const u32 again_mode = AgainSkipMode();
         const u32 trust = AgainTrustMask();
-        const auto again_list = [&](const std::vector<std::pair<u64, u64>>& list, const std::vector<u8>& writers) {
+        const auto again_list = [&](const std::vector<std::pair<u64, u64>>& list, const std::vector<Tag>& writers) {
             size_t at = 0;
             for (const auto& [address, size] : list) {
-                const u32 writer = at < writers.size() ? writers[at] : 0u;
+                const u32 writer = at < writers.size() ? writers[at].writer : 0u;
+                const u64 object = at < writers.size() ? writers[at].object : 0u;
                 ++at;
                 if (aligned && again_mode == 1 && (trust >> writer & 1) != 0) {
                     ++index; // (the first list holds an entry for every range, hashed or not)
@@ -562,7 +579,7 @@ void ApplyBatch(const Batch& batch) {
                     }
                 }
                 ra_gate_applied.fetch_add(1, std::memory_order_relaxed);
-                apply_fn(apply_context, address, size, false);
+                apply_fn(apply_context, address, size, false, object);
             }
         };
         again_list(batch.again, batch.again_writer);
@@ -594,7 +611,7 @@ void ApplyBatch(const Batch& batch) {
     }
     const u32 first_mode = AgainSkipMode();
     const u32 first_trust = AgainTrustMask();
-    const auto first_one = [&](u64 address, u64 size, bool plain, u32 writer) {
+    const auto first_one = [&](u64 address, u64 size, bool plain, u32 writer, u64 object) {
         N0::NoteApplied(size, false);
         FirstHash h{address, size, 0, false};
         if (hash_here && size != 0 && size <= (u64{1} << 20) && !(first_mode == 1 && (first_trust >> writer & 1) != 0)) {
@@ -629,7 +646,7 @@ void ApplyBatch(const Batch& batch) {
         }
         if (!skipped) {
             TLG_PROF_ADD("updates.bytes_first", size);
-            apply_fn(apply_context, address, size, true);
+            apply_fn(apply_context, address, size, true, object);
             b2_applied_bytes.fetch_add(size, std::memory_order_relaxed);
         }
         if (hash_here) {
@@ -639,12 +656,12 @@ void ApplyBatch(const Batch& batch) {
     {
         size_t at = 0;
         for (const auto& [address, size] : batch.first) {
-            first_one(address, size, true, at < batch.first_writer.size() ? batch.first_writer[at] : 0u);
+            first_one(address, size, true, at < batch.first_writer.size() ? batch.first_writer[at].writer : 0u, at < batch.first_writer.size() ? batch.first_writer[at].object : 0u);
             ++at;
         }
         at = 0;
         for (const auto& [address, size] : batch.ring_first) {
-            first_one(address, size, false, at < batch.ring_first_writer.size() ? batch.ring_first_writer[at] : 0u);
+            first_one(address, size, false, at < batch.ring_first_writer.size() ? batch.ring_first_writer[at].writer : 0u, at < batch.ring_first_writer.size() ? batch.ring_first_writer[at].object : 0u);
             ++at;
         }
     }
@@ -809,6 +826,9 @@ nlohmann::json B2Report() {
                                     {"bytes_changed", sk_changed.load()}, {"size_differs", sk_size_differs.load()}, {"unhashed", sk_unhashed.load()}, {"same_bytes_but_check_refused", sk_check_refused.load()},
                                     {"refused_gpu_wrote_the_range", sk_refused_gpu.load()}, {"refused_an_image_covers_it", sk_refused_image.load()}, {"refused_a_clear_waits_for_an_image", sk_refused_clears.load()}, {"refused_tracker_mode", sk_refused_tracker.load()},
                                     {"entries_erased_by_creates_or_deletes", sk_erased_by_deletes.load()}, {"map_cleared_when_too_big", sk_map_cleared.load()}}},
+                  {"buffer_id", {{"mode", BufferIdMode()}, {"told_whole", buffer_id_counts[IdToldWhole].load()}, {"told_partial", buffer_id_counts[IdToldPartial].load()}, {"unknown", buffer_id_counts[IdUnknown].load()},
+                                  {"parts_match", buffer_id_counts[IdPartsMatch].load()}, {"PARTS_DIFFER_MUST_BE_0", buffer_id_counts[IdPartsDiffer].load()}, {"image_skipped", buffer_id_counts[IdImageSkipped].load()},
+                                  {"IMAGE_FOUND_OVER_TOLD_MUST_BE_0", buffer_id_counts[IdImageFoundOverTold].load()}, {"told_block", buffer_id_counts[IdToldBlock].load()}}},
                   {"again_by_writer", [] {
                        nlohmann::json j = nlohmann::json::object();
                        j["mode"] = AgainSkipMode();
@@ -840,7 +860,7 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
         // memory the engine writes fresh every frame (the frame rings): applied early on the raster thread
         const bool fresh = EarlyAnnounceOn() && (writer == 1 || writer == 2 || writer == 4 || ring);
         (fresh ? pending_ring_ranges : pending_ranges).emplace_back(address, size);
-        (fresh ? pending_ring_writers : pending_writers).push_back(static_cast<u8>((writer & 7) | t_announce_site_class));
+        (fresh ? pending_ring_writers : pending_writers).push_back(Tag{static_cast<u8>((writer & 7) | t_announce_site_class), t_announce_object});
     }
     NativeResources::NoteAnnouncedWrite(address, size); // C1: resident buffers on those pages are not synchronized any more
     NativeUploads::Announce(writer, address, size, thread == render_thread.load(std::memory_order_relaxed), NativeDraw::NextSeq());

@@ -94,7 +94,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     Core::NativeReadbacks::SetLandingGate(
         [this](VAddr address, u64 size, u32 timeout_ms) { return WaitForExplicitDownloads(address, size, timeout_ms); });
     // B2 cutover: an applied announcement is a CPU write for the caches
-    Core::NativeUpdates::SetApply([](void* context, u64 address, u64 size, bool newer) { static_cast<BufferCache*>(context)->ApplyCpuWrite(address, size, newer); }, this);
+    Core::NativeUpdates::SetApply([](void* context, u64 address, u64 size, bool newer, u64 object) { static_cast<BufferCache*>(context)->ApplyCpuWrite(address, size, newer, object); }, this);
     Core::NativeUpdates::SetSkipCheck([](void* context, u64 address, u64 size) -> u32 { return static_cast<BufferCache*>(context)->CanSkipIdenticalWrite(address, size); }, this);
 }
 
@@ -113,8 +113,26 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
     cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
 }
 
-void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
+void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object) {
     Core::SplitCensus::Touch(Core::SplitCensus::BufDirty);
+    // N1.2: the announcer named the engine buffer it wrote into. `told_whole`: that buffer holds the whole range, so its part is known without the address walk
+    const u32 id_mode = object != 0 ? Core::NativeUpdates::BufferIdMode() : 0u;
+    Core::NativeDevice::BufferPart told{};
+    bool told_whole = false;
+    const bool buffers_only = object == Core::NativeUpdates::kBuffersOnly; // (a block over several engine buffers: no part is named, but no image is there)
+    if (buffers_only) {
+        Core::NativeUpdates::NoteBufferId(Core::NativeUpdates::IdToldBlock);
+    } else if (id_mode != 0) {
+        if (!Core::NativeDevice::BufferPartOf(object, address, size, told)) {
+            Core::NativeUpdates::NoteBufferId(Core::NativeUpdates::IdUnknown);
+        } else if (told.begin == address && told.end == address + size) {
+            told_whole = true;
+            Core::NativeUpdates::NoteBufferId(Core::NativeUpdates::IdToldWhole);
+        } else {
+            Core::NativeUpdates::NoteBufferId(Core::NativeUpdates::IdToldPartial);
+        }
+    }
+
     bool n0_ring = false;
     if (Core::N0::On()) {
         const auto& ring = UntrackedRing::Get();
@@ -142,7 +160,7 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
         // B9.3 step 2: the page tracker only marks what no engine buffer holds
         static thread_local std::vector<std::pair<VAddr, VAddr>> gaps;
         gaps.clear();
-        MarkBuffersChanged(address, size, true, &gaps);
+        MarkBuffersChanged(address, size, true, &gaps, id_mode != 0 && told_whole ? &told : nullptr, id_mode == 1);
         u64 marked = 0;
         for (const auto& [a, e] : gaps) {
             marked += e - a;
@@ -155,7 +173,13 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
     const u32 b8 = Core::NativeUpdates::B8ImageMode();
     if (b8 != 0) {
         TLG_PROF_LEVEL("cpuwrite.image_index", 3);
-        texture_cache.EngineIndex().NoteAnnouncedWrite(address, size, newer);
+        auto& index = texture_cache.EngineIndex();
+        if (id_mode == 1 && (told_whole || buffers_only)) {
+            // an engine buffer holds the whole range: no engine image or waiting clear lives in a buffer's memory, so none is looked for (the shadow mode counts the cases where the lookup would have changed something)
+            Core::NativeUpdates::NoteBufferId(Core::NativeUpdates::IdImageSkipped);
+        } else if (index.NoteAnnouncedWrite(address, size, newer) == 1 && id_mode == 2 && (told_whole || buffers_only)) {
+            Core::NativeUpdates::NoteBufferId(Core::NativeUpdates::IdImageFoundOverTold);
+        }
     }
 }
 
@@ -172,14 +196,20 @@ u32 BufferCache::CanSkipIdenticalWrite(VAddr address, u64 size) {
     return inert == 0 ? 0 : inert == 1 ? 4 : 2;
 }
 
-void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, std::vector<std::pair<VAddr, VAddr>>* gaps) {
+void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, std::vector<std::pair<VAddr, VAddr>>* gaps, const Core::NativeDevice::BufferPart* told, bool use_told) {
     Core::SplitCensus::Touch(Core::SplitCensus::BufDirty);
     // B9.1: each engine buffer the bytes belong to keeps its part until its next upload (an announcement can run over several buffers)
     static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
     parts.clear();
-    {
+    if (told != nullptr && use_told) {
+        parts.push_back(*told); // N1.2: named by the announcer
+    } else {
         TLG_PROF_LEVEL("cpuwrite.mark.buffers_in_view", 3); // D2: the address to buffer ids resolution
         BuffersInView(address, size, parts);
+        if (told != nullptr) {
+            const bool same = parts.size() == 1 && parts[0].id == told->id && parts[0].begin == told->begin && parts[0].end == told->end;
+            Core::NativeUpdates::NoteBufferId(same ? Core::NativeUpdates::IdPartsMatch : Core::NativeUpdates::IdPartsDiffer);
+        }
     }
     TLG_PROF_NAMED_LEVEL(dirty_scope, "cpuwrite.mark.object_dirty", 3);
     if (!parts.empty()) {

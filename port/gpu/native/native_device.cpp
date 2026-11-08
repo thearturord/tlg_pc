@@ -406,6 +406,25 @@ void BuffersIn(VAddr address, u64 size, std::vector<BufferPart>& out) {
     }
 }
 
+bool BufferPartOf(u64 id, VAddr address, u64 size, BufferPart& out) {
+    if (size == 0) {
+        return false;
+    }
+    std::shared_lock lock{table_mutex};
+    const auto it = by_id.find(id);
+    if (it == by_id.end() || !it->second.alive || it->second.kind != Kind::Buffer || it->second.address == 0) {
+        return false;
+    }
+    const Object& o = it->second;
+    const VAddr begin = std::max<VAddr>(o.address, address);
+    const VAddr end = std::min<VAddr>(o.address + std::max<u64>(o.bytes, 1), address + size);
+    if (begin >= end) {
+        return false;
+    }
+    out = {o.id, begin, end, o.usage, o.cpu_access, o.address, o.address + std::max<u64>(o.bytes, 1)};
+    return true;
+}
+
 bool B6NativeOn() noexcept {
     static const bool on = [] {
         const char* e = std::getenv("TLG_B6_NATIVE");

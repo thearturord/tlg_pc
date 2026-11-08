@@ -4,6 +4,7 @@
 #pragma once
 
 #include "native/native_device.h"
+#include "native/native_updates.h"
 
 #include <array>
 #include <memory>
@@ -41,7 +42,7 @@ public:
     std::vector<u32> pool; ///< the dwords of Packet entries longer than `Entry::words` (the entry's `seq` is the offset)
     /// B2: the engine's announced updates made before this submission (applied on the raster thread before its work), and the previous submission's again
     std::vector<std::pair<u64, u64>> announced_first, announced_again, announced_ring_first, announced_ring_again; ///< (ring: TLG_EARLY_ANNOUNCE, applied ahead of the queued graphics work)
-    std::vector<u8> announced_first_writer, announced_again_writer, announced_ring_first_writer, announced_ring_again_writer; ///< N1: the writer of each range above
+    std::vector<NativeUpdates::Tag> announced_first_writer, announced_again_writer, announced_ring_first_writer, announced_ring_again_writer; ///< N1: the writer of each range above
     std::vector<std::array<u64, 4>> announced_deleted; ///< B8.2: engine textures and views deleted before this submission
     std::vector<Core::NativeDevice::ClearRecord> clears; ///< B11: the engine's clears written into this command buffer, in order
 

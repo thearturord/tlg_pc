@@ -34,7 +34,8 @@ u64 OpenMapSerial();
 void FlushOpenMapsSince(u64 serial);
 /// A hooked engine function announces the memory it is about to write (`writer` names the function: 1 skinning matrices, 2 light constants, 3 a memory copy of the command stream, 4 the BeginRecording stores, 5 buffer creation with initial data, 6 texture initialization).
 /// `site` names the call site for the census `TLG_WRITER_SITES=1` (`/stats` writer_sites: count, bytes, size classes per writer and site); it must be a string literal.
-void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site = nullptr, bool ring = false);
+/// N1.2: `object` is the id (+0x10) of the engine buffer the hook knows it writes into (0: not told). The apply then bumps that buffer by id instead of finding it by address (`TLG_BUFFER_ID`).
+void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site = nullptr, bool ring = false, u64 object = 0);
 /// TLG_EARLY_ANNOUNCE=1: announcements of memory the engine writes fresh every frame (frame rings: light constants, skinning matrices, scene slots, Map into a ring window) are applied on the raster
 /// thread as soon as it can, not behind the graphics work queued before them (documents/tlg/native plan/engine/compute-lane-design.md section 13).
 [[nodiscard]] bool EarlyAnnounceOn() noexcept;
@@ -54,11 +55,23 @@ bool SupersedeEnabled();
 }
 /// The buffer cache's marking of a range the CPU changed (what a harvest's replay does); `newer` (first application): the CPU's bytes are newer than anything the
 /// GPU wrote there before (the GPU written marks of the range are dropped); false for the second application one submission later
-void SetApply(void (*fn)(void* context, u64 address, u64 size, bool newer), void* context);
+void SetApply(void (*fn)(void* context, u64 address, u64 size, bool newer, u64 object), void* context);
+/// N1.2 (`TLG_BUFFER_ID`): 0 off (default), 1 an announcement that names its engine buffer is applied by id (the buffer's part, no address walk; no image index lookup when no clear waits), 2 shadow:
+/// the address path runs as before and every difference to the id path is counted (`buffer_id` in /updates, `*_MUST_BE_0`).
+[[nodiscard]] u32 BufferIdMode() noexcept;
+/// `object` value of an announcement whose memory the hook knows to be engine buffers only (a block over several buffers): no single id, but no image lives there
+constexpr u64 kBuffersOnly = ~u64{0};
+enum BufferIdCount : u32 { IdToldWhole, IdToldPartial, IdUnknown, IdPartsMatch, IdPartsDiffer, IdImageSkipped, IdImageFoundOverTold, IdToldBlock, BufferIdCounts };
+void NoteBufferId(BufferIdCount what);
+/// N1: who announced a range: `writer` (the writer id, plus 8 when the caller gave no site name), `object` the engine buffer id N1.2 (0: not told)
+struct Tag {
+    u8 writer{};
+    u64 object{};
+};
 /// The announcements of one submission: applied once (`first`) and the previous submission's again (`again`)
 struct Batch {
     std::vector<std::pair<u64, u64>> first, again;
-    std::vector<u8> first_writer, again_writer, ring_first_writer, ring_again_writer; ///< N1: the writer id of every range of the four lists (same order)
+    std::vector<Tag> first_writer, again_writer, ring_first_writer, ring_again_writer; ///< N1: the writer (and N1.2 the buffer id) of every range of the four lists (same order)
     std::vector<std::pair<u64, u64>> ring_first, ring_again; ///< the part of first / again in frame ring memory (empty unless EarlyAnnounceOn)
     std::vector<std::array<u64, 4>> deleted; ///< B8.2: engine objects deleted or created before the submission (id, memory, bytes, what: 0 view, 1 texture, 2 created texture, 3 texture with an alias)
     [[nodiscard]] bool Empty() const noexcept {

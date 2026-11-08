@@ -81,6 +81,8 @@ struct BufferPart {
     VAddr object_begin, object_end; ///< the buffer's whole memory
 };
 void BuffersIn(VAddr address, u64 size, std::vector<BufferPart>& out);
+/// N1.2: the part of [address, address + size) inside the live buffer `id` (false: unknown, deleted, not a buffer, or no overlap)
+[[nodiscard]] bool BufferPartOf(u64 id, VAddr address, u64 size, BufferPart& out);
 /// A short name of what owns `address` (for audits): "buffer usage U bind B", "texture_2d usage U bind B", "none"
 [[nodiscard]] std::string OwnerName(VAddr address);
 

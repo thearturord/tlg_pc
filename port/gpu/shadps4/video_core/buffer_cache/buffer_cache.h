@@ -186,7 +186,7 @@ public:
     /// E4: memory no engine buffer answers for: changed when announced bytes of it were not uploaded yet
     [[nodiscard]] bool NativeCpuQuery(VAddr addr, size_t size);
     /// What a CPU write of [address, address + size) means for the caches (the harvest's replay; B2: an applied announcement)
-    void ApplyCpuWrite(VAddr address, u64 size, bool newer = false);
+    void ApplyCpuWrite(VAddr address, u64 size, bool newer = false, u64 object = 0);
     /// TLG_ANNOUNCE_SKIP: may an announced write with the same bytes as the last announcement of these bytes be left unapplied? Not when the GPU wrote them since or an image covers them.
     [[nodiscard]] u32 CanSkipIdenticalWrite(VAddr address, u64 size);
     /// B9.2: the engine deleted the buffer `id` at [address, address + bytes) (raster thread, in order): its announced bytes go; in native mode also the GPU written
@@ -198,7 +198,7 @@ public:
     void NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, bool texture, u32 usage = 0, u32 cpu_access = 0);
     /// B9.1: [address, address + size) changed on the CPU: each engine buffer it meets keeps its part, the rest waits for the first buffer upload over it. Returns the
     /// parts no buffer holds (B9.3 step 2: what the page tracker still marks)
-    void MarkBuffersChanged(VAddr address, u64 size, bool announced, std::vector<std::pair<VAddr, VAddr>>* gaps);
+    void MarkBuffersChanged(VAddr address, u64 size, bool announced, std::vector<std::pair<VAddr, VAddr>>* gaps, const Core::NativeDevice::BufferPart* told = nullptr, bool use_told = false);
     /// R1: changes when an arena is replaced
     [[nodiscard]] u64 PlacementEpoch() const noexcept {
         return placement_epoch.load(std::memory_order_acquire);

@@ -68,7 +68,11 @@ public:
     explicit NativeImageIndex(Host& host_) : host{host_} {}
 
     /// B8.1: the engine announced a CPU write of [addr, addr + size): the images it touches are marked and dirtied.
-    void NoteAnnouncedWrite(VAddr addr, size_t size, bool newer);
+    /// returns 0 when no image and no waiting clear lies in the range, 1 when the write changed something (an image was refreshed or dirtied, a waiting clear dropped), 2 when the lookups ran and found nothing
+    u32 NoteAnnouncedWrite(VAddr addr, size_t size, bool newer);
+    [[nodiscard]] bool HasPendingClears() const noexcept {
+        return !pending_clears.empty();
+    }
     /// True when announcing a write over [addr, addr + size) would do nothing to any image: no clear waits for a first image and no image overlaps the memory.
     [[nodiscard]] u32 AnnouncedWriteIsInert(VAddr addr, size_t size); ///< 0 inert, 1 a clear waits for a first image, 2 an image is in the memory
     /// B8.2: the engine deleted the texture whose memory is [address, address + bytes): its images (same memory, not bigger) are freed (`free`) or marked.

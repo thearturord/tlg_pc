@@ -6968,7 +6968,7 @@ void SkinWritesAnnounce(u64 ring, u64 scene) {
         for (u64 node = first; node != 0 && jobs < 100000; node = Rd<u64>(node, 0), ++jobs) {
             matrices += Rd<u32>(node, 0x50);
         }
-        Core::NativeUpdates::NoteWriterRange(1, memory, matrices * 64, "skinning matrices");
+        Core::NativeUpdates::NoteWriterRange(1, memory, matrices * 64, "skinning matrices", false, Rd<u64>(buffer, 0x10));
         return 0;
     });
 }
@@ -6986,7 +6986,7 @@ u64 PS4_SYSV_ABI LightWrites(u64 object, u64 source, u64 a2, u64 a3, u64 a4, u64
         for (const u64 base : {u64{0xc0}, u64{0x2d0}}) {
             const u64 buffer = Rd<u64>(object, base + index * 0xb0ull);
             if (IsHeapPointer(buffer)) {
-                Core::NativeUpdates::NoteWriterRange(2, Rd<u64>(buffer, 0x30), 0xa0, "light constants");
+                Core::NativeUpdates::NoteWriterRange(2, Rd<u64>(buffer, 0x30), 0xa0, "light constants", false, Rd<u64>(buffer, 0x10));
             }
         }
         return 0;
@@ -7073,7 +7073,7 @@ u64 PS4_SYSV_ABI RecordingWrites(u64 device, u64 a1, u64 a2, u64 a3, u64 a4, u64
             const u64 buffer = Rd<u64>(device, field);
             const u64 width = IsHeapPointer(buffer) ? Rd<u32>(buffer, 0x180) : 0;
             if (width != 0 && width <= (1u << 24)) {
-                Core::NativeUpdates::NoteWriterRange(4, Rd<u64>(buffer, 0x30), width, "BeginRecording buffers");
+                Core::NativeUpdates::NoteWriterRange(4, Rd<u64>(buffer, 0x30), width, "BeginRecording buffers", false, Rd<u64>(buffer, 0x10));
             }
         }
         return 0;
@@ -8567,11 +8567,11 @@ void AnnounceSceneSlotRange(u64 frame, u32 upto, bool remember_group) {
             }
         }
         if (first_memory - last_memory == static_cast<u64>(upto - 1 - first) * SceneSlotStride) {
-            Core::NativeUpdates::NoteWriterRange(4, last_memory, first_memory - last_memory + SceneSlotBytes); // one block
+            Core::NativeUpdates::NoteWriterRange(4, last_memory, first_memory - last_memory + SceneSlotBytes, nullptr, false, Core::NativeUpdates::kBuffersOnly); // one block
         } else {
             for (u32 i = first; i < upto; ++i) {
                 if (const u64 memory = memory_of(i)) {
-                    Core::NativeUpdates::NoteWriterRange(4, memory, SceneSlotBytes);
+                    Core::NativeUpdates::NoteWriterRange(4, memory, SceneSlotBytes, nullptr, false, Core::NativeUpdates::kBuffersOnly);
                 }
             }
         }
