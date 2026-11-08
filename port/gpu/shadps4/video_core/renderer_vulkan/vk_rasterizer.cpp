@@ -2187,9 +2187,21 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
 
 void Rasterizer::ResetBindings(bool is_compute) {
     TLG_PROF_LEVEL("raster.reset_bindings", 2);
+    // Plan S step P2c: two halves, each with its own owner. Same order as before.
+    ResetImageBindings();
+    RecordBufferAccess(is_compute);
+}
+
+void Rasterizer::ResetImageBindings() {
+    // resolve side: the binding flags of the images this draw bound (state of the image objects the resolve pass owns)
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
+    bound_images.clear();
+}
+
+void Rasterizer::RecordBufferAccess(bool is_compute) {
+    // record side: the barrier plan learns what this draw reads and writes; the draw's own barrier flag ends here
     const auto* stream = &buffer_cache.GetStreamBuffer();
     for (const auto [buffer, offset, size, src_access] : bound_buffers) {
         if (buffer == stream && !(src_access & vk::AccessFlagBits2::eShaderWrite)) {
@@ -2199,7 +2211,6 @@ void Rasterizer::ResetBindings(bool is_compute) {
                                           : vk::PipelineStageFlagBits2::eAllGraphics;
         runtime.AccessBuffer(buffer, offset, size, dst_stage, src_access);
     }
-    bound_images.clear();
     bound_buffers.clear();
     needs_barrier = false;
 }
@@ -4977,7 +4988,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     return state;
 }
 
-RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
+RenderState Rasterizer::BeginRenderingLegacy(const GraphicsPipeline* pipeline) {
     attachment_feedback_loop = false;
     const auto& regs = *draw_inputs;
     const auto& key = pipeline->GetGraphicsKey();
@@ -5125,6 +5136,219 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     }
 
     return state;
+}
+
+void Rasterizer::ResolveRenderTargets(const GraphicsPipeline* pipeline, RenderResolved& r) {
+    // Plan S step P2c: the resolve half of the render pass setup (images, views, clear values, sizes); the record half transits the images and reads their layouts
+    attachment_feedback_loop = false;
+    const auto& regs = *draw_inputs;
+    const auto& key = pipeline->GetGraphicsKey();
+    RenderState& state = r.state;
+    state.width = instance.GetMaxFramebufferWidth();
+    state.height = instance.GetMaxFramebufferHeight();
+    state.num_layers = std::numeric_limits<u16>::max();
+    state.num_color_attachments = std::bit_width(key.mrt_mask);
+    for (auto cb = 0u; cb < state.num_color_attachments; ++cb) {
+        auto& [image_id, desc] = cb_descs[cb];
+        if (!image_id) {
+            state.color_attachments[cb] = {};
+            continue;
+        }
+        r.color_used[cb] = true;
+        auto* image = &texture_cache.GetImage(image_id);
+        r.color[cb].image = image;
+        if (image->binding.needs_rebind) {
+            rt_cache[cb].valid = false;
+            image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+            image = &texture_cache.GetImage(image_id);
+            r.color[cb].image = image;
+        }
+        texture_cache.UpdateImage(image_id, Core::ImageCaller::RasterizerBeginRendering);
+        runtime.SetBackingSamples(image, key.color_samples[cb]);
+        const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
+        if (Core::LightRecorder::On()) {
+            Core::LightRecorder::ImageWritten(Core::DebugServer::PresentCount(), image->info.guest_address, image->info.guest_size, texture_cache.ImageUid(image_id), 1);
+        }
+        const auto slice = image_view.info.range.base.layer;
+        const auto mip = image_view.info.range.base.level;
+
+        const auto& col_buf = regs.color_buffers[cb];
+        // B11: an engine fast clear pending on the image is the clear of the next render pass on it (or of the eliminate), as in the original port. Its colour is the
+        // one in the target's registers (the hardware's clear words), not the colour of the engine's clear call (see EliminateFastClear). `TLG_B11_FAST_AT_PASS=0`
+        // leaves it to the eliminate (study).
+        static const bool fast_clear_at_pass = [] {
+            const char* e = std::getenv("TLG_B11_FAST_AT_PASS");
+            return e == nullptr || *e != '0';
+        }();
+        bool is_clear = false;
+        std::optional<vk::ClearValue> engine_clear_value;
+        if (image->pending_fast_clear && fast_clear_at_pass) {
+            engine_clear_value = LiverpoolToVK::ColorBufferClearValue(col_buf);
+            image->pending_fast_clear.reset();
+            is_clear = true;
+            Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeFastClearAtRenderPass);
+        }
+
+        if (image->binding.is_bound) {
+            ASSERT_MSG(!image->binding.force_general,
+                       "Having image both as storage and render target is unsupported");
+            r.color[cb].feedback = true;
+            attachment_feedback_loop = true;
+        }
+        r.color[cb].range = desc.view_info.range;
+
+        state.width = std::min<u32>(state.width, std::max(image->info.size.width >> mip, 1u));
+        state.height = std::min<u32>(state.height, std::max(image->info.size.height >> mip, 1u));
+        state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
+
+        const auto clear_value = engine_clear_value ? *engine_clear_value : vk::ClearValue{};
+        auto& attachment = state.color_attachments[cb];
+        attachment.image_view = *image_view.image_view;
+        attachment.clear_value = clear_value.color.uint32;
+        attachment.is_clear = is_clear;
+
+        image->usage.render_target = 1u;
+    }
+    for (u32 cb = state.num_color_attachments; cb < state.color_attachments.size(); ++cb) {
+        state.color_attachments[cb] = {};
+    }
+
+    if (auto image_id = db_desc.image_id; image_id) {
+        auto& desc = db_desc.desc;
+        const auto htile_address = regs.depth_htile_data_base.GetAddress();
+        const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
+        auto& image = texture_cache.GetImage(image_id);
+        if (Core::LightRecorder::On()) {
+            Core::LightRecorder::ImageWritten(Core::DebugServer::PresentCount(), image.info.guest_address, image.info.guest_size, texture_cache.ImageUid(image_id), 2);
+        }
+
+        const auto slice = image_view.info.range.base.layer;
+        const bool is_depth_clear = regs.depth_render_control.depth_clear_enable && regs.depth_control.depth_enable && regs.depth_control.depth_write_enable;
+        const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
+        ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
+
+        const bool has_stencil = image.info.props.has_stencil;
+        // Stencil writes can be enabled while depth writes are off.
+        const bool stencil_write =
+            has_stencil && regs.depth_control.stencil_enable && !desc.view_info.is_storage;
+        const auto new_layout = desc.view_info.is_storage
+                                    ? has_stencil ? vk::ImageLayout::eDepthStencilAttachmentOptimal
+                                                  : vk::ImageLayout::eDepthAttachmentOptimal
+                                : stencil_write
+                                    ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
+                                : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                              : vk::ImageLayout::eDepthReadOnlyOptimal;
+        r.depth.image = &image;
+        r.depth.range = desc.view_info.range;
+        r.depth.new_layout = new_layout;
+
+        state.width = std::min<u32>(state.width, image.info.size.width);
+        state.height = std::min<u32>(state.height, image.info.size.height);
+        state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
+
+        auto& attachment = state.depth_stencil_attachment;
+        attachment.image_view = *image_view.image_view;
+        attachment.clear_value = {};
+        attachment.is_clear = 0;
+
+        if (regs.depth_buffer.DepthValid()) {
+            attachment.clear_value[0] = is_depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
+            attachment.has_depth = true;
+            attachment.depth_clear = is_depth_clear;
+        }
+        if (regs.depth_buffer.StencilValid()) {
+            attachment.clear_value[1] = is_stencil_clear ? regs.stencil_clear : 0u;
+            attachment.has_stencil = true;
+            attachment.stencil_clear = is_stencil_clear;
+        }
+
+        image.usage.depth_target = true;
+    } else {
+        state.depth_stencil_attachment = {};
+    }
+
+    if (state.num_layers == std::numeric_limits<u16>::max()) {
+        state.num_layers = 1;
+    }
+}
+
+
+RenderState Rasterizer::RecordRenderTargets(RenderResolved& r) {
+    // Plan S step P2c: the record half of the render pass setup: layout transitions of the targets, and the layout each attachment is in afterwards
+    RenderState& state = r.state;
+    for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+        auto& target = r.color[cb];
+        if (target.image == nullptr || !r.color_used[cb]) {
+            continue;
+        }
+        auto* image = target.image;
+        if (target.feedback) {
+            runtime.FlushBarriers();
+            needs_barrier |=
+                runtime.Transit(image,
+                                instance.IsAttachmentFeedbackLoopLayoutSupported()
+                                    ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+                                    : vk::ImageLayout::eGeneral,
+                                vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                                vk::AccessFlagBits2::eColorAttachmentWrite |
+                                    vk::AccessFlagBits2::eColorAttachmentRead);
+        } else {
+            needs_barrier |= runtime.Transit(image, vk::ImageLayout::eColorAttachmentOptimal,
+                                             vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                                             vk::AccessFlagBits2::eColorAttachmentWrite |
+                                                 vk::AccessFlagBits2::eColorAttachmentRead,
+                                             target.range);
+        }
+        state.color_attachments[cb].image_layout = runtime.CurrentLayout(*image);
+        image->usage.render_target = 1u;
+    }
+    if (r.depth.image != nullptr) {
+        auto& image = *r.depth.image;
+        needs_barrier |= runtime.Transit(&image, r.depth.new_layout,
+                                         vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                             vk::PipelineStageFlagBits2::eLateFragmentTests,
+                                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                                             vk::AccessFlagBits2::eDepthStencilAttachmentRead,
+                                         r.depth.range);
+        state.depth_stencil_attachment.image_layout = runtime.CurrentLayout(image);
+        image.usage.depth_target = true;
+    }
+    return state;
+}
+
+RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
+    const u32 mode = SplitBindMode();
+    if (mode == 0) {
+        return BeginRenderingLegacy(pipeline);
+    }
+    if (mode == 2) {
+        static std::atomic<u64> checked{0}, differ{0};
+        const RenderState seen = BeginRenderingLegacy(pipeline);
+        const bool loop_after_legacy = attachment_feedback_loop;
+        const size_t bound_before = bound_images.size();
+        RenderResolved r;
+        ResolveRenderTargets(pipeline, r); // (the fast clear is consumed already: compare views, sizes and the feedback decision, not the clear)
+        bound_images.resize(bound_before);
+        bool same = r.state.width == seen.width && r.state.height == seen.height && r.state.num_layers == seen.num_layers &&
+                    r.state.num_color_attachments == seen.num_color_attachments && attachment_feedback_loop == loop_after_legacy;
+        for (u32 cb = 0; same && cb < seen.num_color_attachments; ++cb) {
+            same = r.state.color_attachments[cb].image_view == seen.color_attachments[cb].image_view;
+        }
+        same = same && r.state.depth_stencil_attachment.image_view == seen.depth_stencil_attachment.image_view &&
+               r.state.depth_stencil_attachment.has_depth == seen.depth_stencil_attachment.has_depth &&
+               r.state.depth_stencil_attachment.has_stencil == seen.depth_stencil_attachment.has_stencil;
+        const u64 n = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (!same && differ.fetch_add(1) < 20) {
+            LOG_WARNING(Render_Vulkan, "split bind verify: render pass setup differs from the old code ({} colour targets)", seen.num_color_attachments);
+        }
+        if ((n & (n - 1)) == 0) {
+            LOG_WARNING(Render_Vulkan, "split bind verify: {} render pass setups, {} differ", n, differ.load());
+        }
+        return seen;
+    }
+    RenderResolved r;
+    ResolveRenderTargets(pipeline, r);
+    return RecordRenderTargets(r);
 }
 
 void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size, u64 position) {

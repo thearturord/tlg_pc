@@ -555,6 +555,24 @@ private:
     void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false);
 
     void ResetBindings(bool is_compute);
+    void ResetImageBindings();
+    /// Plan S step P2c: what the resolve half decided for the render pass (the state minus the layouts, and the images to transit).
+    struct RenderResolved {
+        struct Target {
+            VideoCore::Image* image{nullptr};
+            VideoCore::SubresourceRange range{};
+            bool feedback{false};
+            vk::ImageLayout new_layout{};
+        };
+        RenderState state;
+        std::array<Target, AmdGpu::NUM_COLOR_BUFFERS> color{};
+        std::array<bool, AmdGpu::NUM_COLOR_BUFFERS> color_used{};
+        Target depth{};
+    };
+    RenderState BeginRenderingLegacy(const GraphicsPipeline* pipeline);
+    void ResolveRenderTargets(const GraphicsPipeline* pipeline, RenderResolved& r);
+    RenderState RecordRenderTargets(RenderResolved& r);
+    void RecordBufferAccess(bool is_compute);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
