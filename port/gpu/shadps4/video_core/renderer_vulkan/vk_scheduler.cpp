@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <mutex>
+#include <unordered_map>
 #include <thread>
 #include "native/native_flight.h"
 #include "native/native_occlusion.h"
@@ -454,6 +456,28 @@ void SchedulerCore::EncoderThread(std::stop_token stoken) {
     }
 }
 
+void Scheduler::VerifyEpoch(u64 count, u64 tick) {
+    // Plan S step P3a oracle: the logical submission count and the tick must change together (a pair seen before names the same command buffer, and the other way round).
+    static std::mutex mutex;
+    static std::unordered_map<u64, u64> tick_of_count, count_of_tick;
+    static u64 checked = 0, differ = 0;
+    std::scoped_lock lock{mutex};
+    const auto [a, a_new] = tick_of_count.emplace(count, tick);
+    const auto [b, b_new] = count_of_tick.emplace(tick, count);
+    bool bad = (!a_new && a->second != tick) || (!b_new && b->second != count);
+    if (tick_of_count.size() > 4096) { // old pairs are never read again: the numbers only grow
+        tick_of_count.clear();
+        count_of_tick.clear();
+    }
+    ++checked;
+    if (bad && differ++ < 20) {
+        LOG_WARNING(Render_Vulkan, "split bind verify: epoch {} and tick {:#x} do not change together", count, tick);
+    }
+    if ((checked & (checked - 1)) == 0) {
+        LOG_WARNING(Render_Vulkan, "split bind verify: {} epoch reads, {} differ", checked, differ);
+    }
+}
+
 void SchedulerCore::SubmitExecution(SubmitInfo& info) {
     Core::Flight::Add(Core::Flight::QueueSubmit, 0, info.num_signal_semas != 0 ? info.signal_ticks[0] : 0, stream_id); // L1
     if (Core::NativeOcclusion::query_open.load(std::memory_order_acquire) != 0) {
@@ -475,6 +499,7 @@ void SchedulerCore::SubmitExecution(SubmitInfo& info) {
 
     if (use_encoder && !direct_active) {
         const u64 signal_value = work_semaphore.NextTick();
+        NoteSubmission();
         if (on_submit) {
             on_submit(info); // takes submit_mutex itself when it uses the queue
         }
@@ -499,6 +524,7 @@ void SchedulerCore::SubmitExecution(SubmitInfo& info) {
         ~HeldGuard() { submit_lock_held = false; }
     } held;
     const u64 signal_value = work_semaphore.NextTick();
+    NoteSubmission();
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();

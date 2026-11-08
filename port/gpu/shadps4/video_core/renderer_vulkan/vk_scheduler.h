@@ -568,6 +568,16 @@ public:
         return work_semaphore.CurrentTick();
     }
 
+    /// Plan S step P3a: how many submissions this stream has made (starts at 1). It changes exactly when the tick changes, but it is the resolve side's own
+    /// logical position: nothing in it says when the GPU is done with anything.
+    [[nodiscard]] u64 SubmitCount() const noexcept {
+        return submit_count.load(std::memory_order_acquire);
+    }
+    void NoteSubmission() noexcept {
+        submit_count.fetch_add(1, std::memory_order_acq_rel);
+    }
+    std::atomic<u64> submit_count{1};
+
     /// Returns true when a tick has been triggered by the GPU.
     [[nodiscard]] bool IsFree(u64 tick) noexcept {
         Core::SplitCensus::Count(Core::SplitCensus::CtTickIsFree);
@@ -924,6 +934,26 @@ public:
     [[nodiscard]] bool IsFree(u64 tick) noexcept {
         return Core(tick).IsFree(tick & ~SideTag);
     }
+    /// Plan S step P3a: the position of the resolve side in the stream of submissions, for the memos that only ask "the same command buffer as before?" (equality, never
+    /// "is the GPU done"). TLG_SPLIT_BIND=0: the tick, as before. 1: the logical submission count. 2: the tick, and every read checks that count and tick change together.
+    [[nodiscard]] u64 ResolveEpoch() noexcept {
+        static const u32 mode = [] {
+            const char* e = std::getenv("TLG_SPLIT_BIND");
+            return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u;
+        }();
+        if (mode == 0) {
+            return CurrentTick();
+        }
+        const bool on_side = use_side && side;
+        const u64 count = on_side ? (side->SubmitCount() | SideTag) : gfx.SubmitCount();
+        if (mode == 1) {
+            return count;
+        }
+        const u64 tick = CurrentTick();
+        VerifyEpoch(count, tick);
+        return tick;
+    }
+    void VerifyEpoch(u64 count, u64 tick);
     /// The graphics stream's semaphore (presentation waits on it).
     [[nodiscard]] Semaphore* GetWorkSemaphore() noexcept {
         return gfx.GetWorkSemaphore();

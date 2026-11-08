@@ -347,7 +347,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }
     TLG_PROF_NAMED_LEVEL(lookup_scope, "buffer.obtain.memo_lookup", 3);
     auto& memo = bind_memos[Vulkan::Scheduler::SideSelected() ? 1 : 0];
-    const u64 tick = scheduler.CurrentTick();
+    const u64 tick = scheduler.ResolveEpoch();
     if (memo.tick != tick) {
         // a new command buffer: copies in the stream buffer belong to the old one (the game may rewrite their memory between submissions); answers that name
         // an arena or a placed buffer stay valid until a write or a move erases them (the frame has about 13 command buffers). The entries remember their command
@@ -750,7 +750,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
         const u64 reuse_key = (device_addr << 16) | size;
         auto& reuse = stream_reuse_sets[Vulkan::Scheduler::SideSelected() ? 1 : 0];
         if (StreamReuseOn()) {
-            const u64 tick = scheduler.CurrentTick();
+            const u64 tick = scheduler.ResolveEpoch();
             const u64 wraps = stream_buffer.WrapCount();
             // Copies are per submission, with or without the store: the game rewrites constants (camera, view) in place between submissions, a copy reused across them is stale (W0, owner play 2026-11-04:
             // random lines on the whole screen while walking when the store did not serve; this key was tied to the store serving)
@@ -799,7 +799,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
         memo = &obtain_memo[(hash >> 20) & (ObtainMemoSlots - 1)];
         epoch_before = cpu_epoch.load(std::memory_order_acquire) + range_epoch.load(std::memory_order_acquire) + b9_epoch.load(std::memory_order_acquire);
         if (memo->addr == device_addr && memo->size == size && memo->flags == (is_written ? 1u : 0u) &&
-            memo->epoch == epoch_before && memo->tick == scheduler.CurrentTick()) {
+            memo->epoch == epoch_before && memo->tick == scheduler.ResolveEpoch()) {
             Core::NativeResources::NoteBufferRequest(device_addr, size, is_written,
                                                      Core::NativeResources::BufferPath::Memo, 0);
             TLG_PROF_COUNT("buffer.uncached.obtain_memo_hit");
@@ -845,7 +845,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
     const u64 offset = arena->Offset(device_addr);
     if (memo) {
         // the epoch read before the work: an upload this call did makes the entry stale, as it should
-        *memo = {device_addr, size, is_written ? 1u : 0u, arena, offset, epoch_before, scheduler.CurrentTick()};
+        *memo = {device_addr, size, is_written ? 1u : 0u, arena, offset, epoch_before, scheduler.ResolveEpoch()};
     }
     return {arena, offset};
 }
@@ -1286,7 +1286,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             }
             // Read again in the same command buffer: the data cannot have changed since the first upload.
             auto& done = ring_uploads[(lo >> 6) & 255];
-            const u64 tick = Vulkan::Scheduler::SideSelected() ? (side_upload_epoch | Vulkan::Scheduler::SideTag) : scheduler.CurrentTick();
+            const u64 tick = Vulkan::Scheduler::SideSelected() ? (side_upload_epoch | Vulkan::Scheduler::SideTag) : scheduler.ResolveEpoch();
             if (done.tick != tick || done.lo > lo || done.hi < hi) {
                 add_copy(lo, hi - lo);
                 Core::NativeUploads::NoteRingUpload(hi - lo);
