@@ -294,6 +294,21 @@ std::atomic<u64> real_pieces_in{0}, real_pieces_out{0}, real_merged_bytes{0};
 std::atomic<u64> real_windows{0}, real_window_bytes{0}, real_uploaded_whole{0}, real_announced{0}, real_repaired_bytes{0}, real_repairs{0};
 } // namespace
 
+u32 FillMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_RING_FILL");
+        return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u;
+    }();
+    return mode;
+}
+
+namespace {
+std::atomic<u64> fill_counts[FillCounts]{};
+} // namespace
+void NoteFill(FillCount what, u64 n) noexcept {
+    fill_counts[what].fetch_add(n, std::memory_order_relaxed);
+}
+
 u64 MergeGap() noexcept {
     static const u64 gap = [] {
         const char* e = std::getenv("TLG_RING_MERGE");
@@ -540,6 +555,8 @@ nlohmann::json Report() {
             {"window_bytes", window_bytes.load()},
             {"largest_window", largest_window.load()},
             {"announced_bytes_taken", announced_taken.load()},
+            {"fill", {{"mode", FillMode()}, {"applies", fill_counts[FillApplies].load()}, {"not_in_ring", fill_counts[FillNotRing].load()}, {"bytes_in_filled_ring", fill_counts[FillBytesFilled].load()}, {"bytes_in_unfilled_ring", fill_counts[FillBytesUnfilled].load()},
+                      {"applies_over_engine_buffers", fill_counts[FillWithBuffers].load()}, {"bytes_taken_by_window_syncs", fill_counts[FillTakenBytes].load()}, {"pieces_taken", fill_counts[FillTakenPieces].load()}, {"MISSED_BYTES_MUST_BE_0", fill_counts[FillMissedBytes].load()}}},
             {"real", {{"windows", real_windows.load()}, {"window_bytes", real_window_bytes.load()}, {"uploaded_whole_first_read", real_uploaded_whole.load()}, {"uploaded_from_announcements", real_announced.load()}, {"announced_pieces", real_pieces_in.load()}, {"copies_after_merge", real_pieces_out.load()}, {"gap_bytes_added_by_merge", real_merged_bytes.load()},
                       {"AUDIT_REPAIRED_BYTES_MUST_BE_0", real_repaired_bytes.load()}, {"audit", AuditOn()}}},
             {"raw_differing_bytes", unannounced_bytes.load()},

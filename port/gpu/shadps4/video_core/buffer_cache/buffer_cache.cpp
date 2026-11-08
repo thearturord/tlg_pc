@@ -162,7 +162,22 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object)
         TLG_PROF_LEVEL("cpuwrite.note_resources", 3);
         Core::NativeResources::NoteCpuWrite(address, size);
     }
-    if (Core::NativeUpdates::B9TrackerOff()) {
+    // O2 (`TLG_RING_FILL=1`): an announcement wholly inside the frame ring needs no walk of the engine's buffers (none lies in the ring: the shadow counted 0 in 1.8 M announcements) and no dirty set by
+    // address: the ring has its own set of the bytes the mirror has not taken yet. The part of the ring the mirror has not filled yet needs no mark at all (the first read uploads it whole).
+    bool ring_fast = false;
+    if (Core::RingMirror::FillMode() == 1 && Core::RingMirror::Mode() == 1 && !buffers_only && object == 0) {
+        const auto& ring = UntrackedRing::Get();
+        if (ring.Active()) {
+            const auto [lo, hi] = ring.Clip(address, size);
+            if (lo == address && hi == address + size) {
+                ring_fast = true;
+                std::scoped_lock lock{object_dirty_mutex};
+                ring_filled.ForEachInRange(lo, hi - lo, [&](u64 a, u64 e) { ring_fill_pending.Add(a, e - a); });
+                cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
+            }
+        }
+    }
+    if (!ring_fast && Core::NativeUpdates::B9TrackerOff()) {
         TLG_PROF_LEVEL("cpuwrite.mark_buffers", 3);
         // B9.3 step 2: the page tracker only marks what no engine buffer holds
         static thread_local std::vector<std::pair<VAddr, VAddr>> gaps;
@@ -175,6 +190,36 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object)
         cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
         if (marked < size) {
             Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9TrackerMarksSkipped);
+        }
+    }
+    if (Core::RingMirror::FillMode() == 2 && Core::RingMirror::Mode() == 1) {
+        // O2 shadow: what a fill at announce time would upload for this announcement
+        const auto& ring = UntrackedRing::Get();
+        Core::RingMirror::NoteFill(Core::RingMirror::FillApplies);
+        const auto [lo, hi] = ring.Active() ? ring.Clip(address, size) : std::pair<VAddr, VAddr>{0, 0};
+        if (lo >= hi) {
+            Core::RingMirror::NoteFill(Core::RingMirror::FillNotRing);
+        } else {
+            boost::container::small_vector<std::pair<u64, u64>, 4> filled;
+            u64 filled_bytes = 0;
+            {
+                std::scoped_lock lock{object_dirty_mutex};
+                ring_filled.ForEachInRange(lo, hi - lo, [&](u64 a, u64 e) { filled.emplace_back(a, e - a); });
+                for (const auto& [a, n] : filled) {
+                    ring_fill_pending.Add(a, n);
+                    filled_bytes += n;
+                }
+            }
+            Core::RingMirror::NoteFill(Core::RingMirror::FillBytesFilled, filled_bytes);
+            Core::RingMirror::NoteFill(Core::RingMirror::FillBytesUnfilled, (hi - lo) - filled_bytes);
+            if (filled_bytes != 0) {
+                static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
+                parts.clear();
+                BuffersInView(lo, hi - lo, parts);
+                if (!parts.empty()) {
+                    Core::RingMirror::NoteFill(Core::RingMirror::FillWithBuffers);
+                }
+            }
         }
     }
     const u32 b8 = Core::NativeUpdates::B8ImageMode();
@@ -1101,11 +1146,14 @@ bool BufferCache::NativeCpuQuery(VAddr addr, size_t size) {
     // E4: memory no engine buffer answers for: changed when announced bytes of it were not uploaded yet
     std::scoped_lock lock{object_dirty_mutex};
     const u32 lean = Core::NativeUpdates::LeanDirtyMode();
+    if (Core::RingMirror::FillMode() == 1 && ring_fill_pending.Intersects(addr, size)) {
+        return true;
+    }
     if (lean == 2) {
         return b9_unattributed.Intersects(addr, size);
     }
     const bool unattributed = b9_unattributed.Intersects(addr, size);
-    const bool answer = all_object_dirty.Intersects(addr, size) || unattributed;
+    const bool answer = all_object_dirty.Intersects(addr, size) || unattributed || (Core::RingMirror::FillMode() == 1 && ring_fill_pending.Intersects(addr, size));
     if (lean == 1) {
         Core::NativeUpdates::NoteB9(Core::NativeUpdates::LeanChecked);
         if (answer && !unattributed) {
@@ -1454,6 +1502,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                         arena->ring_mirror_token = ++ring_mirror_token_next; // another buffer is the mirror now: it holds nothing yet
                         ring_mirror_token_current = arena->ring_mirror_token;
                         ring_filled.Clear();
+                        ring_fill_pending.Clear();
                     }
                     ring_filled.ForEachInRange(lo, hi - lo, [&](u64 a, u64 e) { filled_parts.emplace_back(a, e - a); });
                     ring_filled.ForEachNotInRange(lo, hi - lo, [&](u64 a, u64 n) { unfilled.emplace_back(a, n); });
@@ -1473,6 +1522,19 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                     Core::NativeUploads::NoteRingUpload(n);
                     Core::Flight::Add(Core::Flight::Upload, 0, a, n, 1); // L1
                 }
+                if (Core::RingMirror::FillMode() == 1) {
+                    // the ring's own pending set: what was announced inside the filled parts of this window since they were last taken
+                    std::scoped_lock lock{object_dirty_mutex};
+                    for (const auto& [a, n] : filled_parts) {
+                        boost::container::small_vector<std::pair<u64, u64>, 8> pend;
+                        ring_fill_pending.ForEachInRange(a, n, [&](u64 lo, u64 e) { pend.emplace_back(lo, e - lo); });
+                        for (const auto& [lo, len] : pend) {
+                            ring_fill_pending.Subtract(lo, len);
+                            taken.emplace_back(lo, len);
+                            Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4AnnouncedUploads, len);
+                        }
+                    }
+                }
                 announced_sink = &taken;
                 for (const auto& [a, n] : filled_parts) {
                     announced_ranges(a, n);
@@ -1481,6 +1543,18 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 u64 announced_bytes = 0, merged_bytes = 0;
                 for (const auto& [a, n] : taken) {
                     announced_bytes += n;
+                }
+                if (Core::RingMirror::FillMode() == 2) {
+                    // O2 shadow: every byte this window takes from the dirty sets must be one a fill at announce time would have uploaded
+                    u64 missed = 0;
+                    std::scoped_lock lock{object_dirty_mutex};
+                    for (const auto& [a, n] : taken) {
+                        ring_fill_pending.ForEachNotInRange(a, n, [&](u64, u64 miss) { missed += miss; });
+                        ring_fill_pending.Subtract(a, n);
+                    }
+                    Core::RingMirror::NoteFill(Core::RingMirror::FillTakenBytes, announced_bytes);
+                    Core::RingMirror::NoteFill(Core::RingMirror::FillTakenPieces, taken.size());
+                    Core::RingMirror::NoteFill(Core::RingMirror::FillMissedBytes, missed);
                 }
                 {
                     // pieces close together are one copy: the gap bytes are current guest memory (a copy has a fixed cost, the pieces are mostly 100 to 500 bytes)

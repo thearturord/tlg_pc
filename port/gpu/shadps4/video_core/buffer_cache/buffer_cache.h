@@ -445,6 +445,7 @@ private:
     std::array<RingUpload, 256> ring_uploads{};
     /// N2 (`TLG_RING_MIRROR=1`): the parts of the frame ring that the mirror buffer (`ring_mirror_token` of the Buffer) already holds; guarded by object_dirty_mutex
     RangeSet ring_filled;
+    RangeSet ring_fill_pending; ///< O2 shadow: the ranges a fill at announce time would have uploaded since the last window sync took them; guarded by object_dirty_mutex
     u64 ring_mirror_token_next{0}, ring_mirror_token_current{0};
 };
 
