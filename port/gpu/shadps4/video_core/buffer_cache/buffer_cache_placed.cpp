@@ -238,6 +238,16 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
                                           fmt::format("engine buffer {}{} {:#x}+{:#x}", ids.front(), ids.size() > 1 ? "+" : "", begin, end - begin));
     }
     Buffer* dst = buffer.get();
+    dst->placed_begin = begin;
+    dst->placed_end = end;
+    dst->placed_single_id = 0;
+    if (ids.size() == 1 && (ids.front() >> 63) == 0) {
+        // N3: only when the placed range is exactly that engine buffer's own memory (a block grown over memory around it holds bytes that are not the buffer's)
+        Core::NativeDevice::Object object;
+        if (LookupView(ids.front(), object) && object.kind == Core::NativeDevice::Kind::Buffer && object.address == begin && object.address + std::max<u64>(object.bytes, 1) == end) {
+            dst->placed_single_id = ids.front();
+        }
+    }
     dst->NoteResolveUse(); // P3c: the resolve side made this buffer for the operation it is working on, and copies into it below
     if (!ResolveCommands::Deferring()) {
         scheduler.EndRendering(); // (the copies end the render pass themselves when they run)

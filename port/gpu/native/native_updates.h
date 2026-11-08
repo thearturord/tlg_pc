@@ -61,7 +61,10 @@ void SetApply(void (*fn)(void* context, u64 address, u64 size, bool newer, u64 o
 [[nodiscard]] u32 BufferIdMode() noexcept;
 /// `object` value of an announcement whose memory the hook knows to be engine buffers only (a block over several buffers): no single id, but no image lives there
 constexpr u64 kBuffersOnly = ~u64{0};
-enum BufferIdCount : u32 { IdToldWhole, IdToldPartial, IdUnknown, IdPartsMatch, IdPartsDiffer, IdImageSkipped, IdImageFoundOverTold, IdToldBlock, BufferIdCounts };
+enum BufferIdCount : u32 { IdToldWhole, IdToldPartial, IdUnknown, IdPartsMatch, IdPartsDiffer, IdImageSkipped, IdImageFoundOverTold, IdToldBlock, IdSyncHeldMatch, IdSyncHeldDiffer, IdSyncPartsMatch, IdSyncPartsDiffer, IdSyncToldUsed, BufferIdCounts };
+/// N3 (`TLG_SYNC_BY_ID`): 0 off (default), 1 `SynchronizeMemory` of a placed engine buffer takes the buffer's memory and its id from the buffer itself (set when it was placed) instead of walking the
+/// placed map and the engine's address table, 2 shadow: both run, differences are counted (`sync_*` in `buffer_id`, `*_MUST_BE_0`).
+[[nodiscard]] u32 SyncByIdMode() noexcept;
 void NoteBufferId(BufferIdCount what);
 /// N1: who announced a range: `writer` (the writer id, plus 8 when the caller gave no site name), `object` the engine buffer id N1.2 (0: not told)
 struct Tag {

@@ -153,6 +153,8 @@ struct Buffer {
     u64 resolve_use_seq{0}, resolve_prev_seq{0};
 
     VAddr cpu_addr = 0;
+    VAddr placed_begin = 0, placed_end = 0; ///< N3: the memory of the engine buffer(s) this buffer was placed for (0: not a placed buffer)
+    u64 placed_single_id = 0;               ///< N3: the engine buffer id when it holds exactly one (0: a block of several)
     mutable u64 ring_mirror_token = 0; ///< N2: set by the buffer cache when this buffer is the frame ring's mirror (0: not)
     size_t size_bytes = 0;
     std::span<u8> mapped_data{};

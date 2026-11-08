@@ -253,6 +253,14 @@ u32 BufferIdMode() noexcept {
     return mode;
 }
 
+u32 SyncByIdMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_SYNC_BY_ID");
+        return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u;
+    }();
+    return mode;
+}
+
 void NoteBufferId(BufferIdCount what) {
     buffer_id_counts[what].fetch_add(1, std::memory_order_relaxed);
 }
@@ -830,7 +838,9 @@ nlohmann::json B2Report() {
                   {"ring_mirror", RingMirror::Report()},
                   {"buffer_id", {{"mode", BufferIdMode()}, {"told_whole", buffer_id_counts[IdToldWhole].load()}, {"told_partial", buffer_id_counts[IdToldPartial].load()}, {"unknown", buffer_id_counts[IdUnknown].load()},
                                   {"parts_match", buffer_id_counts[IdPartsMatch].load()}, {"PARTS_DIFFER_MUST_BE_0", buffer_id_counts[IdPartsDiffer].load()}, {"image_skipped", buffer_id_counts[IdImageSkipped].load()},
-                                  {"IMAGE_FOUND_OVER_TOLD_MUST_BE_0", buffer_id_counts[IdImageFoundOverTold].load()}, {"told_block", buffer_id_counts[IdToldBlock].load()}}},
+                                  {"IMAGE_FOUND_OVER_TOLD_MUST_BE_0", buffer_id_counts[IdImageFoundOverTold].load()}, {"told_block", buffer_id_counts[IdToldBlock].load()},
+                                  {"sync_by_id", {{"mode", SyncByIdMode()}, {"used", buffer_id_counts[IdSyncToldUsed].load()}, {"held_match", buffer_id_counts[IdSyncHeldMatch].load()}, {"HELD_DIFFER_MUST_BE_0", buffer_id_counts[IdSyncHeldDiffer].load()},
+                                                  {"parts_match", buffer_id_counts[IdSyncPartsMatch].load()}, {"PARTS_DIFFER_MUST_BE_0", buffer_id_counts[IdSyncPartsDiffer].load()}}}}},
                   {"again_by_writer", [] {
                        nlohmann::json j = nlohmann::json::object();
                        j["mode"] = AgainSkipMode();

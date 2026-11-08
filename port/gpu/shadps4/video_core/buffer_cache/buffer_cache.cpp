@@ -1166,7 +1166,14 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     TLG_PROF_NAMED_LEVEL(s_placed, "buffer.sync.placed_walk", 3);
     // B9.4: a placed buffer holds [begin, end) of its block; a read into its slack must not take (and lose) the bytes of the memory after it
     VAddr held_lo = device_addr, held_hi = device_addr + size;
-    {
+    const u32 sync_id_mode = arena->placed_begin != 0 ? Core::NativeUpdates::SyncByIdMode() : 0u; // N3
+    if (sync_id_mode == 1) {
+        held_lo = std::max<VAddr>(held_lo, arena->placed_begin);
+        held_hi = std::min<VAddr>(held_hi, arena->placed_end);
+        if (held_lo >= held_hi) {
+            return false;
+        }
+    } else {
         std::scoped_lock lock{placed_mutex};
         for (auto it = placed.upper_bound(arena->cpu_addr + 255); it != placed.begin();) {
             --it;
@@ -1181,6 +1188,10 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
         if (held_lo >= held_hi) {
             return false;
+        }
+        if (sync_id_mode == 2) {
+            const VAddr told_lo = std::max<VAddr>(device_addr, arena->placed_begin), told_hi = std::min<VAddr>(device_addr + size, arena->placed_end);
+            Core::NativeUpdates::NoteBufferId(told_lo == held_lo && told_hi == held_hi ? Core::NativeUpdates::IdSyncHeldMatch : Core::NativeUpdates::IdSyncHeldDiffer);
         }
     }
     s_placed.End();
@@ -1232,7 +1243,24 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     if (b9 != 0) {
         static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
         parts.clear();
-        BuffersInView(held_lo, held_hi - held_lo, parts);
+        if (sync_id_mode == 1 && arena->placed_single_id != 0) {
+            // N3: the buffer was placed for exactly this engine buffer: its part of the request is known without the walk of the engine's address table
+            parts.push_back({arena->placed_single_id, held_lo, held_hi, 0, 0, arena->placed_begin, arena->placed_end});
+            Core::NativeUpdates::NoteBufferId(Core::NativeUpdates::IdSyncToldUsed);
+        } else {
+            BuffersInView(held_lo, held_hi - held_lo, parts);
+            if (sync_id_mode == 2 && arena->placed_single_id != 0) {
+                const bool same = parts.size() == 1 && parts[0].id == arena->placed_single_id && parts[0].begin == held_lo && parts[0].end == held_hi;
+                Core::NativeUpdates::NoteBufferId(same ? Core::NativeUpdates::IdSyncPartsMatch : Core::NativeUpdates::IdSyncPartsDiffer);
+                if (!same) {
+                    std::string what;
+                    for (const auto& part : parts) {
+                        what += fmt::format(" [id {} {:#x}-{:#x} object {:#x}-{:#x}]", part.id, part.begin, part.end, part.object_begin, part.object_end);
+                    }
+                    Core::RareEvents::Note("n3_sync_parts_differ", fmt::format("placed id {} {:#x}-{:#x}, held {:#x}-{:#x}, address walk gave {} parts:{}", arena->placed_single_id, arena->placed_begin, arena->placed_end, held_lo, held_hi, parts.size(), what));
+                }
+            }
+        }
         if (parts.empty()) {
             // the walk by memory found nothing: the buffer holding the request, found the long way (the request's bytes must not be left to the tracker)
             Core::NativeDevice::Object object;
