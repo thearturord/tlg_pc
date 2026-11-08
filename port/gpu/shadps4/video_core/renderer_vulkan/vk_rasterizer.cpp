@@ -2065,7 +2065,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     }
 }
 
-void Rasterizer::BindBuffersBody(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                                  Shader::PushData& push_data) {
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
     TLG_PROF_LEVEL("raster.bind_buffers", 2);
@@ -2550,6 +2550,612 @@ void Rasterizer::BindBuffersBody(const Shader::Info& stage, Shader::Backend::Bin
         ++binding.buffer;
     }
 }
+
+void Rasterizer::ResolveBufferBinding(const Shader::Info& stage, u32 buffer_index, u64 alignment, u32 census_base, BufferBind& out) {
+    // Plan S step P1: the resolve half of one buffer binding. Decides what is bound (ring row, special buffer, resolved object, in place, ObtainBuffer) and fills `out`;
+    // it does not touch the descriptor writes, the push data offsets, the stream ring rows or the indexed descriptor set (the record half does).
+    const auto& desc = stage.buffers[buffer_index];
+    Census(census_base + CBufferTotal);
+    const auto src_access =
+        vk::AccessFlagBits2::eShaderRead |
+        (desc.is_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eNone);
+        // TLG_RING_KIND (bisect): 1 draws only, 2 dispatches only, 0 both
+        static const u32 ring_kind = [] { const char* e = std::getenv("TLG_RING_KIND"); return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u; }(); // default 0 (draws and dispatches) since 2026-11-07, owner play good; 1 draws only
+        // kind 3: draws and the dispatches whose stage is not indexed
+        const bool dispatch_ok = ring_use.dispatch && (ring_kind == 0 || ring_kind == 2 || (ring_kind == 3 && !(indexed_active && stage.indexed)));
+        const RingBinding* ring = const_ring_level >= 4 && ((ring_use.draw && ring_kind != 2) || dispatch_ok) ? FindRingBinding(stage, buffer_index) : nullptr;
+        if (ring != nullptr && desc.IsSpecial() && indexed_active && stage.indexed) {
+            // an indexed stage has no binding for its flat user data buffer (the shader reads the descriptor words from the row): a ring copy of it would write a binding the layout does not have
+            ring = nullptr;
+        }
+        if (ring != nullptr && ring->formatted) {
+            // N5f: a texel buffer may be the memory of an image (a surface a shader reads as a buffer, HTile, CMask): only the raster thread knows
+            if (texture_cache.AnyImageOverlaps(ring->address, ring->size) || texture_cache.IsMeta(ring->address)) {
+                Core::NativeUploads::NoteRingPrecise(5);
+                ring = nullptr;
+            } else if (buffer_cache.IsRangeGpuWritten(ring->address, ring->size)) {
+                Core::NativeUploads::NoteRingPrecise(6);
+                ring = nullptr;
+            } else {
+                Core::NativeUploads::NoteRingPrecise(4);
+            }
+        }
+        if (ring) {
+            Census(census_base + CBufferRing);
+            // Copied by the command processor thread into the constant ring (read-only, small, not written by queued work).
+            if (!desc.IsSpecial()) {
+                out.has_offset = true; out.adjust = static_cast<u32>(0);
+            }
+            out.info = vk::DescriptorBufferInfo(constant_ring->Handle(), ring->offset, ring->size);
+            ring_use.bound.fetch_add(1, std::memory_order_relaxed);
+            static const bool ring_verify = [] { const char* e = std::getenv("TLG_RING_VERIFY"); return e != nullptr && e[0] == '1'; }();
+            if (ring_verify && !desc.IsSpecial()) {
+                // bisect: the descriptor the raster thread's own path would choose against the one the command processor copied for
+                AmdGpu::Buffer own_sharp;
+                bool own_record = false;
+                if (binder_plan != nullptr && desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
+                    u32 record_binding = ~0u;
+                    if (const u32* words = BinderWords(stage, desc.sharp_fetch.offsets[0], 4, 1, &record_binding)) {
+                        own_sharp = desc.FromWords(words, stage);
+                        own_record = true;
+                    }
+                }
+                if (!own_record) {
+                    own_sharp = desc.GetSharp(stage);
+                }
+                const Core::NativeDesc::BufferDesc own = Core::NativeDesc::BufferDescOf(own_sharp);
+                static std::atomic<u64> sharp_checked[2]{}, sharp_differ[2]{};
+                static std::atomic<u32> sharp_logged{0};
+                const u32 kind = ring_use.dispatch ? 1u : 0u;
+                sharp_checked[kind].fetch_add(1, std::memory_order_relaxed);
+                if (own.address != ring->address || own.size != ring->size) {
+                    sharp_differ[kind].fetch_add(1, std::memory_order_relaxed);
+                    if (sharp_logged.fetch_add(1) < 40) {
+                        LOG_WARNING(Render_Vulkan, "ring verify sharp: {} stage {:#x} buffer {} ring {:#x}+{:#x} own {:#x}+{:#x} (from record {}); differ {}/{} of {}/{} (draw/dispatch)", kind ? "dispatch" : "draw",
+                                    stage.pgm_hash, buffer_index, ring->address, ring->size, own.address, own.size, own_record, sharp_differ[0].load(), sharp_differ[1].load(),
+                                    sharp_checked[0].load(), sharp_checked[1].load());
+                    }
+                }
+            }
+            if (ring_verify && ring->address != 0 && memory->IsValidMapping(ring->address, ring->size)) {
+                // bisect: the ring copy (made by the command processor) against guest memory now (what the raster thread's own copy would read)
+                std::vector<u8> now(ring->size);
+                memory->CopySparseMemory(ring->address, now.data(), ring->size);
+                static std::atomic<u64> checked[2]{}, differ[2]{};
+                static std::atomic<u32> logged{0};
+                const u32 kind = ring_use.dispatch ? 1u : 0u;
+                const u64 n_checked = checked[kind].fetch_add(1, std::memory_order_relaxed) + 1;
+                if ((n_checked & (n_checked - 1)) == 0) {
+                    LOG_WARNING(Render_Vulkan, "ring verify: {} checked {} differ {}", kind ? "dispatch" : "draw", n_checked, differ[kind].load());
+                }
+                if (std::memcmp(now.data(), constant_ring->Data(ring->offset), ring->size) != 0) {
+                    differ[kind].fetch_add(1, std::memory_order_relaxed);
+                    if (logged.fetch_add(1) < 40) {
+                        size_t first = 0;
+                        while (first < ring->size && now[first] == constant_ring->Data(ring->offset)[first]) {
+                            ++first;
+                        }
+                        LOG_WARNING(Render_Vulkan, "ring verify: {} stage {:#x} buffer {} addr {:#x}+{:#x} differs at +{:#x} (ring {:#x}, memory {:#x}); checked {}/{} differ {}/{} (draw/dispatch)",
+                                    kind ? "dispatch" : "draw", stage.pgm_hash, buffer_index, ring->address, ring->size, first, constant_ring->Data(ring->offset)[first], now[first],
+                                    checked[0].load(), checked[1].load(), differ[0].load(), differ[1].load());
+                    }
+                }
+            }
+            if (Core::NativeUploads::RingPrecise() && ring->address != 0 && buffer_cache.IsRangeGpuWritten(ring->address, ring->size)) {
+                Core::NativeUploads::NoteRingPrecise(1); // the GPU wrote bytes of this range after the command processor copied it
+            }
+        } else if (desc.IsSpecial()) {
+            Census(census_base + CBufferSpecial);
+            if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
+                const auto* gds_buf = buffer_cache.GetGdsBuffer();
+                out.info = vk::DescriptorBufferInfo(gds_buf->Handle(), 0, gds_buf->SizeBytes());
+                Core::ResourceAudit::Note(Core::ResourceAudit::BufferUse, 0xfffff0000000ull, gds_buf->SizeBytes(), desc.is_written);
+                out.needs_barrier |=
+                    runtime.IsBufferAccessed(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written);
+                out.SetBound(gds_buf, 0, gds_buf->SizeBytes(), src_access);
+            } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
+                if (indexed_active && stage.indexed) {
+                    out.kind = BufferBind::Skip; // the record pass notes the flat user data of an indexed stage
+                    return;
+                }
+                out.kind = BufferBind::FlatCopy; // the record pass copies the flattened user data into the stream ring
+            } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
+                // Permutations compiled without enabled planes never read the buffer, so the
+                // declared binding is satisfied with a null descriptor instead of a copy.
+                if (clip_plane_mask == 0) {
+                    out.info = vk::DescriptorBufferInfo(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                } else {
+                    out.kind = BufferBind::ClipCopy;
+                    auto& planes = out.planes;
+                    for (u32 i = 0; i < AmdGpu::NUM_CLIP_PLANES; ++i) {
+                        const auto& plane = draw_inputs->clip_user_data[i];
+                        planes[i * 4 + 0] = std::bit_cast<float>(plane.data_x);
+                        planes[i * 4 + 1] = std::bit_cast<float>(plane.data_y);
+                        planes[i * 4 + 2] = std::bit_cast<float>(plane.data_z);
+                        planes[i * 4 + 3] = std::bit_cast<float>(plane.data_w);
+                    }
+                }
+            } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
+                if (indexed_active && stage.indexed) {
+                    Core::RareEvents::Note("c9_shared_memory", fmt::format("compute shader {:#x}: the shared memory is a storage buffer with a slot of its own per dispatch", stage.pgm_hash));
+                }
+                const auto& cs_program = *current_cs;
+                out.kind = BufferBind::LdsMap; // the record pass maps and clears the stream ring rows
+                out.lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();
+            } else {
+                UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
+            }
+        } else {
+            bool cp_no_object = false;
+            if (const StagePlan* ns = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
+                                      : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
+                                                                                                                  : nullptr) {
+                cp_no_object = buffer_index < ns->resolved.size() && ns->resolved[buffer_index].no_object && ns->resolved_epoch == Core::NativeResources::ImmutableEpoch();
+            }
+            if (const StagePlan* rs = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
+                                      : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
+                                                                                                                  : nullptr;
+                rs != nullptr && buffer_index < rs->resolved.size() && rs->resolved[buffer_index].object != nullptr) {
+                // R2: resolved by the command processor from the record's engine object; bound when its stamps hold
+                const ResolvedBuffer& r = rs->resolved[buffer_index];
+                if (rs->resolved_epoch == Core::NativeResources::ImmutableEpoch()) {
+                    const auto* object = r.object;
+                    u64 copy_offset = 0;
+                    if (const auto* copy = object->usage != 1 && object->alive.load(std::memory_order_acquire) && object->generation.load(std::memory_order_acquire) == r.generation
+                                               ? buffer_cache.ObjectCopy(*object, r.address, copy_offset)
+                                               : nullptr) {
+                        // R1b: the object's own copy of this generation in the stream ring
+                        const u64 offset_aligned = Common::AlignDown(copy_offset, alignment);
+                        const u64 adjust = copy_offset - offset_aligned;
+                        out.has_offset = true; out.adjust = static_cast<u32>(adjust);
+                        out.info = vk::DescriptorBufferInfo(copy->Handle(), offset_aligned, r.size + adjust);
+                        Census(census_base + CBufferResolved);
+                        resolve_stats.hits.fetch_add(1, std::memory_order_relaxed);
+                        recipe_ranges.emplace_back(r.address, r.size);
+                        return;
+                    }
+                    const bool ready = object->alive.load(std::memory_order_acquire) && object->synced.load(std::memory_order_acquire); // the arena fields are stored before `synced`
+                    const auto* arena = ready ? static_cast<const VideoCore::Buffer*>(object->resident_buffer.load(std::memory_order_relaxed)) : nullptr;
+                    if (ready && object->generation.load(std::memory_order_acquire) == r.generation && arena != nullptr &&
+                        object->resident_epoch.load(std::memory_order_acquire) == buffer_cache.PlacementEpoch() &&
+                        (object->usage == 1 || !buffer_cache.IsRegionCpuModified(r.address, r.size))) { // as ObtainBuffer: the tracker's dirty bit is the safety net of a resident buffer
+                        const u64 offset = r.address - object->resident_base.load(std::memory_order_relaxed);
+                        const u64 offset_aligned = Common::AlignDown(offset, alignment);
+                        const u64 adjust = offset - offset_aligned;
+                        out.has_offset = true; out.adjust = static_cast<u32>(adjust);
+                        out.info = vk::DescriptorBufferInfo(arena->Handle(), offset_aligned, r.size + adjust);
+                        out.SetBound(arena, offset, r.size, src_access);
+                        if (runtime.PlanHasWrites() && runtime.IsBufferAccessed(arena, offset, r.size, false)) {
+                            out.needs_barrier = true;
+                        }
+                        Census(census_base + CBufferResolved);
+                        resolve_stats.hits.fetch_add(1, std::memory_order_relaxed);
+                        recipe_ranges.emplace_back(r.address, r.size);
+                        return;
+                    }
+                    // why: 0 epoch, 1 gone, 2 not synchronized, 3 generation moved, 4 arena, 5 tracker dirty
+                    const u32 why = !object->alive.load(std::memory_order_relaxed) ? 1 : !object->synced.load(std::memory_order_relaxed) ? 2
+                                    : object->generation.load(std::memory_order_relaxed) != r.generation                       ? 3
+                                    : arena == nullptr || object->resident_epoch.load(std::memory_order_relaxed) != buffer_cache.PlacementEpoch() ? 4 : 5;
+                    resolve_stats.stale_why[why].fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    resolve_stats.stale_why[0].fetch_add(1, std::memory_order_relaxed);
+                }
+                resolve_stats.stale.fetch_add(1, std::memory_order_relaxed);
+            }
+            AmdGpu::Buffer chosen_sharp;
+            bool from_record = false;
+            u32 record_binding = ~0u;
+            if (binder_plan != nullptr && desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
+                if (const u32* words = BinderWords(stage, desc.sharp_fetch.offsets[0], 4, 1, &record_binding)) {
+                    chosen_sharp = desc.FromWords(words, stage);
+                    from_record = true;
+                }
+            }
+            if (from_record) {
+                Core::NativeRegistry::NoteBinder(0);
+            } else if (StageFlatSkipped(stage) && desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::MultiLoad) {
+                Core::NativeRegistry::NoteBinder(6); // must not happen: the plan skipped the flat user data for a stage the record covers
+                if (stage.sw_stage == Shader::SwStage::Compute) {
+                    DumpDispatchRecord(stage, 1, desc.sharp_fetch.offsets[0], "no record entry: buffer");
+                }
+                chosen_sharp = AmdGpu::Buffer::Null();
+            } else {
+                chosen_sharp = desc.GetSharp(stage);
+                if (desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::MultiLoad && desc.sharp_fetch.load_mask == 0) {
+                    Core::NativeRegistry::NoteBinder(12); // F5: built from the shader's immediates, GetSharp reads no flat dword (not a flat user data read)
+                } else {
+                    if (binder_plan != nullptr) {
+                        Core::NativeRegistry::NoteBinder(2);
+                    }
+                }
+            }
+            // F4: from here on the buffer is a plain description (the descriptor type stays at the recompiler's interface above)
+            const Core::NativeDesc::BufferDesc vsharp = Core::NativeDesc::BufferDescOf(chosen_sharp);
+            if (vsharp.address == 0 || vsharp.size == 0) {
+                Census(census_base + CBufferNull);
+                out.info = vk::DescriptorBufferInfo(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+            } else if (vsharp.size >= (1ull << 30) && !memory->IsValidMapping(vsharp.address)) {
+                LOG_ERROR(Render, "buffer sharp at unmapped address {:#x} of {} bytes for stage {:#x}: bound as null", vsharp.address,
+                          vsharp.size, stage.pgm_hash);
+                out.info = vk::DescriptorBufferInfo(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+            } else {
+                const u64 size = memory->ClampRangeSize(vsharp.address, vsharp.size);
+                if (size != vsharp.size) {
+                    LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
+                              vsharp.size, size, stage.pgm_hash);
+                }
+                // N7.5: a read-only buffer of guest memory bound where it is (imported view of the runtime's backing), no copy, no dirty tracking
+                bool in_place = false;
+                if (inplace_on) {
+                    inplace_offered.fetch_add(1, std::memory_order_relaxed);
+                    if (desc.is_written) {
+                        inplace_written.fetch_add(1, std::memory_order_relaxed);
+                    } else if (size > inplace_cap) {
+                        inplace_too_large.fetch_add(1, std::memory_order_relaxed);
+                    } else if (buffer_cache.IsRangeGpuWritten(vsharp.address, size)) {
+                        inplace_gpu_written.fetch_add(1, std::memory_order_relaxed);
+                    } else if (desc.is_formatted && (texture_cache.AnyImageOverlaps(vsharp.address, size) || texture_cache.IsMeta(vsharp.address))) {
+                        inplace_image_or_meta.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        const auto window = host_import->Find(vsharp.address, size);
+                        const u64 aligned = Common::AlignDown(window.offset, alignment);
+                        if (window.buffer && window.offset - aligned + size <= window.chunk_remaining + (window.offset - aligned)) {
+                            in_place = true;
+                            Census(census_base + CBufferInPlace);
+                            const u64 adjust = window.offset - aligned;
+                            out.has_offset = true; out.adjust = static_cast<u32>(adjust);
+                            out.info = vk::DescriptorBufferInfo(window.buffer, aligned, size + adjust);
+                            inplace_taken.fetch_add(1, std::memory_order_relaxed);
+                            inplace_bytes.fetch_add(size, std::memory_order_relaxed);
+                        } else {
+                            inplace_not_in_backing.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                if (!in_place) {
+                // N3c: the immutable engine buffer named by the record's binding (by the engine's id), when the plan resolved one and nothing was registered since
+                Core::NativeResources::ImmutableBuffer* immutable_hint = nullptr;
+                if (record_binding != ~0u && binder_plan->has_handles && (binder_plan->handles[record_binding] != nullptr)) {
+                    if (binder_plan->handle_epoch == Core::NativeResources::ImmutableEpoch()) {
+                        immutable_hint = binder_plan->handles[record_binding];
+                    } else {
+                        Core::NativeResources::NoteHandle(1);
+                        // life census: the plan's handle was made before a create / delete; is its object dead by now, and does its address hold another live buffer?
+                        if (auto* stale = binder_plan->handles[record_binding]; !stale->alive.load(std::memory_order_acquire)) {
+                            Core::NativeDraw::LifeStaleBind(stale->object, Core::NativeResources::FindImmutable(vsharp.address, static_cast<u32>(size)) != nullptr);
+                        }
+                    }
+                }
+                if (immutable_hint != nullptr) {
+                    Census(census_base + CBufferHandle);
+                } else if (desc.is_written) {
+                    Census(census_base + CBufferAddrWritten);
+                } else {
+                    Census(census_base + CBufferAddrRead);
+                    Census(census_base + (size <= 256 ? CBufferAddrReadLe256 : size <= 4096 ? CBufferAddrReadLe4k : size <= 65536 ? CBufferAddrReadLe64k : CBufferAddrReadBig));
+                }
+                Core::NativeRegistry::SetBufferWriter(stage.pgm_hash, static_cast<u32>(stage.sw_stage));
+                Core::NativeContent::SetBindContext({"shader binding", record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].id : 0,
+                                                     record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].view_id : 0, stage.pgm_hash,
+                                                     static_cast<u32>(stage.sw_stage), immutable_hint != nullptr, desc.is_written, vsharp.address, size});
+                // D4 sizing (2026-11-07): the same call, timed by what kind of binding it serves
+                const auto [buffer, offset] = [&] {
+                    VideoCore::BufferCache::UploadBytesReset();
+                    if (immutable_hint != nullptr) {
+                        TLG_PROF_LEVEL("bind.obtain_by_handle", 3);
+                        if (stage.sw_stage == Shader::SwStage::Compute) {
+                            if (desc.is_written) { TLG_PROF_COUNT("bind.handle.compute.written"); } else if (desc.is_formatted) { TLG_PROF_COUNT("bind.handle.compute.texel"); } else { TLG_PROF_COUNT("bind.handle.compute.plain"); }
+                        } else {
+                            if (desc.is_written) { TLG_PROF_COUNT("bind.handle.graphics.written"); } else if (desc.is_formatted) { TLG_PROF_COUNT("bind.handle.graphics.texel"); } else { TLG_PROF_COUNT("bind.handle.graphics.plain"); }
+                        }
+                        const auto r = buffer_cache.ObtainBuffer(vsharp.address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2, cp_no_object);
+                        if (stage.sw_stage == Shader::SwStage::Compute) { TLG_PROF_ADD("bind.uploaded_bytes_compute_handle", VideoCore::BufferCache::UploadBytes()); } else { TLG_PROF_ADD("bind.uploaded_bytes_graphics_handle", VideoCore::BufferCache::UploadBytes()); }
+                        return r;
+                    } else if (desc.is_written) {
+                        TLG_PROF_LEVEL("bind.obtain_by_address_written", 3);
+                        const auto r = buffer_cache.ObtainBuffer(vsharp.address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2, cp_no_object);
+                        if (stage.sw_stage == Shader::SwStage::Compute) { TLG_PROF_ADD("bind.uploaded_bytes_compute_addr_written", VideoCore::BufferCache::UploadBytes()); } else { TLG_PROF_ADD("bind.uploaded_bytes_graphics_addr_written", VideoCore::BufferCache::UploadBytes()); }
+                        return r;
+                    } else {
+                        TLG_PROF_LEVEL("bind.obtain_by_address_read", 3);
+                        const auto r = buffer_cache.ObtainBuffer(vsharp.address, size, desc.is_written, desc.is_formatted, immutable_hint, NativeHandleMode() == 2, cp_no_object);
+                        if (stage.sw_stage == Shader::SwStage::Compute) { TLG_PROF_ADD("bind.uploaded_bytes_compute_addr_read", VideoCore::BufferCache::UploadBytes()); } else { TLG_PROF_ADD("bind.uploaded_bytes_graphics_addr_read", VideoCore::BufferCache::UploadBytes()); }
+                        return r;
+                    }
+                }();
+                Core::NativeContent::ClearBindContext();
+                recipe_ranges.emplace_back(vsharp.address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
+                if (desc.is_written || size > 262144) {
+                    recipe_reusable = false;
+                }
+                if (Core::LightRecorder::On() && !Core::LightRecorder::Recording() && draw_class_now == 0 && size <= 1024 && !desc.is_written) {
+                    Core::LightRecorder::ShadowBuffer(Core::DebugServer::PresentCount(), vsharp.address, size); // a z / shadow draw's view constants candidate
+                }
+                if (Core::LightRecorder::On() && Core::LightRecorder::Recording()) {
+                    Core::LightRecorder::Entry note{};
+                    note.kind = 1;
+                    note.via = immutable_hint != nullptr ? 1 : 0;
+                    note.written = desc.is_written ? 1 : 0;
+                    note.id = record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].id : 0;
+                    note.address = vsharp.address;
+                    note.size = size;
+                    u64 h = 0xcbf29ce484222325ull;
+                    const u64 hashed = std::min<u64>(size, 2048); // a light constant block is below 2 KB (more costs too much with the copy dispatches recorded too)
+                    const u64 bytes = memory->IsValidMapping(vsharp.address, hashed) ? hashed : 0;
+                    for (u64 b = 0; b < bytes; b += 4) {
+                        u32 word = 0;
+                        std::memcpy(&word, reinterpret_cast<const void*>(vsharp.address + b), std::min<u64>(4, bytes - b));
+                        if (b < 704) {
+                            note.words[b / 4] = word;
+                        }
+                        h = (h ^ word) * 0x100000001b3ull;
+                    }
+                    note.hash = h;
+                    Core::LightRecorder::Note(note);
+                }
+                if (Core::NativeRegistry::AuditBuffer(vsharp.address, size, desc.is_written, desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase)) {
+                    {
+                        // where did the shader get this descriptor from, and did the record write the registers it sits in?
+                        thread_local u32 site_tick = 0;
+                        if ((site_tick++ & 3) == 0) {
+                            const u32 offset = desc.sharp_fetch.offsets[0];
+                            const u64 seq = Core::NativeRegistry::CurrentDrawSeq();
+                            u32 set_by_record = 2, table_described = 2;
+                            if (static_cast<u32>(desc.sharp_fetch.summary) != 0) {
+                                const auto flat = stage.FlatUserData();
+                                if (offset + 2 <= flat.size()) {
+                                    const u64 table = u64{flat[offset]} | (u64{flat[offset + 1] & 0xfff} << 32);
+                                    table_described = Core::NativeRegistry::DrawDescribes(seq, table, 1) ? 1 : 0;
+                                }
+                            } else if (offset < 16 && Core::NativeRegistry::CurrentDrawFromPlan()) {
+                                std::array<u32, 16> rvs{}, rps{};
+                                const u32 masks = Core::NativeDraw::RecordUserData(seq, rvs.data(), rps.data());
+                                const u32 mask = stage.sw_stage == Shader::SwStage::Fragment ? masks >> 16 : masks & 0xffff;
+                                set_by_record = (mask >> offset & 1) != 0 ? 1 : 0;
+                            }
+                            // where is the buffer relative to the program of the stage (shader constants sit next to the code), and which post operation builds the descriptor
+                            const u64 program = stage.ProgramBase();
+                            const u64 distance = vsharp.address >= program ? vsharp.address - program : program - vsharp.address;
+                            const u32 below = vsharp.address >= program ? 0u : 1u;
+                            const u32 bucket = distance == 0 ? 0u : static_cast<u32>(std::bit_width(distance));
+                            Core::NativeRegistry::NoteUnexplainedSite(static_cast<u32>(stage.sw_stage), static_cast<u32>(desc.sharp_fetch.summary) != 0 ? 1u : 0u, offset, set_by_record, table_described,
+                                                                      (static_cast<u32>(desc.post_op) << 8) | (below << 7) | std::min(bucket, 63u));
+                        }
+                    }
+                    // the draw's description did not name this buffer: where did the shader's descriptor come from (user data register, flattened table offset)?
+                    static std::atomic<u64> details{0};
+                    static std::atomic<u32> logged_details{0};
+                    if (details.fetch_add(1) % 60000 == 0 && logged_details.fetch_add(1) < 30) {
+                        std::string text = fmt::format("unexplained buffer {:#x}+{} stage {} pgm {:#x} plan_from_record {} index {} sharp_fetch summary {} load_mask {:#x} flat_size {} offsets:", vsharp.address,
+                                                       size, static_cast<u32>(stage.sw_stage), stage.pgm_hash, Core::NativeRegistry::CurrentDrawFromPlan(), buffer_index,
+                                                       static_cast<u32>(desc.sharp_fetch.summary), desc.sharp_fetch.load_mask, stage.FlatUserData().size());
+                        for (u32 k = 0; k < 4; ++k) {
+                            const u32 offset = desc.sharp_fetch.offsets[k];
+                            text += fmt::format(" {}:{:08x}", offset, offset < stage.FlatUserData().size() ? stage.FlatUserData()[offset] : 0u);
+                        }
+                        text += " user_data:";
+                        for (const u32 word : stage.UserData()) {
+                            text += fmt::format(" {:x}", word);
+                        }
+                        text += " flat:";
+                        for (const u32 word : stage.FlatUserData()) {
+                            text += fmt::format(" {:x}", word);
+                        }
+                        u32 record_registers = 0;
+                        const u32 at = Core::NativeDraw::RecordRegisterWith(Core::NativeRegistry::CurrentDrawSeq(), static_cast<u32>(vsharp.address), &record_registers);
+                        text += fmt::format(" | record has base word at register {:#x} of {}", at, record_registers);
+                        std::array<u32, 16> rvs{}, rps{};
+                        const u32 masks = Core::NativeDraw::RecordUserData(Core::NativeRegistry::CurrentDrawSeq(), rvs.data(), rps.data());
+                        text += fmt::format(" | record user data masks vs {:#x} ps {:#x}: vs", masks & 0xffff, masks >> 16);
+                        for (const u32 word : rvs) {
+                            text += fmt::format(" {:x}", word);
+                        }
+                        text += " ps";
+                        for (const u32 word : rps) {
+                            text += fmt::format(" {:x}", word);
+                        }
+                        text += " | " + Core::NativeRegistry::DescribeCurrentDraw();
+                        Core::NativeRegistry::NoteDebug(text);
+                    }
+                }
+                const u64 offset_aligned = Common::AlignDown(offset, alignment);
+                const u64 adjust = offset - offset_aligned;
+                if (adjust % 4 != 0) {
+                    LOG_WARNING(Render_Vulkan, "Buffer binding in shader {:#x} isn't dword aligned",
+                                stage.pgm_hash);
+                }
+                out.has_offset = true; out.adjust = static_cast<u32>(adjust);
+                out.info = vk::DescriptorBufferInfo(buffer->Handle(), offset_aligned, size + adjust);
+                out.SetBound(buffer, offset, size, src_access);
+                if (desc.is_written) {
+                    // Raw storage-buffer writes can also make an aliased cached image stale.
+                    if (size >= (8u << 20)) {
+                        static std::atomic<u32> logged{0};
+                        if (logged.fetch_add(1) < 6) {
+                            LOG_INFO(Render_Vulkan, "stage {:#x} (user data {}) writes {} bytes at {:#x} through a storage buffer, caller {:#x}",
+                                     stage.pgm_hash, stage.user_data.size(), size, vsharp.address,
+                                     dispatch_caller ? dispatch_caller - Core::NativeDraw::ImageBase() + 0x1000000 : 0);
+                        }
+                    }
+                    texture_cache.InvalidateMemoryFromGPU(vsharp.address, size, "a written storage buffer view");
+                }
+                Census(census_base + CBufferBarrierQuery);
+                if (runtime.IsBufferAccessed(buffer, offset, size, desc.is_written)) {
+                    Census(census_base + CBufferBarrierTrue);
+                    out.needs_barrier = true;
+                }
+                }
+            }
+        }
+}
+
+void Rasterizer::RecordBufferBindings(const Shader::Info& stage, Shader::Backend::Bindings& binding, Shader::PushData& push_data, BufferBind* binds, u32 count, u64 alignment) {
+    // Plan S step P1: the record half. Everything here writes the command stream state (descriptor writes, push data offsets, stream ring rows, indexed descriptor set).
+    for (u32 buffer_index = 0; buffer_index < count; ++buffer_index) {
+        const auto& desc = stage.buffers[buffer_index];
+        BufferBind& out = binds[buffer_index];
+        if (out.kind == BufferBind::Skip) {
+            NoteIndexedFlat(stage);
+            ++binding.buffer;
+            continue;
+        }
+        if (out.kind == BufferBind::FlatCopy) {
+            auto& vk_buffer = buffer_cache.GetStreamBuffer();
+            const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
+            const u64 offset = vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
+            out.info = vk::DescriptorBufferInfo(vk_buffer.Handle(), offset, ubo_size);
+        } else if (out.kind == BufferBind::ClipCopy) {
+            auto& vk_buffer = buffer_cache.GetStreamBuffer();
+            const u32 ubo_size = static_cast<u32>(sizeof(out.planes));
+            const u64 offset = vk_buffer.Copy(out.planes.data(), ubo_size, alignment);
+            out.info = vk::DescriptorBufferInfo(vk_buffer.Handle(), offset, ubo_size);
+        } else if (out.kind == BufferBind::LdsMap) {
+            auto& lds_buffer = buffer_cache.GetStreamBuffer();
+            const auto [data, offset] = lds_buffer.Map(out.lds_size, alignment);
+            std::memset(data, 0, out.lds_size);
+            lds_buffer.Commit();
+            out.info = vk::DescriptorBufferInfo(lds_buffer.Handle(), offset, out.lds_size);
+        }
+        if (out.has_offset) {
+            push_data.AddOffset(binding.buffer, out.adjust);
+        }
+        buffer_infos.emplace_back(out.info);
+        if (out.has_bound) {
+            bound_buffers.emplace_back(out.bound_buffer, out.bound_offset, out.bound_size, out.bound_access);
+        }
+        needs_barrier |= out.needs_barrier;
+        if (indexed_active && stage.indexed && Shader::Indexed::IsIndexedBufferType(desc.buffer_type)) {
+            auto* indexed = IndexedData::Get();
+            const auto& info = buffer_infos.back();
+            const u64 made_before = indexed->stats.buffer_new.load(std::memory_order_relaxed);
+            const u32 slot = indexed->BufferSlot(info.buffer, info.offset, info.range);
+            if (indexed->stats.buffer_new.load(std::memory_order_relaxed) != made_before) {
+                // R4 census: which buffers make new slots (0 stream ring, 1 an arena, 2 other)
+                const bool stream = info.buffer == buffer_cache.GetStreamBuffer().Handle();
+                slot_census[stream ? 0 : 2].fetch_add(1, std::memory_order_relaxed);
+            } else {
+                slot_census[3].fetch_add(1, std::memory_order_relaxed);
+            }
+            NoteIndexedRow(slot);
+            ++binding.buffer;
+            continue;
+        }
+        if (indexed_active && stage.indexed) {
+            auto& st = IndexedData::Get()->stats;
+            (desc.buffer_type == Shader::BufferType::Flatbuf ? st.legacy_flat : desc.buffer_type == Shader::BufferType::ClipPlanes ? st.legacy_clip : st.legacy_lds).fetch_add(1, std::memory_order_relaxed);
+        }
+        auto& set_write = set_writes[set_write_index++];
+        set_write.dstSet = VK_NULL_HANDLE;
+        set_write.dstBinding = binding.unified++;
+        set_write.dstArrayElement = 0;
+        set_write.descriptorCount = 1;
+        set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
+        set_write.pBufferInfo = &buffer_infos.back();
+        ++binding.buffer;
+    }
+}
+
+void Rasterizer::BindBuffersBody(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+                                 Shader::PushData& push_data) {
+    // Plan S step P1: TLG_SPLIT_BIND 0 = the old single pass (default), 1 = resolve pass then record pass, 2 = old pass, then the resolve pass again and compare (the oracle)
+    static const u32 mode = [] { const char* e = std::getenv("TLG_SPLIT_BIND"); return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u; }();
+    if (mode == 0) {
+        BindBuffersBodyLegacy(stage, binding, push_data);
+        return;
+    }
+    const u64 alignment = instance.StorageMinAlignment();
+    const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
+    const u32 count = static_cast<u32>(stage.buffers.size());
+    if (mode == 2) {
+        VerifyBufferBindings(stage, binding, push_data, alignment, census_base, count);
+        return;
+    }
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
+    TLG_PROF_LEVEL("raster.bind_buffers", 2);
+    boost::container::small_vector<BufferBind, 16> binds(count);
+    for (u32 i = 0; i < count; ++i) {
+        ResolveBufferBinding(stage, i, alignment, census_base, binds[i]);
+    }
+    RecordBufferBindings(stage, binding, push_data, binds.data(), count, alignment);
+}
+
+void Rasterizer::VerifyBufferBindings(const Shader::Info& stage, Shader::Backend::Bindings& binding, Shader::PushData& push_data, u64 alignment, u32 census_base, u32 count) {
+    // Plan S step P1 oracle: run the old pass for real, then the resolve half on the same draw and compare what each decided. The resolve half runs after the whole old pass
+    // (the order of the split path: every ObtainBuffer before any barrier query), so a difference can also come from that order. The record half does not run.
+    static std::atomic<u64> checked{0}, bindings_checked{0}, differ{0};
+    static std::atomic<u32> logged{0};
+    const size_t infos_before = buffer_infos.size();
+    const bool barrier_before = needs_barrier;
+    const u32 first_binding = binding.buffer;
+    needs_barrier = false;
+    BindBuffersBodyLegacy(stage, binding, push_data);
+    const bool legacy_barrier = needs_barrier;
+    needs_barrier = barrier_before || legacy_barrier;
+    const size_t ranges_after_legacy = recipe_ranges.size();
+    const bool reusable_after_legacy = recipe_reusable;
+    std::vector<vk::DescriptorBufferInfo> seen(buffer_infos.begin() + infos_before, buffer_infos.end());
+    boost::container::small_vector<BufferBind, 16> binds(count);
+    for (u32 i = 0; i < count; ++i) {
+        ResolveBufferBinding(stage, i, alignment, census_base, binds[i]);
+    }
+    recipe_ranges.resize(ranges_after_legacy);
+    recipe_reusable = reusable_after_legacy;
+    const u64 n = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+    bindings_checked.fetch_add(count, std::memory_order_relaxed);
+    u32 diffs = 0;
+    bool resolve_barrier = false;
+    std::vector<u32> kept;
+    for (u32 i = 0; i < count; ++i) {
+        resolve_barrier |= binds[i].needs_barrier;
+        if (binds[i].kind != BufferBind::Skip) {
+            kept.push_back(i);
+        }
+    }
+    const auto stream_handle = buffer_cache.GetStreamBuffer().Handle();
+    std::string what;
+    if (kept.size() != seen.size()) {
+        ++diffs;
+        what += fmt::format(" entries legacy {} split {};", seen.size(), kept.size());
+    } else {
+        for (size_t i = 0; i < kept.size(); ++i) {
+            const BufferBind& b = binds[kept[i]];
+            const vk::DescriptorBufferInfo& a = seen[i];
+            if (b.kind != BufferBind::Info) {
+                if (a.buffer != stream_handle) {
+                    ++diffs;
+                    what += fmt::format(" #{} legacy not on the stream ring;", kept[i]);
+                }
+                continue;
+            }
+            const bool both_stream = a.buffer == stream_handle && b.info.buffer == stream_handle;
+            if (a.buffer != b.info.buffer || a.range != b.info.range || (!both_stream && a.offset != b.info.offset)) {
+                ++diffs;
+                what += fmt::format(" #{} info legacy {:#x}+{:#x}/{:#x} split {:#x}+{:#x}/{:#x};", kept[i], reinterpret_cast<u64>(static_cast<VkBuffer>(a.buffer)), a.offset, a.range,
+                                    reinterpret_cast<u64>(static_cast<VkBuffer>(b.info.buffer)), b.info.offset, b.info.range);
+            }
+            if (b.has_offset && push_data.buf_offsets[first_binding + kept[i]] != b.adjust) {
+                ++diffs;
+                what += fmt::format(" #{} push offset legacy {} split {};", kept[i], push_data.buf_offsets[first_binding + kept[i]], b.adjust);
+            }
+        }
+    }
+    if (legacy_barrier != resolve_barrier) {
+        ++diffs;
+        what += fmt::format(" needs_barrier legacy {} split {};", legacy_barrier, resolve_barrier);
+    }
+    if (diffs != 0) {
+        differ.fetch_add(1, std::memory_order_relaxed);
+        if (logged.fetch_add(1) < 40) {
+            LOG_WARNING(Render_Vulkan, "split bind verify: stage {:#x} {} {} buffers:{} (differing stage calls {} of {})", stage.pgm_hash, stage.sw_stage == Shader::SwStage::Compute ? "compute" : "graphics", count,
+                        what, differ.load(), n);
+        }
+    }
+    if ((n & (n - 1)) == 0) {
+        LOG_WARNING(Render_Vulkan, "split bind verify: {} stage calls, {} bindings, {} differ", n, bindings_checked.load(), differ.load());
+    }
+}
+
 
 namespace {
 u64 ImageUseFlags(const Shader::ImageResource& image_desc) {

@@ -430,6 +430,33 @@ private:
                      Shader::PushData& push_data);
     void BindBuffersBody(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                          Shader::PushData& push_data);
+    void BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backend::Bindings& binding, Shader::PushData& push_data);
+    /// Plan S step P1: what the resolve half decided for one buffer binding (the record half turns it into descriptor writes).
+    struct BufferBind {
+        enum Kind : u8 { Info, Skip, FlatCopy, ClipCopy, LdsMap };
+        Kind kind{Info};
+        bool has_offset{false};
+        bool has_bound{false};
+        bool needs_barrier{false};
+        u32 adjust{0};
+        u32 lds_size{0};
+        vk::DescriptorBufferInfo info{};
+        const VideoCore::Buffer* bound_buffer{nullptr};
+        u64 bound_offset{0};
+        u32 bound_size{0};
+        vk::AccessFlags2 bound_access{};
+        std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
+        void SetBound(const VideoCore::Buffer* buffer, u64 offset, u64 size, vk::AccessFlags2 access) {
+            has_bound = true;
+            bound_buffer = buffer;
+            bound_offset = offset;
+            bound_size = static_cast<u32>(size);
+            bound_access = access;
+        }
+    };
+    void ResolveBufferBinding(const Shader::Info& stage, u32 buffer_index, u64 alignment, u32 census_base, BufferBind& out);
+    void RecordBufferBindings(const Shader::Info& stage, Shader::Backend::Bindings& binding, Shader::PushData& push_data, BufferBind* binds, u32 count, u64 alignment);
+    void VerifyBufferBindings(const Shader::Info& stage, Shader::Backend::Bindings& binding, Shader::PushData& push_data, u64 alignment, u32 census_base, u32 count);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     void BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding);
 
