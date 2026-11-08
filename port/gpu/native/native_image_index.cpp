@@ -5,6 +5,7 @@
 #include <algorithm>
 
 #include "native/native_device.h"
+#include "native/native_n0_census.h"
 #include "native/native_image_index.h"
 #include "native/native_updates.h"
 #include "native/native_split_census.h"
@@ -114,6 +115,7 @@ void NativeImageIndex::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
     if (pending_clears.empty() && !host.AnyImageIn(addr, size)) {
         return; // no image in this memory (most announcements: buffer contents); the page table answers that in a few lookups
     }
+    N0::SetEffect(N0::EffImage);
     SmallVector<ImageId, 8> image_ids;
     // B8.4: a range the engine's textures cover finds its images through them (their lists); B8.5: a range engine buffers cover, through the buffers' lists;
     // only memory neither covers whole asks the page table

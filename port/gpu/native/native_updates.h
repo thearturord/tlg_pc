@@ -58,6 +58,7 @@ void SetApply(void (*fn)(void* context, u64 address, u64 size, bool newer), void
 /// The announcements of one submission: applied once (`first`) and the previous submission's again (`again`)
 struct Batch {
     std::vector<std::pair<u64, u64>> first, again;
+    std::vector<u8> first_writer, again_writer, ring_first_writer, ring_again_writer; ///< N1: the writer id of every range of the four lists (same order)
     std::vector<std::pair<u64, u64>> ring_first, ring_again; ///< the part of first / again in frame ring memory (empty unless EarlyAnnounceOn)
     std::vector<std::array<u64, 4>> deleted; ///< B8.2: engine objects deleted or created before the submission (id, memory, bytes, what: 0 view, 1 texture, 2 created texture, 3 texture with an alias)
     [[nodiscard]] bool Empty() const noexcept {

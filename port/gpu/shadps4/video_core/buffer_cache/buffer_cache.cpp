@@ -115,6 +115,15 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 
 void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer) {
     Core::SplitCensus::Touch(Core::SplitCensus::BufDirty);
+    bool n0_ring = false;
+    if (Core::N0::On()) {
+        const auto& ring = UntrackedRing::Get();
+        if (ring.Active()) {
+            const auto [lo, hi] = ring.Clip(address, size);
+            n0_ring = lo < hi;
+        }
+    }
+    Core::N0::ApplyScope n0_apply{n0_ring, size};
     {
         TLG_PROF_LEVEL("cpuwrite.bind_memo_erase", 3);
         BindMemoErase(address, size);
@@ -173,6 +182,9 @@ void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, st
         BuffersInView(address, size, parts);
     }
     TLG_PROF_NAMED_LEVEL(dirty_scope, "cpuwrite.mark.object_dirty", 3);
+    if (!parts.empty()) {
+        Core::N0::SetEffect(Core::N0::EffBufferParts);
+    }
     std::scoped_lock lock{object_dirty_mutex};
     if (Core::NativeUpdates::LeanDirtyMode() != 2) {
         all_object_dirty.Add(address, size); // audit: every changed byte, by address
@@ -575,6 +587,7 @@ void BufferCache::RecipeEraseRange(VAddr address, u64 size) {
             }
             for (const auto& [a, n] : r->second.ranges) {
                 if (a < address + size && address < a + n) {
+                    Core::N0::SetEffect(Core::N0::EffRecipe);
                     r->second.valid = false;
                     break;
                 }
@@ -592,7 +605,11 @@ void BufferCache::BindMemoErase(VAddr address, u64 size) {
         }
         auto it = memo.entries.lower_bound(address >= memo.max_size ? address - memo.max_size : 0);
         while (it != memo.entries.end() && it->first < address + size) {
+            const size_t n0_before = it->second.size();
             it->second.erase(std::remove_if(it->second.begin(), it->second.end(), [&](const BindMemoEntry& e) { return it->first + e.size > address; }), it->second.end());
+            if (it->second.size() != n0_before) {
+                Core::N0::SetEffect(Core::N0::EffMemo);
+            }
             if (it->second.empty()) {
                 it = memo.entries.erase(it);
                 bind_memo_counts[2].fetch_add(1, std::memory_order_relaxed);
@@ -1091,6 +1108,7 @@ void BufferCache::SupersedeGpuWritten(VAddr addr, size_t size) {
     std::unique_lock lock{gpu_ranges_mutex};
     BindMemoBump(); // GPU written bytes change hands: memo answers are checked again
     if (gpu_modified_ranges.Intersects(addr, size)) {
+        Core::N0::SetEffect(Core::N0::EffGpuRanges);
         NativeIdentity::Note(addr, addr + size, NativeIdentity::GpuWrittenState);
     }
     gpu_modified_ranges.Subtract(addr, size);

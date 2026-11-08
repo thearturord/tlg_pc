@@ -499,12 +499,16 @@ void NativeExecutor::QueueAnnounced(Core::NativeDirect::Buffer& direct) {
         Core::NativeUpdates::Batch early;
         early.ring_first = std::move(direct.announced_ring_first);
         early.ring_again = std::move(direct.announced_ring_again);
+        early.ring_first_writer = std::move(direct.announced_ring_first_writer);
+        early.ring_again_writer = std::move(direct.announced_ring_again_writer);
         RasterMarkNextHoist();
         RasterRun([b = std::move(early)] { Core::NativeUpdates::ApplyBatch(b); });
     }
     Core::NativeUpdates::Batch batch;
     batch.first = std::move(direct.announced_first);
     batch.again = std::move(direct.announced_again);
+    batch.first_writer = std::move(direct.announced_first_writer);
+    batch.again_writer = std::move(direct.announced_again_writer);
     batch.deleted = std::move(direct.announced_deleted);
     RasterRun([b = std::move(batch)] { Core::NativeUpdates::ApplyBatch(b); });
 }

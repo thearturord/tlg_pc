@@ -17,6 +17,7 @@ bool g_on = [] {
 }();
 thread_local SyncSite t_sync_site{SyncArenaRead};
 thread_local u64 t_hash_ns{0};
+thread_local u32 t_effect{0};
 
 namespace {
 constexpr const char* SyncNames[SyncSiteCount] = {"immutable_whole", "arena_read", "arena_written", "arena_texel", "download", "pre_sync"};
@@ -33,6 +34,10 @@ std::array<CopyStat, CopySiteCount> copy_stats;
 std::array<std::atomic<u64>, 24> applied_first_log2{}, applied_again_log2{};
 std::atomic<u64> first_ns{0};
 std::array<std::atomic<u64>, 4> cause_bytes{}, cause_pieces{};
+struct ApplyStat {
+    std::atomic<u64> calls{0}, bytes{0}, ns{0};
+};
+std::array<std::array<ApplyStat, 64>, 2> apply_stats; // [ring][effect mask]
 std::atomic<u64> image_calls{0}, image_tiled{0}, image_ns{0};
 
 struct Last {
@@ -102,6 +107,14 @@ void NoteFromImage(u64 ns, bool tiled) noexcept {
     }
 }
 
+void NoteApply(bool ring, u64 size, u32 effects, u64 ns) noexcept {
+    Touch();
+    auto& s = apply_stats[ring ? 1 : 0][effects & 63];
+    s.calls.fetch_add(1, std::memory_order_relaxed);
+    s.bytes.fetch_add(size, std::memory_order_relaxed);
+    s.ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
 void NoteApplied(u64 size, bool again) noexcept {
     u32 log = 0;
     while ((size >> log) > 1 && log < 23) {
@@ -128,6 +141,14 @@ nlohmann::json Report() {
     static constexpr const char* CauseNames[3] = {"frame_ring_part_uploaded_whole", "announced_bytes_of_engine_buffer", "announced_bytes_of_unowned_memory"};
     for (u32 i = 0; i < 3; ++i) {
         j["upload_cause"][CauseNames[i]] = {{"pieces", cause_pieces[i].load()}, {"bytes", cause_bytes[i].load()}};
+    }
+    for (u32 r = 0; r < 2; ++r) {
+        for (u32 m = 0; m < 64; ++m) {
+            const auto& s = apply_stats[r][m];
+            if (const u64 n = s.calls.load()) {
+                j["apply"][r ? "ring" : "other"][std::to_string(m)] = {{"calls", n}, {"bytes", s.bytes.load()}, {"ms", s.ns.load() / 1e6}};
+            }
+        }
     }
     j["from_image"] = {{"calls", image_calls.load()}, {"tiled_calls", image_tiled.load()}, {"ms", image_ns.load() / 1e6}};
     for (u32 i = 0; i < 24; ++i) {

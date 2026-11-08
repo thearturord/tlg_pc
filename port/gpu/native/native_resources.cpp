@@ -28,6 +28,7 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "native/native_draw.h"
+#include "native/native_n0_census.h"
 #include "native/native_frame_gate.h"
 #include "native/native_identity_log.h"
 #include "native/native_log.h"
@@ -666,6 +667,7 @@ void NoteCpuWrite(VAddr address, u64 size) {
                 ImmutableBuffer& buffer = *it->second;
                 const bool hit = buffer.usage == 1 ? (buffer.end > address && buffer.begin < address + size) : (buffer.end > page_begin && buffer.begin < page_end);
                 if (hit) {
+                    Core::N0::SetEffect(Core::N0::EffResident);
                     buffer.generation.fetch_add(1, std::memory_order_acq_rel);
                     if (buffer.synced.exchange(false, std::memory_order_acq_rel)) {
                         immutable_drops.fetch_add(1, std::memory_order_relaxed);

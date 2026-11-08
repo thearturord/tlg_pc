@@ -295,6 +295,10 @@ void NativeExecutor::SubmitGfx(std::span<const u32> dcb, std::span<const u32> cc
             direct->announced_again = std::move(announced.again);
             direct->announced_ring_first = std::move(announced.ring_first);
             direct->announced_ring_again = std::move(announced.ring_again);
+            direct->announced_first_writer = std::move(announced.first_writer);
+            direct->announced_again_writer = std::move(announced.again_writer);
+            direct->announced_ring_first_writer = std::move(announced.ring_first_writer);
+            direct->announced_ring_again_writer = std::move(announced.ring_again_writer);
             direct->announced_deleted = std::move(announced.deleted);
         } else {
             RasterRun([batch = std::move(announced)] { Core::NativeUpdates::ApplyBatch(batch); });
@@ -333,6 +337,10 @@ void NativeExecutor::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
             direct->announced_again = std::move(announced.again);
             direct->announced_ring_first = std::move(announced.ring_first);
             direct->announced_ring_again = std::move(announced.ring_again);
+            direct->announced_first_writer = std::move(announced.first_writer);
+            direct->announced_again_writer = std::move(announced.again_writer);
+            direct->announced_ring_first_writer = std::move(announced.ring_first_writer);
+            direct->announced_ring_again_writer = std::move(announced.ring_again_writer);
             direct->announced_deleted = std::move(announced.deleted);
         } else {
             RasterRun([batch = std::move(announced)] { Core::NativeUpdates::ApplyBatch(batch); });

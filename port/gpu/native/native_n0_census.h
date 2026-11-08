@@ -40,6 +40,14 @@ enum CopySite : u32 {
 
 extern bool g_on;
 extern thread_local SyncSite t_sync_site;
+/// What one applied announcement did that a later draw could observe (N1 census). Each place that changes shared state for a range sets its bit.
+enum Effect : u32 { EffMemo = 1, EffRecipe = 2, EffGpuRanges = 4, EffResident = 8, EffBufferParts = 16, EffImage = 32 };
+extern thread_local u32 t_effect;
+inline void SetEffect(u32 bit) noexcept {
+    if (g_on) {
+        t_effect |= bit;
+    }
+}
 extern thread_local u64 t_hash_ns; ///< time the census itself spent hashing on this thread (taken out of the sync times)
 
 [[nodiscard]] inline bool On() noexcept {
@@ -55,6 +63,7 @@ void NoteCopy(CopySite site, u64 address, u64 size, u64 ns, const void* data) no
 void NoteApplied(u64 size, bool again) noexcept;
 /// Why bytes were uploaded: 0 the frame ring part is uploaded whole (nobody announced what changed), 1 the announced bytes of an engine buffer, 2 announced bytes of memory no engine buffer holds.
 void NoteCause(u32 cause, u64 bytes) noexcept;
+void NoteApply(bool ring, u64 size, u32 effects, u64 ns) noexcept;
 void NoteFromImage(u64 ns, bool tiled) noexcept;
 [[nodiscard]] nlohmann::json Report();
 
@@ -83,6 +92,20 @@ struct FromImageScope {
     ~FromImageScope() {
         if (start != 0) {
             NoteFromImage(NowNs() - start, tiled);
+        }
+    }
+};
+
+/// One ApplyCpuWrite. `ring`: the range lies in the frame ring window.
+struct ApplyScope {
+    bool ring;
+    u64 size, start;
+    ApplyScope(bool ring_, u64 size_) noexcept : ring(ring_), size(size_), start(g_on ? NowNs() : 0) {
+        t_effect = 0;
+    }
+    ~ApplyScope() {
+        if (start != 0) {
+            NoteApply(ring, size, t_effect, NowNs() - start);
         }
     }
 };
