@@ -228,8 +228,8 @@ bool StreamBuffer::PrepareMap(u64 size, u64 alignment, bool allow_wait) {
     }
 
     if (offset + size > this->size_bytes) {
-        wraps[ring_id < 3 ? ring_id : 0][!VideoCore::RecordQueue::jobs.empty() && !VideoCore::RecordQueue::executing ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
-        if (!VideoCore::RecordQueue::jobs.empty() && !VideoCore::RecordQueue::executing) {
+        wraps[ring_id < 3 ? ring_id : 0][VideoCore::RecordQueue::Pending() && !VideoCore::RecordQueue::executing ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+        if (VideoCore::RecordQueue::Pending() && !VideoCore::RecordQueue::executing) {
             static std::atomic<u32> shown{0};
             if (shown.fetch_add(1) < 6) {
                 LOG_WARNING(Render_Vulkan, "ring lap with draws waiting: ring {} rva: {}", ring_id, Core::NativeOcclusion::CallerRvas(1, 9));
@@ -336,7 +336,7 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
         if (!scheduler.IsFree(watch.tick) && !allow_wait) {
             return false;
         }
-        if (!allow_wait && ring_id == 2 && !VideoCore::RecordQueue::jobs.empty() && !VideoCore::RecordQueue::executing) {
+        if (!allow_wait && ring_id == 2 && VideoCore::RecordQueue::Pending() && !VideoCore::RecordQueue::executing) {
             // P3e.5: a staging block holds copies that draws waiting in the record queue still read, and its watches carry the tick of the time they were written (older than the
             // tick the draws get). Not reused while draws wait: the pool takes another block.
             return false;

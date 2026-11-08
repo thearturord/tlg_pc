@@ -122,7 +122,7 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
 
     LargeBuffer* best{};
     // P3e.5: an entry's tick is the tick of its last request; draws waiting in the record queue may still read it, and they get a later tick: only never used entries then
-    const bool draws_wait = !VideoCore::RecordQueue::jobs.empty() && !VideoCore::RecordQueue::executing;
+    const bool draws_wait = VideoCore::RecordQueue::Pending() && !VideoCore::RecordQueue::executing;
     for (LargeBuffer& entry : cache) {
         const u64 entry_size = entry.buffer->SizeBytes();
         if (entry.held || entry_size < size || entry_size > max_size || (draws_wait && entry.tick != 0) ||

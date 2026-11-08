@@ -1018,7 +1018,7 @@ const RingBinding* Rasterizer::FindRingBinding(const Shader::Info& stage, u32 in
 void Rasterizer::EndRingUse() noexcept {
     const u64 end = ring_use.End();
     if (constant_ring && end != 0) {
-        if (VideoCore::RecordQueue::Enabled() && !VideoCore::RecordQueue::jobs.empty()) {
+        if (VideoCore::RecordQueue::Enabled() && VideoCore::RecordQueue::Pending()) {
             // P3e.4b: the ring region is free once the GPU is done with the draws that read it: those are recorded (and get their tick) after the ones that wait in front of them
             VideoCore::RecordQueue::Post([this, end] { constant_ring->Stamp(end); });
         } else {

@@ -182,7 +182,7 @@ enum CensusKind : u32 {
 } // namespace
 
 void Rasterizer::MaybeFlushRecorded() {
-    if (VideoCore::RecordQueue::Enabled() && !VideoCore::RecordQueue::jobs.empty()) {
+    if (VideoCore::RecordQueue::Enabled() && VideoCore::RecordQueue::Pending()) {
         VideoCore::RecordQueue::Post([this] { MaybeFlushRecordedBody(); }); // after the draws that wait
         return;
     }
@@ -345,6 +345,16 @@ bool Rasterizer::FilterDraw(const DrawPlan* plan) {
                             VideoCore::RecordQueue::Lag(), VideoCore::RecordQueue::posted.load(), VideoCore::RecordQueue::ran.load(), VideoCore::RecordQueue::max_depth.load(), why,
                             VideoCore::StreamBuffer::wraps[0][0].load(), VideoCore::StreamBuffer::wraps[0][1].load(), VideoCore::StreamBuffer::wraps[1][0].load(), VideoCore::StreamBuffer::wraps[1][1].load(),
                             VideoCore::StreamBuffer::wraps[2][0].load(), VideoCore::StreamBuffer::wraps[2][1].load());
+            }
+            if (last_log_ns != 0 && VideoCore::RecordQueue::Threaded()) {
+                std::string waits;
+                for (u32 i = 0; i < VideoCore::RecordQueue::ReasonCount; ++i) {
+                    if (const u64 ns = VideoCore::RecordQueue::drain_wait_ns[i].load(); ns != 0) {
+                        waits += fmt::format(" {} {:.0f} ms", VideoCore::RecordQueue::names[i], static_cast<double>(ns) / 1e6);
+                    }
+                }
+                LOG_WARNING(Render_Vulkan, "split bind thread: recorder busy {:.0f} ms, idle {:.0f} ms; resolver waited in Post {:.0f} ms, in drains:{}", static_cast<double>(VideoCore::RecordQueue::worker_busy_ns.load()) / 1e6,
+                            static_cast<double>(VideoCore::RecordQueue::worker_idle_ns.load()) / 1e6, static_cast<double>(VideoCore::RecordQueue::post_wait_ns.load()) / 1e6, waits);
             }
             class_counts = {};
             last_log_ns = now;
@@ -2388,18 +2398,26 @@ void Rasterizer::RecordIndexBuffer(IndexBind& ib, VideoCore::BufferCache::Upload
     }
 }
 
+static std::mutex g_job_pool_mutex;
+
 std::vector<std::unique_ptr<Rasterizer::DrawJob>>& Rasterizer::DrawJobPool() {
-    static thread_local std::vector<std::unique_ptr<DrawJob>> pool;
+    static std::vector<std::unique_ptr<DrawJob>> pool; // (a job is taken by the resolver and given back by the recorder: one pool, one lock)
     return pool;
 }
 
 std::unique_ptr<Rasterizer::DrawJob> Rasterizer::TakeDrawJob() {
     auto& pool = DrawJobPool();
-    if (pool.empty()) {
+    std::unique_ptr<DrawJob> job;
+    {
+        std::scoped_lock lock{g_job_pool_mutex};
+        if (!pool.empty()) {
+            job = std::move(pool.back());
+            pool.pop_back();
+        }
+    }
+    if (!job) {
         return std::make_unique<DrawJob>();
     }
-    std::unique_ptr<DrawJob> job = std::move(pool.back());
-    pool.pop_back();
     DrawJob* raw = job.get();
     std::destroy_at(raw);
     std::construct_at(raw);
@@ -2418,7 +2436,8 @@ void Rasterizer::RunDrawJob(std::unique_ptr<DrawJob>&& job) {
     VideoCore::OpSequence::recording = job->op_seq;
     RecordDraw(*job);
     VideoCore::OpSequence::recording = 0;
-    if (pool.size() < 64) {
+    std::scoped_lock lock{g_job_pool_mutex};
+    if (pool.size() < 256) {
         pool.push_back(std::move(job));
     }
 }

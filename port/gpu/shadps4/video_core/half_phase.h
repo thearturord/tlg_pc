@@ -2,10 +2,15 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <mutex>
+#include <thread>
 #include <vector>
 
+#include "common/thread.h"
 #include "common/types.h"
 #include "common/unique_function.h"
 
@@ -53,24 +58,77 @@ struct ResolveCommands {
 struct RecordQueue {
     enum Reason : u32 { NonDraw, Closure, Callbacks, Idle, Commands, Transit, Backing, SchedulerApi, SchedulerDefer, FreeImage, Diagnostics, Other, ReasonCount };
     static constexpr const char* names[ReasonCount] = {"non-draw op", "closure", "callbacks", "idle", "commands", "transit", "backing swap", "scheduler api", "scheduler defer", "free image", "diagnostics", "other"};
-    static inline thread_local std::deque<Common::UniqueFunction<void>> jobs;
-    static inline thread_local bool executing{false};
+    static inline thread_local std::deque<Common::UniqueFunction<void>> jobs; ///< same-thread mode
+    static inline thread_local bool executing{false};                         ///< true while a queued job runs (always on the recorder thread)
     static inline thread_local bool disabled{false};
     static inline std::atomic<u64> posted{0}, ran{0}, max_depth{0};
-    static inline std::atomic<u64> drains[ReasonCount]{}, drained_jobs[ReasonCount]{};
+    static inline std::atomic<u64> drains[ReasonCount]{}, drained_jobs[ReasonCount]{}, drain_wait_ns[ReasonCount]{}, post_wait_ns{0}, worker_idle_ns{0}, worker_busy_ns{0};
+
+    /// `TLG_SPLIT_THREAD=1` (with TLG_SPLIT_BIND=1): the record half runs on its own thread (`shadPS4:GpuRecord`), the queue is shared and bounded by `Lag()`.
+    static bool Threaded() noexcept {
+        static const bool on = [] {
+            const char* e = std::getenv("TLG_SPLIT_THREAD");
+            return ResolveCommands::SplitMode() == 1 && e != nullptr && *e == '1';
+        }();
+        return on;
+    }
     static u32 Lag() noexcept {
         static const u32 lag = [] {
             if (ResolveCommands::SplitMode() != 1) {
                 return 0u;
             }
             const char* e = std::getenv("TLG_SPLIT_QUEUE");
-            return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u;
+            if (e != nullptr) {
+                return static_cast<u32>(std::atoi(e));
+            }
+            return Threaded() ? 64u : 0u;
         }();
         return lag;
     }
     static bool Enabled() noexcept {
         return Lag() != 0 && !disabled;
     }
+
+    // ---- thread mode
+    static inline std::mutex mutex;
+    static inline std::condition_variable work_cv, done_cv;
+    static inline std::deque<Common::UniqueFunction<void>> shared;
+    static inline std::atomic<u64> done{0};
+    static inline std::atomic<bool> started{false};
+    static inline std::thread::id resolver_id{};
+    /// Draws wait (posted and not yet run). Meaningful on the resolver thread; elsewhere it only says "something is in flight".
+    static bool Pending() noexcept {
+        if (Threaded()) {
+            return posted.load(std::memory_order_relaxed) != done.load(std::memory_order_acquire);
+        }
+        return !jobs.empty();
+    }
+    static void WorkerMain() {
+        Common::SetCurrentThreadName("shadPS4:GpuRecord");
+        executing = true;
+        while (true) {
+            Common::UniqueFunction<void> work;
+            {
+                const auto idle_start = std::chrono::steady_clock::now();
+                std::unique_lock lock{mutex};
+                work_cv.wait(lock, [] { return !shared.empty(); });
+                worker_idle_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - idle_start).count(), std::memory_order_relaxed);
+                work = std::move(shared.front());
+                shared.pop_front();
+            }
+            const auto busy_start = std::chrono::steady_clock::now();
+            work();
+            work = {};
+            worker_busy_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - busy_start).count(), std::memory_order_relaxed);
+            ran.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::scoped_lock lock{mutex};
+                done.fetch_add(1, std::memory_order_release);
+            }
+            done_cv.notify_all();
+        }
+    }
+
     static void RunOne() {
         auto work = std::move(jobs.front());
         jobs.pop_front();
@@ -80,6 +138,24 @@ struct RecordQueue {
         ran.fetch_add(1, std::memory_order_relaxed);
     }
     static void Post(Common::UniqueFunction<void>&& work) {
+        if (Threaded()) {
+            if (!started.exchange(true)) {
+                resolver_id = std::this_thread::get_id();
+                std::thread{WorkerMain}.detach();
+            }
+            const auto wait_start = std::chrono::steady_clock::now();
+            std::unique_lock lock{mutex};
+            done_cv.wait(lock, [] { return posted.load(std::memory_order_relaxed) - done.load(std::memory_order_relaxed) < Lag(); });
+            post_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start).count(), std::memory_order_relaxed);
+            shared.push_back(std::move(work));
+            const u64 depth = posted.fetch_add(1, std::memory_order_relaxed) + 1 - done.load(std::memory_order_relaxed);
+            if (depth > max_depth.load(std::memory_order_relaxed)) {
+                max_depth.store(depth, std::memory_order_relaxed);
+            }
+            lock.unlock();
+            work_cv.notify_one();
+            return;
+        }
         jobs.push_back(std::move(work));
         posted.fetch_add(1, std::memory_order_relaxed);
         if (jobs.size() > max_depth.load(std::memory_order_relaxed)) {
@@ -89,9 +165,28 @@ struct RecordQueue {
             RunOne();
         }
     }
-    /// Runs everything that waits (nothing, from inside a running job: everything older is done already).
+    /// Runs (or waits for) everything that waits. Nothing from inside a running job (everything older is done already) and nothing from a thread that is not the resolver.
     static void Drain(Reason reason) {
-        if (executing || jobs.empty()) {
+        if (executing) {
+            return;
+        }
+        if (Threaded()) {
+            if (!started.load(std::memory_order_acquire) || std::this_thread::get_id() != resolver_id) {
+                return;
+            }
+            const u64 target = posted.load(std::memory_order_relaxed);
+            if (done.load(std::memory_order_acquire) == target) {
+                return;
+            }
+            drains[reason].fetch_add(1, std::memory_order_relaxed);
+            drained_jobs[reason].fetch_add(target - done.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            const auto wait_start = std::chrono::steady_clock::now();
+            std::unique_lock lock{mutex};
+            done_cv.wait(lock, [target] { return done.load(std::memory_order_relaxed) >= target; });
+            drain_wait_ns[reason].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start).count(), std::memory_order_relaxed);
+            return;
+        }
+        if (jobs.empty()) {
             return;
         }
         drains[reason].fetch_add(1, std::memory_order_relaxed);
@@ -101,7 +196,7 @@ struct RecordQueue {
         }
     }
     static void Guard(Reason reason) {
-        if (!jobs.empty() && !executing) {
+        if (!executing && Pending()) {
             Drain(reason);
         }
     }
