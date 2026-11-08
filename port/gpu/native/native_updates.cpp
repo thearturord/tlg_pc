@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "native/native_switch.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -248,16 +249,14 @@ std::array<std::atomic<u64>, BufferIdCounts> buffer_id_counts{};
 
 u32 BufferIdMode() noexcept {
     static const u32 mode = [] {
-        const char* e = std::getenv("TLG_BUFFER_ID");
-        return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u;
+        return SwitchValue("TLG_BUFFER_ID", 1);
     }();
     return mode;
 }
 
 u32 ApplyCoalesceMode() noexcept {
     static const u32 mode = [] {
-        const char* e = std::getenv("TLG_APPLY_COALESCE");
-        return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u;
+        return SwitchValue("TLG_APPLY_COALESCE", 1);
     }();
     return mode;
 }
@@ -295,8 +294,7 @@ void SetMergeCheck(bool (*fn)(void*, u64, u64, u64, const AnnouncedPiece*, size_
 
 u32 SyncByIdMode() noexcept {
     static const u32 mode = [] {
-        const char* e = std::getenv("TLG_SYNC_BY_ID");
-        return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u;
+        return SwitchValue("TLG_SYNC_BY_ID", 1);
     }();
     return mode;
 }
@@ -372,8 +370,7 @@ u32 AnnounceSkipOn() noexcept {
 /// 2: shadow, the gate runs as before and counts every trusted range whose memory changed between its two applications (`TRUSTED_WRONG_MUST_BE_0`).
 u32 AgainSkipMode() noexcept {
     static const u32 mode = [] {
-        const char* e = std::getenv("TLG_AGAIN_SKIP");
-        return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u;
+        return SwitchValue("TLG_AGAIN_SKIP", 1);
     }();
     return mode;
 }

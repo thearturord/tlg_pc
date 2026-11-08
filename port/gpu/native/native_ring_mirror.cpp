@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "native/native_ring_mirror.h"
+#include "native/native_switch.h"
 
 #include <algorithm>
 #include <array>
@@ -271,8 +272,7 @@ void TraceStep(u32 now) {
 
 u32 Mode() noexcept {
     static const u32 mode = [] {
-        const char* e = std::getenv("TLG_RING_MIRROR");
-        return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u;
+        return SwitchValue("TLG_RING_MIRROR", 1);
     }();
     return mode;
 }
@@ -296,8 +296,7 @@ std::atomic<u64> real_windows{0}, real_window_bytes{0}, real_uploaded_whole{0}, 
 
 u32 FillMode() noexcept {
     static const u32 mode = [] {
-        const char* e = std::getenv("TLG_RING_FILL");
-        return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u;
+        return SwitchValue("TLG_RING_FILL", 1);
     }();
     return mode;
 }
