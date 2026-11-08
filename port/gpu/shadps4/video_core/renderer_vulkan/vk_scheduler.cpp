@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <algorithm>
 #include <chrono>
 #include <mutex>
 #include <unordered_map>
@@ -18,6 +22,7 @@
 #include "video_core/renderer_vulkan/vk_gpu_time.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/buffer_cache/buffer.h"
 #include "native/native_prof.h"
 
 #include "video_core/renderer_vulkan/vk_indexed_data.h"
@@ -456,29 +461,63 @@ void SchedulerCore::EncoderThread(std::stop_token stoken) {
     }
 }
 
-void Scheduler::VerifyEpoch(u64 count, u64 tick) {
-    // Plan S step P3a oracle: the logical submission count and the tick must change together (a pair seen before names the same command buffer, and the other way round).
+void Scheduler::VerifyEpoch(u64 count, u64 tick, u64 unplanned) {
+    // Plan S step P3b oracle: the tick runs ahead of the logical count by exactly the flushes the recorder made on its own. For one count, every tick seen differs from the first
+    // by the unplanned flushes made between; one tick never belongs to two counts.
     static std::mutex mutex;
-    static std::unordered_map<u64, u64> tick_of_count, count_of_tick;
-    static u64 checked = 0, differ = 0;
+    struct First {
+        u64 tick, unplanned;
+    };
+    static std::unordered_map<u64, First> first_of_count;
+    static std::unordered_map<u64, u64> count_of_tick;
+    static u64 checked = 0, differ = 0, coarse = 0;
     std::scoped_lock lock{mutex};
-    const auto [a, a_new] = tick_of_count.emplace(count, tick);
+    const auto [a, a_new] = first_of_count.emplace(count, First{tick, unplanned});
     const auto [b, b_new] = count_of_tick.emplace(tick, count);
-    bool bad = (!a_new && a->second != tick) || (!b_new && b->second != count);
-    if (tick_of_count.size() > 4096) { // old pairs are never read again: the numbers only grow
-        tick_of_count.clear();
+    bool bad = !b_new && b->second != count;
+    if (!a_new) {
+        bad |= (tick - a->second.tick) != (unplanned - a->second.unplanned);
+        coarse += tick != a->second.tick ? 1 : 0;
+    }
+    if (first_of_count.size() > 4096) { // old entries are never read again: the numbers only grow
+        first_of_count.clear();
         count_of_tick.clear();
     }
     ++checked;
     if (bad && differ++ < 20) {
-        LOG_WARNING(Render_Vulkan, "split bind verify: epoch {} and tick {:#x} do not change together", count, tick);
+        LOG_WARNING(Render_Vulkan, "split bind verify: epoch {} and tick {:#x} do not fit ({} flushes of the recorder's own)", count, tick, unplanned);
     }
     if ((checked & (checked - 1)) == 0) {
-        LOG_WARNING(Render_Vulkan, "split bind verify: {} epoch reads, {} differ", checked, differ);
+        LOG_WARNING(Render_Vulkan, "split bind verify: {} epoch reads, {} differ ({} reads where the tick had moved on inside one epoch)", checked, differ, coarse);
     }
 }
 
 void SchedulerCore::SubmitExecution(SubmitInfo& info) {
+    {
+        // Plan S step P3b census (TLG_FLUSH_CENSUS=1): who makes a submission, in an operation (between BindResources and ResetBindings) or outside, and on which thread
+        static const bool census_on = [] { const char* e = std::getenv("TLG_FLUSH_CENSUS"); return e != nullptr && *e == '1'; }();
+        if (census_on) {
+            static std::mutex census_mutex;
+            static std::unordered_map<std::string, u64> census;
+            static u64 total = 0;
+            const bool in_op = VideoCore::OpSequence::resolving.load(std::memory_order_relaxed) != VideoCore::OpSequence::retired.load(std::memory_order_relaxed);
+            std::string key = fmt::format("stream {} {} thread {} rva: {}", stream_id, in_op ? "IN-OPERATION" : "outside", Common::GetCurrentThreadName(), Core::NativeOcclusion::CallerRvas(1, 8));
+            std::scoped_lock lock{census_mutex};
+            ++census[key];
+            ++total;
+            if (total >= 256 && (total & (total - 1)) == 0) {
+                std::vector<std::pair<u64, const std::string*>> order;
+                for (const auto& [text, count] : census) {
+                    order.emplace_back(count, &text);
+                }
+                std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                LOG_WARNING(Render_Vulkan, "flush census: {} submissions, {} different callers", total, order.size());
+                for (size_t i = 0; i < order.size() && i < 14; ++i) {
+                    LOG_WARNING(Render_Vulkan, "flush census: x{} {}", order[i].first, *order[i].second);
+                }
+            }
+        }
+    }
     Core::Flight::Add(Core::Flight::QueueSubmit, 0, info.num_signal_semas != 0 ? info.signal_ticks[0] : 0, stream_id); // L1
     if (Core::NativeOcclusion::query_open.load(std::memory_order_acquire) != 0) {
         Core::NativeOcclusion::NoteSubmitDuringQuery(stream_id); // diagnostic (side stream hunt)

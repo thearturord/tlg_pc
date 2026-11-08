@@ -188,7 +188,7 @@ void Rasterizer::MaybeFlushRecorded() {
         if (Core::NativeOcclusion::query_open.load(std::memory_order_acquire) != 0) {
             return; // a submit now would end the command buffer inside an occlusion query (begun and ended in different command buffers: invalid, device lost)
         }
-        scheduler.Flush();
+        scheduler.FlushUnplanned(); // P3b: the only submission the recorder makes on its own; the logical count does not move
     }
 }
 

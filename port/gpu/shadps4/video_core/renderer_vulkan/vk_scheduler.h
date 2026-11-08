@@ -573,10 +573,26 @@ public:
     [[nodiscard]] u64 SubmitCount() const noexcept {
         return submit_count.load(std::memory_order_acquire);
     }
+    /// Plan S step P3b: only submissions the stream of operations asks for advance the count (a fence, a flip, an explicit Flush or Finish: closures, in the order of the
+    /// queue). A flush the recorder makes on its own (`UnplannedScope`: the recorded command limit of `MaybeFlushRecorded`) changes the tick but not the count, because the
+    /// resolve side cannot know when it happens. Every user of the count only asks "the same game submission as before?", which an extra command buffer split does not change.
     void NoteSubmission() noexcept {
+        if (unplanned_scope != 0) {
+            unplanned_submits.fetch_add(1, std::memory_order_acq_rel);
+            return;
+        }
         submit_count.fetch_add(1, std::memory_order_acq_rel);
     }
+    [[nodiscard]] u64 UnplannedSubmits() const noexcept {
+        return unplanned_submits.load(std::memory_order_acquire);
+    }
+    struct UnplannedScope {
+        UnplannedScope() noexcept { ++unplanned_scope; }
+        ~UnplannedScope() { --unplanned_scope; }
+    };
+    static inline thread_local u32 unplanned_scope = 0;
     std::atomic<u64> submit_count{1};
+    std::atomic<u64> unplanned_submits{0};
 
     /// Returns true when a tick has been triggered by the GPU.
     [[nodiscard]] bool IsFree(u64 tick) noexcept {
@@ -950,10 +966,17 @@ public:
             return count;
         }
         const u64 tick = CurrentTick();
-        VerifyEpoch(count, tick);
+        if (!on_side) {
+            VerifyEpoch(count, tick, gfx.UnplannedSubmits());
+        }
         return tick;
     }
-    void VerifyEpoch(u64 count, u64 tick);
+    void VerifyEpoch(u64 count, u64 tick, u64 unplanned);
+    /// The flush of the recorder's own command limit (see NoteSubmission): it does not move the logical submission count.
+    void FlushUnplanned() {
+        SchedulerCore::UnplannedScope scope;
+        Flush();
+    }
     /// The graphics stream's semaphore (presentation waits on it).
     [[nodiscard]] Semaphore* GetWorkSemaphore() noexcept {
         return gfx.GetWorkSemaphore();
