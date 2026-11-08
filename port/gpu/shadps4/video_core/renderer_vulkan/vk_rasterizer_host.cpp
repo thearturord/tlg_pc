@@ -7,6 +7,7 @@
 
 #include "native/native_debug_server.h"
 #include "native/native_device.h"
+#include "native/native_n0_census.h"
 #include "native/native_resources.h"
 #include "native/native_updates.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -119,6 +120,9 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
                            {"index_ring", c[27]}, {"index_by_engine_handle", c[28]}, {"index_by_address", c[29]}};
         out["note"] = "C0 census, counts per ~5 s interval (read only)";
         Core::DebugServer::Publish("consumer_census", std::move(out));
+        if (Core::N0::On()) {
+            Core::DebugServer::Publish("n0_census", Core::N0::Report());
+        }
         const auto r = TakeResolveStats();
         Core::DebugServer::Publish("native_backend", {{"buffers_resolved_by_the_command_processor", r[0]}, {"bound_from_the_resolution", r[1]},
                                                       {"resolution_stale_at_bind", r[2]},

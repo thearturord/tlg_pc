@@ -19,6 +19,7 @@
 #include "native/native_config.h"
 #include "native/native_device.h"
 #include "native/native_draw.h"
+#include "native/native_n0_census.h"
 #include "native/native_readbacks.h"
 #include "native/native_registry.h"
 #include "native/native_updates.h"
@@ -285,6 +286,7 @@ u64 BufferCache::PreSynchronize(VAddr device_addr, u64 size) {
     }
     last_upload_bytes = 0;
     Core::NativeUploads::SetPreSyncActive(true);
+    Core::N0::SetSyncSite(Core::N0::SyncPre);
     SynchronizeMemory(arena, device_addr, static_cast<u32>(size), false, false);
     Core::NativeUploads::SetPreSyncActive(false);
     return last_upload_bytes;
@@ -685,7 +687,11 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
                 const u32 generation = immutable->generation.load(std::memory_order_acquire);
                 const u32 gpu_writes = immutable->gpu_writes.load(std::memory_order_acquire);
                 const auto [data, at] = CopyRing().Map(whole, instance.UniformMinAlignment());
-                memory->CopySparseMemory(immutable->begin, data, whole);
+                {
+                    Core::N0::CopyScope n0{Core::N0::CopyObject, immutable->begin, whole};
+                    memory->CopySparseMemory(immutable->begin, data, whole);
+                    n0.Done(data);
+                }
                 // M2: the bytes of the record's submission; a copy that was corrected must not be reused by a later generation's check, so it records a generation nobody has
                 const bool corrected = Core::NativeContent::FrameStoreServe(Core::NativeContent::LateKind::BufferObjectCopy, immutable->begin, data, whole) != 0;
                 Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::BufferObjectCopy, immutable->begin, whole);
@@ -738,6 +744,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             const u32 whole = static_cast<u32>(immutable->end - immutable->begin);
             const auto* arena = BufferFor(immutable->begin, immutable->end - immutable->begin);
             last_upload_bytes = 0;
+            Core::N0::SetSyncSite(Core::N0::SyncImmutable);
             SynchronizeMemory(arena, immutable->begin, whole, false, false);
             Core::NativeContent::SilentSynced(0, immutable->begin, whole); // W1.5 census
             // R1: the object keeps where it is resident (read by the command processor's binding resolution once `synced` is set)
@@ -784,7 +791,11 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             }
         }
         const auto [data, offset] = CopyRing().Map(size, instance.UniformMinAlignment());
-        memory->CopySparseMemory(device_addr, data, size);
+        {
+            Core::N0::CopyScope n0{Core::N0::CopyStream, device_addr, size};
+            memory->CopySparseMemory(device_addr, data, size);
+            n0.Done(data);
+        }
         Core::NativeContent::FrameStoreServe(Core::NativeContent::LateKind::BufferStreamCopy, device_addr, data, size); // M2
         Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::BufferStreamCopy, device_addr, size);
         CopyRing().Commit();
@@ -824,6 +835,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
     const auto* arena = BufferFor(device_addr, size, true, is_written); // B9.4: a placed engine buffer's own Vulkan buffer, or the arena
     for_scope.End();
     last_upload_bytes = 0;
+    Core::N0::SetSyncSite(is_written ? Core::N0::SyncArenaWritten : is_texel_buffer ? Core::N0::SyncArenaTexel : Core::N0::SyncArenaRead);
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     TLG_PROF_NAMED_LEVEL(post_scope, "buffer.part.after_sync", 3);
     if (last_upload_bytes != 0) {
@@ -877,7 +889,11 @@ u32 BufferCache::WaitForExplicitDownloads(VAddr device_addr, u64 size, u32 timeo
 
 std::pair<const Buffer*, u64> BufferCache::StreamCopy(VAddr device_addr, u32 size) {
     const auto [data, offset] = CopyRing().Map(size, instance.UniformMinAlignment());
-    memory->CopySparseMemory(device_addr, data, size);
+    {
+        Core::N0::CopyScope n0{Core::N0::CopyStreamFn, device_addr, size};
+        memory->CopySparseMemory(device_addr, data, size);
+        n0.Done(data);
+    }
     CopyRing().Commit();
     return {&CopyRing(), offset};
 }
@@ -885,6 +901,7 @@ std::pair<const Buffer*, u64> BufferCache::StreamCopy(VAddr device_addr, u32 siz
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForDownload(VAddr device_addr, u32 size) {
     const auto* arena = BufferFor(device_addr, size);
     last_upload_bytes = 0;
+    Core::N0::SetSyncSite(Core::N0::SyncDownload);
     SynchronizeMemory(arena, device_addr, size, false, false);
     Core::NativeResources::NoteBufferRequest(device_addr, size, false, Core::NativeResources::BufferPath::Arena, last_upload_bytes);
     return {arena, arena->Offset(device_addr)};
@@ -903,7 +920,11 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     last_image_source_gpu = false;
     const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
                                               instance.StorageMinAlignment());
-    memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
+    {
+        Core::N0::CopyScope n0{Core::N0::CopyForImage, device_addr, staging.size};
+        memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
+        n0.Done(staging.mapped);
+    }
     Core::NativeContent::CheckUploadMemory(device_addr, size); // F2.5: outside the ring, was the memory written after the draw's record?
     Core::NativeContent::OverlayImage(device_addr, size, staging.mapped); // F2.2 swap (TLG_F2_RING_STORE=1): ring bytes as announced, not as the ring holds them now
     staging.Flush();
@@ -1085,6 +1106,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                                     bool is_written, bool is_texel_buffer) {
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseBufResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::BufSync);
+    Core::N0::SyncScope n0_sync{size, last_upload_bytes};
     if (arena != nullptr) {
         const_cast<Buffer*>(arena)->NoteResolveUse(); // P3c: whoever synchronizes an arena asks for it in this operation
     }
@@ -1112,6 +1134,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     s_placed.End();
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
+    u32 n0_cause = 0; // N0 census: why the next piece is uploaded
     const auto add_piece = [&](u64 addr, u64 copy_size) {
         {
             // B9.4: a placed engine buffer takes only the memory it holds (a page range of the tracker, or a read past its end into the slack, can reach beyond)
@@ -1122,6 +1145,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             addr = lo;
             copy_size = hi - lo;
         }
+        Core::N0::NoteCause(n0_cause, copy_size);
         copies.emplace_back(total_size_bytes, addr, copy_size);
         total_size_bytes += copy_size;
     };
@@ -1275,6 +1299,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
         for (const auto& [lo, n] : from_announced) {
             Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4AnnouncedUploads, n);
+            n0_cause = 2;
             add_copy(lo, n);
         }
         if (!from_announced.empty()) {
@@ -1303,6 +1328,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             auto& done = ring_uploads[(lo >> 6) & 255];
             const u64 tick = Vulkan::Scheduler::SideSelected() ? (side_upload_epoch | Vulkan::Scheduler::SideTag) : scheduler.ResolveEpoch();
             if (done.tick != tick || done.lo > lo || done.hi < hi) {
+                n0_cause = 0;
                 add_copy(lo, hi - lo);
                 Core::NativeUploads::NoteRingUpload(hi - lo);
                 Core::Flight::Add(Core::Flight::Upload, 0, lo, hi - lo, 1); // L1
@@ -1327,6 +1353,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 continue;
             }
             // native: the announced bytes are the upload (outside the part the untracked ring uploads whole)
+            n0_cause = 1;
             const u64 end = a + n;
             if (ring_lo < ring_hi && a < ring_hi && ring_lo < end) {
                 if (a < ring_lo) {
@@ -1382,7 +1409,11 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             u8* const base = const_cast<u8*>(arena->mapped_data.data());
             for (const auto& copy : copies) {
                 u8* const dst = base + (copy.dstOffset - arena->cpu_addr);
-                memory->CopySparseMemory(copy.dstOffset, dst, copy.size);
+                {
+                    Core::N0::CopyScope n0{Core::N0::CopyZeroDirect, copy.dstOffset, copy.size};
+                    memory->CopySparseMemory(copy.dstOffset, dst, copy.size);
+                    n0.Done(dst);
+                }
                 // M2b: the announced bytes are those of the submission being worked on (the raster thread applies announcements in order), so the game having run ahead is undone here
                 Core::NativeContent::FrameStoreServe(Core::NativeContent::LateKind::BufferArenaSync, copy.dstOffset, dst, copy.size);
             }
@@ -1401,7 +1432,11 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     if (!copies.empty()) {
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
         for (auto& copy : copies) {
-            memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
+            {
+                Core::N0::CopyScope n0{Core::N0::CopyStaging, copy.dstOffset, copy.size};
+                memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
+                n0.Done(staging.mapped + copy.srcOffset);
+            }
             Core::NativeContent::FrameStoreServe(Core::NativeContent::LateKind::BufferArenaSync, copy.dstOffset, staging.mapped + copy.srcOffset, copy.size); // M2b
             copy.srcOffset += staging.offset;
             copy.dstOffset -= arena->cpu_addr;
@@ -1430,6 +1465,7 @@ void BufferCache::RunDeferredUploads(UploadSink& sink) {
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {
+    Core::N0::FromImageScope n0_image;
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseBufResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::BufSync);
     if (const auto meta = texture_cache.GetMetaInfo(device_addr)) {
@@ -1490,6 +1526,7 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
         return false;
     }
     auto& tile_manager = texture_cache.GetTileManager();
+    n0_image.tiled = true;
     tile_manager.TileImage(image, buffer_copies, arena, arena_offset);
     return true;
 }

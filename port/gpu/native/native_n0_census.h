@@ -1,0 +1,113 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Plan N+T, step N0 (documents/tlg/native plan/native-path-and-threads-plan.md): the census of the emulation-shaped data path. Counters only, no behaviour change.
+//
+// Off by default (`TLG_N0_CENSUS=1`). It answers three questions on the raster thread:
+//   1. SynchronizeMemory: per caller site, how many calls, how much of the time is spent in calls that upload nothing (pure guessing) and how much in calls that copy.
+//   2. CopySparseMemory (the page walk of the guest memory): per caller site, calls, bytes, time, and how many copies carry exactly the bytes the previous copy at the same
+//      address carried (an announced write that changed nothing).
+//   3. The announcements: sizes of the applied ranges (a cheap size histogram; the writer split is in /native).
+// The report is published as `n0_census` (cumulative, with the seconds since the first count; take two reads for rates).
+
+#pragma once
+
+#include <chrono>
+
+#include <nlohmann/json_fwd.hpp>
+
+#include "common/types.h"
+
+namespace Core::N0 {
+
+enum SyncSite : u32 {
+    SyncImmutable = 0, ///< an engine buffer synchronized whole (not resident yet)
+    SyncArenaRead,     ///< a read-only request that goes through the arena / placed buffer
+    SyncArenaWritten,  ///< a request the shader writes
+    SyncArenaTexel,    ///< a texel buffer request
+    SyncDownload,      ///< ObtainBufferForDownload
+    SyncPre,           ///< announced uploads before the draws (off by default)
+    SyncSiteCount,
+};
+
+enum CopySite : u32 {
+    CopyObject = 0,   ///< the once-per-generation copy of a whole engine buffer into the stream ring
+    CopyStream,       ///< a small read-only range copied into the stream ring
+    CopyStreamFn,     ///< StreamCopy() while a pass is open
+    CopyForImage,     ///< bytes read for an image upload
+    CopyZeroDirect,   ///< SynchronizeMemory, straight into video memory
+    CopyStaging,      ///< SynchronizeMemory, through a staging buffer
+    CopySiteCount,
+};
+
+extern bool g_on;
+extern thread_local SyncSite t_sync_site;
+extern thread_local u64 t_hash_ns; ///< time the census itself spent hashing on this thread (taken out of the sync times)
+
+[[nodiscard]] inline bool On() noexcept {
+    return g_on;
+}
+
+[[nodiscard]] inline u64 NowNs() noexcept {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void NoteSync(SyncSite site, u64 requested, u64 uploaded, u64 ns) noexcept;
+void NoteCopy(CopySite site, u64 address, u64 size, u64 ns, const void* data) noexcept;
+void NoteApplied(u64 size, bool again) noexcept;
+/// Why bytes were uploaded: 0 the frame ring part is uploaded whole (nobody announced what changed), 1 the announced bytes of an engine buffer, 2 announced bytes of memory no engine buffer holds.
+void NoteCause(u32 cause, u64 bytes) noexcept;
+void NoteFromImage(u64 ns, bool tiled) noexcept;
+[[nodiscard]] nlohmann::json Report();
+
+/// Times one SynchronizeMemory call. `uploaded` is the thread's upload counter (it is reset by the caller before the call), read again at the end.
+struct SyncScope {
+    SyncSite site;
+    u64 requested;
+    const u64& uploaded;
+    u64 before;
+    u64 start;
+    u64 hash_before;
+    SyncScope(u64 requested_, const u64& uploaded_) noexcept : site(t_sync_site), requested(requested_), uploaded(uploaded_), before(uploaded_), start(g_on ? NowNs() : 0), hash_before(t_hash_ns) {}
+    ~SyncScope() {
+        if (start != 0) {
+            NoteSync(site, requested, uploaded - before, NowNs() - start - (t_hash_ns - hash_before));
+            t_sync_site = SyncArenaRead;
+        }
+    }
+};
+
+/// Times SynchronizeMemoryFromImage (the texel buffer path: a buffer whose memory is an image).
+struct FromImageScope {
+    u64 start;
+    bool tiled{false};
+    FromImageScope() noexcept : start(g_on ? NowNs() : 0) {}
+    ~FromImageScope() {
+        if (start != 0) {
+            NoteFromImage(NowNs() - start, tiled);
+        }
+    }
+};
+
+/// Sets the caller site of the next SynchronizeMemory call on this thread.
+inline void SetSyncSite(SyncSite site) noexcept {
+    if (g_on) {
+        t_sync_site = site;
+    }
+}
+
+/// Times one CopySparseMemory call; `Done(data)` after the copy lets the census hash the bytes.
+struct CopyScope {
+    CopySite site;
+    u64 address, size, start;
+    const void* data{nullptr};
+    CopyScope(CopySite site_, u64 address_, u64 size_) noexcept : site(site_), address(address_), size(size_), start(g_on ? NowNs() : 0) {}
+    void Done(const void* data_) noexcept {
+        data = data_;
+    }
+    ~CopyScope() {
+        if (start != 0) {
+            NoteCopy(site, address, size, NowNs() - start, data);
+        }
+    }
+};
+
+} // namespace Core::N0

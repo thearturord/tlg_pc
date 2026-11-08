@@ -18,6 +18,7 @@
 #endif
 #include <nlohmann/json.hpp>
 #include "native/native_hooks.h"
+#include "native/native_n0_census.h"
 #include "native/native_draw.h"
 #include "native/native_registry.h"
 #include "native/native_resources.h"
@@ -500,6 +501,7 @@ void ApplyBatch(const Batch& batch) {
                     ++index;
                     u64 now = 0;
                     bool unchanged = false;
+                    N0::NoteApplied(size, true);
                     {
                         TLG_PROF_LEVEL("updates.again_hash", 3); // D2: the hash that decides whether a range is applied a second time
                         unchanged = before.ok && before.address == address && before.size == size && NativeContent::HashGuarded64(address, size, now) && now == before.hash;
@@ -541,6 +543,7 @@ void ApplyBatch(const Batch& batch) {
         }
     }
     const auto first_one = [&](u64 address, u64 size, bool plain) {
+        N0::NoteApplied(size, false);
         FirstHash h{address, size, 0, false};
         if (hash_here && size != 0 && size <= (u64{1} << 20)) {
             h.ok = NativeContent::HashGuarded64(address, size, h.hash);
