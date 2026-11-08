@@ -561,7 +561,12 @@ private:
     bool BindTexturesFromSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count,
                              Shader::Backend::Bindings& binding);
     bool ResolveTextureSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count, TextureResolved& r);
-    bool BindResources(const Pipeline* pipeline, const FixedState* fixed = nullptr);
+    /// Plan S step P3e.2: the plain data a graphics draw carries from its resolve half to its record half (render pass, vertex buffers, index buffer).
+    struct DrawJob;
+    static bool RenderStateMemoEnabled();
+    void ResolveDrawJob(const GraphicsPipeline* pipeline, DrawJob& job);
+    RenderState RecordDrawJob(DrawJob& job);
+    bool BindResources(const Pipeline* pipeline, const FixedState* fixed = nullptr, DrawJob* draw_job = nullptr);
     void BindCensus(const Pipeline* pipeline);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);

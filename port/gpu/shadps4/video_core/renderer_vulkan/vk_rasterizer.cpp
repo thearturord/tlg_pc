@@ -656,6 +656,45 @@ struct UiCopyPending {
 std::vector<UiCopyPending> ui_copies_pending;
 } // namespace
 
+struct Rasterizer::VertexBind {
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    VertexInputs<vk::Buffer> host_buffers;
+    VertexInputs<vk::DeviceSize> host_offsets;
+    VertexInputs<vk::DeviceSize> host_sizes;
+    VertexInputs<vk::DeviceSize> host_strides;
+    struct Query {
+        const VideoCore::Buffer* buffer;
+        u64 offset;
+        u64 size;
+    };
+    boost::container::small_vector<Query, 4> queries; ///< barrier queries and bound buffers, asked by the record half
+};
+
+struct Rasterizer::IndexBind {
+    vk::Buffer buffer{};
+    u64 offset{};
+    u32 size{};
+    vk::IndexType type{};
+    const VideoCore::Buffer* query_buffer{nullptr};
+    u64 query_offset{};
+    u64 query_size{};
+};
+
+/// Plan S step P3e.2: everything the resolve half decides for a graphics draw besides its stages, as plain data: the render pass, the vertex buffers, the index buffer.
+/// The record half (`RecordDrawJob`) turns it into commands; nothing in it is a pointer to something the resolver may change before then, except the image and buffer objects
+/// that the engine keeps alive until the work is recorded.
+struct Rasterizer::DrawJob {
+    const DrawPlan* plan{nullptr};
+    bool indexed{false};
+    u32 index_offset{0};
+    RenderResolved render;
+    VertexBind vertex;
+    IndexBind index;
+    VideoCore::BufferCache::UploadSink vertex_uploads;
+    VideoCore::BufferCache::UploadSink index_uploads;
+};
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseDraw, engine_clear_on);
     if (SkipForEngineClear() && plan != nullptr) {
@@ -778,21 +817,35 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     binder_plan = NativeBinderFor(plan, tag.valid ? (tag.meta & 0xff) : 15u);
     draw_class_now = tag.valid ? (tag.meta & 0xff) : 15u;
     resolved_draw = binder_plan == plan ? plan : nullptr;
-    const bool bound = BindResources(pipeline, &fixed);
+    // Plan S step P3e.2: with the split on (and the render state memo off) the render pass, the vertex buffers and the index buffer are resolved together with the stages
+    // and recorded after them, in the order the old code bound them
+    const bool hoisted = SplitBindMode() == 1 && !RenderStateMemoEnabled();
+    DrawJob job;
+    if (hoisted) {
+        job.plan = plan;
+        job.indexed = is_indexed;
+        job.index_offset = index_offset;
+    }
+    const bool bound = BindResources(pipeline, &fixed, hoisted ? &job : nullptr);
     resolved_draw = nullptr;
     binder_plan = nullptr;
     draw_class_now = 15;
     if (!bound) {
         return;
     }
-    geometry_plan = plan;
-    const auto state = BeginRendering(pipeline);
+    RenderState state;
+    if (hoisted) {
+        state = RecordDrawJob(job);
+    } else {
+        geometry_plan = plan;
+        state = BeginRendering(pipeline);
 
-    BindVertexBuffers(pipeline);
-    if (is_indexed) {
-        BindIndexBuffer(index_offset);
+        BindVertexBuffers(pipeline);
+        if (is_indexed) {
+            BindIndexBuffer(index_offset);
+        }
+        geometry_plan = nullptr;
     }
-    geometry_plan = nullptr;
 
     const bool pass_barrier = needs_barrier;
     {
@@ -1398,7 +1451,7 @@ void Rasterizer::BindCensus(const Pipeline* pipeline) {
     }
 }
 
-bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed) {
+bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed, DrawJob* draw_job) {
     TLG_PROF_LEVEL("raster.bind_resources", 2);
     VideoCore::OpSequence::resolving.fetch_add(1, std::memory_order_acq_rel); // P3c: a new operation (a draw or a dispatch)
     VideoCore::ResolveCommands::Run();
@@ -1474,6 +1527,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
                 }
                 ResolveTextures(*stage, job.textures);
                 ResolveSamplers(*stage, job.samplers);
+            }
+            if (draw_job != nullptr) {
+                ResolveDrawJob(static_cast<const GraphicsPipeline*>(pipeline), *draw_job);
             }
         }
         {
@@ -1865,21 +1921,6 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
     }
 }
 
-struct Rasterizer::VertexBind {
-    VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
-    VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
-    VertexInputs<vk::Buffer> host_buffers;
-    VertexInputs<vk::DeviceSize> host_offsets;
-    VertexInputs<vk::DeviceSize> host_sizes;
-    VertexInputs<vk::DeviceSize> host_strides;
-    struct Query {
-        const VideoCore::Buffer* buffer;
-        u64 offset;
-        u64 size;
-    };
-    boost::container::small_vector<Query, 4> queries; ///< barrier queries and bound buffers, asked by the record half
-};
-
 void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline, VertexBind& vb) {
     VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Resolve};
     // Plan S step P2: the resolve half of the vertex buffer binding (what is bound where); no command is recorded here
@@ -2101,16 +2142,6 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
     }
 }
 
-struct Rasterizer::IndexBind {
-    vk::Buffer buffer{};
-    u64 offset{};
-    u32 size{};
-    vk::IndexType type{};
-    const VideoCore::Buffer* query_buffer{nullptr};
-    u64 query_offset{};
-    u64 query_size{};
-};
-
 void Rasterizer::ResolveIndexBuffer(u32 index_offset, bool is_indirect, IndexBind& ib) {
     VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Resolve};
     // Plan S step P2: the resolve half of the index buffer binding; no command is recorded here
@@ -2195,6 +2226,42 @@ void Rasterizer::RecordIndexBuffer(IndexBind& ib, VideoCore::BufferCache::Upload
     } else {
         cmdbuf.bindIndexBuffer(ib.buffer, ib.offset, ib.type);
     }
+}
+
+bool Rasterizer::RenderStateMemoEnabled() {
+    // Off by default until it is checked in play (documents/tlg/pc-port-draw-pipeline-architecture.md): TLG_RENDER_STATE_MEMO=1 turns it on.
+    static const bool enabled = [] {
+        const char* env = std::getenv("TLG_RENDER_STATE_MEMO");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
+void Rasterizer::ResolveDrawJob(const GraphicsPipeline* pipeline, DrawJob& job) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
+    TLG_PROF_LEVEL("raster.resolve_geometry", 2);
+    geometry_plan = job.plan;
+    ResolveRenderTargets(pipeline, job.render);
+    VideoCore::BufferCache::SetUploadSink(&job.vertex_uploads);
+    ResolveVertexBuffers(pipeline, job.vertex);
+    VideoCore::BufferCache::SetUploadSink(nullptr);
+    if (job.indexed) {
+        VideoCore::BufferCache::SetUploadSink(&job.index_uploads);
+        ResolveIndexBuffer(job.index_offset, false, job.index);
+        VideoCore::BufferCache::SetUploadSink(nullptr);
+    }
+    geometry_plan = nullptr;
+}
+
+RenderState Rasterizer::RecordDrawJob(DrawJob& job) {
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
+    TLG_PROF_LEVEL("raster.record_geometry", 2);
+    RenderState state = RecordRenderTargets(job.render);
+    RecordVertexBuffers(job.vertex, job.vertex_uploads);
+    if (job.indexed) {
+        RecordIndexBuffer(job.index, job.index_uploads);
+    }
+    return state;
 }
 
 void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
@@ -5007,12 +5074,7 @@ Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     TLG_PROF_LEVEL("raster.begin_rendering", 2);
-    static const bool memo_enabled = [] {
-        // Off by default until it is checked in play (documents/tlg/pc-port-draw-pipeline-architecture.md): TLG_RENDER_STATE_MEMO=1 turns it on.
-        const char* env = std::getenv("TLG_RENDER_STATE_MEMO");
-        return env && env[0] == '1';
-    }();
-    if (!memo_enabled) {
+    if (!RenderStateMemoEnabled()) {
         return BeginRenderingFull(pipeline);
     }
     const auto& regs = *draw_inputs;
