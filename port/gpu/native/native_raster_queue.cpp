@@ -18,6 +18,7 @@
 #include "native/native_prof.h"
 #include "native/native_readback_policy.h"
 #include "native/native_resource_audit.h"
+#include "native/native_pass_census.h"
 #include "native/native_split_census.h"
 #include "native/native_timeline.h"
 #include "video_core/readback_stats.h"
@@ -324,11 +325,17 @@ void Queue::Run(std::stop_token stoken) {
                         sp.ns_depth_only_draws += op_ns;
                         ++sp.n_depth_only_draws;
                     }
+                    if (Core::PassCensus::On() && op.draw_plan) {
+                        Core::PassCensus::NoteDraw(*op.draw_plan, depth_only, op.call.kind == Call::Kind::DrawIndirect);
+                    }
                     if (Core::SplitCensus::On()) {
                         Core::SplitCensus::Record(depth_only ? 1 : 0, ClassBucket(op.audit_class), nullptr, 0, Core::SplitCensus::Current(), op_ns);
                     }
                 } else {
                     sp.ns_dispatches += op_ns;
+                    if (Core::PassCensus::On() && op.dispatch_plan) {
+                        Core::PassCensus::NoteDispatch(*op.dispatch_plan, op.call.kind == Call::Kind::DispatchIndirect);
+                    }
                     sp.ns_class_dispatch[ClassBucket(op.audit_class)] += op_ns;
                     ++sp.n_class_dispatch[ClassBucket(op.audit_class)];
                     if (Core::SplitCensus::On()) {
