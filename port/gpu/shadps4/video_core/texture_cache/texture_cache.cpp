@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/half_phase.h"
 #include <chrono>
 #include <fstream>
 #include <limits>
@@ -1283,24 +1284,36 @@ void TextureCache::RefreshImage(Image& image, Core::ImageCaller caller) {
         return;
     }
 
-    scheduler.EndRendering();
-
     const u64 ui_hash_before = Core::UiTrace::UploadHash(image.info.guest_address, image.info.guest_size);
+    // plan S P3d: with the split on, the upload (the detile, the layout change, the copy) is record side work queued in the order it was decided
+    const bool queue_upload = ResolveCommands::Deferring() && ui_hash_before == 0;
+    if (!queue_upload) {
+        scheduler.EndRendering();
+    }
     TLG_PROF_NAMED_LEVEL(prof_obtain, "texture.refresh.obtain_bytes", 2);
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
     prof_obtain.End();
     Core::NativeCensus::NoteImage(Core::NativeCensus::ImageDetile, image.info.guest_size);
-    TLG_PROF_NAMED_LEVEL(prof_detile, "texture.refresh.detile", 2);
-    const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
-    prof_detile.End();
-    for (auto& copy : image_copies) {
-        copy.bufferOffset += offset;
-    }
-
-    {
+    const auto upload = [this](Image* img, const Buffer* in_buf, u64 in_off, SmallVector<vk::BufferImageCopy, 14> copies) {
+        scheduler.EndRendering();
+        TLG_PROF_NAMED_LEVEL(prof_detile, "texture.refresh.detile", 2);
+        const auto [buffer, offset] = tile_manager.DetileImage(in_buf, in_off, img->info);
+        prof_detile.End();
+        for (auto& copy : copies) {
+            copy.bufferOffset += offset;
+        }
         TLG_PROF_NAMED_LEVEL(prof_upload, "texture.refresh.upload", 2);
-        runtime.UploadImage(&image, buffer, image_copies);
+        runtime.UploadImage(img, buffer, copies);
+    };
+    if (queue_upload) {
+        runtime.SetBackingSamples(&image, image.info.num_samples, false); // the views made next in this resolve half are of this backing
+        image.flags &= ~ImageFlagBits::Dirty; // the flag is the resolve side's: set again by the next write, not by the upload that runs later
+        const Buffer* source = in_buffer;
+        const u64 source_offset = in_offset;
+        ResolveCommands::Defer([upload, img = &image, source, source_offset, copies = std::move(image_copies)]() mutable { upload(img, source, source_offset, std::move(copies)); });
+    } else {
+        upload(&image, in_buffer, in_offset, std::move(image_copies));
     }
     if (ui_hash_before != 0) {
         std::string page_map;

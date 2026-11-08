@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <vector>
+#include <unordered_map>
+#include <string>
+#include <mutex>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
@@ -15,6 +20,27 @@
 namespace Core::NativeOcclusion {
 
 std::atomic<u32> query_open{0};
+
+void NoteCrossing(const char* what) {
+    static std::mutex mutex;
+    static std::unordered_map<std::string, u64> counts;
+    static u64 total = 0;
+    std::string key = std::string{what} + " rva: " + CallerRvas(1, 7);
+    std::scoped_lock lock{mutex};
+    ++counts[key];
+    ++total;
+    if (total >= 8 && (total & (total - 1)) == 0) {
+        std::vector<std::pair<u64, const std::string*>> order;
+        for (const auto& [text, count] : counts) {
+            order.emplace_back(count, &text);
+        }
+        std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        LOG_WARNING(Render_Vulkan, "crossing census: {} events, {} different", total, order.size());
+        for (size_t i = 0; i < order.size() && i < 12; ++i) {
+            LOG_WARNING(Render_Vulkan, "crossing census: x{} {}", order[i].first, *order[i].second);
+        }
+    }
+}
 
 std::string CallerRvas(unsigned skip, unsigned count) {
 #ifdef _WIN32

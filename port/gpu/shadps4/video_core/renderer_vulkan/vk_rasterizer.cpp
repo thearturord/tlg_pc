@@ -48,6 +48,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/half_phase.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -1401,6 +1402,7 @@ void Rasterizer::BindCensus(const Pipeline* pipeline) {
 bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed) {
     TLG_PROF_LEVEL("raster.bind_resources", 2);
     VideoCore::OpSequence::resolving.fetch_add(1, std::memory_order_acq_rel); // P3c: a new operation (a draw or a dispatch)
+    VideoCore::ResolveCommands::Run();
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         return false;
@@ -1843,6 +1845,7 @@ struct Rasterizer::VertexBind {
 };
 
 void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline, VertexBind& vb) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Resolve};
     // Plan S step P2: the resolve half of the vertex buffer binding (what is bound where); no command is recorded here
     const auto& regs = *draw_inputs;
     VertexInputs<vk::VertexInputAttributeDescription2EXT>& attributes = vb.attributes;
@@ -1926,6 +1929,8 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline, VertexBi
 }
 
 void Rasterizer::RecordVertexBuffers(VertexBind& vb, VideoCore::BufferCache::UploadSink& uploads) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Record};
+    VideoCore::ResolveCommands::Run();
     // Plan S step P2: the record half. The order of the old function is kept: the vertex input state, the synchronization copies, the barrier queries, the bind.
     if (instance.IsVertexInputDynamicState()) {
         const auto cmdbuf = scheduler.CommandBuffer();
@@ -2071,6 +2076,7 @@ struct Rasterizer::IndexBind {
 };
 
 void Rasterizer::ResolveIndexBuffer(u32 index_offset, bool is_indirect, IndexBind& ib) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Resolve};
     // Plan S step P2: the resolve half of the index buffer binding; no command is recorded here
     const auto& regs = *draw_inputs;
 
@@ -2140,6 +2146,8 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset, bool is_indirect, IndexBin
 }
 
 void Rasterizer::RecordIndexBuffer(IndexBind& ib, VideoCore::BufferCache::UploadSink& uploads) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Record};
+    VideoCore::ResolveCommands::Run();
     buffer_cache.RunDeferredUploads(uploads);
     if (ib.query_buffer != nullptr) {
         needs_barrier |= runtime.IsBufferAccessed(ib.query_buffer, ib.query_offset, ib.query_size);
@@ -2188,6 +2196,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
 
 void Rasterizer::ResetBindings(bool is_compute) {
     TLG_PROF_LEVEL("raster.reset_bindings", 2);
+    VideoCore::ResolveCommands::Run();
     // Plan S step P2c: two halves, each with its own owner. Same order as before.
     ResetImageBindings();
     RecordBufferAccess(is_compute);
@@ -2882,6 +2891,7 @@ u32 Rasterizer::BufferSlotCounted(const vk::DescriptorBufferInfo& info) {
 }
 
 void Rasterizer::ResolveBufferBinding(const Shader::Info& stage, u32 buffer_index, u64 alignment, u32 census_base, BufferBind& out) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Resolve};
     ResolveBufferBindingBody(stage, buffer_index, alignment, census_base, out);
     // the descriptor slot of a buffer that is already final (not a stream ring copy made by the record pass): the slot table is state of the resolve side
     if (out.kind == BufferBind::Info && indexed_active && stage.indexed && Shader::Indexed::IsIndexedBufferType(stage.buffers[buffer_index].buffer_type)) {
@@ -3324,6 +3334,8 @@ void Rasterizer::ResolveBufferBindingBody(const Shader::Info& stage, u32 buffer_
 }
 
 void Rasterizer::RecordBufferBindings(const Shader::Info& stage, Shader::Backend::Bindings& binding, Shader::PushData& push_data, BufferBind* binds, u32 count, u64 alignment, u32 census_base) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Record};
+    VideoCore::ResolveCommands::Run();
     // Plan S step P1: the record half. Everything here writes the command stream state (descriptor writes, push data offsets, stream ring rows, indexed descriptor set).
     for (u32 buffer_index = 0; buffer_index < count; ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
@@ -3431,7 +3443,10 @@ void Rasterizer::BindBuffersBody(const Shader::Info& stage, Shader::Backend::Bin
                         with_commands.load(), commands.load());
         }
     }
-    buffer_cache.RunDeferredUploads(uploads);
+    {
+        VideoCore::HalfPhase::Scope record_scope{VideoCore::HalfPhase::Record};
+        buffer_cache.RunDeferredUploads(uploads);
+    }
     RecordBufferBindings(stage, binding, push_data, binds.data(), count, alignment, census_base);
 }
 
@@ -4103,6 +4118,7 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
 }
 
 void Rasterizer::ResolveTextures(const Shader::Info& stage, TextureResolved& r) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Resolve};
     // Plan S step P2: the resolve half of the texture bindings (T# words to images and views); the record half does the layout transitions and the descriptor writes
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
     TLG_PROF_LEVEL("raster.bind_textures", 2);
@@ -4469,6 +4485,7 @@ void Rasterizer::ResolveTextures(const Shader::Info& stage, TextureResolved& r) 
 }
 
 bool Rasterizer::ResolveTextureSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count, TextureResolved& r) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Resolve};
     // Plan S step P2: the checks of the texture set memo (resolve), see BindTexturesFromSet
     if (set.count != count) {
         ++texture_set_stats.no_entry;
@@ -4528,6 +4545,8 @@ bool Rasterizer::ResolveTextureSet(const Shader::Info& stage, TextureSet& set, c
 }
 
 void Rasterizer::RecordTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding, TextureResolved& r) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Record};
+    VideoCore::ResolveCommands::Run();
     // Plan S step P2: the record half of the texture bindings (layout transitions, descriptor infos and writes, the indexed row)
     const u32 first_image_idx = image_infos.size();
     const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
@@ -4814,6 +4833,7 @@ void Rasterizer::BindSamplersLegacy(const Shader::Info& stage, Shader::Backend::
 }
 
 void Rasterizer::ResolveSamplers(const Shader::Info& stage, boost::container::small_vector<vk::Sampler, 8>& out) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Resolve};
     // Plan S step P2: the resolve half of the sampler bindings (S# words to the host sampler)
     for (const auto& sampler : stage.samplers) {
         AmdGpu::Sampler ssharp;
@@ -4874,6 +4894,8 @@ void Rasterizer::ResolveSamplers(const Shader::Info& stage, boost::container::sm
 }
 
 void Rasterizer::RecordSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding, const vk::Sampler* samplers, u32 count) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Record};
+    VideoCore::ResolveCommands::Run();
     // Plan S step P2: the record half (descriptor infos, writes, the indexed row)
     for (u32 i = 0; i < count; ++i) {
         if (indexed_active && stage.indexed) {
@@ -5142,6 +5164,7 @@ RenderState Rasterizer::BeginRenderingLegacy(const GraphicsPipeline* pipeline) {
 }
 
 void Rasterizer::ResolveRenderTargets(const GraphicsPipeline* pipeline, RenderResolved& r) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Resolve};
     // Plan S step P2c: the resolve half of the render pass setup (images, views, clear values, sizes); the record half transits the images and reads their layouts
     attachment_feedback_loop = false;
     const auto& regs = *draw_inputs;
@@ -5277,6 +5300,8 @@ void Rasterizer::ResolveRenderTargets(const GraphicsPipeline* pipeline, RenderRe
 
 
 RenderState Rasterizer::RecordRenderTargets(RenderResolved& r) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Record};
+    VideoCore::ResolveCommands::Run();
     // Plan S step P2c: the record half of the render pass setup: layout transitions of the targets, and the layout each attachment is in afterwards
     RenderState& state = r.state;
     for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {

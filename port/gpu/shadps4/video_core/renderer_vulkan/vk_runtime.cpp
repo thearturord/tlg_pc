@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/half_phase.h"
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -398,6 +399,10 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
 bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
+    if (VideoCore::HalfPhase::current == VideoCore::HalfPhase::Resolve) {
+        VideoCore::ResolveCommands::Run(); // P3d: what was queued comes first
+        Core::NativeOcclusion::NoteCrossing("Transit (layout state) in a resolve half");
+    }
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
     {
         // 2026-11-07 GPU ordering plan step 1 (TLG_TRACE_DISPLAY_LAYOUT=1): who moves the 4K colour images, in call order, next to the validation layer's own messages in the same log
@@ -914,6 +919,10 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         return;
     }
     ASSERT_MSG(!image->info.props.is_depth, "Swapping samples is only valid for color images");
+    if (VideoCore::HalfPhase::current == VideoCore::HalfPhase::Resolve) {
+        VideoCore::ResolveCommands::Run();
+        Core::NativeOcclusion::NoteCrossing("backing swap (SetBackingSamples) in a resolve half");
+    }
     VideoCore::Image::BackingImage* new_backing;
     auto it = std::ranges::find(backing_images, num_samples,
                                 &VideoCore::Image::BackingImage::num_samples);

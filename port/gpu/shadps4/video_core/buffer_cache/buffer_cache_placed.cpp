@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/half_phase.h"
 #include <chrono>
 #include <unordered_set>
 #include <algorithm>
@@ -238,14 +239,20 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
     }
     Buffer* dst = buffer.get();
     dst->NoteResolveUse(); // P3c: the resolve side made this buffer for the operation it is working on, and copies into it below
-    scheduler.EndRendering();
+    if (!ResolveCommands::Deferring()) {
+        scheduler.EndRendering(); // (the copies end the render pass themselves when they run)
+    }
     // placed buffers inside the block: their contents come over as they are
     boost::container::small_vector<VAddr, 4> inside;
     for (auto it = placed.lower_bound(begin); it != placed.end() && it->first < end; ++it) {
         inside.push_back(it->first);
         it->second.buffer->NoteResolveUse(); // P3c: the old placed buffer is read by the copy below
         const vk::BufferCopy copy{it->second.buffer->Offset(it->second.begin), dst->Offset(it->second.begin), it->second.end - it->second.begin};
-        runtime.CopyBuffer(it->second.buffer.get(), dst, std::span<const vk::BufferCopy>{&copy, 1});
+        if (ResolveCommands::Deferring()) {
+            ResolveCommands::Defer([this, source = it->second.buffer.get(), dst, copy]() { runtime.CopyBuffer(source, dst, std::span<const vk::BufferCopy>{&copy, 1}); });
+        } else {
+            runtime.CopyBuffer(it->second.buffer.get(), dst, std::span<const vk::BufferCopy>{&copy, 1});
+        }
         Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9GroupReused);
     }
     // the rest: the CPU's bytes from memory, the bytes the GPU wrote (and nothing newer since) from the arena
@@ -334,7 +341,11 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
             at += n;
         }
         staging.Flush();
-        runtime.CopyBuffer(staging.buffer, dst, copies);
+        if (ResolveCommands::Deferring()) {
+            ResolveCommands::Defer([this, source = staging.buffer, dst, copies = std::move(copies)]() { runtime.CopyBuffer(source, dst, copies); });
+        } else {
+            runtime.CopyBuffer(staging.buffer, dst, copies);
+        }
     }
     {
         // the block holds memory as it is now: the announced bytes outside the placed buffers it took over are uploaded (those inside stay announced:

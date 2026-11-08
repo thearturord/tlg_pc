@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "video_core/half_phase.h"
 #include <functional>
 #include "native/native_image_index.h"
 #include <atomic>
@@ -435,6 +436,7 @@ private:
 
     /// Removes image from the cache and schedules it for deletion.
     void FreeImage(ImageId image_id) {
+        VideoCore::ResolveCommands::Run(); // P3d: queued work may name this image
         {
             std::scoped_lock lk{slot_images[image_id].mutex};
             UntrackImage(image_id);

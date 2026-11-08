@@ -24,6 +24,8 @@
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "vulkan/vulkan.hpp"
 #include "native/native_split_census.h"
+#include "native/native_occlusion.h"
+#include "video_core/half_phase.h"
 
 namespace tracy {
 class VkCtxScope;
@@ -923,6 +925,10 @@ public:
     }
     CommandRecorder CommandBuffer() const {
         Core::SplitCensus::Touch(Core::SplitCensus::Commands);
+        if (VideoCore::HalfPhase::current == VideoCore::HalfPhase::Resolve) {
+            VideoCore::ResolveCommands::Run(); // P3d: what was queued comes first
+            Core::NativeOcclusion::NoteCrossing("commands recorded in a resolve half");
+        }
         return ActiveConst().CommandBuffer();
     }
     [[nodiscard]] bool IsRecordingCommands() const noexcept {

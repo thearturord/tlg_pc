@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/thread.h"
+#include <unordered_map>
+#include <string>
+#include <mutex>
+#include "video_core/half_phase.h"
 #include <cstdlib>
 #include <numeric>
 #include <string_view>
@@ -243,6 +248,18 @@ bool StreamBuffer::PrepareMap(u64 size, u64 alignment, bool allow_wait) {
 }
 
 std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) {
+    {
+        // plan S P3d census: which half writes the stream ring (0 outside the split halves, 1 resolve, 2 record), and how many bytes
+        static std::atomic<u64> calls[3]{}, bytes[3]{}, total{0};
+        const u32 half = VideoCore::HalfPhase::current;
+        calls[half].fetch_add(1, std::memory_order_relaxed);
+        bytes[half].fetch_add(size, std::memory_order_relaxed);
+        const u64 n = total.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n >= 4096 && (n & (n - 1)) == 0) {
+            LOG_WARNING(Render_Vulkan, "stream ring census: outside the halves {} writes / {} KiB, resolve half {} / {} KiB, record half {} / {} KiB", calls[0].load(), bytes[0].load() >> 10, calls[1].load(),
+                        bytes[1].load() >> 10, calls[2].load(), bytes[2].load() >> 10);
+        }
+    }
     if (!PrepareMap(size, alignment, allow_wait)) {
         return {nullptr, 0};
     }

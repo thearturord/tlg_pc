@@ -29,6 +29,8 @@ class Scheduler;
 namespace Core::NativeOcclusion {
 /// Diagnostics (plan S P3c): the calling code addresses (relative to the exe) of the current stack, innermost first, skipping `skip` frames.
 std::string CallerRvas(unsigned skip, unsigned count);
+/// Diagnostics (plan S P3d): counts `what` by the calling stack and prints the top ones at the powers of two.
+void NoteCrossing(const char* what);
 
 /// False when `TLG_REAL_OCCLUSION=0`
 [[nodiscard]] bool Enabled() noexcept;

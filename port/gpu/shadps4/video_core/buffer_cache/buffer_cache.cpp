@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/half_phase.h"
 #include <chrono>
 #include <unordered_set>
 #include <algorithm>
@@ -1404,7 +1405,10 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             copy.dstOffset -= arena->cpu_addr;
         }
         staging.Flush();
-        if (t_upload_sink != nullptr) {
+        if (ResolveCommands::Deferring()) {
+            // plan S P3d: one ordered queue for everything the resolve half would record (image uploads read what this copy writes)
+            ResolveCommands::Defer([this, source = staging.buffer, arena, copies = std::move(copies)]() { runtime.CopyBuffer(source, arena, copies); });
+        } else if (t_upload_sink != nullptr) {
             t_upload_sink->push_back({staging.buffer, arena, std::move(copies)}); // plan S P1d: the record pass issues the copy
         } else {
             runtime.CopyBuffer(staging.buffer, arena, copies);
