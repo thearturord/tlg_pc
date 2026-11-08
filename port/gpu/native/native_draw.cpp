@@ -8793,7 +8793,13 @@ u64 PS4_SYSV_ABI TextureUpdateSubresource(u64 context, u64 resource, u64 subreso
             const u32 bind = Rd<u32>(resource, 0x188);
             if ((bind & 0x4) != 0 && ran != 0 && width != 0 && width < (1u << 20)) {
                 // F2.2: the new version of a constant buffer is copied into the frame ring (V# base at +0x60 and +0x64); nothing announces it, the shadow remembers the range as a mark
-                Core::NativeContent::NoteMark(3, static_cast<u64>(Rd<u32>(resource, 0x60)) | (static_cast<u64>(Rd<u32>(resource, 0x64) & 0xfffu) << 32), width);
+                const u64 version = static_cast<u64>(Rd<u32>(resource, 0x60)) | (static_cast<u64>(Rd<u32>(resource, 0x64) & 0xfffu) << 32);
+                Core::NativeContent::NoteMark(3, version, width);
+                // N2: found by the ring mirror shadow (the writer probe saw this memcpy): the copy is finished here, so it is announced as every other ring write
+                static const bool cbuf_announce = [] { const char* e = std::getenv("TLG_CBUF_ANNOUNCE"); return e == nullptr || *e != '0'; }();
+                if (cbuf_announce && Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
+                    Core::NativeUpdates::NoteWriterRange(3, version, width, "UpdateSubresource constant buffer", true);
+                }
             }
             if ((bind & 0x4) == 0 && Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && memory != 0 && width != 0 && width < (1u << 30)) {
                 Core::NativeUpdates::NoteWriterRange(5, memory, width, "UpdateSubresource non-constant buffer");
@@ -8829,6 +8835,35 @@ u64 PS4_SYSV_ABI TextureUpdateSubresource(u64 context, u64 resource, u64 subreso
         }
         return 0;
     });
+    return ran;
+}
+
+/// N2: `FUN_024721a0(context, resource, subresource, box, data)` is JsComputeContext::UpdateSubresource, the compute context's twin of the function above: a constant buffer gets a new version
+/// in the frame ring (or in the context's command buffer) by a plain memcpy that nothing announced (found by the writer probe of the ring mirror shadow, 2026-11-08). The original runs here, then the
+/// copy is announced (writer 3).
+u64 PS4_SYSV_ABI ComputeUpdateSubresource(u64 context, u64 resource, u64 subresource, u64 box, u64 data, u64 a5, u64 ret) {
+    (void)a5, (void)ret;
+    u64 ran = 0;
+    if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && IsHeapPointer(resource)) {
+        if (const u64 original = Core::GuestHooks::OriginalEntry("ComputeUpdateSubresource"); original != 0) {
+            reinterpret_cast<GuestFunction6>(original)(context, resource, subresource, box, data, 0);
+            ran = 1ull << 63;
+        }
+    }
+    if (ran != 0) {
+        Guarded([&]() -> u64 {
+            if (Rd<u32>(resource, 0x124) == 1) {
+                const u32 width = Rd<u32>(resource, 0x180);
+                const u32 bind = Rd<u32>(resource, 0x188);
+                static const bool cbuf_announce = [] { const char* e = std::getenv("TLG_CBUF_ANNOUNCE"); return e == nullptr || *e != '0'; }();
+                if (cbuf_announce && (bind & 0x4) != 0 && width != 0 && width < (1u << 20)) {
+                    const u64 version = static_cast<u64>(Rd<u32>(resource, 0x60)) | (static_cast<u64>(Rd<u32>(resource, 0x64) & 0xfffu) << 32);
+                    Core::NativeUpdates::NoteWriterRange(3, version, width, "UpdateSubresource constant buffer (compute)", true);
+                }
+            }
+            return 0;
+        });
+    }
     return ran;
 }
 
@@ -9214,6 +9249,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "texture_update_subresource") {
         return reinterpret_cast<u64>(&TextureUpdateSubresource);
+    }
+    if (name == "compute_update_subresource") {
+        return reinterpret_cast<u64>(&ComputeUpdateSubresource);
     }
     if (name == "zpass_enter") {
         return reinterpret_cast<u64>(&ZPassEnter);

@@ -27,6 +27,7 @@
 #include "native/native_flight.h"
 #include "native/native_prof.h"
 #include "native/native_debug_server.h"
+#include "native/native_ring_mirror.h"
 
 #include "native/native_resources.h"
 #include "native/native_resource_audit.h"
@@ -142,6 +143,9 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object)
         }
     }
     Core::N0::ApplyScope n0_apply{n0_ring, size};
+    if (Core::RingMirror::Mode() >= 2) {
+        Core::RingMirror::NoteAnnounced(address, size);
+    }
     {
         TLG_PROF_LEVEL("cpuwrite.bind_memo_erase", 3);
         BindMemoErase(address, size);
@@ -1371,6 +1375,22 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             // Untracked upload ring: nobody told us what the CPU wrote, so the requested part is uploaded.
             if (device_addr < lo) {
                 announced_ranges(device_addr, lo - device_addr);
+            }
+            if (Core::RingMirror::Mode() >= 2) {
+                // N2 shadow: a host copy of the ring kept current by the announced bytes alone; the window must equal it (the uploads below are unchanged)
+                boost::container::small_vector<std::pair<u64, u64>, 16> taken;
+                {
+                    std::scoped_lock lock{object_dirty_mutex};
+                    if (Core::RingMirror::NeedFill(ring.Start(), ring.End())) {
+                        b9_unattributed.Subtract(ring.Start(), ring.End() - ring.Start()); // (the marks before the fill are in the copy)
+                        Core::RingMirror::Fill(ring.Start(), ring.End());
+                    }
+                    b9_unattributed.ForEachInRange(lo, hi - lo, [&](u64 a, u64 e) { taken.emplace_back(a, e - a); });
+                    for (const auto& [a, n] : taken) {
+                        b9_unattributed.Subtract(a, n);
+                    }
+                }
+                Core::RingMirror::CheckWindow(lo, hi, taken.data(), taken.size());
             }
             // Read again in the same command buffer: the data cannot have changed since the first upload.
             auto& done = ring_uploads[(lo >> 6) & 255];

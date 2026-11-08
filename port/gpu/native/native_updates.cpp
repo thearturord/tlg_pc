@@ -19,6 +19,7 @@
 #include <nlohmann/json.hpp>
 #include "native/native_hooks.h"
 #include "native/native_n0_census.h"
+#include "native/native_ring_mirror.h"
 #include "native/native_draw.h"
 #include "native/native_registry.h"
 #include "native/native_resources.h"
@@ -826,6 +827,7 @@ nlohmann::json B2Report() {
                                     {"bytes_changed", sk_changed.load()}, {"size_differs", sk_size_differs.load()}, {"unhashed", sk_unhashed.load()}, {"same_bytes_but_check_refused", sk_check_refused.load()},
                                     {"refused_gpu_wrote_the_range", sk_refused_gpu.load()}, {"refused_an_image_covers_it", sk_refused_image.load()}, {"refused_a_clear_waits_for_an_image", sk_refused_clears.load()}, {"refused_tracker_mode", sk_refused_tracker.load()},
                                     {"entries_erased_by_creates_or_deletes", sk_erased_by_deletes.load()}, {"map_cleared_when_too_big", sk_map_cleared.load()}}},
+                  {"ring_mirror", RingMirror::Report()},
                   {"buffer_id", {{"mode", BufferIdMode()}, {"told_whole", buffer_id_counts[IdToldWhole].load()}, {"told_partial", buffer_id_counts[IdToldPartial].load()}, {"unknown", buffer_id_counts[IdUnknown].load()},
                                   {"parts_match", buffer_id_counts[IdPartsMatch].load()}, {"PARTS_DIFFER_MUST_BE_0", buffer_id_counts[IdPartsDiffer].load()}, {"image_skipped", buffer_id_counts[IdImageSkipped].load()},
                                   {"IMAGE_FOUND_OVER_TOLD_MUST_BE_0", buffer_id_counts[IdImageFoundOverTold].load()}, {"told_block", buffer_id_counts[IdToldBlock].load()}}},
