@@ -243,6 +243,17 @@ public:
     /// D4 sizing: the upload counter of this thread, to attribute bytes to the binding kind that caused them.
     static void UploadBytesReset() noexcept { last_upload_bytes = 0; }
     [[nodiscard]] static u64 UploadBytes() noexcept { return last_upload_bytes; }
+    /// Plan S step P1d: a synchronization copy decided now and recorded later. The staging bytes are read from guest memory when the copy is decided (as before);
+    /// only the copy command (and its barrier work) waits for `RunDeferredUploads`. Active on this thread while a sink is set.
+    struct DeferredUpload {
+        VideoCore::Buffer* staging;
+        const Buffer* arena;
+        boost::container::small_vector<vk::BufferCopy, 4> copies;
+    };
+    using UploadSink = boost::container::small_vector<DeferredUpload, 4>;
+    static void SetUploadSink(UploadSink* sink) noexcept { t_upload_sink = sink; }
+    void RunDeferredUploads(UploadSink& sink);
+    static inline thread_local UploadSink* t_upload_sink{nullptr};
     /// True when the last ObtainBufferForImage of this thread read GPU written memory (the data came from the arena, not from guest memory).
     static inline thread_local bool last_image_source_gpu{};
 private:

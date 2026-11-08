@@ -1373,12 +1373,23 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             copy.dstOffset -= arena->cpu_addr;
         }
         staging.Flush();
-        runtime.CopyBuffer(staging.buffer, arena, copies);
+        if (t_upload_sink != nullptr) {
+            t_upload_sink->push_back({staging.buffer, arena, std::move(copies)}); // plan S P1d: the record pass issues the copy
+        } else {
+            runtime.CopyBuffer(staging.buffer, arena, copies);
+        }
     }
     if (is_texel_buffer && !is_written) {
         return SynchronizeMemoryFromImage(arena, device_addr, size);
     }
     return false;
+}
+
+void BufferCache::RunDeferredUploads(UploadSink& sink) {
+    for (auto& u : sink) {
+        runtime.CopyBuffer(u.staging, u.arena, u.copies);
+    }
+    sink.clear();
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {

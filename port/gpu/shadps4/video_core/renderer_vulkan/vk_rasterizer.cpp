@@ -2533,6 +2533,9 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 slot_census[3].fetch_add(1, std::memory_order_relaxed);
             }
             NoteIndexedRow(slot);
+            if (verify_slots_on) {
+                verify_slots.push_back(slot);
+            }
             ++binding.buffer;
             continue;
         }
@@ -2551,7 +2554,30 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
     }
 }
 
+u32 Rasterizer::BufferSlotCounted(const vk::DescriptorBufferInfo& info) {
+    auto* indexed = IndexedData::Get();
+    const u64 made_before = indexed->stats.buffer_new.load(std::memory_order_relaxed);
+    const u32 slot = indexed->BufferSlot(info.buffer, info.offset, info.range);
+    if (indexed->stats.buffer_new.load(std::memory_order_relaxed) != made_before) {
+        // R4 census: which buffers make new slots (0 stream ring, 1 an arena, 2 other)
+        const bool stream = info.buffer == buffer_cache.GetStreamBuffer().Handle();
+        slot_census[stream ? 0 : 2].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        slot_census[3].fetch_add(1, std::memory_order_relaxed);
+    }
+    return slot;
+}
+
 void Rasterizer::ResolveBufferBinding(const Shader::Info& stage, u32 buffer_index, u64 alignment, u32 census_base, BufferBind& out) {
+    ResolveBufferBindingBody(stage, buffer_index, alignment, census_base, out);
+    // the descriptor slot of a buffer that is already final (not a stream ring copy made by the record pass): the slot table is state of the resolve side
+    if (out.kind == BufferBind::Info && indexed_active && stage.indexed && Shader::Indexed::IsIndexedBufferType(stage.buffers[buffer_index].buffer_type)) {
+        out.slot = BufferSlotCounted(out.info);
+        out.has_slot = true;
+    }
+}
+
+void Rasterizer::ResolveBufferBindingBody(const Shader::Info& stage, u32 buffer_index, u64 alignment, u32 census_base, BufferBind& out) {
     // Plan S step P1: the resolve half of one buffer binding. Decides what is bound (ring row, special buffer, resolved object, in place, ObtainBuffer) and fills `out`;
     // it does not touch the descriptor writes, the push data offsets, the stream ring rows or the indexed descriptor set (the record half does).
     const auto& desc = stage.buffers[buffer_index];
@@ -2650,8 +2676,7 @@ void Rasterizer::ResolveBufferBinding(const Shader::Info& stage, u32 buffer_inde
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
                 out.info = vk::DescriptorBufferInfo(gds_buf->Handle(), 0, gds_buf->SizeBytes());
                 Core::ResourceAudit::Note(Core::ResourceAudit::BufferUse, 0xfffff0000000ull, gds_buf->SizeBytes(), desc.is_written);
-                out.needs_barrier |=
-                    runtime.IsBufferAccessed(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written);
+                out.SetQuery(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written, false);
                 out.SetBound(gds_buf, 0, gds_buf->SizeBytes(), src_access);
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 if (indexed_active && stage.indexed) {
@@ -2725,9 +2750,7 @@ void Rasterizer::ResolveBufferBinding(const Shader::Info& stage, u32 buffer_inde
                         out.has_offset = true; out.adjust = static_cast<u32>(adjust);
                         out.info = vk::DescriptorBufferInfo(arena->Handle(), offset_aligned, r.size + adjust);
                         out.SetBound(arena, offset, r.size, src_access);
-                        if (runtime.PlanHasWrites() && runtime.IsBufferAccessed(arena, offset, r.size, false)) {
-                            out.needs_barrier = true;
-                        }
+                        out.SetQuery(arena, offset, r.size, false, true); // asked by the record pass: only when the plan has writes
                         Census(census_base + CBufferResolved);
                         resolve_stats.hits.fetch_add(1, std::memory_order_relaxed);
                         recipe_ranges.emplace_back(r.address, r.size);
@@ -2980,17 +3003,14 @@ void Rasterizer::ResolveBufferBinding(const Shader::Info& stage, u32 buffer_inde
                     }
                     texture_cache.InvalidateMemoryFromGPU(vsharp.address, size, "a written storage buffer view");
                 }
-                Census(census_base + CBufferBarrierQuery);
-                if (runtime.IsBufferAccessed(buffer, offset, size, desc.is_written)) {
-                    Census(census_base + CBufferBarrierTrue);
-                    out.needs_barrier = true;
-                }
+                out.SetQuery(buffer, offset, size, desc.is_written, false); // the barrier query belongs to the record pass (it reads the barrier state the recording writes)
+                out.census_query = true;
                 }
             }
         }
 }
 
-void Rasterizer::RecordBufferBindings(const Shader::Info& stage, Shader::Backend::Bindings& binding, Shader::PushData& push_data, BufferBind* binds, u32 count, u64 alignment) {
+void Rasterizer::RecordBufferBindings(const Shader::Info& stage, Shader::Backend::Bindings& binding, Shader::PushData& push_data, BufferBind* binds, u32 count, u64 alignment, u32 census_base) {
     // Plan S step P1: the record half. Everything here writes the command stream state (descriptor writes, push data offsets, stream ring rows, indexed descriptor set).
     for (u32 buffer_index = 0; buffer_index < count; ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
@@ -3024,19 +3044,20 @@ void Rasterizer::RecordBufferBindings(const Shader::Info& stage, Shader::Backend
         if (out.has_bound) {
             bound_buffers.emplace_back(out.bound_buffer, out.bound_offset, out.bound_size, out.bound_access);
         }
-        needs_barrier |= out.needs_barrier;
-        if (indexed_active && stage.indexed && Shader::Indexed::IsIndexedBufferType(desc.buffer_type)) {
-            auto* indexed = IndexedData::Get();
-            const auto& info = buffer_infos.back();
-            const u64 made_before = indexed->stats.buffer_new.load(std::memory_order_relaxed);
-            const u32 slot = indexed->BufferSlot(info.buffer, info.offset, info.range);
-            if (indexed->stats.buffer_new.load(std::memory_order_relaxed) != made_before) {
-                // R4 census: which buffers make new slots (0 stream ring, 1 an arena, 2 other)
-                const bool stream = info.buffer == buffer_cache.GetStreamBuffer().Handle();
-                slot_census[stream ? 0 : 2].fetch_add(1, std::memory_order_relaxed);
-            } else {
-                slot_census[3].fetch_add(1, std::memory_order_relaxed);
+        if (out.has_query) {
+            if (out.census_query) {
+                Census(census_base + CBufferBarrierQuery);
             }
+            if ((!out.query_plan_writes || runtime.PlanHasWrites()) && runtime.IsBufferAccessed(out.query_buffer, out.query_offset, out.query_size, out.query_written)) {
+                if (out.census_query) {
+                    Census(census_base + CBufferBarrierTrue);
+                }
+                needs_barrier = true;
+            }
+        }
+        if (indexed_active && stage.indexed && Shader::Indexed::IsIndexedBufferType(desc.buffer_type)) {
+            // a slot made by the resolve pass, or (a stream ring copy: its offset is only known here) made now
+            const u32 slot = out.has_slot ? out.slot : BufferSlotCounted(buffer_infos.back());
             NoteIndexedRow(slot);
             ++binding.buffer;
             continue;
@@ -3074,22 +3095,46 @@ void Rasterizer::BindBuffersBody(const Shader::Info& stage, Shader::Backend::Bin
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
     TLG_PROF_LEVEL("raster.bind_buffers", 2);
     boost::container::small_vector<BufferBind, 16> binds(count);
+    // P1d: the synchronization copies decided by the resolve pass are issued by the record pass; what else the resolve pass records is counted
+    VideoCore::BufferCache::UploadSink uploads;
+    const auto* list = scheduler.CommandBuffer().List();
+    const u64 commands_before = list != nullptr ? list->Size() : 0;
+    VideoCore::BufferCache::SetUploadSink(&uploads);
     for (u32 i = 0; i < count; ++i) {
         ResolveBufferBinding(stage, i, alignment, census_base, binds[i]);
     }
-    RecordBufferBindings(stage, binding, push_data, binds.data(), count, alignment);
+    VideoCore::BufferCache::SetUploadSink(nullptr);
+    {
+        static std::atomic<u64> calls{0}, with_commands{0}, commands{0}, deferred{0};
+        const u64 n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        const u64 made = (list != nullptr ? list->Size() : 0) - commands_before;
+        deferred.fetch_add(uploads.size(), std::memory_order_relaxed);
+        if (made != 0) {
+            with_commands.fetch_add(1, std::memory_order_relaxed);
+            commands.fetch_add(made, std::memory_order_relaxed);
+        }
+        if ((n & (n - 1)) == 0) {
+            LOG_WARNING(Render_Vulkan, "split bind: {} stage calls, {} copies deferred to the record pass, the resolve pass still recorded commands in {} calls ({} commands)", n, deferred.load(),
+                        with_commands.load(), commands.load());
+        }
+    }
+    buffer_cache.RunDeferredUploads(uploads);
+    RecordBufferBindings(stage, binding, push_data, binds.data(), count, alignment, census_base);
 }
 
 void Rasterizer::VerifyBufferBindings(const Shader::Info& stage, Shader::Backend::Bindings& binding, Shader::PushData& push_data, u64 alignment, u32 census_base, u32 count) {
     // Plan S step P1 oracle: run the old pass for real, then the resolve half on the same draw and compare what each decided. The resolve half runs after the whole old pass
     // (the order of the split path: every ObtainBuffer before any barrier query), so a difference can also come from that order. The record half does not run.
-    static std::atomic<u64> checked{0}, bindings_checked{0}, differ{0};
+    static std::atomic<u64> checked{0}, bindings_checked{0}, differ{0}, extra_barrier{0}, slots_checked{0};
     static std::atomic<u32> logged{0};
     const size_t infos_before = buffer_infos.size();
     const bool barrier_before = needs_barrier;
     const u32 first_binding = binding.buffer;
     needs_barrier = false;
+    verify_slots.clear();
+    verify_slots_on = true;
     BindBuffersBodyLegacy(stage, binding, push_data);
+    verify_slots_on = false;
     const bool legacy_barrier = needs_barrier;
     needs_barrier = barrier_before || legacy_barrier;
     const size_t ranges_after_legacy = recipe_ranges.size();
@@ -3107,7 +3152,10 @@ void Rasterizer::VerifyBufferBindings(const Shader::Info& stage, Shader::Backend
     bool resolve_barrier = false;
     std::vector<u32> kept;
     for (u32 i = 0; i < count; ++i) {
-        resolve_barrier |= binds[i].needs_barrier;
+        if (binds[i].has_query && (!binds[i].query_plan_writes || runtime.PlanHasWrites()) &&
+            runtime.IsBufferAccessed(binds[i].query_buffer, binds[i].query_offset, binds[i].query_size, binds[i].query_written)) {
+            resolve_barrier = true; // what the record pass would decide, asked here after the whole old pass
+        }
         if (binds[i].kind != BufferBind::Skip) {
             kept.push_back(i);
         }
@@ -3140,9 +3188,32 @@ void Rasterizer::VerifyBufferBindings(const Shader::Info& stage, Shader::Backend
             }
         }
     }
-    if (legacy_barrier != resolve_barrier) {
+    if (legacy_barrier && !resolve_barrier) {
         ++diffs;
-        what += fmt::format(" needs_barrier legacy {} split {};", legacy_barrier, resolve_barrier);
+        what += " needs_barrier legacy true split false;";
+    } else if (!legacy_barrier && resolve_barrier) {
+        extra_barrier.fetch_add(1, std::memory_order_relaxed); // allowed: a query asked later sees more accesses (a barrier too many, never one too few)
+    }
+    {
+        size_t at = 0;
+        for (u32 i = 0; i < count; ++i) {
+            if (binds[i].kind == BufferBind::Skip || !(indexed_active && stage.indexed && Shader::Indexed::IsIndexedBufferType(stage.buffers[i].buffer_type))) {
+                continue;
+            }
+            if (at >= verify_slots.size()) {
+                ++diffs;
+                what += " fewer slots noted by the old pass;";
+                break;
+            }
+            if (binds[i].has_slot && binds[i].info.buffer != stream_handle) { // (a stream ring copy is made again by this pass: another offset, another slot)
+                slots_checked.fetch_add(1, std::memory_order_relaxed);
+                if (binds[i].slot != verify_slots[at]) {
+                    ++diffs;
+                    what += fmt::format(" #{} slot legacy {} split {};", i, verify_slots[at], binds[i].slot);
+                }
+            }
+            ++at;
+        }
     }
     if (diffs != 0) {
         differ.fetch_add(1, std::memory_order_relaxed);
@@ -3152,7 +3223,7 @@ void Rasterizer::VerifyBufferBindings(const Shader::Info& stage, Shader::Backend
         }
     }
     if ((n & (n - 1)) == 0) {
-        LOG_WARNING(Render_Vulkan, "split bind verify: {} stage calls, {} bindings, {} differ", n, bindings_checked.load(), differ.load());
+        LOG_WARNING(Render_Vulkan, "split bind verify: {} stage calls, {} bindings, {} slots compared, {} differ ({} stage calls with a barrier only the later query sees)", n, bindings_checked.load(), slots_checked.load(), differ.load(), extra_barrier.load());
     }
 }
 

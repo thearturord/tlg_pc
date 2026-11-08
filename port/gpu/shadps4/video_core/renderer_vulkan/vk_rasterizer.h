@@ -437,7 +437,11 @@ private:
         Kind kind{Info};
         bool has_offset{false};
         bool has_bound{false};
-        bool needs_barrier{false};
+        bool has_query{false}, query_plan_writes{false}, query_written{false}, census_query{false};
+        bool has_slot{false};
+        u32 slot{0};
+        const VideoCore::Buffer* query_buffer{nullptr};
+        u64 query_offset{0}, query_size{0};
         u32 adjust{0};
         u32 lds_size{0};
         vk::DescriptorBufferInfo info{};
@@ -446,6 +450,15 @@ private:
         u32 bound_size{0};
         vk::AccessFlags2 bound_access{};
         std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
+        /// a barrier query for the record pass: does the buffer range conflict with what the plan holds (with `plan_writes`: only asked when the plan has writes)
+        void SetQuery(const VideoCore::Buffer* buffer, u64 offset, u64 size, bool written, bool plan_writes) {
+            has_query = true;
+            query_buffer = buffer;
+            query_offset = offset;
+            query_size = size;
+            query_written = written;
+            query_plan_writes = plan_writes;
+        }
         void SetBound(const VideoCore::Buffer* buffer, u64 offset, u64 size, vk::AccessFlags2 access) {
             has_bound = true;
             bound_buffer = buffer;
@@ -455,7 +468,11 @@ private:
         }
     };
     void ResolveBufferBinding(const Shader::Info& stage, u32 buffer_index, u64 alignment, u32 census_base, BufferBind& out);
-    void RecordBufferBindings(const Shader::Info& stage, Shader::Backend::Bindings& binding, Shader::PushData& push_data, BufferBind* binds, u32 count, u64 alignment);
+    void ResolveBufferBindingBody(const Shader::Info& stage, u32 buffer_index, u64 alignment, u32 census_base, BufferBind& out);
+    u32 BufferSlotCounted(const vk::DescriptorBufferInfo& info);
+    std::vector<u32> verify_slots;
+    bool verify_slots_on{false};
+    void RecordBufferBindings(const Shader::Info& stage, Shader::Backend::Bindings& binding, Shader::PushData& push_data, BufferBind* binds, u32 count, u64 alignment, u32 census_base);
     void VerifyBufferBindings(const Shader::Info& stage, Shader::Backend::Bindings& binding, Shader::PushData& push_data, u64 alignment, u32 census_base, u32 count);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     void BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding);
