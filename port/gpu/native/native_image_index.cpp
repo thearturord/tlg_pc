@@ -110,6 +110,37 @@ u32 NativeImageIndex::AnnouncedWriteIsInert(VAddr addr, size_t size) {
     return host.AnyImageIn(addr, size) ? 2 : 0;
 }
 
+bool NativeImageIndex::MergeIsExact(VAddr begin, u64 size, const std::pair<u64, u64>* pieces, size_t count) {
+    Core::SplitCensus::Touch(Core::SplitCensus::ImageIndex);
+    if (!pending_clears.empty()) {
+        // only a clear that waits for a texture this memory belongs to is touched by an announcement
+        static thread_local std::vector<u64> ids;
+        ids.clear();
+        NativeDevice::TexturesIn(begin, size, ids);
+        for (const u64 id : ids) {
+            if (pending_clears.count(id) != 0) {
+                return false;
+            }
+        }
+    }
+    if (!host.AnyImageIn(begin, size)) {
+        return true;
+    }
+    bool exact = true;
+    host.ForEachImageIn(begin, size, [&](ImageId image_id) {
+        if (!exact) {
+            return;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            if (host.Overlaps(image_id, pieces[i].first, pieces[i].second)) {
+                return;
+            }
+        }
+        exact = false;
+    });
+    return exact;
+}
+
 u32 NativeImageIndex::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
     Core::SplitCensus::Touch(Core::SplitCensus::ImageIndex);
     const bool clears = !pending_clears.empty();

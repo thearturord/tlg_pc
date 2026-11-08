@@ -253,6 +253,45 @@ u32 BufferIdMode() noexcept {
     return mode;
 }
 
+u32 ApplyCoalesceMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_APPLY_COALESCE");
+        return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u;
+    }();
+    return mode;
+}
+
+namespace {
+std::atomic<u64> coalesce_gap_out[4]{}, coalesce_objects{0};
+std::atomic<u64> coalesce_guard[2][2]{}; // [gap 4 KiB / 64 KiB][pieces in groups the guard lets merge / pieces in groups it refuses]
+std::atomic<u64> coalesce_guard_verdict[2][5]{};
+std::atomic<u64> coalesce_class[3][2]{}; // [object: 0 unknown, buffers-only, named][pieces in groups the 4 KiB guard accepts / refuses]
+std::atomic<u64> coalesce_in{0}, coalesce_sequential{0}, coalesce_out{0}, coalesce_batches{0}, coalesce_bytes{0};
+using Piece = AnnouncedPiece;
+bool (*merge_check_fn)(void*, u64, u64, u64, const AnnouncedPiece*, size_t) = nullptr;
+void* merge_check_context = nullptr;
+std::atomic<u64> coalesce_why[4][2]{};
+std::atomic<u64> coalesce_merged_groups{0}, coalesce_refused_groups{0}, coalesce_merged_pieces{0}, coalesce_refused_pieces{0}, coalesce_gap_bytes{0}, coalesce_apply_calls{0};
+} // namespace
+
+u64 ApplyCoalesceGap() noexcept {
+    static const u64 gap = [] {
+        const char* e = std::getenv("TLG_APPLY_COALESCE_GAP");
+        return e != nullptr ? static_cast<u64>(std::atoll(e)) : u64{4096};
+    }();
+    return gap;
+}
+
+void NoteMergeRefused(u32 why, u64 pieces) noexcept {
+    coalesce_why[why & 3][0].fetch_add(1, std::memory_order_relaxed);
+    coalesce_why[why & 3][1].fetch_add(pieces, std::memory_order_relaxed);
+}
+
+void SetMergeCheck(bool (*fn)(void*, u64, u64, u64, const AnnouncedPiece*, size_t), void* context) {
+    merge_check_context = context;
+    merge_check_fn = fn;
+}
+
 u32 SyncByIdMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_SYNC_BY_ID");
@@ -620,6 +659,9 @@ void ApplyBatch(const Batch& batch) {
     }
     const u32 first_mode = AgainSkipMode();
     const u32 first_trust = AgainTrustMask();
+    const u32 coalesce_mode = ApplyCoalesceMode();
+    static std::vector<Piece> todo;
+    todo.clear();
     const auto first_one = [&](u64 address, u64 size, bool plain, u32 writer, u64 object) {
         N0::NoteApplied(size, false);
         FirstHash h{address, size, 0, false};
@@ -655,7 +697,12 @@ void ApplyBatch(const Batch& batch) {
         }
         if (!skipped) {
             TLG_PROF_ADD("updates.bytes_first", size);
-            apply_fn(apply_context, address, size, true, object);
+            if (coalesce_mode != 0 && size != 0) {
+                todo.push_back({object, address, size});
+            }
+            if (coalesce_mode != 1) {
+                apply_fn(apply_context, address, size, true, object);
+            }
             b2_applied_bytes.fetch_add(size, std::memory_order_relaxed);
         }
         if (hash_here) {
@@ -673,6 +720,117 @@ void ApplyBatch(const Batch& batch) {
             first_one(address, size, false, at < batch.ring_first_writer.size() ? batch.ring_first_writer[at].writer : 0u, at < batch.ring_first_writer.size() ? batch.ring_first_writer[at].object : 0u);
             ++at;
         }
+    }
+    if (coalesce_mode != 0 && !todo.empty()) {
+        // L1: pieces of the same engine buffer that touch or overlap are one range (sorted by buffer, then address). The merged range stays inside what the pieces covered, so the sets the passes
+        // keep (dirty bytes, GPU written bytes, resident generations, the image index) end the same; the announcer that named no buffer (0) merges by address alone.
+        TLG_PROF_LEVEL("updates.coalesce", 2);
+        u64 sequential = 0;
+        for (size_t i = 1; i < todo.size(); ++i) {
+            sequential += todo[i].object == todo[i - 1].object && todo[i].address >= todo[i - 1].address && todo[i].address <= todo[i - 1].address + todo[i - 1].size ? 1 : 0;
+        }
+        std::sort(todo.begin(), todo.end(), [](const Piece& a, const Piece& b) { return a.object != b.object ? a.object < b.object : a.address < b.address; });
+        u64 out = 0, merged_bytes = 0;
+        constexpr u64 MaxMerged = u64{1} << 20;
+        const u64 gap = coalesce_mode == 1 ? ApplyCoalesceGap() : 0;
+        for (size_t i = 0; i < todo.size();) {
+            const u64 object = todo[i].object, begin = todo[i].address;
+            u64 end = begin + todo[i].size;
+            size_t j = i + 1;
+            while (j < todo.size() && todo[j].object == object && todo[j].address <= end + gap && std::max(end, todo[j].address + todo[j].size) - begin <= MaxMerged) {
+                end = std::max(end, todo[j].address + todo[j].size);
+                ++j;
+            }
+            merged_bytes += end - begin;
+            if (coalesce_mode == 1) {
+                // a group the buffer cache refuses is cut in halves and each half asked again (an image next to the pieces refuses the whole run, not its two ends); pieces left alone are applied as they are
+                const auto apply_run = [&](const auto& self, size_t a, size_t b, u32 depth) -> void {
+                    if (b - a > 1) {
+                        u64 run_end = todo[a].address + todo[a].size, piece_bytes = 0;
+                        for (size_t k = a; k < b; ++k) {
+                            run_end = std::max(run_end, todo[k].address + todo[k].size);
+                            piece_bytes += todo[k].size;
+                        }
+                        const u64 run_begin = todo[a].address;
+                        if (merge_check_fn != nullptr && merge_check_fn(merge_check_context, object, run_begin, run_end - run_begin, &todo[a], b - a)) {
+                            coalesce_merged_groups.fetch_add(1, std::memory_order_relaxed);
+                            coalesce_merged_pieces.fetch_add(b - a, std::memory_order_relaxed);
+                            coalesce_gap_bytes.fetch_add((run_end - run_begin) > piece_bytes ? (run_end - run_begin) - piece_bytes : 0, std::memory_order_relaxed);
+                            apply_fn(apply_context, run_begin, run_end - run_begin, true, object);
+                            ++out;
+                            return;
+                        }
+                        if (depth < 5 && b - a >= 4) {
+                            const size_t mid = a + (b - a) / 2;
+                            self(self, a, mid, depth + 1);
+                            self(self, mid, b, depth + 1);
+                            return;
+                        }
+                        coalesce_refused_groups.fetch_add(1, std::memory_order_relaxed);
+                        coalesce_refused_pieces.fetch_add(b - a, std::memory_order_relaxed);
+                    }
+                    for (size_t k = a; k < b; ++k) {
+                        apply_fn(apply_context, todo[k].address, todo[k].size, true, todo[k].object);
+                        ++out;
+                    }
+                };
+                apply_run(apply_run, i, j, 0);
+            } else {
+                ++out;
+            }
+            i = j;
+        }
+        if (coalesce_mode == 2) {
+            // (census only) how many ranges would be left if pieces up to 256 B, 4 KiB, 64 KiB apart were merged too, and how many different engine buffers the batch names
+            static const u64 gaps[4] = {256, 4096, 65536, 1u << 20};
+            for (int g = 0; g < 4; ++g) {
+                u64 n = 0;
+                for (size_t i = 0; i < todo.size();) {
+                    const u64 object = todo[i].object;
+                    u64 end = todo[i].address + todo[i].size;
+                    size_t j = i + 1;
+                    while (j < todo.size() && todo[j].object == object && todo[j].address <= end + gaps[g]) {
+                        end = std::max(end, todo[j].address + todo[j].size);
+                        ++j;
+                    }
+                    ++n;
+                    i = j;
+                }
+                coalesce_gap_out[g].fetch_add(n, std::memory_order_relaxed);
+            }
+            if (skip_check_fn != nullptr) {
+                for (int g = 1; g <= 2; ++g) {
+                    for (size_t i = 0; i < todo.size();) {
+                        const u64 object = todo[i].object, begin = todo[i].address;
+                        u64 end = begin + todo[i].size;
+                        size_t j = i + 1;
+                        while (j < todo.size() && todo[j].object == object && todo[j].address <= end + gaps[g]) {
+                            end = std::max(end, todo[j].address + todo[j].size);
+                            ++j;
+                        }
+                        if (j - i > 1) {
+                            const u32 verdict = skip_check_fn(skip_check_context, begin, end - begin);
+                            coalesce_guard[g - 1][verdict == 0 ? 0 : 1].fetch_add(j - i, std::memory_order_relaxed);
+                            coalesce_guard_verdict[g - 1][verdict < 5 ? verdict : 4].fetch_add(1, std::memory_order_relaxed);
+                            if (g == 1) {
+                                coalesce_class[object == 0 ? 0 : object == kBuffersOnly ? 1 : 2][verdict == 0 ? 0 : 1].fetch_add(j - i, std::memory_order_relaxed);
+                            }
+                        }
+                        i = j;
+                    }
+                }
+            }
+            u64 objects = 0;
+            for (size_t i = 0; i < todo.size(); ++i) {
+                objects += i == 0 || todo[i].object != todo[i - 1].object ? 1 : 0;
+            }
+            coalesce_objects.fetch_add(objects, std::memory_order_relaxed);
+        }
+        coalesce_batches.fetch_add(1, std::memory_order_relaxed);
+        coalesce_in.fetch_add(todo.size(), std::memory_order_relaxed);
+        coalesce_sequential.fetch_add(sequential, std::memory_order_relaxed);
+        coalesce_out.fetch_add(out, std::memory_order_relaxed);
+        coalesce_bytes.fetch_add(merged_bytes, std::memory_order_relaxed);
     }
     b2_applied_ranges.fetch_add(batch.first.size() + batch.ring_first.size(), std::memory_order_relaxed);
     b2_reapplied_ranges.fetch_add(batch.again.size(), std::memory_order_relaxed);
@@ -839,6 +997,10 @@ nlohmann::json B2Report() {
                   {"buffer_id", {{"mode", BufferIdMode()}, {"told_whole", buffer_id_counts[IdToldWhole].load()}, {"told_partial", buffer_id_counts[IdToldPartial].load()}, {"unknown", buffer_id_counts[IdUnknown].load()},
                                   {"parts_match", buffer_id_counts[IdPartsMatch].load()}, {"PARTS_DIFFER_MUST_BE_0", buffer_id_counts[IdPartsDiffer].load()}, {"image_skipped", buffer_id_counts[IdImageSkipped].load()},
                                   {"IMAGE_FOUND_OVER_TOLD_MUST_BE_0", buffer_id_counts[IdImageFoundOverTold].load()}, {"told_block", buffer_id_counts[IdToldBlock].load()},
+                                  {"coalesce", {{"mode", ApplyCoalesceMode()}, {"batches", coalesce_batches.load()}, {"pieces_in", coalesce_in.load()}, {"touching_the_previous_piece", coalesce_sequential.load()}, {"ranges_out", coalesce_out.load()}, {"gap", ApplyCoalesceGap()}, {"merged_groups", coalesce_merged_groups.load()}, {"merged_pieces", coalesce_merged_pieces.load()}, {"refused_groups", coalesce_refused_groups.load()}, {"refused_why_mode_namedbuffer_gpuwritten_image_groups_pieces", {{coalesce_why[0][0].load(), coalesce_why[0][1].load()}, {coalesce_why[1][0].load(), coalesce_why[1][1].load()}, {coalesce_why[2][0].load(), coalesce_why[2][1].load()}, {coalesce_why[3][0].load(), coalesce_why[3][1].load()}}}, {"refused_pieces", coalesce_refused_pieces.load()}, {"gap_bytes_marked_extra", coalesce_gap_bytes.load()}, {"ranges_if_gap_256", coalesce_gap_out[0].load()}, {"ranges_if_gap_4k", coalesce_gap_out[1].load()}, {"ranges_if_gap_64k", coalesce_gap_out[2].load()}, {"ranges_if_gap_1m", coalesce_gap_out[3].load()}, {"distinct_buffers_summed_over_batches", coalesce_objects.load()},
+                                              {"guard_4k_pieces_in_mergeable_groups", coalesce_guard[0][0].load()}, {"guard_4k_pieces_in_refused_groups", coalesce_guard[0][1].load()}, {"guard_64k_pieces_in_mergeable_groups", coalesce_guard[1][0].load()}, {"guard_64k_pieces_in_refused_groups", coalesce_guard[1][1].load()},
+                                              {"guard_4k_pieces_by_object_unknown_buffersonly_named_accepted_refused", {{coalesce_class[0][0].load(), coalesce_class[0][1].load()}, {coalesce_class[1][0].load(), coalesce_class[1][1].load()}, {coalesce_class[2][0].load(), coalesce_class[2][1].load()}}},
+                                              {"guard_4k_verdicts_0_to_4", {coalesce_guard_verdict[0][0].load(), coalesce_guard_verdict[0][1].load(), coalesce_guard_verdict[0][2].load(), coalesce_guard_verdict[0][3].load(), coalesce_guard_verdict[0][4].load()}}, {"bytes_out", coalesce_bytes.load()}}},
                                   {"sync_by_id", {{"mode", SyncByIdMode()}, {"used", buffer_id_counts[IdSyncToldUsed].load()}, {"held_match", buffer_id_counts[IdSyncHeldMatch].load()}, {"HELD_DIFFER_MUST_BE_0", buffer_id_counts[IdSyncHeldDiffer].load()},
                                                   {"parts_match", buffer_id_counts[IdSyncPartsMatch].load()}, {"PARTS_DIFFER_MUST_BE_0", buffer_id_counts[IdSyncPartsDiffer].load()}}}}},
                   {"again_by_writer", [] {

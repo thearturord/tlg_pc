@@ -75,6 +75,9 @@ public:
     }
     /// True when announcing a write over [addr, addr + size) would do nothing to any image: no clear waits for a first image and no image overlaps the memory.
     [[nodiscard]] u32 AnnouncedWriteIsInert(VAddr addr, size_t size); ///< 0 inert, 1 a clear waits for a first image, 2 an image is in the memory
+    /// L1: announcing the one range [begin, begin + size) dirties exactly the images that announcing its `count` pieces (pairs of start and size) would: no clear waits for a first image, and every
+    /// image in the range overlaps one of the pieces.
+    [[nodiscard]] bool MergeIsExact(VAddr begin, u64 size, const std::pair<u64, u64>* pieces, size_t count);
     /// B8.2: the engine deleted the texture whose memory is [address, address + bytes): its images (same memory, not bigger) are freed (`free`) or marked.
     void NoteTextureDelete(u64 id, VAddr address, u64 bytes, bool free);
     /// B8.4: the engine created a texture at [address, address + bytes): older images in that memory are unlisted (a lookup that gives one out refreshes it).

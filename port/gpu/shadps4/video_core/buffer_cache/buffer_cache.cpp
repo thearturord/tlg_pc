@@ -97,6 +97,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     // B2 cutover: an applied announcement is a CPU write for the caches
     Core::NativeUpdates::SetApply([](void* context, u64 address, u64 size, bool newer, u64 object) { static_cast<BufferCache*>(context)->ApplyCpuWrite(address, size, newer, object); }, this);
     Core::NativeUpdates::SetSkipCheck([](void* context, u64 address, u64 size) -> u32 { return static_cast<BufferCache*>(context)->CanSkipIdenticalWrite(address, size); }, this);
+    Core::NativeUpdates::SetMergeCheck([](void* context, u64 object, u64 begin, u64 size, const Core::NativeUpdates::AnnouncedPiece* pieces, size_t count) {
+        return static_cast<BufferCache*>(context)->CanMergeAnnounced(object, begin, size, pieces, count);
+    }, this);
 }
 
 BufferCache::~BufferCache() {
@@ -185,6 +188,36 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object)
             Core::NativeUpdates::NoteBufferId(Core::NativeUpdates::IdImageFoundOverTold);
         }
     }
+}
+
+bool BufferCache::CanMergeAnnounced(u64 object, VAddr begin, u64 size, const Core::NativeUpdates::AnnouncedPiece* pieces, size_t count) {
+    // L1: the apply of the merged range does to the gap bytes what the pieces do to their own. Nothing may depend on which bytes exactly were written: the dirty marks of the buffers (the gap
+    // bytes are current guest memory, uploading them is right), the resident generations (a page each), the memo (erased wider). What must not widen: bytes the GPU wrote (the apply would
+    // supersede them) and images (the apply dirties every image it meets).
+    if (!Core::NativeUpdates::B9TrackerOff() || Core::NativeUpdates::B8ImageMode() == 0) {
+        Core::NativeUpdates::NoteMergeRefused(0, count);
+        return false;
+    }
+    if (object != 0 && object != Core::NativeUpdates::kBuffersOnly) {
+        Core::NativeDevice::BufferPart part{};
+        if (!Core::NativeDevice::BufferPartOf(object, begin, size, part) || part.begin != begin || part.end != begin + size) {
+            Core::NativeUpdates::NoteMergeRefused(1, count);
+            return false; // (the named buffer must hold the whole range, as for one piece)
+        }
+    }
+    if (IsRangeGpuWritten(begin, size)) {
+        Core::NativeUpdates::NoteMergeRefused(2, count);
+        return false;
+    }
+    boost::container::small_vector<std::pair<u64, u64>, 16> list;
+    for (size_t i = 0; i < count; ++i) {
+        list.emplace_back(pieces[i].address, pieces[i].size);
+    }
+    const bool exact = texture_cache.EngineIndex().MergeIsExact(begin, size, list.data(), list.size());
+    if (!exact) {
+        Core::NativeUpdates::NoteMergeRefused(3, count);
+    }
+    return exact;
 }
 
 u32 BufferCache::CanSkipIdenticalWrite(VAddr address, u64 size) {

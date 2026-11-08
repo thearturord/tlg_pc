@@ -65,6 +65,20 @@ enum BufferIdCount : u32 { IdToldWhole, IdToldPartial, IdUnknown, IdPartsMatch, 
 /// N3 (`TLG_SYNC_BY_ID`): 0 off (default), 1 `SynchronizeMemory` of a placed engine buffer takes the buffer's memory and its id from the buffer itself (set when it was placed) instead of walking the
 /// placed map and the engine's address table, 2 shadow: both run, differences are counted (`sync_*` in `buffer_id`, `*_MUST_BE_0`).
 [[nodiscard]] u32 SyncByIdMode() noexcept;
+/// L1 (`TLG_APPLY_COALESCE`): 0 off (default), 1 the first-time announcements of a batch are applied as merged ranges (same engine buffer, touching or overlapping bytes: the byte set is the same, the
+/// apply passes run once per merged range instead of once per piece), 2 counts what merging would do and applies as before (`coalesce` in `buffer_id`).
+[[nodiscard]] u32 ApplyCoalesceMode() noexcept;
+/// L1: pieces of one engine buffer closer than this many bytes (`TLG_APPLY_COALESCE_GAP`, default 4096) are candidates for one applied range.
+[[nodiscard]] u64 ApplyCoalesceGap() noexcept;
+/// L1: why a group was refused (0 tracker/image mode, 1 named buffer does not hold the range, 2 GPU written, 3 clear waits or an image touches no piece), counted in groups and pieces.
+void NoteMergeRefused(u32 why, u64 pieces) noexcept;
+/// One announced piece of a batch.
+struct AnnouncedPiece {
+    u64 object, address, size;
+};
+/// L1: the buffer cache says whether the pieces (sorted, one engine buffer or none named) may be applied as the one range [begin, begin + size): true when the bytes between the pieces are
+/// not GPU written, no clear waits for an image, no image is in the range that no piece touches, and a named buffer holds the whole range.
+void SetMergeCheck(bool (*fn)(void*, u64 object, u64 begin, u64 size, const AnnouncedPiece* pieces, size_t count), void* context);
 void NoteBufferId(BufferIdCount what);
 /// N1: who announced a range: `writer` (the writer id, plus 8 when the caller gave no site name), `object` the engine buffer id N1.2 (0: not told)
 struct Tag {

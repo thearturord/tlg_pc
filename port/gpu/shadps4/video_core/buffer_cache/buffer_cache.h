@@ -7,6 +7,7 @@
 #include <absl/container/btree_map.h>
 #include "native/native_buffer_index.h"
 #include "native/native_device.h"
+#include "native/native_updates.h"
 #include "native/native_ring_mirror.h"
 #include "native/native_resources.h"
 #include "native/native_readback_policy.h"
@@ -190,6 +191,8 @@ public:
     void ApplyCpuWrite(VAddr address, u64 size, bool newer = false, u64 object = 0);
     /// TLG_ANNOUNCE_SKIP: may an announced write with the same bytes as the last announcement of these bytes be left unapplied? Not when the GPU wrote them since or an image covers them.
     [[nodiscard]] u32 CanSkipIdenticalWrite(VAddr address, u64 size);
+    /// L1: may these announced pieces be applied as the one range [begin, begin + size)?
+    [[nodiscard]] bool CanMergeAnnounced(u64 object, VAddr begin, u64 size, const Core::NativeUpdates::AnnouncedPiece* pieces, size_t count);
     /// B9.2: the engine deleted the buffer `id` at [address, address + bytes) (raster thread, in order): its announced bytes go; in native mode also the GPU written
     /// bytes and stream copies of its memory, unless another live buffer shares the memory
     void NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool native);
