@@ -494,6 +494,13 @@ private:
         std::array<u32, Shader::NUM_IMAGES> image_keys{};
         bool set_hit{false};
     };
+    /// Plan S step P3e.1: everything the resolve half decided for one stage of a draw or dispatch.
+    struct StageResolved {
+        const Shader::Info* stage{nullptr};
+        boost::container::small_vector<BufferBind, 16> buffers;
+        TextureResolved textures;
+        boost::container::small_vector<vk::Sampler, 8> samplers;
+    };
     void BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     void ResolveTextures(const Shader::Info& stage, TextureResolved& r);
     void RecordTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding, TextureResolved& r);

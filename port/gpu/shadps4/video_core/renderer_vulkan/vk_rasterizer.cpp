@@ -1453,6 +1453,44 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
     clip_plane_mask = fixed ? fixed->user_clip_plane_mask : 0;
     const bool timed_resolve = recipe_active && VersionCensusOn();
     const auto resolve_begin = timed_resolve ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (SplitBindMode() == 1) {
+        // Plan S step P3e.1: the whole draw is resolved first (every stage: buffers, images, samplers), then recorded. What the resolve loop leaves is plain data per stage
+        // (`StageResolved`): the unit a resolver thread would hand to the recorder.
+        boost::container::small_vector<StageResolved, 6> jobs;
+        {
+            Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
+            TLG_PROF_LEVEL("raster.resolve_stages", 2);
+            for (const auto* stage : pipeline->GetStages()) {
+                if (!stage) {
+                    continue;
+                }
+                StageResolved& job = jobs.emplace_back();
+                job.stage = stage;
+                job.buffers.resize(stage->buffers.size());
+                const u64 alignment = instance.StorageMinAlignment();
+                const u32 census_base = stage->sw_stage == Shader::SwStage::Compute ? 32u : 0u;
+                for (u32 i = 0; i < job.buffers.size(); ++i) {
+                    ResolveBufferBinding(*stage, i, alignment, census_base, job.buffers[i]);
+                }
+                ResolveTextures(*stage, job.textures);
+                ResolveSamplers(*stage, job.samplers);
+            }
+        }
+        {
+            Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
+            TLG_PROF_LEVEL("raster.record_stages", 2);
+            for (StageResolved& job : jobs) {
+                const Shader::Info& stage = *job.stage;
+                set_writes.resize(set_writes.size() + stage.buffers.size() + stage.images.size() + stage.samplers.size());
+                const u64 alignment = instance.StorageMinAlignment();
+                const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
+                RecordBufferBindings(stage, binding, push_data, job.buffers.data(), static_cast<u32>(job.buffers.size()), alignment, census_base);
+                RecordTextures(stage, binding, job.textures);
+                RecordSamplers(stage, binding, job.samplers.data(), static_cast<u32>(job.samplers.size()));
+                uses_dma |= stage.uses_dma;
+            }
+        }
+    } else
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
