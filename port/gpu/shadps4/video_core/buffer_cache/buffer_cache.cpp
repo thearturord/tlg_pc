@@ -325,6 +325,15 @@ static u32 BindMemoWideMode() {
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                         Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
+    const auto result = ObtainBufferBody(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
+    if (result.first != nullptr) {
+        const_cast<Buffer*>(result.first)->NoteResolveUse(); // P3c: asked for by the operation being resolved (every answer, memo hits too)
+    }
+    return result;
+}
+
+std::pair<const Buffer*, u64> BufferCache::ObtainBufferBody(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
+                                                            Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseBufResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::BufObtain);
     const BindGuard bind_guard{reinterpret_cast<u64>(__builtin_return_address(0)), device_addr, size, is_written, immutable_hint != nullptr};
@@ -1073,6 +1082,9 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                                     bool is_written, bool is_texel_buffer) {
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseBufResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::BufSync);
+    if (arena != nullptr) {
+        const_cast<Buffer*>(arena)->NoteResolveUse(); // P3c: whoever synchronizes an arena asks for it in this operation
+    }
     TLG_PROF("buffer.synchronize");
     TLG_PROF_NAMED_LEVEL(s_placed, "buffer.sync.placed_walk", 3);
     // B9.4: a placed buffer holds [begin, end) of its block; a read into its slack must not take (and lose) the bytes of the memory after it
@@ -1342,8 +1354,27 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     if (!copies.empty() && arena->mem_type == MemoryType::DeviceMapped && arena->is_device_local && !arena->mapped_data.empty() && arena->CpuAddr() != 0) {
         // zero copy: the GPU is done with this engine buffer (every submission that used it finished): its bytes are written straight into its video memory,
         // with no staging and no copy in the stream (the submission that follows makes the host writes visible). Otherwise the copy below runs as before.
-        const bool idle = (arena->last_gpu_tick[0] == 0 || scheduler.IsFree(arena->last_gpu_tick[0])) &&
-                          (arena->last_gpu_tick[1] == 0 || scheduler.IsFree(arena->last_gpu_tick[1]));
+        const bool tick_idle = (arena->last_gpu_tick[0] == 0 || scheduler.IsFree(arena->last_gpu_tick[0])) &&
+                               (arena->last_gpu_tick[1] == 0 || scheduler.IsFree(arena->last_gpu_tick[1]));
+        // P3c: the GPU being done with what the record side noted is not enough once the resolve side runs ahead: the operations resolved before this one must have been recorded too
+        // (TLG_SPLIT_BIND=1 uses both; 2 uses the tick as before and counts where the sequence would have said no)
+        static const u32 split_mode = [] {
+            const char* e = std::getenv("TLG_SPLIT_BIND");
+            return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u;
+        }();
+        const bool seq_idle = arena->EarlierUsesRetired();
+        if (split_mode == 2) {
+            static std::atomic<u64> checked{0}, would_refuse{0};
+            const u64 n = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (tick_idle && !seq_idle && would_refuse.fetch_add(1) < 20) {
+                LOG_WARNING(Render_Vulkan, "split bind verify: zero copy idle by tick but an earlier operation ({}) is not retired ({})", arena->resolve_prev_seq,
+                            VideoCore::OpSequence::retired.load());
+            }
+            if ((n & (n - 1)) == 0) {
+                LOG_WARNING(Render_Vulkan, "split bind verify: {} zero copy idle tests, {} refused by sequence only", n, would_refuse.load());
+            }
+        }
+        const bool idle = tick_idle && (split_mode != 1 || seq_idle);
         if (idle) {
             u8* const base = const_cast<u8*>(arena->mapped_data.data());
             for (const auto& copy : copies) {

@@ -99,6 +99,8 @@ public:
                                                              bool is_texel_buffer = false,
                                                              Core::NativeResources::ImmutableBuffer* immutable_hint = nullptr,
                                                              bool verify_hint = false, bool known_no_object = false);
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferBody(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer, Core::NativeResources::ImmutableBuffer* immutable_hint,
+                                                                 bool verify_hint, bool known_no_object);
     /// Binding memo (raster thread): a read-only request of at most BindMemoMax bytes asked again in the same command buffer, with nothing written to its memory
     /// since and nothing moved, gets the same answer without the lookups and synchronization (TLG_BIND_MEMO, default on; =0 off)
     static constexpr u64 BindMemoMax = 65536;

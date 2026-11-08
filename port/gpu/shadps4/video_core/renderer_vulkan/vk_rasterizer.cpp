@@ -1400,6 +1400,7 @@ void Rasterizer::BindCensus(const Pipeline* pipeline) {
 
 bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed) {
     TLG_PROF_LEVEL("raster.bind_resources", 2);
+    VideoCore::OpSequence::resolving.fetch_add(1, std::memory_order_acq_rel); // P3c: a new operation (a draw or a dispatch)
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         return false;
@@ -2213,6 +2214,8 @@ void Rasterizer::RecordBufferAccess(bool is_compute) {
     }
     bound_buffers.clear();
     needs_barrier = false;
+    // P3c: everything the operation resolved is recorded now
+    VideoCore::OpSequence::retired.store(VideoCore::OpSequence::resolving.load(std::memory_order_acquire), std::memory_order_release);
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {

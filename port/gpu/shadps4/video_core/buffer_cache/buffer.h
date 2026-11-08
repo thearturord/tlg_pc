@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <optional>
 #include <span>
@@ -80,6 +81,13 @@ struct UniqueBuffer {
     VmaAllocation allocation{};
 };
 
+/// Plan S step P3c: the position of the resolve and the record side in the stream of operations (a draw or a dispatch each). One thread today: `retired` follows
+/// `resolving` at the end of every operation. With a resolver thread ahead of the recorder, `retired` is what the recorder publishes.
+struct OpSequence {
+    static inline std::atomic<u64> resolving{1};
+    static inline std::atomic<u64> retired{0};
+};
+
 struct Buffer {
     explicit Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
                     MemoryType mem_type, std::string_view debug_name = "");
@@ -128,6 +136,20 @@ struct Buffer {
         u64& slot = last_gpu_tick[(tick & side_tag) != 0 ? 1 : 0];
         slot = std::max(slot, tick);
     }
+
+    /// Plan S step P3c: the resolve side's own record of which operation asked for this buffer (`OpSequence`), so the zero-copy "idle" test does not depend on what the
+    /// record side has noted yet. `resolve_prev_seq` is the last operation before the current one that asked for it.
+    void NoteResolveUse() noexcept {
+        const u64 s = OpSequence::resolving.load(std::memory_order_relaxed);
+        if (resolve_use_seq != s) {
+            resolve_prev_seq = resolve_use_seq;
+            resolve_use_seq = s;
+        }
+    }
+    [[nodiscard]] bool EarlierUsesRetired() const noexcept {
+        return resolve_prev_seq <= OpSequence::retired.load(std::memory_order_acquire);
+    }
+    u64 resolve_use_seq{0}, resolve_prev_seq{0};
 
     VAddr cpu_addr = 0;
     size_t size_bytes = 0;

@@ -453,6 +453,9 @@ private:
         /// a barrier query for the record pass: does the buffer range conflict with what the plan holds (with `plan_writes`: only asked when the plan has writes)
         void SetQuery(const VideoCore::Buffer* buffer, u64 offset, u64 size, bool written, bool plan_writes) {
             has_query = true;
+            if (buffer != nullptr) {
+                const_cast<VideoCore::Buffer*>(buffer)->NoteResolveUse();
+            }
             query_buffer = buffer;
             query_offset = offset;
             query_size = size;
@@ -461,6 +464,9 @@ private:
         }
         void SetBound(const VideoCore::Buffer* buffer, u64 offset, u64 size, vk::AccessFlags2 access) {
             has_bound = true;
+            if (buffer != nullptr) {
+                const_cast<VideoCore::Buffer*>(buffer)->NoteResolveUse(); // P3c: the resolve side announces every buffer the operation names, whichever way it found it
+            }
             bound_buffer = buffer;
             bound_offset = offset;
             bound_size = static_cast<u32>(size);

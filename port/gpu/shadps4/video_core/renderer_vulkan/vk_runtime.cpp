@@ -255,6 +255,25 @@ u64 Runtime::LiveObjectSpace(const VideoCore::Buffer* handle, u64 offset, u64& b
         // B10: a placed engine buffer (or block) is its own Vulkan buffer: its hazards are its own, in its own offset space
         ++live_stats.object_space_queries;
         const_cast<VideoCore::Buffer*>(handle)->NoteGpuUse(scheduler.CurrentTick()); // zero copy: the CPU writes it directly only once this is finished
+        {
+            // P3c oracle: a buffer the record side uses for an operation was asked for by the resolve side in that operation (or the one before: bound buffers released at its end)
+            static std::atomic<u64> uses{0}, unannounced{0}, never{0};
+            const u64 seq = VideoCore::OpSequence::resolving.load(std::memory_order_relaxed);
+            const u64 n = uses.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (handle->resolve_use_seq != seq && handle->resolve_prev_seq != seq) {
+                const u64 k = unannounced.fetch_add(1, std::memory_order_relaxed);
+                if (handle->resolve_use_seq == 0) {
+                    never.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (k < 6 || (k & 0xFFFF) == 0) {
+                    LOG_WARNING(Render_Vulkan, "zero copy census: unannounced use of buffer {:#x}+{:#x} (asked in operation {}, before that {}), operation now {}, caller {:#x}", handle->CpuAddr(),
+                                handle->SizeBytes(), handle->resolve_use_seq, handle->resolve_prev_seq, seq, reinterpret_cast<u64>(__builtin_return_address(0)));
+                }
+            }
+            if ((n & (n - 1)) == 0 && n >= 1024) {
+                LOG_WARNING(Render_Vulkan, "zero copy census: {} record side uses of placed buffers, {} of them not asked for by the resolve side in that operation ({} never asked at all)", n, unannounced.load(), never.load());
+            }
+        }
         begin = offset;
         return reinterpret_cast<u64>(handle);
     }
