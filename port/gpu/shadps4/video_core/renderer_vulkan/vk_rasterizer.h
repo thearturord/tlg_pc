@@ -473,6 +473,31 @@ private:
     std::vector<u32> verify_slots;
     bool verify_slots_on{false};
     void RecordBufferBindings(const Shader::Info& stage, Shader::Backend::Bindings& binding, Shader::PushData& push_data, BufferBind* binds, u32 count, u64 alignment, u32 census_base);
+    static u32 SplitBindMode();
+    void BindSamplersLegacy(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+    void ResolveSamplers(const Shader::Info& stage, boost::container::small_vector<vk::Sampler, 8>& out);
+    void RecordSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding, const vk::Sampler* samplers, u32 count);
+    struct VertexBind;
+    struct IndexBind;
+    void BindVertexBuffersLegacy(const GraphicsPipeline* pipeline);
+    void ResolveVertexBuffers(const GraphicsPipeline* pipeline, VertexBind& vb);
+    void RecordVertexBuffers(VertexBind& vb, VideoCore::BufferCache::UploadSink& uploads);
+    void BindIndexBufferLegacy(u32 index_offset, bool is_indirect);
+    void ResolveIndexBuffer(u32 index_offset, bool is_indirect, IndexBind& ib);
+    void RecordIndexBuffer(IndexBind& ib, VideoCore::BufferCache::UploadSink& uploads);
+    struct VerifyVertexEntry {
+        vk::Buffer buffer;
+        u64 offset;
+        bool stream;
+    };
+    std::vector<vk::Sampler> verify_samplers;
+    std::vector<VerifyVertexEntry> verify_vertex;
+    struct VerifyIndex {
+        vk::Buffer buffer{};
+        u64 offset{};
+        u32 size{};
+        bool stream{};
+    } verify_index;
     void VerifyBufferBindings(const Shader::Info& stage, Shader::Backend::Bindings& binding, Shader::PushData& push_data, u64 alignment, u32 census_base, u32 count);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     void BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding);

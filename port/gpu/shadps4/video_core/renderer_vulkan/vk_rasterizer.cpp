@@ -1696,7 +1696,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
     return true;
 }
 
-void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
+void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
     TLG_PROF_LEVEL("raster.bind_vertex_buffers", 2);
     const auto& regs = *draw_inputs;
@@ -1715,6 +1715,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 
     if (bindings.empty()) {
         // If there are no bindings, there is nothing further to do.
+        verify_vertex.clear();
         return;
     }
 
@@ -1809,6 +1810,12 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         host_strides.push_back(buffer.stride);
     }
 
+    if (verify_slots_on) {
+        verify_vertex.clear();
+        for (size_t i = 0; i < host_buffers.size(); ++i) {
+            verify_vertex.push_back({host_buffers[i], host_offsets[i], host_buffers[i] == buffer_cache.GetStreamBuffer().Handle()});
+        }
+    }
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto num_buffers = guest_buffers.size();
     if (instance.IsVertexInputDynamicState()) {
@@ -1819,7 +1826,165 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     }
 }
 
-void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
+struct Rasterizer::VertexBind {
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    VertexInputs<vk::Buffer> host_buffers;
+    VertexInputs<vk::DeviceSize> host_offsets;
+    VertexInputs<vk::DeviceSize> host_sizes;
+    VertexInputs<vk::DeviceSize> host_strides;
+    struct Query {
+        const VideoCore::Buffer* buffer;
+        u64 offset;
+        u64 size;
+    };
+    boost::container::small_vector<Query, 4> queries; ///< barrier queries and bound buffers, asked by the record half
+};
+
+void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline, VertexBind& vb) {
+    // Plan S step P2: the resolve half of the vertex buffer binding (what is bound where); no command is recorded here
+    const auto& regs = *draw_inputs;
+    VertexInputs<vk::VertexInputAttributeDescription2EXT>& attributes = vb.attributes;
+    VertexInputs<vk::VertexInputBindingDescription2EXT>& bindings = vb.bindings;
+    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+    VertexInputs<Core::NativeDesc::BufferDesc> guest_buffers;
+    pipeline->GetVertexInputs(attributes, bindings, divisors, guest_buffers, regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
+    if (bindings.empty()) {
+        return;
+    }
+
+    struct BufferRange {
+        VAddr base_address;
+        VAddr end_address;
+        const VideoCore::Buffer* buffer;
+        u64 offset;
+        bool ring{};
+
+        [[nodiscard]] size_t GetSize() const {
+            return end_address - base_address;
+        }
+    };
+
+    VertexInputs<BufferRange> ranges{};
+    for (const auto& buffer : guest_buffers) {
+        if (buffer.address != 0 && buffer.size > 0) {
+            ranges.emplace_back(buffer.address, buffer.address + buffer.size);
+        }
+    }
+    VertexInputs<BufferRange> ranges_merged{};
+    if (!ranges.empty()) {
+        std::ranges::sort(ranges, [](const BufferRange& lhv, const BufferRange& rhv) { return lhv.base_address < rhv.base_address; });
+        ranges_merged.emplace_back(ranges[0]);
+        for (auto range : ranges) {
+            auto& prev_range = ranges_merged.back();
+            if (prev_range.end_address < range.base_address) {
+                ranges_merged.emplace_back(range);
+            } else {
+                prev_range.end_address = std::max(prev_range.end_address, range.end_address);
+            }
+        }
+    }
+    for (auto& range : ranges_merged) {
+        if (range.GetSize() >= (1ull << 30) && !memory->IsValidMapping(range.base_address)) {
+            LOG_ERROR(Render, "vertex buffer range at unmapped address {:#x} of {} bytes: ignored", range.base_address, range.GetSize());
+            range.buffer = nullptr;
+            continue;
+        }
+        const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
+        if (const RingBinding* ring = FindGeometryRing(range.base_address, size, GeometryVertex)) {
+            if (buffer_cache.IsRangeGpuWritten(range.base_address, size)) {
+                Core::NativeUploads::NoteGeometry(4);
+            } else {
+                range.ring = true;
+                range.offset = ring->offset;
+                Census(CGeometryVertexRing);
+                Core::NativeUploads::NoteGeometry(2);
+                continue;
+            }
+        }
+        auto* vertex_handle = GeometryHandle(range.base_address, size);
+        Census(vertex_handle != nullptr ? CGeometryVertexHandle : CGeometryVertexAddress);
+        Core::NativeContent::SetBindContext({"vertex", 0, 0, 0, 0, vertex_handle != nullptr, false, range.base_address, size});
+        std::tie(range.buffer, range.offset) = buffer_cache.ObtainBuffer(range.base_address, size, false, false, vertex_handle, NativeHandleMode() == 2);
+        Core::NativeContent::ClearBindContext();
+        vb.queries.push_back({range.buffer, range.offset, size});
+    }
+    for (const auto& buffer : guest_buffers) {
+        if (buffer.address != 0 && buffer.size > 0) {
+            const auto host_buffer_info = std::ranges::find_if(ranges_merged, [&](const BufferRange& range) { return buffer.address >= range.base_address && buffer.address < range.end_address; });
+            ASSERT(host_buffer_info != ranges_merged.cend());
+            vb.host_buffers.emplace_back(host_buffer_info->ring ? constant_ring->Handle() : host_buffer_info->buffer->Handle());
+            vb.host_offsets.push_back(host_buffer_info->offset + buffer.address - host_buffer_info->base_address);
+        } else {
+            vb.host_buffers.emplace_back(VK_NULL_HANDLE);
+            vb.host_offsets.push_back(0);
+        }
+        vb.host_sizes.push_back(buffer.size);
+        vb.host_strides.push_back(buffer.stride);
+    }
+}
+
+void Rasterizer::RecordVertexBuffers(VertexBind& vb, VideoCore::BufferCache::UploadSink& uploads) {
+    // Plan S step P2: the record half. The order of the old function is kept: the vertex input state, the synchronization copies, the barrier queries, the bind.
+    if (instance.IsVertexInputDynamicState()) {
+        const auto cmdbuf = scheduler.CommandBuffer();
+        cmdbuf.setVertexInputEXT(vb.bindings, vb.attributes);
+    }
+    buffer_cache.RunDeferredUploads(uploads);
+    if (vb.bindings.empty()) {
+        return;
+    }
+    for (const auto& q : vb.queries) {
+        needs_barrier |= runtime.IsBufferAccessed(q.buffer, q.offset, q.size);
+        bound_buffers.emplace_back(q.buffer, q.offset, q.size, vk::AccessFlagBits2::eVertexAttributeRead);
+    }
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto num_buffers = vb.host_buffers.size();
+    if (instance.IsVertexInputDynamicState()) {
+        cmdbuf.bindVertexBuffers(0, num_buffers, vb.host_buffers.data(), vb.host_offsets.data());
+    } else {
+        cmdbuf.bindVertexBuffers2(0, num_buffers, vb.host_buffers.data(), vb.host_offsets.data(), vb.host_sizes.data(), vb.host_strides.data());
+    }
+}
+
+void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
+    const u32 mode = SplitBindMode();
+    if (mode == 0) {
+        BindVertexBuffersLegacy(pipeline);
+        return;
+    }
+    static std::atomic<u64> checked{0}, differ{0};
+    if (mode == 2) {
+        verify_vertex.clear();
+        verify_slots_on = true;
+        BindVertexBuffersLegacy(pipeline);
+        verify_slots_on = false;
+        VertexBind vb;
+        ResolveVertexBuffers(pipeline, vb);
+        const u64 n = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+        bool same = vb.host_buffers.size() == verify_vertex.size();
+        for (size_t i = 0; same && i < verify_vertex.size(); ++i) {
+            same = vb.host_buffers[i] == verify_vertex[i].buffer && (verify_vertex[i].stream || vb.host_offsets[i] == verify_vertex[i].offset);
+        }
+        if (!same && differ.fetch_add(1) < 20) {
+            LOG_WARNING(Render_Vulkan, "split bind verify: vertex buffers differ ({} legacy, {} split)", verify_vertex.size(), vb.host_buffers.size());
+        }
+        if ((n & (n - 1)) == 0) {
+            LOG_WARNING(Render_Vulkan, "split bind verify: {} vertex binds, {} differ", n, differ.load());
+        }
+        return;
+    }
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
+    TLG_PROF_LEVEL("raster.bind_vertex_buffers", 2);
+    VertexBind vb;
+    VideoCore::BufferCache::UploadSink uploads;
+    VideoCore::BufferCache::SetUploadSink(&uploads);
+    ResolveVertexBuffers(pipeline, vb);
+    VideoCore::BufferCache::SetUploadSink(nullptr);
+    RecordVertexBuffers(vb, uploads);
+}
+
+void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
     TLG_PROF_LEVEL("raster.bind_index_buffer", 2);
     const auto& regs = *draw_inputs;
@@ -1883,12 +2048,141 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
         index_buffer = null_buffer->Handle();
     }
 
+    if (verify_slots_on) {
+        verify_index = {index_buffer, buffer_offset, index_buffer_size, index_buffer == buffer_cache.GetStreamBuffer().Handle()};
+    }
     const auto cmdbuf = scheduler.CommandBuffer();
     if (instance.IsMaintenance5Supported()) {
         cmdbuf.bindIndexBuffer2KHR(index_buffer, buffer_offset, index_buffer_size, index_type);
     } else {
         cmdbuf.bindIndexBuffer(index_buffer, buffer_offset, index_type);
     }
+}
+
+struct Rasterizer::IndexBind {
+    vk::Buffer buffer{};
+    u64 offset{};
+    u32 size{};
+    vk::IndexType type{};
+    const VideoCore::Buffer* query_buffer{nullptr};
+    u64 query_offset{};
+    u64 query_size{};
+};
+
+void Rasterizer::ResolveIndexBuffer(u32 index_offset, bool is_indirect, IndexBind& ib) {
+    // Plan S step P2: the resolve half of the index buffer binding; no command is recorded here
+    const auto& regs = *draw_inputs;
+
+    // Figure out index type and size.
+    const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+    const vk::IndexType index_type = is_index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
+    const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
+    const VAddr base_address = regs.index_base_address.Address<VAddr>();
+    const VAddr index_address = base_address + u64(index_offset) * index_size;
+
+    // Bind index buffer.
+    const u32 num_indices =
+        is_indirect ? regs.max_index_size : std::min(regs.num_indices, regs.max_index_size);
+    const u64 requested_size = u64(num_indices) * index_size;
+    if (base_address != 0 && requested_size >= (1ull << 30) && !memory->IsValidMapping(index_address)) {
+        LOG_ERROR(Render, "index buffer at unmapped address {:#x}: {} indices of {} bytes (indirect {}, num_indices {}, max_index_size {}): ignored",
+                  index_address, num_indices, index_size, is_indirect, regs.num_indices, regs.max_index_size);
+    }
+    const u64 mapped_size = base_address != 0 && (requested_size < (1ull << 30) || memory->IsValidMapping(index_address))
+                                ? memory->ClampRangeSize(index_address, requested_size)
+                                : 0;
+    u32 index_buffer_size = static_cast<u32>(Common::AlignDown(mapped_size, index_size));
+    vk::Buffer index_buffer{};
+    u64 buffer_offset{};
+    const RingBinding* index_ring = index_buffer_size != 0 && !is_indirect ? FindGeometryRing(index_address, index_buffer_size, GeometryIndex) : nullptr;
+    if (index_buffer_size != 0 && !is_indirect && ring_use.draw != nullptr && Core::NativeUploads::RingGeometry()) {
+        bool has_entry = false;
+        for (const auto& ring : ring_use.draw->geometry_ring) {
+            has_entry |= ring.index == GeometryIndex;
+        }
+        Core::NativeUploads::NoteGeometry(index_ring != nullptr ? 14 : has_entry ? 15 : 29);
+    }
+    if (index_ring != nullptr && buffer_cache.IsRangeGpuWritten(index_address, index_buffer_size)) {
+        Core::NativeUploads::NoteGeometry(4);
+        index_ring = nullptr;
+    }
+    if (index_ring != nullptr) {
+        Census(CGeometryIndexRing);
+        index_buffer = constant_ring->Handle();
+        buffer_offset = index_ring->offset;
+        Core::NativeUploads::NoteGeometry(3);
+    } else if (index_buffer_size != 0) {
+        auto* index_handle = GeometryHandle(index_address, index_buffer_size);
+        Census(index_handle != nullptr ? CGeometryIndexHandle : CGeometryIndexAddress);
+        Core::NativeContent::SetBindContext({"index", 0, 0, 0, 0, index_handle != nullptr, false, index_address, index_buffer_size});
+        const auto [buffer, offset] =
+            buffer_cache.ObtainBuffer(index_address, index_buffer_size, false, false, index_handle, NativeHandleMode() == 2);
+        Core::NativeContent::ClearBindContext();
+        ib.query_buffer = buffer;
+        ib.query_offset = offset;
+        ib.query_size = index_buffer_size;
+        index_buffer = buffer->Handle();
+        buffer_offset = offset;
+    } else if (!instance.IsMaintenance6Supported()) {
+        const auto* null_buffer = buffer_cache.GetNullIndexBuffer();
+        index_buffer_size = static_cast<u32>(null_buffer->SizeBytes());
+        ib.query_buffer = null_buffer;
+        ib.query_offset = 0;
+        ib.query_size = index_buffer_size;
+        index_buffer = null_buffer->Handle();
+    }
+
+    ib.buffer = index_buffer;
+    ib.offset = buffer_offset;
+    ib.size = index_buffer_size;
+    ib.type = index_type;
+}
+
+void Rasterizer::RecordIndexBuffer(IndexBind& ib, VideoCore::BufferCache::UploadSink& uploads) {
+    buffer_cache.RunDeferredUploads(uploads);
+    if (ib.query_buffer != nullptr) {
+        needs_barrier |= runtime.IsBufferAccessed(ib.query_buffer, ib.query_offset, ib.query_size);
+        bound_buffers.emplace_back(ib.query_buffer, ib.query_offset, ib.query_size, vk::AccessFlagBits2::eIndexRead);
+    }
+    const auto cmdbuf = scheduler.CommandBuffer();
+    if (instance.IsMaintenance5Supported()) {
+        cmdbuf.bindIndexBuffer2KHR(ib.buffer, ib.offset, ib.size, ib.type);
+    } else {
+        cmdbuf.bindIndexBuffer(ib.buffer, ib.offset, ib.type);
+    }
+}
+
+void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
+    const u32 mode = SplitBindMode();
+    if (mode == 0) {
+        BindIndexBufferLegacy(index_offset, is_indirect);
+        return;
+    }
+    static std::atomic<u64> checked{0}, differ{0};
+    if (mode == 2) {
+        verify_slots_on = true;
+        BindIndexBufferLegacy(index_offset, is_indirect);
+        verify_slots_on = false;
+        IndexBind ib;
+        ResolveIndexBuffer(index_offset, is_indirect, ib);
+        const u64 n = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+        const bool same = ib.buffer == verify_index.buffer && ib.size == verify_index.size && (verify_index.stream || ib.offset == verify_index.offset);
+        if (!same && differ.fetch_add(1) < 20) {
+            LOG_WARNING(Render_Vulkan, "split bind verify: index buffer differs");
+        }
+        if ((n & (n - 1)) == 0) {
+            LOG_WARNING(Render_Vulkan, "split bind verify: {} index binds, {} differ", n, differ.load());
+        }
+        return;
+    }
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
+    TLG_PROF_LEVEL("raster.bind_index_buffer", 2);
+    IndexBind ib;
+    VideoCore::BufferCache::UploadSink uploads;
+    VideoCore::BufferCache::SetUploadSink(&uploads);
+    ResolveIndexBuffer(index_offset, is_indirect, ib);
+    VideoCore::BufferCache::SetUploadSink(nullptr);
+    RecordIndexBuffer(ib, uploads);
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {
@@ -2052,6 +2346,11 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     return true;
 }
 
+
+u32 Rasterizer::SplitBindMode() {
+    static const u32 mode = [] { const char* e = std::getenv("TLG_SPLIT_BIND"); return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u; }();
+    return mode;
+}
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
@@ -3789,7 +4088,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     BindSamplers(stage, binding);
 }
 
-void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+void Rasterizer::BindSamplersLegacy(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
     TLG_PROF_LEVEL("raster.bind_samplers", 2);
     for (const auto& sampler : stage.samplers) {
@@ -3846,6 +4145,9 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
         const auto from_t_sharp = VideoCore::SamplerDescFromSharp(ssharp);
         const auto from_words = Core::NativeImageDesc::SamplerDescFromWords(reinterpret_cast<const u32*>(&ssharp));
         const auto vk_sampler = texture_cache.GetSampler(Core::NativeImageDesc::FromDescOn() ? from_words : from_t_sharp, *current_bc_base, sampler.is_depth);
+        if (verify_slots_on) {
+            verify_samplers.push_back(vk_sampler);
+        }
         if (indexed_active && stage.indexed) {
             NoteIndexedSampler(vk_sampler);
             continue;
@@ -3859,6 +4161,116 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
         set_write.descriptorType = vk::DescriptorType::eSampler;
         set_write.pImageInfo = &image_infos.back();
     }
+}
+
+void Rasterizer::ResolveSamplers(const Shader::Info& stage, boost::container::small_vector<vk::Sampler, 8>& out) {
+    // Plan S step P2: the resolve half of the sampler bindings (S# words to the host sampler)
+    for (const auto& sampler : stage.samplers) {
+        AmdGpu::Sampler ssharp;
+        const u32* record_words = nullptr;
+        u32 aniso_dw3 = 0; // L1: dword 3 of the T# the sampler is used with, from the record's image entry (the aniso post operation reads it)
+        if (binder_plan != nullptr && sampler.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Sampler>::Summary::SingleLoad) {
+            record_words = BinderWords(stage, sampler.sharp_fetch.offsets[0], 4, 3);
+            if (record_words != nullptr && sampler.post_op == Shader::SharpFetchPostOp::DisableAnisoIfSingleLod) {
+                const u32 off = sampler.post_op_tsharp_dw3_off;
+                const u32* tsharp = off >= 3 && off != Shader::UNKNOWN_LOCATION ? BinderWords(stage, off - 3, 8, 2) : nullptr;
+                if (tsharp == nullptr && off >= 3 && off != Shader::UNKNOWN_LOCATION) {
+                    tsharp = BinderWords(stage, off - 3, 4, 2);
+                }
+                if (tsharp != nullptr) {
+                    aniso_dw3 = tsharp[3];
+                } else {
+                    record_words = nullptr;
+                }
+            }
+        }
+        if (record_words != nullptr) {
+            AmdGpu::Sampler raw{};
+            std::memcpy(&raw, record_words, sizeof(raw));
+            ssharp = sampler.PostOp(raw, aniso_dw3);
+            Core::NativeRegistry::NoteBinder(7);
+        } else if (sampler.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Sampler>::Summary::MultiLoad && sampler.sharp_fetch.load_mask == 0 &&
+                   sampler.post_op != Shader::SharpFetchPostOp::DisableAnisoIfSingleLod) {
+            // F5: the sampler is the shader's own immediates (no flat user data dword is read), so a stage whose flat user data was skipped still has it
+            ssharp = sampler.GetSharp(stage);
+            Core::NativeRegistry::NoteBinder(11);
+        } else if (StageFlatSkipped(stage)) {
+            Core::NativeRegistry::NoteBinder(6); // must not happen
+            if (stage.sw_stage == Shader::SwStage::Compute) {
+                DumpDispatchRecord(stage, 3, sampler.sharp_fetch.offsets[0], "no record entry: sampler");
+            }
+            ssharp = AmdGpu::Sampler{};
+        } else {
+            ssharp = sampler.GetSharp(stage);
+        }
+        if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
+                                current_bc_base->Address() == 0)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Rejecting invalid S# max_aniso={}, filter_mode={}, mip_filter={}, "
+                        "border_color_type={}, border_color_base={:#x}",
+                        static_cast<u32>(ssharp.max_aniso.Value()),
+                        static_cast<u32>(ssharp.filter_mode.Value()),
+                        static_cast<u32>(ssharp.mip_filter.Value()),
+                        static_cast<u32>(ssharp.border_color_type.Value()),
+                        current_bc_base->Address());
+            ssharp = AmdGpu::Sampler{};
+        }
+        // F4.1 / F4.3: the host sampler is made from the plain description of the S# words (after the shader's post operation); the shadow compares it with the emulator's own decode
+        const auto from_t_sharp = VideoCore::SamplerDescFromSharp(ssharp);
+        const auto from_words = Core::NativeImageDesc::SamplerDescFromWords(reinterpret_cast<const u32*>(&ssharp));
+        const auto vk_sampler = texture_cache.GetSampler(Core::NativeImageDesc::FromDescOn() ? from_words : from_t_sharp, *current_bc_base, sampler.is_depth);
+        out.push_back(vk_sampler);
+    }
+}
+
+void Rasterizer::RecordSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding, const vk::Sampler* samplers, u32 count) {
+    // Plan S step P2: the record half (descriptor infos, writes, the indexed row)
+    for (u32 i = 0; i < count; ++i) {
+        if (indexed_active && stage.indexed) {
+            NoteIndexedSampler(samplers[i]);
+            continue;
+        }
+        image_infos.emplace_back(samplers[i], VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+        auto& set_write = set_writes[set_write_index++];
+        set_write.dstSet = VK_NULL_HANDLE;
+        set_write.dstBinding = binding.unified++;
+        set_write.dstArrayElement = 0;
+        set_write.descriptorCount = 1;
+        set_write.descriptorType = vk::DescriptorType::eSampler;
+        set_write.pImageInfo = &image_infos.back();
+    }
+}
+
+void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    const u32 mode = SplitBindMode();
+    if (mode == 0) {
+        BindSamplersLegacy(stage, binding);
+        return;
+    }
+    static std::atomic<u64> checked{0}, differ{0};
+    if (mode == 2) {
+        verify_samplers.clear();
+        verify_slots_on = true;
+        BindSamplersLegacy(stage, binding);
+        verify_slots_on = false;
+        boost::container::small_vector<vk::Sampler, 8> again;
+        ResolveSamplers(stage, again);
+        const u64 n = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (again.size() != verify_samplers.size() || !std::equal(again.begin(), again.end(), verify_samplers.begin())) {
+            if (differ.fetch_add(1) < 20) {
+                LOG_WARNING(Render_Vulkan, "split bind verify: samplers of stage {:#x} differ ({} legacy, {} split)", stage.pgm_hash, verify_samplers.size(), again.size());
+            }
+        }
+        if ((n & (n - 1)) == 0) {
+            LOG_WARNING(Render_Vulkan, "split bind verify: {} sampler stage calls, {} differ", n, differ.load());
+        }
+        return;
+    }
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
+    TLG_PROF_LEVEL("raster.bind_samplers", 2);
+    boost::container::small_vector<vk::Sampler, 8> resolved;
+    ResolveSamplers(stage, resolved);
+    RecordSamplers(stage, binding, resolved.data(), static_cast<u32>(resolved.size()));
 }
 
 Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline* pipeline) const {
