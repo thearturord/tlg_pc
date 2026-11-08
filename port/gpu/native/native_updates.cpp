@@ -227,6 +227,7 @@ void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u6
 namespace {
 struct SiteStat {
     u64 count{}, bytes{}, largest{};
+    u64 by_object[3]{}; ///< announcements that named no buffer (0), a block over several (1), one buffer (2)
     u64 by_size_log2[40]{};
 };
 std::map<std::pair<u32, std::string>, SiteStat> site_stats;
@@ -309,6 +310,7 @@ void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site, bool r
         std::scoped_lock lock{site_mutex};
         SiteStat& stat = site_stats[{writer, site != nullptr ? site : "?"}];
         ++stat.count;
+        ++stat.by_object[object == 0 ? 0 : object == kBuffersOnly ? 1 : 2];
         stat.bytes += size;
         stat.largest = std::max(stat.largest, size);
         u32 log = 0;
@@ -328,6 +330,7 @@ void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site, bool r
 
 namespace {
 std::mutex pending_mutex;
+std::atomic<u64> announced_by_object_class[8][3][2]{}; // [writer][named: no, block, one buffer][count, bytes]
 std::vector<std::pair<u64, u64>> pending_ranges, applied_last, pending_ring_ranges, applied_ring_last;
 std::vector<Tag> pending_writers, applied_last_writers, pending_ring_writers, applied_ring_last_writers; // N1: the writer (N1.2: and the buffer id) of each range above
 std::vector<std::array<u64, 4>> pending_deleted;
@@ -1027,6 +1030,11 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
     if (address == 0 || size == 0) {
         return;
     }
+    {
+        const u32 cls = t_announce_object == 0 ? 0u : t_announce_object == kBuffersOnly ? 1u : 2u;
+        announced_by_object_class[writer & 7][cls][0].fetch_add(1, std::memory_order_relaxed);
+        announced_by_object_class[writer & 7][cls][1].fetch_add(size, std::memory_order_relaxed);
+    }
     announced_ranges_by_writer[writer & 7].fetch_add(1, std::memory_order_relaxed);
     announced_bytes_by_writer[writer & 7].fetch_add(size, std::memory_order_relaxed);
     if (RingMirror::ShadowOn()) {
@@ -1054,6 +1062,9 @@ nlohmann::json Report() {
     j["enabled"] = enabled.load();
     for (u32 w = 0; w < 8; ++w) {
         j["announced_by_writer"][std::to_string(w)] = {{"ranges", announced_ranges_by_writer[w].load()}, {"bytes", announced_bytes_by_writer[w].load()}};
+        j["announced_by_writer"][std::to_string(w)]["object_unnamed"] = {{"ranges", announced_by_object_class[w][0][0].load()}, {"bytes", announced_by_object_class[w][0][1].load()}};
+        j["announced_by_writer"][std::to_string(w)]["object_block"] = {{"ranges", announced_by_object_class[w][1][0].load()}, {"bytes", announced_by_object_class[w][1][1].load()}};
+        j["announced_by_writer"][std::to_string(w)]["object_named"] = {{"ranges", announced_by_object_class[w][2][0].load()}, {"bytes", announced_by_object_class[w][2][1].load()}};
     }
     j["gpu_written_marks_superseded"] = {{"enabled", SupersedeEnabled()}, {"ranges", superseded_ranges.load()}, {"bytes", superseded_bytes.load()}};
     auto& m = j["maps_of_buffers"] = nlohmann::json::object();
@@ -1085,7 +1096,7 @@ nlohmann::json Report() {
         auto& sites = j["writer_sites"] = nlohmann::json::object();
         for (const auto& [key, stat] : site_stats) {
             auto& e = sites[std::to_string(key.first) + " " + key.second];
-            e = {{"count", stat.count}, {"bytes", stat.bytes}, {"largest", stat.largest}};
+            e = {{"count", stat.count}, {"bytes", stat.bytes}, {"largest", stat.largest}, {"unnamed", stat.by_object[0]}, {"block", stat.by_object[1]}, {"named", stat.by_object[2]}};
             for (u32 i = 0; i < 40; ++i) {
                 if (stat.by_size_log2[i] != 0) {
                     e["by_size_log2"][std::to_string(i)] = stat.by_size_log2[i];
