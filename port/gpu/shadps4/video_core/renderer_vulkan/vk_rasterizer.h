@@ -389,6 +389,15 @@ private:
     void Resolve(const DrawInputs& inputs, const AmdGpu::CbDbExtent& cb0, const AmdGpu::CbDbExtent& cb1);
     void DepthStencilCopy(const DrawInputs& inputs, const AmdGpu::CbDbExtent& db_extent, bool is_depth, bool is_stencil);
     void EliminateFastClear(const DrawInputs& inputs, const AmdGpu::CbDbExtent& cb0);
+    /// P3e.3: the two halves of the fast clear eliminate. The resolve half looks the target up and decides whether a clear is pending; only then is there a command to record.
+    struct FastClearOp {
+        VideoCore::Image* image{nullptr};
+        VideoCore::SubresourceRange range{};
+        vk::ClearValue value{};
+        u64 address{0};
+    };
+    bool ResolveFastClearEliminate(const DrawInputs& inputs, const AmdGpu::CbDbExtent& cb0, FastClearOp& op);
+    void RecordFastClearEliminate(const FastClearOp& op);
     /// Clears the bound depth / stencil target to the clear values of the registers (native replacement of the SDK's clear quad).
     void ClearDepthTarget(const DrawInputs& inputs, const AmdGpu::CbDbExtent& db_extent);
 
@@ -450,6 +459,8 @@ private:
         u32 bound_size{0};
         vk::AccessFlags2 bound_access{};
         std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
+        /// P3e.3: the stage's flattened user data, copied by the resolve half (FlatCopy / Skip of an indexed stage): the record half must not read the shader info, the next draw's plan rewrites it
+        boost::container::small_vector<u32, 32> flat;
         /// a barrier query for the record pass: does the buffer range conflict with what the plan holds (with `plan_writes`: only asked when the plan has writes)
         void SetQuery(const VideoCore::Buffer* buffer, u64 offset, u64 size, bool written, bool plan_writes) {
             has_query = true;
@@ -568,6 +579,7 @@ private:
     RenderState RecordDrawJob(DrawJob& job);
     bool BindResources(const Pipeline* pipeline, const FixedState* fixed = nullptr, DrawJob* draw_job = nullptr);
     void BindCensus(const Pipeline* pipeline);
+    static void NoteRecordedStateDiagnostics();
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false);
@@ -592,9 +604,19 @@ private:
     RenderState RecordRenderTargets(RenderResolved& r);
     void RecordBufferAccess(bool is_compute);
 
+    /// P3e.3: the game's own compute copies and clears of images. The resolve half decides (`Match*`: which images, which values), the record half issues the command (`RunComputeImageOp`).
+    struct ComputeImageOp {
+        enum Kind : u8 { None, Copy, Clear };
+        Kind kind{None};
+        VideoCore::Image* source{nullptr};
+        VideoCore::Image* target{nullptr};
+        VideoCore::SubresourceRange range{};
+        vk::ClearValue clear{};
+    };
     bool IsComputeMetaClear(const Pipeline* pipeline);
-    bool IsComputeImageCopy(const Pipeline* pipeline);
-    bool IsComputeImageClear(const Pipeline* pipeline);
+    bool MatchComputeImageCopy(const Pipeline* pipeline, ComputeImageOp& op);
+    bool MatchComputeImageClear(const Pipeline* pipeline, ComputeImageOp& op);
+    void RunComputeImageOp(const ComputeImageOp& op);
 
 private:
     friend class VideoCore::BufferCache;
@@ -742,7 +764,7 @@ private:
     /// Puts the slot of one descriptor into the draw's row.
     void NoteIndexedRow(u32 slot);
     /// The dwords of a stage's flat user data go into the row (as many as the shader reserved), zero padded.
-    void NoteIndexedFlat(const Shader::Info& stage);
+    void NoteIndexedFlat(const Shader::Info& stage, const u32* flat, u32 flat_size);
     /// The slot of a sampled image / of a sampler for the draw's row, with the verify against what the legacy binder writes.
     void NoteIndexedImage(const vk::DescriptorImageInfo& info, u32 image_key);
     /// An image bound once per mip level: a run of consecutive slots, the row holds the first.

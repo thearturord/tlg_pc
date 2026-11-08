@@ -654,15 +654,15 @@ void Rasterizer::NoteIndexedRow(u32 slot) {
     }
 }
 
-void Rasterizer::NoteIndexedFlat(const Shader::Info& stage) {
+void Rasterizer::NoteIndexedFlat(const Shader::Info& stage, const u32* flat, u32 flat_size) {
     const u32 count = stage.srt_info.flattened_bufsize_dw;
     if (indexed_row_size + count > indexed_row.size()) {
         TLG_LOG(RASTER, Error, "indexed data: the row of a draw is longer than {} entries (flat user data of {} dwords)", indexed_row.size(), count);
         return;
     }
-    const u32 have = std::min<u32>(count, static_cast<u32>(stage.flattened_ud_buf.size()));
+    const u32 have = std::min<u32>(count, flat_size);
     if (have != 0) {
-        std::memcpy(indexed_row.data() + indexed_row_size, stage.flattened_ud_buf.data(), have * sizeof(u32));
+        std::memcpy(indexed_row.data() + indexed_row_size, flat, have * sizeof(u32));
     }
     if (have < count) {
         std::memset(indexed_row.data() + indexed_row_size + have, 0, (count - have) * sizeof(u32));

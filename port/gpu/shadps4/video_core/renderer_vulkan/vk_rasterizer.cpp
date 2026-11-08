@@ -212,6 +212,33 @@ static bool VersionCensusOn() {
     return on;
 }
 
+/// Plan S step P3e.3: the measuring code below reads what the record half produced (descriptor infos, push data, ticks). On a recorder thread it cannot run in the resolve half:
+/// the switches are listed once, so a mode that moves the record half to another thread refuses them (UiTrace and LightRecorder are armed at run time and are listed by name).
+static bool BindCensusOn() {
+    static const bool on = [] { const char* e = std::getenv("TLG_BIND_CENSUS"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+
+void Rasterizer::NoteRecordedStateDiagnostics() {
+    static const bool once = [] {
+        if (SplitBindMode() == 0) {
+            return true;
+        }
+        std::string on;
+        if (ReuseCensusOn()) {
+            on += " TLG_REUSE_CENSUS/TLG_VERSION_CENSUS (reuse census, key census, recipe verify)";
+        }
+        if (BindCensusOn()) {
+            on += " TLG_BIND_CENSUS";
+        }
+        if (!on.empty()) {
+            LOG_WARNING(Render_Vulkan, "split bind: these switches read recorded state in the resolve half and cannot run on a recorder thread:{}", on);
+        }
+        return true;
+    }();
+    (void)once;
+}
+
 u64 Rasterizer::CurrentTick() const noexcept {
     return scheduler.CurrentTick();
 }
@@ -254,6 +281,8 @@ Rasterizer::DrawClassification Rasterizer::ClassifyRemaining(const DrawInputs& i
     return {DrawClass::Normal};
 }
 
+static std::atomic<u64> g_eliminate_total{0}, g_eliminate_with_clear{0};
+
 bool Rasterizer::FilterDraw(const DrawPlan* plan) {
     TLG_PROF_LEVEL("raster.filter_draw", 3);
     // F3.5: everything comes from the plan (the command processor thread made it from the record); a draw without a plan is not drawn
@@ -288,6 +317,14 @@ bool Rasterizer::FilterDraw(const DrawPlan* plan) {
                          class_counts[static_cast<size_t>(DrawClass::DepthClear)],
                          class_counts[static_cast<size_t>(DrawClass::DepthTransition)],
                          class_counts[static_cast<size_t>(DrawClass::Normal)]);
+            }
+            if (last_log_ns != 0 && SplitBindMode() == 1) {
+                const u64 barrier_ops = class_counts[static_cast<size_t>(DrawClass::EliminateFastClear)] + class_counts[static_cast<size_t>(DrawClass::FmaskDecompress)] +
+                                        class_counts[static_cast<size_t>(DrawClass::Resolve)] + class_counts[static_cast<size_t>(DrawClass::DepthStencilCopy)] +
+                                        class_counts[static_cast<size_t>(DrawClass::DepthClear)];
+                LOG_WARNING(Render_Vulkan, "split bind: per 5 s {} engine operations that resolve and record together (eliminate {} (the ones with a clear to record, so far: {} of {}), fmask {}, resolve {}, depth copy {}, depth clear {}), {} normal draws", barrier_ops,
+                            class_counts[static_cast<size_t>(DrawClass::EliminateFastClear)], g_eliminate_with_clear.load(), g_eliminate_total.load(), class_counts[static_cast<size_t>(DrawClass::FmaskDecompress)], class_counts[static_cast<size_t>(DrawClass::Resolve)],
+                            class_counts[static_cast<size_t>(DrawClass::DepthStencilCopy)], class_counts[static_cast<size_t>(DrawClass::DepthClear)], class_counts[static_cast<size_t>(DrawClass::Normal)]);
             }
             class_counts = {};
             last_log_ns = now;
@@ -537,30 +574,50 @@ static std::pair<u32, u32> GetDrawOffsets(const DrawInputs& regs, const Shader::
 }
 
 void Rasterizer::EliminateFastClear(const DrawInputs& inputs, const AmdGpu::CbDbExtent& cb0) {
+    FastClearOp op;
+    g_eliminate_total.fetch_add(1, std::memory_order_relaxed);
+    if (ResolveFastClearEliminate(inputs, cb0, op)) {
+        g_eliminate_with_clear.fetch_add(1, std::memory_order_relaxed);
+        RecordFastClearEliminate(op);
+    }
+}
+
+bool Rasterizer::ResolveFastClearEliminate(const DrawInputs& inputs, const AmdGpu::CbDbExtent& cb0, FastClearOp& op) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Resolve};
     const auto& col_buf = inputs.color_buffers[0];
     if (!col_buf || !col_buf.info.fast_clear) {
-        return;
+        return false;
     }
     VideoCore::TextureCache::ImageDesc desc(col_buf, cb0);
     desc.engine_id = (*current_target_resources)[0]; // E3
     desc.engine_site = 3;
     const auto image_id = texture_cache.FindImage(desc);
     const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
+    (void)image_view;
     auto& image = texture_cache.GetImage(image_id);
     if (!image.pending_fast_clear) {
         Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseFastClearEliminateNothing, engine_clear_on);
-        return;
+        return false;
     }
     // B11: the engine fast clear pending on the image is written now (the eliminate is where the console writes it into the memory)
     Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseFastClearEliminate, engine_clear_on);
     // The colour is the one the hardware uses: the clear words in the target's registers, not the colour the engine passed to its clear call (for a fast clear
     // the engine's colour can be 1,1,1,1 where the registers hold 0,0,0,0: the B11 audit of 2026-10-30 found 470 such clears in 16,656, and the white fill of those
     // is the giant feathers over the view). The pending clear only says that a fast clear is waiting.
-    const vk::ClearValue value = LiverpoolToVK::ColorBufferClearValue(col_buf);
+    op.value = LiverpoolToVK::ColorBufferClearValue(col_buf);
     image.pending_fast_clear.reset();
     Core::NativeDevice::NoteClearNative(Core::NativeDevice::NativeFastClearAtEliminate);
-    ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}", col_buf.Address()));
-    runtime.ClearImage(&image, desc.view_info.range, value);
+    op.image = &image;
+    op.range = desc.view_info.range;
+    op.address = col_buf.Address();
+    return true;
+}
+
+void Rasterizer::RecordFastClearEliminate(const FastClearOp& op) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Record};
+    VideoCore::ResolveCommands::Run();
+    ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}", op.address));
+    runtime.ClearImage(op.image, op.range, op.value);
     ScopeMarkerEnd();
 }
 
@@ -693,6 +750,8 @@ struct Rasterizer::DrawJob {
     IndexBind index;
     VideoCore::BufferCache::UploadSink vertex_uploads;
     VideoCore::BufferCache::UploadSink index_uploads;
+    u32 vertex_offset{0}; ///< P3e.3: read from the shader info in the resolve half (the next draw's plan rewrites it)
+    u32 instance_offset{0};
 };
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
@@ -873,9 +932,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         scheduler.BeginRendering(state);
     }
 
-    const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
-    const auto& fetch_shader = pipeline->GetFetchShader();
-    const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
+    const auto [vertex_offset, instance_offset] = hoisted ? std::pair<u32, u32>{job.vertex_offset, job.instance_offset}
+                                                          : GetDrawOffsets(regs, pipeline->GetStage(Shader::SwStage::Vertex), pipeline->GetFetchShader());
 
     NoteMarkerRow(0, tag.valid ? (tag.meta & 0xff) : 15u, pipeline, plan != nullptr ? plan->native_seq : 0, draw_inputs, regs.num_indices, regs.num_instances.NumInstances());
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -1408,8 +1466,7 @@ bool Rasterizer::StageFlatSkipped(const Shader::Info& stage) const {
 /// with what that draw got the last time. Same: a cache keyed by the draw's inputs could have answered. Different: the answer moved (a copy in the stream ring, a new upload). Counts
 /// are split by whether any buffer of the draw is a stream ring copy (those move every command buffer by design). Logged every 20000 binds.
 void Rasterizer::BindCensus(const Pipeline* pipeline) {
-    static const bool on = [] { const char* e = std::getenv("TLG_BIND_CENSUS"); return e != nullptr && e[0] == '1'; }();
-    if (!on) {
+    if (!BindCensusOn()) {
         return;
     }
     static thread_local u64 frame = ~0ull;
@@ -1455,10 +1512,21 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
     TLG_PROF_LEVEL("raster.bind_resources", 2);
     VideoCore::OpSequence::resolving.fetch_add(1, std::memory_order_acq_rel); // P3c: a new operation (a draw or a dispatch)
     VideoCore::ResolveCommands::Run();
-    if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
-        IsComputeImageClear(pipeline)) {
-        return false;
+    {
+        ComputeImageOp image_op;
+        if (MatchComputeImageCopy(pipeline, image_op) || IsComputeMetaClear(pipeline) || MatchComputeImageClear(pipeline, image_op)) {
+            if (image_op.kind != ComputeImageOp::None) {
+                static std::atomic<u64> image_ops{0};
+                const u64 n = image_ops.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (SplitBindMode() == 1 && (n & (n - 1)) == 0) {
+                    LOG_WARNING(Render_Vulkan, "split bind: {} compute image copies/clears (record work decided in the resolve half, run in the record half)", n);
+                }
+                RunComputeImageOp(image_op);
+            }
+            return false;
+        }
     }
+    NoteRecordedStateDiagnostics();
 
     set_write_index = 0;
     set_writes.clear();
@@ -2241,6 +2309,7 @@ void Rasterizer::ResolveDrawJob(const GraphicsPipeline* pipeline, DrawJob& job) 
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
     TLG_PROF_LEVEL("raster.resolve_geometry", 2);
     geometry_plan = job.plan;
+    std::tie(job.vertex_offset, job.instance_offset) = GetDrawOffsets(*draw_inputs, pipeline->GetStage(Shader::SwStage::Vertex), pipeline->GetFetchShader());
     ResolveRenderTargets(pipeline, job.render);
     VideoCore::BufferCache::SetUploadSink(&job.vertex_uploads);
     ResolveVertexBuffers(pipeline, job.vertex);
@@ -2351,7 +2420,8 @@ bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
     return false;
 }
 
-bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
+bool Rasterizer::MatchComputeImageCopy(const Pipeline* pipeline, ComputeImageOp& op) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Resolve};
     if (!pipeline->IsCompute()) {
         return false;
     }
@@ -2404,11 +2474,14 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     // Perform image copy
     VideoCore::Image& src_image = desc0.is_written ? image1 : image0;
     VideoCore::Image& dst_image = desc0.is_written ? image0 : image1;
-    runtime.CopyColorAndDepth(&src_image, &dst_image);
+    op.kind = ComputeImageOp::Copy;
+    op.source = &src_image;
+    op.target = &dst_image;
     return true;
 }
 
-bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
+bool Rasterizer::MatchComputeImageClear(const Pipeline* pipeline, ComputeImageOp& op) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Resolve};
     if (!pipeline->IsCompute()) {
         return false;
     }
@@ -2467,8 +2540,21 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
             },
         .extent = image1.info.resources,
     };
-    runtime.ClearImage(&image1, range, clear);
+    op.kind = ComputeImageOp::Clear;
+    op.target = &image1;
+    op.range = range;
+    op.clear = clear;
     return true;
+}
+
+void Rasterizer::RunComputeImageOp(const ComputeImageOp& op) {
+    VideoCore::HalfPhase::Scope half_scope{VideoCore::HalfPhase::Record};
+    VideoCore::ResolveCommands::Run();
+    if (op.kind == ComputeImageOp::Copy) {
+        runtime.CopyColorAndDepth(op.source, op.target);
+    } else if (op.kind == ComputeImageOp::Clear) {
+        runtime.ClearImage(op.target, op.range, op.clear);
+    }
 }
 
 
@@ -2597,7 +2683,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 bound_buffers.emplace_back(gds_buf, 0, gds_buf->SizeBytes(), src_access);
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 if (indexed_active && stage.indexed) {
-                    NoteIndexedFlat(stage);
+                    NoteIndexedFlat(stage, stage.flattened_ud_buf.data(), static_cast<u32>(stage.flattened_ud_buf.size()));
                     ++binding.buffer;
                     continue;
                 }
@@ -3104,6 +3190,7 @@ void Rasterizer::ResolveBufferBindingBody(const Shader::Info& stage, u32 buffer_
                 out.SetQuery(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written, false);
                 out.SetBound(gds_buf, 0, gds_buf->SizeBytes(), src_access);
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
+                out.flat.assign(stage.flattened_ud_buf.begin(), stage.flattened_ud_buf.end()); // P3e.3: a copy; the shader info is rewritten by the next draw's plan
                 if (indexed_active && stage.indexed) {
                     out.kind = BufferBind::Skip; // the record pass notes the flat user data of an indexed stage
                     return;
@@ -3443,14 +3530,14 @@ void Rasterizer::RecordBufferBindings(const Shader::Info& stage, Shader::Backend
         const auto& desc = stage.buffers[buffer_index];
         BufferBind& out = binds[buffer_index];
         if (out.kind == BufferBind::Skip) {
-            NoteIndexedFlat(stage);
+            NoteIndexedFlat(stage, out.flat.data(), static_cast<u32>(out.flat.size()));
             ++binding.buffer;
             continue;
         }
         if (out.kind == BufferBind::FlatCopy) {
             auto& vk_buffer = buffer_cache.GetStreamBuffer();
-            const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
-            const u64 offset = vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
+            const u32 ubo_size = out.flat.size() * sizeof(u32);
+            const u64 offset = vk_buffer.Copy(out.flat.data(), ubo_size, alignment);
             out.info = vk::DescriptorBufferInfo(vk_buffer.Handle(), offset, ubo_size);
         } else if (out.kind == BufferBind::ClipCopy) {
             auto& vk_buffer = buffer_cache.GetStreamBuffer();
