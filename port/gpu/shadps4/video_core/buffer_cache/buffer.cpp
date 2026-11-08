@@ -6,6 +6,7 @@
 #include <string>
 #include <mutex>
 #include "video_core/half_phase.h"
+#include "native/native_occlusion.h"
 #include <cstdlib>
 #include <numeric>
 #include <string_view>
@@ -227,6 +228,13 @@ bool StreamBuffer::PrepareMap(u64 size, u64 alignment, bool allow_wait) {
     }
 
     if (offset + size > this->size_bytes) {
+        wraps[ring_id < 3 ? ring_id : 0][!VideoCore::RecordQueue::jobs.empty() && !VideoCore::RecordQueue::executing ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+        if (!VideoCore::RecordQueue::jobs.empty() && !VideoCore::RecordQueue::executing) {
+            static std::atomic<u32> shown{0};
+            if (shown.fetch_add(1) < 6) {
+                LOG_WARNING(Render_Vulkan, "ring lap with draws waiting: ring {} rva: {}", ring_id, Core::NativeOcclusion::CallerRvas(1, 9));
+            }
+        }
         if (ring_id == 1 && VideoCore::RecordQueue::Enabled()) {
             // P3e.4b: the resolve ring wraps: copies in it are read by draws that wait in the record queue, and its watches carry the tick of the time they were written.
             // Record those draws, then wait for everything recorded so far (once per lap of 128 MB).
@@ -258,8 +266,9 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
         // plan S P3d census: which half writes which ring (rings: 0 record, 1 resolve; halves: 0 outside the halves, 1 resolve, 2 record), calls and bytes
         static std::atomic<u64> calls[2][3]{}, bytes[2][3]{}, total{0};
         const u32 half = VideoCore::HalfPhase::current;
-        calls[ring_id][half].fetch_add(1, std::memory_order_relaxed);
-        bytes[ring_id][half].fetch_add(size, std::memory_order_relaxed);
+        const u32 which = ring_id < 2 ? ring_id : 0;
+        calls[which][half].fetch_add(1, std::memory_order_relaxed);
+        bytes[which][half].fetch_add(size, std::memory_order_relaxed);
         const u64 n = total.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n >= 4096 && (n & (n - 1)) == 0) {
             LOG_WARNING(Render_Vulkan, "stream ring census (calls / KiB) record ring: outside {} / {}, resolve half {} / {}, record half {} / {} | resolve ring: outside {} / {}, resolve half {} / {}, record half {} / {}",
@@ -325,6 +334,11 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
     while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
         auto& watch = previous_watches[wait_cursor];
         if (!scheduler.IsFree(watch.tick) && !allow_wait) {
+            return false;
+        }
+        if (!allow_wait && ring_id == 2 && !VideoCore::RecordQueue::jobs.empty() && !VideoCore::RecordQueue::executing) {
+            // P3e.5: a staging block holds copies that draws waiting in the record queue still read, and its watches carry the tick of the time they were written (older than the
+            // tick the draws get). Not reused while draws wait: the pool takes another block.
             return false;
         }
         scheduler.Wait(watch.tick);

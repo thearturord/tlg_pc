@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/half_phase.h"
 #include "tlg_toggles.h"
 #include <algorithm>
 #include <bit>
@@ -49,6 +50,7 @@ StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& sched
                 instance, scheduler, MemoryType::HostUncached, BLOCK_SIZE),
             .last_used_frame = frame,
         });
+        block.buffer->ring_id = 2;
         if (!block.buffer->mapped_data.empty()) {
             std::memset(block.buffer->mapped_data.data(), 0, block.buffer->mapped_data.size());
         }
@@ -92,6 +94,7 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
                                                                     BLOCK_SIZE),
                 .last_used_frame = frame,
             });
+            best->buffer->ring_id = 2;
             ring.current = ring.blocks.size() - 1;
             best_offset = *best->buffer->Reserve(size, alignment, false);
         }
@@ -118,9 +121,11 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
     const u64 max_size = std::max(size + size / 4, RoundAllocationSize(size));
 
     LargeBuffer* best{};
+    // P3e.5: an entry's tick is the tick of its last request; draws waiting in the record queue may still read it, and they get a later tick: only never used entries then
+    const bool draws_wait = !VideoCore::RecordQueue::jobs.empty() && !VideoCore::RecordQueue::executing;
     for (LargeBuffer& entry : cache) {
         const u64 entry_size = entry.buffer->SizeBytes();
-        if (entry.held || entry_size < size || entry_size > max_size ||
+        if (entry.held || entry_size < size || entry_size > max_size || (draws_wait && entry.tick != 0) ||
             (!scheduler.IsFree(entry.tick) && !unsynchronized)) {
             continue;
         }

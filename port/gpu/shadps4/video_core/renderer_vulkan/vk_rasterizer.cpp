@@ -341,8 +341,10 @@ bool Rasterizer::FilterDraw(const DrawPlan* plan) {
                         why += fmt::format(" {} {} ({} draws)", VideoCore::RecordQueue::names[i], n, VideoCore::RecordQueue::drained_jobs[i].load());
                     }
                 }
-                LOG_WARNING(Render_Vulkan, "split bind queue (lag {}): {} jobs posted, {} run, deepest {}; drains so far:{}", VideoCore::RecordQueue::Lag(), VideoCore::RecordQueue::posted.load(),
-                            VideoCore::RecordQueue::ran.load(), VideoCore::RecordQueue::max_depth.load(), why);
+                LOG_WARNING(Render_Vulkan, "split bind queue (lag {}): {} jobs posted, {} run, deepest {}; drains so far:{}; ring laps (none waiting / draws waiting): record {}/{}, resolve {}/{}, staging {}/{}",
+                            VideoCore::RecordQueue::Lag(), VideoCore::RecordQueue::posted.load(), VideoCore::RecordQueue::ran.load(), VideoCore::RecordQueue::max_depth.load(), why,
+                            VideoCore::StreamBuffer::wraps[0][0].load(), VideoCore::StreamBuffer::wraps[0][1].load(), VideoCore::StreamBuffer::wraps[1][0].load(), VideoCore::StreamBuffer::wraps[1][1].load(),
+                            VideoCore::StreamBuffer::wraps[2][0].load(), VideoCore::StreamBuffer::wraps[2][1].load());
             }
             class_counts = {};
             last_log_ns = now;
