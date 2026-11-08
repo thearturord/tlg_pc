@@ -237,11 +237,13 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
                                           fmt::format("engine buffer {}{} {:#x}+{:#x}", ids.front(), ids.size() > 1 ? "+" : "", begin, end - begin));
     }
     Buffer* dst = buffer.get();
+    dst->NoteResolveUse(); // P3c: the resolve side made this buffer for the operation it is working on, and copies into it below
     scheduler.EndRendering();
     // placed buffers inside the block: their contents come over as they are
     boost::container::small_vector<VAddr, 4> inside;
     for (auto it = placed.lower_bound(begin); it != placed.end() && it->first < end; ++it) {
         inside.push_back(it->first);
+        it->second.buffer->NoteResolveUse(); // P3c: the old placed buffer is read by the copy below
         const vk::BufferCopy copy{it->second.buffer->Offset(it->second.begin), dst->Offset(it->second.begin), it->second.end - it->second.begin};
         runtime.CopyBuffer(it->second.buffer.get(), dst, std::span<const vk::BufferCopy>{&copy, 1});
         Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9GroupReused);

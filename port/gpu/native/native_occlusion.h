@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
+#include <string>
 #include <array>
 #include <atomic>
 #include <functional>
@@ -26,6 +27,8 @@ class Scheduler;
 /// The answer is yes/no: the counters of a block differ by 0x2FFFFFF per pair when something was seen (what the made up answer always was), by 0 when not.
 /// `TLG_REAL_OCCLUSION=0` brings back the made up answer.
 namespace Core::NativeOcclusion {
+/// Diagnostics (plan S P3c): the calling code addresses (relative to the exe) of the current stack, innermost first, skipping `skip` frames.
+std::string CallerRvas(unsigned skip, unsigned count);
 
 /// False when `TLG_REAL_OCCLUSION=0`
 [[nodiscard]] bool Enabled() noexcept;

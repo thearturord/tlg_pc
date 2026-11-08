@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <unordered_map>
+#include <mutex>
+#include "native/native_occlusion.h"
 #include "native/native_config.h"
 #include "native/native_registry.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -262,12 +268,33 @@ u64 Runtime::LiveObjectSpace(const VideoCore::Buffer* handle, u64 offset, u64& b
             const u64 n = uses.fetch_add(1, std::memory_order_relaxed) + 1;
             if (handle->resolve_use_seq != seq && handle->resolve_prev_seq != seq) {
                 const u64 k = unannounced.fetch_add(1, std::memory_order_relaxed);
+                static const bool split_only = [] { const char* e = std::getenv("TLG_SPLIT_BIND"); return e != nullptr && std::atoi(e) == 1; }();
+                if (split_only && k < 5) {
+                    // mode 1 is the real split path: here a use the resolve side did not announce is an error (mode 2 runs the old code too, which announces nothing)
+                    LOG_ERROR(Render_Vulkan, "split bind: record side used buffer {:#x}+{:#x} that the resolve side did not announce in operation {} (last asked {}), rva: {}", handle->CpuAddr(),
+                              handle->SizeBytes(), seq, handle->resolve_use_seq, Core::NativeOcclusion::CallerRvas(1, 7));
+                }
                 if (handle->resolve_use_seq == 0) {
                     never.fetch_add(1, std::memory_order_relaxed);
                 }
-                if (k < 6 || (k & 0xFFFF) == 0) {
-                    LOG_WARNING(Render_Vulkan, "zero copy census: unannounced use of buffer {:#x}+{:#x} (asked in operation {}, before that {}), operation now {}, caller {:#x}", handle->CpuAddr(),
-                                handle->SizeBytes(), handle->resolve_use_seq, handle->resolve_prev_seq, seq, reinterpret_cast<u64>(__builtin_return_address(0)));
+                {
+                    // which code paths: the stack (frames 1 to 7) counted, the top ones printed at the powers of two
+                    static std::mutex stacks_mutex;
+                    static std::unordered_map<std::string, std::pair<u64, u64>> stacks; // stack -> (uses, of them never asked)
+                    std::scoped_lock lock{stacks_mutex};
+                    auto& entry = stacks[Core::NativeOcclusion::CallerRvas(1, 7)];
+                    ++entry.first;
+                    entry.second += handle->resolve_use_seq == 0 ? 1 : 0;
+                    if ((k + 1 >= 4096) && ((k + 1) & k) == 0) {
+                        std::vector<std::pair<u64, const std::string*>> order;
+                        for (const auto& [text, counts] : stacks) {
+                            order.emplace_back(counts.first, &text);
+                        }
+                        std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                        for (size_t i = 0; i < order.size() && i < 8; ++i) {
+                            LOG_WARNING(Render_Vulkan, "zero copy census: unannounced x{} ({} never asked) rva: {}", order[i].first, stacks[*order[i].second].second, *order[i].second);
+                        }
+                    }
                 }
             }
             if ((n & (n - 1)) == 0 && n >= 1024) {

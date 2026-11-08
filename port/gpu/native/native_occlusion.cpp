@@ -16,6 +16,21 @@ namespace Core::NativeOcclusion {
 
 std::atomic<u32> query_open{0};
 
+std::string CallerRvas(unsigned skip, unsigned count) {
+#ifdef _WIN32
+    void* frames[32]{};
+    const USHORT got = CaptureStackBackTrace(skip + 1, std::min(count, 32u), frames, nullptr);
+    const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    std::string text;
+    for (USHORT i = 0; i < got; ++i) {
+        text += fmt::format("{:x} ", reinterpret_cast<uintptr_t>(frames[i]) - base);
+    }
+    return text;
+#else
+    return {};
+#endif
+}
+
 void NoteSubmitDuringQuery(u32 stream_id) {
     static std::atomic<u32> logged{0};
     if (stream_id != 0 || logged.fetch_add(1) >= 6) {
