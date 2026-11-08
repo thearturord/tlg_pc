@@ -1317,7 +1317,21 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     // B9.1: an upload over engine buffers: their announced bytes against the page tracker's ranges (B9.4 step 2: a request may cover several buffers of a block;
     // the bytes between them, which no buffer holds, keep the tracker)
     TLG_PROF_NAMED_LEVEL(s_b9, "buffer.sync.b9_dirty", 3);
-    const u32 b9 = Core::NativeUpdates::B9BufferMode();
+    u32 b9 = Core::NativeUpdates::B9BufferMode();
+    // O3 (`TLG_RING_FILL`): a request inside the frame ring, served by the ring's own buffer, meets no engine buffer (the shadow counts any: `WINDOWS_WITH_ENGINE_BUFFERS_MUST_BE_0`), so the walks that
+    // look for buffers and their dirty bytes by address are skipped; the ring's pending set (taken below) is all there is to take.
+    bool ring_window = false;
+    if (Core::RingMirror::FillMode() != 0 && Core::RingMirror::Mode() == 1 && !is_written && !is_texel_buffer) {
+        const auto& ring0 = UntrackedRing::Get();
+        if (ring0.Active() && arena->cpu_addr <= ring0.Start() && arena->cpu_addr + arena->SizeBytes() >= ring0.End()) {
+            const auto [rlo, rhi] = ring0.Clip(held_lo, held_hi - held_lo);
+            ring_window = rlo == held_lo && rhi == held_hi;
+        }
+    }
+    if (ring_window && Core::RingMirror::FillMode() == 1) {
+        b9 = 0;
+        Core::RingMirror::NoteFill(Core::RingMirror::FillWindowSkipped);
+    }
     u64 b9_object = 0; // the first engine buffer the request meets (0: none)
     boost::container::small_vector<std::pair<u64, u64>, 8> b9_pieces;
     boost::container::small_vector<std::pair<u64, u64>, 4> b9_gaps; // the request's bytes no engine buffer holds
@@ -1349,6 +1363,9 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 const VAddr object_end = object.address + std::max<u64>(object.bytes, 1);
                 parts.push_back({object.id, held_lo, std::min<VAddr>(object_end, held_hi), object.usage, object.cpu_access, object.address, object_end});
             }
+        }
+        if (ring_window && !parts.empty()) {
+            Core::RingMirror::NoteFill(Core::RingMirror::FillWindowBuffers);
         }
         if (!parts.empty()) {
             std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });

@@ -35,7 +35,7 @@ void NoteReal(u64 window, u64 uploaded_whole, u64 announced, u64 pieces_in, u64 
 /// O2 (`TLG_RING_FILL`, with TLG_RING_MIRROR=1): 0 off (default), 1 real (an announcement wholly inside the ring only marks the ring's own pending set: no buffer walk, no dirty sets; the window sync takes the pending bytes), 2 shadow: when an announcement is applied, the part inside the filled ring is what a fill at announce time would upload; the window sync
 /// then compares what it takes from the dirty sets with it (`fill` in `ring_mirror`: `MISSED_BYTES_MUST_BE_0`).
 [[nodiscard]] u32 FillMode() noexcept;
-enum FillCount : u32 { FillApplies, FillNotRing, FillBytesFilled, FillBytesUnfilled, FillWithBuffers, FillTakenBytes, FillMissedBytes, FillTakenPieces, FillCounts };
+enum FillCount : u32 { FillApplies, FillNotRing, FillBytesFilled, FillBytesUnfilled, FillWithBuffers, FillTakenBytes, FillMissedBytes, FillTakenPieces, FillWindowSkipped, FillWindowBuffers, FillCounts };
 void NoteFill(FillCount what, u64 n = 1) noexcept;
 
 /// True once for every definition of the ring [start, end): the caller then drops all marks over the ring (they predate the fill) and calls `Fill`.
