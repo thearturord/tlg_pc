@@ -3609,7 +3609,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set,
     return true;
 }
 
-void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
     TLG_PROF_LEVEL("raster.bind_textures", 2);
     const u32 first_image_idx = image_infos.size();
@@ -4085,6 +4085,642 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         set_slot->generation = set_generation;
         ++texture_set_stats.recorded;
     }
+    BindSamplers(stage, binding);
+}
+
+void Rasterizer::ResolveTextures(const Shader::Info& stage, TextureResolved& r) {
+    // Plan S step P2: the resolve half of the texture bindings (T# words to images and views); the record half does the layout transitions and the descriptor writes
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
+    TLG_PROF_LEVEL("raster.bind_textures", 2);
+    const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
+    // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
+    boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
+
+    // Texture set memo: the set of resolved images for these T#s, when the stage qualifies (no written image, no mip fallback binding, at most 16 images).
+    TextureSet* set_slot = nullptr;
+    std::array<std::array<u32, 8>, TextureSet::MaxImages> set_raws;
+    std::array<u64, TextureSet::MaxImages> set_flags{};
+    std::array<VideoCore::ImageId, TextureSet::MaxImages> set_found{};
+    bool set_record = false;
+    u64 set_generation = 0;
+    const u32 stage_images = static_cast<u32>(stage.images.size());
+    if (texture_set_on && stage_images != 0 && stage_images <= TextureSet::MaxImages) {
+        bool eligible = true;
+        for (const auto& image_desc : stage.images) {
+            eligible &= !image_desc.is_written && image_desc.mip_fallback_mode == Shader::MipStorageFallbackMode::None;
+        }
+        if (eligible) {
+            TLG_PROF_NAMED_LEVEL(key_scope, "texture.set_key", 3);
+            u64 key = 0x9E3779B97F4A7C15ull;
+            const auto flat = stage.FlatUserData();
+            for (u32 i = 0; i < stage_images; ++i) {
+                AmdGpu::Image raw{};
+                const auto& res = stage.images[i];
+                const u32* record_words = binder_plan != nullptr && res.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad
+                                              ? BinderWords(stage, res.sharp_fetch.offsets[0], res.is_r128 ? 4 : 8, 2)
+                                              : nullptr;
+                if (record_words != nullptr) {
+                    res.RawFromWords(record_words, &raw);
+                } else if (StageFlatSkipped(stage)) {
+                    Core::NativeRegistry::NoteBinder(6); // must not happen
+                    raw = {};
+                } else if (!res.Fetch(flat.data(), &raw)) {
+                    raw = {};
+                }
+                static_assert(sizeof(AmdGpu::Image) == sizeof(set_raws[0]));
+                std::memcpy(set_raws[i].data(), &raw, sizeof(raw));
+                set_flags[i] = ImageUseFlags(stage.images[i]);
+                std::array<u64, 5> words{};
+                std::memcpy(words.data(), &raw, sizeof(AmdGpu::Image));
+                words[4] = set_flags[i];
+                for (const u64 word : words) {
+                    key = (key ^ word) * 0xC2B2AE3D27D4EB4Full;
+                    key ^= key >> 29;
+                }
+            }
+            key_scope.End();
+            set_slot = &texture_sets[key % TextureSetSlots];
+            TLG_PROF_NAMED_LEVEL(try_scope, "texture.set_try", 3);
+            if (ResolveTextureSet(stage, *set_slot, set_raws.data(), set_flags.data(), stage_images, r)) {
+                try_scope.End();
+                TLG_PROF_COUNT("texture.set_hit");
+                Census(census_base + CImageTotal, stage_images);
+                Census(census_base + CImageSetHit, stage_images);
+                r.set_hit = true;
+                return;
+            }
+            try_scope.End();
+            TLG_PROF_COUNT("texture.set_miss");
+            set_record = true;
+            set_slot->count = 0; // the entries are rewritten below: no hit on a half written set
+            set_slot->generation = ~0ull;
+            set_generation = texture_cache.ImageGeneration();
+        } else {
+            ++texture_set_stats.not_eligible;
+        }
+    }
+
+    TLG_PROF_LEVEL("texture.slow_path", 3);
+    u32 num_images{};
+    std::array<u32, Shader::NUM_IMAGES> image_keys{}; // tlg C9: the descriptor array of each image of the stage
+    for (const auto& image_desc : stage.images) {
+        AmdGpu::Image chosen_tsharp;
+        bool image_from_record = false;
+        u64 image_view_id = 0;   // E2: the engine's id of the view object the descriptor was built from
+        u64 image_engine_id = 0; // L1(b): the engine's id of the view object the record's binding names
+        if (binder_plan != nullptr && image_desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad) {
+            u32 identity_binding = ~0u;
+            const u32* planned_words = nullptr;
+            const u32 image_index = static_cast<u32>(&image_desc - stage.images.data());
+            if (!PlannedImageWords(stage, image_index, image_desc.is_r128 ? 4 : 8, planned_words, identity_binding)) {
+                planned_words = BinderWords(stage, image_desc.sharp_fetch.offsets[0], image_desc.is_r128 ? 4 : 8, 2, &identity_binding);
+            }
+            if (const u32* words = planned_words) {
+                if (identity_binding != ~0u) {
+                    image_engine_id = binder_plan->bindings[identity_binding].id;
+                    image_view_id = binder_plan->bindings[identity_binding].view_id;
+                }
+                chosen_tsharp = image_desc.FromWords(words);
+                image_from_record = true;
+            }
+        }
+        if (image_from_record) {
+            Core::NativeRegistry::NoteBinder(1);
+        } else if (StageFlatSkipped(stage)) {
+            Core::NativeRegistry::NoteBinder(6); // must not happen
+            if (stage.sw_stage == Shader::SwStage::Compute) {
+                DumpDispatchRecord(stage, 2, image_desc.sharp_fetch.offsets[0], "no record entry: image");
+            }
+            chosen_tsharp = AmdGpu::Image::Null(image_desc.is_depth);
+        } else {
+            chosen_tsharp = image_desc.GetSharp(stage);
+            if (binder_plan != nullptr) {
+                Core::NativeRegistry::NoteBinder(3);
+            }
+        }
+        const auto tsharp = chosen_tsharp;
+        const auto data_fmt = tsharp.GetDataFmt();
+        const auto num_fmt = tsharp.GetNumberFmt();
+        if (indexed_active && stage.indexed) {
+            const u32 desc_index = static_cast<u32>(&image_desc - stage.images.data());
+            image_keys[desc_index] = image_desc.array_key;
+            auto* indexed = IndexedData::Get();
+        }
+        Census(census_base + CImageTotal);
+        if (tsharp.Address() == 0 || data_fmt == Ps4Layout::DataFormat::FormatInvalid) {
+            Census(census_base + CImageNull);
+            image_bindings[num_images++].image_id = {};
+            image_descriptor_array_sizes.push_back(1);
+            continue;
+        }
+
+        Core::NativeRegistry::AuditImage(tsharp.Address());
+        if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
+            !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
+                        "data_format={}, num_format={}",
+                        tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
+                        static_cast<u32>(num_fmt));
+            image_bindings[num_images++].image_id = {};
+            image_descriptor_array_sizes.push_back(1);
+            set_record = false;
+            continue;
+        }
+
+        const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
+        const u32 num_bindings = image_desc.NumBindings(stage);
+        // F4.3: the host infos of this binding come from the engine's plain description when it has one (the T# stays for the shader specialization and the lookup key)
+        Core::NativeDesc::ImageDesc native_image_desc;
+        const bool from_desc = image_from_record && image_engine_id != 0 && !image_desc.is_r128 && Core::NativeImageDesc::FromDescOn() &&
+                               Core::NativeImageDesc::DescForBinding(image_engine_id, image_view_id, image_desc.post_op == Shader::SharpFetchPostOp::ConvertCubeTo2DArray, image_desc.is_depth, native_image_desc);
+        // the plain description every host consumer below reads: the engine's, or (descriptors the engine has no object for) the one decode of the T# words
+        const Core::NativeDesc::ImageDesc binding_image = from_desc ? native_image_desc : VideoCore::ImageDescFromSharp(tsharp);
+        const auto make_image_desc = [&]() { return VideoCore::TextureCache::ImageDesc(binding_image, image_desc); };
+
+        for (auto i = 0; i < num_bindings; i++) {
+            auto& [image_id, desc] = image_bindings[num_images++];
+            // Same T# and use as an earlier lookup, no image registered or removed since: the description and the
+            // image FindImage returned are the same again (native_draw_mode >= 2).
+            TextureKey key{binding_image};
+            key.flags = u64(image_desc.is_depth) | u64(image_desc.is_atomic) << 8 |
+                     u64(image_desc.is_array) << 16 | u64(image_desc.is_written) << 24 |
+                     u64(image_desc.is_r128) << 32 | u64(image_desc.constant_mip_index) << 40 |
+                     u64(static_cast<u8>(image_desc.mip_fallback_mode)) << 48 |
+                     u64(static_cast<u8>(image_desc.post_op)) << 56;
+            key.index = u64(i) | (image_from_record ? image_engine_id << 16 : 0);
+            const u64 hash = Core::NativeDesc::HashImageDesc(binding_image, key.flags * 0x9E3779B97F4A7C15ull ^ key.index);
+            auto& cached = texture_lookup_cache[hash & 8191];
+            const bool native_reuse =
+                Core::NativeConfig::DrawMode >=
+                2;
+            // the mip fallback of the shader's view (applied to a fresh description before FindImage)
+            const auto finish_desc = [&](VideoCore::TextureCache::ImageDesc& d) {
+                d.engine_id = image_engine_id; // E3 census: the engine object the record names
+                if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
+                    ASSERT(num_bindings == 1);
+                    d.view_info.range.base.level += image_desc.constant_mip_index;
+                    d.view_info.range.extent.levels = 1;
+                } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+                    d.view_info.range.base.level += i;
+                    d.view_info.range.extent.levels = 1;
+                }
+            };
+            const u64 generation_now = texture_cache.ImageGeneration();
+            // L1(b): the same description and engine object as an earlier lookup, and the generation moved: the answer is still the answer when its image is registered and no registration or
+            // unregistration touched the range since (the texture cache's event ring says so exactly); the image is found by what it is, not by "nothing changed anywhere"
+            const bool same_generation = native_reuse && cached.valid && cached.key == key && cached.generation == generation_now;
+            const bool by_id = native_reuse && !same_generation && cached.valid && cached.key == key && TextureIdsOn() &&
+                               texture_cache.ImageUnchangedSince(cached.image_id, cached.image_uid, cached.generation, cached.desc.info.guest_address, cached.desc.info.guest_size);
+            if (native_reuse && cached.valid && cached.key == key && !same_generation && !by_id && TextureIdsOn()) {
+            }
+            // B3: the image of an engine object is found by the object's id (and the binding's use), not by its address; the T# the record holds for the object is the
+            // guard that the object still describes the same image
+            NativeImage* native_entry = nullptr;
+            bool native_hit = false;
+            if (B3ImagesOn() && image_from_record && image_engine_id != 0) {
+                native_entry = &native_images[(image_engine_id << 8) ^ (key.flags * 0x9E3779B97F4A7C15ull) ^ i];
+                native_hit = native_entry->valid && native_entry->id == image_engine_id && native_entry->flags == key.flags && native_entry->index == i &&
+                             native_entry->image_key == binding_image && texture_cache.ImageUid(native_entry->image_id) == native_entry->image_uid &&
+                             True(texture_cache.GetImage(native_entry->image_id).flags & VideoCore::ImageFlagBits::Registered);
+                b3_stats[native_hit ? 0 : native_entry->valid ? 2 : 1].fetch_add(1, std::memory_order_relaxed);
+            }
+            if (native_hit) {
+                std::construct_at(&desc, native_entry->desc);
+                image_id = native_entry->image_id;
+                texture_cache.TouchFoundImage(image_id);
+            } else if (same_generation || by_id) {
+                Census(census_base + CImageLookupHit);
+                std::construct_at(&desc, cached.desc);
+                image_id = cached.image_id;
+                texture_cache.TouchFoundImage(image_id);
+                if (by_id) {
+                    cached.generation = generation_now;
+                }
+            } else {
+                std::construct_at(&desc, make_image_desc());
+                finish_desc(desc);
+
+                Census(census_base + CImageFind);
+                if (image_engine_id == 0) {
+                    Core::NativeUpdates::NoteE3UnnamedReason(image_from_record ? 1u : binder_plan == nullptr ? 2u : 3u);
+                }
+                image_id = texture_cache.FindImage(desc);
+                if (native_reuse) {
+                    cached.valid = true;
+                    cached.generation = generation_now;
+                    cached.image_id = image_id;
+                    cached.image_uid = texture_cache.ImageUid(image_id);
+                    cached.key = key;
+                    cached.desc = desc;
+                }
+            }
+            if (native_entry != nullptr && !native_hit && image_id) {
+                if (!native_entry->valid) {
+                    native_image_keys[image_engine_id].push_back((image_engine_id << 8) ^ (key.flags * 0x9E3779B97F4A7C15ull) ^ i);
+                }
+                native_entry->valid = true;
+                native_entry->id = image_engine_id;
+                native_entry->flags = key.flags;
+                native_entry->index = i;
+                native_entry->image_key = binding_image;
+                native_entry->image_id = image_id;
+                native_entry->image_uid = texture_cache.ImageUid(image_id);
+                native_entry->desc = desc;
+            }
+            if (Core::LightRecorder::On() && image_desc.is_written) {
+                Core::LightRecorder::ImageWritten(Core::DebugServer::PresentCount(), desc.info.guest_address, desc.info.guest_size, texture_cache.ImageUid(image_id), 3);
+            }
+            if (Core::LightRecorder::On() && Core::LightRecorder::Recording()) {
+                Core::LightRecorder::Entry note{};
+                note.kind = 2;
+                note.via = native_hit ? 3 : same_generation ? 1 : by_id ? 2 : 0;
+                note.id = image_engine_id;
+                note.address = desc.info.guest_address;
+                note.size = desc.info.guest_size;
+                note.slot = image_id.index;
+                note.uid = texture_cache.ImageUid(image_id);
+                u64 h = 0xcbf29ce484222325ull;
+                u32 words[8] = {};
+                std::memcpy(words, &tsharp, std::min<size_t>(sizeof(words), sizeof(AmdGpu::Image)));
+                for (const u32 word : words) {
+                    h = (h ^ word) * 0x100000001b3ull;
+                }
+                note.hash = h;
+                Core::LightRecorder::Note(note);
+                if (image_desc.is_written) {
+                    Core::LightRecorder::Watch(desc.info.guest_address, desc.info.guest_size);
+                }
+            }
+            if (set_record) {
+                set_found[num_images - 1] = image_id;
+            }
+            auto* image = &texture_cache.GetImage(image_id);
+            {
+                // Dark / bright frame check (2026-10-29): a sampled texture served by a cache image of another address or size than the texture asked for (an overlap resolved
+                // into a view of a bigger image). Inside the frame ring this is how a new small dynamic texture (the R32F 4x4 / 16x16 the CPU writes every frame) can be read
+                // from an old image after the ring wrapped. Counted always, logged for the frame ring and the first other cases.
+                const bool other_image = image->info.guest_address != desc.info.guest_address || image->info.size.width != desc.info.size.width ||
+                                         image->info.size.height != desc.info.size.height;
+                if (other_image && !image_desc.is_written) {
+                    const auto& ring = VideoCore::UntrackedRing::Get();
+                    const bool in_ring = ring.Active() && desc.info.guest_address >= ring.Start() && desc.info.guest_address < ring.End();
+                    static std::atomic<u64> served_other{0}, served_other_ring{0};
+                    const u64 n = (in_ring ? served_other_ring : served_other).fetch_add(1, std::memory_order_relaxed) + 1;
+                    if ((in_ring && (n <= 40 || (n & (n - 1)) == 0)) || (!in_ring && n <= 10)) {
+                        LOG_WARNING(Render_Vulkan, "texture served by another image ({} {}): asked {:#x} {}x{} format {}, got image {:#x} {}x{} format {} view level {} layer {}, present {}, program {:#x}, caller {:#x}",
+                                    in_ring ? "frame ring" : "other", n, desc.info.guest_address, desc.info.size.width, desc.info.size.height, static_cast<u32>(desc.info.pixel_format), image->info.guest_address,
+                                    image->info.size.width, image->info.size.height, static_cast<u32>(image->info.pixel_format), desc.view_info.range.base.level, desc.view_info.range.base.layer,
+                                    Core::DebugServer::PresentCount(), stage.pgm_hash, binder_plan != nullptr ? Core::NativeDraw::RecordCallerGhidra(binder_plan->native_seq) : 0);
+                    }
+                }
+            }
+            if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
+                // If this image has an associated depth image, it's a stencil attachment.
+                // Redirect the access to the actual depth-stencil buffer.
+                image_id = depth_image_id;
+                image = &texture_cache.GetImage(image_id);
+            }
+            if (image->binding.is_bound) {
+                // The image is already bound. In case if it is about to be used as storage we
+                // need to force general layout on it.
+                image->binding.force_general |= image_desc.is_written;
+            }
+            image->binding.is_bound = 1u;
+        }
+
+        image_descriptor_array_sizes.push_back(num_bindings);
+    }
+
+    // Second pass to re-bind images that were updated after binding, and the view of each image
+    for (u32 i = 0; i < num_images; ++i) {
+        auto& [image_id, desc] = image_bindings[i];
+        const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+        TextureBind& tb = r.binds.emplace_back();
+        tb.is_storage = is_storage; // (a null entry keeps the type the old code read from the binding slot)
+        if (!image_id) {
+            tb.null_entry = true;
+            continue;
+        }
+        if (auto& old_image = texture_cache.GetImage(image_id); old_image.binding.needs_rebind) {
+            old_image.binding = {};
+            image_id = texture_cache.FindImage(desc);
+            set_record = false;
+        }
+        bound_images.emplace_back(image_id);
+        auto& image = texture_cache.GetImage(image_id);
+        auto& image_view = texture_cache.FindTexture(image_id, desc);
+        const auto bind_flags = image.binding;
+        tb.image_id = image_id;
+        tb.image = &image;
+        tb.view = *image_view.image_view;
+        tb.range = desc.view_info.range;
+        tb.is_storage = is_storage;
+        tb.is_depth = image.info.props.is_depth;
+        tb.is_target = bind_flags.is_target;
+        tb.general = (bind_flags.force_general || bind_flags.is_target) && !image.info.props.is_depth;
+        tb.feedback = tb.general && instance.IsAttachmentFeedbackLoopLayoutSupported() && image.binding.is_target;
+        if (set_record && i < TextureSet::MaxImages) {
+            if (bind_flags.force_general || bind_flags.is_target || is_storage) {
+                set_record = false;
+            } else {
+                auto& entry = set_slot->entries[i];
+                entry.id = image_id;
+                entry.found = set_found[i];
+                entry.view = *image_view.image_view;
+                entry.backing = image.backing;
+                entry.range = desc.view_info.range;
+                entry.null_entry = false;
+            }
+        }
+    }
+    r.array_sizes = image_descriptor_array_sizes;
+    r.image_keys = image_keys;
+    if (set_record && num_images == stage_images && set_generation == texture_cache.ImageGeneration()) {
+        // Complete the entries: null images and the raw T# and flags of every image (the others were written in the second pass).
+        for (u32 i = 0; i < num_images; ++i) {
+            auto& entry = set_slot->entries[i];
+            if (!image_bindings[i].image_id) {
+                entry = {};
+                entry.null_entry = true;
+            }
+            entry.raw = set_raws[i];
+            entry.flags = set_flags[i];
+            entry.array_key = image_keys[i];
+        }
+        set_slot->count = num_images;
+        set_slot->generation = set_generation;
+        ++texture_set_stats.recorded;
+    }
+}
+
+bool Rasterizer::ResolveTextureSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count, TextureResolved& r) {
+    // Plan S step P2: the checks of the texture set memo (resolve), see BindTexturesFromSet
+    if (set.count != count) {
+        ++texture_set_stats.no_entry;
+        return false;
+    }
+    for (u32 i = 0; i < count; ++i) {
+        if (set.entries[i].flags != flags[i] || set.entries[i].raw != raws[i]) {
+            ++texture_set_stats.no_entry;
+            return false;
+        }
+    }
+    if (set.generation != texture_cache.ImageGeneration()) {
+        ++texture_set_stats.generation;
+        return false;
+    }
+    // Everything the slow path does to an image before it looks at the view: touch and refresh. Idempotent, so a miss after it costs nothing.
+    for (u32 i = 0; i < count; ++i) {
+        const auto& entry = set.entries[i];
+        if (entry.null_entry) {
+            continue;
+        }
+        texture_cache.TouchFoundImage(entry.found);
+        texture_cache.UpdateImage(entry.id, Core::ImageCaller::RasterizerBindTextures);
+    }
+    for (u32 i = 0; i < count; ++i) {
+        const auto& entry = set.entries[i];
+        if (entry.null_entry) {
+            continue;
+        }
+        auto& image = texture_cache.GetImage(entry.id);
+        const bool redirected = entry.id != entry.found;
+        const auto associated = texture_cache.GetAssociatedDepth(texture_cache.GetImage(entry.found));
+        if (image.backing != entry.backing || image.binding.needs_rebind || image.binding.force_general || image.binding.is_target ||
+            (image.backing->num_samples > 1) != (image.info.num_samples > 1) || (redirected ? associated != entry.id : bool(associated))) {
+            ++texture_set_stats.image_check;
+            return false;
+        }
+    }
+    ++texture_set_stats.hits;
+    for (u32 i = 0; i < count; ++i) {
+        const auto& entry = set.entries[i];
+        TextureBind& tb = r.binds.emplace_back();
+        if (entry.null_entry) {
+            tb.null_entry = true;
+            continue;
+        }
+        auto& image = texture_cache.GetImage(entry.id);
+        image.binding.is_bound = 1u;
+        bound_images.emplace_back(entry.id);
+        tb.image_id = entry.id;
+        tb.image = &image;
+        tb.view = entry.view;
+        tb.range = entry.range;
+        tb.is_depth = image.info.props.is_depth;
+    }
+    return true;
+}
+
+void Rasterizer::RecordTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding, TextureResolved& r) {
+    // Plan S step P2: the record half of the texture bindings (layout transitions, descriptor infos and writes, the indexed row)
+    const u32 first_image_idx = image_infos.size();
+    const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
+    if (r.set_hit) {
+        const u32 count = static_cast<u32>(r.binds.size());
+        for (u32 i = 0; i < count; ++i) {
+            const TextureBind& tb = r.binds[i];
+            if (tb.null_entry) {
+                image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+                continue;
+            }
+            auto& image = *tb.image;
+            if (recipe_active) {
+                recipe_image_ranges.emplace_back(image.info.guest_address, static_cast<u32>(std::min<u64>(image.info.guest_size, 0xffffffffull)));
+            }
+            const auto new_layout = tb.is_depth ? vk::ImageLayout::eDepthStencilReadOnlyOptimal : vk::ImageLayout::eShaderReadOnlyOptimal;
+            needs_barrier |= runtime.Transit(&image, new_layout, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead, tb.range);
+            image.usage.texture |= 1u;
+            image_infos.emplace_back(VK_NULL_HANDLE, tb.view, runtime.CurrentLayout(image));
+        }
+        for (u32 i = 0; i < count; ++i) {
+            if (indexed_active && stage.indexed && Shader::Indexed::IsIndexedImage(stage.images[i])) {
+                NoteIndexedImage(image_infos[first_image_idx + i], stage.images[i].array_key);
+                continue;
+            }
+            auto& set_write = set_writes[set_write_index++];
+            set_write.dstSet = VK_NULL_HANDLE;
+            set_write.dstBinding = binding.unified++;
+            set_write.dstArrayElement = 0;
+            set_write.descriptorCount = 1;
+            set_write.descriptorType = vk::DescriptorType::eSampledImage;
+            set_write.pImageInfo = &image_infos[first_image_idx + i];
+        }
+        return;
+    }
+    const u32 num_images = static_cast<u32>(r.binds.size());
+    for (u32 i = 0; i < num_images; ++i) {
+        TextureBind& tb = r.binds[i];
+        if (tb.null_entry) {
+            image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+            continue;
+        }
+        const bool is_storage = tb.is_storage;
+        const auto transit = [&](auto&&... args) {
+            Census(census_base + CImageTransit);
+            const bool result = runtime.Transit(std::forward<decltype(args)>(args)...);
+            if (result) {
+                Census(census_base + CImageTransitTrue);
+            }
+            return result;
+        };
+        if (is_storage) {
+            Census(census_base + CImageStorage);
+        }
+        auto& image = *tb.image;
+        const VideoCore::SubresourceRange& range = tb.range;
+        vk::ImageLayout transit_layout = vk::ImageLayout::eGeneral; // R3 step 2: the layout the transit leaves the image in
+        if (tb.general) {
+            if (tb.feedback) {
+                transit_layout = vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+                needs_barrier |= transit(&image, vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT, vk::PipelineStageFlagBits2::eAllGraphics, vk::AccessFlagBits2::eShaderRead);
+            } else {
+                needs_barrier |= transit(&image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, range);
+            }
+        } else {
+            if (is_storage) {
+                needs_barrier |= transit(&image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, range);
+            } else {
+                const auto new_layout = tb.is_depth ? vk::ImageLayout::eDepthStencilReadOnlyOptimal : vk::ImageLayout::eShaderReadOnlyOptimal;
+                transit_layout = new_layout;
+                needs_barrier |= transit(&image, new_layout, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead, range);
+            }
+        }
+        image.usage.storage |= is_storage;
+        image.usage.texture |= !is_storage;
+        if (is_storage) {
+            Core::UiTrace::NoteGpuWrite("a storage image binding", image.info.guest_address, image.info.guest_size);
+        }
+        if (Core::UiTrace::Active() && !is_storage && image.info.props.is_block && !image.info.props.is_depth && image.info.guest_size <= (256u << 10) && image.info.resources.layers == 1 &&
+            image.info.resources.levels >= 1 && Core::UiTrace::WantsShot(image.info.guest_address, static_cast<u32>(Core::DebugServer::PresentCount()))) {
+            auto ref = runtime.GetStagingPool().Request(image.info.guest_size, VideoCore::MemoryType::HostCached, 16, false);
+            const vk::BufferImageCopy shot_copy = {
+                .bufferOffset = ref.offset,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {image.info.size.width, image.info.size.height, 1},
+            };
+            runtime.DownloadImage(&image, ref.buffer, std::span{&shot_copy, 1});
+            needs_barrier |= transit(&image, transit_layout, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead, range);
+            ui_shots_pending.push_back({image.info.guest_address, ref, scheduler.CurrentTick(), static_cast<u32>(Core::DebugServer::PresentCount()),
+                                        fmt::format("{} {}x{}", vk::to_string(image.info.pixel_format), image.info.size.width, image.info.size.height)});
+        }
+        if (Core::UiTrace::Active()) {
+            Core::UiTrace::NoteImage(image.info.guest_address, image.info.guest_size,
+                                     fmt::format("{} {}x{} {} target={} storage={} bound_layout={}", vk::to_string(image.info.pixel_format), image.info.size.width, image.info.size.height,
+                                                 AmdGpu::NameOf(image.info.tile_mode), tb.is_target, is_storage, vk::to_string(transit_layout)));
+        }
+        vk::ImageLayout bound_layout = transit_layout;
+        if (!image.backing || !runtime.PlannerDecidesLayouts()) {
+            bound_layout = runtime.CurrentLayout(image);
+        }
+        image_infos.emplace_back(VK_NULL_HANDLE, tb.view, bound_layout);
+        if (recipe_active) {
+            recipe_image_ranges.emplace_back(image.info.guest_address, static_cast<u32>(std::min<u64>(image.info.guest_size, 0xffffffffull)));
+        }
+    }
+    u32 image_info_idx = first_image_idx;
+    u32 image_binding_idx = 0;
+    u32 image_desc_idx = 0;
+    for (u32 array_size : r.array_sizes) {
+        const bool is_storage = r.binds[image_binding_idx].is_storage;
+        if (indexed_active && stage.indexed && Shader::Indexed::IsIndexedImage(stage.images[image_desc_idx])) {
+            if (stage.images[image_desc_idx].is_atomic) {
+                Core::RareEvents::Note("c9_atomic_image", fmt::format("shader {:#x} ({}): atomic image in array key {} (format {})", stage.pgm_hash, static_cast<u32>(stage.sw_stage), r.image_keys[image_desc_idx],
+                                                                       (r.image_keys[image_desc_idx] - Shader::Indexed::FirstAtomicKey) / 4));
+            }
+            if (stage.images[image_desc_idx].mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+                Core::RareEvents::Note("c9_mip_level_run", fmt::format("shader {:#x} ({}): image bound once per mip level, {} levels, array key {}", stage.pgm_hash, static_cast<u32>(stage.sw_stage), array_size,
+                                                                       r.image_keys[image_desc_idx]));
+                NoteIndexedRun(&image_infos[image_info_idx], array_size, r.image_keys[image_desc_idx]);
+            } else {
+                NoteIndexedImage(image_infos[image_info_idx], r.image_keys[image_desc_idx]);
+            }
+            image_info_idx += array_size;
+            image_binding_idx += array_size;
+            ++image_desc_idx;
+            continue;
+        }
+        ++image_desc_idx;
+        if (indexed_active && stage.indexed) {
+            IndexedData::Get()->stats.legacy_images.fetch_add(1, std::memory_order_relaxed);
+        }
+        auto& set_write = set_writes[set_write_index++];
+        set_write.dstSet = VK_NULL_HANDLE;
+        set_write.dstBinding = binding.unified;
+        set_write.dstArrayElement = 0;
+        set_write.descriptorCount = array_size;
+        set_write.descriptorType =
+            is_storage ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eSampledImage;
+        set_write.pImageInfo = &image_infos[image_info_idx];
+
+        image_info_idx += array_size;
+        image_binding_idx += array_size;
+        binding.unified += array_size;
+    }
+
+}
+
+void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    const u32 mode = SplitBindMode();
+    if (mode == 0) {
+        BindTexturesLegacy(stage, binding);
+        return;
+    }
+    static std::atomic<u64> checked{0}, differ{0}, set_hits{0};
+    if (mode == 2) {
+        const size_t infos_before = image_infos.size();
+        const size_t bound_before = bound_images.size();
+        BindTexturesLegacy(stage, binding);
+        const size_t infos_after = image_infos.size();
+        const size_t bound_after = bound_images.size();
+        const std::vector<vk::DescriptorImageInfo> seen(image_infos.begin() + infos_before, image_infos.end());
+        const std::vector<VideoCore::ImageId> seen_bound(bound_images.begin() + bound_before, bound_images.end());
+        TextureResolved r;
+        ResolveTextures(stage, r);
+        bound_images.resize(bound_after); // (the resolve pass put the same images in the list a second time)
+        const u64 n = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+        set_hits.fetch_add(r.set_hit ? 1 : 0, std::memory_order_relaxed);
+        bool same = r.binds.size() <= seen.size();
+        std::string what;
+        size_t bound_at = 0;
+        for (size_t i = 0; same && i < r.binds.size(); ++i) {
+            const TextureBind& tb = r.binds[i];
+            if (tb.null_entry) {
+                same = !seen[i].imageView;
+                what = "null entry has a view";
+                continue;
+            }
+            if (!(seen[i].imageView == tb.view)) {
+                same = false;
+                what = "view";
+            } else if (bound_at >= seen_bound.size() || !(seen_bound[bound_at] == tb.image_id)) {
+                same = false;
+                what = "image id";
+            }
+            ++bound_at;
+        }
+        if (same && bound_at != seen_bound.size()) {
+            same = false;
+            what = "bound image count";
+        }
+        if (!same && differ.fetch_add(1) < 20) {
+            LOG_WARNING(Render_Vulkan, "split bind verify: textures of stage {:#x} differ: {} ({} legacy infos, {} split bindings)", stage.pgm_hash, what, seen.size(), r.binds.size());
+        }
+        if ((n & (n - 1)) == 0) {
+            LOG_WARNING(Render_Vulkan, "split bind verify: {} texture stage calls ({} from the set memo), {} differ", n, set_hits.load(), differ.load());
+        }
+        (void)infos_after;
+        return;
+    }
+    Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
+    TLG_PROF_LEVEL("raster.bind_textures", 2);
+    TextureResolved r;
+    ResolveTextures(stage, r);
+    RecordTextures(stage, binding, r);
     BindSamplers(stage, binding);
 }
 

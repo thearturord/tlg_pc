@@ -474,6 +474,23 @@ private:
     bool verify_slots_on{false};
     void RecordBufferBindings(const Shader::Info& stage, Shader::Backend::Bindings& binding, Shader::PushData& push_data, BufferBind* binds, u32 count, u64 alignment, u32 census_base);
     static u32 SplitBindMode();
+    /// Plan S step P2: what the resolve half decided for one image binding.
+    struct TextureBind {
+        VideoCore::ImageId image_id{};
+        VideoCore::Image* image{nullptr};
+        vk::ImageView view{};
+        VideoCore::SubresourceRange range{};
+        bool null_entry{false}, is_storage{false}, is_depth{false}, is_target{false}, general{false}, feedback{false};
+    };
+    struct TextureResolved {
+        boost::container::small_vector<TextureBind, 16> binds;
+        boost::container::small_vector<u32, 8> array_sizes;
+        std::array<u32, Shader::NUM_IMAGES> image_keys{};
+        bool set_hit{false};
+    };
+    void BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+    void ResolveTextures(const Shader::Info& stage, TextureResolved& r);
+    void RecordTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding, TextureResolved& r);
     void BindSamplersLegacy(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     void ResolveSamplers(const Shader::Info& stage, boost::container::small_vector<vk::Sampler, 8>& out);
     void RecordSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding, const vk::Sampler* samplers, u32 count);
@@ -530,6 +547,7 @@ private:
     /// True when the stage's images were bound from the set (the descriptor writes are done).
     bool BindTexturesFromSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count,
                              Shader::Backend::Bindings& binding);
+    bool ResolveTextureSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count, TextureResolved& r);
     bool BindResources(const Pipeline* pipeline, const FixedState* fixed = nullptr);
     void BindCensus(const Pipeline* pipeline);
 
