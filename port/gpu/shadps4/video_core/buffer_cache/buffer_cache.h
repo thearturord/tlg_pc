@@ -234,7 +234,7 @@ public:
     /// A guest memory write by the command processor (WriteData, occlusion results, DMA...).
     /// Drops reusable stream copies it overlaps.
     void NoteCpGuestWrite(VAddr device_addr, u64 size) {
-        if (Core::RingMirror::Mode() >= 2) {
+        if (Core::RingMirror::ShadowOn()) {
             Core::RingMirror::NoteHostWrite(device_addr, size);
         }
         BindMemoBump(); // the command processor's writes (any thread): every memo answer is checked again
@@ -440,6 +440,9 @@ private:
         u64 tick{};
     };
     std::array<RingUpload, 256> ring_uploads{};
+    /// N2 (`TLG_RING_MIRROR=1`): the parts of the frame ring that the mirror buffer (`ring_mirror_token` of the Buffer) already holds; guarded by object_dirty_mutex
+    RangeSet ring_filled;
+    u64 ring_mirror_token_next{0}, ring_mirror_token_current{0};
 };
 
 } // namespace VideoCore

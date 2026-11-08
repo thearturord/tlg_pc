@@ -153,6 +153,7 @@ struct Buffer {
     u64 resolve_use_seq{0}, resolve_prev_seq{0};
 
     VAddr cpu_addr = 0;
+    mutable u64 ring_mirror_token = 0; ///< N2: set by the buffer cache when this buffer is the frame ring's mirror (0: not)
     size_t size_bytes = 0;
     std::span<u8> mapped_data{};
     bool is_coherent{};

@@ -14,6 +14,7 @@
 #pragma once
 
 #include <utility>
+#include <vector>
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -22,12 +23,22 @@
 namespace Core::RingMirror {
 
 [[nodiscard]] u32 Mode() noexcept;
+/// Mode 1 is the real mirror (`TLG_RING_MIRROR=1`): a ring window is uploaded whole the first time it is read, afterwards only the announced bytes. `TLG_RING_MIRROR_AUDIT=1` keeps the host shadow
+/// beside it and uploads every block the shadow finds different (test runs: the compare costs about what the saved copy does).
+[[nodiscard]] bool AuditOn() noexcept;
+/// The shadow bookkeeping (announcement and writer tags, host writes) runs in the shadow modes and in the audited real mode.
+[[nodiscard]] bool ShadowOn() noexcept;
+/// The real mirror served a window: `uploaded_whole` bytes were read for the first time, `announced` bytes came from announcements; the rest of the window needed no upload.
+void NoteReal(u64 window, u64 uploaded_whole, u64 announced, u64 pieces_in, u64 pieces_out, u64 merged_bytes);
+/// Announced pieces closer than this many bytes are uploaded as one copy (`TLG_RING_MERGE`, default 2048, 0 off): a copy has a fixed cost, the gap bytes are current guest memory.
+[[nodiscard]] u64 MergeGap() noexcept;
 
 /// True once for every definition of the ring [start, end): the caller then drops all marks over the ring (they predate the fill) and calls `Fill`.
 [[nodiscard]] bool NeedFill(VAddr start, VAddr end);
 void Fill(VAddr start, VAddr end);
 /// The window [lo, hi) of the ring is read now. `announced`: the announced (marked, not yet taken) ranges inside it, start and size. The shadow takes them, then the window is compared with the shadow.
-void CheckWindow(VAddr lo, VAddr hi, const std::pair<u64, u64>* announced, size_t count);
+/// `repair` (audited real mode): receives the ranges that differ, merged; the caller uploads them.
+void CheckWindow(VAddr lo, VAddr hi, const std::pair<u64, u64>* announced, size_t count, std::vector<std::pair<u64, u64>>* repair = nullptr);
 
 /// An announcement was applied for [address, size): blocks that were found different and are inside it are explained (announced late: the window was read between the write and its announcement).
 void NoteAnnounced(VAddr address, u64 size);

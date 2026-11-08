@@ -143,7 +143,7 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object)
         }
     }
     Core::N0::ApplyScope n0_apply{n0_ring, size};
-    if (Core::RingMirror::Mode() >= 2) {
+    if (Core::RingMirror::ShadowOn()) {
         Core::RingMirror::NoteAnnounced(address, size);
     }
     {
@@ -1292,6 +1292,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     const bool b9_native = b9 == 2 && b9_object != 0;
     // E4: memory no engine buffer holds takes the announced bytes (the placement already copied the rest)
     // the announced bytes inside [x, x + xn) of memory no engine buffer holds (a request over unowned memory, or a gap between the buffers of one): uploaded, then no longer announced
+    boost::container::small_vector<std::pair<u64, u64>, 8>* announced_sink = nullptr; // N2: the announced pieces a ring window takes
     const auto take_announced = [&](u64 x, u64 xn) {
         boost::container::small_vector<std::pair<u64, u64>, 8> from_announced;
         {
@@ -1352,6 +1353,10 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         for (const auto& [lo, n] : from_announced) {
             Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4AnnouncedUploads, n);
             n0_cause = 2;
+            if (announced_sink != nullptr) {
+                announced_sink->emplace_back(lo, n); // (a ring window merges its pieces before it uploads them)
+                continue;
+            }
             add_copy(lo, n);
         }
         if (!from_announced.empty()) {
@@ -1376,6 +1381,84 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             if (device_addr < lo) {
                 announced_ranges(device_addr, lo - device_addr);
             }
+            const bool mirror_real = Core::RingMirror::Mode() == 1 && arena->cpu_addr <= ring.Start() && arena->cpu_addr + arena->SizeBytes() >= ring.End();
+            if (mirror_real) {
+                // N2 real mirror: the arena of the ring window is the ring's own buffer. A part of the ring is uploaded whole the first time a window reads it; after that only the bytes the
+                // engine announced for it are uploaded (and nothing at all when none were).
+                ring_lo = ring_hi = 0; // (the announced pieces of engine buffers inside the ring are uploaded by the loop below)
+                boost::container::small_vector<std::pair<u64, u64>, 8> unfilled, filled_parts, taken;
+                {
+                    std::scoped_lock lock{object_dirty_mutex};
+                    if (arena->ring_mirror_token == 0 || arena->ring_mirror_token != ring_mirror_token_current) {
+                        arena->ring_mirror_token = ++ring_mirror_token_next; // another buffer is the mirror now: it holds nothing yet
+                        ring_mirror_token_current = arena->ring_mirror_token;
+                        ring_filled.Clear();
+                    }
+                    ring_filled.ForEachInRange(lo, hi - lo, [&](u64 a, u64 e) { filled_parts.emplace_back(a, e - a); });
+                    ring_filled.ForEachNotInRange(lo, hi - lo, [&](u64 a, u64 n) { unfilled.emplace_back(a, n); });
+                    for (const auto& [a, n] : unfilled) {
+                        ring_filled.Add(a, n);
+                        b9_unattributed.Subtract(a, n); // (the marks before the upload are in it)
+                        if (Core::NativeUpdates::LeanDirtyMode() != 2) {
+                            all_object_dirty.Subtract(a, n);
+                        }
+                    }
+                }
+                u64 whole = 0;
+                for (const auto& [a, n] : unfilled) {
+                    n0_cause = 0;
+                    add_copy(a, n);
+                    whole += n;
+                    Core::NativeUploads::NoteRingUpload(n);
+                    Core::Flight::Add(Core::Flight::Upload, 0, a, n, 1); // L1
+                }
+                announced_sink = &taken;
+                for (const auto& [a, n] : filled_parts) {
+                    announced_ranges(a, n);
+                }
+                announced_sink = nullptr;
+                u64 announced_bytes = 0, merged_bytes = 0;
+                for (const auto& [a, n] : taken) {
+                    announced_bytes += n;
+                }
+                {
+                    // pieces close together are one copy: the gap bytes are current guest memory (a copy has a fixed cost, the pieces are mostly 100 to 500 bytes)
+                    const u64 gap = Core::RingMirror::MergeGap();
+                    boost::container::small_vector<std::pair<u64, u64>, 8> sorted(taken.begin(), taken.end());
+                    std::sort(sorted.begin(), sorted.end());
+                    u64 count_out = 0;
+                    for (size_t i = 0; i < sorted.size();) {
+                        u64 a = sorted[i].first, e = sorted[i].first + sorted[i].second;
+                        size_t j = i + 1;
+                        while (j < sorted.size() && sorted[j].first <= e + gap && (sorted[j].first + sorted[j].second) - a <= (u64{1} << 20)) {
+                            merged_bytes += sorted[j].first > e ? sorted[j].first - e : 0;
+                            e = std::max<u64>(e, sorted[j].first + sorted[j].second);
+                            ++j;
+                        }
+                        n0_cause = 2;
+                        add_copy(a, e - a);
+                        ++count_out;
+                        i = j;
+                    }
+                    Core::RingMirror::NoteReal(hi - lo, whole, announced_bytes, sorted.size(), count_out, merged_bytes);
+                }
+                if (Core::RingMirror::AuditOn()) {
+                    // the host shadow beside it: what the window holds must equal what the mirror was given; a difference is uploaded now
+                    taken.insert(taken.end(), unfilled.begin(), unfilled.end());
+                    if (Core::RingMirror::NeedFill(ring.Start(), ring.End())) {
+                        Core::RingMirror::Fill(ring.Start(), ring.End());
+                    }
+                    std::vector<std::pair<u64, u64>> repair;
+                    Core::RingMirror::CheckWindow(lo, hi, taken.data(), taken.size(), &repair);
+                    for (const auto& [a, n] : repair) {
+                        n0_cause = 0;
+                        add_copy(a, n);
+                    }
+                }
+                if (hi < device_addr + size) {
+                    announced_ranges(hi, device_addr + size - hi);
+                }
+            } else {
             if (Core::RingMirror::Mode() >= 2) {
                 // N2 shadow: a host copy of the ring kept current by the announced bytes alone; the window must equal it (the uploads below are unchanged)
                 boost::container::small_vector<std::pair<u64, u64>, 16> taken;
@@ -1406,6 +1489,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             }
             if (hi < device_addr + size) {
                 announced_ranges(hi, device_addr + size - hi);
+            }
             }
         } else {
             announced_ranges(device_addr, size);

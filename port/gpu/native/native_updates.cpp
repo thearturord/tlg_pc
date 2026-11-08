@@ -857,7 +857,7 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
     }
     announced_ranges_by_writer[writer & 7].fetch_add(1, std::memory_order_relaxed);
     announced_bytes_by_writer[writer & 7].fetch_add(size, std::memory_order_relaxed);
-    if (RingMirror::Mode() >= 2) {
+    if (RingMirror::ShadowOn()) {
         RingMirror::NoteWriter(address, size, (writer & 7) | t_announce_site_class);
     }
     if (B2NativeMode() != 0) {

@@ -277,6 +277,41 @@ u32 Mode() noexcept {
     return mode;
 }
 
+bool AuditOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_RING_MIRROR_AUDIT");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+bool ShadowOn() noexcept {
+    return Mode() >= 2 || (Mode() == 1 && AuditOn());
+}
+
+namespace {
+std::atomic<u64> real_pieces_in{0}, real_pieces_out{0}, real_merged_bytes{0};
+std::atomic<u64> real_windows{0}, real_window_bytes{0}, real_uploaded_whole{0}, real_announced{0}, real_repaired_bytes{0}, real_repairs{0};
+} // namespace
+
+u64 MergeGap() noexcept {
+    static const u64 gap = [] {
+        const char* e = std::getenv("TLG_RING_MERGE");
+        return e != nullptr ? static_cast<u64>(std::atoll(e)) : u64{2048};
+    }();
+    return gap;
+}
+
+void NoteReal(u64 window, u64 uploaded_whole, u64 announced, u64 pieces_in, u64 pieces_out, u64 merged_bytes) {
+    real_pieces_in.fetch_add(pieces_in, std::memory_order_relaxed);
+    real_pieces_out.fetch_add(pieces_out, std::memory_order_relaxed);
+    real_merged_bytes.fetch_add(merged_bytes, std::memory_order_relaxed);
+    real_windows.fetch_add(1, std::memory_order_relaxed);
+    real_window_bytes.fetch_add(window, std::memory_order_relaxed);
+    real_uploaded_whole.fetch_add(uploaded_whole, std::memory_order_relaxed);
+    real_announced.fetch_add(announced, std::memory_order_relaxed);
+}
+
 bool NeedFill(VAddr start, VAddr end) {
     std::scoped_lock lock{mutex};
     return shadow_start != start || shadow_end != end;
@@ -295,7 +330,7 @@ void Fill(VAddr start, VAddr end) {
     fills.fetch_add(1, std::memory_order_relaxed);
 }
 
-void CheckWindow(VAddr lo, VAddr hi, const std::pair<u64, u64>* announced, size_t count) {
+void CheckWindow(VAddr lo, VAddr hi, const std::pair<u64, u64>* announced, size_t count, std::vector<std::pair<u64, u64>>* repair) {
     std::scoped_lock lock{mutex};
     if (shadow_start == 0 || lo < shadow_start || hi > shadow_end || lo >= hi) {
         return;
@@ -403,6 +438,15 @@ void CheckWindow(VAddr lo, VAddr hi, const std::pair<u64, u64>* announced, size_
                 bad_bytes += guest[at + i] != mirror[at + i];
             }
             std::memcpy(mirror + at, guest + at, n); // (resynchronized: one missed write is counted once)
+            if (repair != nullptr) {
+                const u64 abs = lo + at;
+                if (!repair->empty() && repair->back().first + repair->back().second == abs) {
+                    repair->back().second += n;
+                } else {
+                    repair->emplace_back(abs, n);
+                }
+                real_repaired_bytes.fetch_add(n, std::memory_order_relaxed);
+            }
         }
     }
     if (bad_blocks != 0) {
@@ -496,6 +540,8 @@ nlohmann::json Report() {
             {"window_bytes", window_bytes.load()},
             {"largest_window", largest_window.load()},
             {"announced_bytes_taken", announced_taken.load()},
+            {"real", {{"windows", real_windows.load()}, {"window_bytes", real_window_bytes.load()}, {"uploaded_whole_first_read", real_uploaded_whole.load()}, {"uploaded_from_announcements", real_announced.load()}, {"announced_pieces", real_pieces_in.load()}, {"copies_after_merge", real_pieces_out.load()}, {"gap_bytes_added_by_merge", real_merged_bytes.load()},
+                      {"AUDIT_REPAIRED_BYTES_MUST_BE_0", real_repaired_bytes.load()}, {"audit", AuditOn()}}},
             {"raw_differing_bytes", unannounced_bytes.load()},
             {"suspect_blocks_found", suspects_found.load()},
             {"suspect_blocks_announced_later", suspects_cancelled.load()},
