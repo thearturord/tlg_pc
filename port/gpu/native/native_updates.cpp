@@ -406,7 +406,10 @@ std::atomic<u64> sk_refused_clears{0}, sk_refused_gpu{0}, sk_refused_image{0}, s
 u32 (*skip_check_fn)(void*, u64, u64) = nullptr;
 void* skip_check_context = nullptr;
 
+std::atomic<u64> ra_changed_announced_by_tag[16]{}, ra_changed_unannounced_by_tag[16]{};
 void ReapplyAuditBefore(const Batch& batch) {
+    std::vector<Tag> again_tags = batch.again_writer;
+    again_tags.insert(again_tags.end(), batch.ring_again_writer.begin(), batch.ring_again_writer.end());
     std::vector<std::pair<u64, u64>> again = batch.again;
     again.insert(again.end(), batch.ring_again.begin(), batch.ring_again.end());
     std::vector<std::pair<u64, u64>> newer = batch.first;
@@ -452,7 +455,9 @@ void ReapplyAuditBefore(const Batch& batch) {
             ra_unchanged.fetch_add(1, std::memory_order_relaxed);
         } else if (announced_over(before.address, before.size)) {
             ra_changed_announced.fetch_add(1, std::memory_order_relaxed);
+            ra_changed_announced_by_tag[i < again_tags.size() ? again_tags[i].writer & 15 : 15].fetch_add(1, std::memory_order_relaxed);
         } else {
+            ra_changed_unannounced_by_tag[i < again_tags.size() ? again_tags[i].writer & 15 : 15].fetch_add(1, std::memory_order_relaxed);
             ra_changed_unannounced.fetch_add(1, std::memory_order_relaxed);
             ra_unannounced_bytes.fetch_add(before.size, std::memory_order_relaxed);
             if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
@@ -1014,7 +1019,7 @@ nlohmann::json B2Report() {
                    }()},
                   {"reapply_gate", {{"on", ReapplyGateOn()}, {"skipped_unchanged", ra_gate_skipped.load()}, {"applied_changed_or_unknown", ra_gate_applied.load()}}},
             {"reapply_audit", {{"on", ReapplyAuditOn()}, {"batches", ra_batches.load()}, {"misaligned_batches", ra_misaligned_batches.load()}, {"ranges_audited", ra_audited.load()}, {"unhashed", ra_unhashed.load()},
-                               {"unchanged", ra_unchanged.load()}, {"changed_and_announced_again", ra_changed_announced.load()}, {"changed_nobody_announced", ra_changed_unannounced.load()},
+                               {"unchanged", ra_unchanged.load()}, {"changed_and_announced_again", ra_changed_announced.load()}, {"changed_nobody_announced", ra_changed_unannounced.load()}, {"changed_nobody_announced_by_tag", {ra_changed_unannounced_by_tag[0].load(), ra_changed_unannounced_by_tag[1].load(), ra_changed_unannounced_by_tag[2].load(), ra_changed_unannounced_by_tag[3].load(), ra_changed_unannounced_by_tag[4].load(), ra_changed_unannounced_by_tag[5].load(), ra_changed_unannounced_by_tag[6].load(), ra_changed_unannounced_by_tag[7].load()}}, {"changed_announced_again_by_tag", {ra_changed_announced_by_tag[0].load(), ra_changed_announced_by_tag[1].load(), ra_changed_announced_by_tag[2].load(), ra_changed_announced_by_tag[3].load(), ra_changed_announced_by_tag[4].load(), ra_changed_announced_by_tag[5].load(), ra_changed_announced_by_tag[6].load(), ra_changed_announced_by_tag[7].load()}},
                                {"changed_nobody_announced_bytes", ra_unannounced_bytes.load()}}},
             {"note", "B2, cumulative: the engine's announced CPU writes applied to the caches"}};
 }
