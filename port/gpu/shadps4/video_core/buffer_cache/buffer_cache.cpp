@@ -81,8 +81,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       staging_pool{runtime_.GetStagingPool()}, executor{executor_},
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
+      resolve_stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       stream_reuse_enabled{EmulatorSettings.IsReadbackStreamReuseEnabled()} {
+    resolve_stream_buffer.ring_id = 1;
     if (!instance.IsMaintenance6Supported()) {
         null_index_buffer = std::make_unique<Buffer>(instance, 0, NULL_INDEX_BUFFER_SIZE,
                                                      MemoryType::DeviceLocal, "Null Index Buffer");
@@ -374,7 +376,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferBody(VAddr device_addr, u
     if (const auto it = memo.entries.find(device_addr); it != memo.entries.end()) {
         for (const auto& e : it->second) {
             if (e.size == size && e.texel == is_texel_buffer && e.epoch == epoch && e.range_epoch == ranges && e.placement_epoch == arenas &&
-                (e.buffer != &stream_buffer || (e.wraps == stream_buffer.WrapCount() && e.tick == tick))) {
+                (e.buffer != &CopyRing() || (e.wraps == CopyRing().WrapCount() && e.tick == tick))) {
                 if (wide_class || wide_mode == 1) {
                     const u32 cb = wide_class ? 0u : 10u; // counter base: widened class or classic class
                     bind_memo_wide_counts[cb + 5].fetch_add(1, std::memory_order_relaxed);
@@ -391,7 +393,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferBody(VAddr device_addr, u
                         const auto answer = ObtainBufferUncached(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
                         const u64 commands_after = list != nullptr ? list->Size() : 0;
                         bind_memo_wide_counts[cb + 1].fetch_add(1, std::memory_order_relaxed);
-                        const bool stream = e.buffer == &stream_buffer;
+                        const bool stream = e.buffer == &CopyRing();
                         if (stream) {
                             bind_memo_wide_counts[cb + 3].fetch_add(1, std::memory_order_relaxed);
                         }
@@ -434,7 +436,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferBody(VAddr device_addr, u
         auto& list = memo.entries[device_addr];
         list.erase(std::remove_if(list.begin(), list.end(), [&](const BindMemoEntry& e) { return e.size == size && e.texel == is_texel_buffer; }), list.end());
         // the epochs as they were before the request: anything the request itself changed makes the next one ask again
-        list.push_back({size, result.first, result.second, ranges, arenas, result.first == &stream_buffer ? stream_buffer.WrapCount() : 0, epoch, tick, is_texel_buffer,
+        list.push_back({size, result.first, result.second, ranges, arenas, result.first == &CopyRing() ? CopyRing().WrapCount() : 0, epoch, tick, is_texel_buffer,
                         BindMemoWideMode() == 1 && IsRegionCpuModified(device_addr, size)});
         memo.max_size = std::max<u64>(memo.max_size, size);
     }
@@ -682,21 +684,21 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             if (!IsRangeGpuWritten(immutable->begin, whole)) {
                 const u32 generation = immutable->generation.load(std::memory_order_acquire);
                 const u32 gpu_writes = immutable->gpu_writes.load(std::memory_order_acquire);
-                const auto [data, at] = stream_buffer.Map(whole, instance.UniformMinAlignment());
+                const auto [data, at] = CopyRing().Map(whole, instance.UniformMinAlignment());
                 memory->CopySparseMemory(immutable->begin, data, whole);
                 // M2: the bytes of the record's submission; a copy that was corrected must not be reused by a later generation's check, so it records a generation nobody has
                 const bool corrected = Core::NativeContent::FrameStoreServe(Core::NativeContent::LateKind::BufferObjectCopy, immutable->begin, data, whole) != 0;
                 Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::BufferObjectCopy, immutable->begin, whole);
                 Core::NativeContent::SilentSynced(1, immutable->begin, whole); // W1.5 census
-                stream_buffer.Commit();
+                CopyRing().Commit();
                 immutable->copy_offset = at;
-                immutable->copy_wraps = stream_buffer.WrapCount();
+                immutable->copy_wraps = CopyRing().WrapCount();
                 immutable->copy_generation = corrected ? ~generation : generation;
                 immutable->copy_gpu_writes = gpu_writes;
                 Core::NativeResources::NoteResident(1);
                 Core::NativeResources::NoteBufferRequest(device_addr, size, false, Core::NativeResources::BufferPath::StreamCopy, whole);
                 TLG_PROF_ADD("buffer.uncached.object_copy_made (sum = bytes)", whole);
-                return {&stream_buffer, at + (device_addr - immutable->begin)};
+                return {&CopyRing(), at + (device_addr - immutable->begin)};
             }
         }
         if (immutable != nullptr && immutable->usage != 1 && IsRegionGpuModified(device_addr, size)) {
@@ -761,7 +763,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
         auto& reuse = stream_reuse_sets[Vulkan::Scheduler::SideSelected() ? 1 : 0];
         if (StreamReuseOn()) {
             const u64 tick = scheduler.ResolveEpoch();
-            const u64 wraps = stream_buffer.WrapCount();
+            const u64 wraps = CopyRing().WrapCount();
             // Copies are per submission, with or without the store: the game rewrites constants (camera, view) in place between submissions, a copy reused across them is stale (W0, owner play 2026-11-04:
             // random lines on the whole screen while walking when the store did not serve; this key was tied to the store serving)
             const u32 record_submit = Core::NativeContent::CurrentRecordSubmit();
@@ -778,23 +780,23 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
                 Core::NativeResources::NoteBufferRequest(device_addr, size, false,
                                                          Core::NativeResources::BufferPath::StreamReuse, 0);
                 TLG_PROF_COUNT("buffer.uncached.stream_reuse_hit");
-                return {&stream_buffer, it->second};
+                return {&CopyRing(), it->second};
             }
         }
-        const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
+        const auto [data, offset] = CopyRing().Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         Core::NativeContent::FrameStoreServe(Core::NativeContent::LateKind::BufferStreamCopy, device_addr, data, size); // M2
         Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::BufferStreamCopy, device_addr, size);
-        stream_buffer.Commit();
+        CopyRing().Commit();
         Core::NativeResources::NoteBufferRequest(device_addr, size, false,
                                                  Core::NativeResources::BufferPath::StreamCopy, size);
-        if (StreamReuseOn() && stream_buffer.WrapCount() == reuse.wraps) {
+        if (StreamReuseOn() && CopyRing().WrapCount() == reuse.wraps) {
             reuse.map.emplace(reuse_key, offset);
             reuse.min = std::min<VAddr>(reuse.min, device_addr);
             reuse.max = std::max<VAddr>(reuse.max, device_addr + size);
         }
         TLG_PROF_ADD("buffer.uncached.stream_copy (sum = bytes)", size);
-        return {&stream_buffer, offset};
+        return {&CopyRing(), offset};
     }
     stream_scope.End();
     TLG_PROF_NAMED_LEVEL(memo_scope, "buffer.part.arena_memo", 3);
@@ -874,10 +876,10 @@ u32 BufferCache::WaitForExplicitDownloads(VAddr device_addr, u64 size, u32 timeo
 }
 
 std::pair<const Buffer*, u64> BufferCache::StreamCopy(VAddr device_addr, u32 size) {
-    const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
+    const auto [data, offset] = CopyRing().Map(size, instance.UniformMinAlignment());
     memory->CopySparseMemory(device_addr, data, size);
-    stream_buffer.Commit();
-    return {&stream_buffer, offset};
+    CopyRing().Commit();
+    return {&CopyRing(), offset};
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForDownload(VAddr device_addr, u32 size) {

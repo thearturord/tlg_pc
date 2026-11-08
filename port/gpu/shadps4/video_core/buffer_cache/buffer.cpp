@@ -249,15 +249,16 @@ bool StreamBuffer::PrepareMap(u64 size, u64 alignment, bool allow_wait) {
 
 std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) {
     {
-        // plan S P3d census: which half writes the stream ring (0 outside the split halves, 1 resolve, 2 record), and how many bytes
-        static std::atomic<u64> calls[3]{}, bytes[3]{}, total{0};
+        // plan S P3d census: which half writes which ring (rings: 0 record, 1 resolve; halves: 0 outside the halves, 1 resolve, 2 record), calls and bytes
+        static std::atomic<u64> calls[2][3]{}, bytes[2][3]{}, total{0};
         const u32 half = VideoCore::HalfPhase::current;
-        calls[half].fetch_add(1, std::memory_order_relaxed);
-        bytes[half].fetch_add(size, std::memory_order_relaxed);
+        calls[ring_id][half].fetch_add(1, std::memory_order_relaxed);
+        bytes[ring_id][half].fetch_add(size, std::memory_order_relaxed);
         const u64 n = total.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n >= 4096 && (n & (n - 1)) == 0) {
-            LOG_WARNING(Render_Vulkan, "stream ring census: outside the halves {} writes / {} KiB, resolve half {} / {} KiB, record half {} / {} KiB", calls[0].load(), bytes[0].load() >> 10, calls[1].load(),
-                        bytes[1].load() >> 10, calls[2].load(), bytes[2].load() >> 10);
+            LOG_WARNING(Render_Vulkan, "stream ring census (calls / KiB) record ring: outside {} / {}, resolve half {} / {}, record half {} / {} | resolve ring: outside {} / {}, resolve half {} / {}, record half {} / {}",
+                        calls[0][0].load(), bytes[0][0].load() >> 10, calls[0][1].load(), bytes[0][1].load() >> 10, calls[0][2].load(), bytes[0][2].load() >> 10, calls[1][0].load(), bytes[1][0].load() >> 10,
+                        calls[1][1].load(), bytes[1][1].load() >> 10, calls[1][2].load(), bytes[1][2].load() >> 10);
         }
     }
     if (!PrepareMap(size, alignment, allow_wait)) {

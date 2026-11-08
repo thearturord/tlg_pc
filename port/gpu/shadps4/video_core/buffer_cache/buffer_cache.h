@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "video_core/half_phase.h"
 #include <absl/container/btree_map.h>
 #include "native/native_buffer_index.h"
 #include "native/native_device.h"
@@ -71,9 +72,24 @@ public:
         return null_index_buffer.get();
     }
 
-    /// Retrieves the stream buffer.
+    /// Retrieves the stream buffer (the record side's ring: constants, tables, the indexed rows).
     [[nodiscard]] StreamBuffer& GetStreamBuffer() noexcept {
         return stream_buffer;
+    }
+    /// Plan S step P3d: the resolve side's ring. With TLG_SPLIT_BIND=1 every copy `BufferCache` makes of small guest buffers goes into this one, so the resolver never writes
+    /// the ring the record side writes; otherwise it is the same ring as before.
+    [[nodiscard]] StreamBuffer& CopyRing() noexcept {
+        return VideoCore::ResolveCommands::SplitMode() == 1 ? resolve_stream_buffer : stream_buffer;
+    }
+    [[nodiscard]] const StreamBuffer& CopyRing() const noexcept {
+        return VideoCore::ResolveCommands::SplitMode() == 1 ? resolve_stream_buffer : stream_buffer;
+    }
+    /// Either ring: host written, read by the GPU only (no GPU hazard to track).
+    [[nodiscard]] bool IsStreamBuffer(const Buffer* buffer) const noexcept {
+        return buffer == &stream_buffer || buffer == &resolve_stream_buffer;
+    }
+    [[nodiscard]] bool IsStreamHandle(vk::Buffer handle) const noexcept {
+        return handle == stream_buffer.Handle() || handle == resolve_stream_buffer.Handle();
     }
 
     /// The block granularity the shader recompiler's raw address access used (that access is off: TLG_DIRECT_MEMORY_ACCESS)
@@ -190,11 +206,11 @@ public:
     /// R1b: the object's own copy in the stream ring for [device_addr, device_addr + size) when it is current (no copy is made); null when not
     [[nodiscard]] const Buffer* ObjectCopy(const Core::NativeResources::ImmutableBuffer& object, VAddr device_addr, u64& offset) const noexcept {
         if (object.copy_offset == ~u64{0} || object.copy_generation != object.generation.load(std::memory_order_acquire) ||
-            object.copy_gpu_writes != object.gpu_writes.load(std::memory_order_acquire) || object.copy_wraps != stream_buffer.WrapCount()) {
+            object.copy_gpu_writes != object.gpu_writes.load(std::memory_order_acquire) || object.copy_wraps != CopyRing().WrapCount()) {
             return nullptr;
         }
         offset = object.copy_offset + (device_addr - object.begin);
-        return &stream_buffer;
+        return &CopyRing();
     }
     /// R1b switch (`TLG_OBJECT_COPIES=0` turns it off)
     static bool ObjectCopiesOn();
@@ -270,6 +286,7 @@ private:
     std::atomic<u64> cpu_epoch{1}; ///< bumped when a CPU change is applied or announced bytes are uploaded (the upload memo's answers are stale)
 
     StreamBuffer stream_buffer;
+    StreamBuffer resolve_stream_buffer; ///< plan S P3d: see CopyRing
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
     RangeSet gpu_modified_ranges;

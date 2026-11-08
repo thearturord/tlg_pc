@@ -163,6 +163,7 @@ struct Buffer {
 };
 
 struct StreamBuffer : public Buffer {
+    u32 ring_id{0}; ///< plan S P3d: 0 the record side's ring, 1 the resolve side's (diagnostics)
     explicit StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                           MemoryType mem_type, u64 size_bytes);
 

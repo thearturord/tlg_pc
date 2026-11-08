@@ -1371,12 +1371,11 @@ void Rasterizer::BindCensus(const Pipeline* pipeline) {
     }
     const u32 ordinal = ordinals[reinterpret_cast<u64>(pipeline)]++;
     const u64 key = reinterpret_cast<u64>(pipeline) * 0x9E3779B97F4A7C15ull ^ (u64{ordinal} * 0xC2B2AE3D27D4EB4Full);
-    const VkBuffer stream = static_cast<VkBuffer>(buffer_cache.GetStreamBuffer().Handle());
     u64 h = 0xcbf29ce484222325ull;
     bool has_stream = false;
     for (const auto& info : buffer_infos) {
         const u64 raw = reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer));
-        has_stream |= static_cast<VkBuffer>(info.buffer) == stream;
+        has_stream |= buffer_cache.IsStreamHandle(info.buffer);
         h = (h ^ raw) * 0x100000001b3ull;
         h = (h ^ info.offset) * 0x100000001b3ull;
         h = (h ^ info.range) * 0x100000001b3ull;
@@ -1527,9 +1526,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
         seen_this.insert(h);
         if (recipe_active) {
             bool uses_stream = false;
-            const VkBuffer stream_handle = static_cast<VkBuffer>(buffer_cache.GetStreamBuffer().Handle());
             for (const auto& b : buffer_infos) {
-                uses_stream |= static_cast<VkBuffer>(b.buffer) == stream_handle;
+                uses_stream |= buffer_cache.IsStreamHandle(b.buffer);
             }
             const bool same = recipe_prediction != 0 && recipe_stored_shape == h;
             if (recipe_prediction == 0) {
@@ -1550,12 +1548,12 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
                 u32 kind_index = 0;
                 for (const auto& b : buffer_infos) {
                     const VkBuffer handle = static_cast<VkBuffer>(b.buffer);
-                    const u64 kind = handle == ring_handle ? 1 : handle == stream_handle ? 2 : 3;
+                    const u64 kind = handle == ring_handle ? 1 : buffer_cache.IsStreamHandle(b.buffer) ? 2 : 3;
                     kinds |= kind << (2 * (kind_index++ & 31));
                     if (handle == ring_handle) {
                         mix2(0x52494e47ull);
                         mix2(b.range);
-                    } else if (handle == stream_handle) {
+                    } else if (buffer_cache.IsStreamHandle(b.buffer)) {
                         mix2(0x53545245ull);
                         mix2(b.range);
                     } else {
@@ -1816,7 +1814,7 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
     if (verify_slots_on) {
         verify_vertex.clear();
         for (size_t i = 0; i < host_buffers.size(); ++i) {
-            verify_vertex.push_back({host_buffers[i], host_offsets[i], host_buffers[i] == buffer_cache.GetStreamBuffer().Handle()});
+            verify_vertex.push_back({host_buffers[i], host_offsets[i], buffer_cache.IsStreamHandle(host_buffers[i])});
         }
     }
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -2055,7 +2053,7 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
     }
 
     if (verify_slots_on) {
-        verify_index = {index_buffer, buffer_offset, index_buffer_size, index_buffer == buffer_cache.GetStreamBuffer().Handle()};
+        verify_index = {index_buffer, buffer_offset, index_buffer_size, buffer_cache.IsStreamHandle(index_buffer)};
     }
     const auto cmdbuf = scheduler.CommandBuffer();
     if (instance.IsMaintenance5Supported()) {
@@ -2212,9 +2210,8 @@ void Rasterizer::ResetImageBindings() {
 
 void Rasterizer::RecordBufferAccess(bool is_compute) {
     // record side: the barrier plan learns what this draw reads and writes; the draw's own barrier flag ends here
-    const auto* stream = &buffer_cache.GetStreamBuffer();
     for (const auto [buffer, offset, size, src_access] : bound_buffers) {
-        if (buffer == stream && !(src_access & vk::AccessFlagBits2::eShaderWrite)) {
+        if (buffer_cache.IsStreamBuffer(buffer) && !(src_access & vk::AccessFlagBits2::eShaderWrite)) {
             continue; // R5: only the host writes the stream ring, so a read of it is no hazard for anything later
         }
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
@@ -2849,7 +2846,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
             const u32 slot = indexed->BufferSlot(info.buffer, info.offset, info.range);
             if (indexed->stats.buffer_new.load(std::memory_order_relaxed) != made_before) {
                 // R4 census: which buffers make new slots (0 stream ring, 1 an arena, 2 other)
-                const bool stream = info.buffer == buffer_cache.GetStreamBuffer().Handle();
+                const bool stream = buffer_cache.IsStreamHandle(info.buffer);
                 slot_census[stream ? 0 : 2].fetch_add(1, std::memory_order_relaxed);
             } else {
                 slot_census[3].fetch_add(1, std::memory_order_relaxed);
@@ -2882,7 +2879,7 @@ u32 Rasterizer::BufferSlotCounted(const vk::DescriptorBufferInfo& info) {
     const u32 slot = indexed->BufferSlot(info.buffer, info.offset, info.range);
     if (indexed->stats.buffer_new.load(std::memory_order_relaxed) != made_before) {
         // R4 census: which buffers make new slots (0 stream ring, 1 an arena, 2 other)
-        const bool stream = info.buffer == buffer_cache.GetStreamBuffer().Handle();
+        const bool stream = buffer_cache.IsStreamHandle(info.buffer);
         slot_census[stream ? 0 : 2].fetch_add(1, std::memory_order_relaxed);
     } else {
         slot_census[3].fetch_add(1, std::memory_order_relaxed);
