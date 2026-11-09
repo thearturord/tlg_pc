@@ -153,6 +153,61 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
                 }
                 out["w1_census"] = std::move(w1);
             }
+            {
+                // W1.1 (rewrite plan section 4b)
+                static constexpr const char* names[] = {"shadow_draws", "eligible_no_bad_bit", "eligible_if_front_makes_flat_constants", "eligible_if_stream_copies_allowed",
+                                                        "draws_with_image", "draws_with_written_buffer", "draws_with_buffer_by_address", "draws_with_buffer_from_stream_ring", "draws_with_buffer_upload",
+                                                        "draws_with_flat_constants_copy", "draws_with_geometry_by_address", "draws_with_geometry_from_stream_ring", "draws_with_geometry_upload",
+                                                        "draws_with_in_place_buffer",
+                                                        "only_image", "only_written_buffer", "only_buffer_by_address", "only_buffer_from_stream_ring", "only_buffer_upload", "only_flat_constants_copy",
+                                                        "only_geometry_by_address", "only_geometry_from_stream_ring", "only_geometry_upload", "only_in_place_buffer",
+                                                        "record_integers_sum", "record_integers_max",
+                                                        "row_shader_same", "row_shader_DIFFERENT_MUST_BE_0", "row_shader_learned", "row_shader_epoch_moved",
+                                                        "row_geometry_same", "row_geometry_DIFFERENT_MUST_BE_0", "row_geometry_learned", "row_geometry_epoch_moved",
+                                                        "handle_buffers_from_stream_ring", "handle_buffers_resident", "handle_buffers_resident_with_upload",
+                                                        "geometry_from_stream_ring", "geometry_resident", "geometry_resident_with_upload", "geometry_without_engine_handle",
+                                                        "nohandle_0_has_handle", "nohandle_1_no_binder_plan", "nohandle_2_not_single_load", "nohandle_3_no_record_entry", "nohandle_4_plan_has_no_handles",
+                                                        "nohandle_5_id_not_in_registry", "nohandle_6_handle_epoch_stale", "nohandle_7",
+                                                        "texel_0_has_handle", "texel_1_no_binder_plan", "texel_2_not_single_load", "texel_3_no_record_entry", "texel_4_plan_has_no_handles",
+                                                        "texel_5_id_not_in_registry", "texel_6_handle_epoch_stale", "texel_7",
+                                                        "geo_nohandle_1_no_plan", "geo_nohandle_2_plan_has_no_handles", "geo_nohandle_3_epoch_stale", "geo_nohandle_4_no_handle_holds_request",
+                                                        "eligible_draw_ns_before_bind", "eligible_draw_ns_in_bind", "eligible_draw_ns_after_bind", "eligible_draws_timed",
+                                                        "other_draw_ns_before_bind", "other_draw_ns_in_bind", "other_draw_ns_after_bind", "other_draws_timed",
+                                                        "draws_with_image_work", "only_image_work_or_image", "eligible_images_allowed_no_image_work", "eligible_images_and_image_work_allowed",
+                                                        "shape_new_in_pass", "shape_same_as_previous_draw", "shape_seen_earlier_in_pass", "sum_distinct_shapes_per_pass",
+                                                        "x77", "x78", "x79",
+                                                        "row_compute_read_same", "row_compute_read_DIFFERENT_MUST_BE_0", "row_compute_read_learned", "row_compute_read_epoch_moved",
+                                                        "row_compute_written_same", "row_compute_written_DIFFERENT_MUST_BE_0", "row_compute_written_learned", "row_compute_written_epoch_moved",
+                                                        "stamp_graphics_read_0_good_valid_no_work_same", "stamp_graphics_read_1_VALID_BUT_WORK_MUST_BE_0", "stamp_graphics_read_2_valid_but_moved", "stamp_graphics_read_3_missed_not_predicted_no_work", "stamp_graphics_read_4_not_predicted_work", "stamp_graphics_read_5_no_row", "stamp_graphics_read_6_dirty", "stamp_graphics_read_7_epoch_moved",
+                                                        "stamp_graphics_written_0_good_valid_no_work_same", "stamp_graphics_written_1_VALID_BUT_WORK_MUST_BE_0", "stamp_graphics_written_2_valid_but_moved", "stamp_graphics_written_3_missed_not_predicted_no_work", "stamp_graphics_written_4_not_predicted_work", "stamp_graphics_written_5_no_row", "stamp_graphics_written_6_dirty", "stamp_graphics_written_7_epoch_moved",
+                                                        "stamp_compute_read_0_good_valid_no_work_same", "stamp_compute_read_1_VALID_BUT_WORK_MUST_BE_0", "stamp_compute_read_2_valid_but_moved", "stamp_compute_read_3_missed_not_predicted_no_work", "stamp_compute_read_4_not_predicted_work", "stamp_compute_read_5_no_row", "stamp_compute_read_6_dirty", "stamp_compute_read_7_epoch_moved",
+                                                        "stamp_compute_written_0_good_valid_no_work_same", "stamp_compute_written_1_VALID_BUT_WORK_MUST_BE_0", "stamp_compute_written_2_valid_but_moved", "stamp_compute_written_3_missed_not_predicted_no_work", "stamp_compute_written_4_not_predicted_work", "stamp_compute_written_5_no_row", "stamp_compute_written_6_dirty", "stamp_compute_written_7_epoch_moved",
+                                                        "stampwork_graphics_read_of_1_stream_choice_only", "stampwork_graphics_written_of_1_stream_choice_only", "stampwork_compute_read_of_1_stream_choice_only", "stampwork_compute_written_of_1_stream_choice_only",
+                                                        "x124", "x125", "x126", "x127",
+                                                        "rows_served", "rows_served_and_verified_by_the_old_path", "rows_verify_DIFFERENT_ANSWER_MUST_BE_0", "rows_verify_OLD_PATH_DID_WORK_MUST_BE_0", "rows_learned",
+                                                        "rows_not_learned_texel_over_image_or_gpu_written", "rows_not_served_no_row", "rows_not_served_stale",
+                                                        "rows_differ_no_handle", "rows_differ_handle_usage1", "rows_differ_handle_other_usage", "rows_differ_old_answer_in_stream_ring"};
+                nlohmann::json w1s = nlohmann::json::object();
+                for (u32 i = 0; i < std::size(names); ++i) {
+                    w1s[names[i]] = w1s_counts[i].load();
+                }
+                out["w1_shadow"] = std::move(w1s);
+            }
+            {
+                static constexpr const char* names[] = {"dispatches", "total_ns", "ns_before_bind", "ns_in_bind", "ns_after_bind", "sync_ns", "uploaded_bytes", "b_ring", "b_special", "b_null", "b_engine_handle",
+                                                        "b_address_read", "b_address_written", "b_resolved_by_front", "images", "written_buffers", "stream_ring_answers", "requests_that_uploaded", "with_barrier", "groups",
+                                                        "why0_has_handle", "why1_no_binder_plan", "why2_not_single_load", "why3_no_record_entry", "why4_plan_has_no_handles", "why5_id_not_in_registry", "why6_epoch_stale", "why7",
+                                                        "written_without_record_id", "written_with_record_id"};
+                nlohmann::json rows = nlohmann::json::array();
+                for (const auto& [program, v] : W3Rows()) {
+                    nlohmann::json row = {{"program", fmt::format("{:#x}", program)}};
+                    for (u32 i = 0; i < std::size(names); ++i) {
+                        row[names[i]] = v[i];
+                    }
+                    rows.push_back(std::move(row));
+                }
+                out["w3_dispatch"] = std::move(rows);
+            }
             nlohmann::json sk = nlohmann::json::array();
             for (u32 s = 0; s < 32; ++s) {
                 if (const u64 n = cover_skip_n[s].load(); n != 0) {

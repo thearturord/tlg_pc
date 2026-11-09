@@ -303,6 +303,10 @@ private:
     std::map<u64, std::pair<u64, std::string>> dropped_with_gpu_bytes;
     /// B9.1: the bytes of each engine buffer (by its id) the engine announced since their last upload
     std::unordered_map<u64, RangeSet> object_dirty;
+  public:
+    /// W3.1 shadow: does engine buffer `id` hold announced bytes in [addr, addr + size) that no upload took yet, or are there bytes no engine buffer holds there
+    [[nodiscard]] bool ObjectRangeDirty(u64 id, VAddr addr, u64 size);
+  private:
     RangeSet all_object_dirty; ///< B9.1 audit: the same bytes of all buffers by address
     /// B9.4: the Vulkan buffer of [address, address + size): a placed engine buffer's own when the range is inside one (placing it at its first use), else the arena
     /// (resident). `demote_spanning`: a range over a placed buffer's edge moves that buffer back into the arena first; false: such a range gets nullptr

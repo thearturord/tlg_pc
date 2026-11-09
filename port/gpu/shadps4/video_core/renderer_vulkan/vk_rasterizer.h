@@ -362,6 +362,19 @@ private:
     /// W1.0 census (`TLG_W1_CENSUS=1` together with `TLG_COVER_CENSUS=1`; rewrite plan section 4): z prepass / shadow draws grouped into passes (the depth target changes or the class changes).
     /// Cumulative counters, published as `consumer_census.w1_census`.
     std::array<std::atomic<u64>, 64> w1_counts{};
+    /// W1.1 shadow (`TLG_W1_CENSUS=1` with `TLG_COVER_CENSUS=1`; rewrite plan section 4b): per shadow draw, whether every buffer it bound was a lookup (ring window, resident arena
+    /// buffer) or needed work (image, written buffer, address lookup, stream copy, upload), and whether an id-keyed row (engine id -> buffer, base, placement epoch) predicts the
+    /// answer of the old path. Published as `consumer_census.w1_shadow`.
+    std::array<std::atomic<u64>, 192> w1s_counts{};
+    void W1ShadowRow(u64 id, VAddr address, const void* buffer, u64 offset, u32 base) noexcept;
+    void W1ShadowBinding(const Core::NativeResources::ImmutableBuffer* hint, u64 record_id, VAddr address, const void* buffer, u64 offset, bool written, u32 why, bool formatted) noexcept;
+    void W1ShadowGeometry(const Core::NativeResources::ImmutableBuffer* hint, VAddr address, const void* buffer, u64 offset, bool vertex) noexcept;
+    /// W3.0 dispatch census (`TLG_COVER_CENSUS=1`): per compute program the sums in `W3Stat::v` (published as `consumer_census.w3_dispatch`)
+    [[nodiscard]] std::vector<std::pair<u64, std::array<u64, 32>>> W3Rows() const;
+    [[nodiscard]] bool RowsServe(u64 id, VAddr address, u64 size, bool texel, const VideoCore::Buffer*& buffer, u64& offset) noexcept;
+    void RowsLearn(u64 id, VAddr address, u64 size, bool texel, const VideoCore::Buffer* buffer, u64 offset, u64 epoch_pre, u64 clock_pre, bool gpu_pre) noexcept;
+    void W31Before(u64 id, VAddr address, u64 size) noexcept;
+    void W31After(const void* buffer, u64 offset, VAddr address, bool compute, bool written) noexcept;
     void W1NoteBinding(const Pipeline* pipeline) noexcept;
     void W1EndDraw() noexcept;
     void NoteCover(u32 index) noexcept;

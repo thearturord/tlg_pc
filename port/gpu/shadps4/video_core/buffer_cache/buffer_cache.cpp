@@ -1164,6 +1164,12 @@ bool BufferCache::NativeCpuQuery(VAddr addr, size_t size) {
     return answer;
 }
 
+bool BufferCache::ObjectRangeDirty(u64 id, VAddr addr, u64 size) {
+    std::scoped_lock lock{object_dirty_mutex};
+    const auto it = object_dirty.find(id);
+    return (it != object_dirty.end() && it->second.Intersects(addr, size)) || b9_unattributed.Intersects(addr, size);
+}
+
 bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
     if (Core::NativeUpdates::B9TrackerOff()) {
         // B9.3 step 2: the tracker is not kept for engine buffers: a range over several of them is answered by theirs, the bytes between them by the tracker

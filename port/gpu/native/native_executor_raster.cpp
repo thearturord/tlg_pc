@@ -483,7 +483,9 @@ void NativeExecutor::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan*
         return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u;
     }();
     const bool is_draw_call = c.kind == RasterCall::Kind::Draw || c.kind == RasterCall::Kind::DrawIndirect;
-    const bool skipped = (is_draw_call && (skip_mode & 1u) != 0) || (!is_draw_call && (skip_mode & 2u) != 0);
+    // bit 2 (value 4): skips only the draws of class 0 (z prepass / shadow), bit 3 (value 8): only class 1 (g-buffer): the ceiling of one draw class (W1 falsifier, rewrite plan section 3)
+    const u32 skip_class = c.tag.valid ? (c.tag.meta & 0xffu) : 15u;
+    const bool skipped = (is_draw_call && ((skip_mode & 1u) != 0 || ((skip_mode & 4u) != 0 && skip_class == 0) || ((skip_mode & 8u) != 0 && skip_class == 1))) || (!is_draw_call && (skip_mode & 2u) != 0);
     if (!skipped) switch (c.kind) {
     case RasterCall::Kind::Draw:
         rasterizer->SetNativeTag(c.tag);

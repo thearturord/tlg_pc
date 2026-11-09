@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <unordered_map>
 #include <unordered_set>
 #include <atomic>
 #include <thread>
@@ -62,6 +63,7 @@
 
 namespace {
 thread_local u32 t_cover_class = 15; // R-slice census: the draw class of the draw being timed
+thread_local u64 t_w1_draw_begin = 0, t_w1_bind_begin = 0, t_w1_bind_end = 0; // W1.2 census: the clock at the start of Draw(), of BindResources and at its end (ns)
 
 /// W1.0: what one draw bound, as the raster thread sees it; filled while the draw is built, consumed at the end of Draw()
 struct W1Capture {
@@ -77,13 +79,78 @@ struct W1Capture {
     u32 images{};
     std::vector<u64> ring;       ///< constant ring windows (offset, range)
     std::vector<u64> other;      ///< every other shader buffer (handle, offset, range)
+    u32 bad{};                   ///< W1.1: what this draw needed besides lookups (W1Bad bits)
+    u64 shape{};                 ///< W1.2a: everything the draw bound except the ring offsets and the index range (what a replay of an earlier draw's bind could reuse)
     bool valid{false};
 };
 thread_local W1Capture t_w1;
+/// W1.1: why a shadow draw is not a pure lookup draw (a bit per reason; a draw is eligible when none is set)
+enum W1Bad : u32 {
+    W1BadImage = 1u << 0,      ///< an image is bound (W2 takes it)
+    W1BadWritten = 1u << 1,    ///< a shader buffer the draw writes
+    W1BadAddress = 1u << 2,    ///< a shader buffer found by address (no engine handle)
+    W1BadStream = 1u << 3,     ///< a shader buffer answered from the stream copy ring
+    W1BadWork = 1u << 4,       ///< a shader buffer request uploaded bytes
+    W1BadFlat = 1u << 5,       ///< flat user data / clip planes copy (the front would produce them into the ring)
+    W1BadGeoAddress = 1u << 6, ///< vertex or index buffer found by address
+    W1BadGeoStream = 1u << 7,  ///< vertex or index buffer answered from the stream copy ring
+    W1BadGeoWork = 1u << 8,    ///< vertex or index request uploaded bytes
+    W1BadInPlace = 1u << 9,    ///< bound in place from the imported guest memory window (a lookup by address)
+    W1BadImageWork = 1u << 10, ///< an image binding searched (FindImage), was a storage image or needed a layout transition
+};
+struct W1Row {
+    const void* buffer{};
+    u64 base{}; ///< guest address of byte 0 of the buffer
+    u64 epoch{};
+};
+thread_local std::unordered_map<u64, W1Row> t_w1_rows; ///< W1.1 shadow table: engine id -> where the old path put it
+/// W3.1: what the stamps of the id table say before the old path answers a buffer request
+struct W31Pre {
+    bool have_row{false}, epoch_ok{false}, dirty{false}, predicted{false};
+    const void* row_buffer{};
+    u64 row_base{};
+    u64 commands{};
+};
+thread_local W31Pre t_w31;
+/// W3.2 (`TLG_NATIVE_ROWS=1`): the answer the old path gave for a read-only request of one engine buffer, kept per (id, address, size). Valid while the placement epoch is the same, no identity
+/// event (placement, drop, GPU written state, image registered) touched the range since the clock stored, and the engine buffer holds no announced bytes in the range.
+struct RealRow {
+    u64 id{}, address{}, size{};
+    bool texel{};
+    const void* buffer{};
+    u64 offset{}, epoch{}, clock{};
+    bool gpu{}; ///< the range was GPU written when the answer was made (the old path chooses the stream ring for small ranges that are not)
+};
+thread_local std::unordered_map<u64, RealRow> t_rows_real;
+thread_local bool t_row_gpu = false, t_row_dirty_epoch = false; // (diagnostics of the last served row)
+inline u64 RowKey(u64 id, u64 address, u64 size, bool texel) noexcept {
+    u64 h = 0xcbf29ce484222325ull;
+    for (const u64 v : {id, address, size, static_cast<u64>(texel)}) {
+        h = (h ^ v) * 0x100000001b3ull;
+        h ^= h >> 29;
+    }
+    return h;
+}
+
+/// W3.0 (dispatch census, `TLG_COVER_CENSUS=1`): what one dispatch bound and where its time went; summed per compute program in `g_w3`
+struct W3Cur {
+    u64 bind_ns{}, sync_ns{}, upload{};
+    u32 kinds[8]{}; ///< bindings by kind: 1 ring, 2 special, 3 null, 4 engine handle, 5 address read, 6 address written, 7 resolved by the front
+    u32 images{}, written{}, stream{}, with_upload{};
+    u32 why[8]{};       ///< shader buffers by why they have no engine handle (the W1 reasons: 0 has a handle, 1 no binder plan, 2 not a single load, 3 no record entry, 4 plan has no handles, 5 id not in the registry, 6 epoch stale)
+    u32 written_id[2]{}; ///< written buffers: [0] without an engine id in the record, [1] with one
+};
+thread_local W3Cur t_w3;
+struct W3Stat {
+    u64 v[32]{}; ///< 0 dispatches, 1 total ns, 2 ns before the bind, 3 ns in the bind, 4 ns after the bind, 5 sync ns, 6 uploaded bytes, 7..13 bindings by kind 1..7, 14 images, 15 written buffers, 16 stream-ring answers, 17 requests that uploaded, 18 barriers, 19 groups
+};
+std::mutex g_w3_mutex;
+std::unordered_map<u64, W3Stat> g_w3;
 struct W1Pass {
     u64 depth{~0ull};
     u64 draws{0};
-    std::unordered_set<u64> pipelines, geometry, other, ring, state, index_handles, other_handles;
+    std::unordered_set<u64> pipelines, geometry, other, ring, state, index_handles, other_handles, shapes;
+    u64 prev_shape{};
     bool have_prev{false};
     u64 prev_pipeline{}, prev_geometry{}, prev_other{}, prev_push{}, prev_state{}, prev_vertex{}, prev_index{};
     u64 pairs{0}, same_pipeline{0}, same_geometry{0}, same_other{0}, same_push{0}, same_state{0}, same_vertex{0}, same_index{0};
@@ -850,6 +917,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
             if (self->cover_on) [[unlikely]] {
                 t_cover_class = 15;
                 begin = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+                t_w1_draw_begin = begin;
+                t_w1_bind_begin = t_w1_bind_end = 0;
             }
         }
         ~CoverDrawScope() {
@@ -1248,6 +1317,50 @@ void Rasterizer::SetExplicitImageReadback(bool on) {
 }
 
 void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
+    struct W3Scope {
+        Rasterizer* self;
+        u64 begin{0};
+        u64 program{0};
+        u64 groups{0};
+        bool barrier{false};
+        explicit W3Scope(Rasterizer* r) noexcept : self(r) {
+            if (self->cover_on) [[unlikely]] {
+                begin = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+                t_w3 = W3Cur{};
+                t_w1_bind_begin = t_w1_bind_end = 0;
+            }
+        }
+        ~W3Scope() {
+            if (begin == 0 || t_w1_bind_begin == 0) [[likely]] {
+                return; // census off, or the dispatch never reached the bind (cleared, HLE, no pipeline)
+            }
+            const u64 end = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+            std::scoped_lock lock{g_w3_mutex};
+            auto& st = g_w3[program];
+            auto& v = st.v;
+            v[0] += 1;
+            v[1] += end - begin;
+            v[2] += t_w1_bind_begin - begin;
+            v[3] += t_w1_bind_end - t_w1_bind_begin;
+            v[4] += end - t_w1_bind_end;
+            v[5] += t_w3.sync_ns;
+            v[6] += t_w3.upload;
+            for (u32 k = 1; k <= 7; ++k) {
+                v[6 + k] += t_w3.kinds[k];
+            }
+            v[14] += t_w3.images;
+            v[15] += t_w3.written;
+            v[16] += t_w3.stream;
+            v[17] += t_w3.with_upload;
+            v[18] += barrier ? 1 : 0;
+            v[19] += groups;
+            for (u32 k = 0; k < 8; ++k) {
+                v[20 + k] += t_w3.why[k];
+            }
+            v[28] += t_w3.written_id[0];
+            v[29] += t_w3.written_id[1];
+        }
+    } w3_scope{this};
     Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseDispatch, engine_clear_on);
     if (SkipForEngineClear() && plan != nullptr) {
         const bool own = IsEngineClearOwnWork(plan->native_seq);
@@ -1280,6 +1393,8 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     current_cs = plan ? &plan->cs : &no_program;
     current_bc_base = plan ? &plan->ta_bc_base : &no_border_colors;
     const auto& cs_program = *current_cs;
+    w3_scope.program = cs_program.address;
+    w3_scope.groups = static_cast<u64>(cs_program.dim_x) * cs_program.dim_y * cs_program.dim_z;
     BarrierCensus::SetOp(cs_program.address);
     // G2 (TLG_SIM_INDEPENDENT): the SimParticle dispatches are one independent group (Phase 0b)
     bool group_in_use = false;
@@ -1350,6 +1465,7 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
         Core::LightRecorder::Begin(Core::DebugServer::PresentCount(), Core::NativeDraw::RecordCallerGhidra(plan->native_seq), cs_program.address);
     }
     const bool dispatch_bound = BindResources(pipeline);
+    w3_scope.barrier = needs_barrier;
     if (light_recorded) {
         Core::LightRecorder::End();
     }
@@ -1803,6 +1919,231 @@ enum W1Count : u32 {
     W1Indices, W1Instances, W1PassesOne, W1DrawsInPassesOver50, W1SumIndexHandles, W1SumOtherHandles,
 };
 
+/// W1.1 counters in `w1s_counts`: 0 shadow draws, 1 eligible (no bad bit), 2 eligible when the front produces the flat constants, 3 eligible when stream copies are allowed too,
+/// 4..13 draws with bad bit n, 14..23 draws whose only bad bit is n, 24 sum of integers in the draw record, 25 largest record, 26..29 shader buffer rows (same, DIFFERENT, learned,
+/// epoch moved), 30..33 geometry rows (same, DIFFERENT, learned, epoch moved), 34 handle shader buffers answered from the stream ring, 35 from a resident buffer, 36 resident
+/// with uploaded bytes, 37 geometry from the stream ring, 38 geometry resident, 39 geometry with uploaded bytes, 40 geometry without an engine handle.
+void Rasterizer::W1ShadowRow(u64 id, VAddr address, const void* buffer, u64 offset, u32 base) noexcept {
+    // slots base..base+3: same, DIFFERENT, learned, epoch moved (graphics shader buffers 26, geometry 30, compute read 80, compute written 84); id 0: no engine id, nothing to key
+    if (id == 0) {
+        return;
+    }
+    auto& s = w1s_counts;
+    const u64 epoch = buffer_cache.PlacementEpoch();
+    const auto it = t_w1_rows.find(id);
+    if (it == t_w1_rows.end()) {
+        t_w1_rows.emplace(id, W1Row{buffer, address - offset, epoch});
+        s[base + 2].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    W1Row& r = it->second;
+    if (r.epoch != epoch) {
+        r = W1Row{buffer, address - offset, epoch};
+        s[base + 3].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const bool same = r.buffer == buffer && address >= r.base && address - r.base == offset;
+    s[base + (same ? 0u : 1u)].fetch_add(1, std::memory_order_relaxed);
+    if (!same) {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1) < 8) {
+            LOG_ERROR(Render_Vulkan, "W1 shadow row differs: id {:#x} slot {} address {:#x}: row {:p} base {:#x}, answer {:p} offset {:#x}", id, base, address, r.buffer, r.base, buffer, offset);
+        }
+        r = W1Row{buffer, address - offset, epoch}; // follow the old path so one difference is counted once
+    }
+}
+
+void Rasterizer::W1ShadowBinding(const Core::NativeResources::ImmutableBuffer* hint, u64 record_id, VAddr address, const void* buffer, u64 offset, bool written, u32 why, bool formatted) noexcept {
+    auto& c = t_w1;
+    auto& s = w1s_counts;
+    // W1.2 question: why has this binding no engine handle? 41..48 by reason (0 has a handle, 1 no binder plan, 2 not a single load, 3 no record entry, 4 plan has no handles, 5 id not in the
+    // registry, 6 handle epoch stale), 49..56 the same for formatted (texel) buffers
+    s[41 + (why & 7)].fetch_add(1, std::memory_order_relaxed);
+    if (formatted) {
+        s[49 + (why & 7)].fetch_add(1, std::memory_order_relaxed);
+    }
+    const bool stream = buffer_cache.IsStreamBuffer(static_cast<const VideoCore::Buffer*>(buffer));
+    const bool work = VideoCore::BufferCache::UploadBytes() != 0;
+    if (written) {
+        c.bad |= W1BadWritten;
+    }
+    if (hint == nullptr) {
+        c.bad |= W1BadAddress;
+    }
+    if (stream) {
+        c.bad |= W1BadStream;
+    }
+    if (work) {
+        c.bad |= W1BadWork;
+    }
+    if (hint != nullptr) {
+        s[stream ? 34 : 35].fetch_add(1, std::memory_order_relaxed);
+        if (!stream && work) {
+            s[36].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (!stream && !written) {
+        W1ShadowRow(hint != nullptr ? hint->id : record_id, address, buffer, offset, 26);
+    }
+}
+
+void Rasterizer::W1ShadowGeometry(const Core::NativeResources::ImmutableBuffer* hint, VAddr address, const void* buffer, u64 offset, bool /*vertex*/) noexcept {
+    auto& c = t_w1;
+    auto& s = w1s_counts;
+    const bool stream = buffer_cache.IsStreamBuffer(static_cast<const VideoCore::Buffer*>(buffer));
+    const bool work = VideoCore::BufferCache::UploadBytes() != 0;
+    if (hint == nullptr) {
+        c.bad |= W1BadGeoAddress;
+        s[40].fetch_add(1, std::memory_order_relaxed);
+        // 57 no geometry plan, 58 plan has no handles, 59 handle epoch stale, 60 no handle holds the request
+        const u32 reason = geometry_plan == nullptr ? 57u : !geometry_plan->has_geometry_handles ? 58u : geometry_plan->handle_epoch != Core::NativeResources::ImmutableEpoch() ? 59u : 60u;
+        s[reason].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (stream) {
+        c.bad |= W1BadGeoStream;
+        s[37].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        s[38].fetch_add(1, std::memory_order_relaxed);
+        if (work) {
+            s[39].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (work) {
+        c.bad |= W1BadGeoWork;
+    }
+    if (!stream) {
+        W1ShadowRow(hint != nullptr ? hint->id : 0, address, buffer, offset, 30);
+    }
+}
+
+/// W3.2 counters in `w1s_counts`: 128 requests served from a row, 129 of them also run by the old path (1 in 64), 130 verified answers that differ (MUST_BE_0), 131 verified requests where the old
+/// path did work although the row was valid (MUST_BE_0), 132 rows learned, 133 not learned (texel buffer over an image or image metadata), 134 no row, 135 row stale (epoch, identity event, dirty bytes)
+bool Rasterizer::RowsServe(u64 id, VAddr address, u64 size, bool texel, const VideoCore::Buffer*& buffer, u64& offset) noexcept {
+    if (id == 0) {
+        return false;
+    }
+    auto& s = w1s_counts;
+    const auto it = t_rows_real.find(RowKey(id, address, size, texel));
+    if (it == t_rows_real.end() || it->second.id != id || it->second.address != address || it->second.size != size || it->second.texel != texel) {
+        s[134].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    RealRow& r = it->second;
+    // (ChangedSince walks the identity events after the stored clock: the clock moves up to the one read before each successful check, so the walk covers only what is new)
+    const u64 clock_now = Core::NativeIdentity::Clock();
+    if (r.epoch != buffer_cache.PlacementEpoch() || Core::NativeIdentity::ChangedSince(r.clock, address, address + size) != Core::NativeIdentity::Change::None ||
+        buffer_cache.ObjectRangeDirty(id, address, size) || buffer_cache.IsRangeGpuWritten(address, size) != r.gpu) {
+        s[135].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    r.clock = clock_now;
+    buffer = static_cast<const VideoCore::Buffer*>(r.buffer);
+    offset = r.offset;
+    t_row_gpu = r.gpu;
+    return true;
+}
+
+void Rasterizer::RowsLearn(u64 id, VAddr address, u64 size, bool texel, const VideoCore::Buffer* buffer, u64 offset, u64 epoch_pre, u64 clock_pre, bool gpu_pre) noexcept {
+    if (id == 0 || buffer == nullptr || buffer_cache.IsStreamBuffer(buffer)) {
+        return;
+    }
+    if (texel && (texture_cache.AnyImageOverlaps(address, size) || texture_cache.IsMeta(address))) {
+        w1s_counts[133].fetch_add(1, std::memory_order_relaxed); // a texel buffer over an image: its bytes change with the image, no stamp covers that
+        return;
+    }
+    const bool gpu = buffer_cache.IsRangeGpuWritten(address, size);
+    if (gpu != gpu_pre) {
+        w1s_counts[133].fetch_add(1, std::memory_order_relaxed); // the GPU written state changed while the old path answered (a download completed): the answer says nothing about either state
+        return;
+    }
+    if (texel && size <= 16384 && !gpu) {
+        // (diagnostics) a small texel buffer that is not GPU written is a stream-ring copy for the old path; an answer from a buffer is unexpected
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1) < 10) {
+            LOG_ERROR(Render_Vulkan, "W3.2 learned a small non-GPU-written texel row: id {:#x} address {:#x}+{:#x}: buffer {:p}+{:#x} stream {} gpu pre {} now {}", id, address, size, static_cast<const void*>(buffer), offset,
+                      buffer_cache.IsStreamBuffer(buffer), gpu_pre, buffer_cache.IsRangeGpuWritten(address, size));
+        }
+    }
+    if (t_rows_real.size() > 400000) {
+        t_rows_real.clear();
+    }
+    t_rows_real[RowKey(id, address, size, texel)] = RealRow{id, address, size, texel, buffer, offset, epoch_pre, clock_pre, gpu};
+    w1s_counts[132].fetch_add(1, std::memory_order_relaxed);
+}
+
+/// W3.1 counters in `w1s_counts`, 88 + 16 * (compute ? 1 : 0) + 8 * (written ? 1 : 0) + n: 0 predicted valid, no work, same answer (good), 1 predicted valid but the old path did work (MUST_BE_0),
+/// 2 predicted valid but the answer moved to another buffer or offset (needs the per-id version at placement), 3 not predicted, no work (the missed share), 4 not predicted, work (expected),
+/// 5 no row yet, 6 not predicted because the id holds dirty bytes, 7 not predicted because the placement epoch moved
+void Rasterizer::W31Before(u64 id, VAddr address, u64 size) noexcept {
+    auto& p = t_w31;
+    p = W31Pre{};
+    const auto* list = scheduler.CommandBuffer().List();
+    p.commands = list != nullptr ? list->Size() : 0;
+    if (id == 0) {
+        return;
+    }
+    const auto it = t_w1_rows.find(id);
+    if (it == t_w1_rows.end()) {
+        return;
+    }
+    p.have_row = true;
+    p.row_buffer = it->second.buffer;
+    p.row_base = it->second.base;
+    p.epoch_ok = it->second.epoch == buffer_cache.PlacementEpoch();
+    p.dirty = buffer_cache.ObjectRangeDirty(id, address, size);
+    p.predicted = p.epoch_ok && !p.dirty;
+}
+
+void Rasterizer::W31After(const void* buffer, u64 offset, VAddr address, bool compute, bool written) noexcept {
+    const auto& p = t_w31;
+    auto& s = w1s_counts;
+    const u32 base = 88u + (compute ? 16u : 0u) + (written ? 8u : 0u);
+    const auto* list = scheduler.CommandBuffer().List();
+    const u64 commands_after = list != nullptr ? list->Size() : 0;
+    const bool stream = buffer_cache.IsStreamBuffer(static_cast<const VideoCore::Buffer*>(buffer));
+    const bool work = VideoCore::BufferCache::UploadBytes() != 0 || commands_after != p.commands || stream;
+    const bool same = p.have_row && p.row_buffer == buffer && address >= p.row_base && address - p.row_base == offset;
+    if (!p.have_row) {
+        s[base + 5].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (p.have_row && !p.epoch_ok) {
+        s[base + 7].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (p.have_row && p.dirty) {
+        s[base + 6].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (p.predicted) {
+        if (work) {
+            s[base + 1].fetch_add(1, std::memory_order_relaxed);
+            if (stream && VideoCore::BufferCache::UploadBytes() == 0 && commands_after == p.commands) {
+                s[120 + (compute ? 2u : 0u) + (written ? 1u : 0u)].fetch_add(1, std::memory_order_relaxed); // the old path chose a stream-ring copy (a path choice, no upload, no command)
+            }
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1) < 10) {
+                LOG_ERROR(Render_Vulkan, "W3.1 predicted valid but the old path did work: address {:#x} uploaded {} bytes, {} commands, stream {}, compute {} written {}", address,
+                          VideoCore::BufferCache::UploadBytes(), commands_after - p.commands, stream, compute, written);
+            }
+        } else if (!same) {
+            s[base + 2].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            s[base + 0].fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        s[base + (work ? 4u : 3u)].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+std::vector<std::pair<u64, std::array<u64, 32>>> Rasterizer::W3Rows() const {
+    std::vector<std::pair<u64, std::array<u64, 32>>> out;
+    std::scoped_lock lock{g_w3_mutex};
+    for (const auto& [program, st] : g_w3) {
+        std::array<u64, 32> a{};
+        std::copy(std::begin(st.v), std::end(st.v), a.begin());
+        out.emplace_back(program, a);
+    }
+    return out;
+}
+
 void Rasterizer::W1NoteBinding(const Pipeline* pipeline) noexcept {
     // called from FinishBindResources for every draw: the shader bindings of this draw
     auto& c = t_w1;
@@ -1820,7 +2161,29 @@ void Rasterizer::W1NoteBinding(const Pipeline* pipeline) noexcept {
         }
     }
     c.images = static_cast<u32>(image_infos.size());
-    c.push = W1Mix(W1Mix(W1Mix(std::bit_cast<u32>(push_data.xoffset), std::bit_cast<u32>(push_data.yoffset)), std::bit_cast<u32>(push_data.xscale)), std::bit_cast<u32>(push_data.yscale));
+    if (c.images != 0) {
+        c.bad |= W1BadImage;
+    }
+    c.push =W1Mix(W1Mix(W1Mix(std::bit_cast<u32>(push_data.xoffset), std::bit_cast<u32>(push_data.yoffset)), std::bit_cast<u32>(push_data.xscale)), std::bit_cast<u32>(push_data.yscale));
+    {
+        u64 h = W1Mix(0x5348415045ull, c.pipeline);
+        for (const auto& b : buffer_infos) {
+            if (static_cast<VkBuffer>(b.buffer) == ring_handle) {
+                h = W1Mix(W1Mix(h, 0x52494e47ull), b.range); // a ring window: the size matters, the offset is a parameter
+            } else {
+                h = W1Mix(W1Mix(W1Mix(h, reinterpret_cast<u64>(static_cast<VkBuffer>(b.buffer))), b.offset), b.range);
+            }
+        }
+        for (const auto& i : image_infos) {
+            h = W1Mix(W1Mix(W1Mix(h, reinterpret_cast<u64>(static_cast<VkImageView>(i.imageView))), reinterpret_cast<u64>(static_cast<VkSampler>(i.sampler))), static_cast<u64>(i.imageLayout));
+        }
+        h = W1Mix(h, c.push);
+        for (const u8 o : push_data.buf_offsets) {
+            h = W1Mix(h, o);
+        }
+        h = W1Mix(W1Mix(h, push_data.motion_param), push_data.scene_size);
+        c.shape = h;
+    }
     c.valid = true;
 }
 
@@ -1863,6 +2226,8 @@ void Rasterizer::W1EndDraw() noexcept {
         }
         n[W1SumIndexHandles].fetch_add(p.index_handles.size(), std::memory_order_relaxed);
         n[W1SumOtherHandles].fetch_add(p.other_handles.size(), std::memory_order_relaxed);
+        w1s_counts[76].fetch_add(p.shapes.size(), std::memory_order_relaxed);
+        p.shapes.clear();
         p.index_handles.clear();
         p.other_handles.clear();
         p.pipelines.clear();
@@ -1877,7 +2242,59 @@ void Rasterizer::W1EndDraw() noexcept {
         flush_pass(); // the class changed: the pass ended
         p.depth = ~0ull;
         c.valid = false;
+        c.bad = 0;
         return;
+    }
+    {
+        // W1.1: this shadow draw's verdict and the size of the integer record it would need
+        auto& s = w1s_counts;
+        const u32 bad = c.bad;
+        s[0].fetch_add(1, std::memory_order_relaxed);
+        if (bad == 0) {
+            s[1].fetch_add(1, std::memory_order_relaxed);
+        }
+        if ((bad & ~W1BadFlat) == 0) {
+            s[2].fetch_add(1, std::memory_order_relaxed);
+        }
+        if ((bad & ~(W1BadFlat | W1BadStream | W1BadGeoStream)) == 0) {
+            s[3].fetch_add(1, std::memory_order_relaxed);
+        }
+        for (u32 bit = 0; bit < 10; ++bit) {
+            if ((bad >> bit & 1u) != 0) {
+                s[4 + bit].fetch_add(1, std::memory_order_relaxed);
+            }
+            if (bad == (1u << bit)) {
+                s[14 + bit].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if ((bad & W1BadImageWork) != 0) {
+            s[69].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (bad == W1BadImageWork || bad == (W1BadImageWork | W1BadImage)) {
+            s[70].fetch_add(1, std::memory_order_relaxed);
+        }
+        if ((bad & ~W1BadImage) == 0) {
+            s[71].fetch_add(1, std::memory_order_relaxed); // images allowed, no image work: pure lookups
+        }
+        if ((bad & ~(W1BadImage | W1BadImageWork)) == 0) {
+            s[72].fetch_add(1, std::memory_order_relaxed); // images allowed, image work allowed too
+        }
+        if (t_w1_bind_begin != 0 && t_w1_draw_begin != 0) {
+            // where the time of a shadow draw goes: before BindResources, in it, after it (to the end of Draw())
+            const u64 end = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+            const u32 base = (bad & ~(W1BadFlat | W1BadStream | W1BadGeoStream | W1BadImage | W1BadImageWork)) == 0 ? 61u : 65u;
+            s[base + 0].fetch_add(t_w1_bind_begin - t_w1_draw_begin, std::memory_order_relaxed);
+            s[base + 1].fetch_add(t_w1_bind_end - t_w1_bind_begin, std::memory_order_relaxed);
+            s[base + 2].fetch_add(end - t_w1_bind_end, std::memory_order_relaxed);
+            s[base + 3].fetch_add(1, std::memory_order_relaxed);
+        }
+        // record: pipeline id, index (buffer id, offset, first index, count), push constants (4), per ring window an offset, per other buffer an id and an offset
+        const u64 ints = 1 + 4 + 4 + c.ring.size() + 2 * c.other.size();
+        s[24].fetch_add(ints, std::memory_order_relaxed);
+        u64 old = s[25].load(std::memory_order_relaxed);
+        while (ints > old && !s[25].compare_exchange_weak(old, ints, std::memory_order_relaxed)) {
+        }
+        c.bad = 0;
     }
     if (p.depth != c.depth) {
         flush_pass();
@@ -1889,6 +2306,20 @@ void Rasterizer::W1EndDraw() noexcept {
         other_set = W1Mix(other_set, v);
     }
     ++p.draws;
+    {
+        // W1.2a: could a replay of an earlier draw's bind of this pass serve this draw? shape = all but the ring offsets and the index range, plus the index buffer and the vertex buffers
+        const u64 shape = W1Mix(W1Mix(c.shape, c.index_handle), c.vertex);
+        auto& s = w1s_counts;
+        if (p.have_prev && p.prev_shape == shape) {
+            s[74].fetch_add(1, std::memory_order_relaxed);
+        } else if (p.shapes.count(shape) != 0) {
+            s[75].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            s[73].fetch_add(1, std::memory_order_relaxed);
+        }
+        p.shapes.insert(shape);
+        p.prev_shape = shape;
+    }
     p.pipelines.insert(c.pipeline);
     p.geometry.insert(geometry);
     p.other.insert(other_set);
@@ -1930,44 +2361,55 @@ void Rasterizer::NoteCover(u32 index) noexcept {
     switch (index & 31) {
     case CBufferRing:
         t_cover_kind = 1;
+        ++t_w3.kinds[1];
         break;
     case CBufferSpecial:
         t_cover_kind = 2;
+        ++t_w3.kinds[2];
         break;
     case CBufferNull:
         t_cover_kind = 3;
+        ++t_w3.kinds[3];
         break;
     case CBufferResolved:
         t_cover_kind = 7;
+        ++t_w3.kinds[7];
         break;
     case CBindResources:
         t_cover_mask = 0;
+        t_w3 = W3Cur{};
         ::VideoCore::t_cover_sync_ns = 0;
         t_cover_begin = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
         break;
     case CBufferHandle:
         t_cover_mask |= 1;
         t_cover_kind = 4;
+        ++t_w3.kinds[4];
         break;
     case CBufferAddrRead:
         t_cover_mask |= 2;
         t_cover_kind = 5;
+        ++t_w3.kinds[5];
         break;
     case CBufferAddrWritten:
         t_cover_mask |= 2;
         t_cover_kind = 6;
+        ++t_w3.kinds[6];
         break;
     case CImageLookupHit:
         t_cover_mask |= 4;
         break;
     case CImageFind:
         t_cover_mask |= 8;
+        t_w1.bad |= W1BadImageWork;
         break;
     case CImageStorage:
         t_cover_mask |= 16;
+        t_w1.bad |= W1BadImageWork;
         break;
     case CImageTransitTrue:
         t_cover_mask |= 32;
+        t_w1.bad |= W1BadImageWork;
         break;
     case CGeometryVertexAddress:
     case CGeometryIndexAddress:
@@ -1989,6 +2431,16 @@ void Rasterizer::CoverFinish(bool compute) noexcept {
         t_cover_class = c;
         cover_class_draws[c].fetch_add(1, std::memory_order_relaxed);
         cover_class_bind_ns[c].fetch_add(t_cover_begin != 0 ? now - t_cover_begin : 0, std::memory_order_relaxed);
+    }
+    if (!compute) {
+        t_w1_bind_begin = t_cover_begin;
+        t_w1_bind_end = now;
+    } else {
+        t_w3.bind_ns = t_cover_begin != 0 ? now - t_cover_begin : 0;
+        t_w3.sync_ns = ::VideoCore::t_cover_sync_ns;
+        t_w3.images = static_cast<u32>(image_infos.size());
+        t_w1_bind_begin = t_cover_begin;
+        t_w1_bind_end = now;
     }
     ::VideoCore::t_cover_sync_ns = 0;
     t_cover_begin = 0;
@@ -2457,9 +2909,15 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
         auto* vertex_handle = GeometryHandle(range.base_address, size);
         Census(vertex_handle != nullptr ? CGeometryVertexHandle : CGeometryVertexAddress);
         Core::NativeContent::SetBindContext({"vertex", 0, 0, 0, 0, vertex_handle != nullptr, false, range.base_address, size});
+        if (cover_on) [[unlikely]] {
+            VideoCore::BufferCache::UploadBytesReset();
+        }
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false, false, vertex_handle, NativeHandleMode() == 2);
         Core::NativeContent::ClearBindContext();
+        if (cover_on) [[unlikely]] {
+            W1ShadowGeometry(vertex_handle, range.base_address, range.buffer, range.offset, true);
+        }
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
         bound_buffers.emplace_back(range.buffer, range.offset, size,
                                    vk::AccessFlagBits2::eVertexAttributeRead);
@@ -2712,9 +3170,15 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
         auto* index_handle = GeometryHandle(index_address, index_buffer_size);
         Census(index_handle != nullptr ? CGeometryIndexHandle : CGeometryIndexAddress);
         Core::NativeContent::SetBindContext({"index", 0, 0, 0, 0, index_handle != nullptr, false, index_address, index_buffer_size});
+        if (cover_on) [[unlikely]] {
+            VideoCore::BufferCache::UploadBytesReset();
+        }
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(index_address, index_buffer_size, false, false, index_handle, NativeHandleMode() == 2);
         Core::NativeContent::ClearBindContext();
+        if (cover_on) [[unlikely]] {
+            W1ShadowGeometry(index_handle, index_address, buffer, offset, false);
+        }
         needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
         bound_buffers.emplace_back(buffer, offset, index_buffer_size,
                                    vk::AccessFlagBits2::eIndexRead);
@@ -3363,6 +3827,9 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     ++binding.buffer;
                     continue;
                 }
+                if (cover_on) [[unlikely]] {
+                    t_w1.bad |= W1BadFlat;
+                }
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
                 const u64 offset =
@@ -3524,6 +3991,9 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         if (window.buffer && window.offset - aligned + size <= window.chunk_remaining + (window.offset - aligned)) {
                             in_place = true;
                             Census(census_base + CBufferInPlace);
+                            if (cover_on) [[unlikely]] {
+                                t_w1.bad |= W1BadInPlace;
+                            }
                             const u64 adjust = window.offset - aligned;
                             push_data.AddOffset(binding.buffer, adjust);
                             buffer_infos.emplace_back(window.buffer, aligned, size + adjust);
@@ -3567,8 +4037,23 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 Core::NativeContent::SetBindContext({"shader binding", record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].id : 0,
                                                      record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].view_id : 0, stage.pgm_hash,
                                                      static_cast<u32>(stage.sw_stage), immutable_hint != nullptr, desc.is_written, vsharp.address, size});
+                const u64 w31_id = immutable_hint != nullptr ? immutable_hint->id : record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].id : 0;
+                if (cover_on) [[unlikely]] {
+                    W31Before(w31_id, vsharp.address, size);
+                }
+                // W3.2 (TLG_NATIVE_ROWS=1): a read-only request of an engine buffer with a valid row is answered from the row; 1 in 64 also asks the old path and compares
+                static const bool rows_on = [] {
+                    const char* e = std::getenv("TLG_NATIVE_ROWS"); // default on since 2026-11-09 (owner play good); =0 turns it off
+                    return e == nullptr || e[0] != '0';
+                }();
+                const u64 rows_epoch_pre = rows_on ? buffer_cache.PlacementEpoch() : 0;
+                const u64 rows_clock_pre = rows_on ? Core::NativeIdentity::Clock() : 0;
+                const bool rows_gpu_pre = rows_on && !desc.is_written && buffer_cache.IsRangeGpuWritten(vsharp.address, size);
+                const VideoCore::Buffer* row_buffer = nullptr;
+                u64 row_offset = 0;
+                const bool row_served = rows_on && !desc.is_written && RowsServe(w31_id, vsharp.address, size, desc.is_formatted, row_buffer, row_offset);
                 // D4 sizing (2026-11-07): the same call, timed by what kind of binding it serves
-                const auto [buffer, offset] = [&] {
+                const auto obtain_old = [&] {
                     VideoCore::BufferCache::UploadBytesReset();
                     if (immutable_hint != nullptr) {
                         TLG_PROF_LEVEL("bind.obtain_by_handle", 3);
@@ -3591,7 +4076,52 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         if (stage.sw_stage == Shader::SwStage::Compute) { TLG_PROF_ADD("bind.uploaded_bytes_compute_addr_read", VideoCore::BufferCache::UploadBytes()); } else { TLG_PROF_ADD("bind.uploaded_bytes_graphics_addr_read", VideoCore::BufferCache::UploadBytes()); }
                         return r;
                     }
-                }();
+                };
+                std::pair<const VideoCore::Buffer*, u64> obtained;
+                if (row_served) {
+                    w1s_counts[128].fetch_add(1, std::memory_order_relaxed);
+                    static std::atomic<u64> verify_tick{0};
+                    if ((verify_tick.fetch_add(1, std::memory_order_relaxed) & 63u) == 0) {
+                        const auto* list = scheduler.CommandBuffer().List();
+                        const u64 commands_before = list != nullptr ? list->Size() : 0;
+                        obtained = obtain_old(); // the old answer decides
+                        const auto* list_after = scheduler.CommandBuffer().List();
+                        const u64 commands_after = list_after != nullptr ? list_after->Size() : 0;
+                        w1s_counts[129].fetch_add(1, std::memory_order_relaxed);
+                        if (obtained.first != row_buffer || obtained.second != row_offset) {
+                            w1s_counts[130].fetch_add(1, std::memory_order_relaxed);
+                            // 136 no engine handle, 137 handle of usage 1 (immutable), 138 handle of another usage; 139 the old path answered from the stream ring
+                            w1s_counts[immutable_hint == nullptr ? 136 : immutable_hint->usage == 1 ? 137 : 138].fetch_add(1, std::memory_order_relaxed);
+                            if (buffer_cache.IsStreamBuffer(obtained.first)) {
+                                w1s_counts[139].fetch_add(1, std::memory_order_relaxed);
+                            }
+                            static std::atomic<u32> logged{0};
+                            if (logged.fetch_add(1) < 10) {
+                                LOG_ERROR(Render_Vulkan, "W3.2 row differs: id {:#x} address {:#x}+{:#x} (hint {} usage {} texel {} compute {} row gpu {} gpu now {} object dirty now {}): row {:p}+{:#x}, old path {:p}+{:#x}", w31_id, vsharp.address, size,
+                                          immutable_hint != nullptr, immutable_hint != nullptr ? immutable_hint->usage : 0u, desc.is_formatted, stage.sw_stage == Shader::SwStage::Compute, t_row_gpu,
+                                          buffer_cache.IsRangeGpuWritten(vsharp.address, size), buffer_cache.ObjectRangeDirty(w31_id, vsharp.address, size), static_cast<const void*>(row_buffer),
+                                          row_offset, static_cast<const void*>(obtained.first), obtained.second);
+                            }
+                        } else if (VideoCore::BufferCache::UploadBytes() != 0 || commands_after != commands_before) {
+                            w1s_counts[131].fetch_add(1, std::memory_order_relaxed);
+                            static std::atomic<u32> logged_work{0};
+                            if (logged_work.fetch_add(1) < 10) {
+                                LOG_ERROR(Render_Vulkan, "W3.2 row valid but the old path did work: id {:#x} address {:#x}+{:#x} uploaded {} bytes, {} commands", w31_id, vsharp.address, size,
+                                          VideoCore::BufferCache::UploadBytes(), commands_after - commands_before);
+                            }
+                        }
+                    } else {
+                        VideoCore::BufferCache::UploadBytesReset();
+                        const_cast<VideoCore::Buffer*>(row_buffer)->NoteResolveUse(); // P3c: asked for by the operation being resolved
+                        obtained = {row_buffer, row_offset};
+                    }
+                } else {
+                    obtained = obtain_old();
+                }
+                if (rows_on && !desc.is_written && !row_served) {
+                    RowsLearn(w31_id, vsharp.address, size, desc.is_formatted, obtained.first, obtained.second, rows_epoch_pre, rows_clock_pre, rows_gpu_pre);
+                }
+                const auto [buffer, offset] = obtained;
                 Core::NativeContent::ClearBindContext();
                 recipe_ranges.emplace_back(vsharp.address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
                 if (desc.is_written || size > 262144) {
@@ -3696,6 +4226,40 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 push_data.AddOffset(binding.buffer, adjust);
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
                 bound_buffers.emplace_back(buffer, offset, size, src_access);
+                if (cover_on) [[unlikely]] {
+                    W31After(buffer, offset, vsharp.address, stage.sw_stage == Shader::SwStage::Compute, desc.is_written);
+                }
+                if (cover_on && stage.sw_stage == Shader::SwStage::Compute) [[unlikely]] {
+                    t_w3.upload += VideoCore::BufferCache::UploadBytes();
+                    t_w3.with_upload += VideoCore::BufferCache::UploadBytes() != 0 ? 1u : 0u;
+                    t_w3.written += desc.is_written ? 1u : 0u;
+                    t_w3.stream += buffer_cache.IsStreamBuffer(buffer) ? 1u : 0u;
+                    const u32 why = immutable_hint != nullptr ? 0u
+                                    : binder_plan == nullptr ? 1u
+                                    : desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad ? 2u
+                                    : record_binding == ~0u ? 3u
+                                    : !binder_plan->has_handles ? 4u
+                                    : binder_plan->handles[record_binding] == nullptr ? 5u
+                                                                                       : 6u;
+                    ++t_w3.why[why & 7];
+                    if (desc.is_written) {
+                        ++t_w3.written_id[(why == 0 || why >= 5) ? 1 : 0];
+                    }
+                    if (!buffer_cache.IsStreamBuffer(buffer)) {
+                        const u64 row_id = immutable_hint != nullptr ? immutable_hint->id : record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].id : 0;
+                        W1ShadowRow(row_id, vsharp.address, buffer, offset, desc.is_written ? 84u : 80u);
+                    }
+                }
+                if (cover_on && stage.sw_stage != Shader::SwStage::Compute) [[unlikely]] {
+                    const u32 why = immutable_hint != nullptr ? 0u
+                                    : binder_plan == nullptr ? 1u
+                                    : desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad ? 2u
+                                    : record_binding == ~0u ? 3u
+                                    : !binder_plan->has_handles ? 4u
+                                    : binder_plan->handles[record_binding] == nullptr ? 5u
+                                                                                       : 6u;
+                    W1ShadowBinding(immutable_hint, record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].id : 0, vsharp.address, buffer, offset, desc.is_written, why, desc.is_formatted);
+                }
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     if (size >= (8u << 20)) {
@@ -4042,6 +4606,9 @@ void Rasterizer::ResolveBufferBindingBody(const Shader::Info& stage, u32 buffer_
                         if (window.buffer && window.offset - aligned + size <= window.chunk_remaining + (window.offset - aligned)) {
                             in_place = true;
                             Census(census_base + CBufferInPlace);
+                            if (cover_on) [[unlikely]] {
+                                t_w1.bad |= W1BadInPlace;
+                            }
                             const u64 adjust = window.offset - aligned;
                             out.has_offset = true; out.adjust = static_cast<u32>(adjust);
                             out.info = vk::DescriptorBufferInfo(window.buffer, aligned, size + adjust);
