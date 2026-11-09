@@ -307,6 +307,8 @@ private:
   public:
     /// W3.1 shadow: does engine buffer `id` hold announced bytes in [addr, addr + size) that no upload took yet, or are there bytes no engine buffer holds there
     [[nodiscard]] bool ObjectRangeDirty(u64 id, VAddr addr, u64 size);
+    /// S3b.2 real: the same answer for the row of `buffer`, from the per-buffer clock (lock-free); one call in 64 is also asked of the sets, and where the sets say dirty the answer is dirty.
+    [[nodiscard]] bool ObjectRangeDirtyClock(u64 id, const Buffer* buffer, VAddr addr, u64 size);
   private:
     StampedRangeSet all_object_dirty; ///< B9.1 audit: the same bytes of all buffers by address
     /// B9.4: the Vulkan buffer of [address, address + size): a placed engine buffer's own when the range is inside one (placing it at its first use), else the arena

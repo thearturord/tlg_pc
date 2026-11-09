@@ -2056,6 +2056,9 @@ bool Rasterizer::RowsServe(u64 id, VAddr address, u64 size, bool texel, const Vi
     // (ChangedSince walks the identity events after the stored clock: the clock moves up to the one read before each successful check, so the walk covers only what is new)
     const u64 clock_now = Core::NativeIdentity::Clock();
     const auto sets_dirty = [&] {
+        if (VideoCore::g_producer_state) [[unlikely]] {
+            return buffer_cache.ObjectRangeDirtyClock(id, static_cast<const VideoCore::Buffer*>(r.buffer), address, size); // (only reached with the epoch unchanged: the buffer is alive)
+        }
         const bool d = buffer_cache.ObjectRangeDirty(id, address, size);
         if (VideoCore::g_page_clock_on) [[unlikely]] {
             VideoCore::PageClockQueryShadow(static_cast<const VideoCore::Buffer*>(r.buffer), address, size, d); // (only reached with the epoch unchanged: the buffer is alive)

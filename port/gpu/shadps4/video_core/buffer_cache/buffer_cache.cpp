@@ -494,7 +494,7 @@ ClockPage& ClockPageAt(u64 page) {
     return chunk->pages[page & 255];
 }
 std::atomic<u64> pc_stamps{0}, pc_stamp_pages{0}, pc_syncs{0}, pc_request_pages{0}, pc_old_bytes{0}, pc_old_copies{0}, pc_new_pages{0}, pc_new_runs{0}, pc_new_first_use_pages{0},
-    pc_old_pages_clock_clean{0}, rs_extra_pages{0}, rs_extra_runs{0}, rs_extra_changed{0}, rs_extra_unchanged{0}, rs_extra_unread{0}, pq_calls_placed{0}, pq_calls_arena{0}, pq_nostate{0}, pq_agree_dirty{0}, pq_agree_clean{0}, pq_old_dirty_clock_clean{0}, pq_old_clean_clock_dirty{0}, pq_old_clean_clock_dirty_arena{0}, pq_created{0}, pq_created_inside_pages{0}, pq_created_rest_pages{0}, rs_extra_unverifiable{0}, pb_old_clean_unverifiable{0}, pb_syncs{0}, pb_buffers{0}, pb_old_pages{0}, pb_old_dirty{0}, pb_old_clean{0}, pb_old_clean_verified{0}, pb_old_clean_changed{0}, pb_new_pages{0}, pb_new_agree{0}, pb_new_only_gpu{0}, pb_new_first_use{0}, pb_new_only_other{0}, pb_new_pages_filtered{0}, pb_new_runs_filtered{0}, pc_stale_late_announce{0}, pc_stale_unexplained{0}, pc_stale_pending{0}, pc_new_runs_filtered{0}, g2_calls{0}, g2_skip{0}, g2_skip_but_hit{0}, g2_hit{0}, g2_false_pos{0}, g2_ns_skip{0}, g2_ns_hit{0}, g2_ns_false_pos{0}, g2_pages_checked{0}, g2_page_unsafe{0}, g2_page_false_pos{0}, g2_clear_skipped{0}, g2_pages_set{0}, pc_new_pages_filtered{0}, pc_new_agree{0}, pc_new_only_gpu{0}, pc_new_only_other{0}, pc_new_only_other_first_use{0}, pc_ring_pages{0}, pc_ring_copies{0}, pc_ring_request_pages{0}, pc_old_copies_nonring{0}, pc_verified{0}, pc_stale{0}, pc_unreadable{0}, pc_old_pages_total{0}, pc_syncs_old_zero_new_nonzero{0}, pc_syncs_old_nonzero_new_zero{0};
+    pc_old_pages_clock_clean{0}, rs_extra_pages{0}, rs_extra_runs{0}, rs_extra_changed{0}, rs_extra_unchanged{0}, rs_extra_unread{0}, pr_calls{0}, pr_known{0}, pr_fallback{0}, pr_sampled{0}, pr_wrong{0}, pr_extra{0}, pq_calls_placed{0}, pq_calls_arena{0}, pq_nostate{0}, pq_agree_dirty{0}, pq_agree_clean{0}, pq_old_dirty_clock_clean{0}, pq_old_clean_clock_dirty{0}, pq_old_clean_clock_dirty_arena{0}, pq_created{0}, pq_created_inside_pages{0}, pq_created_rest_pages{0}, rs_extra_unverifiable{0}, pb_old_clean_unverifiable{0}, pb_syncs{0}, pb_buffers{0}, pb_old_pages{0}, pb_old_dirty{0}, pb_old_clean{0}, pb_old_clean_verified{0}, pb_old_clean_changed{0}, pb_new_pages{0}, pb_new_agree{0}, pb_new_only_gpu{0}, pb_new_first_use{0}, pb_new_only_other{0}, pb_new_pages_filtered{0}, pb_new_runs_filtered{0}, pc_stale_late_announce{0}, pc_stale_unexplained{0}, pc_stale_pending{0}, pc_new_runs_filtered{0}, g2_calls{0}, g2_skip{0}, g2_skip_but_hit{0}, g2_hit{0}, g2_false_pos{0}, g2_ns_skip{0}, g2_ns_hit{0}, g2_ns_false_pos{0}, g2_pages_checked{0}, g2_page_unsafe{0}, g2_page_false_pos{0}, g2_clear_skipped{0}, g2_pages_set{0}, pc_new_pages_filtered{0}, pc_new_agree{0}, pc_new_only_gpu{0}, pc_new_only_other{0}, pc_new_only_other_first_use{0}, pc_ring_pages{0}, pc_ring_copies{0}, pc_ring_request_pages{0}, pc_old_copies_nonring{0}, pc_verified{0}, pc_stale{0}, pc_unreadable{0}, pc_old_pages_total{0}, pc_syncs_old_zero_new_nonzero{0}, pc_syncs_old_nonzero_new_zero{0};
 } // namespace
 
 bool g_gpu_filter_skip = [] {
@@ -503,6 +503,7 @@ bool g_gpu_filter_skip = [] {
 }();
 bool g_gpu_filter_bits = g_page_clock_on || g_gpu_filter_skip;
 GpuPageTable g_gpu_page_table;
+StampTable g_stamp_table;
 namespace {
 std::atomic<u64> g3_skipped{0}, g3_sampled{0}, g3_sample_wrong{0};
 }
@@ -583,6 +584,14 @@ void PageClockStampSlow(VAddr base, u64 size) noexcept {
     pc_stamp_pages.fetch_add(last - first + 1, std::memory_order_relaxed);
     for (u64 page = first; page <= last; ++page) {
         ClockPageAt(page).stamp = seq;
+        if ((page >> 28) == 0) {
+            std::atomic<u32>* c = g_stamp_table.chunk[page >> 16].load(std::memory_order_acquire);
+            if (c == nullptr) {
+                c = new std::atomic<u32>[65536]();
+                g_stamp_table.chunk[page >> 16].store(c, std::memory_order_release);
+            }
+            c[page & 65535].store(seq, std::memory_order_release);
+        }
     }
 }
 
@@ -605,10 +614,21 @@ void PageClockBufferCreated(const Buffer* dst, VAddr begin, VAddr end, const std
     };
     pq_created.fetch_add(1, std::memory_order_relaxed);
     const u32 now = g_clock_seq == 0 ? 1 : g_clock_seq;
+    const auto mirror = [&](u64 page, u32 value) {
+        if (dst->clock_flat && page >= dst->clock_flat_first && page < dst->clock_flat_first + dst->clock_flat_pages) {
+            dst->clock_flat[page - dst->clock_flat_first].store(value, std::memory_order_release);
+        }
+    };
+    if (g_producer_state && (((end - 1) >> 12) >> 28) == 0) {
+        dst->clock_flat_first = begin >> 12;
+        dst->clock_flat_pages = ((end - 1) >> 12) - (begin >> 12) + 1;
+        dst->clock_flat = std::make_unique<std::atomic<u32>[]>(dst->clock_flat_pages); // (all 0: dirty as soon as announced, until the rest and inside pages below say otherwise)
+    }
     for (const auto& [a, n] : rest) {
         for (u64 page = a >> 12; page <= (a + n - 1) >> 12; ++page) {
             auto& c = slot(serial, page);
             c.synced[page & 255] = now;
+            mirror(page, now);
             c.hash[page & 255] = 0; // (not hashed: the creation copy is not a sync the checks compare against)
             c.clip[page & 255] = 0;
             pq_created_rest_pages.fetch_add(1, std::memory_order_relaxed);
@@ -618,6 +638,7 @@ void PageClockBufferCreated(const Buffer* dst, VAddr begin, VAddr end, const std
         if (src.buffer == nullptr || src.buffer->clock_serial == 0) {
             for (u64 page = src.begin >> 12; page <= (src.end - 1) >> 12; ++page) {
                 slot(serial, page).synced[page & 255] = 0; // (the old buffer's pages were never made current: dirty as soon as announced)
+                mirror(page, 0);
             }
             continue;
         }
@@ -625,6 +646,7 @@ void PageClockBufferCreated(const Buffer* dst, VAddr begin, VAddr end, const std
             const auto& from = slot(src.buffer->clock_serial, page);
             auto& to = slot(serial, page);
             to.synced[page & 255] = from.synced[page & 255];
+            mirror(page, from.synced[page & 255]);
             to.hash[page & 255] = from.hash[page & 255];
             to.clip[page & 255] = from.clip[page & 255];
             pq_created_inside_pages.fetch_add(1, std::memory_order_relaxed);
@@ -796,6 +818,9 @@ static void PageClockSyncBuffer(const Buffer* arena, VAddr lo, VAddr hi, const b
             in_run_filtered = false;
         }
         *synced = g_clock_seq == 0 ? 1 : g_clock_seq;
+        if (arena->clock_flat && page >= arena->clock_flat_first && page < arena->clock_flat_first + arena->clock_flat_pages) {
+            arena->clock_flat[page - arena->clock_flat_first].store(*synced, std::memory_order_release);
+        }
         u64 h = 0, mstart = 0, mlen = 0;
         *clip_slot = clip_of(page, mstart, mlen);
         *hash = Core::NativeContent::HashGuarded64((page << 12) + mstart, mlen, h) ? h : 0;
@@ -1229,6 +1254,8 @@ nlohmann::json BufferCache::BindMemoReport() const {
                                  {"real_filter_on", g_gpu_filter_skip}, {"real_skipped", g3_skipped.load()}, {"real_sampled", g3_sampled.load()}, {"REAL_SAMPLE_WRONG_MUST_BE_0", g3_sample_wrong.load()}, {"consumer_pages_checked", g2_pages_checked.load()}, {"CONSUMER_PAGE_GPU_WRITTEN_BUT_FILTER_CLEAN_MUST_BE_0", g2_page_unsafe.load()},
                                  {"consumer_page_false_positives", g2_page_false_pos.load()}, {"clear_skipped_big_ranges", g2_clear_skipped.load()}, {"pages_set", g2_pages_set.load()}};
     nlohmann::json page_clock = {{"gpu_filter", gpu_filter},
+                                 {"real_row_check", nlohmann::json{{"on", g_producer_state}, {"calls", pr_calls.load()}, {"answered_by_clock", pr_known.load()}, {"fallback_to_sets", pr_fallback.load()}, {"sampled_against_sets", pr_sampled.load()},
+                                                               {"SAMPLE_SETS_DIRTY_CLOCK_CLEAN_MUST_BE_0", pr_wrong.load()}, {"sample_clock_dirty_sets_clean", pr_extra.load()}}},
                                  {"queries", nlohmann::json{{"calls_placed_buffer", pq_calls_placed.load()}, {"calls_arena_buffer", pq_calls_arena.load()}, {"no_clock_state", pq_nostate.load()},
                                                            {"agree_dirty", pq_agree_dirty.load()}, {"agree_clean", pq_agree_clean.load()},
                                                            {"SETS_DIRTY_CLOCK_CLEAN_MUST_BE_0", pq_old_dirty_clock_clean.load()}, {"sets_clean_clock_dirty_placed", pq_old_clean_clock_dirty.load()},
@@ -1677,6 +1704,35 @@ bool BufferCache::NativeCpuQuery(VAddr addr, size_t size) {
         }
     }
     return answer;
+}
+
+bool BufferCache::ObjectRangeDirtyClock(u64 id, const Buffer* buffer, VAddr addr, u64 size) {
+    pr_calls.fetch_add(1, std::memory_order_relaxed);
+    const u64 first = addr >> 12, last = (addr + size - 1) >> 12;
+    if (buffer == nullptr || !buffer->clock_flat || size == 0 || first < buffer->clock_flat_first || last >= buffer->clock_flat_first + buffer->clock_flat_pages) {
+        pr_fallback.fetch_add(1, std::memory_order_relaxed); // (no per-buffer array for this range: the sets answer)
+        return ObjectRangeDirty(id, addr, size);
+    }
+    pr_known.fetch_add(1, std::memory_order_relaxed);
+    bool dirty = false;
+    for (u64 page = first; page <= last; ++page) {
+        if (PageClockStampOf(page) > buffer->clock_flat[page - buffer->clock_flat_first].load(std::memory_order_acquire)) {
+            dirty = true;
+            break;
+        }
+    }
+    if ((pr_known.load(std::memory_order_relaxed) & 63) == 0) {
+        // the monitor: one answer in 64 is also asked of the sets; where they say dirty, the answer is dirty
+        pr_sampled.fetch_add(1, std::memory_order_relaxed);
+        const bool sets = ObjectRangeDirty(id, addr, size);
+        if (sets && !dirty) {
+            pr_wrong.fetch_add(1, std::memory_order_relaxed);
+            dirty = true;
+        } else if (dirty && !sets) {
+            pr_extra.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return dirty;
 }
 
 bool BufferCache::ObjectRangeDirty(u64 id, VAddr addr, u64 size) {

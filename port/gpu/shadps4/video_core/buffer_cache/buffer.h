@@ -155,6 +155,8 @@ struct Buffer {
     VAddr cpu_addr = 0;
     VAddr placed_begin = 0, placed_end = 0; ///< N3: the memory of the engine buffer(s) this buffer was placed for (0: not a placed buffer)
     u64 placed_single_id = 0;               ///< N3: the engine buffer id when it holds exactly one (0: a block of several)
+    mutable std::unique_ptr<std::atomic<u32>[]> clock_flat; ///< S3b.2 real (TLG_PRODUCER_STATE=1): the sync stamp of each page of [placed_begin, placed_end), lock-free for readers
+    mutable u64 clock_flat_first = 0, clock_flat_pages = 0;  ///< first page number and page count of `clock_flat`
     mutable u64 clock_serial = 0; ///< S3b.0 (TLG_PAGE_CLOCK=1): the identity of this buffer for the per-buffer page clock (0: none yet; a freed buffer's address can be reused, the serial is not)
     mutable u64 ring_mirror_token = 0; ///< N2: set by the buffer cache when this buffer is the frame ring's mirror (0: not)
     size_t size_bytes = 0;

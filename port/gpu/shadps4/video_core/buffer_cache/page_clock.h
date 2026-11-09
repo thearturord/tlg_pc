@@ -18,6 +18,17 @@
 namespace VideoCore {
 
 extern bool g_page_clock_on;
+extern bool g_producer_state; ///< TLG_PRODUCER_STATE=1 (S3b real stages; implies the clock)
+
+/// The producer-side stamps, lock-free for readers: two levels (4096 chunk pointers, chunks of 65,536 pages = 256 MiB of guest memory), written by `PageClockStampSlow` under the clock mutex.
+struct StampTable {
+    std::atomic<std::atomic<u32>*> chunk[4096]{};
+};
+extern StampTable g_stamp_table;
+inline u32 PageClockStampOf(u64 page) noexcept {
+    const std::atomic<u32>* c = g_stamp_table.chunk[page >> 16].load(std::memory_order_acquire);
+    return c != nullptr ? c[page & 65535].load(std::memory_order_relaxed) : 0u;
+}
 void PageClockStampSlow(VAddr base, u64 size) noexcept;
 inline void PageClockStamp(VAddr base, u64 size) noexcept {
     if (g_page_clock_on) [[unlikely]] {
