@@ -1915,6 +1915,7 @@ void CounterSample(std::vector<u64>& values) {
 // are then checked against those pages: a read for submission S of a page silently written for a later submission is a late read the ledger cannot see.
 // Page granular: a silent write elsewhere in the page counts too (samples show the ledger's view of the page to tell).
 extern "C" uint64_t runtime_memory_census_harvest(void (*page)(uintptr_t address, void* context), void* context, uint64_t* gpu_side_resets);
+extern "C" void runtime_memory_census_kernel(uint64_t* ns, uint64_t* calls, uint64_t* max_ns);
 
 namespace {
 bool SilentCensusOn() noexcept {
@@ -2365,6 +2366,13 @@ nlohmann::json SilentReport() {
     out["harvests"] = c_sc_harvests.load();
     out["harvest_ms_total"] = c_sc_ns.load() / 1000000;
     out["harvest_ms_max"] = static_cast<double>(c_sc_max_ns.load()) / 1e6;
+    {
+        uint64_t kns = 0, kcalls = 0, kmax = 0;
+        runtime_memory_census_kernel(&kns, &kcalls, &kmax);
+        out["kernel_call_ms_total"] = static_cast<double>(kns) / 1e6; // K0: GetWriteWatch alone, summed over every region of every harvest
+        out["kernel_calls"] = kcalls;
+        out["kernel_call_ms_max"] = static_cast<double>(kmax) / 1e6;
+    }
     out["pages_written"] = c_sc_written.load();
     out["pages_in_the_frame_ring"] = c_sc_ring.load();
     out["pages_announced_in_this_window"] = c_sc_announced_now.load();

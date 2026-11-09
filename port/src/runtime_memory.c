@@ -172,6 +172,7 @@ static int census_on(void) {
     return on;
 }
 static volatile LONG64 census_gpu_side_resets;
+static volatile LONG64 census_kernel_ns, census_kernel_calls, census_kernel_max_ns; /* K0: the time inside GetWriteWatch alone (measurement only) */
 static int ww_map(HostRegion *r, DWORD protect) {
     uint64_t size=r->end-r->start;
     if (!VirtualAlloc2(NULL,(void *)r->start,size,MEM_RESERVE|MEM_COMMIT|(census_on() ? MEM_WRITE_WATCH : 0)|MEM_REPLACE_PLACEHOLDER,PAGE_READWRITE,NULL,0)) {
@@ -1042,7 +1043,11 @@ uint64_t runtime_memory_census_harvest(void (*page)(uintptr_t address, void *con
         size_t pages=(regions[i].end-regions[i].start)/4096;
         if (found_capacity<pages) { free(found); found=malloc(pages*sizeof(*found)); found_capacity=found ? pages : 0; if (!found) break; }
         ULONG_PTR count=pages; ULONG granularity=0;
-        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET,(void *)regions[i].start,regions[i].end-regions[i].start,found,&count,&granularity)) continue;
+        LARGE_INTEGER qa,qb,qf; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&qa);
+        const UINT kernel_failed=GetWriteWatch(WRITE_WATCH_FLAG_RESET,(void *)regions[i].start,regions[i].end-regions[i].start,found,&count,&granularity);
+        QueryPerformanceCounter(&qb);
+        { LONG64 ns=(LONG64)((qb.QuadPart-qa.QuadPart)*1000000000LL/qf.QuadPart); InterlockedAdd64(&census_kernel_ns,ns); InterlockedIncrement64(&census_kernel_calls); if (ns>census_kernel_max_ns) census_kernel_max_ns=ns; }
+        if (kernel_failed) continue;
         for (ULONG_PTR k=0;k<count;++k) page((uintptr_t)found[k],context);
         total+=count;
     }
@@ -1052,6 +1057,18 @@ uint64_t runtime_memory_census_harvest(void (*page)(uintptr_t address, void *con
     (void)page; (void)context;
     if (gpu_side_resets) *gpu_side_resets=0;
     return 0;
+#endif
+}
+/* K0: totals of the time spent inside GetWriteWatch by the census harvest. */
+void runtime_memory_census_kernel(uint64_t *ns, uint64_t *calls, uint64_t *max_ns) {
+#ifdef _WIN32
+    if (ns) *ns=(uint64_t)census_kernel_ns;
+    if (calls) *calls=(uint64_t)census_kernel_calls;
+    if (max_ns) *max_ns=(uint64_t)census_kernel_max_ns;
+#else
+    if (ns) *ns=0;
+    if (calls) *calls=0;
+    if (max_ns) *max_ns=0;
 #endif
 }
 void runtime_memory_report(void) {

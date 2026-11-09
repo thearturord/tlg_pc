@@ -25,5 +25,6 @@ int runtime_memory_read_backing(uintptr_t, void*, uint64_t) { std::abort(); }
 int runtime_memory_backing_window(uintptr_t, uint64_t, void**, uint64_t*, uint64_t*) { return 0; }
 int runtime_memory_is_mapped(uintptr_t, uint64_t) { return 0; }
 uint64_t runtime_memory_census_harvest(void (*)(uintptr_t, void*), void*, uint64_t* gpu_side_resets) { if (gpu_side_resets) *gpu_side_resets = 0; return 0; }
+void runtime_memory_census_kernel(uint64_t* ns, uint64_t* calls, uint64_t* max_ns) { if (ns) *ns = 0; if (calls) *calls = 0; if (max_ns) *max_ns = 0; }
 }
 
