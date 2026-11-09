@@ -2055,8 +2055,15 @@ bool Rasterizer::RowsServe(u64 id, VAddr address, u64 size, bool texel, const Vi
     RealRow& r = it->second;
     // (ChangedSince walks the identity events after the stored clock: the clock moves up to the one read before each successful check, so the walk covers only what is new)
     const u64 clock_now = Core::NativeIdentity::Clock();
+    const auto sets_dirty = [&] {
+        const bool d = buffer_cache.ObjectRangeDirty(id, address, size);
+        if (VideoCore::g_page_clock_on) [[unlikely]] {
+            VideoCore::PageClockQueryShadow(static_cast<const VideoCore::Buffer*>(r.buffer), address, size, d); // (only reached with the epoch unchanged: the buffer is alive)
+        }
+        return d;
+    };
     if (r.epoch != buffer_cache.PlacementEpoch() || Core::NativeIdentity::ChangedSince(r.clock, address, address + size) != Core::NativeIdentity::Change::None ||
-        buffer_cache.ObjectRangeDirty(id, address, size)) { // (the GPU-written state of the range is covered by the identity events: every change of the set logs one)
+        sets_dirty()) { // (the GPU-written state of the range is covered by the identity events: every change of the set logs one)
         s[135].fetch_add(1, std::memory_order_relaxed);
         return false;
     }

@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <utility>
+#include <vector>
 
 #include "common/types.h"
 #include "video_core/buffer_cache/range_set.h"
@@ -31,6 +33,17 @@ struct StampedRangeSet : RangeSet {
     }
 };
 
+
+// ---- S3b.2 (shadow): placement events and the query comparison of the per-buffer clock.
+struct Buffer;
+struct ClockInsideSource {
+    const Buffer* buffer; ///< a placed buffer the new one takes over (its contents come over as they are)
+    VAddr begin, end;
+};
+/// A placed buffer was created: the pages it copied from memory (`rest`) are synced now, the pages it took over from older buffers keep those buffers' sync stamps.
+void PageClockBufferCreated(const Buffer* dst, VAddr begin, VAddr end, const std::vector<std::pair<u64, u64>>& rest, const std::vector<ClockInsideSource>& inside) noexcept;
+/// `old_dirty`: what the dirty sets say about [addr, addr + size) for this buffer; the clock's answer is computed and compared (counters only).
+void PageClockQueryShadow(const Buffer* buffer, VAddr addr, u64 size, bool old_dirty) noexcept;
 
 // ---- S2/S3a: the page filter for the GPU-written set. A page bit is set when `gpu_modified_ranges` gains bytes of the page and cleared only when the set no longer holds any byte of it, so
 // "no bit set over a range" implies "the set holds nothing there" (MUST_BE_0 in the counters); a set bit over a range with nothing in it is a counted false positive.

@@ -494,7 +494,7 @@ ClockPage& ClockPageAt(u64 page) {
     return chunk->pages[page & 255];
 }
 std::atomic<u64> pc_stamps{0}, pc_stamp_pages{0}, pc_syncs{0}, pc_request_pages{0}, pc_old_bytes{0}, pc_old_copies{0}, pc_new_pages{0}, pc_new_runs{0}, pc_new_first_use_pages{0},
-    pc_old_pages_clock_clean{0}, rs_extra_pages{0}, rs_extra_runs{0}, rs_extra_changed{0}, rs_extra_unchanged{0}, rs_extra_unread{0}, rs_extra_unverifiable{0}, pb_old_clean_unverifiable{0}, pb_syncs{0}, pb_buffers{0}, pb_old_pages{0}, pb_old_dirty{0}, pb_old_clean{0}, pb_old_clean_verified{0}, pb_old_clean_changed{0}, pb_new_pages{0}, pb_new_agree{0}, pb_new_only_gpu{0}, pb_new_first_use{0}, pb_new_only_other{0}, pb_new_pages_filtered{0}, pb_new_runs_filtered{0}, pc_stale_late_announce{0}, pc_stale_unexplained{0}, pc_stale_pending{0}, pc_new_runs_filtered{0}, g2_calls{0}, g2_skip{0}, g2_skip_but_hit{0}, g2_hit{0}, g2_false_pos{0}, g2_ns_skip{0}, g2_ns_hit{0}, g2_ns_false_pos{0}, g2_pages_checked{0}, g2_page_unsafe{0}, g2_page_false_pos{0}, g2_clear_skipped{0}, g2_pages_set{0}, pc_new_pages_filtered{0}, pc_new_agree{0}, pc_new_only_gpu{0}, pc_new_only_other{0}, pc_new_only_other_first_use{0}, pc_ring_pages{0}, pc_ring_copies{0}, pc_ring_request_pages{0}, pc_old_copies_nonring{0}, pc_verified{0}, pc_stale{0}, pc_unreadable{0}, pc_old_pages_total{0}, pc_syncs_old_zero_new_nonzero{0}, pc_syncs_old_nonzero_new_zero{0};
+    pc_old_pages_clock_clean{0}, rs_extra_pages{0}, rs_extra_runs{0}, rs_extra_changed{0}, rs_extra_unchanged{0}, rs_extra_unread{0}, pq_calls_placed{0}, pq_calls_arena{0}, pq_nostate{0}, pq_agree_dirty{0}, pq_agree_clean{0}, pq_old_dirty_clock_clean{0}, pq_old_clean_clock_dirty{0}, pq_old_clean_clock_dirty_arena{0}, pq_created{0}, pq_created_inside_pages{0}, pq_created_rest_pages{0}, rs_extra_unverifiable{0}, pb_old_clean_unverifiable{0}, pb_syncs{0}, pb_buffers{0}, pb_old_pages{0}, pb_old_dirty{0}, pb_old_clean{0}, pb_old_clean_verified{0}, pb_old_clean_changed{0}, pb_new_pages{0}, pb_new_agree{0}, pb_new_only_gpu{0}, pb_new_first_use{0}, pb_new_only_other{0}, pb_new_pages_filtered{0}, pb_new_runs_filtered{0}, pc_stale_late_announce{0}, pc_stale_unexplained{0}, pc_stale_pending{0}, pc_new_runs_filtered{0}, g2_calls{0}, g2_skip{0}, g2_skip_but_hit{0}, g2_hit{0}, g2_false_pos{0}, g2_ns_skip{0}, g2_ns_hit{0}, g2_ns_false_pos{0}, g2_pages_checked{0}, g2_page_unsafe{0}, g2_page_false_pos{0}, g2_clear_skipped{0}, g2_pages_set{0}, pc_new_pages_filtered{0}, pc_new_agree{0}, pc_new_only_gpu{0}, pc_new_only_other{0}, pc_new_only_other_first_use{0}, pc_ring_pages{0}, pc_ring_copies{0}, pc_ring_request_pages{0}, pc_old_copies_nonring{0}, pc_verified{0}, pc_stale{0}, pc_unreadable{0}, pc_old_pages_total{0}, pc_syncs_old_zero_new_nonzero{0}, pc_syncs_old_nonzero_new_zero{0};
 } // namespace
 
 bool g_gpu_filter_skip = [] {
@@ -583,6 +583,86 @@ void PageClockStampSlow(VAddr base, u64 size) noexcept {
     pc_stamp_pages.fetch_add(last - first + 1, std::memory_order_relaxed);
     for (u64 page = first; page <= last; ++page) {
         ClockPageAt(page).stamp = seq;
+    }
+}
+
+void PageClockBufferCreated(const Buffer* dst, VAddr begin, VAddr end, const std::vector<std::pair<u64, u64>>& rest, const std::vector<ClockInsideSource>& inside) noexcept {
+    if (end <= begin) {
+        return;
+    }
+    std::scoped_lock lock{g_clock_mutex};
+    if (dst->clock_serial == 0) {
+        dst->clock_serial = ++g_buf_clock_serial;
+        pb_buffers.fetch_add(1, std::memory_order_relaxed);
+    }
+    const u64 serial = dst->clock_serial;
+    const auto slot = [&](u64 ser, u64 page) -> BufClockChunk& {
+        auto& chunk = g_buf_clock[(ser << 24) | (page >> 8)];
+        if (!chunk) {
+            chunk = std::make_unique<BufClockChunk>();
+        }
+        return *chunk;
+    };
+    pq_created.fetch_add(1, std::memory_order_relaxed);
+    const u32 now = g_clock_seq == 0 ? 1 : g_clock_seq;
+    for (const auto& [a, n] : rest) {
+        for (u64 page = a >> 12; page <= (a + n - 1) >> 12; ++page) {
+            auto& c = slot(serial, page);
+            c.synced[page & 255] = now;
+            c.hash[page & 255] = 0; // (not hashed: the creation copy is not a sync the checks compare against)
+            c.clip[page & 255] = 0;
+            pq_created_rest_pages.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    for (const auto& src : inside) {
+        if (src.buffer == nullptr || src.buffer->clock_serial == 0) {
+            for (u64 page = src.begin >> 12; page <= (src.end - 1) >> 12; ++page) {
+                slot(serial, page).synced[page & 255] = 0; // (the old buffer's pages were never made current: dirty as soon as announced)
+            }
+            continue;
+        }
+        for (u64 page = src.begin >> 12; page <= (src.end - 1) >> 12; ++page) {
+            const auto& from = slot(src.buffer->clock_serial, page);
+            auto& to = slot(serial, page);
+            to.synced[page & 255] = from.synced[page & 255];
+            to.hash[page & 255] = from.hash[page & 255];
+            to.clip[page & 255] = from.clip[page & 255];
+            pq_created_inside_pages.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+void PageClockQueryShadow(const Buffer* buffer, VAddr addr, u64 size, bool old_dirty) noexcept {
+    if (buffer == nullptr || size == 0) {
+        return;
+    }
+    const bool placed = buffer->placed_begin != 0;
+    (placed ? pq_calls_placed : pq_calls_arena).fetch_add(1, std::memory_order_relaxed);
+    if (buffer->clock_serial == 0) {
+        pq_nostate.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    bool dirty = false;
+    {
+        std::scoped_lock lock{g_clock_mutex};
+        for (u64 page = addr >> 12; page <= (addr + size - 1) >> 12 && !dirty; ++page) {
+            const auto it = g_buf_clock.find((buffer->clock_serial << 24) | (page >> 8));
+            const u32 synced = it == g_buf_clock.end() ? 0 : it->second->synced[page & 255];
+            dirty = ClockPageAt(page).stamp > synced;
+        }
+    }
+    if (old_dirty && !dirty) {
+        pq_old_dirty_clock_clean.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1) < 10) {
+            LOG_ERROR(Render_Vulkan, "page clock query: {:#x}+{:#x} is dirty in the sets and clean in the clock (buffer {:#x} placed {})", addr, size, buffer->cpu_addr, placed);
+        }
+    } else if (old_dirty) {
+        pq_agree_dirty.fetch_add(1, std::memory_order_relaxed);
+    } else if (dirty) {
+        (placed ? pq_old_clean_clock_dirty : pq_old_clean_clock_dirty_arena).fetch_add(1, std::memory_order_relaxed);
+    } else {
+        pq_agree_clean.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -1149,6 +1229,11 @@ nlohmann::json BufferCache::BindMemoReport() const {
                                  {"real_filter_on", g_gpu_filter_skip}, {"real_skipped", g3_skipped.load()}, {"real_sampled", g3_sampled.load()}, {"REAL_SAMPLE_WRONG_MUST_BE_0", g3_sample_wrong.load()}, {"consumer_pages_checked", g2_pages_checked.load()}, {"CONSUMER_PAGE_GPU_WRITTEN_BUT_FILTER_CLEAN_MUST_BE_0", g2_page_unsafe.load()},
                                  {"consumer_page_false_positives", g2_page_false_pos.load()}, {"clear_skipped_big_ranges", g2_clear_skipped.load()}, {"pages_set", g2_pages_set.load()}};
     nlohmann::json page_clock = {{"gpu_filter", gpu_filter},
+                                 {"queries", nlohmann::json{{"calls_placed_buffer", pq_calls_placed.load()}, {"calls_arena_buffer", pq_calls_arena.load()}, {"no_clock_state", pq_nostate.load()},
+                                                           {"agree_dirty", pq_agree_dirty.load()}, {"agree_clean", pq_agree_clean.load()},
+                                                           {"SETS_DIRTY_CLOCK_CLEAN_MUST_BE_0", pq_old_dirty_clock_clean.load()}, {"sets_clean_clock_dirty_placed", pq_old_clean_clock_dirty.load()},
+                                                           {"sets_clean_clock_dirty_arena", pq_old_clean_clock_dirty_arena.load()}, {"buffers_created", pq_created.load()},
+                                                           {"created_rest_pages", pq_created_rest_pages.load()}, {"created_inside_pages", pq_created_inside_pages.load()}}},
                                  {"producer_state", nlohmann::json{{"on", g_producer_state}, {"extra_pages_uploaded", rs_extra_pages.load()}, {"extra_runs", rs_extra_runs.load()},
                                                                 {"EXTRA_PAGES_BYTES_CHANGED_OLD_PATH_MISSED", rs_extra_changed.load()}, {"extra_pages_bytes_unchanged", rs_extra_unchanged.load()},
                                                                 {"extra_pages_unread", rs_extra_unread.load()}, {"extra_pages_unverifiable_other_clip", rs_extra_unverifiable.load()}}},

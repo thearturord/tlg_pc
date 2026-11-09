@@ -254,8 +254,12 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
     }
     // placed buffers inside the block: their contents come over as they are
     boost::container::small_vector<VAddr, 4> inside;
+    std::vector<ClockInsideSource> clock_inside; // S3b.2 shadow: the older buffers whose contents come over
     for (auto it = placed.lower_bound(begin); it != placed.end() && it->first < end; ++it) {
         inside.push_back(it->first);
+        if (g_page_clock_on) [[unlikely]] {
+            clock_inside.push_back({it->second.buffer.get(), it->second.begin, it->second.end});
+        }
         it->second.buffer->NoteResolveUse(); // P3c: the old placed buffer is read by the copy below
         const vk::BufferCopy copy{it->second.buffer->Offset(it->second.begin), dst->Offset(it->second.begin), it->second.end - it->second.begin};
         if (ResolveCommands::Deferring()) {
@@ -374,6 +378,9 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
                 all_object_dirty.Subtract(a, n);
             }
         }
+    }
+    if (g_page_clock_on) [[unlikely]] {
+        PageClockBufferCreated(dst, begin, end, std::vector<std::pair<u64, u64>>(rest.begin(), rest.end()), clock_inside);
     }
     // the placed buffers inside are replaced (freed after the GPU is done, the copies above included)
     for (const VAddr b : inside) {
