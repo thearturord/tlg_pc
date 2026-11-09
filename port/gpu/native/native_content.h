@@ -49,6 +49,8 @@ struct BindContext {
     u64 caller{};         ///< "other": the return address into the code that called ObtainBuffer (RVA in the sample)
 };
 [[nodiscard]] bool HasBindContext();
+/// The bind context of this thread (false: none set).
+bool CurrentBindContext(BindContext& out);
 /// The arena sync of the destination of a GPU buffer copy: the range is overwritten by the copy right after, so the bytes read from memory are never used; counted apart from the late reads
 /// (`f2_store.copy_destination_syncs`). `CurrentBindIsCopyDestination` is true while the bind context is the copy's destination.
 [[nodiscard]] bool CurrentBindIsCopyDestination();

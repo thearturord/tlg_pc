@@ -10,7 +10,12 @@
 #include <vector>
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
+#include <map>
+#include <string>
+#include <tuple>
+#include "native/native_content.h"
 #include "native/native_ring_census.h"
+#include "native/native_updates.h"
 #include "native/native_untracked_ring.h"
 
 namespace Core::RingCensus {
@@ -76,6 +81,13 @@ struct Sample {
 };
 std::atomic<u64> c_map_path[8][2][8][4]{}; // [resource kind][subresource 0 / other][map type][path]
 thread_local u32 t_sync_caller = 0;
+
+// wide raster ring reads (above 64 KiB) by who asked: (bind site, program hash, stage) -> totals; silent bytes split by whether a Map that is still open (mapped, not unmapped yet) covers them
+struct WideStats {
+    u64 uses{}, bytes{}, silent{}, silent_open{}, never{}, largest{}, example_id{};
+};
+std::mutex g_wide_mutex;
+std::map<std::tuple<std::string, u64, u32>, WideStats> g_wide;
 std::atomic<u64> c_sync_caller[CallerCount][4]{}; // raster sync uses by caller: [uses, bytes, silent bytes, never bytes]
 
 std::mutex g_sample_mutex;
@@ -265,6 +277,48 @@ void NoteUse(Site site, u64 address, u64 size) {
     if (never != 0) {
         s.uses_with_never.fetch_add(1, std::memory_order_relaxed);
     }
+    if ((site == SiteRasterSync || site == SiteRasterPreSync) && hi - lo > 65536) {
+        // which silent bytes lie in a Map window that is still open (the engine writes it now, for a later record)
+        u64 silent_open = 0;
+        if (silent != 0) {
+            u64 run_lo = 0, run_hi = 0;
+            const auto flush = [&] {
+                if (run_hi > run_lo && Core::NativeUpdates::OpenMapOverlaps(run_lo, run_hi - run_lo)) {
+                    silent_open += run_hi - run_lo;
+                }
+                run_lo = run_hi = 0;
+            };
+            for (u64 g = first; g <= last; ++g) {
+                if (f[g].load(std::memory_order_relaxed) != BitAllocated) {
+                    flush();
+                    continue;
+                }
+                const u64 g_lo = std::max(lo, base + (g << GranuleShift)), g_hi = std::min(hi, base + ((g + 1) << GranuleShift));
+                if (run_hi == g_lo && run_hi != 0) {
+                    run_hi = g_hi;
+                } else {
+                    flush();
+                    run_lo = g_lo;
+                    run_hi = g_hi;
+                }
+            }
+            flush();
+        }
+        Core::NativeContent::BindContext ctx{};
+        const bool has = Core::NativeContent::CurrentBindContext(ctx);
+        const std::string where = has && ctx.site != nullptr ? std::string(ctx.site) : std::string("none");
+        std::scoped_lock lock{g_wide_mutex};
+        auto& w = g_wide[{where, has ? ctx.program : 0, has ? ctx.stage : 0}];
+        ++w.uses;
+        w.bytes += hi - lo;
+        w.silent += silent;
+        w.silent_open += silent_open;
+        w.never += never;
+        w.largest = std::max<u64>(w.largest, hi - lo);
+        if (w.example_id == 0 && has) {
+            w.example_id = ctx.engine_id;
+        }
+    }
     if (silent == 0 && never == 0) {
         s.uses_all_known.fetch_add(1, std::memory_order_relaxed);
     } else if (silent != 0) {
@@ -335,6 +389,14 @@ nlohmann::json Report() {
             if (const u64 n = c_sync_caller[k][0].load()) {
                 j["raster_sync_by_caller"][caller_names[k]] = {{"uses", n}, {"bytes", c_sync_caller[k][1].load()}, {"SILENT_BYTES", c_sync_caller[k][2].load()}, {"never_bytes", c_sync_caller[k][3].load()}};
             }
+        }
+    }
+    {
+        std::scoped_lock lock{g_wide_mutex};
+        auto& list = j["wide_raster_reads"] = nlohmann::json::array();
+        for (const auto& [key, w] : g_wide) {
+            list.push_back({{"bind_site", std::get<0>(key)}, {"program", fmt::format("{:#010x}", std::get<1>(key))}, {"stage", std::get<2>(key)}, {"uses", w.uses}, {"bytes", w.bytes},
+                            {"SILENT_BYTES", w.silent}, {"silent_in_open_maps", w.silent_open}, {"never_bytes", w.never}, {"largest", w.largest}, {"example_engine_id", fmt::format("{:#x}", w.example_id)}});
         }
     }
     static constexpr const char* site_names[SiteCount] = {"front_constant", "front_geometry", "raster_sync", "raster_presync"};

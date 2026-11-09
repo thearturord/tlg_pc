@@ -2425,6 +2425,14 @@ bool HasBindContext() {
     return t_bind_set;
 }
 
+bool CurrentBindContext(BindContext& out) {
+    if (!t_bind_set) {
+        return false;
+    }
+    out = t_bind;
+    return true;
+}
+
 bool CurrentBindIsCopyDestination() {
     return t_bind_set && t_bind.site != nullptr && std::strcmp(t_bind.site, "copy destination") == 0;
 }
