@@ -51,6 +51,7 @@ struct RingBinding {
     VAddr address{};  ///< the guest address it was copied from (0 for the flattened user data)
     bool snapshot{};  ///< N5d: the bytes are the writer's snapshot, not what guest memory held when the command processor looked
     bool formatted{}; ///< N5f: a formatted (texel) buffer: the raster thread checks at bind time that no image or metadata surface covers the range
+    bool hook{};      ///< F1 1a (TLG_HOOK_RING=2): `offset` is in the hook ring (the frame ring copy filled at the writes), not in the constant ring
 };
 
 constexpr u32 GeometryVertex = 0xFFFFFFFDu; ///< RingBinding::index of a vertex range in DrawPlan::geometry_ring

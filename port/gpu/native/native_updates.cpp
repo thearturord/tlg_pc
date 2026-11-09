@@ -1106,7 +1106,9 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
         announced_in_ring[writer & 7][1].fetch_add(size, std::memory_order_relaxed);
     }
     Core::RingCensus::NoteAnnounce(writer, address, size); // TLG_RING_CENSUS (counters only)
-    Core::HookRing::Fill(address, size);                    // TLG_HOOK_RING (F1 1a shadow): the write is finished, copy it now
+    if (Core::HookRing::FillsWriter(writer)) {
+        Core::HookRing::Fill(address, size); // TLG_HOOK_RING (F1 1a): the write is finished, copy it now
+    }
     announced_bytes_by_writer[writer & 7].fetch_add(size, std::memory_order_relaxed);
     if (RingMirror::ShadowOn()) {
         RingMirror::NoteWriter(address, size, (writer & 7) | t_announce_site_class);

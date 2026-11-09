@@ -779,6 +779,25 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
             ring_use.pending_write.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
+        if (Core::HookRing::RealOn()) {
+            // F1 1a (TLG_HOOK_RING=2): a range the hook ring holds whole (filled at the writes, one lap half) is bound from it; no copy. 1 in 64 is compared with game memory.
+            u64 hook_offset = 0;
+            if (Core::HookRing::Resolve(address, size, hook_offset)) {
+                static std::atomic<u32> hook_sample{0};
+                const bool check = (hook_sample.fetch_add(1, std::memory_order_relaxed) & 63) == 0;
+                if (check) {
+                    thread_local std::vector<u8> now;
+                    now.resize(size);
+                    memory->CopySparseMemory(address, now.data(), size);
+                    Core::HookRing::Compare(address, size, now.data());
+                }
+                Core::HookRing::NoteBound(size, check);
+                stage.ring.push_back({index, static_cast<u32>(size), hook_offset, address, false, desc.is_formatted, true});
+                ring_use.taken.fetch_add(1, std::memory_order_relaxed);
+                ring_use.bytes.fetch_add(size, std::memory_order_relaxed);
+                continue;
+            }
+        }
         const auto offset = constant_ring->Allocate(size, alignment);
         if (!offset) {
             ring_use.full.fetch_add(1, std::memory_order_relaxed);

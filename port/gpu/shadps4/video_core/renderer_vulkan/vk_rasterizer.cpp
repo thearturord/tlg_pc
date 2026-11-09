@@ -60,6 +60,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer_engine.h"
 #include "native/native_census.h"
 #include "native/native_split_census.h"
+#include "native/native_hook_ring.h"
 
 namespace {
 thread_local u32 t_cover_class = 15; // R-slice census: the draw class of the draw being timed
@@ -246,6 +247,19 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     }
     if (const_ring_level >= 2) {
         constant_ring = std::make_unique<ConstantRing>(instance, scheduler);
+    }
+    if (Core::HookRing::RealOn() && constant_ring) {
+        // F1 1a: two halves of the game's 64 MB frame ring, in the stream memory type (cached system memory by default: F5 found GPU memory written through the BAR dearer)
+        constexpr u64 hook_capacity = u64{128} << 20;
+        hook_ring_buffer = std::make_unique<VideoCore::Buffer>(instance, 0, hook_capacity, VideoCore::MemoryType::Stream, "hook ring");
+        if (!hook_ring_buffer->mapped_data.empty()) {
+            Core::HookRing::SetStorage(hook_ring_buffer->mapped_data.data(), hook_capacity,
+                                       [](void* context, u64 offset, u64 size) { static_cast<VideoCore::Buffer*>(context)->Flush(offset, size); }, hook_ring_buffer.get());
+            LOG_INFO(Render, "hook ring (F1 1a): {} MB of GPU-visible memory, constants bound from it", hook_capacity >> 20);
+        } else {
+            LOG_ERROR(Render, "hook ring (F1 1a): the buffer is not mapped, the old path stays");
+            hook_ring_buffer.reset();
+        }
     }
     LOG_INFO(Render, "constant ring: level {}", const_ring_level);
     if (const char* env = std::getenv("TLG_INPLACE"); env != nullptr && *env != 0 && *env != '0') {
@@ -1520,7 +1534,7 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
                 if (rb.index == index) {
                     out.address = rb.address;
                     out.size = rb.size;
-                    out.data = constant_ring->Data(rb.offset);
+                    out.data = rb.hook ? Core::HookRing::Data(rb.offset) : constant_ring->Data(rb.offset);
                     out.found = true;
                     return out;
                 }
@@ -3812,10 +3826,18 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
         if (ring) {
             Census(census_base + CBufferRing);
             // Copied by the command processor thread into the constant ring (read-only, small, not written by queued work).
-            if (!desc.IsSpecial()) {
-                push_data.AddOffset(binding.buffer, 0);
+            if (ring->hook && hook_ring_buffer) {
+                // F1 1a: bound straight from the hook ring at the guest address's ring offset (aligned down, the rest through the push offset as for every other buffer)
+                const u64 aligned = Common::AlignDown(ring->offset, alignment);
+                const u64 adjust = ring->offset - aligned;
+                push_data.AddOffset(binding.buffer, adjust);
+                buffer_infos.emplace_back(hook_ring_buffer->Handle(), aligned, ring->size + adjust);
+            } else {
+                if (!desc.IsSpecial()) {
+                    push_data.AddOffset(binding.buffer, 0);
+                }
+                buffer_infos.emplace_back(constant_ring->Handle(), ring->offset, ring->size);
             }
-            buffer_infos.emplace_back(constant_ring->Handle(), ring->offset, ring->size);
             ring_use.bound.fetch_add(1, std::memory_order_relaxed);
             static const bool ring_verify = [] { const char* e = std::getenv("TLG_RING_VERIFY"); return e != nullptr && e[0] == '1'; }();
             if (ring_verify && !desc.IsSpecial()) {
@@ -3846,7 +3868,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     }
                 }
             }
-            if (ring_verify && ring->address != 0 && memory->IsValidMapping(ring->address, ring->size)) {
+            if (ring_verify && !ring->hook && ring->address != 0 && memory->IsValidMapping(ring->address, ring->size)) { // (a hook ring binding is checked by TLG_HOOK_RING itself)
                 // bisect: the ring copy (made by the command processor) against guest memory now (what the raster thread's own copy would read)
                 std::vector<u8> now(ring->size);
                 memory->CopySparseMemory(ring->address, now.data(), ring->size);
@@ -4475,10 +4497,18 @@ void Rasterizer::ResolveBufferBindingBody(const Shader::Info& stage, u32 buffer_
         if (ring) {
             Census(census_base + CBufferRing);
             // Copied by the command processor thread into the constant ring (read-only, small, not written by queued work).
-            if (!desc.IsSpecial()) {
-                out.has_offset = true; out.adjust = static_cast<u32>(0);
+            if (ring->hook && hook_ring_buffer) {
+                // F1 1a: bound straight from the hook ring (see the other binder)
+                const u64 aligned = Common::AlignDown(ring->offset, alignment);
+                const u64 adjust = ring->offset - aligned;
+                out.has_offset = true; out.adjust = static_cast<u32>(adjust);
+                out.info = vk::DescriptorBufferInfo(hook_ring_buffer->Handle(), aligned, ring->size + adjust);
+            } else {
+                if (!desc.IsSpecial()) {
+                    out.has_offset = true; out.adjust = static_cast<u32>(0);
+                }
+                out.info = vk::DescriptorBufferInfo(constant_ring->Handle(), ring->offset, ring->size);
             }
-            out.info = vk::DescriptorBufferInfo(constant_ring->Handle(), ring->offset, ring->size);
             ring_use.bound.fetch_add(1, std::memory_order_relaxed);
             static const bool ring_verify = [] { const char* e = std::getenv("TLG_RING_VERIFY"); return e != nullptr && e[0] == '1'; }();
             if (ring_verify && !desc.IsSpecial()) {
@@ -4509,7 +4539,7 @@ void Rasterizer::ResolveBufferBindingBody(const Shader::Info& stage, u32 buffer_
                     }
                 }
             }
-            if (ring_verify && ring->address != 0 && memory->IsValidMapping(ring->address, ring->size)) {
+            if (ring_verify && !ring->hook && ring->address != 0 && memory->IsValidMapping(ring->address, ring->size)) { // (a hook ring binding is checked by TLG_HOOK_RING itself)
                 // bisect: the ring copy (made by the command processor) against guest memory now (what the raster thread's own copy would read)
                 std::vector<u8> now(ring->size);
                 memory->CopySparseMemory(ring->address, now.data(), ring->size);

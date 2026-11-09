@@ -332,6 +332,7 @@ private:
 
     u32 const_ring_level = 0;
     std::unique_ptr<ConstantRing> constant_ring;
+    std::unique_ptr<VideoCore::Buffer> hook_ring_buffer; ///< F1 1a (TLG_HOOK_RING=2): the frame ring copy filled at the writes, two lap halves, in GPU-visible memory
     // N7.5 (raster thread)
     bool inplace_on = false;
     u32 inplace_cap = 16384;
