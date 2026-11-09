@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <unordered_set>
 #include <atomic>
 #include <thread>
 #include "common/arch.h"
@@ -58,6 +59,46 @@
 #include "video_core/renderer_vulkan/vk_rasterizer_engine.h"
 #include "native/native_census.h"
 #include "native/native_split_census.h"
+
+namespace {
+thread_local u32 t_cover_class = 15; // R-slice census: the draw class of the draw being timed
+
+/// W1.0: what one draw bound, as the raster thread sees it; filled while the draw is built, consumed at the end of Draw()
+struct W1Capture {
+    u64 pipeline{};
+    u64 depth{};                 ///< depth target address (the pass)
+    u64 state{};                 ///< viewport, scissor, depth target, draw class hash
+    u64 push{};                  ///< push constants hash
+    u64 vertex{};                ///< hash of the vertex buffers (handle, offset)
+    u64 index{};                 ///< hash of the index buffer (handle, offset)
+    u64 index_handle{};          ///< the index buffer's Vulkan handle alone
+    std::vector<u64> other_handles; ///< the Vulkan handle alone of every other shader buffer
+    u32 index_count{}, instances{};
+    u32 images{};
+    std::vector<u64> ring;       ///< constant ring windows (offset, range)
+    std::vector<u64> other;      ///< every other shader buffer (handle, offset, range)
+    bool valid{false};
+};
+thread_local W1Capture t_w1;
+struct W1Pass {
+    u64 depth{~0ull};
+    u64 draws{0};
+    std::unordered_set<u64> pipelines, geometry, other, ring, state, index_handles, other_handles;
+    bool have_prev{false};
+    u64 prev_pipeline{}, prev_geometry{}, prev_other{}, prev_push{}, prev_state{}, prev_vertex{}, prev_index{};
+    u64 pairs{0}, same_pipeline{0}, same_geometry{0}, same_other{0}, same_push{0}, same_state{0}, same_vertex{0}, same_index{0};
+};
+thread_local W1Pass t_w1_pass;
+inline u64 W1Mix(u64 h, u64 v) noexcept {
+    h = (h ^ v) * 0x100000001b3ull;
+    return h ^ (h >> 29);
+}
+} // namespace
+
+namespace VideoCore {
+extern thread_local u64 t_cover_sync_ns; // buffer_cache.cpp: A2 census, time in SynchronizeMemory
+extern thread_local u64 t_cover_sync_copies;
+}
 
 namespace Vulkan {
 
@@ -802,6 +843,24 @@ struct Rasterizer::DrawJob {
 };
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
+    struct CoverDrawScope {
+        Rasterizer* self;
+        u64 begin{0};
+        explicit CoverDrawScope(Rasterizer* r) noexcept : self(r) {
+            if (self->cover_on) [[unlikely]] {
+                t_cover_class = 15;
+                begin = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+            }
+        }
+        ~CoverDrawScope() {
+            if (begin != 0) [[unlikely]] {
+                const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+                self->cover_class_total_ns[t_cover_class & 15u].fetch_add(now - begin, std::memory_order_relaxed);
+                self->W1EndDraw();
+            }
+        }
+    } cover_draw_scope{this};
+    BarrierCensus::SetOp(0x4000000000000000ull);
     Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseDraw, engine_clear_on);
     if (SkipForEngineClear() && plan != nullptr) {
         // a draw inside a clear's range is never the clear's own (the clear function draws nothing): counted as "run" (kind 2)
@@ -915,6 +974,27 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         }
     }
     draw_inputs = &plan->inputs;
+    if (cover_on) [[unlikely]] {
+        auto& w = t_w1;
+        w.valid = false;
+        w.depth = draw_inputs->depth_buffer.DepthAddress();
+        u64 st = W1Mix(0xcbf29ce484222325ull, w.depth);
+        for (u32 i = 0; i < fixed.viewport_count; ++i) {
+            const auto& v = fixed.viewports[i];
+            const auto& sc = fixed.scissors[i];
+            st = W1Mix(st, std::bit_cast<u32>(v.x));
+            st = W1Mix(st, std::bit_cast<u32>(v.y));
+            st = W1Mix(st, std::bit_cast<u32>(v.width));
+            st = W1Mix(st, std::bit_cast<u32>(v.height));
+            st = W1Mix(st, static_cast<u64>(sc.offset.x) << 32 | static_cast<u32>(sc.offset.y));
+            st = W1Mix(st, static_cast<u64>(sc.extent.width) << 32 | sc.extent.height);
+        }
+        w.state = st;
+        w.vertex = 0;
+        w.index = 0;
+        w.index_count = draw_inputs->num_indices;
+        w.instances = draw_inputs->num_instances.NumInstances();
+    }
     prof_inputs.End();
     current_bc_base = &draw_inputs->ta_bc_base;
     current_cb_extent = plan ? &plan->cb_extent : &executor->RasterCbExtents();
@@ -1047,6 +1127,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset, const DrawPlan* plan) {
     // B11: the work inside an engine clear is run (see Draw)
+    BarrierCensus::SetOp(0x4000000000000000ull);
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -1199,6 +1280,24 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     current_cs = plan ? &plan->cs : &no_program;
     current_bc_base = plan ? &plan->ta_bc_base : &no_border_colors;
     const auto& cs_program = *current_cs;
+    BarrierCensus::SetOp(cs_program.address);
+    // G2 (TLG_SIM_INDEPENDENT): the SimParticle dispatches are one independent group (Phase 0b)
+    bool group_in_use = false;
+    struct GroupScope {
+        Runtime& rt;
+        ~GroupScope() {
+            rt.SetIndependentGroup(0);
+        }
+    } group_scope{runtime};
+    if (IndependentGroup::Mode() != 0 && plan != nullptr) {
+        static std::unordered_map<u64, bool> is_group;
+        auto it = is_group.find(cs_program.address);
+        if (it == is_group.end()) {
+            it = is_group.emplace(cs_program.address, Core::NativeDraw::IsShaderEntry(cs_program.address, "CS_SimParticle", "SimParticle")).first;
+        }
+        group_in_use = it->second;
+        runtime.SetIndependentGroup(it->second ? 1u : 0u);
+    }
     const ComputePipeline* pipeline = ResolveDispatchPipeline(plan);
     if (!pipeline) {
         return;
@@ -1260,6 +1359,109 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
         return;
     }
 
+    BarrierCensus::Dispatch(cs_program.address, needs_barrier, cs.pgm_hash);
+    if (IndependentGroup::Mode() != 0 && group_in_use) {
+        bool real_hazard = false, aware_hazard = false;
+        runtime.TakeHazardFlags(real_hazard, aware_hazard);
+        IndependentGroup::NoteDispatch(needs_barrier, real_hazard, aware_hazard);
+    }
+    if (BarrierCensus::On() && plan != nullptr && Core::NativeDraw::IsShaderEntry(cs_program.address, "CS_SimParticle", "SimParticle")) {
+        // G2 step 1 (counters only): the slice [base, base + count) x 240 bytes of the particle pool this dispatch touches. Shader read 2026-11-09: buffer 0 holds count at dword 104 and
+        // base at dword 106, buffer 1 is the pool with a 60 dword record; thread i < count touches record base + i.
+        struct Located {
+            u64 address{};
+            u32 size{};
+            const u8* data{};
+            bool found{};
+        };
+        auto locate = [&](u32 index) {
+            Located out;
+            for (const auto& rb : plan->stage.ring) {
+                if (rb.index == index) {
+                    out.address = rb.address;
+                    out.size = rb.size;
+                    out.data = constant_ring->Data(rb.offset);
+                    out.found = true;
+                    return out;
+                }
+            }
+            if (index < plan->stage.resolved.size() && plan->stage.resolved[index].address != 0) {
+                out.address = plan->stage.resolved[index].address;
+                out.size = plan->stage.resolved[index].size;
+                out.found = true;
+            }
+            return out;
+        };
+        const Located ctrl = locate(0);
+        {
+            u32 position = 0;
+            for (const auto& [bbuf, boffset, bsize, baccess] : bound_buffers) {
+                BarrierCensus::SimBinding(cs_program.address, position++, bsize, static_cast<bool>(baccess & vk::AccessFlagBits2::eShaderWrite));
+            }
+        }
+        // the pool is the written buffer: among the buffers this dispatch bound, the largest one with shader write access (key = the Vulkan buffer object, offsets inside it)
+        Located pool;
+        u64 pool_key = 0, pool_offset = 0;
+        for (const auto& [bbuf, boffset, bsize, baccess] : bound_buffers) {
+            if ((baccess & vk::AccessFlagBits2::eShaderWrite) && bsize > pool.size) {
+                pool.size = static_cast<u32>(bsize);
+                pool.found = true;
+                pool_key = reinterpret_cast<u64>(bbuf);
+                pool_offset = boffset;
+            }
+        }
+        u32 status = 0, count = 0, base = 0;
+        u64 begin = 0, end = 0;
+        bool from_ring = false;
+        std::array<u32, 107> words{};
+        if (!ctrl.found) {
+            status = 1;
+        } else if (ctrl.size < 107 * 4) {
+            status = 2;
+        } else if (!pool.found) {
+            status = 5;
+        } else {
+            if (ctrl.data != nullptr) {
+                std::memcpy(words.data(), ctrl.data, sizeof(words));
+                from_ring = true;
+            } else if (memory->IsValidMapping(ctrl.address, sizeof(words))) {
+                memory->CopySparseMemory(ctrl.address, reinterpret_cast<u8*>(words.data()), sizeof(words));
+            } else {
+                status = 1;
+            }
+            if (status == 0) {
+                count = words[104];
+                base = words[106];
+                const u64 n = std::min<u64>(count, static_cast<u64>(cs_program.dim_x) * 64);
+                if (n == 0) {
+                    status = 3;
+                } else if ((static_cast<u64>(base) + n) * 240 > pool.size) {
+                    status = 4;
+                } else {
+                    begin = pool_offset + static_cast<u64>(base) * 240;
+                    end = pool_offset + (static_cast<u64>(base) + n) * 240;
+                }
+            }
+        }
+        BarrierCensus::SimSlice(cs_program.address, status, from_ring, pool_key, begin, end, count, base);
+        if (status == 0 && !bound_buffers.empty()) {
+            // render slot probe: word 6 of record base + i in the record buffer (the first buffer this dispatch bound), as guest memory holds it now
+            const auto& [rbuf, roffset, rsize, raccess] = bound_buffers.front();
+            const u32 n_read = static_cast<u32>(std::min<u64>(std::min<u64>(count, static_cast<u64>(cs_program.dim_x) * 64), 512));
+            std::array<u32, 512> slots{}, index{};
+            bool readable = rbuf->CpuAddr() != 0 && (static_cast<u64>(base) + n_read) * 240 <= rsize;
+            for (u32 i = 0; readable && i < n_read; ++i) {
+                const VAddr a = rbuf->CpuAddr() + roffset + static_cast<u64>(base + i) * 240 + 24;
+                if (!memory->IsValidMapping(a, 4)) {
+                    readable = false;
+                    break;
+                }
+                memory->CopySparseMemory(a, reinterpret_cast<u8*>(&slots[i]), 4);
+                index[i] = base + i;
+            }
+            BarrierCensus::SimSlots(slots.data(), index.data(), n_read, readable);
+        }
+    }
     if (needs_barrier) {
         TLG_PROF_LEVEL("raster.flush_barriers", 2);
         runtime.FlushBarriers();
@@ -1303,6 +1505,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Dis
 
     current_cs = plan ? &plan->cs : &no_program;
     current_bc_base = plan ? &plan->ta_bc_base : &no_border_colors;
+    BarrierCensus::SetOp(current_cs->address);
     const ComputePipeline* pipeline = ResolveDispatchPipeline(plan);
     if (!pipeline) {
         return;
@@ -1354,6 +1557,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Dis
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
     bound_buffers.emplace_back(buffer, base, size, vk::AccessFlagBits2::eIndirectCommandRead);
 
+    BarrierCensus::Dispatch(current_cs->address, needs_barrier);
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
@@ -1587,7 +1791,217 @@ void Rasterizer::BindCensus(const Pipeline* pipeline) {
     }
 }
 
+namespace {
+thread_local u32 t_cover_mask = 0;
+thread_local u32 t_cover_kind = 0; // R1': the kind of the last binding the stage loop counted
+thread_local u64 t_cover_begin = 0;
+} // namespace
+
+enum W1Count : u32 {
+    W1Passes = 0, W1Draws, W1SumPipelines, W1MaxPipelines, W1PipesLe8, W1PipesLe16, W1PipesLe24, W1PipesMore, W1SumGeometry, W1GeomLe10, W1GeomLe33, W1GeomLe66, W1GeomMore, W1SumOther,
+    W1SumRing, W1SumState, W1Pairs, W1SamePipeline, W1SameGeometry, W1SameOther, W1SamePush, W1SameState, W1SameVertex, W1SameIndex, W1RingPerDraw, W1OtherPerDraw, W1ImagesPerDraw,
+    W1Indices, W1Instances, W1PassesOne, W1DrawsInPassesOver50, W1SumIndexHandles, W1SumOtherHandles,
+};
+
+void Rasterizer::W1NoteBinding(const Pipeline* pipeline) noexcept {
+    // called from FinishBindResources for every draw: the shader bindings of this draw
+    auto& c = t_w1;
+    c.pipeline = reinterpret_cast<u64>(pipeline);
+    c.ring.clear();
+    c.other.clear();
+    c.other_handles.clear();
+    const VkBuffer ring_handle = constant_ring ? static_cast<VkBuffer>(constant_ring->Handle()) : VK_NULL_HANDLE;
+    for (const auto& b : buffer_infos) {
+        if (static_cast<VkBuffer>(b.buffer) == ring_handle) {
+            c.ring.push_back(W1Mix(W1Mix(0x52494e47ull, b.offset), b.range));
+        } else {
+            c.other.push_back(W1Mix(W1Mix(reinterpret_cast<u64>(static_cast<VkBuffer>(b.buffer)), b.offset), b.range));
+            c.other_handles.push_back(reinterpret_cast<u64>(static_cast<VkBuffer>(b.buffer)));
+        }
+    }
+    c.images = static_cast<u32>(image_infos.size());
+    c.push = W1Mix(W1Mix(W1Mix(std::bit_cast<u32>(push_data.xoffset), std::bit_cast<u32>(push_data.yoffset)), std::bit_cast<u32>(push_data.xscale)), std::bit_cast<u32>(push_data.yscale));
+    c.valid = true;
+}
+
+void Rasterizer::W1EndDraw() noexcept {
+    auto& c = t_w1;
+    auto& p = t_w1_pass;
+    auto& n = w1_counts;
+    const auto flush_pass = [&]() {
+        if (p.draws == 0) {
+            return;
+        }
+        n[W1Passes].fetch_add(1, std::memory_order_relaxed);
+        n[W1Draws].fetch_add(p.draws, std::memory_order_relaxed);
+        const u64 np = p.pipelines.size();
+        n[W1SumPipelines].fetch_add(np, std::memory_order_relaxed);
+        u64 old = n[W1MaxPipelines].load(std::memory_order_relaxed);
+        while (np > old && !n[W1MaxPipelines].compare_exchange_weak(old, np, std::memory_order_relaxed)) {
+        }
+        n[np <= 8 ? W1PipesLe8 : np <= 16 ? W1PipesLe16 : np <= 24 ? W1PipesLe24 : W1PipesMore].fetch_add(1, std::memory_order_relaxed);
+        const u64 ng = p.geometry.size();
+        n[W1SumGeometry].fetch_add(ng, std::memory_order_relaxed);
+        const double ratio = static_cast<double>(ng) / static_cast<double>(p.draws);
+        n[ratio <= 0.10 ? W1GeomLe10 : ratio <= 0.33 ? W1GeomLe33 : ratio <= 0.66 ? W1GeomLe66 : W1GeomMore].fetch_add(1, std::memory_order_relaxed);
+        n[W1SumOther].fetch_add(p.other.size(), std::memory_order_relaxed);
+        n[W1SumRing].fetch_add(p.ring.size(), std::memory_order_relaxed);
+        n[W1SumState].fetch_add(p.state.size(), std::memory_order_relaxed);
+        n[W1Pairs].fetch_add(p.pairs, std::memory_order_relaxed);
+        n[W1SamePipeline].fetch_add(p.same_pipeline, std::memory_order_relaxed);
+        n[W1SameGeometry].fetch_add(p.same_geometry, std::memory_order_relaxed);
+        n[W1SameOther].fetch_add(p.same_other, std::memory_order_relaxed);
+        n[W1SamePush].fetch_add(p.same_push, std::memory_order_relaxed);
+        n[W1SameState].fetch_add(p.same_state, std::memory_order_relaxed);
+        n[W1SameVertex].fetch_add(p.same_vertex, std::memory_order_relaxed);
+        n[W1SameIndex].fetch_add(p.same_index, std::memory_order_relaxed);
+        if (p.draws > 50) {
+            n[W1DrawsInPassesOver50].fetch_add(p.draws, std::memory_order_relaxed);
+        }
+        if (p.draws == 1) {
+            n[W1PassesOne].fetch_add(1, std::memory_order_relaxed);
+        }
+        n[W1SumIndexHandles].fetch_add(p.index_handles.size(), std::memory_order_relaxed);
+        n[W1SumOtherHandles].fetch_add(p.other_handles.size(), std::memory_order_relaxed);
+        p.index_handles.clear();
+        p.other_handles.clear();
+        p.pipelines.clear();
+        p.geometry.clear();
+        p.other.clear();
+        p.ring.clear();
+        p.state.clear();
+        p.draws = p.pairs = p.same_pipeline = p.same_geometry = p.same_other = p.same_push = p.same_state = p.same_vertex = p.same_index = 0;
+        p.have_prev = false;
+    };
+    if (t_cover_class != 0 || !c.valid) {
+        flush_pass(); // the class changed: the pass ended
+        p.depth = ~0ull;
+        c.valid = false;
+        return;
+    }
+    if (p.depth != c.depth) {
+        flush_pass();
+        p.depth = c.depth;
+    }
+    const u64 geometry = W1Mix(c.vertex, c.index);
+    u64 other_set = 0xcbf29ce484222325ull;
+    for (const u64 v : c.other) {
+        other_set = W1Mix(other_set, v);
+    }
+    ++p.draws;
+    p.pipelines.insert(c.pipeline);
+    p.geometry.insert(geometry);
+    p.other.insert(other_set);
+    p.index_handles.insert(c.index_handle);
+    for (const u64 v : c.other_handles) {
+        p.other_handles.insert(v);
+    }
+    for (const u64 v : c.ring) {
+        p.ring.insert(v);
+    }
+    p.state.insert(c.state);
+    n[W1RingPerDraw].fetch_add(c.ring.size(), std::memory_order_relaxed);
+    n[W1OtherPerDraw].fetch_add(c.other.size(), std::memory_order_relaxed);
+    n[W1ImagesPerDraw].fetch_add(c.images, std::memory_order_relaxed);
+    n[W1Indices].fetch_add(c.index_count, std::memory_order_relaxed);
+    n[W1Instances].fetch_add(c.instances, std::memory_order_relaxed);
+    if (p.have_prev) {
+        ++p.pairs;
+        p.same_pipeline += p.prev_pipeline == c.pipeline;
+        p.same_geometry += p.prev_geometry == geometry;
+        p.same_other += p.prev_other == other_set;
+        p.same_push += p.prev_push == c.push;
+        p.same_state += p.prev_state == c.state;
+        p.same_vertex += p.prev_vertex == c.vertex;
+        p.same_index += p.prev_index == c.index;
+    }
+    p.have_prev = true;
+    p.prev_pipeline = c.pipeline;
+    p.prev_geometry = geometry;
+    p.prev_other = other_set;
+    p.prev_push = c.push;
+    p.prev_state = c.state;
+    p.prev_vertex = c.vertex;
+    p.prev_index = c.index;
+    c.valid = false;
+}
+
+void Rasterizer::NoteCover(u32 index) noexcept {
+    switch (index & 31) {
+    case CBufferRing:
+        t_cover_kind = 1;
+        break;
+    case CBufferSpecial:
+        t_cover_kind = 2;
+        break;
+    case CBufferNull:
+        t_cover_kind = 3;
+        break;
+    case CBufferResolved:
+        t_cover_kind = 7;
+        break;
+    case CBindResources:
+        t_cover_mask = 0;
+        ::VideoCore::t_cover_sync_ns = 0;
+        t_cover_begin = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        break;
+    case CBufferHandle:
+        t_cover_mask |= 1;
+        t_cover_kind = 4;
+        break;
+    case CBufferAddrRead:
+        t_cover_mask |= 2;
+        t_cover_kind = 5;
+        break;
+    case CBufferAddrWritten:
+        t_cover_mask |= 2;
+        t_cover_kind = 6;
+        break;
+    case CImageLookupHit:
+        t_cover_mask |= 4;
+        break;
+    case CImageFind:
+        t_cover_mask |= 8;
+        break;
+    case CImageStorage:
+        t_cover_mask |= 16;
+        break;
+    case CImageTransitTrue:
+        t_cover_mask |= 32;
+        break;
+    case CGeometryVertexAddress:
+    case CGeometryIndexAddress:
+        t_cover_mask |= 64;
+        break;
+    default:
+        break;
+    }
+}
+
+void Rasterizer::CoverFinish(bool compute) noexcept {
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    const u32 slot = (compute ? 128u : 0u) + (t_cover_mask & 127u);
+    cover_count[slot].fetch_add(1, std::memory_order_relaxed);
+    cover_ns[slot].fetch_add(t_cover_begin != 0 ? now - t_cover_begin : 0, std::memory_order_relaxed);
+    cover_sync_ns[slot].fetch_add(::VideoCore::t_cover_sync_ns, std::memory_order_relaxed);
+    if (!compute) {
+        const u32 c = draw_class_now & 15u;
+        t_cover_class = c;
+        cover_class_draws[c].fetch_add(1, std::memory_order_relaxed);
+        cover_class_bind_ns[c].fetch_add(t_cover_begin != 0 ? now - t_cover_begin : 0, std::memory_order_relaxed);
+    }
+    ::VideoCore::t_cover_sync_ns = 0;
+    t_cover_begin = 0;
+}
+
 void Rasterizer::FinishBindResources(const Pipeline* pipeline, bool uses_dma, u64 resolve_ns) {
+    if (cover_on) [[unlikely]] {
+        CoverFinish(pipeline->IsCompute());
+        static const bool w1_on = [] { const char* e = std::getenv("TLG_W1_CENSUS"); return e != nullptr && e[0] == '1'; }();
+        if (w1_on && !pipeline->IsCompute()) {
+            W1NoteBinding(pipeline);
+        }
+    }
     BindCensus(pipeline);
     if (ReuseCensusOn()) {
         // reuse census (counts only): the shape of this draw, with the ring normalized
@@ -2083,6 +2497,13 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
     }
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto num_buffers = guest_buffers.size();
+    if (cover_on) [[unlikely]] {
+        u64 hv = 0xcbf29ce484222325ull;
+        for (size_t i = 0; i < host_buffers.size(); ++i) {
+            hv = W1Mix(W1Mix(hv, reinterpret_cast<u64>(static_cast<VkBuffer>(host_buffers[i]))), host_offsets[i]);
+        }
+        t_w1.vertex = hv;
+    }
     if (instance.IsVertexInputDynamicState()) {
         cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
     } else {
@@ -2194,6 +2615,13 @@ void Rasterizer::RecordVertexBuffers(VertexBind& vb, VideoCore::BufferCache::Upl
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto num_buffers = vb.host_buffers.size();
     if (instance.IsVertexInputDynamicState()) {
+        if (cover_on) [[unlikely]] {
+            u64 hv = 0xcbf29ce484222325ull;
+            for (size_t i = 0; i < vb.host_buffers.size(); ++i) {
+                hv = W1Mix(W1Mix(hv, reinterpret_cast<u64>(static_cast<VkBuffer>(vb.host_buffers[i]))), vb.host_offsets[i]);
+            }
+            t_w1.vertex = hv;
+        }
         cmdbuf.bindVertexBuffers(0, num_buffers, vb.host_buffers.data(), vb.host_offsets.data());
     } else {
         cmdbuf.bindVertexBuffers2(0, num_buffers, vb.host_buffers.data(), vb.host_offsets.data(), vb.host_sizes.data(), vb.host_strides.data());
@@ -2310,6 +2738,10 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
     } else {
         cmdbuf.bindIndexBuffer(index_buffer, buffer_offset, index_type);
     }
+    if (cover_on) [[unlikely]] {
+        t_w1.index = W1Mix(reinterpret_cast<u64>(static_cast<VkBuffer>(index_buffer)), buffer_offset);
+        t_w1.index_handle = reinterpret_cast<u64>(static_cast<VkBuffer>(index_buffer));
+    }
 }
 
 void Rasterizer::ResolveIndexBuffer(u32 index_offset, bool is_indirect, IndexBind& ib) {
@@ -2396,6 +2828,10 @@ void Rasterizer::RecordIndexBuffer(IndexBind& ib, VideoCore::BufferCache::Upload
     } else {
         cmdbuf.bindIndexBuffer(ib.buffer, ib.offset, ib.type);
     }
+    if (cover_on) [[unlikely]] {
+        t_w1.index = W1Mix(reinterpret_cast<u64>(static_cast<VkBuffer>(ib.buffer)), ib.offset);
+        t_w1.index_handle = reinterpret_cast<u64>(static_cast<VkBuffer>(ib.buffer));
+    }
 }
 
 static std::mutex g_job_pool_mutex;
@@ -2443,6 +2879,7 @@ void Rasterizer::RunDrawJob(std::unique_ptr<DrawJob>&& job) {
 }
 
 void Rasterizer::RecordDraw(DrawJob& d) {
+    BarrierCensus::SetOp(0x4000000000000000ull);
     TLG_PROF_LEVEL("raster.record_draw_all", 2);
     const GraphicsPipeline* pipeline = d.pipeline;
     const FixedState& fixed = d.fixed;
@@ -2814,6 +3251,14 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
     const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
+        u64 cover_t0 = 0, cover_sync0 = 0, cover_copies0 = 0;
+        u32 cover_cause = 0;
+        if (cover_on) [[unlikely]] {
+            t_cover_kind = 0;
+            cover_t0 = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+            cover_sync0 = ::VideoCore::t_cover_sync_ns;
+            cover_copies0 = ::VideoCore::t_cover_sync_copies;
+        }
         Census(census_base + CBufferTotal);
         const auto src_access =
             vk::AccessFlagBits2::eShaderRead |
@@ -2962,6 +3407,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                       : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
                                                                                                                   : nullptr) {
                 cp_no_object = buffer_index < ns->resolved.size() && ns->resolved[buffer_index].no_object && ns->resolved_epoch == Core::NativeResources::ImmutableEpoch();
+                cover_cause = cp_no_object ? 1u : 0u;
             }
             if (const StagePlan* rs = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
                                       : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
@@ -2980,6 +3426,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         const u64 adjust = copy_offset - offset_aligned;
                         push_data.AddOffset(binding.buffer, adjust);
                         buffer_infos.emplace_back(copy->Handle(), offset_aligned, r.size + adjust);
+                        cover_cause = 9;
                         Census(census_base + CBufferResolved);
                         resolve_stats.hits.fetch_add(1, std::memory_order_relaxed);
                         recipe_ranges.emplace_back(r.address, r.size);
@@ -2999,6 +3446,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         if (runtime.PlanHasWrites() && runtime.IsBufferAccessed(arena, offset, r.size, false)) {
                             needs_barrier = true;
                         }
+                        cover_cause = 10;
                         Census(census_base + CBufferResolved);
                         resolve_stats.hits.fetch_add(1, std::memory_order_relaxed);
                         recipe_ranges.emplace_back(r.address, r.size);
@@ -3009,8 +3457,10 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                     : object->generation.load(std::memory_order_relaxed) != r.generation                       ? 3
                                     : arena == nullptr || object->resident_epoch.load(std::memory_order_relaxed) != buffer_cache.PlacementEpoch() ? 4 : 5;
                     resolve_stats.stale_why[why].fetch_add(1, std::memory_order_relaxed);
+                    cover_cause = 3 + why;
                 } else {
                     resolve_stats.stale_why[0].fetch_add(1, std::memory_order_relaxed);
+                    cover_cause = 2;
                 }
                 resolve_stats.stale.fetch_add(1, std::memory_order_relaxed);
             }
@@ -3100,6 +3550,13 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 }
                 if (immutable_hint != nullptr) {
                     Census(census_base + CBufferHandle);
+                    if (cover_on && desc.is_formatted && !desc.is_written) [[unlikely]] {
+                        const u32 b = census_base != 0 ? 4u : 0u;
+                        cover_texel[b + 0].fetch_add(1, std::memory_order_relaxed);
+                        cover_texel[b + 1].fetch_add(texture_cache.AnyImageOverlaps(vsharp.address, size) ? 1 : 0, std::memory_order_relaxed);
+                        cover_texel[b + 2].fetch_add(texture_cache.IsMeta(vsharp.address) ? 1 : 0, std::memory_order_relaxed);
+                        cover_texel[b + 3].fetch_add(buffer_cache.IsRangeGpuWritten(vsharp.address, size) ? 1 : 0, std::memory_order_relaxed);
+                    }
                 } else if (desc.is_written) {
                     Census(census_base + CBufferAddrWritten);
                 } else {
@@ -3261,6 +3718,22 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
         }
 
     buffer_bound:
+        if (cover_on) [[unlikely]] {
+            const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+            const u32 slot = (census_base != 0 ? 128u : 0u) + (cover_cause & 15u) * 8u + (t_cover_kind & 7u);
+            cover_buf_n[slot].fetch_add(1, std::memory_order_relaxed);
+            cover_buf_ns[slot].fetch_add(now - cover_t0, std::memory_order_relaxed);
+            cover_buf_sync[slot].fetch_add(::VideoCore::t_cover_sync_ns - cover_sync0, std::memory_order_relaxed);
+            cover_buf_copies[slot].fetch_add(::VideoCore::t_cover_sync_copies - cover_copies0, std::memory_order_relaxed);
+            if (cover_cause == 0 && t_cover_kind == 4) {
+                const u32 code = (desc.is_written ? 1u : 0u) | (desc.is_formatted ? 2u : 0u) | (desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase ? 4u : 0u) |
+                                 (desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad ? 8u : 0u);
+                const u32 s = (census_base != 0 ? 16u : 0u) + code;
+                cover_skip_n[s].fetch_add(1, std::memory_order_relaxed);
+                cover_skip_ns[s].fetch_add(now - cover_t0, std::memory_order_relaxed);
+                cover_skip_sync[s].fetch_add(::VideoCore::t_cover_sync_ns - cover_sync0, std::memory_order_relaxed);
+            }
+        }
         if (indexed_active && stage.indexed && Shader::Indexed::IsIndexedBufferType(desc.buffer_type)) {
             auto* indexed = IndexedData::Get();
             const auto& info = buffer_infos.back();

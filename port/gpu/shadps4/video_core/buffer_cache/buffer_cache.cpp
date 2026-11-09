@@ -1235,8 +1235,28 @@ bool BufferCache::IsRangeGpuWritten(VAddr addr, size_t size) {
     return gpu_modified_ranges.Intersects(addr, size);
 }
 
+bool g_cover_sync_on = [] { const char* e = std::getenv("TLG_COVER_CENSUS"); return e != nullptr && e[0] == '1'; }();
+thread_local u64 t_cover_sync_ns = 0;
+thread_local u64 t_cover_sync_copies = 0; ///< A2 census: SynchronizeMemory calls since the reset that ended with something to copy ///< A2 census: time spent in SynchronizeMemory since the raster thread reset it (read and reset by Rasterizer::CoverFinish)
+namespace {
+struct CoverSyncTimer {
+    u64 begin{0};
+    CoverSyncTimer() noexcept {
+        if (g_cover_sync_on) [[unlikely]] {
+            begin = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        }
+    }
+    ~CoverSyncTimer() {
+        if (begin != 0) [[unlikely]] {
+            t_cover_sync_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()) - begin;
+        }
+    }
+};
+} // namespace
+
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
+    CoverSyncTimer cover_sync_timer;
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseBufResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::BufSync);
     Core::N0::SyncScope n0_sync{size, last_upload_bytes};
@@ -1680,6 +1700,9 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         for (const auto& copy : copies) {
             Core::NativeUploads::NoteUploadedRange(copy.dstOffset, copy.size);
         }
+    }
+    if (!copies.empty() && g_cover_sync_on) {
+        ++t_cover_sync_copies;
     }
     if (!copies.empty()) {
         // where uploads go: the arena (memory no placed buffer holds), a placed buffer in plain device memory, a placed buffer the CPU can write

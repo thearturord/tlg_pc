@@ -7307,6 +7307,7 @@ u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4
             if (pointer != 0 && bytes != 0 && bytes <= (1ull << 28)) {
                 Core::NativeContent::NoteTextureMap(Rd<u64>(resource, 0x10), pointer, bytes, Rd<u32>(out, 8), Rd<u32>(out, 0xc), static_cast<u32>(type));
                 const u64 announce = Core::NativeContent::MapAnnounceBytes(pointer, bytes);
+                Core::NativeUpdates::MarkNextMapTexture();
                 Core::NativeUpdates::NoteMap(Rd<u64>(resource, 0x10), Core::NativeResources::ResourceUsage(resource), static_cast<u32>(type), pointer, static_cast<u32>(announce),
                                              Rd<u64>(resource, 0x30), ret, 0);
             }
@@ -9123,6 +9124,16 @@ void PublishShaderNames() {
                         {"file", n.file}, {"entry", n.entry}, {"defines", n.defines}, {"first_resource", n.first_resource}});
     }
     Core::DebugServer::Publish("shader_names", {{"count", shader_names.size()}, {"shaders", std::move(list)}});
+}
+
+bool IsShaderEntry(u64 program, const char* file, const char* entry) {
+    std::scoped_lock lock{shader_names_mutex};
+    for (const auto& n : shader_names) {
+        if (n.program == program && n.file == file && n.entry == entry) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// N6.4: `FUN_01ee4e50(inner, instance group, view type)` binds an instance group for a depth / G-buffer batch. It copies the group's instance data (`memcpy` of `uploader[2]` bytes from

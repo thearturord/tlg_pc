@@ -59,6 +59,8 @@ struct Entry {
     u32 writer{};
     std::shared_ptr<const u8[]> block; ///< the bytes live in a block that a copy's entries share with the entry they were copied from
     u64 offset{};                      ///< where this entry's first byte is in the block
+    mutable bool read{false};          ///< A1 census: a reader (OverlayImage) used this entry's bytes at least once
+    bool skippable{false};             ///< A1.0 shadow: announced as not image content
     [[nodiscard]] const u8* Bytes() const {
         return block.get() + offset;
     }
@@ -99,6 +101,12 @@ std::atomic<u64> c_ov_calls{0}, c_ov_images{0}, c_ov_bytes{0}, c_ov_changed_byte
 std::atomic<u64> c_cmp_open{0}, c_cmp_open_differs{0}, c_cmp_closed{0}, c_cmp_closed_differs{0};
 std::atomic<u64> c_copies{0}, c_copy_bytes_covered{0}, c_copy_bytes_uncovered{0}, c_copy_skipped_big{0}, c_deleted{0}, c_deleted_bytes{0};
 std::atomic<u64> c_announced_by_writer[8]{};
+std::atomic<u64> c_a1_skipped{0}, c_a1_skipped_bytes{0}, c_a1_skippable_read{0}, c_a1_skippable_read_bytes{0};
+u32 A1SkipMode() {
+    static const u32 mode = [] { const char* e = std::getenv("TLG_A1_STORE_SKIP"); return e != nullptr ? static_cast<u32>(std::atoi(e)) : 2u; }(); // default 2 since 2026-11-09 (owner play good); =0 off, =1 shadow
+    return mode;
+}
+std::atomic<u64> c_announced_bytes_by_writer[8]{}, c_entries_read_by_writer[8]{}, c_entry_bytes_read_by_writer[8]{}, c_read_pieces_by_writer[8]{}; ///< A1 census: stored, ever read, bytes read
 std::atomic<u64> c_skipped_big_by_writer[8]{}, c_skipped_big_by_log2[40]{};
 
 // per group and class
@@ -955,7 +963,7 @@ std::map<u64, std::pair<u64, u32>> g_heap_free_blocks; ///< freed GPU allocation
 std::atomic<u64> c_gap[8][18]{};
 } // namespace
 
-void Announce(u32 writer, u64 address, u64 size, u64 stamp) {
+void Announce(u32 writer, u64 address, u64 size, u64 stamp, bool image_content) {
     if (!On() || address == 0 || size == 0) {
         return;
     }
@@ -987,6 +995,11 @@ void Announce(u32 writer, u64 address, u64 size, u64 stamp) {
             return;
         }
     }
+    if (!image_content && A1SkipMode() == 2) {
+        c_a1_skipped.fetch_add(1, std::memory_order_relaxed);
+        c_a1_skipped_bytes.fetch_add(size, std::memory_order_relaxed);
+        return;
+    }
     if (writer == 1 || writer == 2 || writer == 4) {
         c_skip_writer.fetch_add(1, std::memory_order_relaxed); // announced before the write: no content yet, and buffers only; kept as a mark
         NoteMark(writer, address, size);
@@ -1002,6 +1015,7 @@ void Announce(u32 writer, u64 address, u64 size, u64 stamp) {
     entry.size = size;
     entry.writer = writer;
     entry.stamp = stamp;
+    entry.skippable = !image_content;
     std::shared_ptr<u8[]> block{new u8[size]};
     if (!GuardedCopy(block.get(), reinterpret_cast<const void*>(address), size)) {
         c_skip_unreadable.fetch_add(1, std::memory_order_relaxed);
@@ -1011,6 +1025,7 @@ void Announce(u32 writer, u64 address, u64 size, u64 stamp) {
     c_announced.fetch_add(1, std::memory_order_relaxed);
     c_announced_bytes.fetch_add(size, std::memory_order_relaxed);
     c_announced_by_writer[writer & 7].fetch_add(1, std::memory_order_relaxed);
+    c_announced_bytes_by_writer[writer & 7].fetch_add(size, std::memory_order_relaxed);
     std::scoped_lock lock{g_mutex};
     InsertLocked(address, std::move(entry));
 }
@@ -2647,6 +2662,19 @@ void OverlayImage(u64 address, u64 size, u8* staged) {
     u32 image_writer = 0, image_writer_unexplained = 0;
     u64 image_unexplained_seq = ~0ull; // the oldest entry (by seq) with an unexplained byte
     for (const Piece& p : pieces) {
+        {
+            const u32 w = p.entry->writer == WriterCopy ? 7u : (p.entry->writer & 7u);
+            c_read_pieces_by_writer[w].fetch_add(1, std::memory_order_relaxed);
+            c_entry_bytes_read_by_writer[w].fetch_add(p.end - p.begin, std::memory_order_relaxed);
+            if (p.entry->skippable) {
+                c_a1_skippable_read.fetch_add(1, std::memory_order_relaxed);
+                c_a1_skippable_read_bytes.fetch_add(p.end - p.begin, std::memory_order_relaxed);
+            }
+            if (!p.entry->read) {
+                p.entry->read = true;
+                c_entries_read_by_writer[w].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         u8* destination = staged + (p.begin - address);
         const u8* source = p.entry->Bytes() + (p.begin - p.entry_begin);
         const u64 n = p.end - p.begin;
@@ -3151,6 +3179,16 @@ nlohmann::json Report() {
     if (!ShadowOn()) {
         std::scoped_lock lock{g_mutex};
         out["store"] = {{"entries", g_entries.size()}, {"bytes", g_stored_bytes}, {"announced", c_announced.load()}, {"evicted", c_evicted.load()}};
+        {
+            nlohmann::json census;
+            for (u32 w = 0; w < 8; ++w) {
+                census[std::to_string(w)] = {{"stored_entries", c_announced_by_writer[w].load()}, {"stored_bytes", c_announced_bytes_by_writer[w].load()}, {"entries_ever_read", c_entries_read_by_writer[w].load()},
+                                             {"pieces_read", c_read_pieces_by_writer[w].load()}, {"bytes_read", c_entry_bytes_read_by_writer[w].load()}};
+            }
+            out["a1_store_census"] = census;
+        out["a1_skip"] = {{"mode", A1SkipMode()}, {"announcements_not_stored", c_a1_skipped.load()}, {"bytes_not_stored", c_a1_skipped_bytes.load()},
+                          {"skippable_entries_read_(must_be_0)", c_a1_skippable_read.load()}, {"skippable_bytes_read", c_a1_skippable_read_bytes.load()}};
+        }
         if (!On()) {
             out["switch"] = "TLG_F2_STORE=1 or TLG_F2_RING_STORE=1";
         }
@@ -3167,6 +3205,16 @@ nlohmann::json Report() {
         by_writer[std::to_string(w)] = c_announced_by_writer[w].load();
     }
     out["announced_by_writer"] = by_writer;
+    {
+        nlohmann::json census;
+        for (u32 w = 0; w < 8; ++w) {
+            census[std::to_string(w)] = {{"stored_entries", c_announced_by_writer[w].load()}, {"stored_bytes", c_announced_bytes_by_writer[w].load()}, {"entries_ever_read", c_entries_read_by_writer[w].load()},
+                                         {"pieces_read", c_read_pieces_by_writer[w].load()}, {"bytes_read", c_entry_bytes_read_by_writer[w].load()}};
+        }
+        out["a1_store_census"] = census;
+        out["a1_skip"] = {{"mode", A1SkipMode()}, {"announcements_not_stored", c_a1_skipped.load()}, {"bytes_not_stored", c_a1_skipped_bytes.load()},
+                          {"skippable_entries_read_(must_be_0)", c_a1_skippable_read.load()}, {"skippable_bytes_read", c_a1_skippable_read_bytes.load()}};
+    }
     nlohmann::json skipped;
     for (u32 w = 0; w < 8; ++w) {
         skipped["by_writer"][std::to_string(w)] = c_skipped_big_by_writer[w].load();

@@ -70,7 +70,10 @@ struct OpenMap {
     u64 stamp{}; ///< the number the next record got when the Map was made (F2.2: a draw of an earlier record cannot depend on the write)
     bool in_ring{};
     u64 caller{}; ///< the guest return address of the Map call (TLG_WRITER_SITES names the write site after it)
+    bool texture{}; ///< A1.0: a texture's Map (its window is image content), else a buffer's
 };
+thread_local bool t_next_map_texture = false;
+thread_local bool t_announce_texture = true; ///< A1.0: set around the announcement of a Map window: false for a buffer's
 std::mutex open_map_mutex;
 std::mutex site_mutex;
 std::map<std::string, std::array<u64, 13>> map_diff; ///< caller/path -> count by (context frame - resource stamp), 12 = 12 or more (and wrap-around)
@@ -117,7 +120,9 @@ void NoteRenderThread() {
     }
     for (const auto& [thread, map] : stale) {
         SetMapSite(map, MapSitesOn());
+        t_announce_texture = map.texture;
         NoteWriterRangeOf(0, map.address, map.size, thread, map.stamp, map.in_ring);
+        t_announce_texture = true;
         NativeContent::SetSite(0);
     }
     NativeUploads::PublishPending(NativeDraw::NextSeq());
@@ -161,7 +166,9 @@ void NoteUnmap(u64 resource_id) {
             site = own_name;
         }
     }
+    t_announce_texture = map.texture;
     NoteWriterRange(0, map.address, map.size, site, map.in_ring);
+    t_announce_texture = true;
 }
 
 u64 OpenMapSerial() {
@@ -185,7 +192,9 @@ void FlushOpenMapsSince(u64 serial) {
     }
     for (const OpenMap& map : done) {
         SetMapSite(map, MapSitesOn());
+        t_announce_texture = map.texture;
         NoteWriterRangeOf(0, map.address, map.size, thread, map.stamp, map.in_ring);
+        t_announce_texture = true;
         NativeContent::SetSite(0);
     }
 }
@@ -200,7 +209,13 @@ bool OpenMapOverlaps(u64 address, u64 size) {
     return false;
 }
 
+void MarkNextMapTexture() {
+    t_next_map_texture = true;
+}
+
 void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u64 memory, u64 caller, u64 requested_size, u32 context_frame, u32 resource_stamp, u32 bind_flags) {
+    const bool texture_map = t_next_map_texture;
+    t_next_map_texture = false;
     maps.total.fetch_add(1, std::memory_order_relaxed);
     maps.by_type[map_type < 8 ? map_type : 7].fetch_add(1, std::memory_order_relaxed);
     maps.by_usage[usage < 4 ? usage : 3].fetch_add(1, std::memory_order_relaxed);
@@ -221,7 +236,7 @@ void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u6
     const u64 written = requested_size != 0 && requested_size < size ? requested_size : size;
     NativeContent::NoteMapOpen(address, written); // M3: before the write
     std::scoped_lock lock{open_map_mutex};
-    open_maps[{ThreadKey(), resource_id}] = {address, written, ++open_map_serial, NativeDraw::NextSeq(), in_ring, caller};
+    open_maps[{ThreadKey(), resource_id}] = {address, written, ++open_map_serial, NativeDraw::NextSeq(), in_ring, caller, texture_map};
     (void)usage, (void)in_ring;
 }
 
@@ -1026,6 +1041,7 @@ nlohmann::json B2Report() {
 
 namespace {
 std::array<std::atomic<u64>, 8> announced_ranges_by_writer{}, announced_bytes_by_writer{};
+std::atomic<u64> announced_in_ring[8][2]{}; // phase 0b: [writer][ranges, bytes] of the announcements that lie inside the frame ring
 } // namespace
 
 void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp, bool ring) {
@@ -1038,6 +1054,10 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
         announced_by_object_class[writer & 7][cls][1].fetch_add(size, std::memory_order_relaxed);
     }
     announced_ranges_by_writer[writer & 7].fetch_add(1, std::memory_order_relaxed);
+    if (NativeContent::InRing(address, size)) {
+        announced_in_ring[writer & 7][0].fetch_add(1, std::memory_order_relaxed);
+        announced_in_ring[writer & 7][1].fetch_add(size, std::memory_order_relaxed);
+    }
     announced_bytes_by_writer[writer & 7].fetch_add(size, std::memory_order_relaxed);
     if (RingMirror::ShadowOn()) {
         RingMirror::NoteWriter(address, size, (writer & 7) | t_announce_site_class);
@@ -1051,7 +1071,9 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
     }
     NativeResources::NoteAnnouncedWrite(address, size); // C1: resident buffers on those pages are not synchronized any more
     NativeUploads::Announce(writer, address, size, thread == render_thread.load(std::memory_order_relaxed), NativeDraw::NextSeq());
-    NativeContent::Announce(writer, address, size, stamp != 0 ? stamp : NativeDraw::NextSeq()); // F2.2: the bytes now, on the writing thread
+    // A1.0: the constant buffer copies (writer 3) and the Maps of buffers are not image content: nothing reads their bytes from the store
+    const bool image_content = !(writer == 3 || (writer == 0 && !t_announce_texture));
+    NativeContent::Announce(writer, address, size, stamp != 0 ? stamp : NativeDraw::NextSeq(), image_content); // F2.2: the bytes now, on the writing thread
     if (supersede_fn != nullptr && SupersedeEnabled() && (writer == 5 || writer == 6 || (writer == 0 && thread == render_thread.load(std::memory_order_relaxed)))) {
         supersede_fn(address, size);
         superseded_ranges.fetch_add(1, std::memory_order_relaxed);
@@ -1064,6 +1086,7 @@ nlohmann::json Report() {
     j["enabled"] = enabled.load();
     for (u32 w = 0; w < 8; ++w) {
         j["announced_by_writer"][std::to_string(w)] = {{"ranges", announced_ranges_by_writer[w].load()}, {"bytes", announced_bytes_by_writer[w].load()}};
+        j["announced_by_writer"][std::to_string(w)]["in_frame_ring"] = {{"ranges", announced_in_ring[w][0].load()}, {"bytes", announced_in_ring[w][1].load()}};
         j["announced_by_writer"][std::to_string(w)]["object_unnamed"] = {{"ranges", announced_by_object_class[w][0][0].load()}, {"bytes", announced_by_object_class[w][0][1].load()}};
         j["announced_by_writer"][std::to_string(w)]["object_block"] = {{"ranges", announced_by_object_class[w][1][0].load()}, {"bytes", announced_by_object_class[w][1][1].load()}};
         j["announced_by_writer"][std::to_string(w)]["object_named"] = {{"ranges", announced_by_object_class[w][2][0].load()}, {"bytes", announced_by_object_class[w][2][1].load()}};

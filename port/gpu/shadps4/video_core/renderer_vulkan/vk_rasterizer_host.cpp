@@ -118,6 +118,51 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
         }
         out["geometry"] = {{"vertex_ring", c[24]}, {"vertex_by_engine_handle", c[25]}, {"vertex_by_address", c[26]},
                            {"index_ring", c[27]}, {"index_by_engine_handle", c[28]}, {"index_by_address", c[29]}};
+        if (cover_on) {
+            nlohmann::json cov = nlohmann::json::array();
+            for (u32 slot = 0; slot < 256; ++slot) {
+                if (const u64 n = cover_count[slot].load(); n != 0) {
+                    cov.push_back({{"side", slot >= 128 ? "compute" : "graphics"}, {"mask", slot & 127}, {"ops", n}, {"bind_ns", cover_ns[slot].load()}, {"sync_ns", cover_sync_ns[slot].load()}});
+                }
+            }
+            out["coverage_cumulative"] = std::move(cov);
+            nlohmann::json bc = nlohmann::json::array();
+            for (u32 slot = 0; slot < 256; ++slot) {
+                if (const u64 n = cover_buf_n[slot].load(); n != 0) {
+                    bc.push_back({{"side", slot >= 128 ? "compute" : "graphics"}, {"cause", (slot & 127) / 8}, {"kind", slot & 7}, {"n", n}, {"ns", cover_buf_ns[slot].load()},
+                                  {"sync_ns", cover_buf_sync[slot].load()}, {"sync_calls_that_copied", cover_buf_copies[slot].load()}});
+                }
+            }
+            out["buffer_causes_cumulative"] = std::move(bc);
+            nlohmann::json cc = nlohmann::json::array();
+            for (u32 c = 0; c < 16; ++c) {
+                if (const u64 n = cover_class_draws[c].load(); n != 0) {
+                    cc.push_back({{"class", c}, {"draws", n}, {"bind_ns", cover_class_bind_ns[c].load()}, {"draw_total_ns", cover_class_total_ns[c].load()}});
+                }
+            }
+            out["draw_classes_cumulative"] = std::move(cc);
+            {
+                static constexpr const char* names[] = {"passes", "draws", "sum_distinct_pipelines", "max_distinct_pipelines", "passes_pipelines_le8", "passes_pipelines_le16", "passes_pipelines_le24", "passes_pipelines_more",
+                                                        "sum_distinct_geometry_sources", "passes_geom_ratio_le10", "passes_geom_ratio_le33", "passes_geom_ratio_le66", "passes_geom_ratio_more", "sum_distinct_other_buffer_sets",
+                                                        "sum_distinct_ring_windows", "sum_distinct_states", "pairs", "pairs_same_pipeline", "pairs_same_geometry", "pairs_same_other_buffers", "pairs_same_push", "pairs_same_state",
+                                                        "pairs_same_vertex", "pairs_same_index", "ring_windows_per_draw_sum", "other_buffers_per_draw_sum", "images_per_draw_sum", "index_count_sum", "instance_count_sum",
+                                                        "passes_of_one_draw", "draws_in_passes_over_50", "sum_distinct_index_buffer_handles", "sum_distinct_other_buffer_handles"};
+                nlohmann::json w1 = nlohmann::json::object();
+                for (u32 i = 0; i < std::size(names); ++i) {
+                    w1[names[i]] = w1_counts[i].load();
+                }
+                out["w1_census"] = std::move(w1);
+            }
+            nlohmann::json sk = nlohmann::json::array();
+            for (u32 s = 0; s < 32; ++s) {
+                if (const u64 n = cover_skip_n[s].load(); n != 0) {
+                    sk.push_back({{"side", s >= 16 ? "compute" : "graphics"}, {"code", s & 15}, {"n", n}, {"ns", cover_skip_ns[s].load()}, {"sync_ns", cover_skip_sync[s].load()}});
+                }
+            }
+            out["handle_without_entry_by_skip_reason_cumulative"] = std::move(sk);
+            out["read_only_texel_handle_bindings_cumulative"] = {{"graphics", {{"checked", cover_texel[0].load()}, {"image_overlaps", cover_texel[1].load()}, {"is_image_metadata", cover_texel[2].load()}, {"gpu_written", cover_texel[3].load()}}},
+                                                                 {"compute", {{"checked", cover_texel[4].load()}, {"image_overlaps", cover_texel[5].load()}, {"is_image_metadata", cover_texel[6].load()}, {"gpu_written", cover_texel[7].load()}}}};
+        }
         out["note"] = "C0 census, counts per ~5 s interval (read only)";
         Core::DebugServer::Publish("consumer_census", std::move(out));
         if (Core::N0::On()) {
@@ -226,6 +271,12 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
         nlohmann::json same_pass = {{"flushes_that_end_a_pass_the_draw_would_keep", sp.flushes.load()}, {"image_barriers_in_them", sp.image_barriers.load()}, {"with_a_memory_barrier", sp.with_memory_barrier.load()},
                                     {"flushes_with_a_pass_open_where_the_draw_changes_pass_anyway", sp.other_pass_changes.load()}, {"note", "Rasterizer::Draw only, other callers count as 'anyway'"}};
         Core::DebugServer::Publish("segment_census", {{"by_kind_since_start", std::move(kinds)}, {"flush_in_same_pass", std::move(same_pass)}, {"draw_shape_repeat", std::move(repeat)}, {"draw_key_census", std::move(key_census)}, {"pass_state_differences", std::move(changes)}, {"image_barriers_with_a_pass_open_by_layouts", std::move(layouts)}, {"ended_by_caller_since_start", std::move(cuts)}, {"flush_barriers_with_a_pass_open_by_caller", std::move(flush_cuts)}, {"note", "C6 census: commands and draws recorded between a begin and an end of rendering, graphics stream, counts only"}});
+    }
+    if (IndependentGroup::Mode() != 0) {
+        Core::DebugServer::Publish("sim_independent", nlohmann::json::parse(IndependentGroup::Report()));
+    }
+    if (BarrierCensus::On()) {
+        Core::DebugServer::Publish("barrier_census", nlohmann::json::parse(BarrierCensus::Report()));
     }
     if (LivePlannerOn()) {
         const auto p = ReadLivePlanStats();

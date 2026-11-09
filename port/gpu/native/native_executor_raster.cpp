@@ -3,6 +3,8 @@
 // The executor's raster side (G4e; the code of Liverpool::liverpool.cpp, unchanged except for the names): queueing draws and dispatches for the raster thread, running
 // them there through the rasterizer host (native/native_raster_host.h), the fences and the waits of the command stream, the command processor's own writes and copies.
 
+#include <chrono>
+#include <cstdlib>
 #include "video_core/half_phase.h"
 #include <algorithm>
 #include <cstring>
@@ -474,7 +476,15 @@ void NativeExecutor::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan*
     if (c.kind != RasterCall::Kind::Draw) {
         VideoCore::RecordQueue::Drain(VideoCore::RecordQueue::NonDraw); // P3e.4b: a dispatch records its own commands and reads the state the draws that wait leave
     }
-    switch (c.kind) {
+    // TLG_RASTER_SKIP (default 0, measurement only, the picture is wrong): bit 0 skips draws, bit 1 skips dispatches on the raster thread, so the rate of everything upstream of the raster back end can be
+    // measured (master plan experiment E2: which wall comes after the raster thread).
+    static const u32 skip_mode = [] {
+        const char* e = std::getenv("TLG_RASTER_SKIP");
+        return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u;
+    }();
+    const bool is_draw_call = c.kind == RasterCall::Kind::Draw || c.kind == RasterCall::Kind::DrawIndirect;
+    const bool skipped = (is_draw_call && (skip_mode & 1u) != 0) || (!is_draw_call && (skip_mode & 2u) != 0);
+    if (!skipped) switch (c.kind) {
     case RasterCall::Kind::Draw:
         rasterizer->SetNativeTag(c.tag);
         run([&] { rasterizer->Draw(c.indexed, c.index_offset, draw_plan); });
@@ -568,6 +578,17 @@ bool NativeExecutor::RasterConsumer::LaneUsable() const {
 }
 
 void NativeExecutor::RasterConsumer::RunCall(RasterOp& op) {
+    // TLG_RASTER_SPIN_NS=N (default 0, measurement only): busy-wait N nanoseconds before every draw and dispatch of the raster thread. Master plan experiment E1: how much does the frame
+    // time grow when the raster thread gets a known amount of extra work (the elasticity of the frame time to raster work).
+    static const s64 spin_ns = [] {
+        const char* e = std::getenv("TLG_RASTER_SPIN_NS");
+        return e != nullptr ? static_cast<s64>(std::atoll(e)) : s64{0};
+    }();
+    if (spin_ns > 0) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(spin_ns);
+        while (std::chrono::steady_clock::now() < until) {
+        }
+    }
     owner.ExecRasterCall(op.call, op.draw_plan.get(), op.dispatch_plan.get());
 }
 

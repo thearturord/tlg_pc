@@ -22,6 +22,30 @@ namespace Vulkan {
 class Instance;
 class Scheduler;
 
+/// Phase 0b barrier-necessity census (`TLG_BARRIER_CENSUS=1`, default off, counters only): for each buffer hazard that makes a barrier, who produced the pending bytes, who asks for them, and how much of the
+/// asking range overlaps. Report() is a JSON text for /stats. The calls cost nothing when it is off.
+/// G2 (`TLG_SIM_INDEPENDENT`, default 2 since 2026-11-09, =0 off): operations of one "independent group" (the SimParticle dispatches: their slices of the particle buffers never overlap, Phase 0b) need no barrier between
+/// each other. 1 shadow: the tracker answers as before and the group-aware answer is counted next to it; 2 real: the group-aware answer decides. Another operation still sees the group's
+/// pending writes and reads, so every barrier to or from anything else stays. Counters: see IndepReport().
+namespace IndependentGroup {
+[[nodiscard]] u32 Mode();
+std::string Report();
+void NoteDispatch(bool had_barrier, bool real_buffer_hazard, bool aware_buffer_hazard);
+} // namespace IndependentGroup
+
+namespace BarrierCensus {
+[[nodiscard]] bool On();
+void SetOp(u64 tag);                  ///< a draw or dispatch starts (the tag names its program; graphics use a fixed tag)
+void Dispatch(u64 tag, bool barrier, u64 pgm_hash = 0); ///< a dispatch finished binding; `barrier` = the tracker will flush before it
+/// G2 step 1: one SimParticle dispatch. `status`: 0 ok, 1 no control buffer found, 2 control buffer too short, 3 count 0, 4 slice outside the pool, 5 no pool buffer found.
+/// The slice is the guest byte range [begin, end) of the pool the dispatch reads and writes.
+void SimSlice(u64 tag, u32 status, bool from_ring, u64 pool_key, u64 begin, u64 end, u32 count, u32 base);
+void SimBinding(u64 tag, u32 position, u64 size, bool write);
+/// G2: the render slot (word 6 of each particle record, read from guest memory) of the particles of one dispatch: how many equal the particle index, are zero, repeat inside the last dispatches
+void SimSlots(const u32* slots, const u32* index, u32 n, bool memory_readable);
+std::string Report();
+} // namespace BarrierCensus
+
 class Runtime {
 public:
     explicit Runtime(const Instance& instance, Scheduler& scheduler);
@@ -89,6 +113,17 @@ public:
 
     void FlushBarriers();
 
+    /// G2: the group of the operation being bound (0 none, 1 SimParticle). Set by the rasterizer around one dispatch, cleared after.
+    void SetIndependentGroup(u32 group) noexcept {
+        independent_group = group;
+        op_real_hazard = op_aware_hazard = false;
+    }
+    /// G2: the buffer hazards the operation since SetIndependentGroup met: by the old answer and by the group-aware one
+    void TakeHazardFlags(bool& real, bool& aware) noexcept {
+        real = op_real_hazard;
+        aware = op_aware_hazard;
+    }
+
     /// L4: `TLG_BARRIER_PLANNER=1` makes the planner (a state machine over the access list keyed by guest address, see `Planner`) answer the buffer hazard queries; the tracker still runs
     /// next to it and corrects it (a barrier the planner lacks and the tracker has is counted as a miss and the barrier is made). 0 misses over a long run is the exit of L4.
     struct LivePlanStats {
@@ -131,6 +166,9 @@ private:
     Planner live_plan; ///< L4: updated by every access, consulted by every query, cleared by every effective flush
     /// B10 (`TLG_B10_OBJECTS`): 0 off, 1 audit (the object planner runs next to the address planner, which answers), 2 native (the object planner answers alone)
     u32 b10_mode{};
+    u32 independent_group{};
+    bool op_real_hazard{}, op_aware_hazard{};
+    Planner aware_normal, aware_group; ///< G2: the group-aware planner: accesses of operations outside any group, and accesses of the group (kept apart)
     Planner live_object; ///< B10: the same state machine keyed by object: a placed engine buffer (its own Vulkan buffer) in its own offset space
     u64 LiveObjectSpace(const VideoCore::Buffer* handle, u64 offset, u64& begin);
     struct SeenBuffer {

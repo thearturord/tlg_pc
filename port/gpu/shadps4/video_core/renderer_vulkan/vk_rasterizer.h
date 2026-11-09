@@ -341,7 +341,31 @@ private:
     std::array<std::atomic<u64>, 64> consumer_census{};
     void Census(u32 index, u64 n = 1) noexcept {
         consumer_census[index & 63].fetch_add(n, std::memory_order_relaxed);
+        if (cover_on) [[unlikely]] {
+            NoteCover(index);
+        }
     }
+    /// A2 census (`TLG_COVER_CENSUS=1`, default off): per draw and dispatch, which kinds of binding it met that the command processor cannot know ahead, and the time of its BindResources.
+    /// Mask bits: 1 buffer of an engine handle not resolved ahead, 2 buffer by guest address, 4 image by lookup, 8 image found, 16 storage image, 32 image transit with a barrier, 64 vertex / index by address.
+    bool cover_on = [] { const char* e = std::getenv("TLG_COVER_CENSUS"); return e != nullptr && e[0] == '1'; }();
+    std::array<std::atomic<u64>, 256> cover_count{}, cover_ns{}, cover_sync_ns{}; ///< [side * 128 + mask]
+    /// R1': per buffer binding of a shader stage, [side * 128 + cause * 8 + kind]: bindings, ns until the binding is chosen, ns of it in SynchronizeMemory, calls that copied.
+    /// cause: 0 no resolved entry, 1 front found no engine object, 2 epoch moved, 3.. not hit (4 gone, 5 not synchronized, 6 generation moved, 7 arena or epoch, 8 tracker dirty), 9 hit (object copy), 10 hit (arena).
+    /// kind: 1 ring, 2 special, 3 null, 4 handle, 5 address read, 6 address written, 7 resolved.
+    std::array<std::atomic<u64>, 256> cover_buf_n{}, cover_buf_ns{}, cover_buf_sync{}, cover_buf_copies{};
+    /// R1'': handle bindings the front left without an entry (cause 0), by why ResolveAhead skips them: [side * 16 + (1 written, 2 formatted, 4 program-base offset, 8 not a single load)]
+    std::array<std::atomic<u64>, 32> cover_skip_n{}, cover_skip_ns{}, cover_skip_sync{};
+    /// R1''': formatted (texel) engine-handle bindings: [side * 4 + (0 checked, 1 an image overlaps the range, 2 the range is image metadata, 3 GPU wrote the range)]
+    std::array<std::atomic<u64>, 8> cover_texel{};
+    /// per draw class (0 z prepass / shadow, 1 g-buffer, 2 forward, 15 untagged): draws, ns in BindResources, ns in the whole Draw() call
+    std::array<std::atomic<u64>, 16> cover_class_draws{}, cover_class_bind_ns{}, cover_class_total_ns{};
+    /// W1.0 census (`TLG_W1_CENSUS=1` together with `TLG_COVER_CENSUS=1`; rewrite plan section 4): z prepass / shadow draws grouped into passes (the depth target changes or the class changes).
+    /// Cumulative counters, published as `consumer_census.w1_census`.
+    std::array<std::atomic<u64>, 64> w1_counts{};
+    void W1NoteBinding(const Pipeline* pipeline) noexcept;
+    void W1EndDraw() noexcept;
+    void NoteCover(u32 index) noexcept;
+    void CoverFinish(bool compute) noexcept;
     // Front thread only:
     struct PendingWrite {
         VAddr begin, end;

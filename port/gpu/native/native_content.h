@@ -120,7 +120,9 @@ void ClassifyRingLookup(u64 address, u64 size, u32 binding_type);
 void OverlayImage(u64 address, u64 size, u8* staged);
 
 /// The engine wrote [address, address + size) and has finished (any thread). `writer` is the number NativeUpdates::NoteWriterRange gets.
-void Announce(u32 writer, u64 address, u64 size, u64 stamp = 0);
+/// A1.0 (`TLG_A1_STORE_SKIP`, default 2 since 2026-11-09, 0 off, 1 shadow, 2 skip; read once): `image_content` false marks an announcement that no image reader can read (the constant buffer copies of writer 3 and the Maps of buffers):
+/// mode 1 stores it as before and counts a read of it (`a1_skip.skippable_entries_read`, must stay 0), mode 2 does not store it at all (no copy, no allocation, no lock).
+void Announce(u32 writer, u64 address, u64 size, u64 stamp = 0, bool image_content = true);
 /// `TLG_WRITER_SITES`: the call site of the announcements the calling thread makes next (SetSite before NoteWriterRange, 0 after); the ledger keeps it with the newest write and the late read census
 /// names the site of the write that made a read late. `SiteId` interns a string literal (0: unknown).
 [[nodiscard]] u32 SiteId(const char* name);

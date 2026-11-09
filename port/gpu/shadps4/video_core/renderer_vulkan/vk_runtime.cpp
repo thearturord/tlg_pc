@@ -7,6 +7,11 @@
 #include <algorithm>
 #include <unordered_map>
 #include <mutex>
+#include <map>
+#include <deque>
+#include <tuple>
+#include <cstdlib>
+#include <nlohmann/json.hpp>
 #include "native/native_occlusion.h"
 #include "native/native_config.h"
 #include "native/native_registry.h"
@@ -23,6 +28,304 @@
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Vulkan {
+
+namespace IndependentGroup {
+namespace {
+std::atomic<u64> g_queries{}, g_suppressed{}, g_aware_extra{}, g_dispatches{}, g_barrier_before{}, g_barrier_saved{}, g_other_cause{};
+}
+u32 Mode() {
+    static const u32 mode = [] { const char* e = std::getenv("TLG_SIM_INDEPENDENT"); return e != nullptr ? static_cast<u32>(std::atoi(e)) : 2u; }(); // default 2 since 2026-11-09 (owner play good); =0 turns it off, =1 shadow
+    return mode;
+}
+void NoteQuery(bool real, bool aware) {
+    g_queries.fetch_add(1, std::memory_order_relaxed);
+    g_suppressed.fetch_add(real && !aware ? 1 : 0, std::memory_order_relaxed);
+    g_aware_extra.fetch_add(!real && aware ? 1 : 0, std::memory_order_relaxed);
+}
+void NoteDispatch(bool had_barrier, bool real_buffer_hazard, bool aware_buffer_hazard) {
+    g_dispatches.fetch_add(1, std::memory_order_relaxed);
+    g_barrier_before.fetch_add(had_barrier ? 1 : 0, std::memory_order_relaxed);
+    // the barrier only existed for buffer hazards the group-aware answer does not have
+    g_barrier_saved.fetch_add(had_barrier && real_buffer_hazard && !aware_buffer_hazard ? 1 : 0, std::memory_order_relaxed);
+    g_other_cause.fetch_add(had_barrier && !real_buffer_hazard ? 1 : 0, std::memory_order_relaxed);
+}
+std::string Report() {
+    nlohmann::json j = {{"mode", Mode()}, {"group_dispatches", g_dispatches.load()}, {"with_a_barrier_before_them", g_barrier_before.load()}, {"barriers_the_group_aware_answer_drops", g_barrier_saved.load()},
+                        {"barriers_from_other_causes_(images)", g_other_cause.load()}, {"buffer_queries_in_group", g_queries.load()}, {"hazards_suppressed", g_suppressed.load()},
+                        {"EXTRA_hazards_the_group_aware_answer_adds_(must_be_0)", g_aware_extra.load()}};
+    return j.dump();
+}
+} // namespace IndependentGroup
+
+namespace BarrierCensus {
+namespace {
+struct Pending {
+    u64 key, begin, end, tag;
+    bool write;
+};
+struct PairStats {
+    u64 count{}, overlap{}, bound{}, full{};
+};
+struct ConsumerStats {
+    u64 dispatches{}, with_barrier{}, buffer_hazard{}, prev_same{}, prev_same_barrier{}, pgm_hash{};
+};
+std::mutex g_mutex;
+std::vector<Pending> g_pending;
+std::map<std::tuple<u64, u64, u32>, PairStats> g_pairs; // (consumer, producer, kind 0 RAW 1 WAW 2 WAR)
+std::unordered_map<u64, ConsumerStats> g_consumers;
+u64 g_op_tag{}, g_prev_tag{}, g_overflow{}, g_queries_true_unmatched{};
+bool g_op_hazard{};
+constexpr size_t kPendingCap = 8192;
+struct SimStats {
+    u64 total{}, status[6]{}, from_ring{}, from_memory{};
+    u64 pair_disjoint{}, pair_overlap{}, pair_first{}, pair_same_pool{}, window_same_pool{};
+    u64 window_disjoint{}, window_overlap{};
+    u64 count_sum{}, count_max{};
+    u64 bytes_sum{};
+};
+std::unordered_map<u64, SimStats> g_sim;
+SimStats g_sim_all;
+struct SlotStats {
+    u64 dispatches{}, unreadable{}, particles{}, equal_index{}, zero{}, dup_in_window{}, above_capacity{};
+} g_slots;
+std::deque<std::vector<u32>> g_slot_window;
+std::map<std::tuple<u32, u64, bool>, u64> g_sim_bindings; // (position among the bound buffers, size, written) -> count
+struct SimRecent {
+    u64 key, begin, end;
+};
+std::deque<SimRecent> g_sim_recent; // the slices of the last 64 valid SimParticle dispatches
+constexpr size_t kSimWindow = 64;
+} // namespace
+
+bool On() {
+    static const bool on = [] { const char* e = std::getenv("TLG_BARRIER_CENSUS"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+
+void SetOp(u64 tag) {
+    if (!On()) {
+        return;
+    }
+    std::scoped_lock lock{g_mutex};
+    g_prev_tag = g_op_tag;
+    g_op_tag = tag;
+    g_op_hazard = false;
+}
+
+void Dispatch(u64 tag, bool barrier, u64 pgm_hash) {
+    if (!On()) {
+        return;
+    }
+    std::scoped_lock lock{g_mutex};
+    auto& c = g_consumers[tag];
+    c.pgm_hash = pgm_hash;
+    ++c.dispatches;
+    c.with_barrier += barrier ? 1 : 0;
+    c.buffer_hazard += g_op_hazard ? 1 : 0;
+    if (g_prev_tag == tag) {
+        ++c.prev_same;
+        c.prev_same_barrier += barrier ? 1 : 0;
+    }
+}
+
+static void NoteAccess(u64 key, u64 begin, u64 size, bool write) {
+    std::scoped_lock lock{g_mutex};
+    if (g_pending.size() >= kPendingCap) {
+        ++g_overflow;
+        return;
+    }
+    g_pending.push_back({key, begin, begin + size, g_op_tag, write});
+}
+
+static void NoteHazard(u64 key, u64 begin, u64 size, bool new_access_writes) {
+    std::scoped_lock lock{g_mutex};
+    g_op_hazard = true;
+    const u64 end = begin + size;
+    u64 best = 0, best_overlap = 0;
+    u32 best_kind = 0;
+    bool found = false;
+    for (const auto& p : g_pending) {
+        if (p.key != key || p.begin >= end || p.end <= begin) {
+            continue;
+        }
+        if (!p.write && !new_access_writes) {
+            continue; // a pending read only conflicts with a write
+        }
+        const u64 overlap = std::min(p.end, end) - std::max(p.begin, begin);
+        if (!found || overlap > best_overlap) {
+            found = true;
+            best = p.tag;
+            best_overlap = overlap;
+            best_kind = p.write ? (new_access_writes ? 1u : 0u) : 2u;
+        }
+    }
+    if (!found) {
+        ++g_queries_true_unmatched;
+        return;
+    }
+    auto& s = g_pairs[{g_op_tag, best, best_kind}];
+    ++s.count;
+    s.overlap += std::min(best_overlap, size);
+    s.bound += size;
+    s.full += best_overlap * 10 >= size * 9 ? 1 : 0;
+}
+
+void SimSlice(u64 tag, u32 status, bool from_ring, u64 pool_key, u64 begin, u64 end, u32 count, u32 base) {
+    if (!On()) {
+        return;
+    }
+    (void)base;
+    std::scoped_lock lock{g_mutex};
+    for (SimStats* s : {&g_sim[tag], &g_sim_all}) {
+        ++s->total;
+        ++s->status[status < 6 ? status : 5];
+        if (status == 0) {
+            (from_ring ? s->from_ring : s->from_memory) += 1;
+            s->count_sum += count;
+            s->count_max = std::max<u64>(s->count_max, count);
+            s->bytes_sum += end - begin;
+        }
+    }
+    if (status != 0) {
+        return;
+    }
+    // pair: against the previous valid SimParticle dispatch; window: against the last 64
+    bool pair_overlap = false, window_overlap = false, pair_same = false, window_same = false;
+    if (!g_sim_recent.empty()) {
+        const auto& last = g_sim_recent.back();
+        pair_same = last.key == pool_key;
+        pair_overlap = pair_same && begin < last.end && last.begin < end;
+    }
+    for (const auto& r : g_sim_recent) {
+        window_same |= r.key == pool_key;
+        if (r.key == pool_key && begin < r.end && r.begin < end) {
+            window_overlap = true;
+            break;
+        }
+    }
+    const bool first = g_sim_recent.empty();
+    for (SimStats* s : {&g_sim[tag], &g_sim_all}) {
+        if (first) {
+            ++s->pair_first;
+        } else {
+            s->pair_same_pool += pair_same ? 1 : 0;
+            s->window_same_pool += window_same ? 1 : 0;
+            ++(pair_overlap ? s->pair_overlap : s->pair_disjoint);
+            ++(window_overlap ? s->window_overlap : s->window_disjoint);
+        }
+    }
+    g_sim_recent.push_back({pool_key, begin, end});
+    if (g_sim_recent.size() > kSimWindow) {
+        g_sim_recent.pop_front();
+    }
+}
+
+void SimBinding(u64 tag, u32 position, u64 size, bool write) {
+    (void)tag;
+    if (!On()) {
+        return;
+    }
+    std::scoped_lock lock{g_mutex};
+    ++g_sim_bindings[{position, size, write}];
+}
+
+void SimSlots(const u32* slots, const u32* index, u32 n, bool memory_readable) {
+    if (!On()) {
+        return;
+    }
+    std::scoped_lock lock{g_mutex};
+    ++g_slots.dispatches;
+    if (!memory_readable) {
+        ++g_slots.unreadable;
+        return;
+    }
+    std::vector<u32> mine(slots, slots + n);
+    for (u32 i = 0; i < n; ++i) {
+        ++g_slots.particles;
+        g_slots.equal_index += slots[i] == index[i] ? 1 : 0;
+        g_slots.zero += slots[i] == 0 ? 1 : 0;
+        g_slots.above_capacity += slots[i] >= 20480 ? 1 : 0;
+        bool dup = false;
+        for (const auto& w : g_slot_window) {
+            for (const u32 s : w) {
+                if (s == slots[i] && s != 0) {
+                    dup = true;
+                }
+            }
+            if (dup) {
+                break;
+            }
+        }
+        g_slots.dup_in_window += dup ? 1 : 0;
+    }
+    g_slot_window.push_back(std::move(mine));
+    if (g_slot_window.size() > 16) {
+        g_slot_window.pop_front();
+    }
+}
+
+static void ClearPending() {
+    std::scoped_lock lock{g_mutex};
+    g_pending.clear();
+}
+
+std::string Report() {
+    std::scoped_lock lock{g_mutex};
+    nlohmann::json out = nlohmann::json::object();
+    auto hex = [](u64 v) { char b[24]; std::snprintf(b, sizeof b, "%llx", static_cast<unsigned long long>(v)); return std::string(b); };
+    nlohmann::json consumers = nlohmann::json::array();
+    std::vector<std::pair<u64, u64>> order;
+    for (const auto& [tag, c] : g_consumers) {
+        order.emplace_back(c.dispatches, tag);
+    }
+    std::sort(order.begin(), order.end(), std::greater<>());
+    for (size_t i = 0; i < order.size() && i < 60; ++i) {
+        const auto& c = g_consumers[order[i].second];
+        consumers.push_back({{"program", hex(order[i].second)}, {"dispatches", c.dispatches}, {"with_barrier", c.with_barrier}, {"buffer_hazard", c.buffer_hazard}, {"previous_op_same_program", c.prev_same}, {"previous_same_and_barrier", c.prev_same_barrier}, {"pgm_hash", hex(c.pgm_hash)}});
+    }
+    nlohmann::json pairs = nlohmann::json::array();
+    std::vector<std::pair<u64, std::tuple<u64, u64, u32>>> porder;
+    for (const auto& [k, s] : g_pairs) {
+        porder.emplace_back(s.count, k);
+    }
+    std::sort(porder.begin(), porder.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    static const char* kinds[3] = {"RAW", "WAW", "WAR"};
+    for (size_t i = 0; i < porder.size() && i < 120; ++i) {
+        const auto& k = porder[i].second;
+        const auto& s = g_pairs[k];
+        pairs.push_back({{"consumer", hex(std::get<0>(k))}, {"producer", hex(std::get<1>(k))}, {"kind", kinds[std::get<2>(k)]}, {"hazards", s.count}, {"overlap_bytes", s.overlap}, {"asked_bytes", s.bound}, {"overlap_covers_90pct_of_asked", s.full}});
+    }
+    {
+        auto sim_json = [&](const SimStats& s) {
+            return nlohmann::json{{"dispatches", s.total}, {"ok", s.status[0]}, {"no_control_buffer", s.status[1]}, {"control_buffer_too_short", s.status[2]}, {"count_zero", s.status[3]},
+                                  {"slice_outside_pool", s.status[4]}, {"no_pool_buffer", s.status[5]}, {"control_from_ring_copy", s.from_ring}, {"control_from_guest_memory", s.from_memory},
+                                  {"pair_disjoint", s.pair_disjoint}, {"pair_overlap", s.pair_overlap}, {"pair_same_pool_buffer", s.pair_same_pool}, {"window64_has_same_pool_buffer", s.window_same_pool}, {"window64_disjoint", s.window_disjoint}, {"window64_overlap", s.window_overlap},
+                                  {"count_sum", s.count_sum}, {"count_max", s.count_max}, {"slice_bytes_sum", s.bytes_sum}};
+        };
+        nlohmann::json sim = nlohmann::json::object();
+        sim["all"] = sim_json(g_sim_all);
+        nlohmann::json per = nlohmann::json::object();
+        for (const auto& [tag, s] : g_sim) {
+            per[hex(tag)] = sim_json(s);
+        }
+        sim["by_program"] = std::move(per);
+        sim["render_slots"] = {{"dispatches", g_slots.dispatches}, {"memory_unreadable", g_slots.unreadable}, {"particles_read", g_slots.particles}, {"slot_equals_particle_index", g_slots.equal_index},
+                               {"slot_zero", g_slots.zero}, {"slot_repeats_in_last_16_dispatches", g_slots.dup_in_window}, {"slot_at_or_above_20480", g_slots.above_capacity}};
+        nlohmann::json bindings = nlohmann::json::array();
+        for (const auto& [k, n] : g_sim_bindings) {
+            bindings.push_back({{"position", std::get<0>(k)}, {"size", std::get<1>(k)}, {"written", std::get<2>(k)}, {"count", n}});
+        }
+        sim["bound_buffers"] = std::move(bindings);
+        out["sim_particle_slices"] = std::move(sim);
+    }
+    out["consumers"] = std::move(consumers);
+    out["hazard_pairs"] = std::move(pairs);
+    out["pending_overflow"] = g_overflow;
+    out["hazards_without_a_matching_pending_entry"] = g_queries_true_unmatched;
+    out["note"] = "Phase 0b, cumulative since start. Tag: program address of a compute op, 4000000000000000 = any graphics op, 0 = none. Overlap is on the BOUND ranges, not on the bytes the shader touches.";
+    return out.dump();
+}
+} // namespace BarrierCensus
 
 static vk::ImageType ConvertImageType(AmdGpu::ImageType type) noexcept {
     switch (type) {
@@ -278,7 +581,9 @@ u64 Runtime::LiveObjectSpace(const VideoCore::Buffer* handle, u64 offset, u64& b
                 if (handle->resolve_use_seq == 0) {
                     never.fetch_add(1, std::memory_order_relaxed);
                 }
-                {
+                // 2026-11-09: the stack capture below walked the stack and took a mutex for every unannounced use (6.5 % of the raster thread's samples in the spears sample); it is a census, off unless TLG_P3C_STACKS=1
+                static const bool stacks_on = [] { const char* e = std::getenv("TLG_P3C_STACKS"); return e != nullptr && e[0] == '1'; }();
+                if (stacks_on) {
                     // which code paths: the stack (frames 1 to 7) counted, the top ones printed at the powers of two
                     static std::mutex stacks_mutex;
                     static std::unordered_map<std::string, std::pair<u64, u64>> stacks; // stack -> (uses, of them never asked)
@@ -1003,8 +1308,30 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
     Core::SplitCensus::Count(Core::SplitCensus::CtBarrierQuery);
     // B10: the planner by object answers (a placed engine buffer in its own offset space, the arena by guest address)
     u64 begin = 0;
-    auto& space = live_object.buffers[LiveObjectSpace(handle, offset, begin)];
-    const bool planned = space.write.Overlaps(begin, begin + size) || (check_read_access && space.read.Overlaps(begin, begin + size));
+    const u64 census_key = LiveObjectSpace(handle, offset, begin);
+    auto& space = live_object.buffers[census_key];
+    const bool planned_old = space.write.Overlaps(begin, begin + size) || (check_read_access && space.read.Overlaps(begin, begin + size));
+    bool planned = planned_old;
+    if (IndependentGroup::Mode() != 0) {
+        // the group-aware answer: outside a group, everything counts; inside the group, only what was accessed outside it (the group's own pending accesses are independent of each other)
+        auto& normal = aware_normal.buffers[census_key];
+        bool aware = normal.write.Overlaps(begin, begin + size) || (check_read_access && normal.read.Overlaps(begin, begin + size));
+        if (independent_group == 0) {
+            auto& grp = aware_group.buffers[census_key];
+            aware = aware || grp.write.Overlaps(begin, begin + size) || (check_read_access && grp.read.Overlaps(begin, begin + size));
+        }
+        op_real_hazard |= planned_old;
+        op_aware_hazard |= aware;
+        if (independent_group != 0) {
+            IndependentGroup::NoteQuery(planned_old, aware);
+        }
+        if (IndependentGroup::Mode() == 2) {
+            planned = aware;
+        }
+    }
+    if (planned && BarrierCensus::On()) {
+        BarrierCensus::NoteHazard(census_key, begin, size, check_read_access);
+    }
     ++live_stats.object_queries;
     ++live_stats.queries;
     live_stats.answered_true += planned ? 1 : 0;
@@ -1027,13 +1354,31 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
 
     {
         u64 begin = 0;
-        auto& space = live_object.buffers[LiveObjectSpace(handle, offset, begin)];
+        const u64 census_key = LiveObjectSpace(handle, offset, begin);
+        auto& space = live_object.buffers[census_key];
+        if (BarrierCensus::On()) {
+            if (src_access & WRITE_MASK) {
+                BarrierCensus::NoteAccess(census_key, begin, size, true);
+            }
+            if (src_access & READ_MASK) {
+                BarrierCensus::NoteAccess(census_key, begin, size, false);
+            }
+        }
         if (src_access & WRITE_MASK) {
             LivePlanAdd(space.write, begin, begin + size);
             ++const_cast<VideoCore::Buffer*>(handle)->gpu_write_generation;
         }
         if (src_access & READ_MASK) {
             LivePlanAdd(space.read, begin, begin + size);
+        }
+        if (IndependentGroup::Mode() != 0) {
+            auto& aware = (independent_group != 0 ? aware_group : aware_normal).buffers[census_key];
+            if (src_access & WRITE_MASK) {
+                LivePlanAdd(aware.write, begin, begin + size);
+            }
+            if (src_access & READ_MASK) {
+                LivePlanAdd(aware.read, begin, begin + size);
+            }
         }
         live_object.memory_pending |= src_stage != vk::PipelineStageFlags2{};
     }
@@ -1071,6 +1416,11 @@ void Runtime::FlushBarriers() {
             live_plan.memory_pending = false;
             live_object.buffers.clear();
             live_object.memory_pending = false;
+            aware_normal.buffers.clear();
+            aware_group.buffers.clear();
+            if (BarrierCensus::On()) {
+                BarrierCensus::ClearPending();
+            }
         }
     }
     if (!dep_info.memoryBarrierCount && !dep_info.imageMemoryBarrierCount) {
