@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "video_core/half_phase.h"
+#include <bit>
 #include <chrono>
 #include <unordered_set>
 #include <algorithm>
@@ -487,27 +488,39 @@ std::atomic<u64> pc_stamps{0}, pc_stamp_pages{0}, pc_syncs{0}, pc_request_pages{
     pc_old_pages_clock_clean{0}, pc_stale_late_announce{0}, pc_stale_unexplained{0}, pc_stale_pending{0}, pc_new_runs_filtered{0}, g2_calls{0}, g2_skip{0}, g2_skip_but_hit{0}, g2_hit{0}, g2_false_pos{0}, g2_ns_skip{0}, g2_ns_hit{0}, g2_ns_false_pos{0}, g2_pages_checked{0}, g2_page_unsafe{0}, g2_page_false_pos{0}, g2_clear_skipped{0}, g2_pages_set{0}, pc_new_pages_filtered{0}, pc_new_agree{0}, pc_new_only_gpu{0}, pc_new_only_other{0}, pc_new_only_other_first_use{0}, pc_ring_pages{0}, pc_ring_copies{0}, pc_ring_request_pages{0}, pc_old_copies_nonring{0}, pc_verified{0}, pc_stale{0}, pc_unreadable{0}, pc_old_pages_total{0}, pc_syncs_old_zero_new_nonzero{0}, pc_syncs_old_nonzero_new_zero{0};
 } // namespace
 
+bool g_gpu_filter_skip = [] {
+    const char* e = std::getenv("TLG_GPU_FILTER");
+    return e != nullptr && e[0] == '1';
+}();
+bool g_gpu_filter_bits = g_page_clock_on || g_gpu_filter_skip;
+GpuPageTable g_gpu_page_table;
 namespace {
-// the page filter of S2: exact (a chunk map of bit sets under a mutex; the real version is a flat lock-free array)
-struct GpuBitChunk {
-    std::array<u64, 64> bits{}; ///< 4096 pages = 16 MiB of guest memory
-};
-std::mutex g_gpu_bits_mutex;
-std::unordered_map<u64, std::unique_ptr<GpuBitChunk>> g_gpu_bits;
-}  // namespace
+std::atomic<u64> g3_skipped{0}, g3_sampled{0}, g3_sample_wrong{0};
+}
 
 void GpuPagesSet(VAddr base, u64 size) noexcept {
     if (size == 0) {
         return;
     }
-    std::scoped_lock lock{g_gpu_bits_mutex};
     const u64 first = base >> 12, last = (base + size - 1) >> 12;
-    for (u64 page = first; page <= last; ++page) {
-        auto& chunk = g_gpu_bits[page >> 12];
-        if (!chunk) {
-            chunk = std::make_unique<GpuBitChunk>();
+    if ((last >> 28) != 0) {
+        return; // (untracked: always "maybe")
+    }
+    for (u64 page = first; page <= last;) {
+        auto& slot = g_gpu_page_table.chunk[page >> 16];
+        std::atomic<u64>* words = slot.load(std::memory_order_acquire);
+        if (words == nullptr) {
+            words = new std::atomic<u64>[1024]();
+            slot.store(words, std::memory_order_release); // (one writer at a time: the callers hold gpu_ranges_mutex)
         }
-        chunk->bits[(page >> 6) & 63] |= u64{1} << (page & 63);
+        const u64 stop = std::min<u64>(last + 1, ((page >> 16) + 1) << 16);
+        while (page < stop) {
+            const u64 word_end = std::min<u64>(stop, (page | 63) + 1);
+            const u64 lo = page & 63, hi = lo + (word_end - page);
+            const u64 mask = (hi >= 64 ? ~u64{0} : ((u64{1} << hi) - 1)) & ~((u64{1} << lo) - 1);
+            words[(page >> 6) & 1023].fetch_or(mask, std::memory_order_release);
+            page = word_end;
+        }
     }
     g2_pages_set.fetch_add(last - first + 1, std::memory_order_relaxed);
 }
@@ -517,41 +530,37 @@ void GpuPagesClearFree(const RangeSet& set, VAddr base, u64 size) noexcept {
         return;
     }
     const u64 first = base >> 12, last = (base + size - 1) >> 12;
-    if (last - first + 1 > 65536) {
+    if ((last >> 28) != 0) {
+        return;
+    }
+    if (last - first + 1 > (u64{1} << 20)) {
         g2_clear_skipped.fetch_add(1, std::memory_order_relaxed); // (conservative: the bits stay)
         return;
     }
-    std::scoped_lock lock{g_gpu_bits_mutex};
-    for (u64 page = first; page <= last; ++page) {
-        const auto it = g_gpu_bits.find(page >> 12);
-        if (it == g_gpu_bits.end()) {
-            page |= 4095; // (no bit of this 16 MiB chunk)
+    for (u64 page = first; page <= last;) {
+        std::atomic<u64>* words = g_gpu_page_table.chunk[page >> 16].load(std::memory_order_acquire);
+        const u64 stop = std::min<u64>(last + 1, ((page >> 16) + 1) << 16);
+        if (words == nullptr) {
+            page = stop;
             continue;
         }
-        u64& word = it->second->bits[(page >> 6) & 63];
-        if ((word >> (page & 63) & 1) != 0 && !set.Intersects(page << 12, 4096)) {
-            word &= ~(u64{1} << (page & 63));
+        while (page < stop) {
+            const u64 word_end = std::min<u64>(stop, (page | 63) + 1);
+            const u64 lo = page & 63, hi = lo + (word_end - page);
+            const u64 mask = (hi >= 64 ? ~u64{0} : ((u64{1} << hi) - 1)) & ~((u64{1} << lo) - 1);
+            std::atomic<u64>& word = words[(page >> 6) & 1023];
+            u64 candidates = word.load(std::memory_order_relaxed) & mask;
+            while (candidates != 0) {
+                const u64 bit = static_cast<u64>(std::countr_zero(candidates));
+                candidates &= candidates - 1;
+                const u64 pg = (page & ~u64{63}) + bit;
+                if (!set.Intersects(pg << 12, 4096)) {
+                    word.fetch_and(~(u64{1} << bit), std::memory_order_release);
+                }
+            }
+            page = word_end;
         }
     }
-}
-
-bool GpuPagesMaybe(VAddr base, u64 size) noexcept {
-    if (size == 0) {
-        return false;
-    }
-    std::scoped_lock lock{g_gpu_bits_mutex};
-    const u64 first = base >> 12, last = (base + size - 1) >> 12;
-    for (u64 page = first; page <= last; ++page) {
-        const auto it = g_gpu_bits.find(page >> 12);
-        if (it == g_gpu_bits.end()) {
-            page |= 4095;
-            continue;
-        }
-        if ((it->second->bits[(page >> 6) & 63] >> (page & 63) & 1) != 0) {
-            return true;
-        }
-    }
-    return false;
 }
 
 void PageClockStampSlow(VAddr base, u64 size) noexcept {
@@ -992,7 +1001,7 @@ void BufferCache::BindMemoErase(VAddr address, u64 size) {
 nlohmann::json BufferCache::BindMemoReport() const {
     nlohmann::json gpu_filter = {{"calls", g2_calls.load()}, {"filter_skips", g2_skip.load()}, {"SKIP_BUT_EXACT_HIT_MUST_BE_0", g2_skip_but_hit.load()}, {"exact_hits", g2_hit.load()},
                                  {"false_positive_calls", g2_false_pos.load()}, {"ns_calls_the_filter_would_skip", g2_ns_skip.load()}, {"ns_exact_hits", g2_ns_hit.load()}, {"ns_false_positives", g2_ns_false_pos.load()},
-                                 {"consumer_pages_checked", g2_pages_checked.load()}, {"CONSUMER_PAGE_GPU_WRITTEN_BUT_FILTER_CLEAN_MUST_BE_0", g2_page_unsafe.load()},
+                                 {"real_filter_on", g_gpu_filter_skip}, {"real_skipped", g3_skipped.load()}, {"real_sampled", g3_sampled.load()}, {"REAL_SAMPLE_WRONG_MUST_BE_0", g3_sample_wrong.load()}, {"consumer_pages_checked", g2_pages_checked.load()}, {"CONSUMER_PAGE_GPU_WRITTEN_BUT_FILTER_CLEAN_MUST_BE_0", g2_page_unsafe.load()},
                                  {"consumer_page_false_positives", g2_page_false_pos.load()}, {"clear_skipped_big_ranges", g2_clear_skipped.load()}, {"pages_set", g2_pages_set.load()}};
     nlohmann::json page_clock = {{"gpu_filter", gpu_filter}, {"on", g_page_clock_on}, {"stamps", pc_stamps.load()}, {"stamped_pages", pc_stamp_pages.load()}, {"syncs", pc_syncs.load()}, {"request_pages", pc_request_pages.load()},
                                  {"old_bytes", pc_old_bytes.load()}, {"old_copies", pc_old_copies.load()}, {"old_pages", pc_old_pages_total.load()}, {"old_copies_outside_ring", pc_old_copies_nonring.load()}, {"new_pages_filtered", pc_new_pages_filtered.load()}, {"new_runs_filtered", pc_new_runs_filtered.load()}, {"new_pages_old_path_also_uploaded", pc_new_agree.load()}, {"new_pages_only_clock_gpu_written", pc_new_only_gpu.load()}, {"new_pages_only_clock_other", pc_new_only_other.load()}, {"new_pages_only_clock_other_first_use", pc_new_only_other_first_use.load()}, {"ring_pages_uploaded", pc_ring_pages.load()}, {"ring_copies", pc_ring_copies.load()}, {"ring_request_pages", pc_ring_request_pages.load()},
@@ -1494,6 +1503,19 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 void BufferCache::SupersedeGpuWritten(VAddr addr, size_t size) {
     Core::SplitCensus::Touch(Core::SplitCensus::GpuRanges);
     Core::UiTrace::NoteSupersede(addr, size, reinterpret_cast<u64>(__builtin_return_address(0)));
+    // S3a (`TLG_GPU_FILTER=1`): no page of the range holds a GPU-written byte, so the exact work below changes nothing (no identity event, nothing to subtract); only the memo bump stays.
+    if (g_gpu_filter_skip && !GpuPagesMaybe(addr, size)) {
+        BindMemoBump();
+        if ((g3_skipped.fetch_add(1, std::memory_order_relaxed) & 63) == 63) {
+            // the monitor: one skipped call in 64 is also asked of the exact set (a hit here is a missed GPU-written byte)
+            std::shared_lock sample_lock{gpu_ranges_mutex};
+            g3_sampled.fetch_add(1, std::memory_order_relaxed);
+            if (gpu_modified_ranges.Intersects(addr, size)) {
+                g3_sample_wrong.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        return;
+    }
     // S2 shadow: what the page filter says about this announcement, and what the call costs in each case (the exact work below runs as before)
     const bool filter_on = g_page_clock_on;
     const bool filter_maybe = filter_on ? GpuPagesMaybe(addr, size) : true;
