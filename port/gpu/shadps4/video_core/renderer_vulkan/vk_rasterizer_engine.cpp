@@ -51,6 +51,7 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_engine.h"
+#include "native/native_ring_census.h"
 
 // Engine path: member functions of an emulator class that serve the native path (moved out of native/ 2026-11-03).
 // so that the emulator files only call into native/; the class stays declared in the emulator's header until the owning plan phase
@@ -782,6 +783,7 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
             ring_use.full.fetch_add(1, std::memory_order_relaxed);
             continue; // never wait: the binding stays on the raster thread
         }
+        Core::RingCensus::NoteUse(Core::RingCensus::SiteFrontConstant, address, size); // TLG_RING_CENSUS (counters only)
         bool from_snapshot = false;
         if (seq != 0 && Core::NativeUploads::SnapshotsEnabled()) {
             // N5d: the writers' copy of the range as it was when this record was issued; a range the newest write only partly covers is not known at all
@@ -883,6 +885,7 @@ void Rasterizer::FrontGeometryRing(DrawPlan& plan, u64 done, bool indexed, u32 i
             Core::NativeUploads::NoteGeometry(base + 3);
             return;
         }
+        Core::RingCensus::NoteUse(Core::RingCensus::SiteFrontGeometry, address, size); // TLG_RING_CENSUS (counters only)
         memory->CopySparseMemory(address, constant_ring->Data(*offset), size);
         Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::GeometryRing, address, size, plan.native_seq);
         constant_ring->Flush(*offset, size);

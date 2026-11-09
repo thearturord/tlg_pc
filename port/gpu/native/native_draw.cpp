@@ -69,6 +69,7 @@
 #include "video_core/renderer_vulkan/vk_fixed_state.h"
 #include "native/native_readback_policy.h"
 #include "native/native_untracked_ring.h"
+#include "native/native_ring_census.h"
 #include "core/memory.h"
 #include "core/address_space.h"
 
@@ -5715,6 +5716,8 @@ bool FrameAllocLocked() {
     return on;
 }
 std::mutex g_frame_alloc_mutex;
+thread_local bool t_engine_frame_alloc = false; // TLG_RING_CENSUS: the allocation below was asked for by the engine (through RingDiscover), not by one of our redirects
+thread_local u32 t_engine_frame_alloc_site = 0;  // TLG_RING_CENSUS: its call site (Ghidra address)
 
 u64 LockedFrameAlloc(u64 original, u64 allocator, u64 size, u64 alignment) {
     u64 block;
@@ -5722,6 +5725,7 @@ u64 LockedFrameAlloc(u64 original, u64 allocator, u64 size, u64 alignment) {
     {
         std::scoped_lock lock{g_frame_alloc_mutex};
         block = reinterpret_cast<u64(PS4_SYSV_ABI*)(u64, u64, u64)>(original)(allocator, size, alignment);
+        Core::RingCensus::NoteAlloc(block, size & 0xffffffffull, !t_engine_frame_alloc, t_engine_frame_alloc ? t_engine_frame_alloc_site : 0); // TLG_RING_CENSUS (counters only)
         if (Core::NativeContent::RingLapFenceOn() && block != 0) {
             lap_wait = Core::NativeContent::RingLapNote(Rd<u64>(allocator, 0x18), Rd<u64>(allocator, 0x0) & 0xffffffffull, block, size & 0xffffffffull);
         }
@@ -5742,9 +5746,13 @@ u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64
     if ((Core::NativeContent::ShadowOn() || Core::NativeContent::RingWindowsOn() || FrameAllocLocked()) && allocator != 0) {
         if (const u64 original = Core::GuestHooks::OriginalEntry("AllocFrameGarlic"); original != 0) {
             if (FrameAllocLocked()) {
+                t_engine_frame_alloc = true;
+                t_engine_frame_alloc_site = Core::RingCensus::On() && ImageBase() != 0 ? static_cast<u32>(ret - ImageBase() + 0x1000000) : 0;
                 allocated = LockedFrameAlloc(original, allocator, a1, a2);
+                t_engine_frame_alloc = false;
             } else {
                 allocated = reinterpret_cast<GuestDraw6>(original)(allocator, a1, a2, a3, a4, a5);
+                Core::RingCensus::NoteAlloc(allocated, a1 & 0xffffffffull, false, Core::RingCensus::On() && ImageBase() != 0 ? static_cast<u32>(ret - ImageBase() + 0x1000000) : 0); // TLG_RING_CENSUS (counters only)
                 Core::NativeContent::NoteMark(6, allocated, a1 & 0xffffffffull);
                 Core::NativeContent::NoteRingWindow(allocated, a1 & 0xffffffffull);
             }

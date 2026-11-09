@@ -48,6 +48,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "native/native_split_census.h"
+#include "native/native_ring_census.h"
 
 #include <vk_mem_alloc.h>
 
@@ -2135,6 +2136,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         if (lo < hi && !IsRegionGpuModified(lo, hi - lo)) {
             ring_lo = lo;
             ring_hi = hi;
+            Core::RingCensus::NoteUse(Core::RingCensus::SiteRasterSync, lo, hi - lo); // TLG_RING_CENSUS (counters only)
             // Untracked upload ring: nobody told us what the CPU wrote, so the requested part is uploaded.
             if (device_addr < lo) {
                 announced_ranges(device_addr, lo - device_addr);
