@@ -38,6 +38,7 @@ void NoteApplied(u64 ranges, u64 bytes, u64 uploaded_bytes);
 /// SynchronizeMemory of the buffer cache copied `bytes` from guest memory (on this thread, inside a pre-synchronization or on demand).
 void NoteUploaded(u64 bytes);
 void SetPreSyncActive(bool active);
+bool PreSyncActive();
 /// The upload ring (UntrackedRing): a read uploaded `bytes` of it / found them uploaded already in this command buffer.
 void NoteRingUpload(u64 bytes);
 void NoteRingSkipped(u64 bytes);

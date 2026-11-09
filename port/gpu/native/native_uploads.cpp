@@ -124,6 +124,10 @@ void SetPreSyncActive(bool active) {
     presync_active = active;
 }
 
+bool PreSyncActive() {
+    return presync_active;
+}
+
 void NoteRingUpload(u64 bytes) {
     (presync_active ? ring_upload_presync_bytes : ring_upload_bytes).fetch_add(bytes, std::memory_order_relaxed);
     ring_upload_count.fetch_add(1, std::memory_order_relaxed);

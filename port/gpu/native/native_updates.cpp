@@ -83,6 +83,18 @@ std::map<std::pair<u64, u64>, OpenMap> open_maps; ///< (thread, resource id) -> 
 // ring census (design review section 9): Maps whose window is never announced: a second Map of the same resource on the same thread before its Unmap replaces the
 // first entry (its window is lost), and an Unmap that finds no open Map
 std::atomic<u64> c_open_replaced{0}, c_open_replaced_bytes{0}, c_open_replaced_in_ring{0}, c_unmap_unmatched{0};
+std::atomic<u64> c_replace_announced{0}, c_replace_announced_bytes{0};
+
+/// `TLG_MAP_REPLACE_ANNOUNCE=1` (design review section 10; default off until the owner plays it): a Map of a resource that this thread mapped before and has not unmapped
+/// announces the earlier window first, as its Unmap would have (the thread has moved on to a new Map of the same resource, so the earlier window's writes are done).
+/// Before, the new entry replaced the old one and the old window was never announced. Adds announcements (and uploads), removes none.
+bool ReplaceAnnounceOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_MAP_REPLACE_ANNOUNCE");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
 } // namespace
 
 void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp = 0, bool ring = false);
@@ -149,14 +161,15 @@ bool SupersedeEnabled() {
     return on;
 }
 
-void NoteUnmap(u64 resource_id) {
+namespace {
+/// The Unmap's work: the thread's open Map of the resource is closed and its window announced. False when there is none.
+bool CloseOpenMap(u64 resource_id) {
     OpenMap map;
     {
         std::scoped_lock lock{open_map_mutex};
         const auto it = open_maps.find({ThreadKey(), resource_id});
         if (it == open_maps.end()) {
-            c_unmap_unmatched.fetch_add(1, std::memory_order_relaxed);
-            return;
+            return false;
         }
         map = it->second;
         open_maps.erase(it);
@@ -174,6 +187,14 @@ void NoteUnmap(u64 resource_id) {
     t_announce_texture = map.texture;
     NoteWriterRange(0, map.address, map.size, site, map.in_ring);
     t_announce_texture = true;
+    return true;
+}
+} // namespace
+
+void NoteUnmap(u64 resource_id) {
+    if (!CloseOpenMap(resource_id)) {
+        c_unmap_unmatched.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 u64 OpenMapSerial() {
@@ -239,6 +260,18 @@ void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u6
     }
     // the written part: the requested size when the caller gave one, else everything the Map handed out; it is announced when the thread unmaps the resource
     const u64 written = requested_size != 0 && requested_size < size ? requested_size : size;
+    if (ReplaceAnnounceOn()) {
+        u64 old_size = 0;
+        {
+            std::scoped_lock lock{open_map_mutex};
+            const auto it = open_maps.find({ThreadKey(), resource_id});
+            old_size = it != open_maps.end() ? it->second.size : 0;
+        }
+        if (old_size != 0 && CloseOpenMap(resource_id)) {
+            c_replace_announced.fetch_add(1, std::memory_order_relaxed);
+            c_replace_announced_bytes.fetch_add(old_size, std::memory_order_relaxed);
+        }
+    }
     NativeContent::NoteMapOpen(address, written); // M3: before the write
     std::scoped_lock lock{open_map_mutex};
     auto& slot = open_maps[{ThreadKey(), resource_id}];
@@ -1109,6 +1142,7 @@ nlohmann::json Report() {
     auto& m = j["maps_of_buffers"] = nlohmann::json::object();
     m["open_map_REPLACED_before_unmap"] = {{"count", c_open_replaced.load()}, {"bytes", c_open_replaced_bytes.load()}, {"in_ring", c_open_replaced_in_ring.load()}};
     m["unmap_without_open_map"] = c_unmap_unmatched.load();
+    m["replace_announce"] = {{"on", ReplaceAnnounceOn()}, {"announced", c_replace_announced.load()}, {"bytes", c_replace_announced_bytes.load()}};
     {
         std::scoped_lock lock{open_map_mutex};
         u64 bytes = 0;

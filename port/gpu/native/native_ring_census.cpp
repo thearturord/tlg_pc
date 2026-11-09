@@ -75,6 +75,8 @@ struct Sample {
     u64 never;
 };
 std::atomic<u64> c_map_path[8][2][8][4]{}; // [resource kind][subresource 0 / other][map type][path]
+thread_local u32 t_sync_caller = 0;
+std::atomic<u64> c_sync_caller[CallerCount][4]{}; // raster sync uses by caller: [uses, bytes, silent bytes, never bytes]
 
 std::mutex g_sample_mutex;
 std::vector<Sample> g_samples;
@@ -234,6 +236,13 @@ void NoteUse(Site site, u64 address, u64 size) {
     }
     s.uses.fetch_add(1, std::memory_order_relaxed);
     s.bytes.fetch_add(hi - lo, std::memory_order_relaxed);
+    if (site == SiteRasterSync || site == SiteRasterPreSync) {
+        const u32 k = std::min<u32>(t_sync_caller, CallerCount - 1);
+        c_sync_caller[k][0].fetch_add(1, std::memory_order_relaxed);
+        c_sync_caller[k][1].fetch_add(hi - lo, std::memory_order_relaxed);
+        c_sync_caller[k][2].fetch_add(silent, std::memory_order_relaxed);
+        c_sync_caller[k][3].fetch_add(never, std::memory_order_relaxed);
+    }
     s.announced.fetch_add(announced, std::memory_order_relaxed);
     s.ours.fetch_add(ours, std::memory_order_relaxed);
     {
@@ -264,6 +273,10 @@ void NoteUse(Site site, u64 address, u64 size) {
             g_samples.push_back({static_cast<u32>(site), lo - base, hi - lo, silent, never});
         }
     }
+}
+
+void SetSyncCaller(SyncCaller caller) noexcept {
+    t_sync_caller = caller;
 }
 
 void NoteMapPath(u32 kind, u64 subresource, u32 map_type, u32 path) {
@@ -316,7 +329,15 @@ nlohmann::json Report() {
             }
         }
     }
-    static constexpr const char* site_names[SiteCount] = {"front_constant", "front_geometry", "raster_sync"};
+    {
+        static constexpr const char* caller_names[CallerCount] = {"unknown", "presync", "immutable", "bind_read", "bind_written", "bind_texel", "download"};
+        for (u32 k = 0; k < CallerCount; ++k) {
+            if (const u64 n = c_sync_caller[k][0].load()) {
+                j["raster_sync_by_caller"][caller_names[k]] = {{"uses", n}, {"bytes", c_sync_caller[k][1].load()}, {"SILENT_BYTES", c_sync_caller[k][2].load()}, {"never_bytes", c_sync_caller[k][3].load()}};
+            }
+        }
+    }
+    static constexpr const char* site_names[SiteCount] = {"front_constant", "front_geometry", "raster_sync", "raster_presync"};
     for (u32 i = 0; i < SiteCount; ++i) {
         const auto& s = g_sites[i];
         auto& e = j["uses"][site_names[i]];

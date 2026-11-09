@@ -27,8 +27,13 @@ enum Site : u32 {
     SiteFrontConstant = 0, ///< the front thread copies a constant buffer range into the constant ring
     SiteFrontGeometry = 1, ///< the front thread copies vertex or index bytes into the constant ring
     SiteRasterSync = 2,    ///< the raster thread uploads a ring range at a binding (the old "uploaded on every use" path)
-    SiteCount = 3,
+    SiteRasterPreSync = 3, ///< the raster thread pre-uploads the announced ranges due before a record (PreSynchronize; merged ranges, not a binding)
+    SiteCount = 4,
 };
+/// Which buffer cache caller runs the next SynchronizeMemory on this thread (raster sync uses are split by it).
+enum SyncCaller : u32 { CallerUnknown = 0, CallerPreSync = 1, CallerImmutable = 2, CallerBindRead = 3, CallerBindWritten = 4, CallerBindTexel = 5, CallerDownload = 6, CallerCount = 7 };
+void SetSyncCaller(SyncCaller caller) noexcept;
+
 /// The GPU will read [address, address + size) of game memory (only the part inside the frame ring counts).
 void NoteUse(Site site, u64 address, u64 size);
 

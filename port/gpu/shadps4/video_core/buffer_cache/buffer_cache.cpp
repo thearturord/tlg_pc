@@ -413,6 +413,7 @@ u64 BufferCache::PreSynchronize(VAddr device_addr, u64 size) {
     last_upload_bytes = 0;
     Core::NativeUploads::SetPreSyncActive(true);
     Core::N0::SetSyncSite(Core::N0::SyncPre);
+    Core::RingCensus::SetSyncCaller(Core::RingCensus::CallerPreSync);
     SynchronizeMemory(arena, device_addr, static_cast<u32>(size), false, false);
     Core::NativeUploads::SetPreSyncActive(false);
     return last_upload_bytes;
@@ -1416,6 +1417,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             const auto* arena = BufferFor(immutable->begin, immutable->end - immutable->begin);
             last_upload_bytes = 0;
             Core::N0::SetSyncSite(Core::N0::SyncImmutable);
+            Core::RingCensus::SetSyncCaller(Core::RingCensus::CallerImmutable);
             SynchronizeMemory(arena, immutable->begin, whole, false, false);
             Core::NativeContent::SilentSynced(0, immutable->begin, whole); // W1.5 census
             // R1: the object keeps where it is resident (read by the command processor's binding resolution once `synced` is set)
@@ -1507,6 +1509,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
     for_scope.End();
     last_upload_bytes = 0;
     Core::N0::SetSyncSite(is_written ? Core::N0::SyncArenaWritten : is_texel_buffer ? Core::N0::SyncArenaTexel : Core::N0::SyncArenaRead);
+    Core::RingCensus::SetSyncCaller(is_written ? Core::RingCensus::CallerBindWritten : is_texel_buffer ? Core::RingCensus::CallerBindTexel : Core::RingCensus::CallerBindRead);
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     TLG_PROF_NAMED_LEVEL(post_scope, "buffer.part.after_sync", 3);
     if (last_upload_bytes != 0) {
@@ -1574,6 +1577,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForDownload(VAddr device_
     const auto* arena = BufferFor(device_addr, size);
     last_upload_bytes = 0;
     Core::N0::SetSyncSite(Core::N0::SyncDownload);
+    Core::RingCensus::SetSyncCaller(Core::RingCensus::CallerDownload);
     SynchronizeMemory(arena, device_addr, size, false, false);
     Core::NativeResources::NoteBufferRequest(device_addr, size, false, Core::NativeResources::BufferPath::Arena, last_upload_bytes);
     return {arena, arena->Offset(device_addr)};
@@ -2136,7 +2140,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         if (lo < hi && !IsRegionGpuModified(lo, hi - lo)) {
             ring_lo = lo;
             ring_hi = hi;
-            Core::RingCensus::NoteUse(Core::RingCensus::SiteRasterSync, lo, hi - lo); // TLG_RING_CENSUS (counters only)
+            Core::RingCensus::NoteUse(Core::NativeUploads::PreSyncActive() ? Core::RingCensus::SiteRasterPreSync : Core::RingCensus::SiteRasterSync, lo, hi - lo); // TLG_RING_CENSUS (counters only)
             // Untracked upload ring: nobody told us what the CPU wrote, so the requested part is uploaded.
             if (device_addr < lo) {
                 announced_ranges(device_addr, lo - device_addr);
