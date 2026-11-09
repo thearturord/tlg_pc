@@ -4012,10 +4012,8 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         immutable_hint = binder_plan->handles[record_binding];
                     } else {
                         Core::NativeResources::NoteHandle(1);
-                        // life census: the plan's handle was made before a create / delete; is its object dead by now, and does its address hold another live buffer?
-                        if (auto* stale = binder_plan->handles[record_binding]; !stale->alive.load(std::memory_order_acquire)) {
-                            Core::NativeDraw::LifeStaleBind(stale->object, Core::NativeResources::FindImmutable(vsharp.address, static_cast<u32>(size)) != nullptr);
-                        }
+                        // (the life census that read the plan's handle here is gone: the handle was made before a create / delete, and the object it names may already have left the
+                        // graveyard, so its fields cannot be read; a crash in bloom, 2026-11-09, `alive.load` of a freed object)
                     }
                 }
                 if (immutable_hint != nullptr) {
@@ -4627,10 +4625,8 @@ void Rasterizer::ResolveBufferBindingBody(const Shader::Info& stage, u32 buffer_
                         immutable_hint = binder_plan->handles[record_binding];
                     } else {
                         Core::NativeResources::NoteHandle(1);
-                        // life census: the plan's handle was made before a create / delete; is its object dead by now, and does its address hold another live buffer?
-                        if (auto* stale = binder_plan->handles[record_binding]; !stale->alive.load(std::memory_order_acquire)) {
-                            Core::NativeDraw::LifeStaleBind(stale->object, Core::NativeResources::FindImmutable(vsharp.address, static_cast<u32>(size)) != nullptr);
-                        }
+                        // (the life census that read the plan's handle here is gone: the handle was made before a create / delete, and the object it names may already have left the
+                        // graveyard, so its fields cannot be read; a crash in bloom, 2026-11-09, `alive.load` of a freed object)
                     }
                 }
                 if (immutable_hint != nullptr) {

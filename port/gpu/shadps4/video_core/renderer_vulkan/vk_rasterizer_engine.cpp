@@ -403,12 +403,7 @@ Core::NativeResources::ImmutableBuffer* Rasterizer::GeometryHandle(VAddr address
     }
     if (geometry_plan->handle_epoch != Core::NativeResources::ImmutableEpoch()) {
         Core::NativeResources::NoteHandle(6);
-        for (u32 i = 0; i < geometry_plan->geometry_handle_count; ++i) {
-            auto* stale = geometry_plan->geometry_handles[i];
-            if (stale != nullptr && !stale->alive.load(std::memory_order_acquire) && address >= stale->begin && address + size <= stale->end) {
-                Core::NativeDraw::LifeStaleBind(stale->object, Core::NativeResources::FindImmutable(address, static_cast<u32>(size)) != nullptr);
-            }
-        }
+        // (the plan's handles were made before a create / delete and may name freed objects: not read; see the bind of shader buffers)
         return nullptr;
     }
     for (u32 i = 0; i < geometry_plan->geometry_handle_count; ++i) {
