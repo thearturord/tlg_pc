@@ -3,6 +3,7 @@
 // The executor's raster side (G4e; the code of Liverpool::liverpool.cpp, unchanged except for the names): queueing draws and dispatches for the raster thread, running
 // them there through the rasterizer host (native/native_raster_host.h), the fences and the waits of the command stream, the command processor's own writes and copies.
 
+#include <map>
 #include <chrono>
 #include <cstdlib>
 #include "video_core/half_phase.h"
@@ -600,7 +601,34 @@ void NativeExecutor::RasterConsumer::RunClosure(RasterOp& op) {
     {
         TLG_PROF_NAMED_LEVEL(prof_closure, "raster.op.closure", 1);
         TLG_PROF_TAG("closure_site", op.write_line, op.write_file);
-        op.closure();
+        // W4.2 census (`TLG_COVER_CENSUS=1`): time of every closure by the source line of the RasterRun call that queued it, published as `closure_sites`
+        static const bool census = [] {
+            const char* e = std::getenv("TLG_COVER_CENSUS");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (census) [[unlikely]] {
+            struct Site {
+                u64 n{}, ns{}, max_ns{};
+            };
+            static std::map<std::pair<std::string, u32>, Site> sites;
+            static u64 count = 0;
+            const auto t0 = std::chrono::steady_clock::now();
+            op.closure();
+            const u64 dt = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+            auto& site = sites[{op.write_file != nullptr ? op.write_file : "?", op.write_line}];
+            ++site.n;
+            site.ns += dt;
+            site.max_ns = std::max(site.max_ns, dt);
+            if ((++count & 2047u) == 0) {
+                nlohmann::json rows = nlohmann::json::array();
+                for (const auto& [key, v] : sites) {
+                    rows.push_back({{"file", key.first}, {"line", key.second}, {"n", v.n}, {"ns", v.ns}, {"max_ns", v.max_ns}});
+                }
+                Core::DebugServer::Publish("closure_sites", std::move(rows));
+            }
+        } else {
+            op.closure();
+        }
     }
 }
 
