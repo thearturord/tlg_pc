@@ -197,7 +197,10 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
                 static constexpr const char* names[] = {"dispatches", "total_ns", "ns_before_bind", "ns_in_bind", "ns_after_bind", "sync_ns", "uploaded_bytes", "b_ring", "b_special", "b_null", "b_engine_handle",
                                                         "b_address_read", "b_address_written", "b_resolved_by_front", "images", "written_buffers", "stream_ring_answers", "requests_that_uploaded", "with_barrier", "groups",
                                                         "why0_has_handle", "why1_no_binder_plan", "why2_not_single_load", "why3_no_record_entry", "why4_plan_has_no_handles", "why5_id_not_in_registry", "why6_epoch_stale", "why7",
-                                                        "written_without_record_id", "written_with_record_id"};
+                                                        "written_without_record_id", "written_with_record_id", "x30", "x31",
+                                                        "phase_entry_drains", "phase_compute_image_op_checks", "phase_setup", "phase_buffers", "phase_textures_and_samplers", "phase_finish",
+                                                        "buf_ns_before_obtain", "buf_ns_obtain", "buf_ns_after_obtain", "buf_bindings_with_obtain",
+                                                        "obtain_written_ns", "obtain_written_n", "obtain_read_old_ns", "obtain_read_old_n", "obtain_read_row_ns", "obtain_read_row_n"};
                 nlohmann::json rows = nlohmann::json::array();
                 for (const auto& [program, v] : W3Rows()) {
                     nlohmann::json row = {{"program", fmt::format("{:#x}", program)}};

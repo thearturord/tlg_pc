@@ -370,7 +370,7 @@ private:
     void W1ShadowBinding(const Core::NativeResources::ImmutableBuffer* hint, u64 record_id, VAddr address, const void* buffer, u64 offset, bool written, u32 why, bool formatted) noexcept;
     void W1ShadowGeometry(const Core::NativeResources::ImmutableBuffer* hint, VAddr address, const void* buffer, u64 offset, bool vertex) noexcept;
     /// W3.0 dispatch census (`TLG_COVER_CENSUS=1`): per compute program the sums in `W3Stat::v` (published as `consumer_census.w3_dispatch`)
-    [[nodiscard]] std::vector<std::pair<u64, std::array<u64, 32>>> W3Rows() const;
+    [[nodiscard]] std::vector<std::pair<u64, std::array<u64, 48>>> W3Rows() const;
     [[nodiscard]] bool RowsServe(u64 id, VAddr address, u64 size, bool texel, const VideoCore::Buffer*& buffer, u64& offset) noexcept;
     void RowsLearn(u64 id, VAddr address, u64 size, bool texel, const VideoCore::Buffer* buffer, u64 offset, u64 epoch_pre, u64 clock_pre, bool gpu_pre) noexcept;
     void W31Before(u64 id, VAddr address, u64 size) noexcept;

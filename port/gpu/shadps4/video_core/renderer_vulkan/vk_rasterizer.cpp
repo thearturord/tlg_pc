@@ -112,6 +112,14 @@ struct W31Pre {
     u64 commands{};
 };
 thread_local W31Pre t_w31;
+/// the shadow comparators of W1 to W3.1 (rows by id, stamps) run only with `TLG_W1_CENSUS=1`: they cost several hundred ns per binding and would hide what the census clocks measure
+inline bool W1ShadowOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_W1_CENSUS");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
 /// W3.2 (`TLG_NATIVE_ROWS=1`): the answer the old path gave for a read-only request of one engine buffer, kept per (id, address, size). Valid while the placement epoch is the same, no identity
 /// event (placement, drop, GPU written state, image registered) touched the range since the clock stored, and the engine buffer holds no announced bytes in the range.
 struct RealRow {
@@ -137,12 +145,15 @@ struct W3Cur {
     u64 bind_ns{}, sync_ns{}, upload{};
     u32 kinds[8]{}; ///< bindings by kind: 1 ring, 2 special, 3 null, 4 engine handle, 5 address read, 6 address written, 7 resolved by the front
     u32 images{}, written{}, stream{}, with_upload{};
+    u64 wr_ns{}, wr_n{}, rd_ns{}, rd_n{}, rd_row_ns{}, rd_row_n{}; ///< obtain ns and count of written requests, of read requests the old path answered, of read requests a row answered
+    u64 buf[3]{}, buf_n{}; ///< the bindings that reached the obtain: ns before the obtain, in it, after it (to the end of the iteration), and how many
+    u64 phase[6]{};     ///< ns of the compute bind by part: 0 entry (queue drains), 1 the compute image op checks, 2 setup (diagnostics, user data), 3 buffers, 4 textures and samplers, 5 FinishBindResources
     u32 why[8]{};       ///< shader buffers by why they have no engine handle (the W1 reasons: 0 has a handle, 1 no binder plan, 2 not a single load, 3 no record entry, 4 plan has no handles, 5 id not in the registry, 6 epoch stale)
     u32 written_id[2]{}; ///< written buffers: [0] without an engine id in the record, [1] with one
 };
 thread_local W3Cur t_w3;
 struct W3Stat {
-    u64 v[32]{}; ///< 0 dispatches, 1 total ns, 2 ns before the bind, 3 ns in the bind, 4 ns after the bind, 5 sync ns, 6 uploaded bytes, 7..13 bindings by kind 1..7, 14 images, 15 written buffers, 16 stream-ring answers, 17 requests that uploaded, 18 barriers, 19 groups
+    u64 v[48]{}; ///< 0 dispatches, 1 total ns, 2 ns before the bind, 3 ns in the bind, 4 ns after the bind, 5 sync ns, 6 uploaded bytes, 7..13 bindings by kind 1..7, 14 images, 15 written buffers, 16 stream-ring answers, 17 requests that uploaded, 18 barriers, 19 groups
 };
 std::mutex g_w3_mutex;
 std::unordered_map<u64, W3Stat> g_w3;
@@ -1359,6 +1370,19 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
             }
             v[28] += t_w3.written_id[0];
             v[29] += t_w3.written_id[1];
+            for (u32 k = 0; k < 6; ++k) {
+                v[32 + k] += t_w3.phase[k];
+            }
+            for (u32 k = 0; k < 3; ++k) {
+                v[38 + k] += t_w3.buf[k];
+            }
+            v[41] += t_w3.buf_n;
+            v[42] += t_w3.wr_ns;
+            v[43] += t_w3.wr_n;
+            v[44] += t_w3.rd_ns;
+            v[45] += t_w3.rd_n;
+            v[46] += t_w3.rd_row_ns;
+            v[47] += t_w3.rd_row_n;
         }
     } w3_scope{this};
     Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseDispatch, engine_clear_on);
@@ -2133,11 +2157,11 @@ void Rasterizer::W31After(const void* buffer, u64 offset, VAddr address, bool co
     }
 }
 
-std::vector<std::pair<u64, std::array<u64, 32>>> Rasterizer::W3Rows() const {
-    std::vector<std::pair<u64, std::array<u64, 32>>> out;
+std::vector<std::pair<u64, std::array<u64, 48>>> Rasterizer::W3Rows() const {
+    std::vector<std::pair<u64, std::array<u64, 48>>> out;
     std::scoped_lock lock{g_w3_mutex};
     for (const auto& [program, st] : g_w3) {
-        std::array<u64, 32> a{};
+        std::array<u64, 48> a{};
         std::copy(std::begin(st.v), std::end(st.v), a.begin());
         out.emplace_back(program, a);
     }
@@ -2686,10 +2710,22 @@ void Rasterizer::FinishBindResources(const Pipeline* pipeline, bool uses_dma, u6
 
 bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed, DrawJob* draw_job) {
     TLG_PROF_LEVEL("raster.bind_resources", 2);
+    const bool w3_time = cover_on && pipeline->IsCompute();
+    const auto w3_now = [] { return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); };
+    u64 w3_p[6]{};
+    u64 w3_t = w3_time ? w3_now() : 0;
+    const auto w3_lap = [&](u32 k) {
+        if (w3_time) {
+            const u64 n = w3_now();
+            w3_p[k] += n - w3_t;
+            w3_t = n;
+        }
+    };
     VideoCore::OpSequence::resolving.fetch_add(1, std::memory_order_acq_rel); // P3c: a new operation (a draw or a dispatch)
     if (draw_job == nullptr || !VideoCore::RecordQueue::Enabled()) {
         VideoCore::ResolveCommands::Run();
     }
+    w3_lap(0);
     {
         ComputeImageOp image_op;
         if (MatchComputeImageCopy(pipeline, image_op) || IsComputeMetaClear(pipeline) || MatchComputeImageClear(pipeline, image_op)) {
@@ -2704,6 +2740,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
             return false;
         }
     }
+    w3_lap(1);
     NoteRecordedStateDiagnostics();
 
     indexed_active = pipeline->IsIndexed();
@@ -2816,14 +2853,26 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
         }
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
+        w3_lap(2);
         BindBuffers(*stage, binding, push_data);
+        w3_lap(3);
         const u32 images_before = static_cast<u32>(image_infos.size());
         BindTextures(*stage, binding);
+        w3_lap(4);
         uses_dma |= stage->uses_dma;
     }
     const u64 resolve_ns = timed_resolve ? static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - resolve_begin).count()) : 0;
 
+    if (w3_time) {
+        for (u32 k = 0; k < 5; ++k) {
+            t_w3.phase[k] += w3_p[k];
+        }
+        w3_t = w3_now();
+    }
     FinishBindResources(pipeline, uses_dma, resolve_ns);
+    if (w3_time) {
+        t_w3.phase[5] += w3_now() - w3_t;
+    }
     return true;
 }
 
@@ -2915,7 +2964,7 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false, false, vertex_handle, NativeHandleMode() == 2);
         Core::NativeContent::ClearBindContext();
-        if (cover_on) [[unlikely]] {
+        if (cover_on && W1ShadowOn()) [[unlikely]] {
             W1ShadowGeometry(vertex_handle, range.base_address, range.buffer, range.offset, true);
         }
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
@@ -3176,7 +3225,7 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(index_address, index_buffer_size, false, false, index_handle, NativeHandleMode() == 2);
         Core::NativeContent::ClearBindContext();
-        if (cover_on) [[unlikely]] {
+        if (cover_on && W1ShadowOn()) [[unlikely]] {
             W1ShadowGeometry(index_handle, index_address, buffer, offset, false);
         }
         needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
@@ -3716,6 +3765,8 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
         u64 cover_t0 = 0, cover_sync0 = 0, cover_copies0 = 0;
+        u64 w3_a = 0, w3_b = 0; // (W3 census: the clock before and after the obtain of this binding)
+        bool w3_row = false;
         u32 cover_cause = 0;
         if (cover_on) [[unlikely]] {
             t_cover_kind = 0;
@@ -4037,6 +4088,9 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                                      static_cast<u32>(stage.sw_stage), immutable_hint != nullptr, desc.is_written, vsharp.address, size});
                 const u64 w31_id = immutable_hint != nullptr ? immutable_hint->id : record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].id : 0;
                 if (cover_on) [[unlikely]] {
+                    w3_a = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+                }
+                if (cover_on && W1ShadowOn()) [[unlikely]] {
                     W31Before(w31_id, vsharp.address, size);
                 }
                 // W3.2 (TLG_NATIVE_ROWS=1): a read-only request of an engine buffer with a valid row is answered from the row; 1 in 64 also asks the old path and compares
@@ -4044,12 +4098,17 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     const char* e = std::getenv("TLG_NATIVE_ROWS"); // default on since 2026-11-09 (owner play good); =0 turns it off
                     return e == nullptr || e[0] != '0';
                 }();
-                const u64 rows_epoch_pre = rows_on ? buffer_cache.PlacementEpoch() : 0;
-                const u64 rows_clock_pre = rows_on ? Core::NativeIdentity::Clock() : 0;
-                const bool rows_gpu_pre = rows_on && !desc.is_written && buffer_cache.IsRangeGpuWritten(vsharp.address, size);
                 const VideoCore::Buffer* row_buffer = nullptr;
                 u64 row_offset = 0;
                 const bool row_served = rows_on && !desc.is_written && RowsServe(w31_id, vsharp.address, size, desc.is_formatted, row_buffer, row_offset);
+                // (what a learn needs, taken before the old path answers; only asked of the requests the old path answers)
+                u64 rows_epoch_pre = 0, rows_clock_pre = 0;
+                bool rows_gpu_pre = false;
+                if (rows_on && !desc.is_written && (!row_served || false)) {
+                    rows_epoch_pre = buffer_cache.PlacementEpoch();
+                    rows_clock_pre = Core::NativeIdentity::Clock();
+                    rows_gpu_pre = buffer_cache.IsRangeGpuWritten(vsharp.address, size);
+                }
                 // D4 sizing (2026-11-07): the same call, timed by what kind of binding it serves
                 const auto obtain_old = [&] {
                     VideoCore::BufferCache::UploadBytesReset();
@@ -4118,6 +4177,10 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 }
                 if (rows_on && !desc.is_written && !row_served) {
                     RowsLearn(w31_id, vsharp.address, size, desc.is_formatted, obtained.first, obtained.second, rows_epoch_pre, rows_clock_pre, rows_gpu_pre);
+                }
+                if (cover_on) [[unlikely]] {
+                    w3_row = row_served;
+                    w3_b = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
                 }
                 const auto [buffer, offset] = obtained;
                 Core::NativeContent::ClearBindContext();
@@ -4224,7 +4287,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 push_data.AddOffset(binding.buffer, adjust);
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
                 bound_buffers.emplace_back(buffer, offset, size, src_access);
-                if (cover_on) [[unlikely]] {
+                if (cover_on && W1ShadowOn()) [[unlikely]] {
                     W31After(buffer, offset, vsharp.address, stage.sw_stage == Shader::SwStage::Compute, desc.is_written);
                 }
                 if (cover_on && stage.sw_stage == Shader::SwStage::Compute) [[unlikely]] {
@@ -4243,12 +4306,12 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     if (desc.is_written) {
                         ++t_w3.written_id[(why == 0 || why >= 5) ? 1 : 0];
                     }
-                    if (!buffer_cache.IsStreamBuffer(buffer)) {
+                    if (W1ShadowOn() && !buffer_cache.IsStreamBuffer(buffer)) {
                         const u64 row_id = immutable_hint != nullptr ? immutable_hint->id : record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].id : 0;
                         W1ShadowRow(row_id, vsharp.address, buffer, offset, desc.is_written ? 84u : 80u);
                     }
                 }
-                if (cover_on && stage.sw_stage != Shader::SwStage::Compute) [[unlikely]] {
+                if (cover_on && W1ShadowOn() && stage.sw_stage != Shader::SwStage::Compute) [[unlikely]] {
                     const u32 why = immutable_hint != nullptr ? 0u
                                     : binder_plan == nullptr ? 1u
                                     : desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad ? 2u
@@ -4285,6 +4348,22 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
             const u32 slot = (census_base != 0 ? 128u : 0u) + (cover_cause & 15u) * 8u + (t_cover_kind & 7u);
             cover_buf_n[slot].fetch_add(1, std::memory_order_relaxed);
             cover_buf_ns[slot].fetch_add(now - cover_t0, std::memory_order_relaxed);
+            if (census_base != 0 && w3_a != 0 && w3_b != 0) {
+                t_w3.buf[0] += w3_a - cover_t0;
+                t_w3.buf[1] += w3_b - w3_a;
+                if (desc.is_written) {
+                    t_w3.wr_ns += w3_b - w3_a;
+                    ++t_w3.wr_n;
+                } else if (w3_row) {
+                    t_w3.rd_row_ns += w3_b - w3_a;
+                    ++t_w3.rd_row_n;
+                } else {
+                    t_w3.rd_ns += w3_b - w3_a;
+                    ++t_w3.rd_n;
+                }
+                t_w3.buf[2] += now - w3_b;
+                ++t_w3.buf_n;
+            }
             cover_buf_sync[slot].fetch_add(::VideoCore::t_cover_sync_ns - cover_sync0, std::memory_order_relaxed);
             cover_buf_copies[slot].fetch_add(::VideoCore::t_cover_sync_copies - cover_copies0, std::memory_order_relaxed);
             if (cover_cause == 0 && t_cover_kind == 4) {
