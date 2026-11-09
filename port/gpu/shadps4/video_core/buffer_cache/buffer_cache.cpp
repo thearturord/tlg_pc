@@ -452,6 +452,263 @@ static u32 BindMemoWideMode() {
     return mode;
 }
 
+
+// ---- producer-side state, step S1 (page_clock.h) ---------------------------------------------------------------------------------------------------------------------------------
+bool g_page_clock_on = [] {
+    const char* e = std::getenv("TLG_PAGE_CLOCK");
+    return e != nullptr && e[0] == '1';
+}();
+namespace {
+struct ClockPage {
+    u32 stamp{0};  ///< the newest announcement that touched the page
+    u32 synced{0}; ///< the sequence the page was last made current at (0: never)
+    u64 hash{0};   ///< the page's bytes when it was made current (0: not taken)
+};
+struct ClockChunk {
+    std::array<ClockPage, 256> pages{};
+};
+std::mutex g_clock_mutex;
+struct StaleSuspect {
+    u64 page;
+    u32 synced;
+    u32 countdown;
+};
+std::vector<StaleSuspect> g_stale_suspects; // pages found changed under a clean clock: resolved when a later stamp arrives (the announcement was late) or called unexplained
+std::unordered_map<u64, std::unique_ptr<ClockChunk>> g_clock_chunks;
+u32 g_clock_seq = 0;
+ClockPage& ClockPageAt(u64 page) {
+    auto& chunk = g_clock_chunks[page >> 8];
+    if (!chunk) {
+        chunk = std::make_unique<ClockChunk>();
+    }
+    return chunk->pages[page & 255];
+}
+std::atomic<u64> pc_stamps{0}, pc_stamp_pages{0}, pc_syncs{0}, pc_request_pages{0}, pc_old_bytes{0}, pc_old_copies{0}, pc_new_pages{0}, pc_new_runs{0}, pc_new_first_use_pages{0},
+    pc_old_pages_clock_clean{0}, pc_stale_late_announce{0}, pc_stale_unexplained{0}, pc_stale_pending{0}, pc_new_runs_filtered{0}, g2_calls{0}, g2_skip{0}, g2_skip_but_hit{0}, g2_hit{0}, g2_false_pos{0}, g2_ns_skip{0}, g2_ns_hit{0}, g2_ns_false_pos{0}, g2_pages_checked{0}, g2_page_unsafe{0}, g2_page_false_pos{0}, g2_clear_skipped{0}, g2_pages_set{0}, pc_new_pages_filtered{0}, pc_new_agree{0}, pc_new_only_gpu{0}, pc_new_only_other{0}, pc_new_only_other_first_use{0}, pc_ring_pages{0}, pc_ring_copies{0}, pc_ring_request_pages{0}, pc_old_copies_nonring{0}, pc_verified{0}, pc_stale{0}, pc_unreadable{0}, pc_old_pages_total{0}, pc_syncs_old_zero_new_nonzero{0}, pc_syncs_old_nonzero_new_zero{0};
+} // namespace
+
+namespace {
+// the page filter of S2: exact (a chunk map of bit sets under a mutex; the real version is a flat lock-free array)
+struct GpuBitChunk {
+    std::array<u64, 64> bits{}; ///< 4096 pages = 16 MiB of guest memory
+};
+std::mutex g_gpu_bits_mutex;
+std::unordered_map<u64, std::unique_ptr<GpuBitChunk>> g_gpu_bits;
+}  // namespace
+
+void GpuPagesSet(VAddr base, u64 size) noexcept {
+    if (size == 0) {
+        return;
+    }
+    std::scoped_lock lock{g_gpu_bits_mutex};
+    const u64 first = base >> 12, last = (base + size - 1) >> 12;
+    for (u64 page = first; page <= last; ++page) {
+        auto& chunk = g_gpu_bits[page >> 12];
+        if (!chunk) {
+            chunk = std::make_unique<GpuBitChunk>();
+        }
+        chunk->bits[(page >> 6) & 63] |= u64{1} << (page & 63);
+    }
+    g2_pages_set.fetch_add(last - first + 1, std::memory_order_relaxed);
+}
+
+void GpuPagesClearFree(const RangeSet& set, VAddr base, u64 size) noexcept {
+    if (size == 0) {
+        return;
+    }
+    const u64 first = base >> 12, last = (base + size - 1) >> 12;
+    if (last - first + 1 > 65536) {
+        g2_clear_skipped.fetch_add(1, std::memory_order_relaxed); // (conservative: the bits stay)
+        return;
+    }
+    std::scoped_lock lock{g_gpu_bits_mutex};
+    for (u64 page = first; page <= last; ++page) {
+        const auto it = g_gpu_bits.find(page >> 12);
+        if (it == g_gpu_bits.end()) {
+            page |= 4095; // (no bit of this 16 MiB chunk)
+            continue;
+        }
+        u64& word = it->second->bits[(page >> 6) & 63];
+        if ((word >> (page & 63) & 1) != 0 && !set.Intersects(page << 12, 4096)) {
+            word &= ~(u64{1} << (page & 63));
+        }
+    }
+}
+
+bool GpuPagesMaybe(VAddr base, u64 size) noexcept {
+    if (size == 0) {
+        return false;
+    }
+    std::scoped_lock lock{g_gpu_bits_mutex};
+    const u64 first = base >> 12, last = (base + size - 1) >> 12;
+    for (u64 page = first; page <= last; ++page) {
+        const auto it = g_gpu_bits.find(page >> 12);
+        if (it == g_gpu_bits.end()) {
+            page |= 4095;
+            continue;
+        }
+        if ((it->second->bits[(page >> 6) & 63] >> (page & 63) & 1) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void PageClockStampSlow(VAddr base, u64 size) noexcept {
+    if (size == 0) {
+        return;
+    }
+    std::scoped_lock lock{g_clock_mutex};
+    const u32 seq = ++g_clock_seq;
+    pc_stamps.fetch_add(1, std::memory_order_relaxed);
+    const u64 first = base >> 12, last = (base + size - 1) >> 12;
+    pc_stamp_pages.fetch_add(last - first + 1, std::memory_order_relaxed);
+    for (u64 page = first; page <= last; ++page) {
+        ClockPageAt(page).stamp = seq;
+    }
+}
+
+/// One simulated synchronization: `lo, hi` the part of the request the buffer holds, `copies` what the old path uploads for it.
+static void PageClockSync(VAddr lo, VAddr hi, const boost::container::small_vector<vk::BufferCopy, 4>& copies, u64 old_bytes, const std::function<bool(VAddr, u64)>& gpu_written) {
+    if (lo >= hi) {
+        return;
+    }
+    // the untracked upload ring is uploaded whole at every use and nobody announces what the CPU writes into it: it is its own class, outside the clock
+    const auto& clock_ring = UntrackedRing::Get();
+    const u64 ring_first = clock_ring.Active() ? clock_ring.Start() >> 12 : 1, ring_last = clock_ring.Active() ? (clock_ring.End() - 1) >> 12 : 0;
+    const auto in_ring = [&](u64 page) { return page >= ring_first && page <= ring_last; };
+    std::scoped_lock lock{g_clock_mutex};
+    pc_syncs.fetch_add(1, std::memory_order_relaxed);
+    for (size_t i = 0; i < g_stale_suspects.size();) {
+        StaleSuspect& sus = g_stale_suspects[i];
+        if (ClockPageAt(sus.page).stamp > sus.synced) {
+            pc_stale_late_announce.fetch_add(1, std::memory_order_relaxed);
+        } else if (--sus.countdown == 0) {
+            pc_stale_unexplained.fetch_add(1, std::memory_order_relaxed);
+            LOG_ERROR(Render_Vulkan, "page clock: page {:#x} changed under a clean clock and no announcement followed", sus.page << 12);
+        } else {
+            ++i;
+            continue;
+        }
+        g_stale_suspects[i] = g_stale_suspects.back();
+        g_stale_suspects.pop_back();
+    }
+    pc_stale_pending.store(g_stale_suspects.size(), std::memory_order_relaxed);
+    pc_old_bytes.fetch_add(old_bytes, std::memory_order_relaxed);
+    pc_old_copies.fetch_add(copies.size(), std::memory_order_relaxed);
+    const u64 first = lo >> 12, last = (hi - 1) >> 12;
+    pc_request_pages.fetch_add(last - first + 1, std::memory_order_relaxed);
+    // 1. the pages the old path uploads: if the clock calls one clean, the memory must still hold what the clock saw
+    for (const auto& copy : copies) {
+        const u64 a = copy.dstOffset, n = copy.size;
+        if (in_ring(a >> 12) && in_ring((a + n - 1) >> 12)) {
+            pc_ring_copies.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            pc_old_copies_nonring.fetch_add(1, std::memory_order_relaxed);
+        }
+        for (u64 page = a >> 12; page <= (a + n - 1) >> 12; ++page) {
+            if (in_ring(page)) {
+                pc_ring_pages.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            pc_old_pages_total.fetch_add(1, std::memory_order_relaxed);
+            ClockPage& cp = ClockPageAt(page);
+            const bool dirty = cp.synced == 0 || cp.stamp > cp.synced;
+            if (dirty) {
+                continue;
+            }
+            pc_old_pages_clock_clean.fetch_add(1, std::memory_order_relaxed);
+            if (cp.hash != 0) {
+                u64 now = 0;
+                if (!Core::NativeContent::HashGuarded64(page << 12, 4096, now)) {
+                    pc_unreadable.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    pc_verified.fetch_add(1, std::memory_order_relaxed);
+                    if (now != cp.hash) {
+                        pc_stale.fetch_add(1, std::memory_order_relaxed);
+                        if (g_stale_suspects.size() < 256) {
+                            g_stale_suspects.push_back({page, cp.synced, 200000}); // (about 3 s of syncs)
+                        }
+                        static std::atomic<u32> logged{0};
+                        if (logged.fetch_add(1) < 10) {
+                            LOG_ERROR(Render_Vulkan, "page clock: page {:#x} is clean for the clock (stamp {} synced {}) but its bytes changed since (hash {:#x} then, {:#x} now)", page << 12, cp.stamp, cp.synced, cp.hash, now);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 2. what the clock's consumer would upload for the request: the pages that were never made current or were announced since
+    u64 run = 0;
+    bool in_run = false, in_run_filtered = false;
+    for (u64 page = first; page <= last; ++page) {
+        if (in_ring(page)) {
+            pc_ring_request_pages.fetch_add(1, std::memory_order_relaxed);
+            in_run = false;
+            continue;
+        }
+        ClockPage& cp = ClockPageAt(page);
+        const bool dirty = cp.synced == 0 || cp.stamp > cp.synced;
+        if (dirty) {
+            pc_new_pages.fetch_add(1, std::memory_order_relaxed);
+            if (cp.synced == 0) {
+                pc_new_first_use_pages.fetch_add(1, std::memory_order_relaxed);
+            }
+            // S2 consumer side: the filter must say "maybe" for every page the exact set holds GPU-written bytes of
+            const bool gpu_exact = gpu_written(page << 12, 4096), gpu_maybe = GpuPagesMaybe(page << 12, 4096);
+            g2_pages_checked.fetch_add(1, std::memory_order_relaxed);
+            if (gpu_exact && !gpu_maybe) {
+                g2_page_unsafe.fetch_add(1, std::memory_order_relaxed);
+            } else if (!gpu_exact && gpu_maybe) {
+                g2_page_false_pos.fetch_add(1, std::memory_order_relaxed);
+            }
+            bool filtered_page = false; // a page the real consumer would upload at a sync: announced, not GPU-written, not a first use (those are the placement's copy)
+            {
+                // why: did the old path upload any byte of this page?
+                bool agree = false;
+                for (const auto& copy : copies) {
+                    if (copy.dstOffset < ((page + 1) << 12) && copy.dstOffset + copy.size > (page << 12)) {
+                        agree = true;
+                        break;
+                    }
+                }
+                if (agree) {
+                    pc_new_agree.fetch_add(1, std::memory_order_relaxed);
+                    filtered_page = true;
+                } else if (gpu_exact) {
+                    pc_new_only_gpu.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    pc_new_only_other.fetch_add(1, std::memory_order_relaxed);
+                    filtered_page = cp.synced != 0;
+                    if (cp.synced == 0) {
+                        pc_new_only_other_first_use.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+            if (!in_run) {
+                pc_new_runs.fetch_add(1, std::memory_order_relaxed);
+                in_run = true;
+            }
+            if (filtered_page) {
+                pc_new_pages_filtered.fetch_add(1, std::memory_order_relaxed);
+                if (!in_run_filtered) {
+                    pc_new_runs_filtered.fetch_add(1, std::memory_order_relaxed);
+                    in_run_filtered = true;
+                }
+            } else {
+                in_run_filtered = false;
+            }
+            cp.synced = g_clock_seq == 0 ? 1 : g_clock_seq;
+            u64 h = 0;
+            cp.hash = Core::NativeContent::HashGuarded64(page << 12, 4096, h) ? h : 0;
+        } else {
+            in_run = false;
+            in_run_filtered = false;
+        }
+        (void)run;
+    }
+}
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                         Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
     const auto result = ObtainBufferBody(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
@@ -733,7 +990,17 @@ void BufferCache::BindMemoErase(VAddr address, u64 size) {
 }
 
 nlohmann::json BufferCache::BindMemoReport() const {
-    return {{"on", BindMemoOn()}, {"hits", bind_memo_counts[0].load()}, {"misses", bind_memo_counts[1].load()}, {"addresses_erased_by_writes", bind_memo_counts[2].load()},
+    nlohmann::json gpu_filter = {{"calls", g2_calls.load()}, {"filter_skips", g2_skip.load()}, {"SKIP_BUT_EXACT_HIT_MUST_BE_0", g2_skip_but_hit.load()}, {"exact_hits", g2_hit.load()},
+                                 {"false_positive_calls", g2_false_pos.load()}, {"ns_calls_the_filter_would_skip", g2_ns_skip.load()}, {"ns_exact_hits", g2_ns_hit.load()}, {"ns_false_positives", g2_ns_false_pos.load()},
+                                 {"consumer_pages_checked", g2_pages_checked.load()}, {"CONSUMER_PAGE_GPU_WRITTEN_BUT_FILTER_CLEAN_MUST_BE_0", g2_page_unsafe.load()},
+                                 {"consumer_page_false_positives", g2_page_false_pos.load()}, {"clear_skipped_big_ranges", g2_clear_skipped.load()}, {"pages_set", g2_pages_set.load()}};
+    nlohmann::json page_clock = {{"gpu_filter", gpu_filter}, {"on", g_page_clock_on}, {"stamps", pc_stamps.load()}, {"stamped_pages", pc_stamp_pages.load()}, {"syncs", pc_syncs.load()}, {"request_pages", pc_request_pages.load()},
+                                 {"old_bytes", pc_old_bytes.load()}, {"old_copies", pc_old_copies.load()}, {"old_pages", pc_old_pages_total.load()}, {"old_copies_outside_ring", pc_old_copies_nonring.load()}, {"new_pages_filtered", pc_new_pages_filtered.load()}, {"new_runs_filtered", pc_new_runs_filtered.load()}, {"new_pages_old_path_also_uploaded", pc_new_agree.load()}, {"new_pages_only_clock_gpu_written", pc_new_only_gpu.load()}, {"new_pages_only_clock_other", pc_new_only_other.load()}, {"new_pages_only_clock_other_first_use", pc_new_only_other_first_use.load()}, {"ring_pages_uploaded", pc_ring_pages.load()}, {"ring_copies", pc_ring_copies.load()}, {"ring_request_pages", pc_ring_request_pages.load()},
+                                 {"old_pages_the_clock_calls_clean", pc_old_pages_clock_clean.load()}, {"clean_pages_verified_against_memory", pc_verified.load()},
+                                 {"CLEAN_BUT_CHANGED_total", pc_stale.load()}, {"changed_then_announced_late", pc_stale_late_announce.load()}, {"CHANGED_NEVER_ANNOUNCED_MUST_BE_0", pc_stale_unexplained.load()}, {"changed_pending", pc_stale_pending.load()}, {"unreadable", pc_unreadable.load()}, {"new_pages", pc_new_pages.load()}, {"new_runs", pc_new_runs.load()},
+                                 {"new_first_use_pages", pc_new_first_use_pages.load()}};
+    return {
+        {"page_clock", page_clock},{"on", BindMemoOn()}, {"hits", bind_memo_counts[0].load()}, {"misses", bind_memo_counts[1].load()}, {"addresses_erased_by_writes", bind_memo_counts[2].load()},
             {"recipes", {{"graphics_draws_checked", recipe_counts[0].load()}, {"no_key", recipe_counts[1].load()}, {"no_recipe_yet", recipe_counts[2].load()},
                          {"predicted_valid_and_same", recipe_counts[3].load()}, {"PREDICTED_VALID_BUT_DIFFERENT_MUST_BE_0", recipe_counts[4].load()},
                          {"predicted_invalid_and_same", recipe_counts[5].load()}, {"predicted_invalid_and_different", recipe_counts[6].load()},
@@ -1227,13 +1494,35 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 void BufferCache::SupersedeGpuWritten(VAddr addr, size_t size) {
     Core::SplitCensus::Touch(Core::SplitCensus::GpuRanges);
     Core::UiTrace::NoteSupersede(addr, size, reinterpret_cast<u64>(__builtin_return_address(0)));
+    // S2 shadow: what the page filter says about this announcement, and what the call costs in each case (the exact work below runs as before)
+    const bool filter_on = g_page_clock_on;
+    const bool filter_maybe = filter_on ? GpuPagesMaybe(addr, size) : true;
+    const auto filter_t0 = filter_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::unique_lock lock{gpu_ranges_mutex};
     BindMemoBump(); // GPU written bytes change hands: memo answers are checked again
-    if (gpu_modified_ranges.Intersects(addr, size)) {
+    const bool exact = gpu_modified_ranges.Intersects(addr, size);
+    if (exact) {
         Core::N0::SetEffect(Core::N0::EffGpuRanges);
         NativeIdentity::Note(addr, addr + size, NativeIdentity::GpuWrittenState);
     }
     gpu_modified_ranges.Subtract(addr, size);
+    if (filter_on) [[unlikely]] {
+        const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - filter_t0).count());
+        g2_calls.fetch_add(1, std::memory_order_relaxed);
+        if (!filter_maybe) {
+            g2_skip.fetch_add(1, std::memory_order_relaxed);
+            g2_ns_skip.fetch_add(ns, std::memory_order_relaxed);
+            if (exact) {
+                g2_skip_but_hit.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else if (exact) {
+            g2_hit.fetch_add(1, std::memory_order_relaxed);
+            g2_ns_hit.fetch_add(ns, std::memory_order_relaxed);
+        } else {
+            g2_false_pos.fetch_add(1, std::memory_order_relaxed);
+            g2_ns_false_pos.fetch_add(ns, std::memory_order_relaxed);
+        }
+    }
 }
 
 bool BufferCache::IsRangeGpuWritten(VAddr addr, size_t size) {
@@ -1702,6 +1991,9 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     TLG_PROF_NAMED_LEVEL(s_up, "buffer.sync.upload", 3);
     Core::SplitCensus::PhaseScope upload_phase{Core::SplitCensus::PhaseUpload};
     last_upload_bytes += total_size_bytes;
+    if (g_page_clock_on) [[unlikely]] {
+        PageClockSync(held_lo, held_hi, copies, total_size_bytes, [this](VAddr a, u64 n) { return IsRegionGpuModified(a, n); });
+    }
     Core::NativeUploads::NoteUploaded(total_size_bytes);
     if (Core::NativeUploads::Enabled()) {
         for (const auto& copy : copies) {

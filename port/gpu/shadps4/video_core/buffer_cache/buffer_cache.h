@@ -33,6 +33,7 @@
 #include "common/types.h"
 #include "common/unique_function.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/buffer_cache/page_clock.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
@@ -296,18 +297,18 @@ private:
     StreamBuffer resolve_stream_buffer; ///< plan S P3d: see CopyRing
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
-    RangeSet gpu_modified_ranges;
+    GpuRangeSet gpu_modified_ranges;
     /// TLG_GPUWRITE_WHO=1 (diagnostic): the draw that last wrote each GPU written range, by start address (guarded by gpu_ranges_mutex)
     std::map<u64, std::pair<u64, std::string>> gpu_writer_who;
     /// TLG_GPUWRITE_WHO=1: placed blocks dropped while they held GPU written bytes: start -> {end, text} (guarded by gpu_ranges_mutex)
     std::map<u64, std::pair<u64, std::string>> dropped_with_gpu_bytes;
     /// B9.1: the bytes of each engine buffer (by its id) the engine announced since their last upload
-    std::unordered_map<u64, RangeSet> object_dirty;
+    std::unordered_map<u64, StampedRangeSet> object_dirty;
   public:
     /// W3.1 shadow: does engine buffer `id` hold announced bytes in [addr, addr + size) that no upload took yet, or are there bytes no engine buffer holds there
     [[nodiscard]] bool ObjectRangeDirty(u64 id, VAddr addr, u64 size);
   private:
-    RangeSet all_object_dirty; ///< B9.1 audit: the same bytes of all buffers by address
+    StampedRangeSet all_object_dirty; ///< B9.1 audit: the same bytes of all buffers by address
     /// B9.4: the Vulkan buffer of [address, address + size): a placed engine buffer's own when the range is inside one (placing it at its first use), else the arena
     /// (resident). `demote_spanning`: a range over a placed buffer's edge moves that buffer back into the arena first; false: such a range gets nullptr
     const Buffer* BufferFor(VAddr address, u64 size, bool demote_spanning = true, bool written = false);
@@ -381,7 +382,7 @@ private:
     /// B9.4: a resident object's binding resolution names `buffer` from now on (a placed buffer remembers it, so freeing the buffer resets it)
     void NoteResolutionUser(const Buffer* buffer, u64 id);
     std::atomic<u64> b9_epoch{0}; ///< B9.3 step 2: bumped when an engine buffer gets changed bytes (the upload memo's answers are stale)
-    RangeSet b9_unattributed; ///< B9.1: announced bytes no engine buffer held when they were announced (a buffer's creation data comes before the buffer is known)
+    StampedRangeSet b9_unattributed; ///< B9.1: announced bytes no engine buffer held when they were announced (a buffer's creation data comes before the buffer is known)
     std::mutex object_dirty_mutex;
 public:
     std::atomic<u64> upload_bytes_kept_for_gpu{0}; ///< B5 / B6: uploads that left GPU written bytes out
