@@ -80,6 +80,9 @@ std::mutex site_mutex;
 std::map<std::string, std::array<u64, 13>> map_diff; ///< caller/path -> count by (context frame - resource stamp), 12 = 12 or more (and wrap-around)
 u64 open_map_serial = 0;
 std::map<std::pair<u64, u64>, OpenMap> open_maps; ///< (thread, resource id) -> the window of the Map that has not been unmapped yet
+// ring census (design review section 9): Maps whose window is never announced: a second Map of the same resource on the same thread before its Unmap replaces the
+// first entry (its window is lost), and an Unmap that finds no open Map
+std::atomic<u64> c_open_replaced{0}, c_open_replaced_bytes{0}, c_open_replaced_in_ring{0}, c_unmap_unmatched{0};
 } // namespace
 
 void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp = 0, bool ring = false);
@@ -152,6 +155,7 @@ void NoteUnmap(u64 resource_id) {
         std::scoped_lock lock{open_map_mutex};
         const auto it = open_maps.find({ThreadKey(), resource_id});
         if (it == open_maps.end()) {
+            c_unmap_unmatched.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         map = it->second;
@@ -237,7 +241,15 @@ void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u6
     const u64 written = requested_size != 0 && requested_size < size ? requested_size : size;
     NativeContent::NoteMapOpen(address, written); // M3: before the write
     std::scoped_lock lock{open_map_mutex};
-    open_maps[{ThreadKey(), resource_id}] = {address, written, ++open_map_serial, NativeDraw::NextSeq(), in_ring, caller, texture_map};
+    auto& slot = open_maps[{ThreadKey(), resource_id}];
+    if (slot.size != 0) {
+        c_open_replaced.fetch_add(1, std::memory_order_relaxed);
+        c_open_replaced_bytes.fetch_add(slot.size, std::memory_order_relaxed);
+        if (slot.in_ring) {
+            c_open_replaced_in_ring.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    slot = {address, written, ++open_map_serial, NativeDraw::NextSeq(), in_ring, caller, texture_map};
     (void)usage, (void)in_ring;
 }
 
@@ -1095,6 +1107,16 @@ nlohmann::json Report() {
     }
     j["gpu_written_marks_superseded"] = {{"enabled", SupersedeEnabled()}, {"ranges", superseded_ranges.load()}, {"bytes", superseded_bytes.load()}};
     auto& m = j["maps_of_buffers"] = nlohmann::json::object();
+    m["open_map_REPLACED_before_unmap"] = {{"count", c_open_replaced.load()}, {"bytes", c_open_replaced_bytes.load()}, {"in_ring", c_open_replaced_in_ring.load()}};
+    m["unmap_without_open_map"] = c_unmap_unmatched.load();
+    {
+        std::scoped_lock lock{open_map_mutex};
+        u64 bytes = 0;
+        for (const auto& [key, map] : open_maps) {
+            bytes += map.size;
+        }
+        m["open_now"] = {{"count", open_maps.size()}, {"bytes", bytes}};
+    }
     m["total"] = maps.total.load();
     m["into_the_buffers_own_memory"] = maps.own_memory.load();
     m["into_a_frame_ring_window"] = maps.in_ring.load();

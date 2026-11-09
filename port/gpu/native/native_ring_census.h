@@ -32,6 +32,10 @@ enum Site : u32 {
 /// The GPU will read [address, address + size) of game memory (only the part inside the frame ring counts).
 void NoteUse(Site site, u64 address, u64 size);
 
+/// The Map hook's path for one Map: 0 buffer (announced at Unmap), 1 texture with a native upload record, 2 texture, record refused (both announced at Unmap),
+/// 3 not handled (the engine's function runs, nothing is announced). `kind` is the resource kind (+0x124), `subresource` the mip/slice index.
+void NoteMapPath(u32 kind, u64 subresource, u32 map_type, u32 path);
+
 nlohmann::json Report();
 
 } // namespace Core::RingCensus

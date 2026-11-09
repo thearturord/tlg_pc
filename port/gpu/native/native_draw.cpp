@@ -5718,6 +5718,14 @@ bool FrameAllocLocked() {
 std::mutex g_frame_alloc_mutex;
 thread_local bool t_engine_frame_alloc = false; // TLG_RING_CENSUS: the allocation below was asked for by the engine (through RingDiscover), not by one of our redirects
 thread_local u32 t_engine_frame_alloc_site = 0;  // TLG_RING_CENSUS: its call site (Ghidra address)
+thread_local u32 t_census_map_type = 0;          // TLG_RING_CENSUS: the map type of the Map running on this thread (its allocation sites get it in the top bits of the site)
+u32 CensusSite(u64 ret) {
+    u32 site = static_cast<u32>(ret - ImageBase() + 0x1000000);
+    if ((site == 0x247fcf0 || site == 0x247ffe9) && t_census_map_type != 0) {
+        site |= (t_census_map_type & 0xf) << 28; // e.g. 0x1247fcf0: texture branch of a READ Map, 0x4247fcf0: of a WRITE_DISCARD Map
+    }
+    return site;
+}
 
 u64 LockedFrameAlloc(u64 original, u64 allocator, u64 size, u64 alignment) {
     u64 block;
@@ -5747,12 +5755,12 @@ u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64
         if (const u64 original = Core::GuestHooks::OriginalEntry("AllocFrameGarlic"); original != 0) {
             if (FrameAllocLocked()) {
                 t_engine_frame_alloc = true;
-                t_engine_frame_alloc_site = Core::RingCensus::On() && ImageBase() != 0 ? static_cast<u32>(ret - ImageBase() + 0x1000000) : 0;
+                t_engine_frame_alloc_site = Core::RingCensus::On() && ImageBase() != 0 ? CensusSite(ret) : 0;
                 allocated = LockedFrameAlloc(original, allocator, a1, a2);
                 t_engine_frame_alloc = false;
             } else {
                 allocated = reinterpret_cast<GuestDraw6>(original)(allocator, a1, a2, a3, a4, a5);
-                Core::RingCensus::NoteAlloc(allocated, a1 & 0xffffffffull, false, Core::RingCensus::On() && ImageBase() != 0 ? static_cast<u32>(ret - ImageBase() + 0x1000000) : 0); // TLG_RING_CENSUS (counters only)
+                Core::RingCensus::NoteAlloc(allocated, a1 & 0xffffffffull, false, Core::RingCensus::On() && ImageBase() != 0 ? CensusSite(ret) : 0); // TLG_RING_CENSUS (counters only)
                 Core::NativeContent::NoteMark(6, allocated, a1 & 0xffffffffull);
                 Core::NativeContent::NoteRingWindow(allocated, a1 & 0xffffffffull);
             }
@@ -7240,7 +7248,14 @@ u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4
     // F2.2 (TLG_F2_STORE=1): which Maps are announced: by resource kind, map type and the path taken (0 buffer, announced at Unmap; 1 texture, native upload record; 2 texture, record refused;
     // 3 not handled here: the guest function runs and nothing is announced)
     const u32 map_kind = Core::NativeContent::ShadowOn() && IsHeapPointer(resource) && (resource & 7) == 0 ? Guarded([&]() -> u64 { return Rd<u32>(resource, 0x124); }) : 0xffu;
-    const auto count_map = [&](u32 path) { Core::NativeContent::CountMap(map_kind, static_cast<u32>(type), path); };
+    const u32 census_kind = Core::RingCensus::On() && IsHeapPointer(resource) && (resource & 7) == 0 ? Guarded([&]() -> u64 { return Rd<u32>(resource, 0x124); }) : 0xffu;
+    if (Core::RingCensus::On()) {
+        t_census_map_type = static_cast<u32>(type); // stays set while the engine's Map runs after this hook (path 3) or inside it
+    }
+    const auto count_map = [&](u32 path) {
+        Core::NativeContent::CountMap(map_kind, static_cast<u32>(type), path);
+        Core::RingCensus::NoteMapPath(census_kind, subresource, static_cast<u32>(type), path); // TLG_RING_CENSUS (counters only)
+    };
     if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && ctx != 0 && IsHeapPointer(resource) && (resource & 7) == 0 && Rd<u32>(resource, 0x124) == 1) {
         // N5a: a Map of a buffer is announced to the update audit; the game's function runs here and its result is returned
         const u64 original_map = Core::GuestHooks::OriginalEntry("Map");

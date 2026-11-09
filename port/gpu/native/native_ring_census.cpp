@@ -74,6 +74,8 @@ struct Sample {
     u64 silent;
     u64 never;
 };
+std::atomic<u64> c_map_path[8][2][8][4]{}; // [resource kind][subresource 0 / other][map type][path]
+
 std::mutex g_sample_mutex;
 std::vector<Sample> g_samples;
 constexpr size_t MaxSamples = 40;
@@ -264,6 +266,13 @@ void NoteUse(Site site, u64 address, u64 size) {
     }
 }
 
+void NoteMapPath(u32 kind, u64 subresource, u32 map_type, u32 path) {
+    if (!On()) {
+        return;
+    }
+    c_map_path[std::min<u32>(kind, 7)][subresource != 0 ? 1 : 0][std::min<u32>(map_type, 7)][path & 3].fetch_add(1, std::memory_order_relaxed);
+}
+
 nlohmann::json Report() {
     nlohmann::json j;
     j["on"] = On();
@@ -290,6 +299,21 @@ nlohmann::json Report() {
             const std::string name = i == 0 ? std::string("unknown_or_ours") : i == MaxOrigins - 1 ? std::string("other_sites") : fmt::format("{:#x}", g_site_list[i].load());
             list.push_back({{"site", name}, {"allocs", c_origin_allocs[i].load()}, {"bytes", c_origin_bytes[i].load()},
                             {"used_announced_bytes", c_origin_announced_used[i].load()}, {"used_SILENT_bytes", c_origin_silent_used[i].load()}});
+        }
+    }
+    {
+        static constexpr const char* path_names[4] = {"buffer_announced", "texture_record_announced", "texture_refused_announced", "NOT_HANDLED_NOT_ANNOUNCED"};
+        auto& m = j["maps"] = nlohmann::json::object();
+        for (u32 k = 0; k < 8; ++k) {
+            for (u32 s = 0; s < 2; ++s) {
+                for (u32 t = 0; t < 8; ++t) {
+                    for (u32 p = 0; p < 4; ++p) {
+                        if (const u64 n = c_map_path[k][s][t][p].load()) {
+                            m[fmt::format("kind{} {} type{}", k, s == 0 ? "sub0" : "sub>0", t)][path_names[p]] = n;
+                        }
+                    }
+                }
+            }
         }
     }
     static constexpr const char* site_names[SiteCount] = {"front_constant", "front_geometry", "raster_sync"};
