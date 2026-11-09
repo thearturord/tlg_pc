@@ -455,10 +455,12 @@ static u32 BindMemoWideMode() {
 
 
 // ---- producer-side state, step S1 (page_clock.h) ---------------------------------------------------------------------------------------------------------------------------------
-bool g_page_clock_on = [] {
-    const char* e = std::getenv("TLG_PAGE_CLOCK");
+static bool EnvOne(const char* name) {
+    const char* e = std::getenv(name);
     return e != nullptr && e[0] == '1';
-}();
+}
+bool g_producer_state = EnvOne("TLG_PRODUCER_STATE"); ///< S3b.1: the sync also uploads the pages the per-buffer clock calls dirty that the old pieces left out
+bool g_page_clock_on = EnvOne("TLG_PAGE_CLOCK") || g_producer_state;
 namespace {
 struct ClockPage {
     u32 stamp{0};  ///< the newest announcement that touched the page
@@ -474,6 +476,13 @@ struct StaleSuspect {
     u32 synced;
     u32 countdown;
 };
+struct BufClockChunk {
+    std::array<u32, 256> synced{};
+    std::array<u64, 256> hash{};
+    std::array<u32, 256> clip{}; ///< the part of the page the hash covers: (start offset << 16) | end offset. A buffer's range rarely starts or ends on a page edge; bytes outside it are not its business
+};
+std::unordered_map<u64, std::unique_ptr<BufClockChunk>> g_buf_clock; // key (buffer serial << 24) | (page >> 8): the sync stamps of one destination buffer
+u64 g_buf_clock_serial = 0;
 std::vector<StaleSuspect> g_stale_suspects; // pages found changed under a clean clock: resolved when a later stamp arrives (the announcement was late) or called unexplained
 std::unordered_map<u64, std::unique_ptr<ClockChunk>> g_clock_chunks;
 u32 g_clock_seq = 0;
@@ -485,7 +494,7 @@ ClockPage& ClockPageAt(u64 page) {
     return chunk->pages[page & 255];
 }
 std::atomic<u64> pc_stamps{0}, pc_stamp_pages{0}, pc_syncs{0}, pc_request_pages{0}, pc_old_bytes{0}, pc_old_copies{0}, pc_new_pages{0}, pc_new_runs{0}, pc_new_first_use_pages{0},
-    pc_old_pages_clock_clean{0}, pc_stale_late_announce{0}, pc_stale_unexplained{0}, pc_stale_pending{0}, pc_new_runs_filtered{0}, g2_calls{0}, g2_skip{0}, g2_skip_but_hit{0}, g2_hit{0}, g2_false_pos{0}, g2_ns_skip{0}, g2_ns_hit{0}, g2_ns_false_pos{0}, g2_pages_checked{0}, g2_page_unsafe{0}, g2_page_false_pos{0}, g2_clear_skipped{0}, g2_pages_set{0}, pc_new_pages_filtered{0}, pc_new_agree{0}, pc_new_only_gpu{0}, pc_new_only_other{0}, pc_new_only_other_first_use{0}, pc_ring_pages{0}, pc_ring_copies{0}, pc_ring_request_pages{0}, pc_old_copies_nonring{0}, pc_verified{0}, pc_stale{0}, pc_unreadable{0}, pc_old_pages_total{0}, pc_syncs_old_zero_new_nonzero{0}, pc_syncs_old_nonzero_new_zero{0};
+    pc_old_pages_clock_clean{0}, rs_extra_pages{0}, rs_extra_runs{0}, rs_extra_changed{0}, rs_extra_unchanged{0}, rs_extra_unread{0}, rs_extra_unverifiable{0}, pb_old_clean_unverifiable{0}, pb_syncs{0}, pb_buffers{0}, pb_old_pages{0}, pb_old_dirty{0}, pb_old_clean{0}, pb_old_clean_verified{0}, pb_old_clean_changed{0}, pb_new_pages{0}, pb_new_agree{0}, pb_new_only_gpu{0}, pb_new_first_use{0}, pb_new_only_other{0}, pb_new_pages_filtered{0}, pb_new_runs_filtered{0}, pc_stale_late_announce{0}, pc_stale_unexplained{0}, pc_stale_pending{0}, pc_new_runs_filtered{0}, g2_calls{0}, g2_skip{0}, g2_skip_but_hit{0}, g2_hit{0}, g2_false_pos{0}, g2_ns_skip{0}, g2_ns_hit{0}, g2_ns_false_pos{0}, g2_pages_checked{0}, g2_page_unsafe{0}, g2_page_false_pos{0}, g2_clear_skipped{0}, g2_pages_set{0}, pc_new_pages_filtered{0}, pc_new_agree{0}, pc_new_only_gpu{0}, pc_new_only_other{0}, pc_new_only_other_first_use{0}, pc_ring_pages{0}, pc_ring_copies{0}, pc_ring_request_pages{0}, pc_old_copies_nonring{0}, pc_verified{0}, pc_stale{0}, pc_unreadable{0}, pc_old_pages_total{0}, pc_syncs_old_zero_new_nonzero{0}, pc_syncs_old_nonzero_new_zero{0};
 } // namespace
 
 bool g_gpu_filter_skip = [] {
@@ -574,6 +583,142 @@ void PageClockStampSlow(VAddr base, u64 size) noexcept {
     pc_stamp_pages.fetch_add(last - first + 1, std::memory_order_relaxed);
     for (u64 page = first; page <= last; ++page) {
         ClockPageAt(page).stamp = seq;
+    }
+}
+
+/// S3b.0: the same simulation as PageClockSync with the sync stamp kept per destination buffer (the stamps still come from the producer side, one per page).
+static void PageClockSyncBuffer(const Buffer* arena, VAddr lo, VAddr hi, const boost::container::small_vector<vk::BufferCopy, 4>& copies, const std::function<bool(VAddr, u64)>& gpu_written,
+                                boost::container::small_vector<std::pair<u64, u64>, 8>* extras) {
+    if (lo >= hi) {
+        return;
+    }
+    const auto& clock_ring = UntrackedRing::Get();
+    const u64 ring_first = clock_ring.Active() ? clock_ring.Start() >> 12 : 1, ring_last = clock_ring.Active() ? (clock_ring.End() - 1) >> 12 : 0;
+    const auto in_ring = [&](u64 page) { return page >= ring_first && page <= ring_last; };
+    std::scoped_lock lock{g_clock_mutex};
+    if (arena->clock_serial == 0) {
+        arena->clock_serial = ++g_buf_clock_serial;
+        pb_buffers.fetch_add(1, std::memory_order_relaxed);
+    }
+    const u64 serial = arena->clock_serial;
+    u32* clip_slot = nullptr;
+    const auto entry = [&](u64 page, u32*& synced, u64*& hash) {
+        auto& chunk = g_buf_clock[(serial << 24) | (page >> 8)];
+        if (!chunk) {
+            chunk = std::make_unique<BufClockChunk>();
+        }
+        synced = &chunk->synced[page & 255];
+        hash = &chunk->hash[page & 255];
+        clip_slot = &chunk->clip[page & 255];
+    };
+    // the part of a page that belongs to this buffer's request
+    const auto clip_of = [&](u64 page, u64& start, u64& length) -> u32 {
+        const u64 cs = page == (lo >> 12) ? (lo & 4095) : 0;
+        const u64 ce = page == ((hi - 1) >> 12) ? ((hi - 1) & 4095) + 1 : 4096;
+        start = cs;
+        length = ce - cs;
+        return static_cast<u32>((cs << 16) | ce);
+    };
+    pb_syncs.fetch_add(1, std::memory_order_relaxed);
+    for (const auto& copy : copies) {
+        const u64 a = copy.dstOffset, n = copy.size;
+        for (u64 page = a >> 12; page <= (a + n - 1) >> 12; ++page) {
+            if (in_ring(page)) {
+                continue;
+            }
+            pb_old_pages.fetch_add(1, std::memory_order_relaxed);
+            u32* synced;
+            u64* hash;
+            entry(page, synced, hash);
+            const bool dirty = *synced == 0 || ClockPageAt(page).stamp > *synced;
+            if (dirty) {
+                pb_old_dirty.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            pb_old_clean.fetch_add(1, std::memory_order_relaxed);
+            u64 cstart = 0, clen = 0;
+            const u32 clip_now = clip_of(page, cstart, clen);
+            u64 now = 0;
+            if (*hash != 0 && *clip_slot != clip_now) {
+                pb_old_clean_unverifiable.fetch_add(1, std::memory_order_relaxed);
+            } else if (*hash != 0 && Core::NativeContent::HashGuarded64((page << 12) + cstart, clen, now)) {
+                pb_old_clean_verified.fetch_add(1, std::memory_order_relaxed);
+                if (now != *hash) {
+                    pb_old_clean_changed.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+    bool in_run_filtered = false;
+    for (u64 page = lo >> 12; page <= (hi - 1) >> 12; ++page) {
+        if (in_ring(page)) {
+            in_run_filtered = false;
+            continue;
+        }
+        u32* synced;
+        u64* hash;
+        entry(page, synced, hash);
+        const bool dirty = *synced == 0 || ClockPageAt(page).stamp > *synced;
+        if (!dirty) {
+            in_run_filtered = false;
+            continue;
+        }
+        pb_new_pages.fetch_add(1, std::memory_order_relaxed);
+        bool agree = false;
+        for (const auto& copy : copies) {
+            if (copy.dstOffset < ((page + 1) << 12) && copy.dstOffset + copy.size > (page << 12)) {
+                agree = true;
+                break;
+            }
+        }
+        bool filtered_page = false;
+        if (agree) {
+            pb_new_agree.fetch_add(1, std::memory_order_relaxed);
+            filtered_page = true;
+        } else if (gpu_written(page << 12, 4096)) {
+            pb_new_only_gpu.fetch_add(1, std::memory_order_relaxed);
+        } else if (*synced == 0) {
+            pb_new_first_use.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            pb_new_only_other.fetch_add(1, std::memory_order_relaxed);
+            filtered_page = true;
+            if (extras != nullptr) {
+                // S3b.1: announced for this buffer since its last sync, not uploaded by the old pieces: upload it too. Did its bytes change since this buffer last held it?
+                u64 now = 0, cstart = 0, clen = 0;
+                const u32 clip_now = clip_of(page, cstart, clen);
+                if (*hash == 0) {
+                    rs_extra_unread.fetch_add(1, std::memory_order_relaxed);
+                } else if (*clip_slot != clip_now) {
+                    rs_extra_unverifiable.fetch_add(1, std::memory_order_relaxed);
+                } else if (!Core::NativeContent::HashGuarded64((page << 12) + cstart, clen, now)) {
+                    rs_extra_unread.fetch_add(1, std::memory_order_relaxed);
+                } else if (now != *hash) {
+                    rs_extra_changed.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    rs_extra_unchanged.fetch_add(1, std::memory_order_relaxed);
+                }
+                rs_extra_pages.fetch_add(1, std::memory_order_relaxed);
+                if (!extras->empty() && extras->back().first + extras->back().second == (page << 12)) {
+                    extras->back().second += 4096;
+                } else {
+                    extras->emplace_back(page << 12, 4096);
+                    rs_extra_runs.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        if (filtered_page) {
+            pb_new_pages_filtered.fetch_add(1, std::memory_order_relaxed);
+            if (!in_run_filtered) {
+                pb_new_runs_filtered.fetch_add(1, std::memory_order_relaxed);
+                in_run_filtered = true;
+            }
+        } else {
+            in_run_filtered = false;
+        }
+        *synced = g_clock_seq == 0 ? 1 : g_clock_seq;
+        u64 h = 0, mstart = 0, mlen = 0;
+        *clip_slot = clip_of(page, mstart, mlen);
+        *hash = Core::NativeContent::HashGuarded64((page << 12) + mstart, mlen, h) ? h : 0;
     }
 }
 
@@ -1003,7 +1148,15 @@ nlohmann::json BufferCache::BindMemoReport() const {
                                  {"false_positive_calls", g2_false_pos.load()}, {"ns_calls_the_filter_would_skip", g2_ns_skip.load()}, {"ns_exact_hits", g2_ns_hit.load()}, {"ns_false_positives", g2_ns_false_pos.load()},
                                  {"real_filter_on", g_gpu_filter_skip}, {"real_skipped", g3_skipped.load()}, {"real_sampled", g3_sampled.load()}, {"REAL_SAMPLE_WRONG_MUST_BE_0", g3_sample_wrong.load()}, {"consumer_pages_checked", g2_pages_checked.load()}, {"CONSUMER_PAGE_GPU_WRITTEN_BUT_FILTER_CLEAN_MUST_BE_0", g2_page_unsafe.load()},
                                  {"consumer_page_false_positives", g2_page_false_pos.load()}, {"clear_skipped_big_ranges", g2_clear_skipped.load()}, {"pages_set", g2_pages_set.load()}};
-    nlohmann::json page_clock = {{"gpu_filter", gpu_filter}, {"on", g_page_clock_on}, {"stamps", pc_stamps.load()}, {"stamped_pages", pc_stamp_pages.load()}, {"syncs", pc_syncs.load()}, {"request_pages", pc_request_pages.load()},
+    nlohmann::json page_clock = {{"gpu_filter", gpu_filter},
+                                 {"producer_state", nlohmann::json{{"on", g_producer_state}, {"extra_pages_uploaded", rs_extra_pages.load()}, {"extra_runs", rs_extra_runs.load()},
+                                                                {"EXTRA_PAGES_BYTES_CHANGED_OLD_PATH_MISSED", rs_extra_changed.load()}, {"extra_pages_bytes_unchanged", rs_extra_unchanged.load()},
+                                                                {"extra_pages_unread", rs_extra_unread.load()}, {"extra_pages_unverifiable_other_clip", rs_extra_unverifiable.load()}}},
+                                 {"per_buffer", nlohmann::json{{"syncs", pb_syncs.load()}, {"buffers", pb_buffers.load()}, {"old_pages_outside_ring", pb_old_pages.load()}, {"old_pages_buffer_clock_dirty", pb_old_dirty.load()},
+                                                                {"OLD_PAGES_BUFFER_CLOCK_CLEAN", pb_old_clean.load()}, {"old_clean_verified", pb_old_clean_verified.load()}, {"old_clean_unverifiable_other_clip", pb_old_clean_unverifiable.load()}, {"OLD_CLEAN_BUT_CHANGED", pb_old_clean_changed.load()},
+                                                                {"new_pages", pb_new_pages.load()}, {"new_pages_old_path_also_uploaded", pb_new_agree.load()}, {"new_pages_only_clock_gpu_written", pb_new_only_gpu.load()},
+                                                                {"new_pages_first_use", pb_new_first_use.load()}, {"new_pages_only_clock_other", pb_new_only_other.load()}, {"new_pages_filtered", pb_new_pages_filtered.load()},
+                                                                {"new_runs_filtered", pb_new_runs_filtered.load()}}}, {"on", g_page_clock_on}, {"stamps", pc_stamps.load()}, {"stamped_pages", pc_stamp_pages.load()}, {"syncs", pc_syncs.load()}, {"request_pages", pc_request_pages.load()},
                                  {"old_bytes", pc_old_bytes.load()}, {"old_copies", pc_old_copies.load()}, {"old_pages", pc_old_pages_total.load()}, {"old_copies_outside_ring", pc_old_copies_nonring.load()}, {"new_pages_filtered", pc_new_pages_filtered.load()}, {"new_runs_filtered", pc_new_runs_filtered.load()}, {"new_pages_old_path_also_uploaded", pc_new_agree.load()}, {"new_pages_only_clock_gpu_written", pc_new_only_gpu.load()}, {"new_pages_only_clock_other", pc_new_only_other.load()}, {"new_pages_only_clock_other_first_use", pc_new_only_other_first_use.load()}, {"ring_pages_uploaded", pc_ring_pages.load()}, {"ring_copies", pc_ring_copies.load()}, {"ring_request_pages", pc_ring_request_pages.load()},
                                  {"old_pages_the_clock_calls_clean", pc_old_pages_clock_clean.load()}, {"clean_pages_verified_against_memory", pc_verified.load()},
                                  {"CLEAN_BUT_CHANGED_total", pc_stale.load()}, {"changed_then_announced_late", pc_stale_late_announce.load()}, {"CHANGED_NEVER_ANNOUNCED_MUST_BE_0", pc_stale_unexplained.load()}, {"changed_pending", pc_stale_pending.load()}, {"unreadable", pc_unreadable.load()}, {"new_pages", pc_new_pages.load()}, {"new_runs", pc_new_runs.load()},
@@ -2012,8 +2165,20 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     s_ann.End();
     TLG_PROF_NAMED_LEVEL(s_up, "buffer.sync.upload", 3);
     Core::SplitCensus::PhaseScope upload_phase{Core::SplitCensus::PhaseUpload};
-    last_upload_bytes += total_size_bytes;
     if (g_page_clock_on) [[unlikely]] {
+        const auto gpu_lambda = [this](VAddr a, u64 n) { return IsRegionGpuModified(a, n); };
+        boost::container::small_vector<std::pair<u64, u64>, 8> extra_pieces;
+        PageClockSyncBuffer(arena, held_lo, held_hi, copies, gpu_lambda, g_producer_state ? &extra_pieces : nullptr);
+        if (!extra_pieces.empty()) {
+            n0_cause = 2;
+            for (const auto& [a, n] : extra_pieces) {
+                add_copy(a, n);
+            }
+            cpu_epoch.fetch_add(1, std::memory_order_acq_rel); // (the upload memo's answers are stale)
+        }
+    }
+    last_upload_bytes += total_size_bytes;
+    if (g_page_clock_on && !g_producer_state) [[unlikely]] {
         PageClockSync(held_lo, held_hi, copies, total_size_bytes, [this](VAddr a, u64 n) { return IsRegionGpuModified(a, n); });
     }
     Core::NativeUploads::NoteUploaded(total_size_bytes);
