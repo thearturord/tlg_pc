@@ -978,7 +978,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
                                              Core::NativeResources::BufferPath::Arena, last_upload_bytes);
     if (is_written) {
         std::unique_lock lock{gpu_ranges_mutex};
-        if (!gpu_modified_ranges.Intersects(device_addr, size)) {
+        if (!gpu_modified_ranges.Contains(device_addr, size)) {
+            // (every change of the set is an identity event: a range that was only partly in the set grows it over bytes next to it, and a row for those bytes must see that)
             NativeIdentity::Note(device_addr, device_addr + size, NativeIdentity::GpuWrittenState);
         }
         gpu_modified_ranges.Add(device_addr, size);

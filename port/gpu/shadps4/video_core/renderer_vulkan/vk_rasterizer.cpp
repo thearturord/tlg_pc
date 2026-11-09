@@ -2032,7 +2032,7 @@ bool Rasterizer::RowsServe(u64 id, VAddr address, u64 size, bool texel, const Vi
     // (ChangedSince walks the identity events after the stored clock: the clock moves up to the one read before each successful check, so the walk covers only what is new)
     const u64 clock_now = Core::NativeIdentity::Clock();
     if (r.epoch != buffer_cache.PlacementEpoch() || Core::NativeIdentity::ChangedSince(r.clock, address, address + size) != Core::NativeIdentity::Change::None ||
-        buffer_cache.ObjectRangeDirty(id, address, size) || buffer_cache.IsRangeGpuWritten(address, size) != r.gpu) {
+        buffer_cache.ObjectRangeDirty(id, address, size)) { // (the GPU-written state of the range is covered by the identity events: every change of the set logs one)
         s[135].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
