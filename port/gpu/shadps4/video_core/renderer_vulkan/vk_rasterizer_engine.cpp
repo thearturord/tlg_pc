@@ -52,6 +52,7 @@
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_engine.h"
 #include "native/native_ring_census.h"
+#include "native/native_hook_ring.h"
 
 // Engine path: member functions of an emulator class that serve the native path (moved out of native/ 2026-11-03).
 // so that the emulator files only call into native/; the class stays declared in the emulator's header until the owning plan phase
@@ -838,6 +839,7 @@ void Rasterizer::FrontStageRing(StagePlan& stage, u64 done, const DrawPlan* owne
             memory->CopySparseMemory(address, constant_ring->Data(*offset), size);
             Core::NativeContent::NoteLateRead(Core::NativeContent::LateKind::ConstantRing, address, size, seq);
         }
+        Core::HookRing::Compare(address, size, constant_ring->Data(*offset)); // TLG_HOOK_RING (F1 1a shadow): the bytes the old path copied against the ring filled at the writes
         constant_ring->Flush(*offset, size);
         stage.ring.push_back({index, static_cast<u32>(size), *offset, address, from_snapshot, desc.is_formatted});
         ring_use.taken.fetch_add(1, std::memory_order_relaxed);

@@ -39,6 +39,7 @@
 #include "native/native_drain_audit.h"
 #include "native/native_uploads.h"
 #include "native/native_ring_census.h"
+#include "native/native_hook_ring.h"
 #include "native/native_zpass_gen.h"
 #include "native/native_resources.h"
 #include "core/memory.h"
@@ -691,6 +692,7 @@ void RegisterBuiltins() {
     Register("/zpassgen", "(N6.3i, TLG_ZPASS_GEN=1) the cascade generator: passes generated, run by the loop, declined (and why), verify runs and their differences, the learned variant table",
              [](const Params&) { return Core::NativeZPassGen::Report(); });
     Register("/threads", "CPU use of the busiest threads since the previous call", Threads);
+    Register("/hook_ring", "TLG_HOOK_RING=1 (F1 class 1a shadow): front constant copies compared with a ring filled at the writes", [](const Params&) { return Core::HookRing::Report(); });
     Register("/ring_census", "TLG_RING_CENSUS=1 (design review F1): frame ring bytes the GPU reads, announced by a hook or silent", [](const Params&) { return Core::RingCensus::Report(); });
     Register("/memory", "?addr=0x..&size=N (max 65536): guest memory as hex", Memory);
     Register("/log", "?lines=N&filter=text&file=shad_log.txt: tail of a log file", Log);
