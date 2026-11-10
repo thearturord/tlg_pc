@@ -133,6 +133,20 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
             }
             out["row_ahead_census_cumulative"] = std::move(ra);
         }
+        {
+            nlohmann::json rs = nlohmann::json::object();
+            static constexpr const char* names[] = {"bindings_with_engine_id", "planned_row_found", "planned_row_valid_at_bind", "valid_raster_row_served_same",
+                                                    "VALID_RASTER_ROW_SERVED_DIFFERENT_MUST_BE_0", "valid_raster_old_path_same", "valid_raster_old_path_different",
+                                                    "planned_row_stale_at_bind", "no_planned_row_but_raster_row_served", "of_valid_static", "of_valid_written", "x11"};
+            for (u32 side = 0; side < 2; ++side) {
+                nlohmann::json one = nlohmann::json::object();
+                for (u32 k = 0; k < 12; ++k) {
+                    one[names[k]] = rows_ahead_shadow[side][k].load();
+                }
+                rs[side ? "compute" : "graphics"] = std::move(one);
+            }
+            out["rows_ahead_shadow_cumulative"] = std::move(rs);
+        }
         out["geometry"] = {{"vertex_ring", c[24]}, {"vertex_by_engine_handle", c[25]}, {"vertex_by_address", c[26]},
                            {"index_ring", c[27]}, {"index_by_engine_handle", c[28]}, {"index_by_address", c[29]}};
         if (cover_on) {

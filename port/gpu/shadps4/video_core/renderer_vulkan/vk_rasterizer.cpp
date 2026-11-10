@@ -11,6 +11,7 @@
 #include <windows.h>
 #endif
 #include "common/debug.h"
+#include "video_core/renderer_vulkan/row_share.h"
 #include "native/native_debug_server.h"
 #include "native/native_identity_log.h"
 #include "native/native_image_caller.h"
@@ -146,12 +147,15 @@ thread_local bool t_row_gpu = false, t_row_dirty_epoch = false; // (diagnostics 
 thread_local bool t_row_static = false; // the last served row is a static row
 thread_local u64 t_row_hash = 0;
 inline u64 RowKey(u64 id, u64 address, u64 size, bool texel, bool written = false) noexcept {
-    u64 h = 0xcbf29ce484222325ull;
-    for (const u64 v : {id, address, size, static_cast<u64>(texel) | (written ? 2u : 0u)}) {
-        h = (h ^ v) * 0x100000001b3ull;
-        h ^= h >> 29;
+    return Vulkan::RowShare::Key(id, address, size, texel, written); // (the same key the front reads the shared row table by)
+}
+inline void ShareRow(u64 key, const RealRow& row) noexcept {
+    if (Vulkan::RowShare::Mode() != 0) {
+        Vulkan::RowShare::Publish(key, Vulkan::RowShare::Row{row.id, row.address, row.size,
+                                                            (row.texel ? Vulkan::RowShare::FlagTexel : 0u) | (row.written ? Vulkan::RowShare::FlagWritten : 0u) |
+                                                                (row.inside ? Vulkan::RowShare::FlagInside : 0u) | (row.is_static ? Vulkan::RowShare::FlagStatic : 0u),
+                                                            row.buffer, row.offset, row.epoch, row.version});
     }
-    return h;
 }
 
 /// W3.0 (dispatch census, `TLG_COVER_CENSUS=1`): what one dispatch bound and where its time went; summed per compute program in `g_w3`
@@ -2200,7 +2204,11 @@ void Rasterizer::RowsLearn(u64 id, VAddr address, u64 size, bool texel, const Vi
             return;
         }
     }
-    t_rows_real[RowKey(id, address, size, texel, written)] = RealRow{id, address, size, texel, buffer, offset, epoch_pre, clock_pre, gpu, version_pre, unattr_pre, inside, false, 0, written};
+    {
+        const u64 key = RowKey(id, address, size, texel, written);
+        const RealRow& row = t_rows_real[key] = RealRow{id, address, size, texel, buffer, offset, epoch_pre, clock_pre, gpu, version_pre, unattr_pre, inside, false, 0, written};
+        ShareRow(key, row);
+    }
     if (written) {
         Core::RowVersion::NoteWritten(1);
     }
@@ -4307,6 +4315,9 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                 LOG_ERROR(Render_Vulkan, "static row: id {:#x} {:#x}+{:#x}: guest bytes changed since the learn, the version did not move (not served)", w31_id, vsharp.address, size);
                             }
                             t_rows_real.erase(RowKey(w31_id, vsharp.address, size, desc.is_formatted));
+                            if (Vulkan::RowShare::Mode() != 0) {
+                                Vulkan::RowShare::Erase(RowKey(w31_id, vsharp.address, size, desc.is_formatted));
+                            }
                             keep = false;
                         }
                     }
@@ -4378,9 +4389,13 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                             if (t_rows_real.size() > 400000) {
                                 t_rows_real.clear();
                             }
-                            t_rows_real[RowKey(w31_id, vsharp.address, size, desc.is_formatted)] =
-                                RealRow{w31_id, vsharp.address, size, desc.is_formatted, static_buffer, static_offset, rows_epoch_pre, rows_clock_pre, false, rows_version_pre, rows_unattr_pre,
-                                        true, true, learn_hash};
+                            {
+                                const u64 key = RowKey(w31_id, vsharp.address, size, desc.is_formatted);
+                                const RealRow& row = t_rows_real[key] =
+                                    RealRow{w31_id, vsharp.address, size, desc.is_formatted, static_buffer, static_offset, rows_epoch_pre, rows_clock_pre, false, rows_version_pre, rows_unattr_pre,
+                                            true, true, learn_hash};
+                                ShareRow(key, row);
+                            }
                             Core::RowVersion::NoteStaticReal(0);
                         } else {
                             Core::RowVersion::NoteStaticReal(5);
@@ -4443,6 +4458,48 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     }
                     if (!buffer_cache.IsHookRing(obtained.first)) { // a hook ring answer moves with the ring's laps: never learned
                         RowsLearn(w31_id, vsharp.address, size, desc.is_formatted, obtained.first, obtained.second, rows_epoch_pre, rows_clock_pre, rows_gpu_pre, rows_version_pre, rows_unattr_pre);
+                    }
+                }
+                if (Vulkan::RowShare::Mode() != 0 && w31_id != 0) [[unlikely]] {
+                    // rows ahead shadow (design review 55): the row the front planned against the answer the raster thread gave
+                    auto& c = rows_ahead_shadow[stage.sw_stage == Shader::SwStage::Compute ? 1 : 0];
+                    c[0].fetch_add(1, std::memory_order_relaxed);
+                    const StagePlan* ap = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
+                                          : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
+                                                                                                                      : nullptr;
+                    const ResolvedBuffer* a = ap != nullptr && buffer_index < ap->resolved.size() && ap->resolved[buffer_index].ahead_id == w31_id &&
+                                                      ap->resolved[buffer_index].ahead_address == vsharp.address && ap->resolved[buffer_index].ahead_size == size
+                                                  ? &ap->resolved[buffer_index]
+                                                  : nullptr;
+                    if (a == nullptr || !a->plan_found) {
+                        if (row_served) {
+                            c[8].fetch_add(1, std::memory_order_relaxed);
+                        }
+                    } else {
+                        c[1].fetch_add(1, std::memory_order_relaxed);
+                        const bool valid = a->plan_epoch == buffer_cache.PlacementEpoch() && a->plan_version == Core::RowVersion::Of(w31_id) &&
+                                           (a->plan_flags & Vulkan::RowShare::FlagInside) != 0;
+                        if (!valid) {
+                            c[7].fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            c[2].fetch_add(1, std::memory_order_relaxed);
+                            const bool same = obtained.first == a->plan_buffer && obtained.second == a->plan_offset;
+                            c[row_served ? (same ? 3 : 4) : (same ? 5 : 6)].fetch_add(1, std::memory_order_relaxed);
+                            if (row_served && !same) {
+                                static std::atomic<u32> logged{0};
+                                if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+                                    LOG_ERROR(Render_Vulkan, "rows ahead shadow: id {:#x} {:#x}+{:#x}: planned row {:p}+{:#x}, the raster's row {:p}+{:#x} (written {} texel {} static {})", w31_id,
+                                              vsharp.address, size, a->plan_buffer, a->plan_offset, static_cast<const void*>(obtained.first), obtained.second, desc.is_written,
+                                              desc.is_formatted, (a->plan_flags & Vulkan::RowShare::FlagStatic) != 0);
+                                }
+                            }
+                            if ((a->plan_flags & Vulkan::RowShare::FlagStatic) != 0) {
+                                c[9].fetch_add(1, std::memory_order_relaxed);
+                            }
+                            if (desc.is_written) {
+                                c[10].fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
                     }
                 }
                 if (cover_on) [[unlikely]] {

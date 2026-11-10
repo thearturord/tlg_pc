@@ -72,6 +72,10 @@ struct ResolvedBuffer {
     VAddr ahead_address{};
     u64 ahead_size{};
     u64 ahead_version{};
+    /// Rows ahead shadow (`TLG_ROWS_AHEAD=1`): the row the front found in the shared row table for this binding
+    bool plan_found{};
+    const void* plan_buffer{};
+    u64 plan_offset{}, plan_epoch{}, plan_version{}, plan_flags{};
 };
 
 /// Per-draw state of one shader stage, captured by the command processor thread when it looks the
