@@ -14,7 +14,7 @@ namespace Core::ViewTable {
 /// Notes 102 to 106 (`TLG_TARGET_TABLE`: 2 real by default since the owner's play, note 106, one draw in 64 audited; 1 shadow; 0 off, the old path): render and depth targets
 /// by their view id, in this same table (use flags with bit 63).
 [[nodiscard]] u32 TargetMode() noexcept;
-/// Notes 107 and 108 (`TLG_WRITTEN_NO_IMAGE`: 0 off (default), 1 shadow, 2 real with one in 64 walked as the audit): a written binding of an engine buffer whose image list holds no live image and no
+/// Notes 107 to 110 (`TLG_WRITTEN_NO_IMAGE`: 2 real by default since the owner's play, note 110, one in 64 walked as the audit; 1 shadow; 0 off, the old path): a written binding of an engine buffer whose image list holds no live image and no
 /// waiting clear needs no texture cache walk for images based in its memory (`NativeImageIndex::NoImageInBuffer`).
 [[nodiscard]] u32 WrittenMode() noexcept;
 

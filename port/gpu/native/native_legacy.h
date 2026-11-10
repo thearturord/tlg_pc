@@ -21,6 +21,7 @@
 ///   TLG_HOOK_OWNED=0           the light and slot writes announced and applied on the raster thread, one batch entry per write (90-94)
 ///   TLG_VIEW_TABLE=0           every image binding found by its T# words (set memo key, lookup cache, B3, FindImage) instead of by the engine view id (95-99)
 ///   TLG_TARGET_TABLE=0         every render and depth target found by its register words (register cache, image generation, decode, FindImage) instead of by the view id (102-106)
+///   TLG_WRITTEN_NO_IMAGE=0     every written buffer binding walks the texture cache for images based in its memory, even where the buffer's id says there is none (107-110)
 ///   TLG_OWN_IMMUTABLE=0        immutable buffers bound through rows and `ObtainBuffer` (83-84)
 ///   TLG_OWN_MUTABLE=0          default and dynamic buffers bound through rows and `ObtainBuffer` (85-86)
 ///   TLG_OWN_CLOSE=0            no lazy own pointer (87-88)

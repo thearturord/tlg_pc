@@ -36,7 +36,10 @@ u32 TargetMode() noexcept {
 u32 WrittenMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_WRITTEN_NO_IMAGE");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+        if (e == nullptr || e[0] == 0) {
+            return 2u; // default 2 since 2026-11-11 after the owner's play (note 110); LEGACY(written_no_image): =0 walks the texture cache for every written buffer, =1 shadow
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
