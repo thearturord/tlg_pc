@@ -44,7 +44,7 @@ void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site = nullp
 /// F1 1c real (`TLG_RING_LEAN_APPLY`, default on since 2026-11-10, =0 off): an in-ring constant copy or buffer Map window is applied lean on the raster thread (image index and GPU-written
 /// supersede only; no buffer marks, memo erase or resident note), one in 64 in full with its effects counted; rows do not learn ranges inside the frame ring.
 [[nodiscard]] bool RingLeanApplyOn() noexcept;
-/// F1 class 1 finished (`TLG_RING_OUT=1`, default off): an in-ring constant copy or buffer Map window does not enter the raster thread's batch at all (the hook ring holds its bytes, the
+/// F1 class 1 finished (`TLG_RING_OUT`, default on since 2026-11-10, =0 off): an in-ring constant copy or buffer Map window does not enter the raster thread's batch at all (the hook ring holds its bytes, the
 /// census of design review section 26 found every remaining step of its apply without effect); one in 64 still goes through the batch and is applied in full with its effects counted.
 [[nodiscard]] bool RingOutOn() noexcept;
 /// Counters of the lean apply: 0 applied lean, 1 applied in full as the sampled check, 2 sampled with a buffer, memo, recipe or resident effect (MUST_BE_0), 3 rows not learned in the ring.
