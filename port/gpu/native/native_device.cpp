@@ -497,6 +497,21 @@ void NoteMapped(u64 id, u64 address, u64 size, u32 type) {
     last_map[id] = {address, size, type};
 }
 
+std::string MapsCovering(u64 address, u32 max) {
+    std::string out;
+    u32 n = 0;
+    std::scoped_lock lock{map_mutex};
+    for (const auto& [id, m] : last_map) {
+        if (m.address <= address && address < m.address + std::max<u64>(m.size, 1)) {
+            out += fmt::format(" [id {:#x} {:#x}+{:#x} type {}]", id, m.address, m.size, m.type);
+            if (++n >= max) {
+                break;
+            }
+        }
+    }
+    return out.empty() ? std::string{" none"} : out;
+}
+
 namespace {
 /// B11 census
 struct ClearFrame {

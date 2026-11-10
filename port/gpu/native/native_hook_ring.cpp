@@ -11,6 +11,9 @@
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 #include "native/native_draw.h"
+#include "native/native_device.h"
+#include "native/native_content.h"
+#include <cstdio>
 #include "native/native_hook_ring.h"
 #include "native/native_ring_mirror.h"
 #include "native/native_updates.h"
@@ -356,6 +359,7 @@ bool WideCensusOn() noexcept {
 std::atomic<u64> c_wide[10]{};
 std::atomic<u64> c_wide_diff_writer[9]{};
 std::atomic<u64> c_wide_landed[2]{}, c_wide_probed{0};
+std::array<std::atomic<u64>, MaxTags> c_wide_prefix_tag_granules{}; // granules changed in the prefix, not landed, by fill tag
 std::mutex g_wide_mutex;
 std::vector<std::array<u64, 5>> g_wide_examples; // ring offset of the window, its first differing ring offset, diff bytes, unfilled bytes, prefix bytes
 
@@ -391,6 +395,8 @@ void CompareWide(u64 address, u64 size, bool probe) {
             c_wide_diff_writer[std::min<u32>(g_fill_writer[g].load(std::memory_order_relaxed), 8)].fetch_add(1, std::memory_order_relaxed);
             if ((filled[g].load(std::memory_order_relaxed) & 2) != 0) {
                 c_wide_landed[in_prefix ? 0 : 1].fetch_add(1, std::memory_order_relaxed); // a GPU result landed there since the fill
+            } else if (in_prefix) {
+                c_wide_prefix_tag_granules[g_fill_tag[g].load(std::memory_order_relaxed) % MaxTags].fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (in_prefix) {
@@ -418,6 +424,33 @@ void CompareWide(u64 address, u64 size, bool probe) {
     c_wide[7].fetch_add(diff_after != 0 ? 1 : 0, std::memory_order_relaxed);
     c_wide[8].fetch_add(unfilled == 0 ? 1 : 0, std::memory_order_relaxed);
     c_wide[9].fetch_add(granules_differ, std::memory_order_relaxed);
+    if (first_prefix_diff != ~0ull) {
+        // the details of the change in the buffer's own block (the first 24 windows that have one)
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+            const u64 at = lo + first_prefix_diff;
+            const u64 g = (at - base) >> GranuleShift;
+            const u16 tag = g_fill_tag[g].load(std::memory_order_relaxed);
+            FillTag t{};
+            {
+                std::scoped_lock lock{g_tag_mutex};
+                if (tag < g_tags.size()) {
+                    t = g_tags[tag];
+                }
+            }
+            Core::NativeContent::BindContext bc{};
+            const bool have_bc = Core::NativeContent::CurrentBindContext(bc);
+            std::fprintf(stderr,
+                         "wide census: window %#llx+%#llx (bound id %#llx program %#llx) prefix %#llx: changed byte at %#llx (ring+%#llx), fill writer %u age %u seq, fill tag how %u caller %#x "
+                         "resource %#llx map type %u, open Map over it %d, landed %d; Maps covering it:%s\n",
+                         static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi - lo), static_cast<unsigned long long>(have_bc ? bc.engine_id : 0),
+                         static_cast<unsigned long long>(have_bc ? bc.program : 0), static_cast<unsigned long long>(prefix), static_cast<unsigned long long>(at),
+                         static_cast<unsigned long long>(at - base), g_fill_writer[g].load(std::memory_order_relaxed),
+                         static_cast<u32>(Core::NativeDraw::NextSeq()) - g_fill_seq[g].load(std::memory_order_relaxed), t.how, t.caller, static_cast<unsigned long long>(t.resource), t.map_type,
+                         Core::NativeUpdates::OpenMapOverlaps(at, 1) ? 1 : 0, (filled[g].load(std::memory_order_relaxed) & 2) != 0 ? 1 : 0,
+                         Core::NativeDevice::MapsCovering(at).c_str());
+        }
+    }
     if (first_prefix_diff != ~0ull && probe) {
         Core::RingMirror::ProbeWrites(lo + first_prefix_diff); // (the buffer's own block only)
         c_wide_probed.fetch_add(1, std::memory_order_relaxed);
@@ -619,6 +652,15 @@ nlohmann::json Report() {
         }
         w["differing_granules_where_a_gpu_result_landed"] = {{"in_prefix", c_wide_landed[0].load()}, {"after_prefix", c_wide_landed[1].load()}};
         w["prefix_diffs_probed"] = c_wide_probed.load();
+        {
+            std::scoped_lock tag_lock{g_tag_mutex};
+            for (u32 t = 0; t < g_tags.size() && t < MaxTags; ++t) {
+                if (const u64 n = c_wide_prefix_tag_granules[t].load()) {
+                    const auto& e = g_tags[t];
+                    w["prefix_changed_not_landed_by_fill_tag"].push_back(fmt::format("{} granules: how {} caller {:#x} resource {:#x} map type {}", n, e.how, e.caller, e.resource, e.map_type));
+                }
+            }
+        }
         std::scoped_lock lock{g_wide_mutex};
         for (const auto& e : g_wide_examples) {
             w["examples"].push_back(fmt::format("window ring+{:#x} first diff ring+{:#x} diff {} unfilled {} prefix {}", e[0], e[1], e[2], e[3], e[4]));

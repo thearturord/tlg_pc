@@ -88,6 +88,8 @@ void BuffersIn(VAddr address, u64 size, std::vector<BufferPart>& out);
 
 /// E2: a Map of buffer `id` returned `address` (`size` bytes, `type` the Direct3D map type); the buffer's data is there until its next Map
 void NoteMapped(u64 id, u64 address, u64 size, u32 type);
+/// Diagnostics: the last Maps (of any buffer) whose returned window covers `address`, as text (id, window, type), at most `max` of them.
+[[nodiscard]] std::string MapsCovering(u64 address, u32 max = 4);
 /// B6: does the CPU read [address, address + size)? True for memory of a resource the engine created for CPU reads (staging usage or CPU read access) and for memory
 /// no engine resource owns (unknown: kept safe); false for every other engine resource (the GPU's own data)
 [[nodiscard]] bool CpuReads(VAddr address, u64 size);
