@@ -171,7 +171,7 @@ private:
     Planner aware_normal, aware_group; ///< G2: the group-aware planner: accesses of operations outside any group, and accesses of the group (kept apart)
     Planner live_object; ///< B10: the same state machine keyed by object: a placed engine buffer (its own Vulkan buffer) in its own offset space
     u64 LiveObjectSpace(const VideoCore::Buffer* handle, u64 offset, u64& begin);
-    /// Design review 72 (`TLG_EPOCH_PLANNER`, default 0 off; 1 shadow, 2 real): one planner keyed by object whose entries survive a flush. A flush moves the epoch on instead of clearing
+    /// Design review 72 (`TLG_EPOCH_PLANNER`, default 2 real since 2026-11-10 after the owner's play; 0 off, 1 shadow): one planner keyed by object whose entries survive a flush. A flush moves the epoch on instead of clearing
     /// the maps (no node freed and made again per key per flush window, no list allocated again); an entry of an older epoch counts as empty and is reset at its next access.
     /// It keeps the group-aware lists in the same entry and answers what the deciding planner answers (the group-aware one in G2 mode 2, the object planner otherwise).
     /// Shadow: every query compared with the old answer, which decides. Real: the old planners run only in one flush window in 64 (audit), where the answer is the OR of both.

@@ -1316,8 +1316,11 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 
 u32 Runtime::EpochPlannerMode() noexcept {
     static const u32 mode = [] {
-        const char* e = std::getenv("TLG_EPOCH_PLANNER");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+        const char* e = std::getenv("TLG_EPOCH_PLANNER"); // default 2 (real) since 2026-11-10 after the owner's play; =0 off, =1 shadow
+        if (e == nullptr || e[0] == 0) {
+            return 2u;
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
