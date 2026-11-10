@@ -73,6 +73,9 @@ struct ImmutableBuffer {
     u32 copy_generation{};
     u32 copy_gpu_writes{};
     u8 usage{1}; ///< 1 immutable (the engine writes it once); 0 default and 2 dynamic only with `TLG_RESIDENT_BUFFERS` (C1, see below)
+    /// Design review 81 (`TLG_DROP_DIRTY_APPLIES`): set when an announced write marked the whole of this buffer's range dirty, cleared when an upload takes its dirty bytes.
+    /// While set, a further write of the light constants or scene slots changes nothing a reader sees (the next reader uploads the bytes from guest memory anyway).
+    std::atomic<bool> dirty_pending{false};
 };
 
 /// C1 / C3: resident engine buffers (`TLG_RESIDENT_BUFFERS=1`). The residency of the immutable buffers (a buffer synchronized once is read from the arena with no tracker query)

@@ -185,10 +185,39 @@ void NoteFault(u64 address, u64 size) {
     ++info->faults;
 }
 
+u32 DropDirtyMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_DROP_DIRTY_APPLIES");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // 0 off (default), 1 shadow, 2 real (1 in 64 audited)
+    }();
+    return mode;
+}
+
+namespace {
+std::array<std::atomic<u64>, DropCount> drops{};
+}
+
+void NoteDrop(u32 what) noexcept {
+    if (what < DropCount) {
+        drops[what].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 nlohmann::json Report() {
+    nlohmann::json j = nlohmann::json::object();
+    {
+        static constexpr const char* D[DropCount] = {"asked", "no_registered_buffer", "set_held_the_range", "flag_set_would_drop", "FLAG_SET_BUT_NOT_DIRTY_MUST_BE_0",
+                                                     "set_held_but_flag_clear", "DROP_WITH_LIVE_COPY_MUST_BE_0", "DROP_ERASED_A_MEMO_MUST_BE_0", "uploads_cleared_the_flag", "dropped_real", "audited_real"};
+        j["drop_dirty"]["mode"] = DropDirtyMode();
+        for (u32 k = 0; k < DropCount; ++k) {
+            j["drop_dirty"][D[k]] = drops[k].load();
+        }
+    }
+    if (!On()) {
+        return j;
+    }
     static constexpr const char* B[BindClassCount] = {"ring", "special", "engine_id_inside_its_buffer", "engine_id_crossing_its_buffer", "engine_id_not_in_registry", "no_engine_id", "ring_from_hook_ring", "ring_copy_of_an_engine_buffer", "ring_copy_no_engine_buffer", "no_id_inside_an_engine_buffer", "no_id_no_engine_buffer", "no_id_no_record_words"};
     static constexpr const char* U[4] = {"default", "immutable", "dynamic", "staging"};
-    nlohmann::json j = nlohmann::json::object();
     for (u32 k = 0; k < BindClassCount; ++k) {
         j["binds"][B[k]] = binds[k].load();
     }

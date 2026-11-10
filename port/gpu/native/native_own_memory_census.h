@@ -32,6 +32,23 @@ void NoteBindNoId(u64 address, u64 size, bool written);
 void NoteCopy(u64 dst, u64 src, u64 size);
 /// A vertex or index buffer range a draw reads.
 void NoteGeometryRead(u64 address, u64 size);
+/// Design review 81: `TLG_DROP_DIRTY_APPLIES` (default 0; 1 shadow, 2 real): a light constant or scene slot write to a buffer whose bytes are still marked dirty needs no batch entry.
+[[nodiscard]] u32 DropDirtyMode() noexcept;
+enum Drop : u32 {
+    DropAsked,          ///< lean applies of tags 2 and 12 seen
+    DropNoResident,     ///< the id names no registered buffer (no flag to keep)
+    DropCovered,        ///< the buffer's dirty set already held the whole range
+    DropFlagSet,        ///< the flag was set (the drop decision)
+    DropFlagNotCovered, ///< FLAG_SET_BUT_NOT_DIRTY_MUST_BE_0: dropping would lose a mark
+    DropCoveredNoFlag,  ///< the set held the range, the flag was clear (a drop missed: safe)
+    DropLiveCopy,       ///< DROP_WITH_LIVE_COPY_MUST_BE_0: a stream ring copy made at the buffer's current generation
+    DropMemoErased,     ///< DROP_ERASED_A_MEMO_MUST_BE_0: the apply's bind memo erase removed an entry
+    DropFlagCleared,    ///< uploads that cleared a set flag
+    DropDropped,        ///< real: dropped (the image step only ran)
+    DropAudited,        ///< real: a would-drop write applied in full and checked (1 in 64)
+    DropCount
+};
+void NoteDrop(u32 what) noexcept;
 [[nodiscard]] nlohmann::json Report();
 
 } // namespace Core::OwnMemoryCensus

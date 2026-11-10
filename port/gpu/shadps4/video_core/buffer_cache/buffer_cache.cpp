@@ -151,7 +151,71 @@ void BufferCache::IdMarkLean(VAddr address, u64 size, bool newer, u64 id) {
             t = n;
         }
     };
-    BindMemoErase(address, size);
+    // design review 81 (TLG_DROP_DIRTY_APPLIES=1, shadow): would this write need its batch entry? Not when the buffer's bytes are still marked dirty (no upload took them since):
+    // the next reader uploads them from guest memory, which holds this write. The flag beside the set is what a hook could read; both are compared here.
+    namespace OM = Core::OwnMemoryCensus;
+    const u32 drop_mode = OM::DropDirtyMode();
+    auto* drop_resident = drop_mode != 0 ? Core::NativeResources::FindImmutableById(id) : nullptr;
+    bool drop_real = false; // real (2): the write is dropped after the image step
+    if (drop_mode == 2 && drop_resident != nullptr && drop_resident->dirty_pending.load(std::memory_order_acquire)) {
+        static thread_local u32 drop_tick = 0;
+        if ((++drop_tick & 63u) != 0) {
+            drop_real = true;
+            OM::NoteDrop(OM::DropDropped);
+        } else {
+            OM::NoteDrop(OM::DropAudited); // the audit: the shadow's checks and the full lean apply
+        }
+    }
+    const bool drop_shadow = drop_mode == 1 || (drop_mode == 2 && !drop_real);
+    bool would_drop = false;
+    if (drop_shadow && drop_mode != 0) [[unlikely]] {
+        OM::NoteDrop(OM::DropAsked);
+        bool covered = false;
+        {
+            std::scoped_lock lock{object_dirty_mutex};
+            const auto it = object_dirty.find(id);
+            covered = it != object_dirty.end() && it->second.Contains(address, size);
+        }
+        const bool flag = drop_resident != nullptr && drop_resident->dirty_pending.load(std::memory_order_acquire);
+        if (drop_resident == nullptr) {
+            OM::NoteDrop(OM::DropNoResident);
+        }
+        if (covered) {
+            OM::NoteDrop(OM::DropCovered);
+        }
+        if (flag) {
+            would_drop = true;
+            OM::NoteDrop(OM::DropFlagSet);
+            if (!covered) {
+                OM::NoteDrop(OM::DropFlagNotCovered);
+                static std::atomic<u32> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+                    LOG_ERROR(Render_Vulkan, "drop dirty: buffer id {:#x} {:#x}+{:#x}: the flag says dirty, the set does not hold the range", id, address, size);
+                }
+            }
+            if (drop_resident->copy_offset != ~u64{0} && drop_resident->copy_generation == drop_resident->generation.load(std::memory_order_acquire)) {
+                OM::NoteDrop(OM::DropLiveCopy);
+            }
+        } else if (covered) {
+            OM::NoteDrop(OM::DropCoveredNoFlag);
+        }
+    }
+    if (!drop_real) {
+        const bool force_before = Core::N0::t_force_effect;
+        const u32 effect_before = Core::N0::t_effect;
+        if (would_drop) [[unlikely]] {
+            Core::N0::t_force_effect = true;
+            Core::N0::t_effect = 0;
+        }
+        BindMemoErase(address, size);
+        if (would_drop) [[unlikely]] {
+            if ((Core::N0::t_effect & Core::N0::EffMemo) != 0) {
+                OM::NoteDrop(OM::DropMemoErased);
+            }
+            Core::N0::t_force_effect = force_before;
+            Core::N0::t_effect = effect_before;
+        }
+    }
     step(1);
     if (Core::NativeUpdates::ImageByIdMode() == 1 && Core::NativeUpdates::B8ImageMode() != 0) [[unlikely]] {
         // design review 63, shadow: the image step's answer by the buffer id beside the address lookup's
@@ -201,6 +265,9 @@ void BufferCache::IdMarkLean(VAddr address, u64 size, bool newer, u64 id) {
         Core::NativeUpdates::NoteIdMarks(Core::NativeUpdates::ImLeanImageTouched);
     }
     step(2);
+    if (drop_real) {
+        return; // design review 81: the buffer's bytes are still marked dirty; the next reader uploads them with this write in them
+    }
     {
         std::scoped_lock lock{object_dirty_mutex};
         if (Core::NativeUpdates::LeanDirtyMode() != 2) {
@@ -208,6 +275,9 @@ void BufferCache::IdMarkLean(VAddr address, u64 size, bool newer, u64 id) {
         }
         object_dirty[id].Add(address, size);
         b9_unattributed.Subtract(address, size);
+    }
+    if (drop_mode != 0 && drop_resident != nullptr) [[unlikely]] {
+        drop_resident->dirty_pending.store(true, std::memory_order_release); // (the lean apply's range is the whole buffer: section 49)
     }
     step(3);
     Core::RowVersion::Bump(id);
@@ -2351,6 +2421,11 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                     it->second.ForEachInRange(part.begin, part.end - part.begin, [&](u64 a, u64 e) { b9_pieces.emplace_back(a, e - a); }); // (start, end) pairs
                     if (b9_pieces.size() != before) {
                         it->second.Subtract(part.begin, part.end - part.begin);
+                        if (Core::OwnMemoryCensus::DropDirtyMode() != 0) [[unlikely]] {
+                            if (auto* r = Core::NativeResources::FindImmutableById(part.id); r != nullptr && r->dirty_pending.exchange(false, std::memory_order_acq_rel)) {
+                                Core::OwnMemoryCensus::NoteDrop(Core::OwnMemoryCensus::DropFlagCleared);
+                            }
+                        }
                     }
                 }
                 const size_t before_unattributed = b9_pieces.size();
