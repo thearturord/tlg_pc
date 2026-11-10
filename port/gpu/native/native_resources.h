@@ -82,6 +82,10 @@ struct ImmutableBuffer {
     /// Design review 85 (`TLG_OWN_MUTABLE`): the buffer's dirty set holds bytes inside it that no upload took yet (announced CPU writes). Kept with the set under the
     /// buffer cache's dirty mutex: set by every add, recomputed by every subtraction. A mutable buffer is bound from `own` only while this is clear.
     std::atomic<bool> cpu_dirty{true};
+    /// Design review 87 (`TLG_OWN_CLOSE`): `own` was found by the lazy resolution (the placed block that holds the whole buffer), not by a placement or a synchronization
+    /// that set it; and the placement version of the last resolution that found none (no new lookup until placements change).
+    std::atomic<bool> own_new{false};
+    std::atomic<u64> own_tried{0};
 };
 
 /// C1 / C3: resident engine buffers (`TLG_RESIDENT_BUFFERS=1`). The residency of the immutable buffers (a buffer synchronized once is read from the arena with no tracker query)

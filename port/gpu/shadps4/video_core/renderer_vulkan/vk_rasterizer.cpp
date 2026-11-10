@@ -4285,16 +4285,29 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     }
                     if (mode != 0 && h != nullptr && r->ahead_address >= h->begin && r->ahead_address + r->ahead_size <= h->end && h->alive.load(std::memory_order_acquire)) {
                         OM::NoteOwn(OM::OwnImmutable, cls);
+                        const u32 close_mode = OM::OwnCloseMode();
                         const auto* own = static_cast<const VideoCore::Buffer*>(h->own.load(std::memory_order_acquire));
-                        if (own == nullptr) {
+                        if (own == nullptr && close_mode != 0) {
+                            own = buffer_cache.OwnResolve(*h); // design review 87: once per buffer (until the placements change)
+                        }
+                        const bool by_resolved = own != nullptr && h->own_new.load(std::memory_order_acquire);
+                        u32 eff = mode;
+                        if (by_resolved) {
+                            eff = close_mode == 0 ? 0u : close_mode == 1 ? 1u : mode; // shadow: compared; real: as its class
+                        }
+                        if (own == nullptr || eff == 0) {
                             OM::NoteOwn(OM::OwnNoOwn, cls);
-                        } else if (imm ? !h->synced.load(std::memory_order_acquire) : h->cpu_dirty.load(std::memory_order_acquire)) {
+                        } else if (by_resolved ? h->cpu_dirty.load(std::memory_order_acquire)
+                                               : imm ? !h->synced.load(std::memory_order_acquire) : h->cpu_dirty.load(std::memory_order_acquire)) {
                             OM::NoteOwn(OM::OwnNotSynced, cls);
                         } else if (desc.is_written && !buffer_cache.GpuWrittenContains(r->ahead_address, r->ahead_size)) {
                             OM::NoteOwn(OM::OwnNotGpuMarked, cls); // (the old path marks it: the address readers must see the GPU's bytes from the first write on)
                         } else {
+                            if (by_resolved) {
+                                OM::NoteOwn(OM::OwnByResolved, cls);
+                            }
                             static thread_local u32 own_tick = 0;
-                            if (mode == 2 && (++own_tick & 63u) != 0) {
+                            if (eff == 2 && (++own_tick & 63u) != 0) {
                                 OM::NoteOwn(OM::OwnBound, cls);
                                 const VAddr address = r->ahead_address;
                                 const u64 size = r->ahead_size;

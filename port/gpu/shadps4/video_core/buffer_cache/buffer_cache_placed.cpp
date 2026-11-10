@@ -400,6 +400,7 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
         std::scoped_lock lock{object_dirty_mutex};
         for (const u64 id : ids) {
             if (auto* h = Core::NativeResources::FindImmutableById(id); h != nullptr && h->usage != 1 && h->begin >= begin && h->end <= end) {
+                h->own_new.store(false, std::memory_order_release);
                 h->own.store(dst, std::memory_order_release);
                 Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnSet, 1);
                 if (const auto it = object_dirty.find(id); it == object_dirty.end() || !it->second.Intersects(h->begin, h->end - h->begin)) {

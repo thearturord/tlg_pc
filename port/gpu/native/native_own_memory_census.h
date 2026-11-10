@@ -64,6 +64,8 @@ enum Own : u32 {
     OwnSet,            ///< own pointers set
     OwnCleared,        ///< own pointers cleared (placed buffer dropped)
     OwnNotGpuMarked,   ///< written: the range is not marked GPU-written yet (the old path marks it)
+    OwnResolved,       ///< own pointers found by the lazy resolution
+    OwnByResolved,     ///< bindings valid only through a resolved pointer
     OwnCount
 };
 /// `cls` 0 immutable read, 1 mutable read, 2 mutable written (design review 85).
@@ -71,6 +73,9 @@ void NoteOwn(u32 what, u32 cls = 0) noexcept;
 /// Design review 85: `TLG_OWN_MUTABLE` (default 2 real since the owner's play 2026-11-10, 1 in 64 audited; 0 off, 1 shadow): bindings of default and dynamic engine buffers (reads and GPU writes) bound
 /// from the buffer's own placed buffer by id while no CPU bytes wait for it.
 [[nodiscard]] u32 OwnMutableMode() noexcept;
+/// Design review 87: `TLG_OWN_CLOSE` (default 0; 1 shadow, 2 real): a binding whose buffer has no own pointer resolves it once from the placed block that holds the
+/// whole buffer. Shadow: bindings valid only through such a pointer are compared with the old path.
+[[nodiscard]] u32 OwnCloseMode() noexcept;
 [[nodiscard]] nlohmann::json Report();
 
 } // namespace Core::OwnMemoryCensus

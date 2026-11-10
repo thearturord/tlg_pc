@@ -333,6 +333,11 @@ private:
     const Buffer* BufferFor(VAddr address, u64 size, bool demote_spanning = true, bool written = false);
     /// Design review 85: the engine buffer `id`'s `cpu_dirty` flag after its dirty set changed (`object_dirty_mutex` held; `added`: an add, else a subtraction).
     void OwnDirtyNote(u64 id, bool added);
+  public:
+    /// Design review 87: the placed block holding the whole of engine buffer `h` becomes its own memory (`own`, `own_new`), with `cpu_dirty` taken from its dirty set;
+    /// null when no placed block holds it (then not asked again until the placements change).
+    const Buffer* OwnResolve(Core::NativeResources::ImmutableBuffer& h);
+  private:
     static constexpr u64 PlacedSlack = 64; ///< B9.4: a read may run this far past a placed buffer's end (vertex fetch rounding); the bytes there are not memory's
     struct PlacedBuffer {
         std::vector<u64> ids; ///< the engine buffers it holds (one, or a block the engine laid out next to each other and binds as one range)

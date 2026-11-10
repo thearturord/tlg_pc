@@ -1608,6 +1608,37 @@ void BufferCache::OwnDirtyNote(u64 id, bool added) {
     h->cpu_dirty.store(it != object_dirty.end() && it->second.Intersects(h->begin, h->end - h->begin), std::memory_order_release);
 }
 
+const Buffer* BufferCache::OwnResolve(Core::NativeResources::ImmutableBuffer& h) {
+    const u64 version = placed_version.load(std::memory_order_acquire);
+    if (h.own_tried.load(std::memory_order_relaxed) == version) {
+        return nullptr;
+    }
+    const Buffer* holder = nullptr;
+    {
+        std::scoped_lock lock{placed_mutex};
+        auto it = placed.upper_bound(h.begin);
+        if (it != placed.begin()) {
+            --it;
+            if (it->second.begin <= h.begin && it->second.end >= h.end) {
+                holder = it->second.buffer.get();
+            }
+        }
+    }
+    if (holder == nullptr) {
+        h.own_tried.store(version, std::memory_order_relaxed);
+        return nullptr;
+    }
+    {
+        std::scoped_lock lock{object_dirty_mutex};
+        const auto it = object_dirty.find(h.id);
+        h.cpu_dirty.store(it != object_dirty.end() && it->second.Intersects(h.begin, h.end - h.begin), std::memory_order_release);
+    }
+    h.own_new.store(true, std::memory_order_release);
+    h.own.store(holder, std::memory_order_release);
+    Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnResolved, h.usage == 1 ? 0u : 1u);
+    return holder;
+}
+
 bool BufferCache::GpuWrittenContains(VAddr address, u64 size) {
     std::shared_lock lock{gpu_ranges_mutex};
     return gpu_modified_ranges.Contains(address, size);
@@ -1778,7 +1809,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
                 (immutable->usage == 1 || !IsRegionCpuModified(device_addr, size))) {
                 const auto* arena = BufferFor(device_addr, size); // B9.4: the object's own Vulkan buffer when it is placed
                 if (Core::OwnMemoryCensus::OwnImmutableMode() != 0 && immutable->usage == 1 && arena->placed_begin != 0 && immutable->begin >= arena->cpu_addr &&
-                    immutable->end <= arena->cpu_addr + arena->size_bytes && immutable->own.exchange(arena, std::memory_order_acq_rel) != arena) {
+                    immutable->end <= arena->cpu_addr + arena->size_bytes && (immutable->own_new.store(false, std::memory_order_release), true) &&
+                    immutable->own.exchange(arena, std::memory_order_acq_rel) != arena) {
                     Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnSet); // design review 83: synchronized, and held whole by this placed buffer
                 }
                 if (immutable->resident_epoch.load(std::memory_order_relaxed) != PlacementEpoch() && immutable->begin >= arena->cpu_addr &&
@@ -1819,6 +1851,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             if (Core::OwnMemoryCensus::OwnImmutableMode() != 0 && immutable->usage == 1 && arena->placed_begin != 0 && immutable->begin >= arena->cpu_addr &&
                 immutable->end <= arena->cpu_addr + arena->size_bytes) {
                 // design review 83: the buffer is synchronized whole into a placed buffer of its own (or its block's): that is its own memory until the placed buffer is dropped
+                immutable->own_new.store(false, std::memory_order_release);
                 if (immutable->own.exchange(arena, std::memory_order_acq_rel) != arena) {
                     Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnSet);
                 }

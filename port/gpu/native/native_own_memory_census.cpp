@@ -222,6 +222,14 @@ u32 OwnMutableMode() noexcept {
     return mode;
 }
 
+u32 OwnCloseMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_OWN_CLOSE"); // 0 off (default), 1 shadow, 2 real (1 in 64 audited)
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
+
 namespace {
 std::array<std::array<std::atomic<u64>, OwnCount>, 3> owns{};
 }
@@ -250,10 +258,12 @@ nlohmann::json Report() {
     }
     {
         static constexpr const char* O[OwnCount] = {"asked", "immutable_inside", "no_own_buffer", "not_synced", "bound_from_own", "compared", "DIFFERENT_MUST_BE_0",
-                                                    "OLD_PATH_DID_WORK_MUST_BE_0", "old_answer_stream_ring", "own_set", "own_cleared", "not_gpu_marked_yet"};
+                                                    "OLD_PATH_DID_WORK_MUST_BE_0", "old_answer_stream_ring", "own_set", "own_cleared", "not_gpu_marked_yet", "own_resolved_lazily",
+                                                    "bindings_valid_only_by_a_resolved_pointer"};
         static constexpr const char* C[3] = {"own_immutable", "own_mutable_read", "own_mutable_written"};
         for (u32 c = 0; c < 3; ++c) {
             j[C[c]]["mode"] = c == 0 ? OwnImmutableMode() : OwnMutableMode();
+            j[C[c]]["close_mode"] = OwnCloseMode();
             for (u32 k = 0; k < OwnCount; ++k) {
                 j[C[c]][O[k]] = owns[c][k].load();
             }
