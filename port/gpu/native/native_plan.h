@@ -66,6 +66,12 @@ struct ResolvedBuffer {
     u32 size{};
     u32 generation{};
     bool no_object{}; ///< the lookup by address found no engine object (the raster thread need not look again while the immutable epoch holds)
+    /// Rows ahead census (`TLG_ROW_AHEAD_CENSUS=1`, design review 53/54): the engine id, range and row version the front saw for this binding when it planned the draw
+    /// (every buffer binding with a record entry, written and texel ones too)
+    u64 ahead_id{};
+    VAddr ahead_address{};
+    u64 ahead_size{};
+    u64 ahead_version{};
 };
 
 /// Per-draw state of one shader stage, captured by the command processor thread when it looks the

@@ -9,6 +9,7 @@
 #include <windows.h>
 #endif
 #include "common/debug.h"
+#include "native/native_row_version.h"
 #include "native/native_debug_server.h"
 #include "native/native_log.h"
 #include "native/native_image_caller.h"
@@ -568,6 +569,30 @@ void Rasterizer::ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) 
             // not synchronized yet is fine: the raster thread binds it only once it is (at this generation)
             out.resolved[i] = {object, v.address, static_cast<u32>(size), generation};
             resolve_stats.planned.fetch_add(1, std::memory_order_relaxed);
+        }
+        static const bool ahead_census = [] { const char* e = std::getenv("TLG_ROW_AHEAD_CENSUS"); return e != nullptr && e[0] == '1'; }();
+        if (ahead_census) {
+            // rows ahead census (design review 54): every buffer binding with a record entry and an engine id, written and texel ones too: what the front would key a row by
+            for (u32 i = 0; i < info.buffers.size(); ++i) {
+                const auto& desc = info.buffers[i];
+                if (desc.IsSpecial() || desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase || desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
+                    continue;
+                }
+                u32 first = 0;
+                const u32* words = FindRecordWords(info, list, count, s, 1, desc.sharp_fetch.offsets[0], 4, &first, false);
+                if (words == nullptr || list[first].id == 0) {
+                    continue;
+                }
+                const Core::NativeDesc::BufferDesc v = Core::NativeDesc::BufferDescOf(desc.FromWords(words, info));
+                if (v.address == 0 || v.size == 0 || v.size >= (u64{1} << 30)) {
+                    continue;
+                }
+                auto& r = out.resolved[i];
+                r.ahead_id = list[first].id;
+                r.ahead_address = v.address;
+                r.ahead_size = memory->ClampRangeSize(v.address, v.size);
+                r.ahead_version = Core::RowVersion::Of(list[first].id);
+            }
         }
     };
     if (draw_plan != nullptr && draw_plan->pipeline != nullptr && (draw_plan->any_flat_skipped || (draw_plan->bindings_complete && draw_plan->binding_count != 0))) {

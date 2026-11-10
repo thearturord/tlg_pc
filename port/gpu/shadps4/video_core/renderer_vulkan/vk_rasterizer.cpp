@@ -4231,6 +4231,29 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     t_bseg[3] = BsegNow();
                     t_bseg_served = row_served;
                 }
+                static const bool ahead_census = [] { const char* e = std::getenv("TLG_ROW_AHEAD_CENSUS"); return e != nullptr && e[0] == '1'; }();
+                if (ahead_census && w31_id != 0) [[unlikely]] {
+                    // rows ahead census (design review 54): would the front's key have found this row, and was its version still the one the front saw
+                    auto& c = row_ahead_census[stage.sw_stage == Shader::SwStage::Compute ? 1 : 0];
+                    c[0].fetch_add(1, std::memory_order_relaxed);
+                    const StagePlan* ap = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
+                                          : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
+                                                                                                                      : nullptr;
+                    const ResolvedBuffer* a = ap != nullptr && buffer_index < ap->resolved.size() && ap->resolved[buffer_index].ahead_id != 0 ? &ap->resolved[buffer_index] : nullptr;
+                    if (a == nullptr) {
+                        c[1].fetch_add(1, std::memory_order_relaxed);
+                    } else if (a->ahead_id != w31_id || a->ahead_address != vsharp.address || a->ahead_size != size) {
+                        c[2].fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        c[!row_served ? 5 : a->ahead_version == Core::RowVersion::Of(w31_id) ? 3 : 4].fetch_add(1, std::memory_order_relaxed);
+                        if (desc.is_written) {
+                            c[6].fetch_add(1, std::memory_order_relaxed);
+                        }
+                        if (desc.is_formatted) {
+                            c[7].fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
                 // (what a learn needs, taken before the old path answers; only asked of the requests the old path answers)
                 u64 rows_epoch_pre = 0, rows_clock_pre = 0, rows_version_pre = 0, rows_unattr_pre = 0;
                 bool rows_gpu_pre = false;

@@ -120,6 +120,19 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
             }
             out[side ? "compute" : "graphics"] = std::move(part);
         }
+        {
+            nlohmann::json ra = nlohmann::json::object();
+            static constexpr const char* names[] = {"bindings_with_engine_id", "front_saw_none", "KEY_DIFFERS", "same_key_row_served_version_as_planned", "same_key_row_served_version_moved",
+                                                    "same_key_no_row_served", "of_same_key_written", "of_same_key_texel"};
+            for (u32 side = 0; side < 2; ++side) {
+                nlohmann::json one = nlohmann::json::object();
+                for (u32 k = 0; k < 8; ++k) {
+                    one[names[k]] = row_ahead_census[side][k].load();
+                }
+                ra[side ? "compute" : "graphics"] = std::move(one);
+            }
+            out["row_ahead_census_cumulative"] = std::move(ra);
+        }
         out["geometry"] = {{"vertex_ring", c[24]}, {"vertex_by_engine_handle", c[25]}, {"vertex_by_address", c[26]},
                            {"index_ring", c[27]}, {"index_by_engine_handle", c[28]}, {"index_by_address", c[29]}};
         if (cover_on) {
