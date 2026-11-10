@@ -9,7 +9,9 @@
 #include <vector>
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
+#include "native/native_draw.h"
 #include "native/native_hook_ring.h"
+#include "native/native_updates.h"
 #include "native/native_untracked_ring.h"
 
 namespace Core::HookRing {
@@ -45,6 +47,13 @@ struct RasterStats {
 };
 RasterStats g_raster[2];
 std::atomic<u64> c_raster_wide{0}, c_raster_wide_bytes{0};
+// 1b shadow, why a raster upload differs from the hook ring (one count per differing compare, the first rule that holds)
+std::atomic<u32>* g_fill_seq = nullptr; // per granule: the record sequence number when it was last filled
+std::atomic<u8>* g_fill_writer = nullptr; // per granule: the writer of that fill (8: our redirects)
+std::atomic<u64> c_why_landed{0}, c_why_open_map{0}, c_why_gpu_written{0}, c_why_none{0}, c_landings{0}, c_landing_bytes{0};
+std::atomic<u64> c_why_writer[9]{};  // the writer of the last fill of the first differing granule
+std::atomic<u64> c_why_age[5]{};     // records since that fill: <100, <1k, <10k, <100k, more
+std::atomic<u64> c_why_whole{0};     // every filled byte of the range differs in at least... : the first differing byte is at offset 0
 std::vector<Example> g_raster_examples;
 
 u32 Mode() noexcept {
@@ -89,6 +98,12 @@ bool Ensure() {
     }
     g_base.store(base, std::memory_order_relaxed);
     g_size.store(size, std::memory_order_relaxed);
+    g_fill_seq = new std::atomic<u32>[size >> GranuleShift];
+    g_fill_writer = new std::atomic<u8>[size >> GranuleShift];
+    for (u64 i = 0; i < (size >> GranuleShift); ++i) {
+        g_fill_seq[i].store(0, std::memory_order_relaxed);
+        g_fill_writer[i].store(0xff, std::memory_order_relaxed);
+    }
     g_filled.store(filled, std::memory_order_release);
     g_half.store(half, std::memory_order_release);
     g_bytes.store(bytes, std::memory_order_release);
@@ -159,7 +174,7 @@ void NoteAlloc(u64 block, u64 size) {
     }
 }
 
-void Fill(u64 address, u64 size) {
+void Fill(u64 address, u64 size, u32 writer) {
     if (!On() || size == 0 || !Ensure()) {
         return;
     }
@@ -192,8 +207,13 @@ void Fill(u64 address, u64 size) {
         }
     }
     copy_run(run_lo, hi, run_half);
+    const u32 seq_now = Raster1bOn() ? static_cast<u32>(Core::NativeDraw::NextSeq()) : 0u;
     for (u64 g = (lo - base) >> GranuleShift; g <= (hi - 1 - base) >> GranuleShift; ++g) {
-        filled[g].store(1, std::memory_order_release);
+        if (Raster1bOn()) {
+            g_fill_seq[g].store(seq_now, std::memory_order_relaxed);
+            g_fill_writer[g].store(static_cast<u8>(std::min<u32>(writer, 8)), std::memory_order_relaxed);
+        }
+        filled[g].store(1, std::memory_order_release); // (also clears the "a GPU result landed" bit)
     }
     c_fills.fetch_add(1, std::memory_order_relaxed);
     c_fill_bytes.fetch_add(hi - lo, std::memory_order_relaxed);
@@ -263,7 +283,24 @@ void NoteRasterWide(u64 size) {
     c_raster_wide_bytes.fetch_add(size, std::memory_order_relaxed);
 }
 
-void CompareRaster(u32 cls, u64 address, u64 size) {
+void NoteLanding(u64 address, u64 size) {
+    if (!Raster1bOn() || size == 0 || g_bytes.load(std::memory_order_acquire) == nullptr) {
+        return;
+    }
+    u64 lo, hi;
+    if (!Clip(address, size, lo, hi)) {
+        return;
+    }
+    const u64 base = g_base.load(std::memory_order_relaxed);
+    auto* filled = g_filled.load(std::memory_order_acquire);
+    for (u64 g = (lo - base) >> GranuleShift; g <= (hi - 1 - base) >> GranuleShift; ++g) {
+        filled[g].fetch_or(2, std::memory_order_relaxed);
+    }
+    c_landings.fetch_add(1, std::memory_order_relaxed);
+    c_landing_bytes.fetch_add(hi - lo, std::memory_order_relaxed);
+}
+
+void CompareRaster(u32 cls, u64 address, u64 size, bool gpu_written) {
     if (!Raster1bOn() || size == 0) {
         return;
     }
@@ -307,6 +344,27 @@ void CompareRaster(u32 cls, u64 address, u64 size) {
     if (diff != 0) {
         st.diff_compares.fetch_add(1, std::memory_order_relaxed);
         st.diff_bytes.fetch_add(diff, std::memory_order_relaxed);
+        // why: the first rule that holds
+        bool landed = false;
+        for (u64 g = (lo - base) >> GranuleShift; g <= (hi - 1 - base) >> GranuleShift && !landed; ++g) {
+            landed = (filled[g].load(std::memory_order_relaxed) & 2) != 0;
+        }
+        if (landed) {
+            c_why_landed.fetch_add(1, std::memory_order_relaxed);
+        } else if (Core::NativeUpdates::OpenMapOverlaps(lo, hi - lo)) {
+            c_why_open_map.fetch_add(1, std::memory_order_relaxed);
+        } else if (gpu_written) {
+            c_why_gpu_written.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            c_why_none.fetch_add(1, std::memory_order_relaxed);
+        }
+        const u64 g0 = (lo - base + first_diff) >> GranuleShift;
+        c_why_writer[std::min<u32>(g_fill_writer[g0].load(std::memory_order_relaxed), 8)].fetch_add(1, std::memory_order_relaxed);
+        const u32 age = static_cast<u32>(Core::NativeDraw::NextSeq()) - g_fill_seq[g0].load(std::memory_order_relaxed);
+        c_why_age[age < 100 ? 0 : age < 1000 ? 1 : age < 10000 ? 2 : age < 100000 ? 3 : 4].fetch_add(1, std::memory_order_relaxed);
+        if (first_diff == 0) {
+            c_why_whole.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     if (unfilled != 0) {
         st.unfilled_compares.fetch_add(1, std::memory_order_relaxed);
@@ -391,6 +449,18 @@ nlohmann::json Report() {
                                         {"UNFILLED_BYTES_MUST_BE_0", st.unfilled_bytes.load()}, {"partial_ranges", st.partial.load()}};
     }
     j["raster_1b"]["wide_reads_old_path"] = {{"count", c_raster_wide.load()}, {"bytes", c_raster_wide_bytes.load()}};
+    j["raster_1b"]["why_differs"] = {{"gpu_result_landed_since_fill", c_why_landed.load()}, {"inside_an_open_map", c_why_open_map.load()},
+                                     {"range_gpu_written", c_why_gpu_written.load()}, {"NONE_OF_THESE", c_why_none.load()}, {"first_byte_differs", c_why_whole.load()}};
+    for (u32 w = 0; w < 9; ++w) {
+        if (const u64 n = c_why_writer[w].load()) {
+            j["raster_1b"]["why_differs"]["last_fill_writer"][w == 8 ? std::string("ours") : std::to_string(w)] = n;
+        }
+    }
+    static constexpr const char* age_names[5] = {"under_100", "under_1k", "under_10k", "under_100k", "more"};
+    for (u32 k = 0; k < 5; ++k) {
+        j["raster_1b"]["why_differs"]["records_since_fill"][age_names[k]] = c_why_age[k].load();
+    }
+    j["raster_1b"]["landings"] = {{"count", c_landings.load()}, {"bytes", c_landing_bytes.load()}};
     std::scoped_lock lock{g_example_mutex};
     {
         auto& rl = j["raster_1b"]["examples"] = nlohmann::json::array();

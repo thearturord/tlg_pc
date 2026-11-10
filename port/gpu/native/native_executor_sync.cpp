@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "native/native_hook_ring.h"
 #include "native/native_executor_sync.h"
 
 #include <algorithm>
@@ -275,6 +276,7 @@ void ReportLongSpin(const char* what, const void* address, u64 wait_start, bool&
 }
 
 void WriteFenceMemory(void* address, u64 data, u32 num_bytes) {
+    Core::HookRing::NoteLanding(reinterpret_cast<u64>(address), num_bytes); // F1 1b shadow
     auto* memory = Core::Memory::Instance();
     if (!memory->TryWriteBacking(address, &data, num_bytes)) {
         memcpy(address, &data, num_bytes);
@@ -284,6 +286,7 @@ void WriteFenceMemory(void* address, u64 data, u32 num_bytes) {
 void NoFenceWrite(void*, u64, u32) {}
 
 bool TryWriteOffThread(void* address, const void* data, u32 num_bytes, const std::function<bool(VAddr, u32)>& not_mapped) {
+    Core::HookRing::NoteLanding(reinterpret_cast<u64>(address), num_bytes); // F1 1b shadow
     if (Core::Memory::Instance()->TryWriteBacking(address, data, num_bytes)) {
         return true;
     }
@@ -295,6 +298,7 @@ bool TryWriteOffThread(void* address, const void* data, u32 num_bytes, const std
 }
 
 void WriteBackingOrMemory(void* address, const void* data, u32 num_bytes) {
+    Core::HookRing::NoteLanding(reinterpret_cast<u64>(address), num_bytes); // F1 1b shadow
     if (!Core::Memory::Instance()->TryWriteBacking(address, data, num_bytes)) {
         std::memcpy(address, data, num_bytes);
     }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "native/native_hook_ring.h"
 #include "video_core/half_phase.h"
 #include <chrono>
 #include <fstream>
@@ -158,12 +159,14 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         download.Invalidate();
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
                                                   download.mapped, download_size);
+                Core::HookRing::NoteLanding(image.info.guest_address, download_size); // F1 1b shadow
     } else {
         scheduler.DeferPriorityOperation(
             [this, device_addr = image.info.guest_address, download, download_size] {
                 download.Invalidate();
                 Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
                                                           download.mapped, download_size);
+                Core::HookRing::NoteLanding(device_addr, download_size); // F1 1b shadow
                 runtime.GetStagingPool().FreeDeferred(download);
             });
     }
@@ -179,6 +182,7 @@ void TextureCache::RecordImageCopyAsync(Image& image, u32 download_size) {
             download.Invalidate();
             Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(addr), download.mapped,
                                                       download_size);
+                Core::HookRing::NoteLanding(addr, download_size); // F1 1b shadow
             runtime.GetStagingPool().FreeDeferred(download);
         },
         scheduler.CurrentTick());
@@ -208,6 +212,7 @@ void TextureCache::RecordImageDownloads(ReadbackBatch& batch, u32 fence_kind) {
                       download.Invalidate();
                       Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
                                                                 download.mapped, download_size);
+                Core::HookRing::NoteLanding(device_addr, download_size); // F1 1b shadow
                       runtime.GetStagingPool().FreeDeferred(download);
                   });
     }

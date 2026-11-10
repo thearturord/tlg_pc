@@ -30,7 +30,7 @@ void NoteAlloc(u64 block, u64 size);
 /// front never binds them. `TLG_HOOK_RING_WRITERS=<bit mask>` overrides (bit n = writer n).
 bool FillsWriter(u32 writer) noexcept;
 /// A write to [address, address + size) is finished: the bytes are copied into the ring copy now (only the part inside the frame ring).
-void Fill(u64 address, u64 size);
+void Fill(u64 address, u64 size, u32 writer = 8);
 /// The front thread copied [address, address + size) of game memory into `copied`: compare with the ring copy.
 void Compare(u64 address, u64 size, const void* copied);
 /// Mode 2: the offset in the storage of [address, address + size) when every byte of it was filled in one lap half; false otherwise.
@@ -44,7 +44,10 @@ void NoteBound(u64 size, bool checked);
 /// the hook ring. `cls`: 0 read-only binding up to 64 KiB, 1 texel binding. The wide read bindings (above 64 KiB, the 4 MB dynamic buffers of section 12) stay
 /// on the old path by design and are only counted (`NoteRasterWide`). The source bytes are game memory now (what the old path uploads).
 bool Raster1bOn() noexcept;
-void CompareRaster(u32 cls, u64 address, u64 size);
+void CompareRaster(u32 cls, u64 address, u64 size, bool gpu_written);
+/// A GPU result was written into game memory at [address, address + size) (readbacks, image downloads, fence and label writes): the 1b shadow files a later
+/// difference over it under "a GPU result landed since the fill".
+void NoteLanding(u64 address, u64 size);
 void NoteRasterWide(u64 size);
 
 nlohmann::json Report();

@@ -386,6 +386,7 @@ void BufferCache::RecordDmaDownload(const Buffer* arena, VAddr dst, u32 size, bo
             }
             staging.buffer->Invalidate(staging.offset, size);
             memory->TryWriteBacking(std::bit_cast<u8*>(dst), staging.mapped, size);
+            Core::HookRing::NoteLanding(dst, size); // F1 1b shadow
             staging_pool.FreeDeferred(staging);
             if (tracked) {
                 Core::NativeReadbacks::LandingEnd(dst, size);
@@ -2144,10 +2145,11 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             Core::RingCensus::NoteUse(Core::NativeUploads::PreSyncActive() ? Core::RingCensus::SiteRasterPreSync : Core::RingCensus::SiteRasterSync, lo, hi - lo); // TLG_RING_CENSUS (counters only)
             if (Core::HookRing::Raster1bOn() && !Core::NativeUploads::PreSyncActive()) {
                 // F1 1b shadow: what the old path uploads here against the hook ring (the wide read bindings stay on the old path by design)
+                const bool gpu_written = IsRangeGpuWritten(lo, hi - lo);
                 if (is_texel_buffer) {
-                    Core::HookRing::CompareRaster(1, lo, hi - lo);
+                    Core::HookRing::CompareRaster(1, lo, hi - lo, gpu_written);
                 } else if (hi - lo <= 65536) {
-                    Core::HookRing::CompareRaster(0, lo, hi - lo);
+                    Core::HookRing::CompareRaster(0, lo, hi - lo, gpu_written);
                 } else {
                     Core::HookRing::NoteRasterWide(hi - lo);
                 }

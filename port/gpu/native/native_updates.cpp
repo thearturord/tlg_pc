@@ -1107,7 +1107,7 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
     }
     Core::RingCensus::NoteAnnounce(writer, address, size); // TLG_RING_CENSUS (counters only)
     if (Core::HookRing::FillsWriter(writer)) {
-        Core::HookRing::Fill(address, size); // TLG_HOOK_RING (F1 1a): the write is finished, copy it now
+        Core::HookRing::Fill(address, size, writer); // TLG_HOOK_RING (F1 1a): the write is finished, copy it now
     }
     announced_bytes_by_writer[writer & 7].fetch_add(size, std::memory_order_relaxed);
     if (RingMirror::ShadowOn()) {
