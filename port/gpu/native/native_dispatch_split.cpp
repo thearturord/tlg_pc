@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "native/native_dispatch_split.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 
@@ -45,6 +46,73 @@ constexpr const char* Names[PointCount] = {"(calibration: one empty segment)", "
 
 bool On() noexcept {
     return g_on;
+}
+
+thread_local bool t_planner_sampled = false;
+thread_local u64 t_oracle_ticks = 0;
+namespace {
+const bool g_planner_on = [] {
+    const char* e = std::getenv("TLG_PLANNER_CENSUS");
+    return e != nullptr && e[0] == '1';
+}();
+thread_local u32 t_planner_count = 0;
+// access: 0 samples, 1 space, 2 oracle, 3 lookup, 4 add, 5 rest, 6 placed, 7 new nodes, 8 writes, 9 read list size sum, 10 write list size sum, 11 calibration ticks
+std::atomic<u64> g_pa[12]{};
+// query: 0 samples, 1 space, 2 oracle, 3 lookup and overlaps, 4 new nodes, 5 answered true
+std::atomic<u64> g_pq[6]{};
+// flush: 0 flushes, 1 with a barrier, 2 clear ticks (with a barrier), 3 record ticks, 4 object keys, 5 address keys, 6 group keys, 7 clear ticks without a barrier
+std::atomic<u64> g_pf[8]{};
+} // namespace
+
+bool PlannerOn() noexcept {
+    return g_planner_on;
+}
+
+bool PlannerSample() noexcept {
+    t_planner_sampled = g_planner_on && (++t_planner_count & 7) == 0;
+    t_oracle_ticks = 0;
+    if (t_planner_sampled && g_tsc0.load(std::memory_order_relaxed) == 0) {
+        u64 expected = 0;
+        const u64 tsc = Tsc();
+        if (g_tsc0.compare_exchange_strong(expected, tsc, std::memory_order_relaxed)) {
+            g_ns0.store(SteadyNs(), std::memory_order_relaxed);
+        }
+    }
+    if (t_planner_sampled) {
+        const u64 a = Tsc();
+        g_pa[11].fetch_add(Tsc() - a, std::memory_order_relaxed);
+    }
+    return t_planner_sampled;
+}
+
+void NotePlannerAccess(u64 space, u64 oracle, u64 lookup, u64 add, u64 rest, bool placed, bool new_node, bool write, u32 read_size, u32 write_size) noexcept {
+    t_planner_sampled = false;
+    const u64 v[11] = {1, space - std::min(space, oracle), oracle, lookup, add, rest, placed ? 1u : 0u, new_node ? 1u : 0u, write ? 1u : 0u, read_size, write_size};
+    for (u32 k = 0; k < 11; ++k) {
+        g_pa[k].fetch_add(v[k], std::memory_order_relaxed);
+    }
+}
+
+void NotePlannerQuery(u64 space, u64 oracle, u64 lookup, bool new_node, bool answer) noexcept {
+    t_planner_sampled = false;
+    const u64 v[6] = {1, space - std::min(space, oracle), oracle, lookup, new_node ? 1u : 0u, answer ? 1u : 0u};
+    for (u32 k = 0; k < 6; ++k) {
+        g_pq[k].fetch_add(v[k], std::memory_order_relaxed);
+    }
+}
+
+void NotePlannerFlush(u64 clear, u64 record, u32 object_keys, u32 address_keys, u32 group_keys, bool actual) noexcept {
+    g_pf[0].fetch_add(1, std::memory_order_relaxed);
+    if (actual) {
+        g_pf[1].fetch_add(1, std::memory_order_relaxed);
+        g_pf[2].fetch_add(clear, std::memory_order_relaxed);
+        g_pf[3].fetch_add(record, std::memory_order_relaxed);
+        g_pf[4].fetch_add(object_keys, std::memory_order_relaxed);
+        g_pf[5].fetch_add(address_keys, std::memory_order_relaxed);
+        g_pf[6].fetch_add(group_keys, std::memory_order_relaxed);
+    } else {
+        g_pf[7].fetch_add(clear, std::memory_order_relaxed);
+    }
 }
 
 void Begin() noexcept {
@@ -118,6 +186,21 @@ nlohmann::json Report() {
     j["dropped_left_early"] = g_dropped.load();
     j["record_buffer_access"] = {{"stream_reads_skipped", g_access[0].load()}, {"reads_recorded", g_access[1].load()}, {"writes_recorded", g_access[2].load()}};
     j["note"] = "cumulative; per step: total ticks over the samples (ns = ticks / ticks_per_ns); each step includes one time stamp read, the calibration row is one empty segment";
+    if (g_planner_on) {
+        static constexpr const char* A[12] = {"samples", "space_ticks", "oracle_ticks", "map_lookup_ticks", "interval_add_ticks", "rest_ticks", "placed", "new_nodes", "writes",
+                                              "read_list_size_sum", "write_list_size_sum", "calibration_ticks"};
+        static constexpr const char* Q[6] = {"samples", "space_ticks", "oracle_ticks", "lookup_and_overlap_ticks", "new_nodes", "answered_true"};
+        static constexpr const char* F[8] = {"flushes", "with_barrier", "clear_ticks", "vulkan_record_ticks", "object_keys", "address_keys", "group_keys", "clear_ticks_without_barrier"};
+        for (u32 k = 0; k < 12; ++k) {
+            j["planner"]["access"][A[k]] = g_pa[k].load();
+        }
+        for (u32 k = 0; k < 6; ++k) {
+            j["planner"]["query"][Q[k]] = g_pq[k].load();
+        }
+        for (u32 k = 0; k < 8; ++k) {
+            j["planner"]["flush"][F[k]] = g_pf[k].load();
+        }
+    }
     for (u32 p = 0; p < 2; ++p) {
         nlohmann::json o = nlohmann::json::object();
         o["samples"] = g_samples[p].load();

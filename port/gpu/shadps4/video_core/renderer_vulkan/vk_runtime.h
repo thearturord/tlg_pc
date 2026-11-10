@@ -171,6 +171,33 @@ private:
     Planner aware_normal, aware_group; ///< G2: the group-aware planner: accesses of operations outside any group, and accesses of the group (kept apart)
     Planner live_object; ///< B10: the same state machine keyed by object: a placed engine buffer (its own Vulkan buffer) in its own offset space
     u64 LiveObjectSpace(const VideoCore::Buffer* handle, u64 offset, u64& begin);
+    /// Design review 72 (`TLG_EPOCH_PLANNER`, default 0 off; 1 shadow, 2 real): one planner keyed by object whose entries survive a flush. A flush moves the epoch on instead of clearing
+    /// the maps (no node freed and made again per key per flush window, no list allocated again); an entry of an older epoch counts as empty and is reset at its next access.
+    /// It keeps the group-aware lists in the same entry and answers what the deciding planner answers (the group-aware one in G2 mode 2, the object planner otherwise).
+    /// Shadow: every query compared with the old answer, which decides. Real: the old planners run only in one flush window in 64 (audit), where the answer is the OR of both.
+    struct EpochEntry {
+        u64 epoch{0};
+        Planner::List read, write, group_read, group_write;
+    };
+    absl::node_hash_map<u64, EpochEntry> epoch_entries;
+    u64 plan_epoch{1};
+    bool epoch_audit{true}; ///< real mode: the old planners run in this flush window too
+    u64 epoch_flushes{0};
+public:
+    struct EpochStats {
+        u64 queries{}, compared{}, different{}, epoch_true_old_false{}, epoch_false_old_true{}, accesses{}, entries_reset{}, entries_new{}, cap_clears{}, audit_windows{}, windows{};
+    };
+    [[nodiscard]] static u32 EpochPlannerMode() noexcept;
+    [[nodiscard]] EpochStats ReadEpochStats() const noexcept {
+        return epoch_stats;
+    }
+    [[nodiscard]] size_t EpochEntries() const noexcept {
+        return epoch_entries.size();
+    }
+private:
+    EpochStats epoch_stats{};
+    bool EpochQuery(u64 key, u64 begin, u64 size, bool check_read) const;
+    void EpochAccess(u64 key, u64 begin, u64 size, bool write, bool read);
     struct SeenBuffer {
         u64 base{}, size{};
     };

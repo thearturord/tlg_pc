@@ -70,4 +70,19 @@ void End() noexcept;
 [[nodiscard]] bool On() noexcept;
 [[nodiscard]] nlohmann::json Report();
 
+// ---- barrier planner census (design review section 72, `TLG_PLANNER_CENSUS=1`, default off; counters only): one access record and one query in 8 split by step,
+// every effective flush timed with the size of what it clears. Published inside `dispatch_split` as `planner`.
+[[nodiscard]] bool PlannerOn() noexcept;
+extern thread_local bool t_planner_sampled; ///< set while a sampled access or query runs (LiveObjectSpace times its oracle part then)
+extern thread_local u64 t_oracle_ticks;
+/// Decides whether the next access or query on this thread is sampled (sets t_planner_sampled, clears t_oracle_ticks).
+bool PlannerSample() noexcept;
+/// One sampled access record: ticks of the object space lookup (oracle part apart), of the map lookup, of the interval adds, of the rest; whether the buffer is placed (own Vulkan
+/// buffer), the map made a new node, it was a write; the sizes of the read and write lists after.
+void NotePlannerAccess(u64 space, u64 oracle, u64 lookup, u64 add, u64 rest, bool placed, bool new_node, bool write, u32 read_size, u32 write_size) noexcept;
+/// One sampled query: ticks of the object space lookup (oracle apart) and of the map lookup with the overlap tests; whether the map made a new node; the answer.
+void NotePlannerQuery(u64 space, u64 oracle, u64 lookup, bool new_node, bool answer) noexcept;
+/// One flush: ticks of the planner clears and of the Vulkan barrier record; the keys the object, address and group maps held; whether a barrier was recorded.
+void NotePlannerFlush(u64 clear, u64 record, u32 object_keys, u32 address_keys, u32 group_keys, bool actual) noexcept;
+
 } // namespace Core::DispatchSplit

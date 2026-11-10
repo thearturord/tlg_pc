@@ -317,7 +317,7 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
         if (Core::RowVersion::Mode() != 0) {
             Core::DebugServer::Publish("row_version", Core::RowVersion::Report()); // F2 row version shadow
         }
-        if (Core::DispatchSplit::On()) {
+        if (Core::DispatchSplit::On() || Core::DispatchSplit::PlannerOn()) {
             Core::DebugServer::Publish("dispatch_split", Core::DispatchSplit::Report()); // design review 71
         }
         const auto r = TakeResolveStats();
@@ -441,6 +441,14 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
                                     {"b10_by_object", {{"mode", B10Mode()}, {"queries", p.object_queries}, {"in_a_placed_buffers_own_space", p.object_space_queries},
                                                        {"same_answer", p.object_same}, {"OBJECT_NO_ADDRESS_YES", p.object_no_address_yes}, {"object_yes_address_no", p.object_yes_address_no}}},
                                     {"note", "L4 TLG_BARRIER_PLANNER=1, cumulative since start; the planner decides, the tracker corrects a miss"}});
+        if (Runtime::EpochPlannerMode() != 0) {
+            const auto e = runtime.ReadEpochStats();
+            Core::DebugServer::Publish("epoch_planner", {{"mode", Runtime::EpochPlannerMode()}, {"queries", e.queries}, {"compared_with_the_old_planner", e.compared},
+                                                         {"DIFFERENT_MUST_BE_0", e.different}, {"epoch_true_old_false", e.epoch_true_old_false}, {"epoch_false_old_true", e.epoch_false_old_true},
+                                                         {"accesses", e.accesses}, {"entries_new", e.entries_new}, {"entries_reset_at_a_new_epoch", e.entries_reset},
+                                                         {"entries_now", runtime.EpochEntries()}, {"cap_clears", e.cap_clears}, {"flush_windows", e.windows},
+                                                         {"audit_windows_real_mode", e.audit_windows}, {"note", "design review 72, cumulative since start"}});
+        }
     }
     if (InPlaceOn()) {
         const auto p = TakeInPlaceStats();

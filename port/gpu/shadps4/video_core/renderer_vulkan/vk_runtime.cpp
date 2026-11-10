@@ -24,6 +24,7 @@
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 #include "native/native_split_census.h"
+#include "native/native_dispatch_split.h"
 
 #include <vulkan/vulkan_format_traits.hpp>
 
@@ -565,7 +566,17 @@ u64 Runtime::LiveObjectSpace(const VideoCore::Buffer* handle, u64 offset, u64& b
         // B10: a placed engine buffer (or block) is its own Vulkan buffer: its hazards are its own, in its own offset space
         ++live_stats.object_space_queries;
         const_cast<VideoCore::Buffer*>(handle)->NoteGpuUse(scheduler.CurrentTick()); // zero copy: the CPU writes it directly only once this is finished
+        const u64 oracle_start = Core::DispatchSplit::t_planner_sampled ? Core::DispatchSplit::Tsc() : 0;
+        struct OracleTicks {
+            u64 start;
+            ~OracleTicks() {
+                if (start != 0) {
+                    Core::DispatchSplit::t_oracle_ticks += Core::DispatchSplit::Tsc() - start;
+                }
+            }
+        };
         {
+            const OracleTicks oracle_ticks{oracle_start};
             // P3c oracle: a buffer the record side uses for an operation was asked for by the resolve side in that operation (or the one before: bound buffers released at its end)
             static std::atomic<u64> uses{0}, unannounced{0}, never{0};
             const u64 seq = VideoCore::OpSequence::recording != 0 ? VideoCore::OpSequence::recording : VideoCore::OpSequence::resolving.load(std::memory_order_relaxed);
@@ -1303,30 +1314,119 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
     backing = new_backing;
 }
 
+u32 Runtime::EpochPlannerMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_EPOCH_PLANNER");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
+
+bool Runtime::EpochQuery(u64 key, u64 begin, u64 size, bool check_read) const {
+    const auto it = epoch_entries.find(key); // (a query makes no entry)
+    if (it == epoch_entries.end() || it->second.epoch != plan_epoch) {
+        return false;
+    }
+    const EpochEntry& e = it->second;
+    const u64 end = begin + size;
+    bool hit = e.write.Overlaps(begin, end) || (check_read && e.read.Overlaps(begin, end));
+    // G2 mode 2: inside the group only what was accessed outside it counts; outside the group everything counts (the group's lists are filled only in mode 2)
+    if (!hit && independent_group == 0) {
+        hit = e.group_write.Overlaps(begin, end) || (check_read && e.group_read.Overlaps(begin, end));
+    }
+    return hit;
+}
+
+void Runtime::EpochAccess(u64 key, u64 begin, u64 size, bool write, bool read) {
+    const size_t before = epoch_entries.size();
+    EpochEntry& e = epoch_entries[key];
+    if (epoch_entries.size() != before) {
+        ++epoch_stats.entries_new;
+    }
+    if (e.epoch != plan_epoch) {
+        if (e.epoch != 0) {
+            ++epoch_stats.entries_reset;
+        }
+        e.epoch = plan_epoch;
+        e.read.Clear(); // (the lists keep their storage)
+        e.write.Clear();
+        e.group_read.Clear();
+        e.group_write.Clear();
+    }
+    const bool group = IndependentGroup::Mode() == 2 && independent_group != 0;
+    if (write) {
+        LivePlanAdd(group ? e.group_write : e.write, begin, begin + size);
+    }
+    if (read) {
+        LivePlanAdd(group ? e.group_read : e.read, begin, begin + size);
+    }
+    ++epoch_stats.accesses;
+}
+
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
     Core::SplitCensus::Count(Core::SplitCensus::CtBarrierQuery);
     // B10: the planner by object answers (a placed engine buffer in its own offset space, the arena by guest address)
+    const u32 epoch_mode = EpochPlannerMode();
+    const bool run_old = epoch_mode != 2 || epoch_audit;
+    const bool pc = Core::DispatchSplit::PlannerOn() && Core::DispatchSplit::PlannerSample(); // design review 72 census
+    const u64 q0 = pc ? Core::DispatchSplit::Tsc() : 0;
     u64 begin = 0;
     const u64 census_key = LiveObjectSpace(handle, offset, begin);
-    auto& space = live_object.buffers[census_key];
-    const bool planned_old = space.write.Overlaps(begin, begin + size) || (check_read_access && space.read.Overlaps(begin, begin + size));
-    bool planned = planned_old;
-    if (IndependentGroup::Mode() != 0) {
-        // the group-aware answer: outside a group, everything counts; inside the group, only what was accessed outside it (the group's own pending accesses are independent of each other)
-        auto& normal = aware_normal.buffers[census_key];
-        bool aware = normal.write.Overlaps(begin, begin + size) || (check_read_access && normal.read.Overlaps(begin, begin + size));
-        if (independent_group == 0) {
-            auto& grp = aware_group.buffers[census_key];
-            aware = aware || grp.write.Overlaps(begin, begin + size) || (check_read_access && grp.read.Overlaps(begin, begin + size));
+    const u64 q1 = pc ? Core::DispatchSplit::Tsc() : 0;
+    bool planned = false;
+    if (run_old) {
+        const size_t keys_before = pc ? live_object.buffers.size() : 0;
+        auto& space = live_object.buffers[census_key];
+        const bool planned_old = space.write.Overlaps(begin, begin + size) || (check_read_access && space.read.Overlaps(begin, begin + size));
+        if (pc) {
+            Core::DispatchSplit::NotePlannerQuery(q1 - q0, Core::DispatchSplit::t_oracle_ticks, Core::DispatchSplit::Tsc() - q1, live_object.buffers.size() != keys_before, planned_old);
         }
-        op_real_hazard |= planned_old;
-        op_aware_hazard |= aware;
-        if (independent_group != 0) {
-            IndependentGroup::NoteQuery(planned_old, aware);
+        planned = planned_old;
+        if (IndependentGroup::Mode() != 0) {
+            // the group-aware answer: outside a group, everything counts; inside the group, only what was accessed outside it (the group's own pending accesses are independent of each other)
+            auto& normal = aware_normal.buffers[census_key];
+            bool aware = normal.write.Overlaps(begin, begin + size) || (check_read_access && normal.read.Overlaps(begin, begin + size));
+            if (independent_group == 0) {
+                auto& grp = aware_group.buffers[census_key];
+                aware = aware || grp.write.Overlaps(begin, begin + size) || (check_read_access && grp.read.Overlaps(begin, begin + size));
+            }
+            op_real_hazard |= planned_old;
+            op_aware_hazard |= aware;
+            if (independent_group != 0) {
+                IndependentGroup::NoteQuery(planned_old, aware);
+            }
+            if (IndependentGroup::Mode() == 2) {
+                planned = aware;
+            }
         }
-        if (IndependentGroup::Mode() == 2) {
-            planned = aware;
+    }
+    if (epoch_mode != 0) {
+        const bool answer = EpochQuery(census_key, begin, size, check_read_access);
+        ++epoch_stats.queries;
+        if (run_old) {
+            ++epoch_stats.compared;
+            if (answer != planned) {
+                ++epoch_stats.different;
+                ++(answer ? epoch_stats.epoch_true_old_false : epoch_stats.epoch_false_old_true);
+                static u32 logged = 0;
+                if (logged++ < 10) {
+                    LOG_ERROR(Render_Vulkan, "epoch planner: answer {} where the old planner answered {} (key {:#x}, {:#x}+{:#x}, read check {}, group {})", answer, planned, census_key, begin, size,
+                              check_read_access, independent_group);
+                }
+            }
+            if (epoch_mode == 2) {
+                planned = planned || answer; // audit window: a barrier either planner wants is made
+            }
+        } else {
+            planned = answer;
+            if (IndependentGroup::Mode() != 0) {
+                op_real_hazard |= answer; // (the group census sees the deciding answer only outside the audit windows)
+                op_aware_hazard |= answer;
+                if (independent_group != 0) {
+                    IndependentGroup::NoteQuery(answer, answer);
+                }
+            }
         }
     }
     if (planned && BarrierCensus::On()) {
@@ -1352,43 +1452,77 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
+    const u32 epoch_mode = EpochPlannerMode();
+    const bool run_old = epoch_mode != 2 || epoch_audit;
+    const bool is_write = (src_access & WRITE_MASK) != vk::AccessFlags2{};
+    const bool is_read = (src_access & READ_MASK) != vk::AccessFlags2{};
+    const bool pc = Core::DispatchSplit::PlannerOn() && Core::DispatchSplit::PlannerSample(); // design review 72 census
+    u64 a0 = pc ? Core::DispatchSplit::Tsc() : 0, a1 = 0, a2 = 0, a3 = 0;
+    bool new_node = false;
+    u32 read_size = 0, write_size = 0;
     {
         u64 begin = 0;
         const u64 census_key = LiveObjectSpace(handle, offset, begin);
-        auto& space = live_object.buffers[census_key];
+        if (pc) {
+            a1 = Core::DispatchSplit::Tsc();
+        }
         if (BarrierCensus::On()) {
-            if (src_access & WRITE_MASK) {
+            if (is_write) {
                 BarrierCensus::NoteAccess(census_key, begin, size, true);
             }
-            if (src_access & READ_MASK) {
+            if (is_read) {
                 BarrierCensus::NoteAccess(census_key, begin, size, false);
             }
         }
-        if (src_access & WRITE_MASK) {
-            LivePlanAdd(space.write, begin, begin + size);
+        if (is_write) {
             ++const_cast<VideoCore::Buffer*>(handle)->gpu_write_generation;
         }
-        if (src_access & READ_MASK) {
-            LivePlanAdd(space.read, begin, begin + size);
+        if (run_old) {
+            const size_t keys_before = pc ? live_object.buffers.size() : 0;
+            auto& space = live_object.buffers[census_key];
+            if (pc) {
+                a2 = Core::DispatchSplit::Tsc();
+                new_node = live_object.buffers.size() != keys_before;
+            }
+            if (is_write) {
+                LivePlanAdd(space.write, begin, begin + size);
+            }
+            if (is_read) {
+                LivePlanAdd(space.read, begin, begin + size);
+            }
+            if (pc) {
+                a3 = Core::DispatchSplit::Tsc();
+                read_size = static_cast<u32>(space.read.Size());
+                write_size = static_cast<u32>(space.write.Size());
+            }
+            if (IndependentGroup::Mode() != 0) {
+                auto& aware = (independent_group != 0 ? aware_group : aware_normal).buffers[census_key];
+                if (is_write) {
+                    LivePlanAdd(aware.write, begin, begin + size);
+                }
+                if (is_read) {
+                    LivePlanAdd(aware.read, begin, begin + size);
+                }
+            }
+        } else if (pc) {
+            a2 = a3 = Core::DispatchSplit::Tsc();
         }
-        if (IndependentGroup::Mode() != 0) {
-            auto& aware = (independent_group != 0 ? aware_group : aware_normal).buffers[census_key];
-            if (src_access & WRITE_MASK) {
-                LivePlanAdd(aware.write, begin, begin + size);
-            }
-            if (src_access & READ_MASK) {
-                LivePlanAdd(aware.read, begin, begin + size);
-            }
+        if (epoch_mode != 0) {
+            EpochAccess(census_key, begin, size, is_write, is_read);
         }
         live_object.memory_pending |= src_stage != vk::PipelineStageFlags2{};
     }
     // B10 native: the address planner is not kept (only its write count, which R2 asks)
-    if (src_access & WRITE_MASK) {
+    if (is_write) {
         ++live_plan_writes;
     }
     live_plan.memory_pending |= src_stage != vk::PipelineStageFlags2{};
     memory_barrier.srcStageMask |= src_stage;
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
+    if (pc) {
+        Core::DispatchSplit::NotePlannerAccess(a1 - a0, Core::DispatchSplit::t_oracle_ticks, a2 - a1, a3 - a2, Core::DispatchSplit::Tsc() - a3, handle->CpuAddr() != 0, new_node,
+                                               is_write, read_size, write_size);
+    }
 }
 
 void Runtime::FlushBarriers() {
@@ -1405,11 +1539,30 @@ void Runtime::FlushBarriers() {
         dep_info.imageMemoryBarrierCount = static_cast<u32>(image_barriers.size());
     }
 
+    const bool flush_census = Core::DispatchSplit::PlannerOn();
+    const u64 f0 = flush_census ? Core::DispatchSplit::Tsc() : 0;
+    const u32 object_keys = flush_census ? static_cast<u32>(live_object.buffers.size()) : 0u;
+    const u32 address_keys = flush_census ? static_cast<u32>(live_plan.buffers.size()) : 0u;
+    const u32 group_keys = flush_census ? static_cast<u32>(aware_normal.buffers.size() + aware_group.buffers.size()) : 0u;
+    struct FlushCensus {
+        bool on;
+        u64 f0, f1{0};
+        u32 object_keys, address_keys, group_keys;
+        bool actual{false};
+        ~FlushCensus() {
+            if (on) {
+                const u64 end = Core::DispatchSplit::Tsc();
+                const u64 clear_end = f1 != 0 ? f1 : end;
+                Core::DispatchSplit::NotePlannerFlush(clear_end - f0, f1 != 0 ? end - f1 : 0, object_keys, address_keys, group_keys, actual);
+            }
+        }
+    } flush_scope{flush_census, f0, 0, object_keys, address_keys, group_keys};
     if (live_plan_on) {
         const bool actual = dep_info.memoryBarrierCount != 0 || dep_info.imageMemoryBarrierCount != 0;
         const bool planned = live_plan.memory_pending || !image_barriers.empty();
         ++live_stats.flushes;
         live_stats.flush_differences += planned != actual ? 1 : 0;
+        flush_scope.actual = actual;
         if (actual) {
             live_plan.buffers.clear();
             live_plan_writes = 0;
@@ -1418,10 +1571,25 @@ void Runtime::FlushBarriers() {
             live_object.memory_pending = false;
             aware_normal.buffers.clear();
             aware_group.buffers.clear();
+            if (EpochPlannerMode() != 0) {
+                // design review 72: the epoch moves on (every entry counts as empty from now); the map is cleared only when it grew past its cap
+                ++plan_epoch;
+                ++epoch_flushes;
+                ++epoch_stats.windows;
+                if (epoch_entries.size() > (size_t{1} << 16)) {
+                    epoch_entries.clear();
+                    ++epoch_stats.cap_clears;
+                }
+                epoch_audit = EpochPlannerMode() != 2 || (epoch_flushes & 63) == 0;
+                epoch_stats.audit_windows += epoch_audit && EpochPlannerMode() == 2 ? 1 : 0;
+            }
             if (BarrierCensus::On()) {
                 BarrierCensus::ClearPending();
             }
         }
+    }
+    if (flush_census) {
+        flush_scope.f1 = Core::DispatchSplit::Tsc(); // the clears end here; the rest is the barrier's record
     }
     if (!dep_info.memoryBarrierCount && !dep_info.imageMemoryBarrierCount) {
         return;
