@@ -674,8 +674,9 @@ void NoteEngineDelete(u64 id, u64 address, u64 bytes, u32 what) {
 
 bool RingLeanApplyOn() noexcept {
     static const bool on = [] {
+        // default on since 2026-11-10 after the owner's play; =0 off
         const char* e = std::getenv("TLG_RING_LEAN_APPLY");
-        return e != nullptr && e[0] == '1';
+        return e == nullptr || e[0] == 0 || e[0] != '0';
     }();
     return on;
 }

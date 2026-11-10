@@ -41,7 +41,7 @@ void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site = nullp
 /// TLG_EARLY_ANNOUNCE=1: announcements of memory the engine writes fresh every frame (frame rings: light constants, skinning matrices, scene slots, Map into a ring window) are applied on the raster
 /// thread as soon as it can, not behind the graphics work queued before them (documents/tlg/native plan/engine/compute-lane-design.md section 13).
 [[nodiscard]] bool EarlyAnnounceOn() noexcept;
-/// F1 1c real (`TLG_RING_LEAN_APPLY=1`, default off): an in-ring constant copy or buffer Map window is applied lean on the raster thread (image index and GPU-written
+/// F1 1c real (`TLG_RING_LEAN_APPLY`, default on since 2026-11-10, =0 off): an in-ring constant copy or buffer Map window is applied lean on the raster thread (image index and GPU-written
 /// supersede only; no buffer marks, memo erase or resident note), one in 64 in full with its effects counted; rows do not learn ranges inside the frame ring.
 [[nodiscard]] bool RingLeanApplyOn() noexcept;
 /// Counters of the lean apply: 0 applied lean, 1 applied in full as the sampled check, 2 sampled with a buffer, memo, recipe or resident effect (MUST_BE_0), 3 rows not learned in the ring.

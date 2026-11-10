@@ -152,7 +152,7 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object)
     if (Core::RingMirror::ShadowOn()) {
         Core::RingMirror::NoteAnnounced(address, size);
     }
-    // F1 1c real (TLG_RING_LEAN_APPLY=1): an in-ring constant copy or buffer Map window keeps only the image index and the GPU-written supersede; one in 64 runs in full
+    // F1 1c real (TLG_RING_LEAN_APPLY, default on, =0 off): an in-ring constant copy or buffer Map window keeps only the image index and the GPU-written supersede; one in 64 runs in full
     // and its effects are counted (the census found none of the skipped steps doing anything for these ranges in three scenes, design review section 22)
     const bool lean_candidate = Core::N0::t_ring_candidate && Core::NativeUpdates::RingLeanApplyOn();
     bool lean = false, lean_sampled = false;
