@@ -4875,8 +4875,11 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
 
 bool Rasterizer::BufferBarrierQuery(const VideoCore::Buffer* buffer, u64 offset, u64 size, bool written) {
     static const u32 mode = [] {
-        const char* e = std::getenv("TLG_BARRIER_GUARD");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+        const char* e = std::getenv("TLG_BARRIER_GUARD"); // default 2 (real) since 2026-11-10 after the owner's play; =0 off, =1 shadow
+        if (e == nullptr || e[0] == 0) {
+            return 2u;
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     if (mode == 0 || written) {
         return runtime.IsBufferAccessed(buffer, offset, size, written);

@@ -370,7 +370,7 @@ private:
     std::array<std::array<std::atomic<u64>, 3>, 2> rows_ahead_walk{};
     std::array<std::array<std::atomic<u64>, 8>, 2> rows_ahead_fseg{}; ///< design review 66: [side][6 segments ns, count, of them indexed]
     void NoteFastSegments(u32 side, bool indexed) noexcept;
-    /// Design review 67 (`TLG_BARRIER_GUARD`: 0 off (default), 1 shadow, 2 real): the barrier query of a read-only buffer binding. A read can only need a barrier against a write the
+    /// Design review 67 to 69 (`TLG_BARRIER_GUARD`: 2 real (default since 2026-11-10, owner's play), 1 shadow, 0 off): the barrier query of a read-only buffer binding. A read can only need a barrier against a write the
     /// planner holds since its last barrier; with none (`PlanHasWrites` false) the query is not asked (real) or asked and compared (shadow). The read itself is still recorded at the
     /// finish (`AccessBuffer` over the bound list). One in 64 skipped queries is asked anyway.
     [[nodiscard]] bool BufferBarrierQuery(const VideoCore::Buffer* buffer, u64 offset, u64 size, bool written);
