@@ -127,6 +127,8 @@ public:
     static constexpr u64 BindMemoWideMax = u64{1} << 17; // 128 KiB: an erase looks back this far in the tree, a 16 MiB bound made every erase walk thousands of entries (measured 1.2 ms per frame)
     static constexpr size_t BindMemoMaxAddresses = 200000; ///< the memo is cleared at a new command buffer when it holds more addresses (stale copy entries are no longer walked away)
     void BindMemoErase(VAddr address, u64 size);
+    /// Design review 85: [address, address + size) is wholly in the GPU-written set (a written binding needs no new mark: the address readers already see it).
+    [[nodiscard]] bool GpuWrittenContains(VAddr address, u64 size);
 
     /// Draw recipes (verify stage, raster thread only): the resolved shape of a graphics draw by the identity of its record, with the guest ranges its buffers came from. A recipe
     /// is predicted valid while no write overlapped one of its ranges (the invalidation the bind memo uses), the epochs are the same, and (when it names a copy in the stream
@@ -329,6 +331,8 @@ private:
     /// B9.4: the Vulkan buffer of [address, address + size): a placed engine buffer's own when the range is inside one (placing it at its first use), else the arena
     /// (resident). `demote_spanning`: a range over a placed buffer's edge moves that buffer back into the arena first; false: such a range gets nullptr
     const Buffer* BufferFor(VAddr address, u64 size, bool demote_spanning = true, bool written = false);
+    /// Design review 85: the engine buffer `id`'s `cpu_dirty` flag after its dirty set changed (`object_dirty_mutex` held; `added`: an add, else a subtraction).
+    void OwnDirtyNote(u64 id, bool added);
     static constexpr u64 PlacedSlack = 64; ///< B9.4: a read may run this far past a placed buffer's end (vertex fetch rounding); the bytes there are not memory's
     struct PlacedBuffer {
         std::vector<u64> ids; ///< the engine buffers it holds (one, or a block the engine laid out next to each other and binds as one range)

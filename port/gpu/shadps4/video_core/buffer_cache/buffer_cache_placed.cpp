@@ -373,6 +373,7 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
                 for (const auto& [a, n] : rest) {
                     it->second.Subtract(a, n);
                 }
+                OwnDirtyNote(id, false);
             }
         }
         for (const auto& [a, n] : rest) {
@@ -393,6 +394,19 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
         std::scoped_lock lock{placed_mutex};
         placed.emplace(begin, PlacedBuffer{ids, {}, begin, end, std::move(buffer)});
         placed_version.fetch_add(1, std::memory_order_acq_rel);
+    }
+    if (Core::OwnMemoryCensus::OwnMutableMode() != 0) [[unlikely]] {
+        // design review 85: every registered engine buffer this block holds whole lives here now (its own memory until the block is dropped)
+        std::scoped_lock lock{object_dirty_mutex};
+        for (const u64 id : ids) {
+            if (auto* h = Core::NativeResources::FindImmutableById(id); h != nullptr && h->usage != 1 && h->begin >= begin && h->end <= end) {
+                h->own.store(dst, std::memory_order_release);
+                Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnSet, 1);
+                if (const auto it = object_dirty.find(id); it == object_dirty.end() || !it->second.Intersects(h->begin, h->end - h->begin)) {
+                    h->cpu_dirty.store(false, std::memory_order_release);
+                }
+            }
+        }
     }
     Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9Placed);
     Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9PlacedBytes, end - begin);
@@ -540,6 +554,7 @@ void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, boo
                     // the block holds older bytes there (a deleted member's, a gap's): the new buffer's first upload takes all of its memory, as a placement would
                     std::scoped_lock lock{object_dirty_mutex};
                     object_dirty[id].Add(address, bytes);
+                    OwnDirtyNote(id, true);
                     Core::RowVersion::Bump(id); // F2 row version (shadow)
                     if (Core::NativeUpdates::LeanDirtyMode() != 2) {
                         all_object_dirty.Add(address, bytes);

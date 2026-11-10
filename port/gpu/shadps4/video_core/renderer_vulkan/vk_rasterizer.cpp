@@ -4265,7 +4265,8 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 t_fseg[0] = BsegNow();
             }
             own_compare = nullptr;
-            if (const u32 own_mode = Core::OwnMemoryCensus::OwnImmutableMode(); own_mode != 0 && !desc.is_written) {
+            if (const u32 own_mode = Core::OwnMemoryCensus::OwnImmutableMode(), mutable_mode = Core::OwnMemoryCensus::OwnMutableMode();
+                (own_mode != 0 && !desc.is_written) || mutable_mode != 0) {
                 // design review 83 (TLG_OWN_IMMUTABLE): a read binding of an immutable engine buffer, named by its id, bound from the buffer's own memory. Its bytes never change
                 // after the synchronization (a CPU write clears `synced`; GPU copies into it write that same buffer and the barrier query below orders them)
                 namespace OM = Core::OwnMemoryCensus;
@@ -4274,27 +4275,52 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                                                                                                   : nullptr;
                 const ResolvedBuffer* r = op != nullptr && buffer_index < op->resolved.size() && op->resolved[buffer_index].ahead_id != 0 ? &op->resolved[buffer_index] : nullptr;
                 if (r != nullptr) {
-                    OM::NoteOwn(OM::OwnAsked);
                     auto* h = Core::NativeResources::FindImmutableById(r->ahead_id);
-                    if (h != nullptr && h->usage == 1 && r->ahead_address >= h->begin && r->ahead_address + r->ahead_size <= h->end && h->alive.load(std::memory_order_acquire)) {
-                        OM::NoteOwn(OM::OwnImmutable);
+                    const bool imm = h != nullptr && h->usage == 1;
+                    // class: 0 immutable read, 1 mutable read, 2 mutable written (design review 85); an immutable written binding is left alone
+                    const u32 cls = imm ? 0u : desc.is_written ? 2u : 1u;
+                    const u32 mode = imm ? (desc.is_written ? 0u : own_mode) : mutable_mode;
+                    if (mode != 0) {
+                        OM::NoteOwn(OM::OwnAsked, cls);
+                    }
+                    if (mode != 0 && h != nullptr && r->ahead_address >= h->begin && r->ahead_address + r->ahead_size <= h->end && h->alive.load(std::memory_order_acquire)) {
+                        OM::NoteOwn(OM::OwnImmutable, cls);
                         const auto* own = static_cast<const VideoCore::Buffer*>(h->own.load(std::memory_order_acquire));
                         if (own == nullptr) {
-                            OM::NoteOwn(OM::OwnNoOwn);
-                        } else if (!h->synced.load(std::memory_order_acquire)) {
-                            OM::NoteOwn(OM::OwnNotSynced);
+                            OM::NoteOwn(OM::OwnNoOwn, cls);
+                        } else if (imm ? !h->synced.load(std::memory_order_acquire) : h->cpu_dirty.load(std::memory_order_acquire)) {
+                            OM::NoteOwn(OM::OwnNotSynced, cls);
+                        } else if (desc.is_written && !buffer_cache.GpuWrittenContains(r->ahead_address, r->ahead_size)) {
+                            OM::NoteOwn(OM::OwnNotGpuMarked, cls); // (the old path marks it: the address readers must see the GPU's bytes from the first write on)
                         } else {
                             static thread_local u32 own_tick = 0;
-                            if (own_mode == 2 && (++own_tick & 63u) != 0) {
-                                OM::NoteOwn(OM::OwnBound);
-                                const u64 offset = own->Offset(r->ahead_address);
+                            if (mode == 2 && (++own_tick & 63u) != 0) {
+                                OM::NoteOwn(OM::OwnBound, cls);
+                                const VAddr address = r->ahead_address;
+                                const u64 size = r->ahead_size;
+                                const u64 offset = own->Offset(address);
                                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                                 const u64 adjust = offset - offset_aligned;
                                 const_cast<VideoCore::Buffer*>(own)->NoteResolveUse();
+                                if (desc.is_written) {
+                                    // what a GPU write must tell the address-keyed readers, as the written rows path does (design review 37)
+                                    Core::NativeRegistry::SetBufferWriter(stage.pgm_hash, static_cast<u32>(stage.sw_stage));
+                                    buffer_cache.BindMemoErase(address, size);
+                                    Core::NativeResources::NoteGpuWritten(address, size);
+                                    Core::RowVersion::NoteWritten(0);
+                                    recipe_reusable = false;
+                                }
+                                recipe_ranges.emplace_back(address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
+                                if (size > 262144) {
+                                    recipe_reusable = false;
+                                }
                                 push_data.AddOffset(binding.buffer, adjust);
-                                buffer_infos.emplace_back(own->Handle(), offset_aligned, r->ahead_size + adjust);
-                                bound_buffers.emplace_back(own, offset, r->ahead_size, src_access);
-                                if (BufferBarrierQuery(own, offset, r->ahead_size, false)) {
+                                buffer_infos.emplace_back(own->Handle(), offset_aligned, size + adjust);
+                                bound_buffers.emplace_back(own, offset, size, src_access);
+                                if (desc.is_written) {
+                                    texture_cache.InvalidateMemoryFromGPU(address, size, "a written storage buffer view");
+                                }
+                                if (BufferBarrierQuery(own, offset, size, desc.is_written)) {
                                     needs_barrier = true;
                                 }
                                 goto buffer_bound;
@@ -4304,6 +4330,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                             own_compare_offset = own->Offset(r->ahead_address);
                             own_compare_size = r->ahead_size;
                             own_compare_slot = binding.buffer;
+                            own_compare_cls = cls;
                             VideoCore::BufferCache::UploadBytesReset();
                         }
                     }
@@ -5041,22 +5068,23 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
             // design review 83: the own memory's answer against the old path's
             namespace OM = Core::OwnMemoryCensus;
             const auto& info = buffer_infos.back();
+            const u32 cls = own_compare_cls;
             if (buffer_cache.IsStreamHandle(info.buffer)) {
-                OM::NoteOwn(OM::OwnOldStream);
+                OM::NoteOwn(OM::OwnOldStream, cls);
             } else {
-                OM::NoteOwn(OM::OwnCompared);
+                OM::NoteOwn(OM::OwnCompared, cls);
                 const u64 aligned = Common::AlignDown(own_compare_offset, alignment);
                 const u64 adjust = own_compare_offset - aligned;
                 if (info.buffer != own_compare->Handle() || info.offset != aligned || info.range != own_compare_size + adjust || push_data.buf_offsets[own_compare_slot] != adjust) {
-                    OM::NoteOwn(OM::OwnDifferent);
+                    OM::NoteOwn(OM::OwnDifferent, cls);
                     static std::atomic<u32> logged{0};
-                    if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
-                        LOG_ERROR(Render_Vulkan, "own immutable differs: stage {:#x} buffer {}: own {:#x}+{:#x}/{:#x} adjust {}, old {:#x}+{:#x}/{:#x} adjust {}", stage.pgm_hash, buffer_index,
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+                        LOG_ERROR(Render_Vulkan, "own memory differs (class {}): stage {:#x} buffer {}: own {:#x}+{:#x}/{:#x} adjust {}, old {:#x}+{:#x}/{:#x} adjust {}", cls, stage.pgm_hash, buffer_index,
                                   reinterpret_cast<u64>(static_cast<VkBuffer>(own_compare->Handle())), aligned, own_compare_size + adjust, adjust,
                                   reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)), info.offset, info.range, push_data.buf_offsets[own_compare_slot]);
                     }
                 } else if (VideoCore::BufferCache::UploadBytes() != 0) {
-                    OM::NoteOwn(OM::OwnOldPathWork);
+                    OM::NoteOwn(OM::OwnOldPathWork, cls);
                 }
             }
             own_compare = nullptr;

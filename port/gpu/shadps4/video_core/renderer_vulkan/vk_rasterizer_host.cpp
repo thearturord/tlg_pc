@@ -318,7 +318,7 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
         if (Core::RowVersion::Mode() != 0) {
             Core::DebugServer::Publish("row_version", Core::RowVersion::Report()); // F2 row version shadow
         }
-        if (Core::OwnMemoryCensus::On() || Core::OwnMemoryCensus::DropDirtyMode() != 0 || Core::OwnMemoryCensus::OwnImmutableMode() != 0) {
+        if (Core::OwnMemoryCensus::On() || Core::OwnMemoryCensus::DropDirtyMode() != 0 || Core::OwnMemoryCensus::OwnImmutableMode() != 0 || Core::OwnMemoryCensus::OwnMutableMode() != 0) {
             Core::DebugServer::Publish("own_memory_census", Core::OwnMemoryCensus::Report()); // design review 79, step 1a
         }
         if (Core::DispatchSplit::On() || Core::DispatchSplit::PlannerOn() || Core::DispatchSplit::DrawOn()) {

@@ -334,6 +334,7 @@ private:
     const VideoCore::Buffer* own_compare{};
     u64 own_compare_offset{}, own_compare_size{};
     u32 own_compare_slot{};
+    u32 own_compare_cls{};
 
     u32 const_ring_level = 0;
     std::unique_ptr<ConstantRing> constant_ring;

@@ -277,6 +277,7 @@ void BufferCache::IdMarkLean(VAddr address, u64 size, bool newer, u64 id) {
         }
         object_dirty[id].Add(address, size);
         b9_unattributed.Subtract(address, size);
+        OwnDirtyNote(id, true);
     }
     if (drop_mode != 0 && drop_resident != nullptr) [[unlikely]] {
         drop_resident->dirty_pending.store(true, std::memory_order_release); // (the lean apply's range is the whole buffer: section 49)
@@ -614,6 +615,7 @@ void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, st
     }
     for (const auto& part : parts) {
         object_dirty[part.id].Add(part.begin, part.end - part.begin);
+        OwnDirtyNote(part.id, true);
         Core::RowVersion::Bump(part.id); // F2 row version (shadow)
     }
     if (Core::RowVersion::Watched(address, size)) [[unlikely]] {
@@ -1590,6 +1592,27 @@ void BufferCache::RecipeEraseRange(VAddr address, u64 size) {
     }
 }
 
+void BufferCache::OwnDirtyNote(u64 id, bool added) {
+    if (Core::OwnMemoryCensus::OwnMutableMode() == 0) [[likely]] {
+        return;
+    }
+    auto* h = Core::NativeResources::FindImmutableById(id);
+    if (h == nullptr) {
+        return;
+    }
+    if (added) {
+        h->cpu_dirty.store(true, std::memory_order_release);
+        return;
+    }
+    const auto it = object_dirty.find(id);
+    h->cpu_dirty.store(it != object_dirty.end() && it->second.Intersects(h->begin, h->end - h->begin), std::memory_order_release);
+}
+
+bool BufferCache::GpuWrittenContains(VAddr address, u64 size) {
+    std::shared_lock lock{gpu_ranges_mutex};
+    return gpu_modified_ranges.Contains(address, size);
+}
+
 void BufferCache::BindMemoErase(VAddr address, u64 size) {
     Core::SplitCensus::Touch(Core::SplitCensus::BufMemoErase);
     RecipeEraseRange(address, size);
@@ -1975,6 +1998,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainStatic(u64 id, VAddr device_add
     {
         std::scoped_lock lock{object_dirty_mutex};
         object_dirty[id].Add(device_addr, size); // (the whole range is taken from guest memory now: the device copy equals it after this call)
+        OwnDirtyNote(id, true);
     }
     const auto* arena = BufferFor(device_addr, size, true, false);
     last_upload_bytes = 0;
@@ -2434,6 +2458,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                     it->second.ForEachInRange(part.begin, part.end - part.begin, [&](u64 a, u64 e) { b9_pieces.emplace_back(a, e - a); }); // (start, end) pairs
                     if (b9_pieces.size() != before) {
                         it->second.Subtract(part.begin, part.end - part.begin);
+                        OwnDirtyNote(part.id, false);
                         if (Core::OwnMemoryCensus::DropDirtyMode() != 0) [[unlikely]] {
                             if (auto* r = Core::NativeResources::FindImmutableById(part.id); r != nullptr && r->dirty_pending.exchange(false, std::memory_order_acq_rel)) {
                                 Core::OwnMemoryCensus::NoteDrop(Core::OwnMemoryCensus::DropFlagCleared);

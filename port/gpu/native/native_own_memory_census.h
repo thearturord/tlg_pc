@@ -63,9 +63,14 @@ enum Own : u32 {
     OwnOldStream,      ///< the old path answered from the stream ring (a copy, not compared)
     OwnSet,            ///< own pointers set
     OwnCleared,        ///< own pointers cleared (placed buffer dropped)
+    OwnNotGpuMarked,   ///< written: the range is not marked GPU-written yet (the old path marks it)
     OwnCount
 };
-void NoteOwn(u32 what) noexcept;
+/// `cls` 0 immutable read, 1 mutable read, 2 mutable written (design review 85).
+void NoteOwn(u32 what, u32 cls = 0) noexcept;
+/// Design review 85: `TLG_OWN_MUTABLE` (default 0; 1 shadow, 2 real, 1 in 64 audited): bindings of default and dynamic engine buffers (reads and GPU writes) bound
+/// from the buffer's own placed buffer by id while no CPU bytes wait for it.
+[[nodiscard]] u32 OwnMutableMode() noexcept;
 [[nodiscard]] nlohmann::json Report();
 
 } // namespace Core::OwnMemoryCensus
