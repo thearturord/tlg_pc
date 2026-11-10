@@ -346,6 +346,73 @@ void NoteRasterBound(u32 cls, u64 size, bool checked) {
     }
 }
 
+u32 WideRowsMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_WIDE_ROWS");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
+
+std::atomic<u64> c_wide_rows[11]{};
+void NoteWideRows(u32 what) noexcept {
+    if (what < 11) {
+        c_wide_rows[what].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+bool ResolveWide(u64 address, u64 size, u64& offset, u64& prefix) {
+    if (g_bytes.load(std::memory_order_acquire) == nullptr || size == 0) {
+        return false;
+    }
+    u64 lo, hi;
+    if (!Clip(address, size, lo, hi) || lo != address || hi != address + size) {
+        return false;
+    }
+    const u64 base = g_base.load(std::memory_order_relaxed);
+    const auto* filled = g_filled.load(std::memory_order_acquire);
+    const auto* half = g_half.load(std::memory_order_acquire);
+    const u64 first = (lo - base) >> GranuleShift, last = (hi - 1 - base) >> GranuleShift;
+    if (filled[first].load(std::memory_order_acquire) == 0) {
+        NoteWideRows(2);
+        return false;
+    }
+    const u8 h = half[first].load(std::memory_order_relaxed);
+    u64 g = first;
+    // the buffer's own block: the filled granules from the window's start in the start's lap half (a granule of the other half is a block of another lap: the block ended)
+    for (; g <= last && filled[g].load(std::memory_order_acquire) != 0 && half[g].load(std::memory_order_relaxed) == h; ++g) {
+    }
+    prefix = std::min(hi, base + (g << GranuleShift)) - lo;
+    offset = CopyOffset(lo - base, h);
+    NoteWideRows(4);
+    return true;
+}
+
+u64 ComparePrefix(u64 address, u64 size) {
+    u8* bytes = g_bytes.load(std::memory_order_acquire);
+    u64 lo, hi;
+    if (bytes == nullptr || size == 0 || !Clip(address, size, lo, hi)) {
+        return 0;
+    }
+    const u64 base = g_base.load(std::memory_order_relaxed);
+    const auto* filled = g_filled.load(std::memory_order_acquire);
+    const auto* half = g_half.load(std::memory_order_acquire);
+    const u8* theirs = reinterpret_cast<const u8*>(lo);
+    u64 diff = 0;
+    const u8 h0 = half[(lo - base) >> GranuleShift].load(std::memory_order_relaxed);
+    for (u64 g = (lo - base) >> GranuleShift; g <= (hi - 1 - base) >> GranuleShift; ++g) {
+        if (filled[g].load(std::memory_order_acquire) == 0 || half[g].load(std::memory_order_relaxed) != h0) {
+            break; // the end of the prefix (the buffer's own block)
+        }
+        const u64 g_lo = std::max(lo, base + (g << GranuleShift)) - lo, g_hi = std::min(hi, base + ((g + 1) << GranuleShift)) - lo;
+        const u8* mine = bytes + CopyOffset(lo - base, half[g].load(std::memory_order_relaxed));
+        for (u64 i = g_lo; i < g_hi; ++i) {
+            diff += mine[i] != theirs[i] ? 1 : 0;
+        }
+    }
+    return diff;
+}
+
 bool WideCensusOn() noexcept {
     static const bool on = [] {
         const char* e = std::getenv("TLG_WIDE_CENSUS");
@@ -375,12 +442,16 @@ void CompareWide(u64 address, u64 size, bool probe) {
     const u8* theirs = reinterpret_cast<const u8*>(lo);
     u64 prefix = 0, diff_prefix = 0, diff_after = 0, unfilled = 0, first_diff = ~0ull, first_prefix_diff = ~0ull, granules_differ = 0;
     bool in_prefix = true;
+    const u8 prefix_half = half[(lo - base) >> GranuleShift].load(std::memory_order_relaxed);
     for (u64 g = (lo - base) >> GranuleShift; g <= (hi - 1 - base) >> GranuleShift; ++g) {
         const u64 g_lo = std::max(lo, base + (g << GranuleShift)) - lo, g_hi = std::min(hi, base + ((g + 1) << GranuleShift)) - lo;
         if (filled[g].load(std::memory_order_acquire) == 0) {
             unfilled += g_hi - g_lo;
             in_prefix = false;
             continue;
+        }
+        if (half[g].load(std::memory_order_relaxed) != prefix_half) {
+            in_prefix = false; // a block of another lap: the buffer's own block ended
         }
         const u8* mine = bytes + CopyOffset(lo - base, half[g].load(std::memory_order_relaxed));
         u64 d = 0;
@@ -477,6 +548,17 @@ void ClearFillTag() {
 
 void NoteLanding(u64 address, u64 size) {
     if (!Raster1bOn() || size == 0 || g_bytes.load(std::memory_order_acquire) == nullptr) {
+        return;
+    }
+    if (WideRowsMode() != 0) {
+        // F1 wide windows: the GPU's result is in game memory now (callers note a landing after the write); the hook ring takes it too
+        u64 lo, hi;
+        if (Clip(address, size, lo, hi)) {
+            Fill(lo, hi - lo, 8);
+            NoteWideRows(10);
+            c_landings.fetch_add(1, std::memory_order_relaxed);
+            c_landing_bytes.fetch_add(hi - lo, std::memory_order_relaxed);
+        }
         return;
     }
     u64 lo, hi;
@@ -652,6 +734,12 @@ nlohmann::json Report() {
         }
         w["differing_granules_where_a_gpu_result_landed"] = {{"in_prefix", c_wide_landed[0].load()}, {"after_prefix", c_wide_landed[1].load()}};
         w["prefix_diffs_probed"] = c_wide_probed.load();
+        static constexpr const char* RowNames[11] = {"asked", "outside_ring_or_gpu_written", "no_prefix", "prefix_in_two_halves", "resolved", "bound", "compared",
+                                                     "PREFIX_DIFFERS_MUST_BE_0", "shadow_checked", "SHADOW_PREFIX_DIFFERS_MUST_BE_0", "landings_copied_into_hook_ring"};
+        j["wide_rows"]["mode"] = WideRowsMode();
+        for (u32 k = 0; k < 11; ++k) {
+            j["wide_rows"][RowNames[k]] = c_wide_rows[k].load();
+        }
         {
             std::scoped_lock tag_lock{g_tag_mutex};
             for (u32 t = 0; t < g_tags.size() && t < MaxTags; ++t) {

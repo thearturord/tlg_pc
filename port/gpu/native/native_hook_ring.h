@@ -62,6 +62,17 @@ void NoteRasterWide(u64 size);
 /// (the Map's block). `probe`: the address of the first differing byte in the filled part is made read only once (writer probe) when nonzero.
 [[nodiscard]] bool WideCensusOn() noexcept;
 void CompareWide(u64 address, u64 size, bool probe);
+/// F1 wide windows (`TLG_WIDE_ROWS`, default 0 off; design review section 41): 1 shadow (every window the old path uploads is checked: the buffer's own block in the hook ring
+/// against game memory; the old path decides), 2 real (a 4 MB read window inside the frame ring is bound from the hook ring when its block is filled in one lap half; one in 16
+/// is compared first and a window whose block differs takes the old path). With either mode a GPU result that lands in the ring is copied into the hook ring.
+[[nodiscard]] u32 WideRowsMode() noexcept;
+/// The offset in the storage of the window [address, address + size) when its filled prefix (the block from its start) lies in one lap half; `prefix` its length.
+bool ResolveWide(u64 address, u64 size, u64& offset, u64& prefix);
+/// The bytes of the window's filled prefix that differ from game memory now.
+u64 ComparePrefix(u64 address, u64 size);
+/// Counters of the stage: 0 asked, 1 outside the ring or GPU written, 2 no prefix, 3 prefix in two halves, 4 resolved, 5 bound, 6 compared, 7 PREFIX_DIFFERS (MUST_BE_0; not bound),
+/// 8 shadow windows checked, 9 SHADOW_PREFIX_DIFFERS (MUST_BE_0), 10 landings copied into the hook ring.
+void NoteWideRows(u32 what) noexcept;
 
 nlohmann::json Report();
 

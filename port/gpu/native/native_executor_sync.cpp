@@ -276,36 +276,38 @@ void ReportLongSpin(const char* what, const void* address, u64 wait_start, bool&
 }
 
 void WriteFenceMemory(void* address, u64 data, u32 num_bytes) {
-    Core::HookRing::NoteLanding(reinterpret_cast<u64>(address), num_bytes); // F1 1b shadow
     auto* memory = Core::Memory::Instance();
     if (!memory->TryWriteBacking(address, &data, num_bytes)) {
         memcpy(address, &data, num_bytes);
     }
+    Core::HookRing::NoteLanding(reinterpret_cast<u64>(address), num_bytes); // F1 1b shadow / wide windows (after the write)
 }
 
 void NoFenceWrite(void*, u64, u32) {}
 
 bool TryWriteOffThread(void* address, const void* data, u32 num_bytes, const std::function<bool(VAddr, u32)>& not_mapped) {
-    Core::HookRing::NoteLanding(reinterpret_cast<u64>(address), num_bytes); // F1 1b shadow
     if (Core::Memory::Instance()->TryWriteBacking(address, data, num_bytes)) {
+        Core::HookRing::NoteLanding(reinterpret_cast<u64>(address), num_bytes); // F1 1b shadow / wide windows (after the write)
         return true;
     }
     if (not_mapped(reinterpret_cast<VAddr>(address), num_bytes)) {
         std::memcpy(address, data, num_bytes);
+        Core::HookRing::NoteLanding(reinterpret_cast<u64>(address), num_bytes);
         return true;
     }
-    return false;
+    return false; // (the caller writes it another way and notes the landing there)
 }
 
 void WriteBackingOrMemory(void* address, const void* data, u32 num_bytes) {
-    Core::HookRing::NoteLanding(reinterpret_cast<u64>(address), num_bytes); // F1 1b shadow
     if (!Core::Memory::Instance()->TryWriteBacking(address, data, num_bytes)) {
         std::memcpy(address, data, num_bytes);
     }
+    Core::HookRing::NoteLanding(reinterpret_cast<u64>(address), num_bytes); // F1 1b shadow / wide windows (after the write)
 }
 
 void ApplyCpWrite(void* address, const std::vector<u32>& words, u32 queue) {
     std::memcpy(address, words.data(), words.size() * sizeof(u32));
+    Core::HookRing::NoteLanding(reinterpret_cast<u64>(address), words.size() * sizeof(u32)); // a command processor write into memory is a landing for the hook ring too
     if (Core::FrameTimeline::capture_active.load(std::memory_order_relaxed)) {
         Core::FrameTimeline::Record(Core::FrameTimeline::LabelWrite, words[0] | (u64(queue) << 32), Core::FrameTimeline::Now(), reinterpret_cast<u64>(address));
     }

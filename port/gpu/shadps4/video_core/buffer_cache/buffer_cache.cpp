@@ -1056,6 +1056,30 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             }
         }
     }
+    if (hook_ring != nullptr && !is_written && !is_texel_buffer && size > 65536 && Core::HookRing::WideRowsMode() == 2 && Core::HookRing::Raster1bReal()) [[unlikely]] {
+        // F1 wide windows real (design review section 41): a 4 MB read window inside the frame ring is bound from the hook ring when the buffer's own block (the filled prefix) lies in
+        // one lap half; one in 16 compares that block with game memory first and a window that differs takes the old path
+        Core::HookRing::NoteWideRows(0);
+        const auto& ring = UntrackedRing::Get();
+        u64 hook_offset = 0, prefix = 0;
+        if (!ring.Active() || device_addr < ring.Start() || device_addr + size > ring.End() || IsRegionGpuModified(device_addr, size) || IsRangeGpuWritten(device_addr, size)) {
+            Core::HookRing::NoteWideRows(1);
+        } else if (Core::HookRing::ResolveWide(device_addr, size, hook_offset, prefix)) {
+            static thread_local u32 wide_sample = 0;
+            bool bind = true;
+            if ((++wide_sample & 15) == 0) {
+                Core::HookRing::NoteWideRows(6);
+                if (Core::HookRing::ComparePrefix(device_addr, size) != 0) {
+                    Core::HookRing::NoteWideRows(7);
+                    bind = false;
+                }
+            }
+            if (bind) {
+                Core::HookRing::NoteWideRows(5);
+                return {hook_ring, hook_offset};
+            }
+        }
+    }
     const auto result = ObtainBufferBody(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
     if (result.first != nullptr) {
         const_cast<Buffer*>(result.first)->NoteResolveUse(); // P3c: asked for by the operation being resolved (every answer, memo hits too)
@@ -2268,6 +2292,18 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                     Core::HookRing::CompareRaster(0, lo, hi - lo, gpu_written);
                 } else {
                     Core::HookRing::NoteRasterWide(hi - lo);
+                    if (Core::HookRing::WideRowsMode() == 1) [[unlikely]] {
+                        // F1 wide windows shadow: would the hook ring give this window's block as game memory has it now?
+                        u64 shadow_offset = 0, shadow_prefix = 0;
+                        if (lo == device_addr && hi == device_addr + size && Core::HookRing::ResolveWide(lo, hi - lo, shadow_offset, shadow_prefix)) {
+                            Core::HookRing::NoteWideRows(8);
+                            if (Core::HookRing::ComparePrefix(lo, hi - lo) != 0) {
+                                Core::HookRing::NoteWideRows(9);
+                            }
+                        } else if (lo != device_addr || hi != device_addr + size) {
+                            Core::HookRing::NoteWideRows(1);
+                        }
+                    }
                     if (Core::HookRing::WideCensusOn()) [[unlikely]] {
                         static thread_local u32 wide_sample = 0;
                         if ((++wide_sample & 15) == 0) {
