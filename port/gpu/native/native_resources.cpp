@@ -28,6 +28,7 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "native/native_draw.h"
+#include "native/native_own_memory_census.h"
 #include "native/native_n0_census.h"
 #include "native/native_frame_gate.h"
 #include "native/native_identity_log.h"
@@ -341,6 +342,9 @@ void AddResource(const Resource& resource) {
     }
     resources_by_address[resource.address] = resource;
     address_by_object[resource.object] = resource.address;
+    if (resource.kind == 1 && OwnMemoryCensus::On()) [[unlikely]] {
+        OwnMemoryCensus::NoteResource(resource.id, resource.address, resource.width, resource.usage, resource.bind, resource.misc); // design review 79, step 1a
+    }
 }
 
 void UpdateRing() {
@@ -566,6 +570,9 @@ bool NoteBufferDestroyed(u64 object) {
     }
     std::lock_guard lock{resource_mutex};
     if (const auto it = address_by_object.find(object); it != address_by_object.end()) {
+        if (OwnMemoryCensus::On()) [[unlikely]] {
+            OwnMemoryCensus::NoteResourceGone(it->second);
+        }
         resources_by_address.erase(it->second);
         address_by_object.erase(it);
     }

@@ -19,6 +19,7 @@
 #include "native/native_n0_census.h"
 #include "native/native_row_version.h"
 #include "native/native_dispatch_split.h"
+#include "native/native_own_memory_census.h"
 #include "native/native_prof.h"
 #include "native/native_marker.h"
 #include "native/native_ui_trace.h"
@@ -3112,6 +3113,9 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
 
     // Map buffers for merged ranges
     for (auto& range : ranges_merged) {
+        if (Core::OwnMemoryCensus::On()) [[unlikely]] {
+            Core::OwnMemoryCensus::NoteGeometryRead(range.base_address, range.GetSize()); // design review 79, step 1a
+        }
         if (range.GetSize() >= (1ull << 30) && !memory->IsValidMapping(range.base_address)) {
             LOG_ERROR(Render, "vertex buffer range at unmapped address {:#x} of {} bytes: ignored", range.base_address, range.GetSize());
             range.buffer = nullptr;
@@ -3396,6 +3400,9 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
         index_ring = nullptr;
     }
     ilap(2);
+    if (Core::OwnMemoryCensus::On() && index_buffer_size != 0) [[unlikely]] {
+        Core::OwnMemoryCensus::NoteGeometryRead(index_address, index_buffer_size); // design review 79, step 1a
+    }
     if (index_ring != nullptr) {
         Census(CGeometryIndexRing);
         index_buffer = constant_ring->Handle();
@@ -4089,6 +4096,39 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 ring = nullptr;
             } else {
                 Core::NativeUploads::NoteRingPrecise(4);
+            }
+        }
+        if (Core::OwnMemoryCensus::On()) [[unlikely]] {
+            // design review 79, step 1a: what names this binding (the front's engine id for it, from the record)
+            namespace OM = Core::OwnMemoryCensus;
+            if (ring) {
+                OM::NoteBindRing(ring->address, ring->size, ring->hook && hook_ring_buffer);
+            } else if (desc.IsSpecial()) {
+                OM::NoteBind(OM::Special);
+            } else {
+                const StagePlan* op = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
+                                      : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
+                                                                                                                  : nullptr;
+                const ResolvedBuffer* r = op != nullptr && buffer_index < op->resolved.size() && op->resolved[buffer_index].ahead_id != 0 ? &op->resolved[buffer_index] : nullptr;
+                if (r == nullptr) {
+                    OM::NoteBind(OM::NoId);
+                    u64 at = 0, bytes = 0;
+                    const u32* words = binder_plan != nullptr && desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad
+                                           ? BinderWords(stage, desc.sharp_fetch.offsets[0], 4, 1)
+                                           : nullptr;
+                    if (words != nullptr) {
+                        const Core::NativeDesc::BufferDesc v = Core::NativeDesc::BufferDescOf(desc.FromWords(words, stage));
+                        at = v.address;
+                        bytes = v.size;
+                    } else if (op == nullptr || !op->flat_skipped) {
+                        const Core::NativeDesc::BufferDesc v = Core::NativeDesc::BufferDescOf(desc.GetSharp(stage)); // (the stage's user data and flat user data exist)
+                        at = v.address;
+                        bytes = v.size;
+                    }
+                    OM::NoteBindNoId(at, bytes, desc.is_written);
+                } else {
+                    OM::NoteBindId(r->ahead_id, r->ahead_address, r->ahead_size, desc.is_written, census_base != 0);
+                }
             }
         }
         if (ring) {
@@ -8022,6 +8062,9 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     if (!dst_gds && !src_gds) {
         Core::UiTrace::NoteGpuCopy(dst, src, num_bytes);
     }
+    if (!dst_gds && !src_gds && Core::OwnMemoryCensus::On()) [[unlikely]] {
+        Core::OwnMemoryCensus::NoteCopy(dst, src, num_bytes); // design review 79, step 1a
+    }
     const u64 ui_copy_number = Core::UiTrace::LastCopyNumber(); // taken now: work in between must not change which copy a result belongs to
     Core::ResourceAudit::Note(dst_gds ? Core::ResourceAudit::GdsFill : Core::ResourceAudit::MemoryCopyDst, dst, num_bytes, true);
     Core::ResourceAudit::Note(src_gds ? Core::ResourceAudit::GdsFill : Core::ResourceAudit::MemoryCopySrc, src, num_bytes, false);
@@ -8126,6 +8169,9 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
 }
 
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
+    if (Core::OwnMemoryCensus::On()) [[unlikely]] {
+        Core::OwnMemoryCensus::NoteFault(addr, size); // design review 79, step 1a
+    }
     Core::DebugServer::NoteWriteFault(addr);
     Core::NativeResources::NoteCpuWrite(addr, size);
 #ifdef ARCH_X86_64

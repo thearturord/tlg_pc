@@ -21,6 +21,7 @@
 #include "native/native_device.h"
 #include "native/native_draw.h"
 #include "native/native_n0_census.h"
+#include "native/native_own_memory_census.h"
 #include "native/native_row_version.h"
 #include "native/native_readbacks.h"
 #include "native/native_registry.h"
@@ -122,6 +123,9 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 }
 
 void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object) {
+    if (Core::OwnMemoryCensus::On()) [[unlikely]] {
+        Core::OwnMemoryCensus::NoteApply(address, size, Core::N0::t_writer); // design review 79, step 1a
+    }
     const u32 id_marks = Core::NativeUpdates::IdMarksMode();
     if (id_marks == 0 || !Core::NativeUpdates::IdMarksTag(Core::N0::t_writer)) [[likely]] {
         ApplyCpuWriteFull(address, size, newer, object);
