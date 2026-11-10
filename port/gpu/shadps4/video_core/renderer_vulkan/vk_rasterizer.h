@@ -366,6 +366,10 @@ private:
     /// Rows ahead real (TLG_ROWS_AHEAD=2), [graphics, compute]: 0 bound from the planned row, 1 sampled (full path), 2 SAMPLED_DIFFERENT_MUST_BE_0, 3 sampled same,
     /// 4 refused by the identity walk, 5 planned row stale (epoch or version), 6 static row (full path), 7 no planned row
     std::array<std::array<std::atomic<u64>, 8>, 2> rows_ahead_real{};
+    /// design review 66 (TLG_COVER_CENSUS): the identity walks of the rows ahead fast path: [graphics, compute][calls, events stepped, ns]
+    std::array<std::array<std::atomic<u64>, 3>, 2> rows_ahead_walk{};
+    std::array<std::array<std::atomic<u64>, 8>, 2> rows_ahead_fseg{}; ///< design review 66: [side][6 segments ns, count, of them indexed]
+    void NoteFastSegments(u32 side, bool indexed) noexcept;
     /// Texture census (TLG_TEXTURE_CENSUS=1, design review 58), [graphics, compute][class][calls, ns, images]: classes 0 no image, 1 more than 16 images, 2 memo off, 3 a written image,
     /// 4 a mip fallback image, 5 set hit, 6 miss no entry, 7 miss generation, 8 miss image check, 9 other
     std::array<std::array<std::array<std::atomic<u64>, 3>, 10>, 2> tex_census{};

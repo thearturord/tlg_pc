@@ -168,6 +168,7 @@ struct W3Cur {
     u64 phase[6]{};     ///< ns of the compute bind by part: 0 entry (queue drains), 1 the compute image op checks, 2 setup (diagnostics, user data), 3 buffers, 4 textures and samplers, 5 FinishBindResources
     u32 why[8]{};       ///< shader buffers by why they have no engine handle (the W1 reasons: 0 has a handle, 1 no binder plan, 2 not a single load, 3 no record entry, 4 plan has no handles, 5 id not in the registry, 6 epoch stale)
     u32 written_id[2]{}; ///< written buffers: [0] without an engine id in the record, [1] with one
+    u32 fast{};          ///< design review 66: buffer bindings bound from the front's planned row (rows ahead)
 };
 thread_local W3Cur t_w3;
 struct W3Stat {
@@ -1402,6 +1403,11 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
             }
             v[28] += t_w3.written_id[0];
             v[29] += t_w3.written_id[1];
+            // design review 66: the bindings rows ahead bound, and the dispatches whose every shader buffer was answered without the per-binding old path
+            // (ring, special, null, the front's resolution, a planned row)
+            v[30] += t_w3.fast;
+            const u32 full_path = t_w3.kinds[4] + t_w3.kinds[5] + t_w3.kinds[6] - std::min<u32>(t_w3.fast, t_w3.kinds[4] + t_w3.kinds[5] + t_w3.kinds[6]);
+            v[31] += full_path == 0 ? 1 : 0;
             for (u32 k = 0; k < 6; ++k) {
                 v[32 + k] += t_w3.phase[k];
             }
@@ -1964,6 +1970,8 @@ void Rasterizer::BindCensus(const Pipeline* pipeline) {
 }
 
 namespace {
+thread_local u64 t_fseg[7] = {}; // design review 66 (TLG_COVER_CENSUS, one fast binding in 8): stamps through the rows ahead fast path and the tail of the loop
+thread_local bool t_fseg_on = false;
 thread_local const ResolvedBuffer* t_ahead_sample = nullptr; // rows ahead real: the planned row of the binding sampled through the full path
 thread_local u64 t_bseg[6] = {}; // TLG_COVER_CENSUS: stamps of the handle path of one binding (1 after the descriptor, 2 before the row, 3 after the row, 4 after the answer, 5 before the binding is written)
 thread_local bool t_bseg_served = false;
@@ -4050,6 +4058,10 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
             }
         } else {
+            t_fseg_on = false;
+            if (cover_on) [[unlikely]] {
+                t_fseg[0] = BsegNow();
+            }
             if (Vulkan::RowShare::Mode() == 2) {
                 // rows ahead real (design review 56): the row the front planned for this binding, still valid now, is bound without the descriptor decode, the bind context and the lookup
                 t_ahead_sample = nullptr;
@@ -4068,7 +4080,15 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 } else {
                     static thread_local u32 ahead_tick = 0;
                     const u64 clock_now = Core::NativeIdentity::Clock();
-                    if (Core::NativeIdentity::ChangedSince(a->plan_clock, a->ahead_address, a->ahead_address + a->ahead_size) != Core::NativeIdentity::Change::None) {
+                    const u64 walk_t0 = cover_on ? BsegNow() : 0;
+                    const bool walk_changed = Core::NativeIdentity::ChangedSince(a->plan_clock, a->ahead_address, a->ahead_address + a->ahead_size) != Core::NativeIdentity::Change::None;
+                    if (walk_t0 != 0) [[unlikely]] {
+                        auto& w = rows_ahead_walk[census_base != 0 ? 1 : 0];
+                        w[0].fetch_add(1, std::memory_order_relaxed);
+                        w[1].fetch_add(clock_now > a->plan_clock ? clock_now - a->plan_clock : 0, std::memory_order_relaxed);
+                        w[2].fetch_add(BsegNow() - walk_t0, std::memory_order_relaxed);
+                    }
+                    if (walk_changed) {
                         rc[4].fetch_add(1, std::memory_order_relaxed);
                     } else if ((++ahead_tick & 63u) == 0) {
                         // (sampled only among the rows the whole check accepts, the identity walk included: those are the ones the fast path binds)
@@ -4077,6 +4097,12 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     } else {
                         {
                             rc[0].fetch_add(1, std::memory_order_relaxed);
+                            if (cover_on) [[unlikely]] {
+                                ++t_w3.fast;
+                                static thread_local u32 fseg_tick = 0;
+                                t_fseg_on = (++fseg_tick & 7u) == 0;
+                                t_fseg[1] = BsegNow();
+                            }
                             const VAddr address = a->ahead_address;
                             const u64 size = a->ahead_size;
                             const auto* buffer = static_cast<const VideoCore::Buffer*>(a->plan_buffer);
@@ -4097,6 +4123,9 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                             if (desc.is_written || size > 262144) {
                                 recipe_reusable = false;
                             }
+                            if (t_fseg_on) [[unlikely]] {
+                                t_fseg[2] = BsegNow();
+                            }
                             const u64 offset_aligned = Common::AlignDown(offset, alignment);
                             const u64 adjust = offset - offset_aligned;
                             push_data.AddOffset(binding.buffer, adjust);
@@ -4105,10 +4134,16 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                             if (desc.is_written) {
                                 texture_cache.InvalidateMemoryFromGPU(address, size, "a written storage buffer view");
                             }
+                            if (t_fseg_on) [[unlikely]] {
+                                t_fseg[3] = BsegNow();
+                            }
                             Census(census_base + CBufferBarrierQuery);
                             if (runtime.IsBufferAccessed(buffer, offset, size, desc.is_written)) {
                                 Census(census_base + CBufferBarrierTrue);
                                 needs_barrier = true;
+                            }
+                            if (t_fseg_on) [[unlikely]] {
+                                t_fseg[4] = BsegNow();
                             }
                             goto buffer_bound;
                         }
@@ -4755,6 +4790,9 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
         }
 
     buffer_bound:
+        if (t_fseg_on) [[unlikely]] {
+            t_fseg[5] = BsegNow();
+        }
         if (cover_on) [[unlikely]] {
             const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
             const u32 slot = (census_base != 0 ? 128u : 0u) + (cover_cause & 15u) * 8u + (t_cover_kind & 7u);
@@ -4811,6 +4849,9 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
             if (verify_slots_on) {
                 verify_slots.push_back(slot);
             }
+            if (t_fseg_on) [[unlikely]] {
+                NoteFastSegments(census_base != 0 ? 1 : 0, true);
+            }
             ++binding.buffer;
             continue;
         }
@@ -4825,8 +4866,24 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
         set_write.descriptorCount = 1;
         set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
         set_write.pBufferInfo = &buffer_infos.back();
+        if (t_fseg_on) [[unlikely]] {
+            NoteFastSegments(census_base != 0 ? 1 : 0, false);
+        }
         ++binding.buffer;
     }
+}
+
+void Rasterizer::NoteFastSegments(u32 side, bool indexed) noexcept {
+    // design review 66: 0 validity (plan, epoch, version, identity walk), 1 bookkeeping (clock, census, writer, written effects, recipe), 2 the binding written, 3 the barrier query,
+    // 4 the jump and the cover census at buffer_bound, 5 the loop tail (the indexed data slot or the descriptor write)
+    t_fseg[6] = BsegNow();
+    t_fseg_on = false;
+    auto& seg = rows_ahead_fseg[side];
+    for (u32 k = 0; k < 6; ++k) {
+        seg[k].fetch_add(t_fseg[k + 1] - t_fseg[k], std::memory_order_relaxed);
+    }
+    seg[6].fetch_add(1, std::memory_order_relaxed);
+    seg[7].fetch_add(indexed ? 1 : 0, std::memory_order_relaxed);
 }
 
 u32 Rasterizer::BufferSlotCounted(const vk::DescriptorBufferInfo& info) {

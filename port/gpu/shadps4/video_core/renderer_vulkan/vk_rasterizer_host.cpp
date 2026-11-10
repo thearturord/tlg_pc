@@ -157,6 +157,20 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
                 rr[side ? "compute" : "graphics"] = std::move(one);
             }
             out["rows_ahead_real_cumulative"] = std::move(rr);
+            {
+                static constexpr const char* fseg_names[] = {"0_validity", "1_bookkeeping", "2_binding_written", "3_barrier_query", "4_jump_and_cover_census", "5_loop_tail_slot_or_descriptor"};
+                nlohmann::json fs = nlohmann::json::object();
+                for (u32 side = 0; side < 2; ++side) {
+                    nlohmann::json one = {{"sampled", rows_ahead_fseg[side][6].load()}, {"of_them_indexed", rows_ahead_fseg[side][7].load()}};
+                    for (u32 k = 0; k < 6; ++k) {
+                        one[fseg_names[k]] = rows_ahead_fseg[side][k].load();
+                    }
+                    fs[side ? "compute" : "graphics"] = std::move(one);
+                }
+                out["rows_ahead_fast_segments_ns_cumulative"] = std::move(fs);
+            }
+            out["rows_ahead_walk_cumulative"] = {{"graphics", {{"calls", rows_ahead_walk[0][0].load()}, {"events_stepped", rows_ahead_walk[0][1].load()}, {"ns", rows_ahead_walk[0][2].load()}}},
+                                                  {"compute", {{"calls", rows_ahead_walk[1][0].load()}, {"events_stepped", rows_ahead_walk[1][1].load()}, {"ns", rows_ahead_walk[1][2].load()}}}};
             static constexpr const char* tex_names[] = {"no_image", "more_than_16_images", "memo_off", "written_image", "mip_fallback_image", "set_hit", "miss_no_entry",
                                                         "miss_generation", "miss_image_check", "other"};
             nlohmann::json tc = nlohmann::json::object();
@@ -267,7 +281,7 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
                 static constexpr const char* names[] = {"dispatches", "total_ns", "ns_before_bind", "ns_in_bind", "ns_after_bind", "sync_ns", "uploaded_bytes", "b_ring", "b_special", "b_null", "b_engine_handle",
                                                         "b_address_read", "b_address_written", "b_resolved_by_front", "images", "written_buffers", "stream_ring_answers", "requests_that_uploaded", "with_barrier", "groups",
                                                         "why0_has_handle", "why1_no_binder_plan", "why2_not_single_load", "why3_no_record_entry", "why4_plan_has_no_handles", "why5_id_not_in_registry", "why6_epoch_stale", "why7",
-                                                        "written_without_record_id", "written_with_record_id", "x30", "x31",
+                                                        "written_without_record_id", "written_with_record_id", "b_bound_from_planned_row", "dispatches_without_old_path_buffer",
                                                         "phase_entry_drains", "phase_compute_image_op_checks", "phase_setup", "phase_buffers", "phase_textures_and_samplers", "phase_finish",
                                                         "buf_ns_before_obtain", "buf_ns_obtain", "buf_ns_after_obtain", "buf_bindings_with_obtain",
                                                         "obtain_written_ns", "obtain_written_n", "obtain_read_old_ns", "obtain_read_old_n", "obtain_read_row_ns", "obtain_read_row_n"};
