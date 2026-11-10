@@ -100,7 +100,10 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
     if (TextureSetMemoOn()) {
         const auto sets = TakeTextureSetStats();
         Core::DebugServer::Publish("texture_set_memo", {{"hits", sets.hits}, {"recorded", sets.recorded}, {"miss_no_entry", sets.no_entry}, {"miss_generation", sets.generation},
-                                                      {"miss_image_check", sets.image_check}, {"not_eligible", sets.not_eligible}, {"note", "counts per ~5 s interval"}});
+                                                      {"miss_image_check", sets.image_check}, {"not_eligible", sets.not_eligible},
+                                                      {"by_id", {{"predicted_unchanged", sets.by_id_predicted}, {"served", sets.by_id_served}, {"shadow_same", sets.by_id_same},
+                                                                 {"SHADOW_DIFFERENT_MUST_BE_0", sets.by_id_DIFFERENT}}},
+                                                      {"note", "counts per ~5 s interval"}});
     }
     {
         const auto c = TakeConsumerCensus();

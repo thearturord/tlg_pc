@@ -5337,6 +5337,74 @@ u64 ImageUseFlags(const Shader::ImageResource& image_desc) {
 }
 } // namespace
 
+namespace {
+u32 TexsetByIdMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_TEXSET_BY_ID");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
+} // namespace
+
+Rasterizer::TexsetShadowState& Rasterizer::TexsetShadow() {
+    static thread_local TexsetShadowState state; // the slot the by-id check called still right (shadow) and its entries then
+    return state;
+}
+
+bool Rasterizer::TextureSetGenerationMiss(const TextureSet& set) {
+    const u32 mode = TexsetByIdMode();
+    if (mode == 0 || set.generation == ~0ull) {
+        return false;
+    }
+    const auto unchanged = [&](VideoCore::ImageId id, u64 uid) {
+        return texture_cache.ImageUnchangedSince(id, uid, set.generation, texture_cache.GuestAddress(id), texture_cache.GuestSize(id));
+    };
+    for (u32 i = 0; i < set.count; ++i) {
+        const auto& e = set.entries[i];
+        if (e.null_entry) {
+            continue;
+        }
+        if (!unchanged(e.found, e.found_uid) || (e.id != e.found && !unchanged(e.id, e.id_uid))) {
+            return false;
+        }
+    }
+    ++texture_set_stats.by_id_predicted;
+    if (mode == 2) {
+        const_cast<TextureSet&>(set).generation = texture_cache.ImageGeneration(); // (the set's images are what it holds now: its clock moves on)
+        ++texture_set_stats.by_id_served;
+        return true;
+    }
+    auto& shadow = TexsetShadow();
+    shadow.slot = const_cast<TextureSet*>(&set);
+    shadow.count = set.count;
+    std::copy(set.entries.begin(), set.entries.begin() + set.count, shadow.entries.begin());
+    return false; // shadow: the slow path answers and the new entries are compared
+}
+
+void Rasterizer::TextureSetShadowCompare(const TextureSet& set) {
+    auto& shadow = TexsetShadow();
+    if (shadow.slot != &set) {
+        return;
+    }
+    shadow.slot = nullptr;
+    bool same = set.count == shadow.count;
+    for (u32 i = 0; same && i < set.count; ++i) {
+        const auto& a = set.entries[i];
+        const auto& b = shadow.entries[i];
+        same = a.null_entry == b.null_entry && (a.null_entry || (a.id == b.id && a.found == b.found && a.view == b.view && a.backing == b.backing));
+    }
+    if (same) {
+        ++texture_set_stats.by_id_same;
+    } else {
+        ++texture_set_stats.by_id_DIFFERENT;
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+            LOG_ERROR(Render_Vulkan, "texture set by id: the slow path answered differently from a set the by-id check called unchanged ({} images)", set.count);
+        }
+    }
+}
+
 bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count,
                                      Shader::Backend::Bindings& binding) {
     if (set.count != count) {
@@ -5349,7 +5417,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set,
             return false;
         }
     }
-    if (set.generation != texture_cache.ImageGeneration()) {
+    if (set.generation != texture_cache.ImageGeneration() && !TextureSetGenerationMiss(set)) {
         ++texture_set_stats.generation;
         return false;
     }
@@ -5821,6 +5889,8 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
                     auto& entry = set_slot->entries[i];
                     entry.id = image_id;
                     entry.found = set_found[i];
+                    entry.found_uid = texture_cache.Uid(set_found[i]);
+                    entry.id_uid = texture_cache.Uid(image_id);
                     entry.view = *image_view.image_view;
                     entry.backing = image.backing;
                     entry.range = desc.view_info.range;
@@ -5886,6 +5956,7 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
         set_slot->count = num_images;
         set_slot->generation = set_generation;
         ++texture_set_stats.recorded;
+        TextureSetShadowCompare(*set_slot);
     }
     BindSamplers(stage, binding);
 }
@@ -6230,6 +6301,8 @@ void Rasterizer::ResolveTextures(const Shader::Info& stage, TextureResolved& r) 
                 auto& entry = set_slot->entries[i];
                 entry.id = image_id;
                 entry.found = set_found[i];
+                entry.found_uid = texture_cache.Uid(set_found[i]);
+                entry.id_uid = texture_cache.Uid(image_id);
                 entry.view = *image_view.image_view;
                 entry.backing = image.backing;
                 entry.range = desc.view_info.range;
@@ -6254,6 +6327,7 @@ void Rasterizer::ResolveTextures(const Shader::Info& stage, TextureResolved& r) 
         set_slot->count = num_images;
         set_slot->generation = set_generation;
         ++texture_set_stats.recorded;
+        TextureSetShadowCompare(*set_slot);
     }
 }
 
@@ -6270,7 +6344,7 @@ bool Rasterizer::ResolveTextureSet(const Shader::Info& stage, TextureSet& set, c
             return false;
         }
     }
-    if (set.generation != texture_cache.ImageGeneration()) {
+    if (set.generation != texture_cache.ImageGeneration() && !TextureSetGenerationMiss(set)) {
         ++texture_set_stats.generation;
         return false;
     }

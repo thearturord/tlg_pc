@@ -195,6 +195,7 @@ public:
 
     struct TextureSetStats {
         u64 hits{}, no_entry{}, generation{}, image_check{}, not_eligible{}, recorded{};
+        u64 by_id_predicted{}, by_id_same{}, by_id_DIFFERENT{}, by_id_unchecked{}, by_id_served{}; ///< F2 item 4 (TLG_TEXSET_BY_ID)
     };
     TextureSetStats TakeTextureSetStats() noexcept {
         return std::exchange(texture_set_stats, TextureSetStats{});
@@ -595,6 +596,7 @@ private:
         VideoCore::SubresourceRange range{};
         bool null_entry{};
         u32 array_key{}; ///< tlg C9: the image's descriptor array (Shader::Indexed::ImageKey of its T#)
+        u64 found_uid{}, id_uid{}; ///< F2 item 4: the images' uids (a slot can be reused by another image)
     };
     struct TextureSet {
         static constexpr u32 MaxImages = 16;
@@ -611,6 +613,17 @@ private:
     bool BindTexturesFromSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count,
                              Shader::Backend::Bindings& binding);
     bool ResolveTextureSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count, TextureResolved& r);
+    /// F2 item 4 (`TLG_TEXSET_BY_ID`, default 0 off; 1 shadow, 2 real): a texture set whose generation moved is still right when none of its images changed by identity (the texture
+    /// cache's event ring: no image registered or unregistered over their memory since the set was recorded). Returns true when the set may be used (real mode, all unchanged).
+    bool TextureSetGenerationMiss(const TextureSet& set);
+    /// Shadow: after a set was recorded again, its new entries against the ones the by-id check called still right.
+    void TextureSetShadowCompare(const TextureSet& set);
+    struct TexsetShadowState {
+        TextureSet* slot{};
+        std::array<TextureSetEntry, TextureSet::MaxImages> entries{};
+        u32 count{};
+    };
+    static TexsetShadowState& TexsetShadow();
     /// Plan S step P3e.2: the plain data a graphics draw carries from its resolve half to its record half (render pass, vertex buffers, index buffer).
     struct DrawJob;
     static bool RenderStateMemoEnabled();
