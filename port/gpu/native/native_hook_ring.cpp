@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 #include "native/native_draw.h"
 #include "native/native_hook_ring.h"
+#include "native/native_ring_mirror.h"
 #include "native/native_updates.h"
 #include "native/native_untracked_ring.h"
 
@@ -342,6 +343,91 @@ void NoteRasterBound(u32 cls, u64 size, bool checked) {
     }
 }
 
+bool WideCensusOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_WIDE_CENSUS");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+// 0 windows, 1 bytes, 2 filled prefix bytes, 3 diff bytes in the prefix, 4 diff bytes after it (filled granules), 5 unfilled bytes, 6 windows with a diff in the prefix,
+// 7 windows with a diff after it, 8 windows wholly filled, 9 granules that differ, by writer below
+std::atomic<u64> c_wide[10]{};
+std::atomic<u64> c_wide_diff_writer[9]{};
+std::atomic<u64> c_wide_landed[2]{}, c_wide_probed{0};
+std::mutex g_wide_mutex;
+std::vector<std::array<u64, 5>> g_wide_examples; // ring offset of the window, its first differing ring offset, diff bytes, unfilled bytes, prefix bytes
+
+void CompareWide(u64 address, u64 size, bool probe) {
+    u8* bytes = g_bytes.load(std::memory_order_acquire);
+    u64 lo, hi;
+    if (bytes == nullptr || size == 0 || !Clip(address, size, lo, hi)) {
+        return;
+    }
+    const u64 base = g_base.load(std::memory_order_relaxed);
+    const auto* filled = g_filled.load(std::memory_order_acquire);
+    const auto* half = g_half.load(std::memory_order_acquire);
+    const u8* theirs = reinterpret_cast<const u8*>(lo);
+    u64 prefix = 0, diff_prefix = 0, diff_after = 0, unfilled = 0, first_diff = ~0ull, first_prefix_diff = ~0ull, granules_differ = 0;
+    bool in_prefix = true;
+    for (u64 g = (lo - base) >> GranuleShift; g <= (hi - 1 - base) >> GranuleShift; ++g) {
+        const u64 g_lo = std::max(lo, base + (g << GranuleShift)) - lo, g_hi = std::min(hi, base + ((g + 1) << GranuleShift)) - lo;
+        if (filled[g].load(std::memory_order_acquire) == 0) {
+            unfilled += g_hi - g_lo;
+            in_prefix = false;
+            continue;
+        }
+        const u8* mine = bytes + CopyOffset(lo - base, half[g].load(std::memory_order_relaxed));
+        u64 d = 0;
+        for (u64 i = g_lo; i < g_hi; ++i) {
+            if (mine[i] != theirs[i]) {
+                ++d;
+                first_diff = std::min(first_diff, i);
+            }
+        }
+        if (d != 0) {
+            ++granules_differ;
+            c_wide_diff_writer[std::min<u32>(g_fill_writer[g].load(std::memory_order_relaxed), 8)].fetch_add(1, std::memory_order_relaxed);
+            if ((filled[g].load(std::memory_order_relaxed) & 2) != 0) {
+                c_wide_landed[in_prefix ? 0 : 1].fetch_add(1, std::memory_order_relaxed); // a GPU result landed there since the fill
+            }
+        }
+        if (in_prefix) {
+            prefix += g_hi - g_lo;
+            diff_prefix += d;
+            if (d != 0 && first_prefix_diff == ~0ull) {
+                for (u64 i = g_lo; i < g_hi; ++i) {
+                    if (mine[i] != theirs[i]) {
+                        first_prefix_diff = i;
+                        break;
+                    }
+                }
+            }
+        } else {
+            diff_after += d;
+        }
+    }
+    c_wide[0].fetch_add(1, std::memory_order_relaxed);
+    c_wide[1].fetch_add(hi - lo, std::memory_order_relaxed);
+    c_wide[2].fetch_add(prefix, std::memory_order_relaxed);
+    c_wide[3].fetch_add(diff_prefix, std::memory_order_relaxed);
+    c_wide[4].fetch_add(diff_after, std::memory_order_relaxed);
+    c_wide[5].fetch_add(unfilled, std::memory_order_relaxed);
+    c_wide[6].fetch_add(diff_prefix != 0 ? 1 : 0, std::memory_order_relaxed);
+    c_wide[7].fetch_add(diff_after != 0 ? 1 : 0, std::memory_order_relaxed);
+    c_wide[8].fetch_add(unfilled == 0 ? 1 : 0, std::memory_order_relaxed);
+    c_wide[9].fetch_add(granules_differ, std::memory_order_relaxed);
+    if (first_prefix_diff != ~0ull && probe) {
+        Core::RingMirror::ProbeWrites(lo + first_prefix_diff); // (the buffer's own block only)
+        c_wide_probed.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::scoped_lock lock{g_wide_mutex};
+    if (g_wide_examples.size() < 24) {
+        g_wide_examples.push_back({lo - base, first_diff == ~0ull ? ~0ull : lo - base + first_diff, diff_prefix + diff_after, unfilled, prefix});
+    }
+}
+
 void NoteRasterWide(u64 size) {
     c_raster_wide.fetch_add(1, std::memory_order_relaxed);
     c_raster_wide_bytes.fetch_add(size, std::memory_order_relaxed);
@@ -520,6 +606,24 @@ nlohmann::json Report() {
                  {"old_path_unfilled", c_resolve_unfilled.load()},
                  {"old_path_two_halves", c_resolve_two_halves.load()}};
     static constexpr const char* cls_names[2] = {"read_up_to_64k", "texel"};
+    {
+        auto& w = j["wide_windows_census"];
+        w["on"] = WideCensusOn();
+        static constexpr const char* Names[10] = {"windows", "bytes", "filled_prefix_bytes", "DIFF_BYTES_IN_PREFIX", "diff_bytes_after_prefix", "unfilled_bytes",
+                                                  "windows_with_diff_in_prefix", "windows_with_diff_after_prefix", "windows_wholly_filled", "granules_differing"};
+        for (u32 k = 0; k < 10; ++k) {
+            w[Names[k]] = c_wide[k].load();
+        }
+        for (u32 k = 0; k < 9; ++k) {
+            w["differing_granules_by_fill_writer"][std::to_string(k)] = c_wide_diff_writer[k].load();
+        }
+        w["differing_granules_where_a_gpu_result_landed"] = {{"in_prefix", c_wide_landed[0].load()}, {"after_prefix", c_wide_landed[1].load()}};
+        w["prefix_diffs_probed"] = c_wide_probed.load();
+        std::scoped_lock lock{g_wide_mutex};
+        for (const auto& e : g_wide_examples) {
+            w["examples"].push_back(fmt::format("window ring+{:#x} first diff ring+{:#x} diff {} unfilled {} prefix {}", e[0], e[1], e[2], e[3], e[4]));
+        }
+    }
     j["raster_1b"]["on"] = Raster1bOn();
     j["raster_1b"]["real"] = Raster1bReal();
     j["raster_1b"]["bound_from_hook_ring"] = {{"reads_up_to_64k", c_raster_bound[0].load()}, {"reads_bytes", c_raster_bound_bytes[0].load()},

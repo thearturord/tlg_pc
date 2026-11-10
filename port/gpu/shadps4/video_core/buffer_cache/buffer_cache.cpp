@@ -2268,6 +2268,12 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                     Core::HookRing::CompareRaster(0, lo, hi - lo, gpu_written);
                 } else {
                     Core::HookRing::NoteRasterWide(hi - lo);
+                    if (Core::HookRing::WideCensusOn()) [[unlikely]] {
+                        static thread_local u32 wide_sample = 0;
+                        if ((++wide_sample & 15) == 0) {
+                            Core::HookRing::CompareWide(lo, hi - lo, (wide_sample & 63) == 0); // F1 wide windows census (counters only)
+                        }
+                    }
                 }
             }
             // Untracked upload ring: nobody told us what the CPU wrote, so the requested part is uploaded.

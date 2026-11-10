@@ -57,6 +57,11 @@ void NoteLanding(u64 address, u64 size);
 void SetFillTag(u32 how, u32 caller_ghidra, u64 resource_id, u32 map_type);
 void ClearFillTag();
 void NoteRasterWide(u64 size);
+/// F1 wide windows census (`TLG_WIDE_CENSUS=1`, counters only; design review section 39): a 4 MB window the old path uploads whole, compared with the hook ring granule by granule.
+/// Filled granules that differ (a write after the fill nothing announced), granules never filled (silent or not written yet), and the filled prefix from the window's start
+/// (the Map's block). `probe`: the address of the first differing byte in the filled part is made read only once (writer probe) when nonzero.
+[[nodiscard]] bool WideCensusOn() noexcept;
+void CompareWide(u64 address, u64 size, bool probe);
 
 nlohmann::json Report();
 
