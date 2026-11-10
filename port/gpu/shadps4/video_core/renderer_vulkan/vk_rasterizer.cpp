@@ -974,6 +974,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
             }
         }
     } cover_draw_scope{this};
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DEntry);
     BarrierCensus::SetOp(0x4000000000000000ull);
     Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseDraw, engine_clear_on);
     if (SkipForEngineClear() && plan != nullptr) {
@@ -981,11 +982,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         Core::NativeCensus::NoteSkippedInClear(2, plan->native_seq != 0 ? Core::NativeDraw::RecordCallerGhidra(plan->native_seq) : (0x100000000ull | plan->op_class), plan->op_class);
     }
     RENDERER_TRACE;
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DClearChecks);
 
     {
         TLG_PROF_LEVEL("raster.pop_pending", 3);
         scheduler.PopPendingOperations();
     }
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DPopPending);
 
     // Native draw path: the game said (through the tag in the command stream) which state groups this draw
     // shares with the previous one. Nothing is reused unless the previous executed operation was a tagged draw
@@ -1013,15 +1016,18 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     } else {
         ++native_stats.untagged;
     }
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DTagClassStats);
 
     if (!FilterDraw(plan)) {
         return;
     }
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DFilter);
 
     const GraphicsPipeline* pipeline = ResolveDrawPipeline(plan);
     if (!pipeline) {
         return;
     }
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DPipeline);
     // UI draw trace (native_ui_trace.h): the guest reads of the interface text draws are kept; EndDraw runs when this function returns
     struct UiTraceScope {
         bool on;
@@ -1118,9 +1124,12 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     const bool same_cmdbuf = !hoisted && use_tag && last.valid && last.tick == scheduler.CurrentTick();
     const bool same_pipeline = same_cmdbuf && last.pipeline == pipeline;
     const bool same_dynamic_state = same_pipeline && last.k2 == tag.k2;
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DDiagInputs);
 
     PrepareRenderState(pipeline, fixed);
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DPrepareState);
     binder_plan = NativeBinderFor(plan, tag.valid ? (tag.meta & 0xff) : 15u);
+    Core::DispatchSplit::NoteDrawKind(tag.valid ? (tag.meta & 0xff) : 15u, is_indexed, binder_plan == plan);
     draw_class_now = tag.valid ? (tag.meta & 0xff) : 15u;
     resolved_draw = binder_plan == plan ? plan : nullptr;
     std::unique_ptr<DrawJob> job_owner;
@@ -1130,7 +1139,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         job_owner->indexed = is_indexed;
         job_owner->index_offset = index_offset;
     }
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DBinderPlan);
     const bool bound = BindResources(pipeline, &fixed, job_owner.get());
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DBind);
     resolved_draw = nullptr;
     binder_plan = nullptr;
     draw_class_now = 15;
@@ -1172,11 +1183,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     {
         geometry_plan = plan;
         state = BeginRendering(pipeline);
+        Core::DispatchSplit::DStamp(Core::DispatchSplit::DBeginRenderingState);
 
         BindVertexBuffers(pipeline);
+        Core::DispatchSplit::DStamp(Core::DispatchSplit::DVertexBuffers);
         if (is_indexed) {
             BindIndexBuffer(index_offset);
         }
+        Core::DispatchSplit::DStamp(Core::DispatchSplit::DIndexBuffer);
         geometry_plan = nullptr;
     }
 
@@ -1188,27 +1202,35 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
             g_pass_changes.draws_held[diff].fetch_add(0, std::memory_order_relaxed);
         }
     }
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DPassDifference);
     if (needs_barrier) {
         TLG_PROF_LEVEL("raster.flush_barriers", 2);
         t_flush_in_same_pass = scheduler.WouldContinuePass(state);
         runtime.FlushBarriers();
         t_flush_in_same_pass = false;
     }
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DFlushBarriers);
 
     pipeline->BindResources(set_writes, push_data);
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DDescriptorPush);
     if (same_dynamic_state) {
         ++native_stats.dynamic_skipped;
     } else {
         UpdateDynamicState(pipeline, is_indexed, fixed);
     }
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DDynamicState);
     {
         TLG_PROF_LEVEL("sched.begin_rendering", 3);
         scheduler.BeginRendering(state);
     }
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DSchedBeginRendering);
 
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, pipeline->GetStage(Shader::SwStage::Vertex), pipeline->GetFetchShader());
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DDrawOffsets);
 
     NoteMarkerRow(0, tag.valid ? (tag.meta & 0xff) : 15u, pipeline, plan != nullptr ? plan->native_seq : 0, draw_inputs, regs.num_indices, regs.num_instances.NumInstances());
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DMarkerRow);
+
     const auto cmdbuf = scheduler.CommandBuffer();
     {
         TLG_PROF_LEVEL("raster.record_draw", 2);
@@ -1226,11 +1248,15 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
                         instance_offset);
         }
     }
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DRecord);
     DebugState.IncDrawCall();
     scheduler.NoteDraw();
     ++recorded_work;
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DCounts);
 
     ResetBindings(false);
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DResetBufferAccess);
+
     if (use_tag) {
         native_last = {
             .valid = true, .k2 = tag.k2, .pipeline = pipeline, .tick = scheduler.CurrentTick()};
@@ -3699,9 +3725,11 @@ void Rasterizer::ResetBindings(bool is_compute) {
     TLG_PROF_LEVEL("raster.reset_bindings", 2);
     VideoCore::ResolveCommands::Run();
     Core::DispatchSplit::Stamp(Core::DispatchSplit::PResetResolveCmds);
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DResetResolveCmds);
     // Plan S step P2c: two halves, each with its own owner. Same order as before.
     ResetImageBindings();
     Core::DispatchSplit::Stamp(Core::DispatchSplit::PResetImages);
+    Core::DispatchSplit::DStamp(Core::DispatchSplit::DResetImages);
     RecordBufferAccess(is_compute);
 }
 

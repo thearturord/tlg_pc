@@ -85,4 +85,53 @@ void NotePlannerQuery(u64 space, u64 oracle, u64 lookup, bool new_node, bool ans
 /// One flush: ticks of the planner clears and of the Vulkan barrier record; the keys the object, address and group maps held; whether a barrier was recorded.
 void NotePlannerFlush(u64 clear, u64 record, u32 object_keys, u32 address_keys, u32 group_keys, bool actual) noexcept;
 
+// ---- draw census (design review section 75, `TLG_DRAW_SPLIT=1`, default off; counters only): one direct draw in `TLG_DISPATCH_SPLIT_EVERY` (default 8) stamped at every step
+// from ExecRasterCall to its end, by draw class (the tag's class: 0 z prepass and shadow, 1 g-buffer, ...; 7 any other). Published inside `dispatch_split` as `draws`.
+enum DrawPoint : u32 {
+    DExecBegin = 0,
+    DRingUse,          ///< the plan's inputs and BeginRingUse
+    DSetTag,           ///< SetNativeTag
+    DEntry,            ///< Draw entered (the marker scope and the census scope opened)
+    DClearChecks,      ///< BarrierCensus::SetOp, the clear checks
+    DPopPending,       ///< scheduler.PopPendingOperations
+    DTagClassStats,    ///< the tag, the draw class, the current draw, the profiler tags, the native counters
+    DFilter,           ///< FilterDraw
+    DPipeline,         ///< ResolveDrawPipeline
+    DDiagInputs,       ///< the UI trace, the light recorder, the plan's inputs, the extents
+    DPrepareState,     ///< PrepareRenderState
+    DBinderPlan,       ///< NativeBinderFor
+    DBind,             ///< BindResources
+    DBeginRenderingState, ///< BeginRendering(pipeline): the render state of the targets
+    DVertexBuffers,    ///< BindVertexBuffers
+    DIndexBuffer,      ///< BindIndexBuffer (when indexed)
+    DPassDifference,   ///< PassStateDifference
+    DFlushBarriers,    ///< runtime.FlushBarriers (when needed)
+    DDescriptorPush,   ///< pipeline->BindResources
+    DDynamicState,     ///< UpdateDynamicState
+    DSchedBeginRendering, ///< scheduler.BeginRendering
+    DDrawOffsets,      ///< GetDrawOffsets
+    DMarkerRow,        ///< NoteMarkerRow
+    DRecord,           ///< bindPipeline (unless the same), draw
+    DCounts,           ///< DebugState, NoteDraw, the recorded work count
+    DResetResolveCmds, ///< ResetBindings: ResolveCommands::Run
+    DResetImages,      ///< ResetBindings: the bound images' flags
+    DResetBufferAccess, ///< ResetBindings: RecordBufferAccess
+    DExit,             ///< back in ExecRasterCall (native_last, the scopes closed)
+    DRingEnd,          ///< EndRingUse
+    DFlushRecorded,    ///< MaybeFlushRecorded
+    DrawPointCount
+};
+extern thread_local bool t_draw_active;
+extern thread_local u64 t_draw_stamp[DrawPointCount];
+inline void DStamp(DrawPoint p) noexcept {
+    if (t_draw_active) [[unlikely]] {
+        t_draw_stamp[p] = Tsc();
+    }
+}
+[[nodiscard]] bool DrawOn() noexcept;
+void BeginDraw() noexcept;
+/// The sampled draw's class (the tag's), whether it is indexed and whether the front's binder plan was found.
+void NoteDrawKind(u32 draw_class, bool indexed, bool planned) noexcept;
+void EndDraw() noexcept;
+
 } // namespace Core::DispatchSplit

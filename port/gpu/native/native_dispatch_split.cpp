@@ -152,6 +152,85 @@ void NotePlanned(bool planned) noexcept {
     }
 }
 
+thread_local bool t_draw_active = false;
+thread_local u64 t_draw_stamp[DrawPointCount] = {};
+namespace {
+const bool g_draw_on = [] {
+    const char* e = std::getenv("TLG_DRAW_SPLIT");
+    return e != nullptr && e[0] == '1';
+}();
+thread_local u32 t_draw_count = 0;
+thread_local u32 t_draw_class = 7;
+thread_local bool t_draw_indexed = false, t_draw_planned = false;
+thread_local u64 t_draw_calib = 0;
+constexpr u32 DrawClasses = 8;
+std::atomic<u64> g_dticks[DrawClasses][DrawPointCount]{}; // [class][step], [class][0] the calibration
+std::atomic<u64> g_dsamples[DrawClasses]{}, g_dindexed[DrawClasses]{}, g_dplanned[DrawClasses]{}, g_ddropped{0};
+constexpr const char* DrawNames[DrawPointCount] = {"(calibration: one empty segment)", "ring_use_begin", "set_native_tag", "marker_and_census_scope_open", "clear_checks",
+                                                   "pop_pending_operations", "tag_class_stats", "filter_draw", "resolve_pipeline", "diagnostics_and_inputs",
+                                                   "prepare_render_state", "binder_plan", "BIND_RESOURCES", "begin_rendering_state", "vertex_buffers", "index_buffer",
+                                                   "pass_state_difference", "flush_barriers", "descriptor_push", "dynamic_state", "scheduler_begin_rendering", "draw_offsets",
+                                                   "marker_row", "record_draw", "counts", "reset_resolve_commands", "reset_image_bindings", "reset_record_buffer_access",
+                                                   "census_and_marker_scope_close", "ring_use_end", "flush_recorded"};
+} // namespace
+
+bool DrawOn() noexcept {
+    return g_draw_on;
+}
+
+void BeginDraw() noexcept {
+    t_draw_active = false;
+    if (!g_draw_on || (++t_draw_count % g_every) != 0) {
+        return;
+    }
+    if (g_tsc0.load(std::memory_order_relaxed) == 0) {
+        u64 expected = 0;
+        const u64 tsc = Tsc();
+        if (g_tsc0.compare_exchange_strong(expected, tsc, std::memory_order_relaxed)) {
+            g_ns0.store(SteadyNs(), std::memory_order_relaxed);
+        }
+    }
+    for (auto& s : t_draw_stamp) {
+        s = 0;
+    }
+    t_draw_class = 7;
+    t_draw_indexed = t_draw_planned = false;
+    const u64 a = Tsc();
+    const u64 b = Tsc();
+    t_draw_calib = b - a;
+    t_draw_stamp[DExecBegin] = Tsc();
+    t_draw_active = true;
+}
+
+void NoteDrawKind(u32 draw_class, bool indexed, bool planned) noexcept {
+    if (t_draw_active) {
+        t_draw_class = draw_class < 7 ? draw_class : 7;
+        t_draw_indexed = indexed;
+        t_draw_planned = planned;
+    }
+}
+
+void EndDraw() noexcept {
+    if (!t_draw_active) {
+        return;
+    }
+    t_draw_active = false;
+    for (u32 k = 1; k < DrawPointCount; ++k) {
+        if (t_draw_stamp[k] == 0 || t_draw_stamp[k] < t_draw_stamp[k - 1]) {
+            g_ddropped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    const u32 c = t_draw_class;
+    g_dsamples[c].fetch_add(1, std::memory_order_relaxed);
+    g_dindexed[c].fetch_add(t_draw_indexed ? 1 : 0, std::memory_order_relaxed);
+    g_dplanned[c].fetch_add(t_draw_planned ? 1 : 0, std::memory_order_relaxed);
+    g_dticks[c][0].fetch_add(t_draw_calib, std::memory_order_relaxed);
+    for (u32 k = 1; k < DrawPointCount; ++k) {
+        g_dticks[c][k].fetch_add(t_draw_stamp[k] - t_draw_stamp[k - 1], std::memory_order_relaxed);
+    }
+}
+
 void End() noexcept {
     if (!t_active) {
         return;
@@ -208,6 +287,23 @@ nlohmann::json Report() {
             o["ticks"][Names[k]] = g_ticks[p][k].load();
         }
         j[p ? "planned" : "not_planned"] = std::move(o);
+    }
+    if (g_draw_on) {
+        j["draws"]["dropped_left_early"] = g_ddropped.load();
+        for (u32 c = 0; c < DrawClasses; ++c) {
+            const u64 n = g_dsamples[c].load();
+            if (n == 0) {
+                continue;
+            }
+            nlohmann::json o = nlohmann::json::object();
+            o["samples"] = n;
+            o["indexed"] = g_dindexed[c].load();
+            o["planned"] = g_dplanned[c].load();
+            for (u32 k = 0; k < DrawPointCount; ++k) {
+                o["ticks"][DrawNames[k]] = g_dticks[c][k].load();
+            }
+            j["draws"]["class_" + std::to_string(c)] = std::move(o);
+        }
     }
     return j;
 }

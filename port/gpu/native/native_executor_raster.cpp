@@ -460,6 +460,9 @@ void NativeExecutor::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan*
     if (c.kind == RasterCall::Kind::DispatchDirect && DS::On()) [[unlikely]] {
         DS::Begin(); // design review 71: the steps of one sampled direct dispatch
     }
+    if (c.kind == RasterCall::Kind::Draw && DS::DrawOn()) [[unlikely]] {
+        DS::BeginDraw(); // design review 75: the steps of one sampled direct draw
+    }
     const auto run = [&](auto&& body) {
         if (c.no_marker) {
             body();
@@ -480,6 +483,7 @@ void NativeExecutor::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan*
         rasterizer->BeginRingUse(draw_plan, dispatch_plan);
     }
     DS::Stamp(DS::PRingUse);
+    DS::DStamp(DS::DRingUse);
     if (c.kind != RasterCall::Kind::Draw) {
         VideoCore::RecordQueue::Drain(VideoCore::RecordQueue::NonDraw); // P3e.4b: a dispatch records its own commands and reads the state the draws that wait leave
     }
@@ -497,7 +501,9 @@ void NativeExecutor::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan*
     if (!skipped) switch (c.kind) {
     case RasterCall::Kind::Draw:
         rasterizer->SetNativeTag(c.tag);
+        DS::DStamp(DS::DSetTag);
         run([&] { rasterizer->Draw(c.indexed, c.index_offset, draw_plan); });
+        DS::DStamp(DS::DExit);
         break;
     case RasterCall::Kind::DrawIndirect:
         rasterizer->NativeInvalidate();
@@ -562,9 +568,12 @@ void NativeExecutor::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan*
         rasterizer->EndRingUse();
     }
     DS::Stamp(DS::PRingEnd);
+    DS::DStamp(DS::DRingEnd);
     rasterizer->MaybeFlushRecorded();
     DS::Stamp(DS::PFlushRecorded);
+    DS::DStamp(DS::DFlushRecorded);
     DS::End();
+    DS::EndDraw();
 }
 
 void NativeExecutor::RasterConsumer::ThreadStarted() {

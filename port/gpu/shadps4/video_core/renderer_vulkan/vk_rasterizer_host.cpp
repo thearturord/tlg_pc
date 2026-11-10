@@ -317,7 +317,7 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
         if (Core::RowVersion::Mode() != 0) {
             Core::DebugServer::Publish("row_version", Core::RowVersion::Report()); // F2 row version shadow
         }
-        if (Core::DispatchSplit::On() || Core::DispatchSplit::PlannerOn()) {
+        if (Core::DispatchSplit::On() || Core::DispatchSplit::PlannerOn() || Core::DispatchSplit::DrawOn()) {
             Core::DebugServer::Publish("dispatch_split", Core::DispatchSplit::Report()); // design review 71
         }
         const auto r = TakeResolveStats();
