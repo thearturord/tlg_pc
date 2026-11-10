@@ -5695,7 +5695,7 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
     if (tex_census_on) [[unlikely]] {
         if (stage.images.empty()) {
             tex_census.cls = 0;
-        } else if (stage.images.size() > TextureSet::MaxImages) {
+        } else if (stage.images.size() > TextureSet::Limit()) {
             tex_census.cls = 1;
         } else if (!texture_set_on) {
             tex_census.cls = 2;
@@ -5721,7 +5721,7 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
     bool set_record = false;
     u64 set_generation = 0;
     const u32 stage_images = static_cast<u32>(stage.images.size());
-    if (texture_set_on && stage_images != 0 && stage_images <= TextureSet::MaxImages) {
+    if (texture_set_on && stage_images != 0 && stage_images <= TextureSet::Limit()) {
         bool eligible = true;
         for (const auto& image_desc : stage.images) {
             eligible &= !image_desc.is_written && image_desc.mip_fallback_mode == Shader::MipStorageFallbackMode::None;
@@ -6208,7 +6208,7 @@ void Rasterizer::ResolveTextures(const Shader::Info& stage, TextureResolved& r) 
     bool set_record = false;
     u64 set_generation = 0;
     const u32 stage_images = static_cast<u32>(stage.images.size());
-    if (texture_set_on && stage_images != 0 && stage_images <= TextureSet::MaxImages) {
+    if (texture_set_on && stage_images != 0 && stage_images <= TextureSet::Limit()) {
         bool eligible = true;
         for (const auto& image_desc : stage.images) {
             eligible &= !image_desc.is_written && image_desc.mip_fallback_mode == Shader::MipStorageFallbackMode::None;

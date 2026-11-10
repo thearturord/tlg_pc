@@ -613,7 +613,16 @@ private:
         u64 found_uid{}, id_uid{}; ///< F2 item 4: the images' uids (a slot can be reused by another image)
     };
     struct TextureSet {
-        static constexpr u32 MaxImages = 16;
+        static constexpr u32 MaxImages = 32; ///< the entries' capacity; the stages the memo takes are limited by `Limit()`
+        /// Texture census (design review 58/59): `TLG_TEXSET_MAX` (default 16, at most 32): stages with more images take the slow path every time
+        [[nodiscard]] static u32 Limit() noexcept {
+            static const u32 limit = [] {
+                const char* e = std::getenv("TLG_TEXSET_MAX");
+                const u32 v = e != nullptr ? static_cast<u32>(std::atoi(e)) : 16u;
+                return v == 0 ? 16u : v > MaxImages ? MaxImages : v;
+            }();
+            return limit;
+        }
         u64 key{};
         u64 generation{~0ull};
         u32 count{};
