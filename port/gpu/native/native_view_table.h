@@ -11,7 +11,8 @@
 namespace Core::ViewTable {
 
 [[nodiscard]] u32 Mode() noexcept;
-/// Note 102/103 (`TLG_TARGET_TABLE`: 0 off (default), 1 shadow; 2 real is not built yet): render and depth targets by their view id, in this same table (use flags with bit 63).
+/// Notes 102 to 106 (`TLG_TARGET_TABLE`: 2 real by default since the owner's play, note 106, one draw in 64 audited; 1 shadow; 0 off, the old path): render and depth targets
+/// by their view id, in this same table (use flags with bit 63).
 [[nodiscard]] u32 TargetMode() noexcept;
 
 struct Entry {

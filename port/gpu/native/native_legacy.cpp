@@ -16,7 +16,7 @@ bool EngineRows() noexcept {
 }
 
 nlohmann::json Report() {
-    static constexpr const char* Names[] = {"TLG_LEGACY_ENGINE_ROWS", "TLG_EPOCH_PLANNER", "TLG_BARRIER_GUARD", "TLG_GEOMETRY_ROWS", "TLG_DROP_DIRTY_APPLIES", "TLG_HOOK_OWNED", "TLG_VIEW_TABLE",
+    static constexpr const char* Names[] = {"TLG_LEGACY_ENGINE_ROWS", "TLG_EPOCH_PLANNER", "TLG_BARRIER_GUARD", "TLG_GEOMETRY_ROWS", "TLG_DROP_DIRTY_APPLIES", "TLG_HOOK_OWNED", "TLG_VIEW_TABLE", "TLG_TARGET_TABLE",
                                             "TLG_OWN_IMMUTABLE", "TLG_OWN_MUTABLE", "TLG_OWN_CLOSE", "TLG_ID_MARKS", "TLG_IMAGE_BY_ID", "TLG_ROW_VERSION",
                                             "TLG_STATIC_ROWS", "TLG_WRITTEN_ROWS", "TLG_WIDE_ROWS", "TLG_TEXSET_BY_ID", "TLG_HOOK_RING"};
     nlohmann::json j = nlohmann::json::object();
