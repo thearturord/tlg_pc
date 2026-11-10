@@ -169,6 +169,9 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
                 }
                 out["rows_ahead_fast_segments_ns_cumulative"] = std::move(fs);
             }
+            out["barrier_guard_cumulative"] = {{"read_queries_shadow", barrier_guard[0].load()}, {"shadow_no_planned_write", barrier_guard[1].load()},
+                                               {"SHADOW_NO_WRITES_BUT_BARRIER_MUST_BE_0", barrier_guard[2].load()}, {"real_asked_writes_pending", barrier_guard[3].load()},
+                                               {"real_skipped", barrier_guard[4].load()}, {"real_sampled", barrier_guard[5].load()}, {"SAMPLED_BARRIER_MUST_BE_0", barrier_guard[6].load()}};
             out["rows_ahead_walk_cumulative"] = {{"graphics", {{"calls", rows_ahead_walk[0][0].load()}, {"events_stepped", rows_ahead_walk[0][1].load()}, {"ns", rows_ahead_walk[0][2].load()}}},
                                                   {"compute", {{"calls", rows_ahead_walk[1][0].load()}, {"events_stepped", rows_ahead_walk[1][1].load()}, {"ns", rows_ahead_walk[1][2].load()}}}};
             static constexpr const char* tex_names[] = {"no_image", "more_than_16_images", "memo_off", "written_image", "mip_fallback_image", "set_hit", "miss_no_entry",

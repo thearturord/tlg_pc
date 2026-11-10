@@ -4138,7 +4138,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                 t_fseg[3] = BsegNow();
                             }
                             Census(census_base + CBufferBarrierQuery);
-                            if (runtime.IsBufferAccessed(buffer, offset, size, desc.is_written)) {
+                            if (BufferBarrierQuery(buffer, offset, size, desc.is_written)) {
                                 Census(census_base + CBufferBarrierTrue);
                                 needs_barrier = true;
                             }
@@ -4781,7 +4781,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     texture_cache.InvalidateMemoryFromGPU(vsharp.address, size, "a written storage buffer view");
                 }
                 Census(census_base + CBufferBarrierQuery);
-                if (runtime.IsBufferAccessed(buffer, offset, size, desc.is_written)) {
+                if (BufferBarrierQuery(buffer, offset, size, desc.is_written)) {
                     Census(census_base + CBufferBarrierTrue);
                     needs_barrier = true;
                 }
@@ -4871,6 +4871,47 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
         }
         ++binding.buffer;
     }
+}
+
+bool Rasterizer::BufferBarrierQuery(const VideoCore::Buffer* buffer, u64 offset, u64 size, bool written) {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_BARRIER_GUARD");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    if (mode == 0 || written) {
+        return runtime.IsBufferAccessed(buffer, offset, size, written);
+    }
+    const bool no_writes = !runtime.PlanHasWrites();
+    if (mode == 1) {
+        const bool asked = runtime.IsBufferAccessed(buffer, offset, size, false);
+        barrier_guard[0].fetch_add(1, std::memory_order_relaxed);
+        if (no_writes) {
+            barrier_guard[1].fetch_add(1, std::memory_order_relaxed);
+            if (asked) {
+                barrier_guard[2].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        return asked;
+    }
+    if (!no_writes) {
+        barrier_guard[3].fetch_add(1, std::memory_order_relaxed);
+        return runtime.IsBufferAccessed(buffer, offset, size, false);
+    }
+    static thread_local u32 tick = 0;
+    if ((++tick & 63u) == 0) {
+        barrier_guard[5].fetch_add(1, std::memory_order_relaxed);
+        const bool asked = runtime.IsBufferAccessed(buffer, offset, size, false);
+        if (asked) {
+            barrier_guard[6].fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+                LOG_ERROR(Render_Vulkan, "barrier guard: a read with no planned write still needed a barrier ({:p}+{:#x}, {:#x} bytes)", static_cast<const void*>(buffer), offset, size);
+            }
+        }
+        return asked;
+    }
+    barrier_guard[4].fetch_add(1, std::memory_order_relaxed);
+    return false;
 }
 
 void Rasterizer::NoteFastSegments(u32 side, bool indexed) noexcept {
