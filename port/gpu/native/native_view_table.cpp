@@ -14,7 +14,10 @@ namespace Core::ViewTable {
 u32 Mode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_VIEW_TABLE");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+        if (e == nullptr || e[0] == 0) {
+            return 2u; // default 2 since 2026-11-11 after the owner's play (note 99); LEGACY(view_table): =0 finds every image by its T# again, =1 shadow
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }

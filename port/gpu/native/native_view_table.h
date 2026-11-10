@@ -5,7 +5,7 @@
 #include <nlohmann/json_fwd.hpp>
 #include "common/types.h"
 
-/// Design review notes 95 to 97, section 79 step 3a (`TLG_VIEW_TABLE`: 0 off (default), 1 shadow, 2 real with 1 stage in 64 audited): read-only image bindings of non-dynamic engine textures
+/// Design review notes 95 to 97, section 79 step 3a (`TLG_VIEW_TABLE`: 2 real by default since the owner's play, note 99, with 1 stage in 64 audited; 1 shadow; 0 off, the old path): read-only image bindings of non-dynamic engine textures
 /// are found by the engine view id the record names, not by the T# words. The table lives on the raster thread: an entry is made from the old path's answer at the first bind
 /// of a (view id, use) and holds while the image's uid is unchanged and registered and no delete event of the view or its texture dropped it.
 namespace Core::ViewTable {

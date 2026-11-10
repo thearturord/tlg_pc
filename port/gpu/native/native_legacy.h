@@ -19,6 +19,7 @@
 ///   TLG_GEOMETRY_ROWS=0        the index buffer by address (76-78)
 ///   TLG_DROP_DIRTY_APPLIES=0   the light and slot writes' dirty-set work (81-82)
 ///   TLG_HOOK_OWNED=0           the light and slot writes announced and applied on the raster thread, one batch entry per write (90-94)
+///   TLG_VIEW_TABLE=0           every image binding found by its T# words (set memo key, lookup cache, B3, FindImage) instead of by the engine view id (95-99)
 ///   TLG_OWN_IMMUTABLE=0        immutable buffers bound through rows and `ObtainBuffer` (83-84)
 ///   TLG_OWN_MUTABLE=0          default and dynamic buffers bound through rows and `ObtainBuffer` (85-86)
 ///   TLG_OWN_CLOSE=0            no lazy own pointer (87-88)
