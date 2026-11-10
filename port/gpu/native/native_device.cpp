@@ -23,6 +23,7 @@
 
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "native/native_hook_owned.h"
 #include "common/thread.h"
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
@@ -149,6 +150,21 @@ void Insert(const Object& object) {
     if (object.kind >= Kind::Buffer && object.kind <= Kind::Texture3D && object.address != 0) {
         const u64 bytes = object.kind == Kind::Buffer ? std::max<u64>(object.bytes, 1) : object.bytes;
         resource_by_address[object.address] = AddrEntry{object.id, object.address + bytes, object.kind, object.usage, object.cpu_access};
+        if (object.kind != Kind::Buffer && bytes != 0 && Core::HookOwned::Mode() != 0) {
+            // note 90: a texture in a buffer's memory excludes the buffer from the hook-owned class for good (here, in game order, before any later write of it)
+            const VAddr end = object.address + bytes;
+            auto it = resource_by_address.lower_bound(end);
+            u32 below = 0;
+            while (it != resource_by_address.begin() && below < 16) {
+                --it;
+                if (it->first < object.address) {
+                    ++below;
+                }
+                if (it->second.kind == Kind::Buffer && it->second.end > object.address) {
+                    Core::HookOwned::ExcludeBuffer(it->second.id);
+                }
+            }
+        }
     }
     live_by_kind[static_cast<u32>(object.kind)].fetch_add(1, std::memory_order_relaxed);
 }
@@ -272,6 +288,7 @@ void NoteDelete(u64 object) {
         } else if (gone.kind == Kind::ShaderResourceView || gone.kind == Kind::UnorderedAccessView) {
             Core::NativeUpdates::NoteEngineDelete(gone.id, gone.address, gone.bytes, 0u);
         } else if (gone.kind == Kind::Buffer && gone.address != 0) {
+            Core::HookOwned::BufferGone(gone.id); // note 90
             Core::NativeUpdates::NoteEngineDelete(gone.id, gone.address, gone.bytes, 4u); // B9.2
         }
     }

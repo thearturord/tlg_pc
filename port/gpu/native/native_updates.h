@@ -140,6 +140,7 @@ void NoteMergeRefused(u32 why, u64 pieces) noexcept;
 struct AnnouncedPiece {
     u64 object, address, size;
     u32 writer{16}; ///< (announce batch census: the writer tag, 16 unknown)
+    u8 hook{};      ///< note 90: the hook-owned mark of the piece
 };
 /// L1: the buffer cache says whether the pieces (sorted, one engine buffer or none named) may be applied as the one range [begin, begin + size): true when the bytes between the pieces are
 /// not GPU written, no clear waits for an image, no image is in the range that no piece touches, and a named buffer holds the whole range.
@@ -150,6 +151,7 @@ struct Tag {
     u8 writer{};
     u64 object{};
     u8 ring_candidate{}; ///< F1 1c: inside the frame ring and a constant buffer copy (writer 3) or a buffer's Map window (writer 0, not a texture): a range that could leave the batch
+    u8 hook{};           ///< note 90 (`TLG_HOOK_OWNED`): the hook-owned mark (`HookOwned::Mark`)
 };
 /// The announcements of one submission: applied once (`first`) and the previous submission's again (`again`)
 struct Batch {

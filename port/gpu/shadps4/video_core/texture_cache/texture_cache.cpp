@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "native/native_hook_ring.h"
+#include "native/native_hook_owned.h"
 #include "video_core/half_phase.h"
 #include <chrono>
 #include <fstream>
@@ -1405,6 +1406,9 @@ void TextureCache::RegisterImage(ImageId image_id) {
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
     NoteImageEvent(image.info, true);
+    if (Core::HookOwned::Mode() != 0) [[unlikely]] {
+        Core::HookOwned::ImageRegistered(image.info.guest_address, image.info.guest_size); // note 90 guard: IMAGE_OVER_HOOK_OWNED_MUST_BE_0
+    }
     Core::NativeResources::NoteImageCensus(image.info.guest_address, image.info.size.width, image.info.size.height, (image.usage_flags & vk::ImageUsageFlagBits::eColorAttachment) ? true : false,
                                            image.info.props.is_depth != 0); // B1 census
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);

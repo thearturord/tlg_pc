@@ -196,6 +196,7 @@ public:
     /// What a CPU write of [address, address + size) means for the caches (the harvest's replay; B2: an applied announcement)
     void ApplyCpuWrite(VAddr address, u64 size, bool newer = false, u64 object = 0);
     /// The full apply of an announced range (every step); `ApplyCpuWrite` calls it, or the marks by id for tags 2 and 12 (`TLG_ID_MARKS`)
+    void ApplyCpuWriteBody(VAddr address, u64 size, bool newer, u64 object);
     void ApplyCpuWriteFull(VAddr address, u64 size, bool newer, u64 object);
     void ApplyIdMark(VAddr address, u64 size, bool newer, u64 object, u32 mode);
     void IdMarkLean(VAddr address, u64 size, bool newer, u64 id);

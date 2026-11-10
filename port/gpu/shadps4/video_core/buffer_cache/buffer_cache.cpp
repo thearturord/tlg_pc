@@ -22,6 +22,7 @@
 #include "native/native_draw.h"
 #include "native/native_n0_census.h"
 #include "native/native_own_memory_census.h"
+#include "native/native_hook_owned.h"
 #include "native/native_row_version.h"
 #include "native/native_readbacks.h"
 #include "native/native_registry.h"
@@ -126,6 +127,46 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object)
     if (Core::OwnMemoryCensus::On()) [[unlikely]] {
         Core::OwnMemoryCensus::NoteApply(address, size, Core::N0::t_writer); // design review 79, step 1a
     }
+    if (Core::HookOwned::Mode() != 0) [[unlikely]] {
+        // note 90 shadow: a write the real mode would not announce is applied as before; what the apply still did is captured and counted
+        u64 join_begin = 0, join_end = 0;
+        const bool capture = Core::HookOwned::ApplyBegin(object, address, size, join_begin, join_end);
+        if (join_end > join_begin) {
+            // the second step of the join, in batch order: no image or waiting clear of the texture cache and no GPU-written byte may be in the buffer's memory
+            using Core::HookOwned::Refuse;
+            u32 refuse = Refuse::RefuseNone;
+            {
+                std::shared_lock lock{gpu_ranges_mutex};
+                if (gpu_modified_ranges.Intersects(join_begin, join_end - join_begin)) {
+                    refuse = Refuse::RefuseGpuWritten;
+                }
+            }
+            if (refuse == Refuse::RefuseNone) {
+                auto& index = texture_cache.EngineIndex();
+                if (index.ImageOrClearMetAt(join_begin, join_end - join_begin)) {
+                    refuse = Refuse::RefuseImage;
+                } else if (!index.NoImageInBuffer(object, join_begin, join_end - join_begin)) {
+                    refuse = Refuse::RefuseUnknownBuffer;
+                }
+            }
+            Core::HookOwned::Confirm(object, join_begin, join_end, refuse);
+        }
+        if (capture) {
+            const bool force_before = Core::N0::t_force_effect;
+            const u32 effect_before = Core::N0::t_effect;
+            Core::N0::t_force_effect = true;
+            Core::N0::t_effect = 0;
+            ApplyCpuWriteBody(address, size, newer, object);
+            Core::HookOwned::ApplyEnd(Core::N0::t_effect);
+            Core::N0::t_force_effect = force_before;
+            Core::N0::t_effect = effect_before;
+            return;
+        }
+    }
+    ApplyCpuWriteBody(address, size, newer, object);
+}
+
+void BufferCache::ApplyCpuWriteBody(VAddr address, u64 size, bool newer, u64 object) {
     const u32 id_marks = Core::NativeUpdates::IdMarksMode();
     if (id_marks == 0 || !Core::NativeUpdates::IdMarksTag(Core::N0::t_writer)) [[likely]] {
         ApplyCpuWriteFull(address, size, newer, object);
@@ -1354,6 +1395,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferBody(VAddr device_addr, u
     if (is_written) {
         TLG_PROF_LEVEL("buffer.obtain.written_erase", 3);
         BindMemoErase(device_addr, size); // the GPU writes it: answers over this memory are stale
+    }
+    if (Core::HookOwned::Mode() != 0) [[unlikely]] {
+        if (is_written) {
+            Core::HookOwned::GpuWrite(device_addr, size); // note 90 guard: GPU_WRITE_OVER_HOOK_OWNED_MUST_BE_0
+        } else {
+            Core::HookOwned::Request(device_addr, size); // note 90: what the real mode would copy at every such read
+        }
     }
     const u32 wide_mode = BindMemoWideMode();
     const bool wide_class = wide_mode != 0 && !is_written && (is_texel_buffer || size > BindMemoMax) && size <= BindMemoWideMax;
