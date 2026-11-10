@@ -21,7 +21,10 @@ namespace Core::HookOwned {
 u32 Mode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_HOOK_OWNED");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+        if (e == nullptr || e[0] == 0) {
+            return 2u; // default 2 since 2026-11-10 after the owner's play (note 94); LEGACY(hook_owned): =0 announces the light and slot writes again, =1 shadow
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
@@ -311,8 +314,8 @@ bool ApplyBegin(u64 object, u64 address, u64 size, u64& join_begin, u64& join_en
     join_begin = join_end = 0;
     const u8 mark = t_mark;
     t_captured = false;
-    if (mark == MarkNone && member_count.load(std::memory_order_relaxed) == 0) {
-        return false;
+    if (mark == MarkNone && (Mode() == 2 || member_count.load(std::memory_order_relaxed) == 0)) {
+        return false; // (the count of announced member writes is the shadow's; real mode keeps the lock off the apply path)
     }
     std::scoped_lock lock{rmutex};
     if (mark == MarkJoin) {

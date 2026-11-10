@@ -1416,8 +1416,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferBody(VAddr device_addr, u
     if (Core::HookOwned::Mode() != 0) [[unlikely]] {
         if (is_written) {
             Core::HookOwned::GpuWrite(device_addr, size); // note 90 guard: GPU_WRITE_OVER_HOOK_OWNED_MUST_BE_0
-        } else {
-            Core::HookOwned::Request(device_addr, size); // note 90: what the real mode would copy at every such read
+        } else if (Core::HookOwned::Mode() == 1) {
+            Core::HookOwned::Request(device_addr, size); // note 90 shadow: what the real mode would copy at every such read (real mode: `real_memo_inserts_refused`)
         }
     }
     const u32 wide_mode = BindMemoWideMode();

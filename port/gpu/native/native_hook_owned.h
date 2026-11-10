@@ -5,7 +5,7 @@
 #include <nlohmann/json_fwd.hpp>
 #include "common/types.h"
 
-/// Design review notes 90 to 92, section 79 step 2 (`TLG_HOOK_OWNED`: 0 off (default), 1 shadow, 2 real with 1 in 64 owned writes still announced as an audit): the light constant and scene slot buffers (writer tags 2 and 12)
+/// Design review notes 90 to 92, section 79 step 2 (`TLG_HOOK_OWNED`: 2 real by default since the owner's play, note 94, with 1 in 64 owned writes still announced as an audit; 1 shadow; 0 off, the old path): the light constant and scene slot buffers (writer tags 2 and 12)
 /// become *hook-owned*. Their writes leave the announce batch; the address path treats their bytes as always changed (pinned dirty, no cached answer over them).
 ///
 /// Membership in two steps. The hook proposes it, in game order: the first light or slot write of a buffer with no engine texture in its memory is announced marked "join".
