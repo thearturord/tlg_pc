@@ -22,6 +22,14 @@ u32 Mode() noexcept {
     return mode;
 }
 
+u32 TargetMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_TARGET_TABLE");
+        return e != nullptr && e[0] == '1' ? 1u : 0u; // (2, real, is not built yet)
+    }();
+    return mode;
+}
+
 namespace {
 std::mutex mutex; // (the raster thread binds and applies the batch's events; the lock only guards a second recording thread)
 std::unordered_map<u64, Entry> entries;                       // key: view id and use flags
@@ -67,7 +75,7 @@ Entry& Put(u64 view_id, u64 use_flags) noexcept {
 }
 
 void Event(u32 what, u64 id) noexcept {
-    if (Mode() == 0 || (what != 0 && what != 1 && what != 3)) {
+    if ((Mode() == 0 && TargetMode() == 0) || (what != 0 && what != 1 && what != 3)) {
         return;
     }
     std::scoped_lock lock{mutex};
@@ -112,6 +120,10 @@ nlohmann::json Report() {
                    {"stale_remade", c(ImagesStale)}};
     j["not_in_class"] = {{"no_view", c(NotClassNoView)}, {"dynamic_or_unknown_texture", c(NotClassDynamic)}, {"written_fallback_or_multi", c(NotClassUse)}, {"null", c(NotClassNull)}};
     j["entries_dropped_by_delete_events"] = c(DroppedByEvent);
+    j["targets"] = {{"mode", TargetMode()}, {"draws", c(TgDraws)}, {"draws_all_in_class", c(TgDrawsAllInClass)}, {"draws_would_be_served_by_the_table", c(TgDrawsWouldServe)},
+                    {"draws_in_class_where_the_old_path_ran_findimage", c(TgDrawsOldFind)}, {"targets_in_class", c(TgTargets)}, {"same", c(TgSame)},
+                    {"TARGET_TABLE_DIFFERENT_MUST_BE_0", c(TgDifferent)}, {"no_entry_made", c(TgNoEntry)}, {"stale_remade", c(TgStale)}, {"no_view", c(TgNoView)},
+                    {"view_same", c(TgViewSame)}, {"TARGET_VIEW_DIFFERENT_MUST_BE_0", c(TgViewDifferent)}, {"view_recorded", c(TgViewNoEntry)}};
     j["real"] = {{"stages_bound_from_the_table", c(RealServed)}, {"image_bindings_bound_from_the_table", c(RealServedImages)}, {"stages_audited_by_the_old_path", c(RealAudited)},
                  {"stages_whose_image_checks_failed", c(RealCheckFailed)}};
     return j;

@@ -117,7 +117,7 @@ public:
     [[nodiscard]] Core::TargetExtent& RasterDbExtent() noexcept {
         return last_db_extent;
     }
-    [[nodiscard]] std::array<u64, 9>& RasterTargetResources() noexcept {
+    [[nodiscard]] std::array<u64, 18>& RasterTargetResources() noexcept {
         return last_target_resources;
     }
 
@@ -299,7 +299,7 @@ private:
     u32 index_buffer_num_indices{};
     std::array<Core::TargetExtent, AmdGpu::NUM_COLOR_BUFFERS> last_cb_extent{};
     Core::TargetExtent last_db_extent{};
-    std::array<u64, 9> last_target_resources{}; ///< E3: engine resource ids behind the bound color views (0..7) and the depth view (8)
+    std::array<u64, 18> last_target_resources{}; ///< E3: engine resource ids behind the bound color views (0..7) and the depth view (8)
 
     /// The compute register block of every queue (the dispatches the command processor runs itself read it).
     std::array<AmdGpu::ComputeProgram, NumTotalQueues> cs_states{};

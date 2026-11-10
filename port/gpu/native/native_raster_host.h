@@ -82,7 +82,7 @@ public:
     [[nodiscard]] virtual u64 DrawPlanSeq(const Vulkan::DrawPlan& plan) = 0;
     [[nodiscard]] virtual bool DrawPlanIsDepthOnly(const Vulkan::DrawPlan& plan) = 0;
     /// The extent hints and the engine resources behind the bound targets, as the executor holds them when the plan is queued.
-    virtual void SetDrawPlanTargets(Vulkan::DrawPlan& plan, const ColorExtents& cb_extent, const DepthExtent& db_extent, const std::array<u64, 9>& target_resources) = 0;
+    virtual void SetDrawPlanTargets(Vulkan::DrawPlan& plan, const ColorExtents& cb_extent, const DepthExtent& db_extent, const std::array<u64, 18>& target_resources) = 0;
     [[nodiscard]] virtual const NativeDispatch::DispatchInputs& DispatchPlanInputs(const Vulkan::DispatchPlan& plan) = 0;
     /// Gives a dispatch plan the record it was planned for and the bindings the record carries.
     virtual void TagDispatchPlan(Vulkan::DispatchPlan& plan, u64 seq) = 0;

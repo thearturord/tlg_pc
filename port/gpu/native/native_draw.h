@@ -247,7 +247,7 @@ struct ExecDraw {
     u32 instance_sgpr{};
     std::array<u32, 8> cb_extent{}; ///< render target extent hints (the game's trailing NOP of a target bind)
     u32 cb_extent_mask{};           ///< bit per slot whose hint is set by this draw
-    std::array<u64, 9> target_resources{}; ///< E3: engine ids of the resources behind the bound render target views (0..7) and the depth view (8); 0: none
+    std::array<u64, 18> target_resources{}; ///< E3: engine ids of the resources behind the bound render target views (0..7) and the depth view (8); 0: none
     const Core::NativeTargetDesc::TargetSet* native_targets{}; ///< E7 (TLG_TARGET_DESC_USE): the description of the targets the record's draw, depth clear or eliminate uses (null: none made)
     u32 db_extent{};
     bool has_extents{};

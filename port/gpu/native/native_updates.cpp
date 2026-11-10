@@ -832,8 +832,8 @@ void ApplyBatch(const Batch& batch) {
             if (HookOwned::Mode() != 0) {
                 HookOwned::Event(what, d[0], d[1], d[2]); // note 90: a texture created over a member, or a member deleted, removes it (batch order)
             }
-            if (ViewTable::Mode() != 0) {
-                ViewTable::Event(what, d[0]); // note 95: a deleted view or texture drops its view table entries (batch order)
+            if (ViewTable::Mode() != 0 || ViewTable::TargetMode() != 0) {
+                ViewTable::Event(what, d[0]); // notes 95 and 103: a deleted view or texture drops its view and target table entries (batch order)
             }
             if (what == 2 || what == 5) {
                 if (create_fn != nullptr) {

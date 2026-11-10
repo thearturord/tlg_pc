@@ -1116,7 +1116,7 @@ struct NativeRecord {
     std::array<u32, 8> cb_extent{};
     u32 cb_extent_mask{};
     u32 db_extent{};
-    std::array<u64, 9> target_resources{}; ///< E3: engine ids of the resources behind the bound render target views (0..7) and the depth view (8); 0: none
+    std::array<u64, 18> target_resources{}; ///< E3: engine ids of the resources behind the bound render target views (0..7) and the depth view (8); 0: none
     const Core::NativeTargetDesc::TargetSet* native_targets{}; ///< E7 (TLG_TARGET_DESC_USE): valid when `native_targets_seq` is this record's number
     u64 native_targets_seq{};
     u64 args_addr{};      ///< indirect draws: the argument buffer
@@ -2775,11 +2775,17 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
             return IsHeapPointer(resource) && (resource & 7) == 0 ? Rd<u64>(resource, 0x10) : 0;
         };
         slot.target_resources = {};
+        // note 103: [9 + i] the view's own id (a view is fixed at its creation: its texture, mip and slice)
+        const auto view_id = [&](u64 view) -> u64 { return IsHeapPointer(view) && (view & 7) == 0 ? Rd<u64>(view, 0x10) : 0; };
         const u32 targets = std::min<u32>(Rd<u32>(ctx, Ctx::RenderTargetCount), 7);
         for (u32 i = 0; i < targets; ++i) {
-            slot.target_resources[i] = resource_id(Rd<u64>(ctx, Ctx::RenderTargets + i * 8));
+            const u64 view = Rd<u64>(ctx, Ctx::RenderTargets + i * 8);
+            slot.target_resources[i] = resource_id(view);
+            slot.target_resources[9 + i] = slot.target_resources[i] != 0 ? view_id(view) : 0;
         }
-        slot.target_resources[8] = resource_id(Rd<u64>(ctx, Ctx::DepthStencilView));
+        const u64 depth_view = Rd<u64>(ctx, Ctx::DepthStencilView);
+        slot.target_resources[8] = resource_id(depth_view);
+        slot.target_resources[17] = slot.target_resources[8] != 0 ? view_id(depth_view) : 0;
     }
     slot.flags = synth_flags | (table_overflow || bad_object_seen ? SpecialPipeline : 0u);
     slot.rt_info = synth_rt_info;

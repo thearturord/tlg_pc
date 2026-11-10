@@ -66,7 +66,7 @@ public:
     void RecycleDispatchPlan(Core::DispatchPlanPtr&& plan) override;
     u64 DrawPlanSeq(const DrawPlan& plan) override;
     bool DrawPlanIsDepthOnly(const DrawPlan& plan) override;
-    void SetDrawPlanTargets(DrawPlan& plan, const ColorExtents& cb_extent, const DepthExtent& db_extent, const std::array<u64, 9>& target_resources) override;
+    void SetDrawPlanTargets(DrawPlan& plan, const ColorExtents& cb_extent, const DepthExtent& db_extent, const std::array<u64, 18>& target_resources) override;
     const Core::NativeDispatch::DispatchInputs& DispatchPlanInputs(const DispatchPlan& plan) override;
     void TagDispatchPlan(DispatchPlan& plan, u64 seq) override;
     bool MarkersEnabled() const noexcept override;
@@ -659,6 +659,12 @@ private:
     /// engine texture view is compared with it, and the entry is made or remade from it (`first_info`: the stage's first image info; `bound_before`: the bound image list's size
     /// before the stage; `answers`/`answers_ok`: the old path's per-image record and whether it can be bound from the table).
     void ViewTableShadow(const Shader::Info& stage, u32 first_info, size_t bound_before, const TextureSetEntry* answers, const bool* answers_ok);
+    /// Note 103 (`TLG_TARGET_TABLE=1`, shadow): target `slot` (0..7 color, 8 depth) of the draw, found by the old path as `image_id` (`old_find`: by FindImage), against the
+    /// table's entry for the view the record names; `use` keeps apart what changes the target's description. Returns the entry's key (0: not in the class) for the render pass.
+    u64 TargetTableShadow(u32 slot, u64 use, VideoCore::ImageId image_id, bool old_find, bool& in_class, bool& served);
+    /// ... at the render pass: the view the old path chose for target `slot`.
+    void TargetViewShadow(u32 slot, vk::ImageView view);
+    std::array<u64, 9> target_use{}; ///< note 103: the use the draw's targets were looked up with (0: not in the class)
     /// Note 97 (`TLG_VIEW_TABLE=2`): the stage's images bound from the view table (true), or nothing done (false: the old path binds them).
     bool ViewTableBind(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool ResolveTextureSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count, TextureResolved& r);
@@ -758,8 +764,8 @@ private:
     Core::NativeExecutor* executor;
     const std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS>* current_cb_extent{}; ///< The extent hints of the targets of the draw being recorded.
     const AmdGpu::CbDbExtent* current_db_extent{};
-    static constexpr std::array<u64, 9> kNoTargetResources{};
-    const std::array<u64, 9>* current_target_resources{&kNoTargetResources}; ///< E3: engine resource ids behind the draw's color views (0..7) and depth view (8).
+    static constexpr std::array<u64, 18> kNoTargetResources{};
+    const std::array<u64, 18>* current_target_resources{&kNoTargetResources}; ///< E3: engine resource ids behind the draw's color views (0..7) and depth view (8).
     const AmdGpu::BorderColorBuffer* current_bc_base{}; ///< The border colour table of the draw or dispatch being recorded.
     const Core::NativeDispatch::DispatchInputs* current_cs{}; ///< The compute program of the dispatch being recorded (its plan's; an empty one without a plan).
     Core::MemoryManager* memory;

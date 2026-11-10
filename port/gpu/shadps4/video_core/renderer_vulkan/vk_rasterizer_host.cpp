@@ -74,7 +74,7 @@ bool Rasterizer::DrawPlanIsDepthOnly(const DrawPlan& plan) {
     return plan.fixed.NoColorTargets();
 }
 
-void Rasterizer::SetDrawPlanTargets(DrawPlan& plan, const ColorExtents& cb_extent, const DepthExtent& db_extent, const std::array<u64, 9>& target_resources) {
+void Rasterizer::SetDrawPlanTargets(DrawPlan& plan, const ColorExtents& cb_extent, const DepthExtent& db_extent, const std::array<u64, 18>& target_resources) {
     plan.cb_extent = cb_extent;
     plan.db_extent = db_extent;
     plan.target_resources = target_resources;
@@ -326,8 +326,8 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
         if (Core::HookOwned::Mode() != 0) {
             Core::DebugServer::Publish("hook_owned", Core::HookOwned::Report()); // note 90
         }
-        if (Core::ViewTable::Mode() != 0) {
-            Core::DebugServer::Publish("view_table", Core::ViewTable::Report()); // note 95
+        if (Core::ViewTable::Mode() != 0 || Core::ViewTable::TargetMode() != 0) {
+            Core::DebugServer::Publish("view_table", Core::ViewTable::Report()); // notes 95 and 103 (the target table is under "targets")
         }
         if (Core::TextureVersion::Mode() != 0) {
             Core::DebugServer::Publish("texture_version", Core::TextureVersion::Report()); // note 100

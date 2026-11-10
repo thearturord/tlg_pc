@@ -687,6 +687,11 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const Fixe
     }
 
     const bool skip_cb_binding = !fixed.color_enabled;
+    const bool tg_on = Core::ViewTable::TargetMode() != 0;
+    bool tg_any = false, tg_all_in = true, tg_all_served = true, tg_old_find = false;
+    if (tg_on) [[unlikely]] {
+        target_use.fill(0);
+    }
     for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
         auto& [image_id, desc] = cb_descs[cb];
         const auto& col_buf = regs.color_buffers[cb];
@@ -697,6 +702,28 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const Fixe
             continue;
         }
         const auto& hint = (*current_cb_extent)[cb];
+        bool tg_found = false;
+        struct TgAfter {
+            Rasterizer* r;
+            bool on;
+            u32 cb;
+            VideoCore::ImageId& id;
+            bool& found;
+            bool& any;
+            bool& all_in;
+            bool& all_served;
+            bool& old_find;
+            ~TgAfter() {
+                if (on && id) {
+                    bool in_class = false, served = false;
+                    r->TargetTableShadow(cb, u64(cb), id, found, in_class, served);
+                    any = true;
+                    all_in &= in_class;
+                    all_served &= served;
+                    old_find |= in_class && found;
+                }
+            }
+        } tg_after{this, tg_on, static_cast<u32>(cb), image_id, tg_found, tg_any, tg_all_in, tg_all_served, tg_old_find};
         if (RtReuseOn() && TargetInputsMatch(rt_cache[cb], col_buf, hint)) {
             // Same registers and no image registered or removed since: FindImage would find the
             // same image again (image_id and desc still hold its result).
@@ -707,6 +734,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const Fixe
             desc.engine_id = (*current_target_resources)[cb]; // E3: the resource the draw's bound render target view looks at
             desc.engine_site = 1;
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+            tg_found = true;
             if (RtReuseOn()) {
                 rt_cache[cb].valid = true;
                 rt_cache[cb].generation = texture_cache.ImageGeneration();
@@ -736,12 +764,119 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const Fixe
                 cache.valid = true;
                 cache.generation = texture_cache.ImageGeneration();
             }
+            if (tg_on) [[unlikely]] {
+                tg_old_find = true; // (counted for the class below)
+            }
+        }
+        if (tg_on && image_id) [[unlikely]] {
+            // the depth target's use: what changes its description besides the view (the depth and stencil enables)
+            const u64 use = 8u | (u64(regs.depth_control.depth_enable) << 4) | (u64(regs.depth_control.stencil_enable) << 5);
+            bool in_class = false, served = false;
+            TargetTableShadow(8, use, image_id, false, in_class, served);
+            tg_any = true;
+            tg_all_in &= in_class;
+            tg_all_served &= served;
         }
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     } else {
         db_desc.image_id = {};
         rt_cache[AmdGpu::NUM_COLOR_BUFFERS].valid = false;
+    }
+    if (tg_on && tg_any) [[unlikely]] {
+        using namespace Core::ViewTable;
+        Note(TgDraws);
+        if (tg_all_in) {
+            Note(TgDrawsAllInClass);
+            if (tg_all_served) {
+                Note(TgDrawsWouldServe);
+            }
+            if (tg_old_find) {
+                Note(TgDrawsOldFind);
+            }
+        }
+    }
+}
+
+u64 Rasterizer::TargetTableShadow(u32 slot, u64 use, VideoCore::ImageId image_id, bool old_find, bool& in_class, bool& served) {
+    using namespace Core::ViewTable;
+    (void)old_find;
+    const u64 view_id = (*current_target_resources)[9 + slot];
+    if (view_id == 0) {
+        Note(TgNoView);
+        return 0;
+    }
+    const u64 flags = (1ull << 63) | use;
+    Note(TgTargets);
+    in_class = true;
+    target_use[slot] = flags;
+    Entry* e = Find(view_id, flags);
+    const u64 uid = texture_cache.ImageUid(image_id);
+    if (e == nullptr) {
+        Entry& made = Put(view_id, flags);
+        made.in_class = true;
+        made.resource_id = (*current_target_resources)[slot];
+        if (made.resource_id != 0) {
+            LinkResource(made.resource_id, view_id);
+        }
+        made.image_index = image_id.index;
+        made.image_uid = uid;
+        Note(TgNoEntry);
+        return flags;
+    }
+    const VideoCore::ImageId entry_image{e->image_index};
+    const bool valid = e->image_uid != 0 && texture_cache.ImageUid(entry_image) == e->image_uid &&
+                       True(texture_cache.GetImage(entry_image).flags & VideoCore::ImageFlagBits::Registered);
+    if (!valid) {
+        Note(TgStale);
+        e->image_index = image_id.index;
+        e->image_uid = uid;
+        e->view_handle = 0;
+        return flags;
+    }
+    if (entry_image == image_id) {
+        Note(TgSame);
+        served = true;
+        return flags;
+    }
+    Note(TgDifferent);
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+        const auto& a = texture_cache.GetImage(entry_image);
+        const auto& b = texture_cache.GetImage(image_id);
+        LOG_ERROR(Render_Vulkan, "target table: view {:#x} slot {} answered image {} {:#x} {}x{}; the old path found image {} {:#x} {}x{}", view_id, slot, entry_image.index,
+                  a.info.guest_address, a.info.size.width, a.info.size.height, image_id.index, b.info.guest_address, b.info.size.width, b.info.size.height);
+    }
+    e->image_index = image_id.index;
+    e->image_uid = uid;
+    e->view_handle = 0;
+    return flags;
+}
+
+void Rasterizer::TargetViewShadow(u32 slot, vk::ImageView view) {
+    using namespace Core::ViewTable;
+    const u64 flags = target_use[slot];
+    const u64 view_id = (*current_target_resources)[9 + slot];
+    if (flags == 0 || view_id == 0) {
+        return;
+    }
+    Entry* e = Find(view_id, flags);
+    if (e == nullptr) {
+        return;
+    }
+    const u64 bits = reinterpret_cast<u64>(static_cast<VkImageView>(view));
+    if (e->view_handle == 0) {
+        e->view_handle = bits;
+        Note(TgViewNoEntry);
+    } else if (e->view_handle == bits) {
+        Note(TgViewSame);
+    } else {
+        Note(TgViewDifferent);
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+            LOG_ERROR(Render_Vulkan, "target table: view {:#x} slot {}: the render pass chose another image view", view_id, slot);
+        }
+        e->view_handle = bits;
     }
 }
 
@@ -7757,6 +7892,9 @@ RenderState Rasterizer::BeginRenderingLegacy(const GraphicsPipeline* pipeline) {
         texture_cache.UpdateImage(image_id, Core::ImageCaller::RasterizerBeginRendering);
         runtime.SetBackingSamples(image, key.color_samples[cb]);
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
+        if (Core::ViewTable::TargetMode() != 0) [[unlikely]] {
+            TargetViewShadow(cb, *image_view.image_view);
+        }
         if (Core::LightRecorder::On()) {
             Core::LightRecorder::ImageWritten(Core::DebugServer::PresentCount(), image->info.guest_address, image->info.guest_size, texture_cache.ImageUid(image_id), 1);
         }
@@ -7823,6 +7961,9 @@ RenderState Rasterizer::BeginRenderingLegacy(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
         auto& image = texture_cache.GetImage(image_id);
+        if (Core::ViewTable::TargetMode() != 0) [[unlikely]] {
+            TargetViewShadow(8, *image_view.image_view);
+        }
         if (Core::LightRecorder::On()) {
             Core::LightRecorder::ImageWritten(Core::DebugServer::PresentCount(), image.info.guest_address, image.info.guest_size, texture_cache.ImageUid(image_id), 2);
         }

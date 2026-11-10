@@ -11,6 +11,8 @@
 namespace Core::ViewTable {
 
 [[nodiscard]] u32 Mode() noexcept;
+/// Note 102/103 (`TLG_TARGET_TABLE`: 0 off (default), 1 shadow; 2 real is not built yet): render and depth targets by their view id, in this same table (use flags with bit 63).
+[[nodiscard]] u32 TargetMode() noexcept;
 
 struct Entry {
     u64 view_id{};
@@ -51,6 +53,19 @@ enum Count : u32 {
     RealServedImages,       ///< ... their image bindings
     RealAudited,            ///< ... stages the table could serve that took the old path as the audit (compared at its end)
     RealCheckFailed,        ///< ... stages whose per-image checks (backing, rebind, target, depth association) failed: the old path bound them
+    TgDraws,                ///< target table shadow: draws that bind targets
+    TgDrawsAllInClass,      ///< ... every target names an engine view
+    TgDrawsWouldServe,      ///< ... and every entry valid and equal (image and view): the real mode takes them from the table
+    TgDrawsOldFind,         ///< ... draws of the class where the old path ran FindImage for a target (its register cache missed)
+    TgTargets,              ///< targets in the class
+    TgSame,                 ///< ... valid entry, same image
+    TgDifferent,            ///< ... valid entry, another image (TARGET_TABLE_DIFFERENT_MUST_BE_0)
+    TgNoEntry,              ///< ... entry made
+    TgStale,                ///< ... entry remade (uid moved or unregistered)
+    TgNoView,               ///< targets that name no engine view (video out, eliminate)
+    TgViewSame,             ///< at the render pass: the target view equals the entry's
+    TgViewDifferent,        ///< ... differs (TARGET_VIEW_DIFFERENT_MUST_BE_0)
+    TgViewNoEntry,          ///< ... the entry had no view yet (recorded now)
     Count_
 };
 void Note(Count c, u64 n = 1) noexcept;
