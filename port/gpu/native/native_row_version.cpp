@@ -168,6 +168,24 @@ void NoteWritten(u32 what) noexcept {
     }
 }
 
+u32 GeometryRowsMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_GEOMETRY_ROWS");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
+
+namespace {
+std::atomic<u64> geometry_rows[10]{};
+}
+
+void NoteGeometry(u32 what) noexcept {
+    if (what < 10) {
+        geometry_rows[what].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void NoteLearn(bool inside) noexcept {
     learned[inside ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
 }
@@ -190,6 +208,14 @@ nlohmann::json Report() {
                                                  "version_moved_bytes_different_right_miss", "not_inside_its_buffer", "not_hashed"};
         for (u32 k = 0; k < 7; ++k) {
             j["static_row_census"][Names[k]] = {{"reads", static_rows[k][0].load()}, {"bytes", static_rows[k][1].load()}};
+        }
+    }
+    {
+        static constexpr const char* G[10] = {"asked", "with_geometry_handle", "row_valid", "served", "compared_with_old_path", "DIFFERENT_MUST_BE_0", "OLD_PATH_DID_WORK_MUST_BE_0",
+                                              "learn_attempts", "old_answer_stream_ring", "old_answer_hook_ring"};
+        j["geometry_rows"]["mode"] = GeometryRowsMode();
+        for (u32 k = 0; k < 10; ++k) {
+            j["geometry_rows"][G[k]] = geometry_rows[k].load();
         }
     }
     j["written_rows"] = {{"on", WrittenRowsOn()}, {"served", written_rows[0].load()}, {"learned", written_rows[1].load()}};

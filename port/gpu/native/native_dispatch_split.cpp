@@ -231,6 +231,19 @@ void EndDraw() noexcept {
     }
 }
 
+namespace {
+std::atomic<u64> g_index[4][8]{}; // [path][0..5 ticks, 6 count, 7 stream answers]
+} // namespace
+
+void NoteIndexBind(const u64 (&ticks)[6], u32 path, bool stream) noexcept {
+    const u32 p = path < 4 ? path : 3;
+    for (u32 k = 0; k < 6; ++k) {
+        g_index[p][k].fetch_add(ticks[k], std::memory_order_relaxed);
+    }
+    g_index[p][6].fetch_add(1, std::memory_order_relaxed);
+    g_index[p][7].fetch_add(stream ? 1 : 0, std::memory_order_relaxed);
+}
+
 void End() noexcept {
     if (!t_active) {
         return;
@@ -289,6 +302,13 @@ nlohmann::json Report() {
         j[p ? "planned" : "not_planned"] = std::move(o);
     }
     if (g_draw_on) {
+        static constexpr const char* IP[4] = {"ring", "engine_handle", "by_address", "none"};
+        static constexpr const char* IS[8] = {"size_and_mapping", "ring_lookup", "geometry_handle", "obtain_buffer", "barrier_query", "bound_list_and_command", "count", "stream_answers"};
+        for (u32 p = 0; p < 4; ++p) {
+            for (u32 k = 0; k < 8; ++k) {
+                j["draws"]["index_bind"][IP[p]][IS[k]] = g_index[p][k].load();
+            }
+        }
         j["draws"]["dropped_left_early"] = g_ddropped.load();
         for (u32 c = 0; c < DrawClasses; ++c) {
             const u64 n = g_dsamples[c].load();

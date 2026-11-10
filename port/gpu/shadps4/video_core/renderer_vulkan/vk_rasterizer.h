@@ -374,6 +374,8 @@ private:
     /// planner holds since its last barrier; with none (`PlanHasWrites` false) the query is not asked (real) or asked and compared (shadow). The read itself is still recorded at the
     /// finish (`AccessBuffer` over the bound list). One in 64 skipped queries is asked anyway.
     [[nodiscard]] bool BufferBarrierQuery(const VideoCore::Buffer* buffer, u64 offset, u64 size, bool written);
+    /// Design review 76: the plan's geometry handle holding [address, address + size) (alive, the plan's epoch current), without the compare mode's lookup by address.
+    [[nodiscard]] const Core::NativeResources::ImmutableBuffer* GeometryHandleOfPlan(VAddr address, u64 size) const noexcept;
     /// [0 read queries, 1 of them with no planned write, 2 SHADOW_NO_WRITES_BUT_BARRIER_MUST_BE_0, 3 real: asked (writes pending), 4 real: skipped, 5 real: sampled, 6 SAMPLED_BARRIER_MUST_BE_0]
     std::array<std::atomic<u64>, 8> barrier_guard{};
     /// Texture census (TLG_TEXTURE_CENSUS=1, design review 58), [graphics, compute][class][calls, ns, images]: classes 0 no image, 1 more than 16 images, 2 memo off, 3 a written image,

@@ -57,6 +57,12 @@ void NoteStaticReal(u32 what, u64 n = 1) noexcept;
 [[nodiscard]] bool Watched(u64 address, u64 size) noexcept;
 void NoteStatic(u32 what, u64 bytes) noexcept;
 
+/// Design review 76 (`TLG_GEOMETRY_ROWS`, default 0 off; 1 shadow, 2 real): the index buffer of a draw answered by a row keyed by its engine buffer id (the plan's geometry handle),
+/// like a shader buffer's read row; the barrier guard covers its query. Shadow: the old path answers and the row's answer is compared. Real: one served row in 64 runs the old path too.
+[[nodiscard]] u32 GeometryRowsMode() noexcept;
+/// 0 asked, 1 with a geometry handle, 2 row valid, 3 served (real), 4 compared with the old path, 5 DIFFERENT_MUST_BE_0, 6 OLD_PATH_DID_WORK_MUST_BE_0, 7 learn attempts,
+/// 8 the old answer was the stream ring, 9 the old answer was the hook ring.
+void NoteGeometry(u32 what) noexcept;
 [[nodiscard]] nlohmann::json Report();
 
 } // namespace Core::RowVersion

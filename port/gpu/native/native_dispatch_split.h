@@ -133,5 +133,8 @@ void BeginDraw() noexcept;
 /// The sampled draw's class (the tag's), whether it is indexed and whether the front's binder plan was found.
 void NoteDrawKind(u32 draw_class, bool indexed, bool planned) noexcept;
 void EndDraw() noexcept;
+/// Design review 76 (with `TLG_DRAW_SPLIT=1`): the index buffer bind of a sampled draw in six steps (ticks: 0 size and mapping, 1 ring lookup and GPU-written check, 2 geometry handle,
+/// 3 ObtainBuffer, 4 barrier query, 5 the bound list and the command); `path` 0 ring, 1 engine handle, 2 by address, 3 none; `stream` the answer was the stream ring.
+void NoteIndexBind(const u64 (&ticks)[6], u32 path, bool stream) noexcept;
 
 } // namespace Core::DispatchSplit

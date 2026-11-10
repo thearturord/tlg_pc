@@ -401,6 +401,19 @@ const DrawPlan* Rasterizer::NativeBinderFor(const DrawPlan* plan, u32 draw_class
     return plan;
 }
 
+const Core::NativeResources::ImmutableBuffer* Rasterizer::GeometryHandleOfPlan(VAddr address, u64 size) const noexcept {
+    if (geometry_plan == nullptr || !geometry_plan->has_geometry_handles || geometry_plan->handle_epoch != Core::NativeResources::ImmutableEpoch()) {
+        return nullptr;
+    }
+    for (u32 i = 0; i < geometry_plan->geometry_handle_count; ++i) {
+        const auto* handle = geometry_plan->geometry_handles[i];
+        if (handle != nullptr && address >= handle->begin && address + size <= handle->end && handle->alive.load(std::memory_order_acquire)) {
+            return handle;
+        }
+    }
+    return nullptr;
+}
+
 Core::NativeResources::ImmutableBuffer* Rasterizer::GeometryHandle(VAddr address, u64 size) const {
     if (geometry_plan == nullptr || !geometry_plan->has_geometry_handles) {
         return nullptr;

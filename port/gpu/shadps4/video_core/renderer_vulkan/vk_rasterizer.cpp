@@ -3350,6 +3350,16 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
     TLG_PROF_LEVEL("raster.bind_index_buffer", 2);
     const auto& regs = *draw_inputs;
+    namespace DS = Core::DispatchSplit;
+    const bool ic = DS::t_draw_active; // design review 76: the sampled draw's index bind, in six steps
+    u64 it[6] = {ic ? DS::Tsc() : 0, 0, 0, 0, 0, 0};
+    u32 ipath = 3;
+    bool istream = false;
+    const auto ilap = [&](u32 k) {
+        if (ic) {
+            it[k] = DS::Tsc();
+        }
+    };
 
     // Figure out index type and size.
     const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
@@ -3372,6 +3382,7 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
     u32 index_buffer_size = static_cast<u32>(Common::AlignDown(mapped_size, index_size));
     vk::Buffer index_buffer{};
     u64 buffer_offset{};
+    ilap(1);
     const RingBinding* index_ring = index_buffer_size != 0 && !is_indirect ? FindGeometryRing(index_address, index_buffer_size, GeometryIndex) : nullptr;
     if (index_buffer_size != 0 && !is_indirect && ring_use.draw != nullptr && Core::NativeUploads::RingGeometry()) {
         bool has_entry = false;
@@ -3384,13 +3395,105 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
         Core::NativeUploads::NoteGeometry(4);
         index_ring = nullptr;
     }
+    ilap(2);
     if (index_ring != nullptr) {
         Census(CGeometryIndexRing);
         index_buffer = constant_ring->Handle();
         buffer_offset = index_ring->offset;
         Core::NativeUploads::NoteGeometry(3);
+        ipath = 0;
+        ilap(3);
+        ilap(4);
+        ilap(5);
+    } else if (index_buffer_size != 0 && [&] {
+                   // design review 76 (TLG_GEOMETRY_ROWS): the index buffer by row (engine id of the plan's geometry handle)
+                   const u32 grm = Core::RowVersion::GeometryRowsMode();
+                   if (grm == 0) {
+                       return false;
+                   }
+                   Core::RowVersion::NoteGeometry(0);
+                   const auto* gh = GeometryHandleOfPlan(index_address, index_buffer_size);
+                   if (gh == nullptr) {
+                       return false;
+                   }
+                   Core::RowVersion::NoteGeometry(1);
+                   const VideoCore::Buffer* row_buffer = nullptr;
+                   u64 row_offset = 0;
+                   const bool row_valid = RowsServe(gh->id, index_address, index_buffer_size, false, row_buffer, row_offset, false);
+                   static thread_local u32 geo_sample = 0;
+                   if (row_valid) {
+                       Core::RowVersion::NoteGeometry(2);
+                       if (grm == 2 && (++geo_sample & 63u) != 0) {
+                           Core::RowVersion::NoteGeometry(3);
+                           const_cast<VideoCore::Buffer*>(row_buffer)->NoteResolveUse(); // P3c: asked for by the operation being resolved
+                           needs_barrier |= BufferBarrierQuery(row_buffer, row_offset, index_buffer_size, false); // (the barrier guard: a read with no planned write needs none)
+                           bound_buffers.emplace_back(row_buffer, row_offset, index_buffer_size, vk::AccessFlagBits2::eIndexRead);
+                           index_buffer = row_buffer->Handle();
+                           buffer_offset = row_offset;
+                           ipath = 1;
+                           ilap(3);
+                           ilap(4);
+                           ilap(5);
+                           return true;
+                       }
+                   }
+                   // the old path answers (shadow, a sampled real row, or no valid row) and is compared or learned
+                   const u64 epoch_pre = buffer_cache.PlacementEpoch();
+                   const u64 clock_pre = Core::NativeIdentity::Clock();
+                   const u64 version_pre = Core::RowVersion::Mode() != 0 ? Core::RowVersion::Of(gh->id) : 0;
+                   const u64 unattr_pre = Core::RowVersion::Mode() != 0 ? Core::RowVersion::Unattributed() : 0;
+                   const bool gpu_pre = buffer_cache.IsRangeGpuWritten(index_address, index_buffer_size);
+                   auto* index_handle = GeometryHandle(index_address, index_buffer_size);
+                   ilap(3);
+                   ipath = 1;
+                   VideoCore::BufferCache::UploadBytesReset();
+                   const auto* list = scheduler.CommandBuffer().List();
+                   const u64 commands_before = list != nullptr ? list->Size() : 0;
+                   Core::NativeContent::SetBindContext({"index", 0, 0, 0, 0, index_handle != nullptr, false, index_address, index_buffer_size});
+                   const auto [buffer, offset] = buffer_cache.ObtainBuffer(index_address, index_buffer_size, false, false, index_handle, NativeHandleMode() == 2);
+                   Core::NativeContent::ClearBindContext();
+                   ilap(4);
+                   if (row_valid) {
+                       Core::RowVersion::NoteGeometry(4);
+                       const auto* list_after = scheduler.CommandBuffer().List();
+                       const u64 commands_after = list_after != nullptr ? list_after->Size() : 0;
+                       if (buffer != row_buffer || offset != row_offset) {
+                           Core::RowVersion::NoteGeometry(5);
+                           static std::atomic<u32> logged{0};
+                           if (logged.fetch_add(1) < 10) {
+                               LOG_ERROR(Render_Vulkan, "geometry row differs: id {:#x} index {:#x}+{:#x}: row {:p}+{:#x}, old path {:p}+{:#x} (stream {}, hook ring {})", gh->id, index_address,
+                                         index_buffer_size, static_cast<const void*>(row_buffer), row_offset, static_cast<const void*>(buffer), offset, buffer_cache.IsStreamBuffer(buffer),
+                                         buffer_cache.IsHookRing(buffer));
+                           }
+                       } else if (VideoCore::BufferCache::UploadBytes() != 0 || commands_after != commands_before) {
+                           Core::RowVersion::NoteGeometry(6);
+                           static std::atomic<u32> logged_work{0};
+                           if (logged_work.fetch_add(1) < 10) {
+                               LOG_ERROR(Render_Vulkan, "geometry row valid but the old path did work: id {:#x} index {:#x}+{:#x}: uploaded {} bytes, {} commands", gh->id, index_address,
+                                         index_buffer_size, VideoCore::BufferCache::UploadBytes(), commands_after - commands_before);
+                           }
+                       }
+                   } else if (buffer_cache.IsStreamBuffer(buffer)) {
+                       Core::RowVersion::NoteGeometry(8);
+                   } else if (buffer_cache.IsHookRing(buffer)) {
+                       Core::RowVersion::NoteGeometry(9);
+                   } else {
+                       Core::RowVersion::NoteGeometry(7);
+                       RowsLearn(gh->id, index_address, index_buffer_size, false, buffer, offset, epoch_pre, clock_pre, gpu_pre, version_pre, unattr_pre);
+                   }
+                   istream = ic && buffer_cache.IsStreamBuffer(buffer);
+                   needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size); // (the old path's query, as before)
+                   ilap(5);
+                   bound_buffers.emplace_back(buffer, offset, index_buffer_size, vk::AccessFlagBits2::eIndexRead);
+                   index_buffer = buffer->Handle();
+                   buffer_offset = offset;
+                   return true;
+               }()) {
+        // (bound by the geometry row step above)
     } else if (index_buffer_size != 0) {
         auto* index_handle = GeometryHandle(index_address, index_buffer_size);
+        ilap(3);
+        ipath = index_handle != nullptr ? 1 : 2;
         Census(index_handle != nullptr ? CGeometryIndexHandle : CGeometryIndexAddress);
         Core::NativeContent::SetBindContext({"index", 0, 0, 0, 0, index_handle != nullptr, false, index_address, index_buffer_size});
         if (cover_on) [[unlikely]] {
@@ -3402,7 +3505,10 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
         if (cover_on && W1ShadowOn()) [[unlikely]] {
             W1ShadowGeometry(index_handle, index_address, buffer, offset, false);
         }
+        ilap(4);
+        istream = ic && buffer_cache.IsStreamBuffer(buffer);
         needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+        ilap(5);
         bound_buffers.emplace_back(buffer, offset, index_buffer_size,
                                    vk::AccessFlagBits2::eIndexRead);
         index_buffer = buffer->Handle();
@@ -3428,6 +3534,11 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
     if (cover_on) [[unlikely]] {
         t_w1.index = W1Mix(reinterpret_cast<u64>(static_cast<VkBuffer>(index_buffer)), buffer_offset);
         t_w1.index_handle = reinterpret_cast<u64>(static_cast<VkBuffer>(index_buffer));
+    }
+    if (ic && it[5] != 0) {
+        const u64 end = DS::Tsc();
+        const u64 ticks[6] = {it[1] - it[0], it[2] - it[1], it[3] - it[2], it[4] - it[3], it[5] - it[4], end - it[5]};
+        DS::NoteIndexBind(ticks, ipath, istream);
     }
 }
 
