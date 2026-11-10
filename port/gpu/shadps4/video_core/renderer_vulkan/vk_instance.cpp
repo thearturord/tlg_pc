@@ -378,9 +378,10 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    // TLG_ASC_QUEUE=1 (documents/tlg/async-compute-queue-plan.md): a second queue of the graphics family for the asynchronous compute queue 1.
+    // TLG_ASC_QUEUE (documents/tlg/async-compute-queue-plan.md): a second queue of the graphics family for the asynchronous compute queue 1.
+    // Default on since 2026-11-10 after the owner's play (design review section 21); =0 off. A family with one queue falls back to one queue.
     const char* asc_queue_env = std::getenv("TLG_ASC_QUEUE");
-    const bool want_async_queue = asc_queue_env != nullptr && asc_queue_env[0] == '1';
+    const bool want_async_queue = asc_queue_env == nullptr || asc_queue_env[0] == 0 || asc_queue_env[0] != '0';
     LOG_INFO(Render_Vulkan, "Graphics queue family {} exposes {} queues (TLG_ASC_QUEUE {})", queue_family_index,
              family_properties[queue_family_index].queueCount, want_async_queue ? "on" : "off");
     has_async_queue = want_async_queue && family_properties[queue_family_index].queueCount >= 2;
