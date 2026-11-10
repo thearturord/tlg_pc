@@ -149,6 +149,29 @@ void BufferCache::IdMarkLean(VAddr address, u64 size, bool newer, u64 id) {
     };
     BindMemoErase(address, size);
     step(1);
+    if (Core::NativeUpdates::ImageByIdMode() == 1 && Core::NativeUpdates::B8ImageMode() != 0) [[unlikely]] {
+        // design review 63, shadow: the image step's answer by the buffer id beside the address lookup's
+        auto& index = texture_cache.EngineIndex();
+        const bool id_none = index.NoImageInBuffer(id, address, size);
+        const bool addr_any = index.ImageOrClearMetAt(address, size);
+        using namespace Core::NativeUpdates;
+        NoteIdMarks(ImImgIdClearsSum, index.pending_clears.size());
+        if (id_none) {
+            NoteIdMarks(ImImgIdNone);
+            NoteIdMarks(addr_any ? ImImgIdMissed : ImImgIdNoneAddrNone);
+            if (addr_any) {
+                static std::atomic<u32> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+                    LOG_ERROR(Render_Vulkan, "image by id: buffer id {:#x} {:#x}+{:#x}: the id says no image, the address lookup finds one (or a waiting clear)", id, address, size);
+                }
+            }
+        } else {
+            NoteIdMarks(ImImgIdMaybe);
+            if (!addr_any) {
+                NoteIdMarks(ImImgIdMaybeAddrNone);
+            }
+        }
+    }
     if (Core::NativeUpdates::B8ImageMode() != 0 && texture_cache.EngineIndex().NoteAnnouncedWrite(address, size, newer) == 1) {
         Core::NativeUpdates::NoteIdMarks(Core::NativeUpdates::ImLeanImageTouched);
     }

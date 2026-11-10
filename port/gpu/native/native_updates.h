@@ -113,9 +113,17 @@ enum IdMarksCount : u32 {
     ImAgainSkipped,          ///< mode 2: second applications skipped
     ImHashSkipped,           ///< mode 2: batch hashes skipped
     ImLeanImageTouched,      ///< lean: the image index found an image or a waiting clear over the range (the step is kept: idmdef found 18 in 51 k samples on a later save)
+    ImImgIdNone,             ///< TLG_IMAGE_BY_ID: the id says no image
+    ImImgIdNoneAddrNone,     ///< ... and the address lookup agrees
+    ImImgIdMissed,           ///< ... but the address lookup finds an image or a waiting clear (MUST_BE_0)
+    ImImgIdMaybe,            ///< the id cannot say (clears wait, creation not handled, a live image listed)
+    ImImgIdMaybeAddrNone,    ///< ... and the address lookup finds none
+    ImImgIdClearsSum,        ///< the number of waiting clears, summed over the shadow's checks
     IdMarksCounts
 };
 void NoteIdMarks(IdMarksCount what, u64 n = 1) noexcept;
+/// Design review 63 (`TLG_IMAGE_BY_ID`): 0 off (default), 1 shadow (the image step of a lean mark asks the id and the address and compares; the address decides).
+[[nodiscard]] u32 ImageByIdMode() noexcept;
 /// Batch census (`TLG_BATCH_CENSUS=1`, design review 62, counters only): the time of each apply of the batch by writer tag, and of the lean mark's steps (one mark in 16 timed:
 /// 0 the named-buffer check, 1 the bind memo erase, 2 the image step, 3 the dirty sets under their lock, 4 the version and epochs, 5 the resident lookup and bump).
 [[nodiscard]] bool BatchCensusOn() noexcept;

@@ -1010,22 +1010,17 @@ void NoteHandle(u32 what) {
 }
 
 ImmutableBuffer* FindImmutableById(u64 id) {
+    // design review 62/63: 32,768 entries (the announce batch alone names about 25,000 slot and light buffers; 1,024 entries missed most of them), each entry valid for the epoch it was
+    // filled at (no fill of the whole table when a buffer is registered or destroyed)
     struct Entry {
         u64 id{};
         ImmutableBuffer* buffer{};
+        u64 epoch{~u64{0}};
     };
-    struct Cache {
-        u64 epoch{};
-        std::array<Entry, 1024> entries{};
-    };
-    static thread_local Cache cache;
+    static thread_local std::unique_ptr<Entry[]> cache{new Entry[32768]};
     const u64 epoch = immutable_epoch.load(std::memory_order_acquire);
-    if (cache.epoch != epoch) {
-        cache.entries.fill({});
-        cache.epoch = epoch;
-    }
-    Entry& entry = cache.entries[(id * 0x9E3779B97F4A7C15ull) >> 54];
-    if (entry.id == id) {
+    Entry& entry = cache[(id * 0x9E3779B97F4A7C15ull) >> 49];
+    if (entry.id == id && entry.epoch == epoch) {
         return entry.buffer; // may be null: the id names no immutable buffer (the negative answer is cached too)
     }
     ImmutableBuffer* found = nullptr;
@@ -1035,7 +1030,7 @@ ImmutableBuffer* FindImmutableById(u64 id) {
             found = it->second.get();
         }
     }
-    entry = {id, found};
+    entry = {id, found, epoch};
     return found;
 }
 

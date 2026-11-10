@@ -439,6 +439,11 @@ void NoteIdMarks(IdMarksCount what, u64 n) noexcept {
     id_marks_counts[what].fetch_add(n, std::memory_order_relaxed);
 }
 
+u32 ImageByIdMode() noexcept {
+    static const u32 mode = [] { const char* e = std::getenv("TLG_IMAGE_BY_ID"); return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; }();
+    return mode;
+}
+
 bool BatchCensusOn() noexcept {
     static const bool on = [] { const char* e = std::getenv("TLG_BATCH_CENSUS"); return e != nullptr && e[0] == '1'; }();
     return on;
@@ -1318,7 +1323,10 @@ nlohmann::json B2Report() {
                                              {"SAMPLED_UNEXPECTED_MUST_BE_0", c(ImSampledUnexpected)}, {"unattributed_marked", c(ImUnattributed)}, {"parts_match", c(ImPartsMatch)}, {"PARTS_DIFFER_MUST_BE_0", c(ImPartsDiffer)},
                                              {"part_whole_buffer", c(ImPartWhole)}, {"part_not_whole_buffer", c(ImPartNotWhole)}, {"resident_bumped_own", c(ImResidentTold)}, {"resident_bumped_neighbor", c(ImResidentNeighbor)},
                                              {"resident_bumped_neighbor_was_synced", c(ImResidentNeighborSynced)}, {"named_but_own_not_bumped", c(ImResidentToldNone)}, {"lean_resident_bumped", c(ImLeanResident)},
-                                             {"lean_not_resident", c(ImLeanNoResident)}, {"again_skipped", c(ImAgainSkipped)}, {"hash_skipped", c(ImHashSkipped)}, {"lean_image_touched", c(ImLeanImageTouched)}};
+                                             {"lean_not_resident", c(ImLeanNoResident)}, {"again_skipped", c(ImAgainSkipped)}, {"hash_skipped", c(ImHashSkipped)}, {"lean_image_touched", c(ImLeanImageTouched)},
+                                             {"image_by_id", {{"mode", ImageByIdMode()}, {"id_says_none", c(ImImgIdNone)}, {"id_none_address_agrees", c(ImImgIdNoneAddrNone)},
+                                                              {"ID_NONE_ADDRESS_FINDS_MUST_BE_0", c(ImImgIdMissed)}, {"id_cannot_say", c(ImImgIdMaybe)},
+                                                              {"id_cannot_say_address_none", c(ImImgIdMaybeAddrNone)}, {"waiting_clears_summed", c(ImImgIdClearsSum)}}}};
                    }()},
                   {"batch_census", [] {
                        nlohmann::json j = nlohmann::json::object();

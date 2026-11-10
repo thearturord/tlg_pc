@@ -35,6 +35,47 @@ void NativeImageIndex::NoteBufferCreate(u64 id, VAddr address, u64 bytes) {
     }
 }
 
+bool NativeImageIndex::NoImageInBuffer(u64 id, VAddr addr, u64 size) const {
+    if (!buffers_known.contains(id)) {
+        return false;
+    }
+    if (const auto it = buffer_images.find(id); it != buffer_images.end()) {
+        for (const auto& [image_id, uid] : it->second) {
+            if (host.Live(image_id, uid) && host.Registered(image_id)) {
+                return false;
+            }
+        }
+    }
+    for (const auto& [texture_id, clear] : pending_clears) {
+        NativeDevice::Object o{};
+        if (!NativeDevice::Lookup(texture_id, o)) {
+            return false;
+        }
+        if (o.address < addr + size && addr < o.address + std::max<u64>(o.bytes, 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool NativeImageIndex::ImageOrClearMetAt(VAddr addr, u64 size) {
+    if (host.AnyImageIn(addr, size)) {
+        return true;
+    }
+    if (pending_clears.empty()) {
+        return false;
+    }
+    static thread_local std::vector<u64> ids;
+    ids.clear();
+    (void)NativeDevice::TexturesIn(addr, size, ids);
+    for (const u64 texture_id : ids) {
+        if (pending_clears.contains(texture_id)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool NativeImageIndex::BufferImagesIn(VAddr address, u64 size, SmallVector<ImageId, 8>& out) {
     static thread_local std::vector<NativeDevice::BufferPart> parts;
     parts.clear();

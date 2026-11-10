@@ -84,6 +84,12 @@ public:
     void NoteTextureCreate(VAddr address, u64 bytes);
     /// B8.4: the images listed for the engine textures `ids` (their own and their remembered answers) that meet [address, address + size), each once.
     void ImagesIn(const std::vector<u64>& ids, VAddr address, u64 size, SmallVector<ImageId, 8>& out) const;
+    /// Design review 62/63 (`TLG_IMAGE_BY_ID`): true when, by the buffer's id, no image and no waiting clear can be in its memory [addr, addr + size): the buffer's creation was handled
+    /// (`buffers_known`), its image list (B8.5: images listed at its creation and by every image registered later) holds no live registered image, and no texture whose clear waits
+    /// lies over the range (each waiting clear's texture range from the engine's object table; a texture not found there answers "cannot say").
+    [[nodiscard]] bool NoImageInBuffer(u64 id, VAddr addr, u64 size) const;
+    /// Shadow: what the write would really meet in [addr, addr + size): an image (the page table), or a texture whose clear waits (the textures over the range).
+    [[nodiscard]] bool ImageOrClearMetAt(VAddr addr, u64 size);
     /// B8.5: an engine buffer was created (images already in its memory join its list) / deleted (its list goes).
     void NoteBufferCreate(u64 id, VAddr address, u64 bytes);
     void NoteBufferDelete(u64 id) {
