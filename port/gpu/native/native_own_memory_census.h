@@ -49,7 +49,7 @@ enum Drop : u32 {
     DropCount
 };
 void NoteDrop(u32 what) noexcept;
-/// Design review 83: `TLG_OWN_IMMUTABLE` (default 0; 1 shadow, 2 real, 1 in 64 audited): read bindings of immutable engine buffers bound from the buffer's own memory.
+/// Design review 83: `TLG_OWN_IMMUTABLE` (default 2 real since the owner's play 2026-11-10, 1 in 64 audited; 0 off, 1 shadow): read bindings of immutable engine buffers bound from the buffer's own memory.
 [[nodiscard]] u32 OwnImmutableMode() noexcept;
 enum Own : u32 {
     OwnAsked,          ///< read bindings with an engine id the front planned
