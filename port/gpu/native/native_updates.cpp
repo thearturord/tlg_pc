@@ -231,12 +231,46 @@ bool CloseOpenMap(u64 resource_id, u32 how) {
 }
 } // namespace
 
+namespace {
+/// Diagnostics (`TLG_WATCH_RESOURCES=0x181a,0x180b`): Maps and Unmaps of these engine buffers are logged, and the writer probe is armed on the window at the Unmap.
+bool WatchedResource(u64 id) noexcept {
+    static const std::vector<u64> ids = [] {
+        std::vector<u64> v;
+        const char* e = std::getenv("TLG_WATCH_RESOURCES");
+        while (e != nullptr && *e != 0) {
+            char* end = nullptr;
+            const u64 x = std::strtoull(e, &end, 0);
+            if (end == e) {
+                break;
+            }
+            v.push_back(x);
+            e = *end == ',' ? end + 1 : end;
+        }
+        return v;
+    }();
+    return !ids.empty() && std::find(ids.begin(), ids.end(), id) != ids.end();
+}
+std::atomic<u32> watch_logged{0};
+} // namespace
+
 void NoteUnmap(u64 resource_id) {
     bool kept = false;
+    u64 watch_address = 0, watch_size = 0;
     {
         std::scoped_lock lock{open_map_mutex};
         const auto it = open_maps.find({ThreadKey(), resource_id});
         kept = it != open_maps.end() && it->second.frame_flushed != 0;
+        if (it != open_maps.end()) {
+            watch_address = it->second.address;
+            watch_size = it->second.size;
+        }
+    }
+    if (WatchedResource(resource_id)) [[unlikely]] {
+        if (watch_logged.fetch_add(1, std::memory_order_relaxed) < 160) {
+            std::fprintf(stderr, "watch res: Unmap %#llx window %#llx+%#llx seq %u thread %llu\n", static_cast<unsigned long long>(resource_id), static_cast<unsigned long long>(watch_address),
+                         static_cast<unsigned long long>(watch_size), static_cast<u32>(NativeDraw::NextSeq()), static_cast<unsigned long long>(ThreadKey()));
+        }
+        // (no writer probe here: arming it at every Unmap of these buffers stopped the game in `wide4`)
     }
     if (CloseOpenMap(resource_id, 0)) {
         if (kept) {
@@ -316,6 +350,14 @@ void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u6
     }
     // the written part: the requested size when the caller gave one, else everything the Map handed out; it is announced when the thread unmaps the resource
     const u64 written = requested_size != 0 && requested_size < size ? requested_size : size;
+    if (WatchedResource(resource_id)) [[unlikely]] {
+        if (watch_logged.fetch_add(1, std::memory_order_relaxed) < 160) {
+            std::fprintf(stderr, "watch res: Map %#llx type %u returned %#llx+%#llx (buffer size %#x) own memory %#llx in ring %d frame %u stamp %u caller %#llx seq %u thread %llu\n",
+                         static_cast<unsigned long long>(resource_id), map_type, static_cast<unsigned long long>(address), static_cast<unsigned long long>(written), size,
+                         static_cast<unsigned long long>(memory), in_ring ? 1 : 0, context_frame, resource_stamp,
+                         static_cast<unsigned long long>(caller - NativeDraw::ImageBase() + 0x1000000ull), static_cast<u32>(NativeDraw::NextSeq()), static_cast<unsigned long long>(ThreadKey()));
+        }
+    }
     if (ReplaceAnnounceOn()) {
         u64 old_size = 0;
         {
