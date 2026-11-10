@@ -6,7 +6,7 @@
 #include <nlohmann/json_fwd.hpp>
 #include "common/types.h"
 
-/// F1 class 1a (design review 2026-11-09 sections 2 and 9 to 13). `TLG_HOOK_RING`, default 0 (off).
+/// F1 class 1a (design review 2026-11-09 sections 2 and 9 to 14). `TLG_HOOK_RING`, default 2 (real) since 2026-11-10 after the owner's play; 0 = off.
 ///   1 = shadow: a host copy of the 64 MB frame ring, filled on the writing thread at the moment a write is known to be finished (every announcement inside
 ///       the ring, the light and slot ring copies, the recording and skinning ring blocks when the engine's writing call returns). Every front constant copy
 ///       is compared with it. Nothing the GPU reads changes.

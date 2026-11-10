@@ -42,9 +42,13 @@ std::mutex g_example_mutex;
 std::vector<Example> g_examples;
 
 u32 Mode() noexcept {
+    // default 2 since 2026-11-10 (owner play good); =0 turns it off, =1 is the shadow
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_HOOK_RING");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+        if (e == nullptr || *e == 0) {
+            return 2u;
+        }
+        return e[0] == '0' ? 0u : e[0] == '1' ? 1u : 2u;
     }();
     return mode;
 }
