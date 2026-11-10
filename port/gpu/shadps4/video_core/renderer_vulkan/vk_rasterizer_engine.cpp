@@ -37,6 +37,7 @@
 #include "shader_recompiler/resource.h"
 #include "shader_recompiler/runtime_info.h"
 #include "native/native_executor.h"
+#include "native/native_own_memory_census.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/readback_batch.h"
@@ -585,7 +586,9 @@ void Rasterizer::ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) 
             resolve_stats.planned.fetch_add(1, std::memory_order_relaxed);
         }
         static const bool ahead_census = [] { const char* e = std::getenv("TLG_ROW_AHEAD_CENSUS"); return e != nullptr && e[0] == '1'; }();
-        if (ahead_census || RowShare::Mode() != 0) {
+        // the engine id, range and version of every buffer binding with a record entry: what own memory by id reads (design review 83-88), and what the rows ahead keyed by
+        // (LEGACY(engine_rows): the row lookup below runs only with TLG_LEGACY_ENGINE_ROWS=1, design review 89)
+        if (ahead_census || RowShare::Mode() != 0 || Core::OwnMemoryCensus::OwnImmutableMode() != 0 || Core::OwnMemoryCensus::OwnMutableMode() != 0) {
             // rows ahead census (design review 54): every buffer binding with a record entry and an engine id, written and texel ones too: what the front would key a row by
             for (u32 i = 0; i < info.buffers.size(); ++i) {
                 const auto& desc = info.buffers[i];

@@ -6,6 +6,7 @@
 #include "native/native_row_version.h"
 #include "native/native_dispatch_split.h"
 #include "native/native_own_memory_census.h"
+#include "native/native_legacy.h"
 #include <nlohmann/json.hpp>
 
 #include "native/native_debug_server.h"
@@ -318,6 +319,7 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
         if (Core::RowVersion::Mode() != 0) {
             Core::DebugServer::Publish("row_version", Core::RowVersion::Report()); // F2 row version shadow
         }
+        Core::DebugServer::Publish("legacy", Core::Legacy::Report()); // design review 89: the index of old-path switches as read at startup
         if (Core::OwnMemoryCensus::On() || Core::OwnMemoryCensus::DropDirtyMode() != 0 || Core::OwnMemoryCensus::OwnImmutableMode() != 0 || Core::OwnMemoryCensus::OwnMutableMode() != 0 || Core::OwnMemoryCensus::OwnCloseMode() != 0) {
             Core::DebugServer::Publish("own_memory_census", Core::OwnMemoryCensus::Report()); // design review 79, step 1a
         }

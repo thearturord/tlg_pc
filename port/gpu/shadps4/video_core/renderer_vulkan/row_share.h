@@ -6,6 +6,7 @@
 // draw. The raster thread is the only writer; any thread may read. One slot per key hash (a collision overwrites: a row not found is only a missed shortcut). Each slot has a
 // sequence counter (odd while written), so a reader takes a whole row or none.
 
+#include "native/native_legacy.h"
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -111,6 +112,9 @@ inline void Erase(u64 key) noexcept {
 /// compared), 1 shadow, 0 off.
 [[nodiscard]] inline u32 Mode() noexcept {
     static const u32 mode = [] {
+        if (!Core::Legacy::EngineRows()) {
+            return 0u; // LEGACY(engine_rows): rows ahead deleted by default (design review 89); TLG_LEGACY_ENGINE_ROWS=1 brings them back
+        }
         const char* e = std::getenv("TLG_ROWS_AHEAD");
         if (e == nullptr || e[0] == 0) {
             return 2u;

@@ -20,6 +20,7 @@
 #include "native/native_row_version.h"
 #include "native/native_dispatch_split.h"
 #include "native/native_own_memory_census.h"
+#include "native/native_legacy.h"
 #include "native/native_prof.h"
 #include "native/native_marker.h"
 #include "native/native_ui_trace.h"
@@ -4357,7 +4358,8 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                       : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
                                                                                                                   : nullptr;
                 const ResolvedBuffer* a = ap != nullptr && buffer_index < ap->resolved.size() && ap->resolved[buffer_index].plan_found ? &ap->resolved[buffer_index] : nullptr;
-                static const bool rows_env_on = [] { const char* e = std::getenv("TLG_NATIVE_ROWS"); return e == nullptr || e[0] != '0'; }();
+                // LEGACY(engine_rows): the rows for engine buffer bindings are deleted by default (design review 89); TLG_LEGACY_ENGINE_ROWS=1 brings them back
+                static const bool rows_env_on = [] { const char* e = std::getenv("TLG_NATIVE_ROWS"); return Core::Legacy::EngineRows() && (e == nullptr || e[0] != '0'); }();
                 if (a == nullptr || !rows_env_on || (desc.is_written && !Core::RowVersion::WrittenRowsOn())) {
                     rc[7].fetch_add(1, std::memory_order_relaxed);
                 } else if ((a->plan_flags & Vulkan::RowShare::FlagStatic) != 0) {
@@ -4614,9 +4616,11 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     W31Before(w31_id, vsharp.address, size);
                 }
                 // W3.2 (TLG_NATIVE_ROWS=1): a read-only request of an engine buffer with a valid row is answered from the row; 1 in 64 also asks the old path and compares
+                // LEGACY(engine_rows): the rows for engine buffer bindings (serve and learn) are deleted by default (design review 89): own memory by id answers them, the
+                // rest take ObtainBuffer, whose answer the rows cached. TLG_LEGACY_ENGINE_ROWS=1 brings them back (then TLG_NATIVE_ROWS=0 turns them off as before)
                 static const bool rows_on = [] {
-                    const char* e = std::getenv("TLG_NATIVE_ROWS"); // default on since 2026-11-09 (owner play good); =0 turns it off
-                    return e == nullptr || e[0] != '0';
+                    const char* e = std::getenv("TLG_NATIVE_ROWS");
+                    return Core::Legacy::EngineRows() && (e == nullptr || e[0] != '0');
                 }();
                 const VideoCore::Buffer* row_buffer = nullptr;
                 u64 row_offset = 0;

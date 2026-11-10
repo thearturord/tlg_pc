@@ -1,0 +1,35 @@
+// SPDX-FileCopyrightText: Copyright 2026 tlg_pc
+// SPDX-License-Identifier: GPL-2.0-or-later
+#pragma once
+
+#include <nlohmann/json_fwd.hpp>
+
+/// THE INDEX OF OLD-PATH SWITCHES (design review 89). Every switch that brings an old, emulator-shaped path back is listed here, so a long play can be bisected
+/// without searching the code. All of them are read once at startup (environment variable, or the overlay the launcher passes). Each site the switch gates in the
+/// code carries a comment `LEGACY(<name>)` so `grep -rn "LEGACY(" port/gpu` finds them all.
+///
+/// Deleted paths kept behind a switch here (default off; `=1` brings the old path back):
+///   TLG_LEGACY_ENGINE_ROWS=1   `engine_rows`: rows for shader buffer bindings of engine buffers, on the front (rows ahead: `RowShare::Find`) and the raster thread
+///                              (`RowsServe`, `RowsLearn`, the rows-ahead bind). Deleted 2026-11-10 (design review 89): own memory by id answers them, the rest take
+///                              `ObtainBuffer`, whose answer the rows cached. Not covered: the index buffer rows (`TLG_GEOMETRY_ROWS`), which stay.
+///
+/// Steps whose old path is the switch's `=0` (each default on; listed so the whole set is in one place):
+///   TLG_EPOCH_PLANNER=0        the barrier planner's per-flush maps (design review 72-74)
+///   TLG_BARRIER_GUARD=0        the barrier query on every read binding (67-69)
+///   TLG_GEOMETRY_ROWS=0        the index buffer by address (76-78)
+///   TLG_DROP_DIRTY_APPLIES=0   the light and slot writes' dirty-set work (81-82)
+///   TLG_OWN_IMMUTABLE=0        immutable buffers bound through rows and `ObtainBuffer` (83-84)
+///   TLG_OWN_MUTABLE=0          default and dynamic buffers bound through rows and `ObtainBuffer` (85-86)
+///   TLG_OWN_CLOSE=0            no lazy own pointer (87-88)
+///   TLG_ID_MARKS=0             light and slot applies by address (49-51)
+///   TLG_IMAGE_BY_ID=0          the image step by address (63-65)
+///   TLG_ROW_VERSION=0, TLG_STATIC_ROWS=0, TLG_WRITTEN_ROWS=0, TLG_WIDE_ROWS=0, TLG_TEXSET_BY_ID=0, TLG_HOOK_RING=0 (sections 13-47)
+namespace Core::Legacy {
+
+/// TLG_LEGACY_ENGINE_ROWS=1: the rows for shader buffer bindings of engine buffers (see above).
+[[nodiscard]] bool EngineRows() noexcept;
+
+/// Every switch of the index with its value as read at startup ("unset" = the default), and whether a deleted path is back. Published as `legacy`.
+[[nodiscard]] nlohmann::json Report();
+
+} // namespace Core::Legacy
