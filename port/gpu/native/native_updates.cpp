@@ -420,6 +420,22 @@ u32 ApplyCoalesceMode() noexcept {
     return mode;
 }
 
+u32 IdMarksMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_ID_MARKS");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
+
+namespace {
+std::array<std::atomic<u64>, IdMarksCounts> id_marks_counts{};
+} // namespace
+
+void NoteIdMarks(IdMarksCount what, u64 n) noexcept {
+    id_marks_counts[what].fetch_add(n, std::memory_order_relaxed);
+}
+
 namespace {
 std::atomic<u64> coalesce_gap_out[4]{}, coalesce_objects{0};
 std::atomic<u64> coalesce_guard[2][2]{}; // [gap 4 KiB / 64 KiB][pieces in groups the guard lets merge / pieces in groups it refuses]
@@ -780,6 +796,7 @@ void ApplyBatch(const Batch& batch) {
     if (reapply_audit) {
         ReapplyAuditBefore(batch);
     }
+    const bool id_marks_real = IdMarksMode() == 2; // F1 class 2 marks by id: tags 2 and 12 are not hashed and not applied a second time
     const bool gate = ReapplyGateOn();
     {
         TLG_PROF_LEVEL("updates.apply_again", 2);
@@ -794,6 +811,13 @@ void ApplyBatch(const Batch& batch) {
                 const u32 writer = at < writers.size() ? writers[at].writer : 0u;
                 const u64 object = at < writers.size() ? writers[at].object : 0u;
                 ++at;
+                if (id_marks_real && IdMarksTag(writer)) {
+                    if (aligned) {
+                        ++index;
+                    }
+                    NoteIdMarks(ImAgainSkipped);
+                    continue;
+                }
                 if (aligned && again_mode == 1 && (trust >> writer & 1) != 0) {
                     ++index; // (the first list holds an entry for every range, hashed or not)
                     again_trusted_skipped_by_writer[writer].fetch_add(1, std::memory_order_relaxed);
@@ -867,7 +891,11 @@ void ApplyBatch(const Batch& batch) {
     const auto first_one = [&](u64 address, u64 size, bool plain, u32 writer, u64 object, bool ring_candidate) {
         N0::NoteApplied(size, false);
         FirstHash h{address, size, 0, false};
-        if (hash_here && size != 0 && size <= (u64{1} << 20) && !(first_mode == 1 && (first_trust >> writer & 1) != 0)) {
+        const bool id_lean_tag = id_marks_real && IdMarksTag(writer);
+        if (id_lean_tag && hash_here) {
+            NoteIdMarks(ImHashSkipped);
+        }
+        if (hash_here && !id_lean_tag && size != 0 && size <= (u64{1} << 20) && !(first_mode == 1 && (first_trust >> writer & 1) != 0)) {
             const u64 hash_start = N0::On() ? N0::NowNs() : 0;
             h.ok = NativeContent::HashGuarded64(address, size, h.hash);
             if (hash_start != 0) {
@@ -1227,6 +1255,15 @@ nlohmann::json B2Report() {
                            j[(w >= 8 ? "no_site_" : "") + std::to_string(w & 7)] = {{"unchanged", again_unchanged_by_writer[w].load()}, {"changed", again_changed_by_writer[w].load()}, {"trusted_skipped", again_trusted_skipped_by_writer[w].load()}, {"TRUSTED_WRONG_MUST_BE_0", again_trusted_wrong_by_writer[w].load()}};
                        }
                        return j;
+                   }()},
+                  {"id_marks", [] {
+                       const auto c = [](IdMarksCount w) { return id_marks_counts[w].load(); };
+                       return nlohmann::json{{"mode", IdMarksMode()}, {"applies", c(ImApplies)}, {"lean", c(ImLean)}, {"sampled_full", c(ImSampledFull)}, {"not_named", c(ImNotNamed)}, {"block", c(ImBlock)},
+                                             {"checked", c(ImChecked)}, {"UNEXPECTED_EFFECT_MUST_BE_0", c(ImUnexpectedEffect)}, {"unexpected_gpu_written", c(ImUnexpectedGpu)}, {"unexpected_image", c(ImUnexpectedImage)},
+                                             {"SAMPLED_UNEXPECTED_MUST_BE_0", c(ImSampledUnexpected)}, {"unattributed_marked", c(ImUnattributed)}, {"parts_match", c(ImPartsMatch)}, {"PARTS_DIFFER_MUST_BE_0", c(ImPartsDiffer)},
+                                             {"part_whole_buffer", c(ImPartWhole)}, {"part_not_whole_buffer", c(ImPartNotWhole)}, {"resident_bumped_own", c(ImResidentTold)}, {"resident_bumped_neighbor", c(ImResidentNeighbor)},
+                                             {"resident_bumped_neighbor_was_synced", c(ImResidentNeighborSynced)}, {"named_but_own_not_bumped", c(ImResidentToldNone)}, {"lean_resident_bumped", c(ImLeanResident)},
+                                             {"lean_not_resident", c(ImLeanNoResident)}, {"again_skipped", c(ImAgainSkipped)}, {"hash_skipped", c(ImHashSkipped)}};
                    }()},
                   {"reapply_gate", {{"on", ReapplyGateOn()}, {"skipped_unchanged", ra_gate_skipped.load()}, {"applied_changed_or_unknown", ra_gate_applied.load()}}},
             {"reapply_audit", {{"on", ReapplyAuditOn()}, {"batches", ra_batches.load()}, {"misaligned_batches", ra_misaligned_batches.load()}, {"ranges_audited", ra_audited.load()}, {"unhashed", ra_unhashed.load()},

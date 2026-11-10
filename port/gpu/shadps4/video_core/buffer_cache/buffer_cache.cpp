@@ -122,6 +122,118 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 }
 
 void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object) {
+    const u32 id_marks = Core::NativeUpdates::IdMarksMode();
+    if (id_marks == 0 || !Core::NativeUpdates::IdMarksTag(Core::N0::t_writer)) [[likely]] {
+        ApplyCpuWriteFull(address, size, newer, object);
+        return;
+    }
+    ApplyIdMark(address, size, newer, object, id_marks);
+}
+
+void BufferCache::IdMarkLean(VAddr address, u64 size, u64 id) {
+    // F1 class 2 marks by id (TLG_ID_MARKS=2, design review 49): what the full apply does for a light constant or scene slot range, by the buffer the announcer named. Kept: the bind memo erase
+    // (cheap; the census saw it erase nothing for these writers), the buffer's dirty part and row version, the unattributed set losing the part, the memo epochs, the buffer's resident generation.
+    // Not done: the GPU-written supersede, the address walk of the buffers, the image index and the page-wide resident walk (0 effects in 2.37 M applies, census ab0).
+    BindMemoErase(address, size);
+    {
+        std::scoped_lock lock{object_dirty_mutex};
+        if (Core::NativeUpdates::LeanDirtyMode() != 2) {
+            all_object_dirty.Add(address, size);
+        }
+        object_dirty[id].Add(address, size);
+        b9_unattributed.Subtract(address, size);
+    }
+    Core::RowVersion::Bump(id);
+    b9_epoch.fetch_add(1, std::memory_order_acq_rel);
+    cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
+    if (auto* resident = Core::NativeResources::FindImmutableById(id)) {
+        resident->generation.fetch_add(1, std::memory_order_acq_rel);
+        if (resident->synced.exchange(false, std::memory_order_acq_rel) && resident->usage != 1) {
+            Core::NativeResources::NoteResident(7);
+        }
+        Core::NativeUpdates::NoteIdMarks(Core::NativeUpdates::ImLeanResident);
+    } else {
+        Core::NativeUpdates::NoteIdMarks(Core::NativeUpdates::ImLeanNoResident);
+    }
+}
+
+void BufferCache::ApplyIdMark(VAddr address, u64 size, bool newer, u64 object, u32 mode) {
+    using namespace Core::NativeUpdates;
+    NoteIdMarks(ImApplies);
+    Core::NativeDevice::BufferPart told{};
+    const bool named = object != 0 && object != kBuffersOnly && Core::NativeDevice::BufferPartOf(object, address, size, told) && told.begin == address && told.end == address + size;
+    if (!named) {
+        NoteIdMarks(object == kBuffersOnly ? ImBlock : ImNotNamed);
+    }
+    if (mode == 2) {
+        if (!named) {
+            ApplyCpuWriteFull(address, size, newer, object);
+            return;
+        }
+        static thread_local u32 sample = 0;
+        if ((++sample & 63) != 0) {
+            NoteIdMarks(ImLean);
+            IdMarkLean(address, size, told.id);
+            return;
+        }
+        NoteIdMarks(ImSampledFull);
+    }
+    // the shadow (mode 1) and the mode 2 sample: the full apply decides; what the lean apply would do is compared with what it did
+    static thread_local std::vector<std::pair<u64, bool>> bumped;
+    static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
+    bumped.clear();
+    parts.clear();
+    BuffersInView(address, size, parts);
+    Core::NativeResources::t_bump_capture = &bumped;
+    const bool force_before = Core::N0::t_force_effect;
+    Core::N0::t_force_effect = true;
+    ApplyCpuWriteFull(address, size, newer, object);
+    Core::N0::t_force_effect = force_before;
+    Core::NativeResources::t_bump_capture = nullptr;
+    const u32 effects = Core::N0::t_effect;
+    NoteIdMarks(ImChecked);
+    const u32 unexpected = effects & (Core::N0::EffGpuRanges | Core::N0::EffImage);
+    if (unexpected != 0) {
+        NoteIdMarks(ImUnexpectedEffect);
+        if ((unexpected & Core::N0::EffGpuRanges) != 0) {
+            NoteIdMarks(ImUnexpectedGpu);
+        }
+        if ((unexpected & Core::N0::EffImage) != 0) {
+            NoteIdMarks(ImUnexpectedImage);
+        }
+        if (mode == 2) {
+            NoteIdMarks(ImSampledUnexpected);
+        }
+    }
+    if ((effects & Core::N0::EffUnattributed) != 0) {
+        NoteIdMarks(ImUnattributed);
+    }
+    if (named) {
+        const bool same = parts.size() == 1 && parts[0].id == told.id && parts[0].begin == told.begin && parts[0].end == told.end;
+        NoteIdMarks(same ? ImPartsMatch : ImPartsDiffer);
+    }
+    for (const auto& part : parts) {
+        NoteIdMarks(part.begin == part.object_begin && part.end == part.object_end ? ImPartWhole : ImPartNotWhole);
+    }
+    bool own_bumped = false;
+    for (const auto& [id, was_synced] : bumped) {
+        const bool own = std::any_of(parts.begin(), parts.end(), [&](const auto& p) { return p.id == id; });
+        if (own) {
+            own_bumped = own_bumped || (named && id == told.id);
+            NoteIdMarks(ImResidentTold);
+        } else {
+            NoteIdMarks(ImResidentNeighbor);
+            if (was_synced) {
+                NoteIdMarks(ImResidentNeighborSynced);
+            }
+        }
+    }
+    if (named && !own_bumped) {
+        NoteIdMarks(ImResidentToldNone);
+    }
+}
+
+void BufferCache::ApplyCpuWriteFull(VAddr address, u64 size, bool newer, u64 object) {
     Core::SplitCensus::Touch(Core::SplitCensus::BufDirty);
     // N1.2: the announcer named the engine buffer it wrote into. `told_whole`: that buffer holds the whole range, so its part is known without the address walk
     const u32 id_mode = object != 0 ? Core::NativeUpdates::BufferIdMode() : 0u;

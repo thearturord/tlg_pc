@@ -193,6 +193,10 @@ public:
     [[nodiscard]] bool NativeCpuQuery(VAddr addr, size_t size);
     /// What a CPU write of [address, address + size) means for the caches (the harvest's replay; B2: an applied announcement)
     void ApplyCpuWrite(VAddr address, u64 size, bool newer = false, u64 object = 0);
+    /// The full apply of an announced range (every step); `ApplyCpuWrite` calls it, or the marks by id for tags 2 and 12 (`TLG_ID_MARKS`)
+    void ApplyCpuWriteFull(VAddr address, u64 size, bool newer, u64 object);
+    void ApplyIdMark(VAddr address, u64 size, bool newer, u64 object, u32 mode);
+    void IdMarkLean(VAddr address, u64 size, u64 id);
     /// TLG_ANNOUNCE_SKIP: may an announced write with the same bytes as the last announcement of these bytes be left unapplied? Not when the GPU wrote them since or an image covers them.
     [[nodiscard]] u32 CanSkipIdenticalWrite(VAddr address, u64 size);
     /// L1: may these announced pieces be applied as the one range [begin, begin + size)?

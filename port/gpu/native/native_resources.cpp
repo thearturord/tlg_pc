@@ -630,6 +630,8 @@ void NoteImageUpload(VAddr address, u64 size, bool from_gpu_memory) {
 std::array<std::atomic<u64>, 5> lift_census_faults{};
 std::array<std::atomic<u64>, 8> lift_census_by_usage_size{};
 
+thread_local std::vector<std::pair<u64, bool>>* t_bump_capture = nullptr;
+
 void NoteCpuWrite(VAddr address, u64 size) {
     Core::SplitCensus::Touch(Core::SplitCensus::ObjectNotes);
     {
@@ -669,7 +671,11 @@ void NoteCpuWrite(VAddr address, u64 size) {
                 if (hit) {
                     Core::N0::SetEffect(Core::N0::EffResident);
                     buffer.generation.fetch_add(1, std::memory_order_acq_rel);
-                    if (buffer.synced.exchange(false, std::memory_order_acq_rel)) {
+                    const bool was_synced = buffer.synced.exchange(false, std::memory_order_acq_rel);
+                    if (t_bump_capture != nullptr) [[unlikely]] {
+                        t_bump_capture->emplace_back(buffer.id, was_synced);
+                    }
+                    if (was_synced) {
                         immutable_drops.fetch_add(1, std::memory_order_relaxed);
                         if (buffer.usage != 1) {
                             NoteResident(7);

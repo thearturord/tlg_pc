@@ -6,6 +6,8 @@
 #include <array>
 #include <atomic>
 #include <string>
+#include <utility>
+#include <vector>
 #include <nlohmann/json_fwd.hpp>
 #include "common/types.h"
 
@@ -42,6 +44,8 @@ void NoteImageCensus(VAddr address, u32 width, u32 height, bool render_target, b
 [[nodiscard]] nlohmann::json ImageCensus();
 /// The CPU wrote tracked memory.
 void NoteCpuWrite(VAddr address, u64 size);
+/// F1 marks by id shadow (`TLG_ID_MARKS`): when set on this thread, `NoteCpuWrite` appends the id of every buffer whose generation it bumps and whether it was synchronized then.
+extern thread_local std::vector<std::pair<u64, bool>>* t_bump_capture;
 
 /// An engine buffer with Usage IMMUTABLE: the engine writes its contents once, at creation, and never again. Once the backend
 /// has synchronized the whole buffer with the GPU, requests for it need no tracker query and no copy. A CPU write fault on the

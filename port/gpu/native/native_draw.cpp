@@ -8611,7 +8611,19 @@ void AnnounceSceneSlotRange(u64 frame, u32 upto, bool remember_group) {
                 Core::RareEvents::Note(fmt::format("scene_slot_group_{}_memory", group), fmt::format("group {}: slot {} memory {:#x}, slot {} memory {:#x}, slot 0 memory {:#x}, slot 8191 memory {:#x}", group, first, first_memory, upto - 1, last_memory, memory_of(0), memory_of(8191)));
             }
         }
-        if (first_memory - last_memory == static_cast<u64>(upto - 1 - first) * SceneSlotStride) {
+        if (Core::NativeUpdates::IdMarksMode() != 0) {
+            // F1 class 2 marks by id (TLG_ID_MARKS): each slot names its engine buffer (id at buffer + 0x10), so the raster thread applies it by id, not as a block by address
+            for (u32 i = first; i < upto; ++i) {
+                const u64 slot = Rd<u64>(ring, static_cast<u64>(i) * 8);
+                const u64 buffer = IsHeapPointer(slot) ? Rd<u64>(slot, 0x130) : 0;
+                if (!IsHeapPointer(buffer)) {
+                    continue;
+                }
+                if (const u64 memory = Rd<u64>(buffer, 0x30)) {
+                    Core::NativeUpdates::NoteWriterRange(4, memory, SceneSlotBytes, nullptr, false, Rd<u64>(buffer, 0x10));
+                }
+            }
+        } else if (first_memory - last_memory == static_cast<u64>(upto - 1 - first) * SceneSlotStride) {
             Core::NativeUpdates::NoteWriterRange(4, last_memory, first_memory - last_memory + SceneSlotBytes, nullptr, false, Core::NativeUpdates::kBuffersOnly); // one block
         } else {
             for (u32 i = first; i < upto; ++i) {

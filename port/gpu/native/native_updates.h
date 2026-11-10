@@ -78,6 +78,42 @@ enum BufferIdCount : u32 { IdToldWhole, IdToldPartial, IdUnknown, IdPartsMatch, 
 /// L1 (`TLG_APPLY_COALESCE`): 0 off (default), 1 the first-time announcements of a batch are applied as merged ranges (same engine buffer, touching or overlapping bytes: the byte set is the same, the
 /// apply passes run once per merged range instead of once per piece), 2 counts what merging would do and applies as before (`coalesce` in `buffer_id`).
 [[nodiscard]] u32 ApplyCoalesceMode() noexcept;
+/// F1 class 2, marks by buffer id (`TLG_ID_MARKS`, design review sections 48 and 49): 0 off (default), 1 shadow, 2 real. Concerns the batch applies of the light constants (tag 2) and the
+/// scene slots (tag 12: writer 4 without a site name; with the switch on the slot announcer names each slot's engine buffer instead of announcing a block). The batch order stays.
+/// 1: the full apply decides; beside it, what the lean apply would do is compared (parts, effects, resident buffers it would not bump). 2: a range that its named buffer holds is applied lean:
+/// the bind memo erase, the buffer's dirty part and row version, its resident generation; no GPU-written supersede, no address walk, no image index, no page-wide resident walk, no batch hashes,
+/// no second application (census `ab0`: those steps did nothing for these writers in 2.37 M applies, the second application found 0 changed in 3.1 M). One in 64 runs in full and is compared.
+[[nodiscard]] u32 IdMarksMode() noexcept;
+[[nodiscard]] inline bool IdMarksTag(u32 tag) noexcept {
+    return tag == 2 || tag == 12;
+}
+enum IdMarksCount : u32 {
+    ImApplies,               ///< applies of tags 2 and 12 with the switch on
+    ImLean,                  ///< applied lean (mode 2)
+    ImSampledFull,           ///< mode 2: the one in 64 applied in full and compared
+    ImNotNamed,              ///< the announcer named no buffer that holds the range (full path)
+    ImBlock,                 ///< a block over several buffers (kBuffersOnly; full path)
+    ImChecked,               ///< full applies compared (shadow, or the mode 2 sample)
+    ImUnexpectedEffect,      ///< the full apply did something the lean one does not do: GPU-written supersede or the image index (MUST_BE_0)
+    ImUnexpectedGpu,         ///< ... the GPU-written supersede
+    ImUnexpectedImage,       ///< ... the image index
+    ImSampledUnexpected,     ///< the same in a mode 2 sample (MUST_BE_0)
+    ImUnattributed,          ///< the full apply marked bytes no buffer holds (gaps of a block)
+    ImPartsMatch,            ///< named: the address walk found exactly the named part
+    ImPartsDiffer,           ///< named: it found something else (MUST_BE_0)
+    ImPartWhole,             ///< a part covers its whole buffer
+    ImPartNotWhole,          ///< a part covers only some of its buffer
+    ImResidentTold,          ///< the full apply bumped the resident generation of a buffer the range lies in
+    ImResidentNeighbor,      ///< ... of another buffer on the same page (the lean apply does not)
+    ImResidentNeighborSynced,///< ... that was synchronized at that moment
+    ImResidentToldNone,      ///< named, and the full apply bumped no resident generation of the named buffer
+    ImLeanResident,          ///< lean: the named buffer's resident generation bumped
+    ImLeanNoResident,        ///< lean: the named buffer is not a resident buffer
+    ImAgainSkipped,          ///< mode 2: second applications skipped
+    ImHashSkipped,           ///< mode 2: batch hashes skipped
+    IdMarksCounts
+};
+void NoteIdMarks(IdMarksCount what, u64 n = 1) noexcept;
 /// L1: pieces of one engine buffer closer than this many bytes (`TLG_APPLY_COALESCE_GAP`, default 4096) are candidates for one applied range.
 [[nodiscard]] u64 ApplyCoalesceGap() noexcept;
 /// L1: why a group was refused (0 tracker/image mode, 1 named buffer does not hold the range, 2 GPU written, 3 clear waits or an image touches no piece), counted in groups and pieces.
