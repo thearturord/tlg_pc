@@ -138,6 +138,23 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
                 }
             }
             out["buffer_causes_cumulative"] = std::move(bc);
+            {
+                // design review 53: the handle path of a binding in six segments (ns, cumulative)
+                static constexpr const char* seg_names[] = {"0_resolve_ahead_check_and_descriptor", "1_hint_census_bind_context", "2_row_lookup", "3_answer_verify_learn",
+                                                            "4_recipe_recorder_audit", "5_binding_write_barrier_query"};
+                nlohmann::json hs = nlohmann::json::object();
+                for (u32 served = 0; served < 2; ++served) {
+                    for (u32 side = 0; side < 2; ++side) {
+                        auto& seg = (served ? cover_handle_seg_served : cover_handle_seg)[side];
+                        nlohmann::json one = {{"bindings", seg[6].load()}};
+                        for (u32 k = 0; k < 6; ++k) {
+                            one[seg_names[k]] = seg[k].load();
+                        }
+                        hs[std::string(served ? "row_served_" : "not_row_served_") + (side ? "compute" : "graphics")] = std::move(one);
+                    }
+                }
+                out["handle_path_segments_ns_cumulative"] = std::move(hs);
+            }
             nlohmann::json cc = nlohmann::json::array();
             for (u32 c = 0; c < 16; ++c) {
                 if (const u64 n = cover_class_draws[c].load(); n != 0) {

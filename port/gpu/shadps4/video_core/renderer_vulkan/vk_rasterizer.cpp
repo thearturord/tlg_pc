@@ -1960,6 +1960,11 @@ void Rasterizer::BindCensus(const Pipeline* pipeline) {
 }
 
 namespace {
+thread_local u64 t_bseg[6] = {}; // TLG_COVER_CENSUS: stamps of the handle path of one binding (1 after the descriptor, 2 before the row, 3 after the row, 4 after the answer, 5 before the binding is written)
+thread_local bool t_bseg_served = false;
+inline u64 BsegNow() noexcept {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 thread_local u32 t_cover_mask = 0;
 thread_local u32 t_cover_kind = 0; // R1': the kind of the last binding the stage loop counted
 thread_local u64 t_cover_begin = 0;
@@ -3877,6 +3882,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
         u32 cover_cause = 0;
         if (cover_on) [[unlikely]] {
             t_cover_kind = 0;
+            t_bseg[1] = t_bseg[2] = t_bseg[3] = t_bseg[4] = t_bseg[5] = 0;
             cover_t0 = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
             cover_sync0 = ::VideoCore::t_cover_sync_ns;
             cover_copies0 = ::VideoCore::t_cover_sync_copies;
@@ -4171,6 +4177,9 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     }
                 }
                 if (!in_place) {
+                if (cover_on) [[unlikely]] {
+                    t_bseg[1] = BsegNow();
+                }
                 // N3c: the immutable engine buffer named by the record's binding (by the engine's id), when the plan resolved one and nothing was registered since
                 Core::NativeResources::ImmutableBuffer* immutable_hint = nullptr;
                 if (record_binding != ~0u && binder_plan->has_handles && (binder_plan->handles[record_binding] != nullptr)) {
@@ -4217,6 +4226,11 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 u64 row_offset = 0;
                 const bool rows_here = rows_on && (!desc.is_written || Core::RowVersion::WrittenRowsOn()); // F2 item 3: written bindings by row too (TLG_WRITTEN_ROWS=1)
                 const bool row_served = rows_here && RowsServe(w31_id, vsharp.address, size, desc.is_formatted, row_buffer, row_offset, desc.is_written);
+                if (cover_on) [[unlikely]] {
+                    t_bseg[2] = w3_a;
+                    t_bseg[3] = BsegNow();
+                    t_bseg_served = row_served;
+                }
                 // (what a learn needs, taken before the old path answers; only asked of the requests the old path answers)
                 u64 rows_epoch_pre = 0, rows_clock_pre = 0, rows_version_pre = 0, rows_unattr_pre = 0;
                 bool rows_gpu_pre = false;
@@ -4411,6 +4425,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 if (cover_on) [[unlikely]] {
                     w3_row = row_served;
                     w3_b = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+                    t_bseg[4] = w3_b;
                 }
                 const auto [buffer, offset] = obtained;
                 Core::NativeContent::ClearBindContext();
@@ -4508,6 +4523,9 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         Core::NativeRegistry::NoteDebug(text);
                     }
                 }
+                if (cover_on) [[unlikely]] {
+                    t_bseg[5] = BsegNow();
+                }
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
@@ -4578,6 +4596,14 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
             const u32 slot = (census_base != 0 ? 128u : 0u) + (cover_cause & 15u) * 8u + (t_cover_kind & 7u);
             cover_buf_n[slot].fetch_add(1, std::memory_order_relaxed);
             cover_buf_ns[slot].fetch_add(now - cover_t0, std::memory_order_relaxed);
+            if (t_cover_kind == 4 && t_bseg[1] != 0 && t_bseg[2] != 0 && t_bseg[3] != 0 && t_bseg[4] != 0 && t_bseg[5] != 0) {
+                const u64 marks[7] = {cover_t0, t_bseg[1], t_bseg[2], t_bseg[3], t_bseg[4], t_bseg[5], now};
+                auto& seg = (t_bseg_served ? cover_handle_seg_served : cover_handle_seg)[census_base != 0 ? 1 : 0];
+                for (u32 k = 0; k < 6; ++k) {
+                    seg[k].fetch_add(marks[k + 1] - marks[k], std::memory_order_relaxed);
+                }
+                seg[6].fetch_add(1, std::memory_order_relaxed);
+            }
             if (census_base != 0 && w3_a != 0 && w3_b != 0) {
                 t_w3.buf[0] += w3_a - cover_t0;
                 t_w3.buf[1] += w3_b - w3_a;
