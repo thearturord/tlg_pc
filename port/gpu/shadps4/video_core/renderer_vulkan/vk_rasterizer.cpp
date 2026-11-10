@@ -135,6 +135,7 @@ struct RealRow {
     bool inside{};           ///< the range lies inside the buffer's own bytes (the unattributed version is not asked)
     bool is_static{};        ///< F1 class 2 static row: learned from the one upload of ObtainStatic
     u64 hash{};              ///< ... the guest bytes' hash at that upload
+    bool written{};          ///< F2 item 3: the row of a written binding
 };
 thread_local std::unordered_map<u64, RealRow> t_rows_real;
 struct StaticSeen {
@@ -144,9 +145,9 @@ thread_local std::unordered_map<u64, StaticSeen> t_static_seen; // static-row ce
 thread_local bool t_row_gpu = false, t_row_dirty_epoch = false; // (diagnostics of the last served row)
 thread_local bool t_row_static = false; // the last served row is a static row
 thread_local u64 t_row_hash = 0;
-inline u64 RowKey(u64 id, u64 address, u64 size, bool texel) noexcept {
+inline u64 RowKey(u64 id, u64 address, u64 size, bool texel, bool written = false) noexcept {
     u64 h = 0xcbf29ce484222325ull;
-    for (const u64 v : {id, address, size, static_cast<u64>(texel)}) {
+    for (const u64 v : {id, address, size, static_cast<u64>(texel) | (written ? 2u : 0u)}) {
         h = (h ^ v) * 0x100000001b3ull;
         h ^= h >> 29;
     }
@@ -2069,13 +2070,13 @@ void Rasterizer::W1ShadowGeometry(const Core::NativeResources::ImmutableBuffer* 
 
 /// W3.2 counters in `w1s_counts`: 128 requests served from a row, 129 of them also run by the old path (1 in 64), 130 verified answers that differ (MUST_BE_0), 131 verified requests where the old
 /// path did work although the row was valid (MUST_BE_0), 132 rows learned, 133 not learned (texel buffer over an image or image metadata), 134 no row, 135 row stale (epoch, identity event, dirty bytes)
-bool Rasterizer::RowsServe(u64 id, VAddr address, u64 size, bool texel, const VideoCore::Buffer*& buffer, u64& offset) noexcept {
+bool Rasterizer::RowsServe(u64 id, VAddr address, u64 size, bool texel, const VideoCore::Buffer*& buffer, u64& offset, bool written) noexcept {
     if (id == 0) {
         return false;
     }
     auto& s = w1s_counts;
-    const auto it = t_rows_real.find(RowKey(id, address, size, texel));
-    if (it == t_rows_real.end() || it->second.id != id || it->second.address != address || it->second.size != size || it->second.texel != texel) {
+    const auto it = t_rows_real.find(RowKey(id, address, size, texel, written));
+    if (it == t_rows_real.end() || it->second.id != id || it->second.address != address || it->second.size != size || it->second.texel != texel || it->second.written != written) {
         s[134].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -2150,7 +2151,7 @@ bool Rasterizer::RowsServe(u64 id, VAddr address, u64 size, bool texel, const Vi
 }
 
 void Rasterizer::RowsLearn(u64 id, VAddr address, u64 size, bool texel, const VideoCore::Buffer* buffer, u64 offset, u64 epoch_pre, u64 clock_pre, bool gpu_pre, u64 version_pre,
-                           u64 unattr_pre) noexcept {
+                           u64 unattr_pre, bool written) noexcept {
     if (id == 0 || buffer == nullptr || buffer_cache.IsStreamBuffer(buffer)) {
         return;
     }
@@ -2166,6 +2167,9 @@ void Rasterizer::RowsLearn(u64 id, VAddr address, u64 size, bool texel, const Vi
         return;
     }
     const bool gpu = buffer_cache.IsRangeGpuWritten(address, size);
+    if (written && (!gpu || !gpu_pre)) {
+        return; // a written row is learned once the range is GPU written before and after the old path's answer (its first write changes that state)
+    }
     if (gpu != gpu_pre) {
         w1s_counts[133].fetch_add(1, std::memory_order_relaxed); // the GPU written state changed while the old path answered (a download completed): the answer says nothing about either state
         return;
@@ -2191,7 +2195,10 @@ void Rasterizer::RowsLearn(u64 id, VAddr address, u64 size, bool texel, const Vi
             return;
         }
     }
-    t_rows_real[RowKey(id, address, size, texel)] = RealRow{id, address, size, texel, buffer, offset, epoch_pre, clock_pre, gpu, version_pre, unattr_pre, inside};
+    t_rows_real[RowKey(id, address, size, texel, written)] = RealRow{id, address, size, texel, buffer, offset, epoch_pre, clock_pre, gpu, version_pre, unattr_pre, inside, false, 0, written};
+    if (written) {
+        Core::RowVersion::NoteWritten(1);
+    }
     w1s_counts[132].fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -4208,11 +4215,12 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 }();
                 const VideoCore::Buffer* row_buffer = nullptr;
                 u64 row_offset = 0;
-                const bool row_served = rows_on && !desc.is_written && RowsServe(w31_id, vsharp.address, size, desc.is_formatted, row_buffer, row_offset);
+                const bool rows_here = rows_on && (!desc.is_written || Core::RowVersion::WrittenRowsOn()); // F2 item 3: written bindings by row too (TLG_WRITTEN_ROWS=1)
+                const bool row_served = rows_here && RowsServe(w31_id, vsharp.address, size, desc.is_formatted, row_buffer, row_offset, desc.is_written);
                 // (what a learn needs, taken before the old path answers; only asked of the requests the old path answers)
                 u64 rows_epoch_pre = 0, rows_clock_pre = 0, rows_version_pre = 0, rows_unattr_pre = 0;
                 bool rows_gpu_pre = false;
-                if (rows_on && !desc.is_written && (!row_served || false)) {
+                if (rows_here && (!row_served || false)) {
                     rows_epoch_pre = buffer_cache.PlacementEpoch();
                     rows_clock_pre = Core::NativeIdentity::Clock();
                     if (Core::RowVersion::Mode() != 0) [[unlikely]] {
@@ -4307,6 +4315,12 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     } else {
                         VideoCore::BufferCache::UploadBytesReset();
                         const_cast<VideoCore::Buffer*>(row_buffer)->NoteResolveUse(); // P3c: asked for by the operation being resolved
+                        if (desc.is_written) {
+                            // F2 item 3: what the old path's written answer does besides answering: answers over the memory are stale, the resident copies of its bytes too
+                            buffer_cache.BindMemoErase(vsharp.address, size);
+                            Core::NativeResources::NoteGpuWritten(vsharp.address, size);
+                            Core::RowVersion::NoteWritten(0);
+                        }
                         obtained = {row_buffer, row_offset};
                     }
                 } else {
@@ -4336,6 +4350,12 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         }
                     } else {
                         Core::RowVersion::NoteStaticReal(5);
+                    }
+                }
+                if (rows_here && desc.is_written && !row_served) {
+                    if (!buffer_cache.IsHookRing(obtained.first) && !buffer_cache.IsStreamBuffer(obtained.first)) {
+                        RowsLearn(w31_id, vsharp.address, size, desc.is_formatted, obtained.first, obtained.second, rows_epoch_pre, rows_clock_pre, rows_gpu_pre, rows_version_pre, rows_unattr_pre,
+                                  true);
                     }
                 }
                 if (rows_on && !desc.is_written && !row_served) {

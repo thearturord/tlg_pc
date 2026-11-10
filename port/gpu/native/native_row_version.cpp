@@ -20,7 +20,8 @@ std::atomic<u64> real[5]{};
 std::atomic<u64> walk[7]{};
 std::atomic<u64> old_answer[5][2]{};
 std::atomic<u64> static_rows[7][2]{};
-std::atomic<u64> static_real[6]{}; // calls, steps, ns, max steps, none, overlaps, unknown
+std::atomic<u64> static_real[6]{};
+std::atomic<u64> written_rows[2]{}; // calls, steps, ns, max steps, none, overlaps, unknown
 
 inline u32 SlotOf(u64 id) noexcept {
     return static_cast<u32>((id * 0x9E3779B97F4A7C15ull) >> (64 - SlotBits));
@@ -152,6 +153,20 @@ void NoteStaticReal(u32 what, u64 n) noexcept {
     }
 }
 
+bool WrittenRowsOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_WRITTEN_ROWS");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+void NoteWritten(u32 what) noexcept {
+    if (what < 2) {
+        written_rows[what].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void NoteLearn(bool inside) noexcept {
     learned[inside ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
 }
@@ -176,6 +191,7 @@ nlohmann::json Report() {
             j["static_row_census"][Names[k]] = {{"reads", static_rows[k][0].load()}, {"bytes", static_rows[k][1].load()}};
         }
     }
+    j["written_rows"] = {{"on", WrittenRowsOn()}, {"served", written_rows[0].load()}, {"learned", written_rows[1].load()}};
     j["static_rows"] = {{"on", StaticRowsOn()}, {"learned", static_real[0].load()}, {"served", static_real[1].load()}, {"served_checked_by_hash", static_real[2].load()},
                         {"STATIC_BYTES_CHANGED_MUST_BE_0", static_real[3].load()}, {"bytes_uploaded_at_learns", static_real[4].load()}, {"learns_refused", static_real[5].load()}};
     j["real"] = {{"served_by_version", real[0].load()}, {"also_asked_of_the_sets", real[1].load()}, {"SETS_DIRTY_VERSION_CLEAN_MUST_BE_0", real[2].load()},

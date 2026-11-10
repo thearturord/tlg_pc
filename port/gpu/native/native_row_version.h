@@ -45,6 +45,12 @@ void NoteOldAnswer(u32 what, u64 bytes) noexcept;
 /// bind) is uploaded once into the buffer's own device memory, from guest memory, whole, and learned as a row; the version serves it from then on. One served read in 64 hashes the
 /// guest bytes against the hash taken at the learn (`STATIC_BYTES_CHANGED_MUST_BE_0`; that read is not served). Also turns on the missing BeginRecording announcement (+0x2790).
 [[nodiscard]] bool StaticRowsOn() noexcept;
+/// F2 item 3 (`TLG_WRITTEN_ROWS=1`, default off): a written buffer binding is answered by a row like a read: learned once the range is GPU written (the second written bind), valid while
+/// the placement epoch, the identity log and the buffer's version hold; a served one still erases the bind memo over the range and notes the GPU write for the resident copies.
+/// One in 64 also runs the old path and compares (the W3.2 verifier).
+[[nodiscard]] bool WrittenRowsOn() noexcept;
+/// 0 served, 1 learned.
+void NoteWritten(u32 what) noexcept;
 /// 0 learned, 1 served, 2 served reads checked by hash, 3 STATIC_BYTES_CHANGED (MUST_BE_0), 4 bytes uploaded at the learns, 5 learns refused (outside the buffer, not hashed).
 void NoteStaticReal(u32 what, u64 n = 1) noexcept;
 /// Diagnostics (`TLG_WATCH_ADDR=0x...`): does [address, address + size) overlap the watched address? (logs, nothing else)
