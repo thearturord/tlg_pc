@@ -7099,8 +7099,8 @@ u64 PS4_SYSV_ABI RecordingWrites(u64 device, u64 a1, u64 a2, u64 a3, u64 a4, u64
         // 1 KB), was never announced; the census found its bytes changing every frame with no announcement (`TLG_ANNOUNCE_RECORDING_2790=1`, default off)
         static const bool announce_2790 = [] {
             const char* e = std::getenv("TLG_ANNOUNCE_RECORDING_2790");
-            const char* s = std::getenv("TLG_STATIC_ROWS");
-            return (e != nullptr && e[0] == '1') || (s != nullptr && s[0] == '1');
+            const char* s = std::getenv("TLG_STATIC_ROWS"); // (static rows default on since 2026-11-10: the announcement with them; TLG_STATIC_ROWS=0 alone leaves it off)
+            return (e != nullptr && e[0] == '1') || s == nullptr || s[0] == 0 || s[0] != '0';
         }();
         for (const u64 field : {u64{0x2830}, u64{0x26e0}, u64{0x2790}}) {
             if (field == 0x2790 && !announce_2790) {

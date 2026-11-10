@@ -41,7 +41,7 @@ void NoteOldAnswer(u32 what, u64 bytes) noexcept;
 /// the previous copy of the same request: 0 no previous copy, 1 version same + bytes same (a row would have been right), 2 version same + bytes DIFFERENT (MUST_BE_0: a row would
 /// have served stale bytes), 3 version moved + bytes same (an extra miss), 4 version moved + bytes different (a right miss), 5 not inside its buffer, 6 not hashed.
 [[nodiscard]] bool StaticCensusOn() noexcept;
-/// F1 class 2, first case (`TLG_STATIC_ROWS=1`, default off): a small read-only range of an engine buffer outside the frame ring that the stream ring answered (a fresh copy at every
+/// F1 class 2, first case (`TLG_STATIC_ROWS`, default on since 2026-11-10, =0 off): a small read-only range of an engine buffer outside the frame ring that the stream ring answered (a fresh copy at every
 /// bind) is uploaded once into the buffer's own device memory, from guest memory, whole, and learned as a row; the version serves it from then on. One served read in 64 hashes the
 /// guest bytes against the hash taken at the learn (`STATIC_BYTES_CHANGED_MUST_BE_0`; that read is not served). Also turns on the missing BeginRecording announcement (+0x2790).
 [[nodiscard]] bool StaticRowsOn() noexcept;
