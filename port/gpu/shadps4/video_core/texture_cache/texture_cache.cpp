@@ -17,6 +17,7 @@
 #include "native/native_prof.h"
 
 #include "native/native_image_marks.h"
+#include "native/native_n0_census.h"
 #include "native/native_untracked_ring.h"
 
 #include "common/assert.h"
@@ -993,6 +994,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                 Core::NativeUpdates::NoteB8(gpu ? Core::NativeUpdates::B8AdoptedGpu : Core::NativeUpdates::B8Adopted);
                 if (b8_find == 2 && !gpu) {
                     found.flags |= ImageFlagBits::CpuDirty;
+                    found.b8_marks |= B8OtherDirty;
                 }
             }
         }
@@ -1242,6 +1244,24 @@ void TextureCache::RefreshImage(Image& image, Core::ImageCaller caller) {
     }
     // F2.4: the B8.1 verify (a hash of the guest bytes after each refresh, off by default) and the accounting of what dirtied the image are gone: an image is refreshed by the announcements and
     // the engine's own writes (E3.1: the address route found a change in 0 of 8.7 million refreshes), and the write ledger (F2.5) says whether the memory moved after the draw that reads it.
+    if ((image.b8_marks & (B8CandDirty | B8OtherDirty)) != 0) [[unlikely]] {
+        // F1 ring-out census: a refresh that uploads an image only ring candidates dirtied is what the image step of their apply still protects
+        if (True(image.flags & ImageFlagBits::Dirty) && image.info.num_samples <= 1 && (image.b8_marks & B8CandDirty) != 0) {
+            if ((image.b8_marks & B8OtherDirty) == 0 && False(image.flags & ImageFlagBits::MaybeCpuDirty) && False(image.flags & ImageFlagBits::GpuDirty)) {
+                Core::N0::NoteRingOut(Core::N0::OutImageRefreshOnlyCand);
+                Core::N0::NoteRingOut(Core::N0::OutImageRefreshOnlyCandBytes, image.info.guest_size);
+                static std::atomic<u32> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+                    LOG_WARNING(Render_Vulkan, "F1 ring-out census: image {:#x}+{:#x} ({}x{}, in ring {}) refreshed, dirtied only by ring constant copies or buffer Map windows",
+                                image.info.guest_address, image.info.guest_size, image.info.size.width, image.info.size.height,
+                                Core::NativeContent::InRing(image.info.guest_address, image.info.guest_size));
+                }
+            } else {
+                Core::N0::NoteRingOut(Core::N0::OutImageRefreshCandAndOther);
+            }
+        }
+        image.b8_marks &= ~(B8CandDirty | B8OtherDirty);
+    }
     if (False(image.flags & ImageFlagBits::Dirty)) {
         if (False(image.flags & ImageFlagBits::GpuModified) && image.info.num_samples <= 1 && !Core::NativeContent::InRing(image.info.guest_address, image.info.guest_size)) {
             Core::NativeContent::SilentImageKept(image.info.guest_address, image.info.guest_size); // W1.5 census (TLG_SILENT_CENSUS=1)
@@ -1703,7 +1723,18 @@ Core::NativeImageIndex::Host::Announced TextureCache::ApplyAnnounced(ImageId id,
         return Announced::NotOverlapping;
     }
     if (!newer && True(image.flags & ImageFlagBits::GpuModified)) {
+        if (Core::N0::On() && Core::N0::t_ring_candidate) [[unlikely]] {
+            Core::N0::NoteRingOut(Core::N0::OutImageKeptForGpu);
+        }
         return Announced::KeptForGpu; // the GPU wrote the image after the first application: its bytes are newer than the CPU's
+    }
+    if (Core::N0::On()) [[unlikely]] {
+        if (Core::N0::t_ring_candidate) {
+            image.b8_marks |= B8CandDirty;
+            Core::N0::NoteRingOut(Core::N0::OutImageDirtied);
+        } else {
+            image.b8_marks |= B8OtherDirty;
+        }
     }
     image.flags |= ImageFlagBits::CpuDirty;
     UntrackImage(id);

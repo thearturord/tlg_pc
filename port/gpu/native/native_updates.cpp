@@ -567,6 +567,10 @@ void ReapplyAuditBefore(const Batch& batch) {
             continue;
         }
         ra_audited.fetch_add(1, std::memory_order_relaxed);
+        const bool cand = N0::On() && i < again_tags.size() && again_tags[i].ring_candidate != 0;
+        if (cand) {
+            N0::NoteRingOut(now == before.hash ? N0::OutAgainUnchanged : announced_over(before.address, before.size) ? N0::OutAgainChangedAnnounced : N0::OutAgainChangedUnannounced);
+        }
         if (now == before.hash) {
             ra_unchanged.fetch_add(1, std::memory_order_relaxed);
         } else if (announced_over(before.address, before.size)) {
@@ -680,6 +684,15 @@ bool RingLeanApplyOn() noexcept {
     }();
     return on;
 }
+
+bool RingOutOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_RING_OUT");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+std::atomic<u64> c_ring_out[2]{}; // 0 kept out of the batch, 1 sent to the batch as the sampled full check
 
 std::atomic<u64> c_ring_lean[4]{};
 void NoteRingLean(u32 what) noexcept {
@@ -1189,12 +1202,19 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
     if (RingMirror::ShadowOn()) {
         RingMirror::NoteWriter(address, size, (writer & 7) | t_announce_site_class);
     }
-    if (B2NativeMode() != 0) {
+    bool ring_out = false;
+    const bool ring_candidate = B2NativeMode() != 0 && (N0::On() || RingLeanApplyOn() || RingOutOn()) && NativeContent::InRing(address, size) &&
+                                ((writer & 7) == 3 || ((writer & 7) == 0 && !t_announce_texture)); // F1 1c
+    if (ring_candidate && RingOutOn()) {
+        static thread_local u32 out_count = 0;
+        ring_out = (++out_count & 63) != 0;
+        c_ring_out[ring_out ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (B2NativeMode() != 0 && !ring_out) {
         std::scoped_lock lock{pending_mutex};
         // memory the engine writes fresh every frame (the frame rings): applied early on the raster thread
         const bool fresh = EarlyAnnounceOn() && (writer == 1 || writer == 2 || writer == 4 || ring);
         (fresh ? pending_ring_ranges : pending_ranges).emplace_back(address, size);
-        const bool ring_candidate = (N0::On() || RingLeanApplyOn()) && NativeContent::InRing(address, size) && ((writer & 7) == 3 || ((writer & 7) == 0 && !t_announce_texture)); // F1 1c census
         (fresh ? pending_ring_writers : pending_writers).push_back(Tag{static_cast<u8>((writer & 7) | t_announce_site_class), t_announce_object, static_cast<u8>(ring_candidate ? 1 : 0)});
     }
     NativeResources::NoteAnnouncedWrite(address, size); // C1: resident buffers on those pages are not synchronized any more
@@ -1212,6 +1232,7 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
 nlohmann::json Report() {
     nlohmann::json j = nlohmann::json::object();
     j["enabled"] = enabled.load();
+    j["ring_out_of_batch_real"] = {{"on", RingOutOn()}, {"kept_out", c_ring_out[0].load()}, {"sent_as_sampled_full_check", c_ring_out[1].load()}};
     j["ring_lean_apply"] = {{"on", RingLeanApplyOn()}, {"applied_lean", c_ring_lean[0].load()}, {"sampled_full", c_ring_lean[1].load()},
                             {"SAMPLED_WITH_BUFFER_MEMO_RECIPE_OR_RESIDENT_EFFECT_MUST_BE_0", c_ring_lean[2].load()}, {"rows_not_learned_in_ring", c_ring_lean[3].load()}};
     for (u32 w = 0; w < 8; ++w) {

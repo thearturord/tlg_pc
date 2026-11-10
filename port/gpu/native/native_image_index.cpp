@@ -162,6 +162,9 @@ u32 NativeImageIndex::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
             const bool erased = pending_clears.erase(id) != 0;
             touched |= erased;
             census_touch |= erased;
+            if (erased && N0::On() && N0::t_ring_candidate) [[unlikely]] {
+                N0::NoteRingOut(N0::OutClearErased);
+            }
         }
     }
     if (covered_by_textures) {

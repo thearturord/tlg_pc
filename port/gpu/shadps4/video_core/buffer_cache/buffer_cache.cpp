@@ -149,6 +149,19 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object)
         }
     }
     Core::N0::ApplyScope n0_apply{n0_ring, size};
+    // F1 ring-out census: the memo epochs a ring candidate's apply adds (the memo's misses caused only by them are counted at the obtain)
+    const auto epoch_sum = [this] { return cpu_epoch.load(std::memory_order_acquire) + range_epoch.load(std::memory_order_acquire) + b9_epoch.load(std::memory_order_acquire); };
+    struct CandEpoch {
+        const decltype(epoch_sum)* sum;
+        u64 before;
+        ~CandEpoch() {
+            if (sum != nullptr) {
+                Core::N0::g_cand_epoch.fetch_add((*sum)() - before, std::memory_order_relaxed);
+            }
+        }
+    };
+    const bool cand_census = Core::N0::On() && Core::N0::t_ring_candidate;
+    CandEpoch cand_epoch{cand_census ? &epoch_sum : nullptr, cand_census ? epoch_sum() : 0};
     if (Core::RingMirror::ShadowOn()) {
         Core::RingMirror::NoteAnnounced(address, size);
     }
@@ -158,7 +171,7 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object)
     bool lean = false, lean_sampled = false;
     if (lean_candidate) [[unlikely]] {
         static thread_local u32 lean_count = 0;
-        lean_sampled = (++lean_count & 63) == 0;
+        lean_sampled = Core::NativeUpdates::RingOutOn() || (++lean_count & 63) == 0; // (with the ring out of the batch only the sampled one in 64 comes here: all in full)
         lean = !lean_sampled;
         if (lean_sampled) {
             Core::N0::t_force_effect = true;
@@ -1543,6 +1556,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
     const bool memoizable = !is_texel_buffer;
     ObtainMemo* memo = nullptr;
     u64 epoch_before = 0;
+    u64 cand_before = 0;
+    bool miss_only_cand = false;
     if (memoizable) {
         if (!obtain_memo) {
             obtain_memo = std::make_unique<ObtainMemo[]>(ObtainMemoSlots);
@@ -1557,7 +1572,11 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             TLG_PROF_COUNT("buffer.uncached.obtain_memo_hit");
             return {memo->arena, memo->offset};
         }
-
+        if (Core::N0::On()) [[unlikely]] {
+            cand_before = Core::N0::g_cand_epoch.load(std::memory_order_relaxed);
+            miss_only_cand = memo->addr == device_addr && memo->size == size && memo->flags == (is_written ? 1u : 0u) && memo->tick == scheduler.ResolveEpoch() &&
+                             memo->epoch != epoch_before && memo->epoch_no_cand == epoch_before - cand_before;
+        }
     }
     memo_scope.End();
     TLG_PROF_NAMED_LEVEL(for_scope, "buffer.part.buffer_for", 3);
@@ -1597,10 +1616,17 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
         Core::NativeResources::NoteGpuWritten(device_addr, size); // R1b: copies of engine buffers with these bytes are stale
     }
     TLG_PROF_ADD("buffer.uncached.arena_synchronized (sum = bytes uploaded)", last_upload_bytes);
+    if (miss_only_cand) [[unlikely]] {
+        Core::N0::NoteRingOut(Core::N0::OutMemoMissOnlyCand);
+        if (last_upload_bytes != 0) {
+            Core::N0::NoteRingOut(Core::N0::OutMemoMissOnlyCandUploaded);
+            Core::N0::NoteRingOut(Core::N0::OutMemoMissOnlyCandBytes, last_upload_bytes);
+        }
+    }
     const u64 offset = arena->Offset(device_addr);
     if (memo) {
         // the epoch read before the work: an upload this call did makes the entry stale, as it should
-        *memo = {device_addr, size, is_written ? 1u : 0u, arena, offset, epoch_before, scheduler.ResolveEpoch()};
+        *memo = {device_addr, size, is_written ? 1u : 0u, arena, offset, epoch_before, scheduler.ResolveEpoch(), epoch_before - cand_before};
     }
     return {arena, offset};
 }

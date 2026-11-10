@@ -145,6 +145,14 @@ void NoteCandidateStep(u32 step, u64 ns) noexcept {
     }
 }
 
+std::atomic<u64> ring_out[OutCount]{};
+std::atomic<u64> g_cand_epoch{0};
+void NoteRingOut(RingOut what, u64 n) noexcept {
+    if (what < OutCount) {
+        ring_out[what].fetch_add(n, std::memory_order_relaxed);
+    }
+}
+
 void NoteRowLearn(bool in_ring) noexcept {
     row_learns[in_ring ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
 }
@@ -187,6 +195,16 @@ nlohmann::json Report() {
     for (u32 r = 0; r < 2; ++r) {
         j["rows_vs_ring"][r ? "in_ring" : "outside_ring"] = {{"row_checks", row_checks[r][0].load()}, {"dirty", row_checks[r][1].load()},
                                                              {"dirty_only_from_unattributed", row_checks[r][2].load()}, {"row_learn_attempts", row_learns[r].load()}};
+    }
+    {
+        static constexpr const char* OutNames[OutCount] = {"image_dirtied", "IMAGE_REFRESHED_DIRTY_ONLY_FROM_CANDIDATES_MUST_BE_0", "image_refreshed_only_candidates_bytes",
+                                                           "image_refreshed_candidate_and_other", "image_kept_for_gpu", "WAITING_CLEAR_ERASED_MUST_BE_0", "memo_miss_only_from_candidate_ticks",
+                                                           "MEMO_MISS_ONLY_FROM_CANDIDATES_THEN_UPLOADED_MUST_BE_0", "memo_miss_only_candidates_uploaded_bytes", "again_unchanged",
+                                                           "again_changed_announced", "AGAIN_CHANGED_UNANNOUNCED_MUST_BE_0"};
+        for (u32 k = 0; k < OutCount; ++k) {
+            j["ring_out_of_batch"][OutNames[k]] = ring_out[k].load();
+        }
+        j["ring_out_of_batch"]["candidate_epoch_ticks"] = g_cand_epoch.load();
     }
     for (u32 m = 0; m < 128; ++m) {
         const auto& c = candidate_stats[m];

@@ -418,6 +418,7 @@ private:
         u64 offset{};
         u64 epoch{~0ull};
         u64 tick{~0ull};
+        u64 epoch_no_cand{~0ull}; ///< F1 ring-out census: the epoch without the ticks of ring candidate applies
     };
     static constexpr u32 ObtainMemoSlots = 8192;
     std::unique_ptr<ObtainMemo[]> obtain_memo;

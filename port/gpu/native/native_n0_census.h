@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 
 #include <nlohmann/json_fwd.hpp>
@@ -88,6 +89,25 @@ struct CandidateStep {
         }
     }
 };
+/// F1 1 finish (ring writes out of the batch), census: what the steps a ring candidate still runs in the batch protect. Counters only.
+enum RingOut : u32 {
+    OutImageDirtied = 0,          ///< a ring candidate dirtied an image (CpuDirty)
+    OutImageRefreshOnlyCand,      ///< an image was refreshed whose only dirtying since its last refresh came from ring candidates (MUST_BE_0 to drop the image step)
+    OutImageRefreshOnlyCandBytes, ///< ... its bytes
+    OutImageRefreshCandAndOther,  ///< refreshed, dirtied by a candidate and by something else
+    OutImageKeptForGpu,           ///< a ring candidate met an image the GPU wrote (kept)
+    OutClearErased,               ///< a ring candidate erased a waiting clear (MUST_BE_0 to drop the image step)
+    OutMemoMissOnlyCand,          ///< an upload memo miss whose only cause was the epoch ticks of ring candidate applies
+    OutMemoMissOnlyCandUploaded,  ///< ... after which the obtain uploaded bytes (MUST_BE_0 to drop the tick)
+    OutMemoMissOnlyCandBytes,     ///< ... those bytes
+    OutAgainUnchanged,            ///< the second application of a ring candidate: bytes unchanged (TLG_REAPPLY_AUDIT=1)
+    OutAgainChangedAnnounced,     ///< changed, and a newer announcement covers it
+    OutAgainChangedUnannounced,   ///< changed, nothing newer announced it (MUST_BE_0 to drop the second application)
+    OutCount
+};
+void NoteRingOut(RingOut what, u64 n = 1) noexcept;
+/// The sum of the buffer cache's memo epochs that ring candidate applies added (raster thread).
+extern std::atomic<u64> g_cand_epoch;
 void NoteFromImage(u64 ns, bool tiled) noexcept;
 [[nodiscard]] nlohmann::json Report();
 
