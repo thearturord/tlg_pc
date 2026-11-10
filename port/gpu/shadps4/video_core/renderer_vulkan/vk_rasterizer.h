@@ -366,6 +366,9 @@ private:
     /// Rows ahead real (TLG_ROWS_AHEAD=2), [graphics, compute]: 0 bound from the planned row, 1 sampled (full path), 2 SAMPLED_DIFFERENT_MUST_BE_0, 3 sampled same,
     /// 4 refused by the identity walk, 5 planned row stale (epoch or version), 6 static row (full path), 7 no planned row
     std::array<std::array<std::atomic<u64>, 8>, 2> rows_ahead_real{};
+    /// Texture census (TLG_TEXTURE_CENSUS=1, design review 58), [graphics, compute][class][calls, ns, images]: classes 0 no image, 1 more than 16 images, 2 memo off, 3 a written image,
+    /// 4 a mip fallback image, 5 set hit, 6 miss no entry, 7 miss generation, 8 miss image check, 9 other
+    std::array<std::array<std::array<std::atomic<u64>, 3>, 10>, 2> tex_census{};
     /// R1'': handle bindings the front left without an entry (cause 0), by why ResolveAhead skips them: [side * 16 + (1 written, 2 formatted, 4 program-base offset, 8 not a single load)]
     std::array<std::atomic<u64>, 32> cover_skip_n{}, cover_skip_ns{}, cover_skip_sync{};
     /// R1''': formatted (texel) engine-handle bindings: [side * 4 + (0 checked, 1 an image overlaps the range, 2 the range is image metadata, 3 GPU wrote the range)]

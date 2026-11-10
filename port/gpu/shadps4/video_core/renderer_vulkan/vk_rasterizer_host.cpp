@@ -157,6 +157,17 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
                 rr[side ? "compute" : "graphics"] = std::move(one);
             }
             out["rows_ahead_real_cumulative"] = std::move(rr);
+            static constexpr const char* tex_names[] = {"no_image", "more_than_16_images", "memo_off", "written_image", "mip_fallback_image", "set_hit", "miss_no_entry",
+                                                        "miss_generation", "miss_image_check", "other"};
+            nlohmann::json tc = nlohmann::json::object();
+            for (u32 side = 0; side < 2; ++side) {
+                nlohmann::json one = nlohmann::json::object();
+                for (u32 k = 0; k < 10; ++k) {
+                    one[tex_names[k]] = {{"calls", tex_census[side][k][0].load()}, {"ns", tex_census[side][k][1].load()}, {"images", tex_census[side][k][2].load()}};
+                }
+                tc[side ? "compute" : "graphics"] = std::move(one);
+            }
+            out["texture_census_cumulative"] = std::move(tc);
         }
         out["geometry"] = {{"vertex_ring", c[24]}, {"vertex_by_engine_handle", c[25]}, {"vertex_by_address", c[26]},
                            {"index_ring", c[27]}, {"index_by_engine_handle", c[28]}, {"index_by_address", c[29]}};

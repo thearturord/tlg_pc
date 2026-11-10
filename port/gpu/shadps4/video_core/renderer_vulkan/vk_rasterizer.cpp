@@ -5676,6 +5676,38 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set,
 void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseMixed};
     TLG_PROF_LEVEL("raster.bind_textures", 2);
+    static const bool tex_census_on = [] { const char* e = std::getenv("TLG_TEXTURE_CENSUS"); return e != nullptr && e[0] == '1'; }();
+    struct TexCensusScope {
+        Rasterizer* r;
+        u64 t0;
+        u32 cls;
+        u32 side;
+        u32 images;
+        ~TexCensusScope() {
+            if (t0 != 0) {
+                auto& c = r->tex_census[side][cls < 10 ? cls : 9];
+                c[0].fetch_add(1, std::memory_order_relaxed);
+                c[1].fetch_add(BsegNow() - t0, std::memory_order_relaxed);
+                c[2].fetch_add(images, std::memory_order_relaxed);
+            }
+        }
+    } tex_census{this, tex_census_on ? BsegNow() : 0, 9, stage.sw_stage == Shader::SwStage::Compute ? 1u : 0u, static_cast<u32>(stage.images.size())};
+    if (tex_census_on) [[unlikely]] {
+        if (stage.images.empty()) {
+            tex_census.cls = 0;
+        } else if (stage.images.size() > TextureSet::MaxImages) {
+            tex_census.cls = 1;
+        } else if (!texture_set_on) {
+            tex_census.cls = 2;
+        } else {
+            bool written = false, fallback = false;
+            for (const auto& image_desc : stage.images) {
+                written |= image_desc.is_written;
+                fallback |= image_desc.mip_fallback_mode != Shader::MipStorageFallbackMode::None;
+            }
+            tex_census.cls = written ? 3 : fallback ? 4 : 9;
+        }
+    }
     const u32 first_image_idx = image_infos.size();
     const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
@@ -5726,7 +5758,9 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
             key_scope.End();
             set_slot = &texture_sets[key % TextureSetSlots];
             TLG_PROF_NAMED_LEVEL(try_scope, "texture.set_try", 3);
+            const TextureSetStats census_before = texture_set_stats;
             if (BindTexturesFromSet(stage, *set_slot, set_raws.data(), set_flags.data(), stage_images, binding)) {
+                tex_census.cls = 5;
                 try_scope.End();
                 TLG_PROF_COUNT("texture.set_hit");
                 Census(census_base + CImageTotal, stage_images);
@@ -5735,6 +5769,8 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
                 return;
             }
             try_scope.End();
+            tex_census.cls = texture_set_stats.no_entry != census_before.no_entry ? 6 : texture_set_stats.generation != census_before.generation ? 7
+                             : texture_set_stats.image_check != census_before.image_check ? 8 : 9;
             TLG_PROF_COUNT("texture.set_miss");
             set_record = true;
             set_slot->count = 0; // the entries are rewritten below: no hit on a half written set
