@@ -122,6 +122,9 @@ public:
     std::unordered_map<u64, ImageList> buffer_images;
     /// B8.5: engine buffers whose creation was handled (their memory's older images listed).
     std::unordered_set<u64> buffers_known;
+    /// Design review 64: the waiting clears' texture ranges (id, begin, end), taken from the engine's object table when the set of waiting clears changed (checked by size and ids)
+    mutable std::vector<std::array<u64, 3>> clear_ranges;
+    mutable bool clear_ranges_unknown{false}; ///< a waiting clear's texture was not in the object table: the id cannot answer
 
 private:
     Host& host;

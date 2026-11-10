@@ -1326,7 +1326,8 @@ nlohmann::json B2Report() {
                                              {"lean_not_resident", c(ImLeanNoResident)}, {"again_skipped", c(ImAgainSkipped)}, {"hash_skipped", c(ImHashSkipped)}, {"lean_image_touched", c(ImLeanImageTouched)},
                                              {"image_by_id", {{"mode", ImageByIdMode()}, {"id_says_none", c(ImImgIdNone)}, {"id_none_address_agrees", c(ImImgIdNoneAddrNone)},
                                                               {"ID_NONE_ADDRESS_FINDS_MUST_BE_0", c(ImImgIdMissed)}, {"id_cannot_say", c(ImImgIdMaybe)},
-                                                              {"id_cannot_say_address_none", c(ImImgIdMaybeAddrNone)}, {"waiting_clears_summed", c(ImImgIdClearsSum)}}}};
+                                                              {"id_cannot_say_address_none", c(ImImgIdMaybeAddrNone)}, {"waiting_clears_summed", c(ImImgIdClearsSum)},
+                                                              {"real_skipped", c(ImImgIdSkipped)}, {"real_sampled", c(ImImgIdSampled)}, {"SKIPPED_BUT_TOUCHED_MUST_BE_0", c(ImImgIdSkippedTouched)}}}};
                    }()},
                   {"batch_census", [] {
                        nlohmann::json j = nlohmann::json::object();

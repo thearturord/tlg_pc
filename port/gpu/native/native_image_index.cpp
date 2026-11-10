@@ -46,12 +46,32 @@ bool NativeImageIndex::NoImageInBuffer(u64 id, VAddr addr, u64 size) const {
             }
         }
     }
-    for (const auto& [texture_id, clear] : pending_clears) {
-        NativeDevice::Object o{};
-        if (!NativeDevice::Lookup(texture_id, o)) {
-            return false;
+    if (pending_clears.empty()) {
+        return true;
+    }
+    bool same = clear_ranges.size() == pending_clears.size();
+    for (size_t i = 0; same && i < clear_ranges.size(); ++i) {
+        same = pending_clears.contains(clear_ranges[i][0]);
+    }
+    if (!same) {
+        // the waiting clears changed: their textures' ranges again (a texture's memory does not change while its id lives)
+        clear_ranges.clear();
+        clear_ranges_unknown = false;
+        for (const auto& [texture_id, clear] : pending_clears) {
+            NativeDevice::Object o{};
+            if (!NativeDevice::Lookup(texture_id, o)) {
+                clear_ranges_unknown = true;
+                clear_ranges.push_back({texture_id, 0, 0});
+                continue;
+            }
+            clear_ranges.push_back({texture_id, o.address, o.address + std::max<u64>(o.bytes, 1)});
         }
-        if (o.address < addr + size && addr < o.address + std::max<u64>(o.bytes, 1)) {
+    }
+    if (clear_ranges_unknown) {
+        return false;
+    }
+    for (const auto& r : clear_ranges) {
+        if (r[1] < addr + size && addr < r[2]) {
             return false;
         }
     }

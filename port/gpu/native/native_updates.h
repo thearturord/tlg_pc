@@ -119,10 +119,14 @@ enum IdMarksCount : u32 {
     ImImgIdMaybe,            ///< the id cannot say (clears wait, creation not handled, a live image listed)
     ImImgIdMaybeAddrNone,    ///< ... and the address lookup finds none
     ImImgIdClearsSum,        ///< the number of waiting clears, summed over the shadow's checks
+    ImImgIdSkipped,          ///< TLG_IMAGE_BY_ID=2: the image step skipped (the id says no image, no clear)
+    ImImgIdSampled,          ///< ... one in 64 of those run anyway
+    ImImgIdSkippedTouched,   ///< ... and found something (MUST_BE_0)
     IdMarksCounts
 };
 void NoteIdMarks(IdMarksCount what, u64 n = 1) noexcept;
-/// Design review 63 (`TLG_IMAGE_BY_ID`): 0 off (default), 1 shadow (the image step of a lean mark asks the id and the address and compares; the address decides).
+/// Design review 63/64 (`TLG_IMAGE_BY_ID`): 0 off (default), 1 shadow (the image step of a lean mark asks the id and the address and compares; the address decides), 2 real (a mark whose
+/// id says no image and no waiting clear skips the image step; one in 64 runs it anyway and must find nothing).
 [[nodiscard]] u32 ImageByIdMode() noexcept;
 /// Batch census (`TLG_BATCH_CENSUS=1`, design review 62, counters only): the time of each apply of the batch by writer tag, and of the lean mark's steps (one mark in 16 timed:
 /// 0 the named-buffer check, 1 the bind memo erase, 2 the image step, 3 the dirty sets under their lock, 4 the version and epochs, 5 the resident lookup and bump).

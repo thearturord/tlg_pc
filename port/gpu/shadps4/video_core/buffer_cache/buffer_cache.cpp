@@ -172,7 +172,28 @@ void BufferCache::IdMarkLean(VAddr address, u64 size, bool newer, u64 id) {
             }
         }
     }
-    if (Core::NativeUpdates::B8ImageMode() != 0 && texture_cache.EngineIndex().NoteAnnouncedWrite(address, size, newer) == 1) {
+    bool run_image = Core::NativeUpdates::B8ImageMode() != 0;
+    if (run_image && Core::NativeUpdates::ImageByIdMode() == 2) {
+        // design review 64: the buffer's id says no image and no waiting clear in its memory: the image step is skipped (one in 64 runs it anyway and must find nothing)
+        auto& index = texture_cache.EngineIndex();
+        if (index.NoImageInBuffer(id, address, size)) {
+            run_image = false;
+            static thread_local u32 image_tick = 0;
+            if ((++image_tick & 63u) == 0) {
+                Core::NativeUpdates::NoteIdMarks(Core::NativeUpdates::ImImgIdSampled);
+                if (index.NoteAnnouncedWrite(address, size, newer) == 1) {
+                    Core::NativeUpdates::NoteIdMarks(Core::NativeUpdates::ImImgIdSkippedTouched);
+                    static std::atomic<u32> logged{0};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+                        LOG_ERROR(Render_Vulkan, "image by id: buffer id {:#x} {:#x}+{:#x}: skipped as having no image, the sampled image step touched one", id, address, size);
+                    }
+                }
+            } else {
+                Core::NativeUpdates::NoteIdMarks(Core::NativeUpdates::ImImgIdSkipped);
+            }
+        }
+    }
+    if (run_image && texture_cache.EngineIndex().NoteAnnouncedWrite(address, size, newer) == 1) {
         Core::NativeUpdates::NoteIdMarks(Core::NativeUpdates::ImLeanImageTouched);
     }
     step(2);
