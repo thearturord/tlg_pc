@@ -36,7 +36,7 @@ u32 TargetMode() noexcept {
 u32 WrittenMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_WRITTEN_NO_IMAGE");
-        return e != nullptr && e[0] == '1' ? 1u : 0u; // (2, real, is not built yet)
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
@@ -138,7 +138,8 @@ nlohmann::json Report() {
                     {"TARGET_DESC_DIFFERENT_MUST_BE_0", c(TgDescDifferent)}, {"real_targets_taken", c(TgTaken)}, {"real_draws_taken", c(TgDrawsTaken)},
                     {"real_draws_audited", c(TgAudits)}};
     j["written_buffers"] = {{"mode", WrittenMode()}, {"walks", c(WbCalls)}, {"named_whole", c(WbNamed)}, {"id_says_no_image", c(WbIdNone)}, {"walk_marked_an_image", c(WbWalkFound)},
-                            {"ID_SAID_NO_IMAGE_BUT_WALK_FOUND_MUST_BE_0", c(WbIdNoneWalkFound)}, {"not_named", c(WbNotNamed)}};
+                            {"ID_SAID_NO_IMAGE_BUT_WALK_FOUND_MUST_BE_0", c(WbIdNoneWalkFound)}, {"not_named", c(WbNotNamed)}, {"real_walks_skipped", c(WbSkipped)},
+                            {"real_audited", c(WbAudited)}, {"AUDIT_WALK_FOUND_MUST_BE_0", c(WbAuditFound)}};
     j["real"] = {{"stages_bound_from_the_table", c(RealServed)}, {"image_bindings_bound_from_the_table", c(RealServedImages)}, {"stages_audited_by_the_old_path", c(RealAudited)},
                  {"stages_whose_image_checks_failed", c(RealCheckFailed)}};
     return j;

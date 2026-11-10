@@ -947,7 +947,7 @@ void Rasterizer::InvalidateWrittenBuffer(u64 id, VAddr address, u64 size, bool i
         texture_cache.InvalidateMemoryFromGPU(address, size, "a written storage buffer view");
         return;
     }
-    // note 107 shadow: the walk decides; beside it, the buffer's id answers whether any image or waiting clear can be in its memory
+    // note 107 shadow: the walk decides; beside it, the buffer's id answers whether any image or waiting clear can be in its memory (note 108, real: below)
     Note(WbCalls);
     bool named = false;
     if (id != 0 && Core::NativeUpdates::B8ImageMode() != 0) {
@@ -959,6 +959,23 @@ void Rasterizer::InvalidateWrittenBuffer(u64 id, VAddr address, u64 size, bool i
         }
     }
     const bool id_none = named && texture_cache.EngineIndex().NoImageInBuffer(id, address, size);
+    if (WrittenMode() == 2 && id_none) {
+        // note 108, real: no image can be based in the buffer's memory, so the walk is skipped; one in 64 walks anyway and must mark nothing
+        static thread_local u32 audit_tick = 0;
+        if ((++audit_tick & 63u) != 0) {
+            Note(WbSkipped);
+            return;
+        }
+        Note(WbAudited);
+        if (const u32 found = texture_cache.InvalidateMemoryFromGPU(address, size, "a written storage buffer view"); found != 0) {
+            Note(WbAuditFound);
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+                LOG_ERROR(Render_Vulkan, "written buffer audit: engine buffer {:#x} {:#x}+{:#x}: skipped as having no image, the walk marked {}", id, address, size, found);
+            }
+        }
+        return;
+    }
     const u32 marked = texture_cache.InvalidateMemoryFromGPU(address, size, "a written storage buffer view");
     if (!named) {
         Note(WbNotNamed);
