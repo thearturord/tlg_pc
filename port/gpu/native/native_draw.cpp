@@ -7095,7 +7095,13 @@ u64 PS4_SYSV_ABI RecordingWrites(u64 device, u64 a1, u64 a2, u64 a3, u64 a4, u64
                         Rd<u32>(res, 0x6c), Rd<u32>(res, 0x2c));
             }
         }
-        for (const u64 field : {u64{0x2830}, u64{0x26e0}}) {
+        // F1 class 2 (design review section 33): the third buffer BeginRecording fills through AsyncMap, at this + 0x2790 (the loop at 0x1c4a5b0: up to 32 records of 32 bytes,
+        // 1 KB), was never announced; the census found its bytes changing every frame with no announcement (`TLG_ANNOUNCE_RECORDING_2790=1`, default off)
+        static const bool announce_2790 = [] { const char* e = std::getenv("TLG_ANNOUNCE_RECORDING_2790"); return e != nullptr && e[0] == '1'; }();
+        for (const u64 field : {u64{0x2830}, u64{0x26e0}, u64{0x2790}}) {
+            if (field == 0x2790 && !announce_2790) {
+                continue;
+            }
             const u64 buffer = Rd<u64>(device, field);
             const u64 width = IsHeapPointer(buffer) ? Rd<u32>(buffer, 0x180) : 0;
             if (width != 0 && width <= (1u << 24)) {

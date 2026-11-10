@@ -360,6 +360,16 @@ void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, st
         object_dirty[part.id].Add(part.begin, part.end - part.begin);
         Core::RowVersion::Bump(part.id); // F2 row version (shadow)
     }
+    if (Core::RowVersion::Watched(address, size)) [[unlikely]] {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 40) {
+            std::string ids;
+            for (const auto& part : parts) {
+                ids += fmt::format(" {:#x}:{:#x}..{:#x}", part.id, part.begin, part.end);
+            }
+            LOG_ERROR(Render_Vulkan, "watch: marked {:#x}+{:#x} announced {} parts{}", address, size, announced, ids);
+        }
+    }
     dirty_scope.End();
     TLG_PROF_NAMED_LEVEL(gaps_scope, "cpuwrite.mark.unattributed", 3);
     // the bytes no buffer holds now: the first upload of a buffer over them takes them. (Add of the whole range then Subtract of the buffers' parts, done as the same

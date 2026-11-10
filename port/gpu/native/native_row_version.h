@@ -37,6 +37,13 @@ void NoteWalk(u64 steps, u64 ns, u32 answer) noexcept;
 /// Census (with the walk census): a read the old path answered and that leaves no row behind, by what answered it: 0 the hook ring, 1 the stream ring inside the frame ring,
 /// 2 the stream ring outside the frame ring, 3 a buffer inside the frame ring, 4 a buffer outside it (learned or refused later), bytes summed per class.
 void NoteOldAnswer(u32 what, u64 bytes) noexcept;
+/// Static-row census (`TLG_STATIC_ROW_CENSUS=1`, counters only): a read of an engine buffer outside the frame ring that the stream ring answered with a fresh copy. Compared with
+/// the previous copy of the same request: 0 no previous copy, 1 version same + bytes same (a row would have been right), 2 version same + bytes DIFFERENT (MUST_BE_0: a row would
+/// have served stale bytes), 3 version moved + bytes same (an extra miss), 4 version moved + bytes different (a right miss), 5 not inside its buffer, 6 not hashed.
+[[nodiscard]] bool StaticCensusOn() noexcept;
+/// Diagnostics (`TLG_WATCH_ADDR=0x...`): does [address, address + size) overlap the watched address? (logs, nothing else)
+[[nodiscard]] bool Watched(u64 address, u64 size) noexcept;
+void NoteStatic(u32 what, u64 bytes) noexcept;
 
 [[nodiscard]] nlohmann::json Report();
 

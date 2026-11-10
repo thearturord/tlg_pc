@@ -289,6 +289,10 @@ bool ShadowOn() noexcept {
     return Mode() >= 2 || (Mode() == 1 && AuditOn());
 }
 
+void ProbeWrites(VAddr address) {
+    ProbeProtect(address);
+}
+
 namespace {
 std::atomic<u64> real_pieces_in{0}, real_pieces_out{0}, real_merged_bytes{0};
 std::atomic<u64> real_windows{0}, real_window_bytes{0}, real_uploaded_whole{0}, real_announced{0}, real_repaired_bytes{0}, real_repairs{0};

@@ -18,7 +18,8 @@ std::atomic<u64> learned[2]{};
 std::atomic<u64> bumps{0}, bumps_unattributed{0};
 std::atomic<u64> real[5]{};
 std::atomic<u64> walk[7]{};
-std::atomic<u64> old_answer[5][2]{}; // calls, steps, ns, max steps, none, overlaps, unknown
+std::atomic<u64> old_answer[5][2]{};
+std::atomic<u64> static_rows[7][2]{}; // calls, steps, ns, max steps, none, overlaps, unknown
 
 inline u32 SlotOf(u64 id) noexcept {
     return static_cast<u32>((id * 0x9E3779B97F4A7C15ull) >> (64 - SlotBits));
@@ -112,6 +113,29 @@ void NoteOldAnswer(u32 what, u64 bytes) noexcept {
     }
 }
 
+bool StaticCensusOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_STATIC_ROW_CENSUS");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+void NoteStatic(u32 what, u64 bytes) noexcept {
+    if (what < 7) {
+        static_rows[what][0].fetch_add(1, std::memory_order_relaxed);
+        static_rows[what][1].fetch_add(bytes, std::memory_order_relaxed);
+    }
+}
+
+bool Watched(u64 address, u64 size) noexcept {
+    static const u64 watch = [] {
+        const char* e = std::getenv("TLG_WATCH_ADDR");
+        return e != nullptr ? static_cast<u64>(std::strtoull(e, nullptr, 0)) : u64{0};
+    }();
+    return watch != 0 && address <= watch && watch < address + size;
+}
+
 void NoteLearn(bool inside) noexcept {
     learned[inside ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
 }
@@ -127,6 +151,13 @@ nlohmann::json Report() {
         static constexpr const char* Names[5] = {"hook_ring", "stream_ring_in_frame_ring", "stream_ring_outside_frame_ring", "buffer_in_frame_ring", "buffer_outside_frame_ring"};
         for (u32 k = 0; k < 5; ++k) {
             j["old_path_answers_without_row"][Names[k]] = {{"reads", old_answer[k][0].load()}, {"bytes", old_answer[k][1].load()}};
+        }
+    }
+    {
+        static constexpr const char* Names[7] = {"no_previous_copy", "version_same_bytes_same_ROW_RIGHT", "VERSION_SAME_BYTES_DIFFERENT_MUST_BE_0", "version_moved_bytes_same_extra_miss",
+                                                 "version_moved_bytes_different_right_miss", "not_inside_its_buffer", "not_hashed"};
+        for (u32 k = 0; k < 7; ++k) {
+            j["static_row_census"][Names[k]] = {{"reads", static_rows[k][0].load()}, {"bytes", static_rows[k][1].load()}};
         }
     }
     j["real"] = {{"served_by_version", real[0].load()}, {"also_asked_of_the_sets", real[1].load()}, {"SETS_DIRTY_VERSION_CLEAN_MUST_BE_0", real[2].load()},

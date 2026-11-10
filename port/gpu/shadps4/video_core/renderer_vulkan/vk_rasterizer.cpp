@@ -135,6 +135,10 @@ struct RealRow {
     bool inside{};           ///< the range lies inside the buffer's own bytes (the unattributed version is not asked)
 };
 thread_local std::unordered_map<u64, RealRow> t_rows_real;
+struct StaticSeen {
+    u64 version{}, hash{};
+};
+thread_local std::unordered_map<u64, StaticSeen> t_static_seen; // static-row census: the previous stream copy of a request
 thread_local bool t_row_gpu = false, t_row_dirty_epoch = false; // (diagnostics of the last served row)
 inline u64 RowKey(u64 id, u64 address, u64 size, bool texel) noexcept {
     u64 h = 0xcbf29ce484222325ull;
@@ -4278,6 +4282,47 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     obtained = obtain_old();
                 }
                 if (rows_on && !desc.is_written && !row_served) {
+                    if (Core::RowVersion::StaticCensusOn() && w31_id != 0 && buffer_cache.IsStreamBuffer(obtained.first) &&
+                        !Core::NativeContent::InRing(vsharp.address, size)) [[unlikely]] {
+                        Core::NativeDevice::BufferPart part{};
+                        if (!(Core::NativeDevice::BufferPartOf(w31_id, vsharp.address, size, part) && part.begin <= vsharp.address && part.end >= vsharp.address + size)) {
+                            Core::RowVersion::NoteStatic(5, size);
+                        } else if (u64 hash = 0; !Core::NativeContent::HashGuarded64(vsharp.address, size, hash)) {
+                            Core::RowVersion::NoteStatic(6, size);
+                        } else {
+                            const u64 key = RowKey(w31_id, vsharp.address, size, desc.is_formatted);
+                            if (t_static_seen.size() > 400000) {
+                                t_static_seen.clear();
+                            }
+                            auto [it, fresh] = t_static_seen.try_emplace(key);
+                            if (fresh) {
+                                Core::RowVersion::NoteStatic(0, size);
+                            } else {
+                                const bool same_version = it->second.version == rows_version_pre;
+                                const bool same_bytes = it->second.hash == hash;
+                                Core::RowVersion::NoteStatic(same_version ? (same_bytes ? 1u : 2u) : (same_bytes ? 3u : 4u), size);
+                                if (same_version && !same_bytes) {
+                                    // (each id once, up to 64: which buffers change without an announcement)
+                                    static thread_local std::unordered_map<u64, u64> silent_ids;
+                                    if (++silent_ids[w31_id] == 1 && silent_ids.size() <= 64) {
+                                        LOG_ERROR(Render_Vulkan, "static-row census: id {:#x} {:#x}+{:#x}: version unchanged, bytes changed since the previous copy (new id {}); owner {}, open Map over it {}, "
+                                                  "buffer part {:#x}..{:#x}, immutable hint {} usage {}, compute {}, texel {}",
+                                                  w31_id, vsharp.address, size, silent_ids.size(), Core::NativeDevice::OwnerName(vsharp.address),
+                                                  Core::NativeUpdates::OpenMapOverlaps(vsharp.address, size), part.begin, part.end, immutable_hint != nullptr,
+                                                  immutable_hint != nullptr ? immutable_hint->usage : 0u, stage.sw_stage == Shader::SwStage::Compute, desc.is_formatted);
+                                    }
+                                    if (Core::RowVersion::Watched(vsharp.address, size) && silent_ids[w31_id] % 25 == 1) {
+                                        Core::RingMirror::ProbeWrites(vsharp.address); // diagnostics: the next write into this page records its writer
+                                    }
+                                    if (silent_ids[w31_id] % 200 == 0 && silent_ids[w31_id] <= 1000) {
+                                        LOG_ERROR(Render_Vulkan, "static-row census: id {:#x} changed silently {} times; open Map over it now {}", w31_id, silent_ids[w31_id],
+                                                  Core::NativeUpdates::OpenMapOverlaps(vsharp.address, size));
+                                    }
+                                }
+                            }
+                            it->second = {rows_version_pre, hash};
+                        }
+                    }
                     if (Core::RowVersion::WalkCensusOn() && w31_id != 0) [[unlikely]] {
                         const bool in_ring = Core::NativeContent::InRing(vsharp.address, size);
                         Core::RowVersion::NoteOldAnswer(buffer_cache.IsHookRing(obtained.first) ? 0u : buffer_cache.IsStreamBuffer(obtained.first) ? (in_ring ? 1u : 2u) : in_ring ? 3u : 4u, size);

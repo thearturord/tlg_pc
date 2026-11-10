@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "native/native_row_version.h"
 #include <set>
 #include "native/native_switch.h"
 #include <algorithm>
@@ -1196,6 +1197,14 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
         announced_in_ring[writer & 7][1].fetch_add(size, std::memory_order_relaxed);
     }
     Core::RingCensus::NoteAnnounce(writer, address, size); // TLG_RING_CENSUS (counters only)
+    if (RowVersion::Watched(address, size)) [[unlikely]] {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 40) {
+            std::fprintf(stderr, "watch: announced writer %u %#llx+%#llx object %#llx texture %d ring %d site class %u thread %llu render thread %d\n", writer, static_cast<unsigned long long>(address),
+                         static_cast<unsigned long long>(size), static_cast<unsigned long long>(t_announce_object), t_announce_texture ? 1 : 0, ring ? 1 : 0, t_announce_site_class,
+                         static_cast<unsigned long long>(thread), thread == render_thread.load(std::memory_order_relaxed) ? 1 : 0);
+        }
+    }
     if (Core::HookRing::FillsWriter(writer)) {
         Core::HookRing::Fill(address, size, writer); // TLG_HOOK_RING (F1 1a): the write is finished, copy it now
     }
