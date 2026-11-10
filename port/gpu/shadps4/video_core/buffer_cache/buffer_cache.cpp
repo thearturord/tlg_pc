@@ -135,10 +135,24 @@ void BufferCache::IdMarkLean(VAddr address, u64 size, bool newer, u64 id) {
     // (cheap; the census saw it erase nothing for these writers), the buffer's dirty part and row version, the unattributed set losing the part, the memo epochs, the buffer's resident generation.
     // Not done: the GPU-written supersede, the address walk of the buffers and the page-wide resident walk (0 effects in 2.37 M applies, census ab0). The image index is kept: on a later
     // save (idmdef) 18 of 51 k sampled full applies dirtied an image or erased a waiting clear over a light or slot buffer's memory; it returns early when no image is there.
+    // TLG_BATCH_CENSUS (design review 62): one mark in 16 timed step by step
+    static thread_local u32 lean_tick = 0;
+    const bool timed = Core::NativeUpdates::BatchCensusOn() && (++lean_tick & 15u) == 0;
+    const auto now = [] { return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); };
+    u64 t = timed ? now() : 0;
+    const auto step = [&](u32 k) {
+        if (timed) {
+            const u64 n = now();
+            Core::NativeUpdates::NoteLeanStep(k, n - t);
+            t = n;
+        }
+    };
     BindMemoErase(address, size);
+    step(1);
     if (Core::NativeUpdates::B8ImageMode() != 0 && texture_cache.EngineIndex().NoteAnnouncedWrite(address, size, newer) == 1) {
         Core::NativeUpdates::NoteIdMarks(Core::NativeUpdates::ImLeanImageTouched);
     }
+    step(2);
     {
         std::scoped_lock lock{object_dirty_mutex};
         if (Core::NativeUpdates::LeanDirtyMode() != 2) {
@@ -147,9 +161,11 @@ void BufferCache::IdMarkLean(VAddr address, u64 size, bool newer, u64 id) {
         object_dirty[id].Add(address, size);
         b9_unattributed.Subtract(address, size);
     }
+    step(3);
     Core::RowVersion::Bump(id);
     b9_epoch.fetch_add(1, std::memory_order_acq_rel);
     cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
+    step(4);
     if (auto* resident = Core::NativeResources::FindImmutableById(id)) {
         resident->generation.fetch_add(1, std::memory_order_acq_rel);
         if (resident->synced.exchange(false, std::memory_order_acq_rel) && resident->usage != 1) {
@@ -159,13 +175,20 @@ void BufferCache::IdMarkLean(VAddr address, u64 size, bool newer, u64 id) {
     } else {
         Core::NativeUpdates::NoteIdMarks(Core::NativeUpdates::ImLeanNoResident);
     }
+    step(5);
 }
 
 void BufferCache::ApplyIdMark(VAddr address, u64 size, bool newer, u64 object, u32 mode) {
     using namespace Core::NativeUpdates;
     NoteIdMarks(ImApplies);
     Core::NativeDevice::BufferPart told{};
+    static thread_local u32 named_tick = 0;
+    const bool named_timed = BatchCensusOn() && (++named_tick & 15u) == 0;
+    const auto named_t0 = named_timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool named = object != 0 && object != kBuffersOnly && Core::NativeDevice::BufferPartOf(object, address, size, told) && told.begin == address && told.end == address + size;
+    if (named_timed) {
+        NoteLeanStep(0, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - named_t0).count()));
+    }
     if (!named) {
         NoteIdMarks(object == kBuffersOnly ? ImBlock : ImNotNamed);
     }

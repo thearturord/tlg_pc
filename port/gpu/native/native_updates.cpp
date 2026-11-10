@@ -439,6 +439,25 @@ void NoteIdMarks(IdMarksCount what, u64 n) noexcept {
     id_marks_counts[what].fetch_add(n, std::memory_order_relaxed);
 }
 
+bool BatchCensusOn() noexcept {
+    static const bool on = [] { const char* e = std::getenv("TLG_BATCH_CENSUS"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+
+namespace {
+std::array<std::array<std::atomic<u64>, 2>, 17> bc_apply{}; // [tag 0-15, 16 unknown][calls, ns]
+std::array<std::array<std::atomic<u64>, 2>, 6> bc_lean{};   // [step][samples, ns]
+std::array<std::atomic<u64>, 6> bc_batch{};                  // batches, first ranges, again ranges, ns first loop, ns again loop, ns whole batch
+inline u64 BcNow() noexcept {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+} // namespace
+
+void NoteLeanStep(u32 step, u64 ns) noexcept {
+    bc_lean[step % 6][0].fetch_add(1, std::memory_order_relaxed);
+    bc_lean[step % 6][1].fetch_add(ns, std::memory_order_relaxed);
+}
+
 namespace {
 std::atomic<u64> coalesce_gap_out[4]{}, coalesce_objects{0};
 std::atomic<u64> coalesce_guard[2][2]{}; // [gap 4 KiB / 64 KiB][pieces in groups the guard lets merge / pieces in groups it refuses]
@@ -774,6 +793,20 @@ bool EarlyAnnounceOn() noexcept {
 
 void ApplyBatch(const Batch& batch) {
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseAnnounce};
+    const bool bc_on = BatchCensusOn();
+    struct BcWhole {
+        u64 t0;
+        ~BcWhole() {
+            if (t0 != 0) {
+                bc_batch[5].fetch_add(BcNow() - t0, std::memory_order_relaxed);
+            }
+        }
+    } bc_whole{bc_on ? BcNow() : 0};
+    if (bc_on) {
+        bc_batch[0].fetch_add(1, std::memory_order_relaxed);
+        bc_batch[1].fetch_add(batch.first.size() + batch.ring_first.size(), std::memory_order_relaxed);
+        bc_batch[2].fetch_add(batch.again.size() + batch.ring_again.size(), std::memory_order_relaxed);
+    }
     TLG_PROF_LEVEL("updates.apply_batch", 1);
     TLG_PROF_ADD("updates.ranges_first", batch.first.size());
     TLG_PROF_ADD("updates.ranges_again", batch.again.size());
@@ -801,6 +834,7 @@ void ApplyBatch(const Batch& batch) {
     }
     const bool id_marks_real = IdMarksMode() == 2; // F1 class 2 marks by id: tags 2 and 12 are not hashed and not applied a second time
     const bool gate = ReapplyGateOn();
+    const u64 bc_again_t0 = bc_on ? BcNow() : 0;
     {
         TLG_PROF_LEVEL("updates.apply_again", 2);
         // gate: the ranges of this list that came back unchanged are not applied a second time (ra_last_first holds the previous batch's first list, the ring ranges after the plain ones)
@@ -862,6 +896,18 @@ void ApplyBatch(const Batch& batch) {
         again_list(batch.again, batch.again_writer);
         again_list(batch.ring_again, batch.ring_again_writer);
     }
+    if (bc_on) {
+        bc_batch[4].fetch_add(BcNow() - bc_again_t0, std::memory_order_relaxed);
+    }
+    const u64 bc_first_t0 = bc_on ? BcNow() : 0;
+    struct BcFirst {
+        u64 t0;
+        ~BcFirst() {
+            if (t0 != 0) {
+                bc_batch[3].fetch_add(BcNow() - t0, std::memory_order_relaxed);
+            }
+        }
+    } bc_first{bc_first_t0};
     TLG_PROF_LEVEL("updates.apply_first", 2);
     const bool skip_on = AnnounceSkipOn() != 0 && skip_check_fn != nullptr;
     const bool hash_here = skip_on || (gate && !reapply_audit); // the hash of a range is taken before it is applied now; it is the one the next batch's gate compares against
@@ -940,7 +986,13 @@ void ApplyBatch(const Batch& batch) {
             if (coalesce_mode != 1) {
                 N0::t_ring_candidate = ring_candidate;
                 N0::t_writer = writer;
+                const u64 bc_t0 = bc_on ? BcNow() : 0;
                 apply_fn(apply_context, address, size, true, object);
+                if (bc_t0 != 0) {
+                    auto& a = bc_apply[writer < 16 ? writer : 16];
+                    a[0].fetch_add(1, std::memory_order_relaxed);
+                    a[1].fetch_add(BcNow() - bc_t0, std::memory_order_relaxed);
+                }
                 N0::t_ring_candidate = false;
                 N0::t_writer = 16;
             }
@@ -1267,6 +1319,30 @@ nlohmann::json B2Report() {
                                              {"part_whole_buffer", c(ImPartWhole)}, {"part_not_whole_buffer", c(ImPartNotWhole)}, {"resident_bumped_own", c(ImResidentTold)}, {"resident_bumped_neighbor", c(ImResidentNeighbor)},
                                              {"resident_bumped_neighbor_was_synced", c(ImResidentNeighborSynced)}, {"named_but_own_not_bumped", c(ImResidentToldNone)}, {"lean_resident_bumped", c(ImLeanResident)},
                                              {"lean_not_resident", c(ImLeanNoResident)}, {"again_skipped", c(ImAgainSkipped)}, {"hash_skipped", c(ImHashSkipped)}, {"lean_image_touched", c(ImLeanImageTouched)}};
+                   }()},
+                  {"batch_census", [] {
+                       nlohmann::json j = nlohmann::json::object();
+                       j["on"] = BatchCensusOn();
+                       j["batches"] = bc_batch[0].load();
+                       j["first_ranges"] = bc_batch[1].load();
+                       j["again_ranges"] = bc_batch[2].load();
+                       j["ns_first_loop"] = bc_batch[3].load();
+                       j["ns_again_loop"] = bc_batch[4].load();
+                       j["ns_whole_batch"] = bc_batch[5].load();
+                       nlohmann::json by = nlohmann::json::object();
+                       for (u32 w = 0; w < 17; ++w) {
+                           if (bc_apply[w][0].load() != 0) {
+                               by[w == 16 ? std::string("unknown") : (w >= 8 ? "no_site_" : "") + std::to_string(w & 7)] = {{"calls", bc_apply[w][0].load()}, {"ns", bc_apply[w][1].load()}};
+                           }
+                       }
+                       j["apply_by_tag"] = std::move(by);
+                       static constexpr const char* steps[] = {"0_named_buffer_check", "1_bind_memo_erase", "2_image_step", "3_dirty_sets_locked", "4_version_epochs", "5_resident_lookup_bump"};
+                       nlohmann::json ls = nlohmann::json::object();
+                       for (u32 k = 0; k < 6; ++k) {
+                           ls[steps[k]] = {{"samples", bc_lean[k][0].load()}, {"ns", bc_lean[k][1].load()}};
+                       }
+                       j["lean_steps_sampled_1_in_16"] = std::move(ls);
+                       return j;
                    }()},
                   {"reapply_gate", {{"on", ReapplyGateOn()}, {"skipped_unchanged", ra_gate_skipped.load()}, {"applied_changed_or_unknown", ra_gate_applied.load()}}},
             {"reapply_audit", {{"on", ReapplyAuditOn()}, {"batches", ra_batches.load()}, {"misaligned_batches", ra_misaligned_batches.load()}, {"ranges_audited", ra_audited.load()}, {"unhashed", ra_unhashed.load()},

@@ -116,6 +116,10 @@ enum IdMarksCount : u32 {
     IdMarksCounts
 };
 void NoteIdMarks(IdMarksCount what, u64 n = 1) noexcept;
+/// Batch census (`TLG_BATCH_CENSUS=1`, design review 62, counters only): the time of each apply of the batch by writer tag, and of the lean mark's steps (one mark in 16 timed:
+/// 0 the named-buffer check, 1 the bind memo erase, 2 the image step, 3 the dirty sets under their lock, 4 the version and epochs, 5 the resident lookup and bump).
+[[nodiscard]] bool BatchCensusOn() noexcept;
+void NoteLeanStep(u32 step, u64 ns) noexcept;
 /// L1: pieces of one engine buffer closer than this many bytes (`TLG_APPLY_COALESCE_GAP`, default 4096) are candidates for one applied range.
 [[nodiscard]] u64 ApplyCoalesceGap() noexcept;
 /// L1: why a group was refused (0 tracker/image mode, 1 named buffer does not hold the range, 2 GPU written, 3 clear waits or an image touches no piece), counted in groups and pieces.
