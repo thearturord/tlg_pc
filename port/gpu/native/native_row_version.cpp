@@ -155,8 +155,9 @@ void NoteStaticReal(u32 what, u64 n) noexcept {
 
 bool WrittenRowsOn() noexcept {
     static const bool on = [] {
+        // default on since 2026-11-10 after the owner's play; =0 off
         const char* e = std::getenv("TLG_WRITTEN_ROWS");
-        return e != nullptr && e[0] == '1';
+        return e == nullptr || e[0] == 0 || e[0] != '0';
     }();
     return on;
 }
