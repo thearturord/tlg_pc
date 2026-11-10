@@ -326,7 +326,7 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
         if (Core::HookOwned::Mode() != 0) {
             Core::DebugServer::Publish("hook_owned", Core::HookOwned::Report()); // note 90
         }
-        if (Core::ViewTable::Mode() != 0 || Core::ViewTable::TargetMode() != 0) {
+        if (Core::ViewTable::Mode() != 0 || Core::ViewTable::TargetMode() != 0 || Core::ViewTable::WrittenMode() != 0) {
             Core::DebugServer::Publish("view_table", Core::ViewTable::Report()); // notes 95 and 103 (the target table is under "targets")
         }
         if (Core::TextureVersion::Mode() != 0) {

@@ -290,8 +290,9 @@ void TextureCache::TouchFoundImage(ImageId image_id) {
     TouchImage(image);
 }
 
-void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, const char* by) {
+u32 TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, const char* by) {
     Core::UiTrace::NoteGpuWrite(by, address, max_size);
+    u32 marked = 0;
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Only consider images that match base address.
         // TODO: Maybe also consider subresources
@@ -307,7 +308,9 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, const
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
+        ++marked;
     });
+    return marked;
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {

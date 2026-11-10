@@ -14,6 +14,9 @@ namespace Core::ViewTable {
 /// Notes 102 to 106 (`TLG_TARGET_TABLE`: 2 real by default since the owner's play, note 106, one draw in 64 audited; 1 shadow; 0 off, the old path): render and depth targets
 /// by their view id, in this same table (use flags with bit 63).
 [[nodiscard]] u32 TargetMode() noexcept;
+/// Note 107 (`TLG_WRITTEN_NO_IMAGE`: 0 off (default), 1 shadow; 2 real is not built yet): a written binding of an engine buffer whose image list holds no live image and no
+/// waiting clear needs no texture cache walk for images based in its memory (`NativeImageIndex::NoImageInBuffer`).
+[[nodiscard]] u32 WrittenMode() noexcept;
 
 struct Entry {
     u64 view_id{};
@@ -71,6 +74,12 @@ enum Count : u32 {
     TgTaken,                ///< real mode: targets taken from the table
     TgDrawsTaken,           ///< real mode: draws whose every target came from the table
     TgAudits,               ///< real mode: draws audited by the old path (one in 64)
+    WbCalls,                ///< written buffer bindings that took the texture cache's walk
+    WbNamed,                ///< ... naming an engine buffer that holds the whole range
+    WbIdNone,               ///< ... whose id says no image and no waiting clear is in it
+    WbWalkFound,            ///< ... where the walk marked an image (any)
+    WbIdNoneWalkFound,      ///< ... the id said none and the walk marked one (ID_SAID_NO_IMAGE_BUT_WALK_FOUND_MUST_BE_0)
+    WbNotNamed,             ///< written bindings with no engine id, or a range outside its buffer (the walk stays)
     Count_
 };
 void Note(Count c, u64 n = 1) noexcept;

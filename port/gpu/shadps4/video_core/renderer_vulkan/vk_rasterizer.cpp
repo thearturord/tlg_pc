@@ -941,6 +941,45 @@ u64 Rasterizer::TargetTableShadow(u32 slot, u64 use, VideoCore::ImageId image_id
     return flags;
 }
 
+void Rasterizer::InvalidateWrittenBuffer(u64 id, VAddr address, u64 size, bool inside) {
+    using namespace Core::ViewTable;
+    if (WrittenMode() == 0) [[likely]] {
+        texture_cache.InvalidateMemoryFromGPU(address, size, "a written storage buffer view");
+        return;
+    }
+    // note 107 shadow: the walk decides; beside it, the buffer's id answers whether any image or waiting clear can be in its memory
+    Note(WbCalls);
+    bool named = false;
+    if (id != 0 && Core::NativeUpdates::B8ImageMode() != 0) {
+        if (inside) {
+            named = true;
+        } else {
+            Core::NativeDevice::BufferPart part{};
+            named = Core::NativeDevice::BufferPartOf(id, address, size, part) && part.begin == address && part.end == address + size;
+        }
+    }
+    const bool id_none = named && texture_cache.EngineIndex().NoImageInBuffer(id, address, size);
+    const u32 marked = texture_cache.InvalidateMemoryFromGPU(address, size, "a written storage buffer view");
+    if (!named) {
+        Note(WbNotNamed);
+    } else {
+        Note(WbNamed);
+    }
+    if (id_none) {
+        Note(WbIdNone);
+    }
+    if (marked != 0) {
+        Note(WbWalkFound);
+        if (id_none) {
+            Note(WbIdNoneWalkFound);
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+                LOG_ERROR(Render_Vulkan, "written buffer: engine buffer {:#x} {:#x}+{:#x}: its image list says no image, the walk marked {}", id, address, size, marked);
+            }
+        }
+    }
+}
+
 void Rasterizer::TargetViewShadow(u32 slot, vk::ImageView view) {
     using namespace Core::ViewTable;
     const u64 flags = target_use[slot];
@@ -4557,7 +4596,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                 buffer_infos.emplace_back(own->Handle(), offset_aligned, size + adjust);
                                 bound_buffers.emplace_back(own, offset, size, src_access);
                                 if (desc.is_written) {
-                                    texture_cache.InvalidateMemoryFromGPU(address, size, "a written storage buffer view");
+                                    InvalidateWrittenBuffer(r->ahead_id, address, size, true);
                                 }
                                 if (BufferBarrierQuery(own, offset, size, desc.is_written)) {
                                     needs_barrier = true;
@@ -4646,7 +4685,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                             buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
                             bound_buffers.emplace_back(buffer, offset, size, src_access);
                             if (desc.is_written) {
-                                texture_cache.InvalidateMemoryFromGPU(address, size, "a written storage buffer view");
+                                InvalidateWrittenBuffer(a->ahead_id, address, size, true); // LEGACY(engine_rows): rows ahead bind only inside the buffer
                             }
                             if (t_fseg_on) [[unlikely]] {
                                 t_fseg[3] = BsegNow();
@@ -5294,7 +5333,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                      dispatch_caller ? dispatch_caller - Core::NativeDraw::ImageBase() + 0x1000000 : 0);
                         }
                     }
-                    texture_cache.InvalidateMemoryFromGPU(vsharp.address, size, "a written storage buffer view");
+                    InvalidateWrittenBuffer(record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].id : 0, vsharp.address, size, false);
                 }
                 Census(census_base + CBufferBarrierQuery);
                 if (BufferBarrierQuery(buffer, offset, size, desc.is_written)) {
@@ -5929,7 +5968,7 @@ void Rasterizer::ResolveBufferBindingBody(const Shader::Info& stage, u32 buffer_
                                      dispatch_caller ? dispatch_caller - Core::NativeDraw::ImageBase() + 0x1000000 : 0);
                         }
                     }
-                    texture_cache.InvalidateMemoryFromGPU(vsharp.address, size, "a written storage buffer view");
+                    InvalidateWrittenBuffer(record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].id : 0, vsharp.address, size, false);
                 }
                 out.SetQuery(buffer, offset, size, desc.is_written, false); // the barrier query belongs to the record pass (it reads the barrier state the recording writes)
                 out.census_query = true;

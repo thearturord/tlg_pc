@@ -662,6 +662,9 @@ private:
     /// Note 103 (`TLG_TARGET_TABLE=1`, shadow): target `slot` (0..7 color, 8 depth) of the draw, found by the old path as `image_id` (`old_find`: by FindImage), against the
     /// table's entry for the view the record names; `use` keeps apart what changes the target's description. Returns the entry's key (0: not in the class) for the render pass.
     u64 TargetTableShadow(u32 slot, u64 use, VideoCore::ImageId image_id, const VideoCore::TextureCache::ImageDesc& desc, bool& in_class, bool& served);
+    /// Note 107 (`TLG_WRITTEN_NO_IMAGE`): what a written buffer binding of engine buffer `id` (0: none) over [address, address + size) tells the texture cache; `inside`: the
+    /// caller knows the range lies in the buffer.
+    void InvalidateWrittenBuffer(u64 id, VAddr address, u64 size, bool inside);
     /// Note 104 (`TLG_TARGET_TABLE=2`): target `slot`'s image and description from the table (true), or nothing done (false: the old path finds it).
     bool TargetTableTake(u32 slot, u64 use, VideoCore::ImageId& image_id, VideoCore::TextureCache::ImageDesc& desc);
     /// The use a target is keyed with besides its view: the slot and the bytes its description takes besides the view.

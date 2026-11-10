@@ -33,6 +33,14 @@ u32 TargetMode() noexcept {
     return mode;
 }
 
+u32 WrittenMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_WRITTEN_NO_IMAGE");
+        return e != nullptr && e[0] == '1' ? 1u : 0u; // (2, real, is not built yet)
+    }();
+    return mode;
+}
+
 namespace {
 std::mutex mutex; // (the raster thread binds and applies the batch's events; the lock only guards a second recording thread)
 std::unordered_map<u64, Entry> entries;                       // key: view id and use flags
@@ -129,6 +137,8 @@ nlohmann::json Report() {
                     {"view_same", c(TgViewSame)}, {"TARGET_VIEW_DIFFERENT_MUST_BE_0", c(TgViewDifferent)}, {"view_recorded", c(TgViewNoEntry)},
                     {"TARGET_DESC_DIFFERENT_MUST_BE_0", c(TgDescDifferent)}, {"real_targets_taken", c(TgTaken)}, {"real_draws_taken", c(TgDrawsTaken)},
                     {"real_draws_audited", c(TgAudits)}};
+    j["written_buffers"] = {{"mode", WrittenMode()}, {"walks", c(WbCalls)}, {"named_whole", c(WbNamed)}, {"id_says_no_image", c(WbIdNone)}, {"walk_marked_an_image", c(WbWalkFound)},
+                            {"ID_SAID_NO_IMAGE_BUT_WALK_FOUND_MUST_BE_0", c(WbIdNoneWalkFound)}, {"not_named", c(WbNotNamed)}};
     j["real"] = {{"stages_bound_from_the_table", c(RealServed)}, {"image_bindings_bound_from_the_table", c(RealServedImages)}, {"stages_audited_by_the_old_path", c(RealAudited)},
                  {"stages_whose_image_checks_failed", c(RealCheckFailed)}};
     return j;
