@@ -73,6 +73,8 @@ struct OpenMap {
     bool in_ring{};
     u64 caller{}; ///< the guest return address of the Map call (TLG_WRITER_SITES names the write site after it)
     bool texture{}; ///< A1.0: a texture's Map (its window is image content), else a buffer's
+    u32 map_type{};  ///< 1b shadow: the D3D11 map type (4 write discard, 5 no overwrite)
+    u64 resource{};  ///< 1b shadow: the engine resource id
 };
 thread_local bool t_next_map_texture = false;
 thread_local bool t_announce_texture = true; ///< A1.0: set around the announcement of a Map window: false for a buffer's
@@ -114,6 +116,9 @@ void SetMapSite(const OpenMap& map, bool sites_on) {
     std::snprintf(name, sizeof(name), "Map own @%llx", static_cast<unsigned long long>(map.caller - NativeDraw::ImageBase() + 0x1000000ull));
     NativeContent::SetSite(NativeContent::SiteId(name));
 }
+void TagMapFill(const OpenMap& map, u32 how) {
+    Core::HookRing::SetFillTag(how, static_cast<u32>(map.caller - NativeDraw::ImageBase() + 0x1000000ull), map.resource, map.map_type);
+}
 bool MapSitesOn() {
     static const bool on = [] {
         const char* e = std::getenv("TLG_WRITER_SITES");
@@ -138,7 +143,9 @@ void NoteRenderThread() {
     for (const auto& [thread, map] : stale) {
         SetMapSite(map, MapSitesOn());
         t_announce_texture = map.texture;
+        TagMapFill(map, 3);
         NoteWriterRangeOf(0, map.address, map.size, thread, map.stamp, map.in_ring);
+        Core::HookRing::ClearFillTag();
         t_announce_texture = true;
         NativeContent::SetSite(0);
     }
@@ -164,7 +171,7 @@ bool SupersedeEnabled() {
 
 namespace {
 /// The Unmap's work: the thread's open Map of the resource is closed and its window announced. False when there is none.
-bool CloseOpenMap(u64 resource_id) {
+bool CloseOpenMap(u64 resource_id, u32 how) {
     OpenMap map;
     {
         std::scoped_lock lock{open_map_mutex};
@@ -186,14 +193,16 @@ bool CloseOpenMap(u64 resource_id) {
         }
     }
     t_announce_texture = map.texture;
+    TagMapFill(map, how);
     NoteWriterRange(0, map.address, map.size, site, map.in_ring);
+    Core::HookRing::ClearFillTag();
     t_announce_texture = true;
     return true;
 }
 } // namespace
 
 void NoteUnmap(u64 resource_id) {
-    if (!CloseOpenMap(resource_id)) {
+    if (!CloseOpenMap(resource_id, 0)) {
         c_unmap_unmatched.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -220,7 +229,9 @@ void FlushOpenMapsSince(u64 serial) {
     for (const OpenMap& map : done) {
         SetMapSite(map, MapSitesOn());
         t_announce_texture = map.texture;
+        TagMapFill(map, 2);
         NoteWriterRangeOf(0, map.address, map.size, thread, map.stamp, map.in_ring);
+        Core::HookRing::ClearFillTag();
         t_announce_texture = true;
         NativeContent::SetSite(0);
     }
@@ -268,7 +279,7 @@ void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u6
             const auto it = open_maps.find({ThreadKey(), resource_id});
             old_size = it != open_maps.end() ? it->second.size : 0;
         }
-        if (old_size != 0 && CloseOpenMap(resource_id)) {
+        if (old_size != 0 && CloseOpenMap(resource_id, 1)) {
             c_replace_announced.fetch_add(1, std::memory_order_relaxed);
             c_replace_announced_bytes.fetch_add(old_size, std::memory_order_relaxed);
         }
@@ -283,7 +294,7 @@ void NoteMap(u64 resource_id, u32 usage, u32 map_type, u64 address, u32 size, u6
             c_open_replaced_in_ring.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    slot = {address, written, ++open_map_serial, NativeDraw::NextSeq(), in_ring, caller, texture_map};
+    slot = {address, written, ++open_map_serial, NativeDraw::NextSeq(), in_ring, caller, texture_map, map_type, resource_id};
     (void)usage, (void)in_ring;
 }
 

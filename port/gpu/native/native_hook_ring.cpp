@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -53,7 +54,35 @@ std::atomic<u8>* g_fill_writer = nullptr; // per granule: the writer of that fil
 std::atomic<u64> c_why_landed{0}, c_why_open_map{0}, c_why_gpu_written{0}, c_why_none{0}, c_landings{0}, c_landing_bytes{0};
 std::atomic<u64> c_why_writer[9]{};  // the writer of the last fill of the first differing granule
 std::atomic<u64> c_why_age[5]{};     // records since that fill: <100, <1k, <10k, <100k, more
-std::atomic<u64> c_why_whole{0};     // every filled byte of the range differs in at least... : the first differing byte is at offset 0
+std::atomic<u64> c_why_whole{0};
+// Map window tags of writer 0 fills
+struct FillTag {
+    u32 how, caller, map_type;
+    u64 resource;
+};
+thread_local FillTag t_tag{};
+thread_local bool t_tag_set = false;
+std::mutex g_tag_mutex;
+std::vector<FillTag> g_tags{FillTag{}}; // index 0: no tag
+constexpr u32 MaxTags = 4096;
+std::atomic<u16>* g_fill_tag = nullptr; // per granule
+std::array<std::atomic<u64>, MaxTags> c_tag_fills{}, c_tag_diffs{}, c_tag_diff_bytes{};
+std::atomic<u64> c_how_fills[4]{}, c_how_diffs[4]{};
+
+u16 TagIndex(const FillTag& t) {
+    std::scoped_lock lock{g_tag_mutex};
+    for (u32 i = 1; i < g_tags.size(); ++i) {
+        const auto& e = g_tags[i];
+        if (e.how == t.how && e.caller == t.caller && e.resource == t.resource && e.map_type == t.map_type) {
+            return static_cast<u16>(i);
+        }
+    }
+    if (g_tags.size() < MaxTags - 1) {
+        g_tags.push_back(t);
+        return static_cast<u16>(g_tags.size() - 1);
+    }
+    return static_cast<u16>(MaxTags - 1);
+}     // every filled byte of the range differs in at least... : the first differing byte is at offset 0
 std::vector<Example> g_raster_examples;
 
 u32 Mode() noexcept {
@@ -98,6 +127,10 @@ bool Ensure() {
     }
     g_base.store(base, std::memory_order_relaxed);
     g_size.store(size, std::memory_order_relaxed);
+    g_fill_tag = new std::atomic<u16>[size >> GranuleShift];
+    for (u64 i = 0; i < (size >> GranuleShift); ++i) {
+        g_fill_tag[i].store(0, std::memory_order_relaxed);
+    }
     g_fill_seq = new std::atomic<u32>[size >> GranuleShift];
     g_fill_writer = new std::atomic<u8>[size >> GranuleShift];
     for (u64 i = 0; i < (size >> GranuleShift); ++i) {
@@ -208,10 +241,17 @@ void Fill(u64 address, u64 size, u32 writer) {
     }
     copy_run(run_lo, hi, run_half);
     const u32 seq_now = Raster1bOn() ? static_cast<u32>(Core::NativeDraw::NextSeq()) : 0u;
+    u16 tag = 0;
+    if (Raster1bOn() && writer == 0 && t_tag_set) {
+        tag = TagIndex(t_tag);
+        c_tag_fills[tag].fetch_add(1, std::memory_order_relaxed);
+        c_how_fills[t_tag.how & 3].fetch_add(1, std::memory_order_relaxed);
+    }
     for (u64 g = (lo - base) >> GranuleShift; g <= (hi - 1 - base) >> GranuleShift; ++g) {
         if (Raster1bOn()) {
             g_fill_seq[g].store(seq_now, std::memory_order_relaxed);
             g_fill_writer[g].store(static_cast<u8>(std::min<u32>(writer, 8)), std::memory_order_relaxed);
+            g_fill_tag[g].store(tag, std::memory_order_relaxed);
         }
         filled[g].store(1, std::memory_order_release); // (also clears the "a GPU result landed" bit)
     }
@@ -281,6 +321,15 @@ bool Raster1bOn() noexcept {
 void NoteRasterWide(u64 size) {
     c_raster_wide.fetch_add(1, std::memory_order_relaxed);
     c_raster_wide_bytes.fetch_add(size, std::memory_order_relaxed);
+}
+
+void SetFillTag(u32 how, u32 caller_ghidra, u64 resource_id, u32 map_type) {
+    t_tag = {how, caller_ghidra, map_type, resource_id};
+    t_tag_set = true;
+}
+
+void ClearFillTag() {
+    t_tag_set = false;
 }
 
 void NoteLanding(u64 address, u64 size) {
@@ -364,6 +413,13 @@ void CompareRaster(u32 cls, u64 address, u64 size, bool gpu_written) {
         c_why_age[age < 100 ? 0 : age < 1000 ? 1 : age < 10000 ? 2 : age < 100000 ? 3 : 4].fetch_add(1, std::memory_order_relaxed);
         if (first_diff == 0) {
             c_why_whole.fetch_add(1, std::memory_order_relaxed);
+        }
+        const u16 tag = g_fill_tag[g0].load(std::memory_order_relaxed);
+        c_tag_diffs[tag].fetch_add(1, std::memory_order_relaxed);
+        c_tag_diff_bytes[tag].fetch_add(diff, std::memory_order_relaxed);
+        if (tag != 0) {
+            std::scoped_lock lock{g_tag_mutex};
+            c_how_diffs[g_tags[tag].how & 3].fetch_add(1, std::memory_order_relaxed);
         }
     }
     if (unfilled != 0) {
@@ -461,6 +517,33 @@ nlohmann::json Report() {
         j["raster_1b"]["why_differs"]["records_since_fill"][age_names[k]] = c_why_age[k].load();
     }
     j["raster_1b"]["landings"] = {{"count", c_landings.load()}, {"bytes", c_landing_bytes.load()}};
+    {
+        static constexpr const char* how_names[4] = {"unmap", "replaced_by_second_map", "after_hooked_draw_call", "frame_start_never_unmapped"};
+        for (u32 k = 0; k < 4; ++k) {
+            j["raster_1b"]["map_window_fills_by_how"][how_names[k]] = {{"fills", c_how_fills[k].load()}, {"DIFFS", c_how_diffs[k].load()}};
+        }
+        std::scoped_lock lock{g_tag_mutex};
+        auto& list = j["raster_1b"]["diffs_by_map"] = nlohmann::json::array();
+        for (u32 i = 0; i < MaxTags; ++i) {
+            const u64 d = c_tag_diffs[i].load();
+            if (d == 0) {
+                continue;
+            }
+            const FillTag t = i < g_tags.size() ? g_tags[i] : FillTag{};
+            list.push_back({{"how", i == 0 ? std::string("untagged") : std::string(how_names[t.how & 3])}, {"caller", fmt::format("{:#x}", t.caller)},
+                            {"resource_id", fmt::format("{:#x}", t.resource)}, {"map_type", t.map_type}, {"diffs", d}, {"diff_bytes", c_tag_diff_bytes[i].load()},
+                            {"fills_of_this_map", c_tag_fills[i].load()}});
+        }
+        j["raster_1b"]["map_tags"] = g_tags.size() - 1;
+        // the Maps announced only at the next frame start (their Unmap was not seen): which call sites
+        auto& never = j["raster_1b"]["never_unmapped_maps"] = nlohmann::json::array();
+        for (u32 i = 1; i < g_tags.size(); ++i) {
+            const FillTag& t = g_tags[i];
+            if ((t.how & 3) == 3 && c_tag_fills[i].load() != 0) {
+                never.push_back({{"caller", fmt::format("{:#x}", t.caller)}, {"resource_id", fmt::format("{:#x}", t.resource)}, {"map_type", t.map_type}, {"fills", c_tag_fills[i].load()}});
+            }
+        }
+    }
     std::scoped_lock lock{g_example_mutex};
     {
         auto& rl = j["raster_1b"]["examples"] = nlohmann::json::array();

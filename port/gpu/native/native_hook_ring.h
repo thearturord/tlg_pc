@@ -48,6 +48,10 @@ void CompareRaster(u32 cls, u64 address, u64 size, bool gpu_written);
 /// A GPU result was written into game memory at [address, address + size) (readbacks, image downloads, fence and label writes): the 1b shadow files a later
 /// difference over it under "a GPU result landed since the fill".
 void NoteLanding(u64 address, u64 size);
+/// 1b shadow: the Map window announced next on this thread (how: 0 Unmap, 1 replaced by a second Map, 2 after a hooked draw call, 3 at the next frame start
+/// because it was never unmapped); fills of writer 0 keep it per granule, and a later difference reports it. `ClearFillTag` after the announcement.
+void SetFillTag(u32 how, u32 caller_ghidra, u64 resource_id, u32 map_type);
+void ClearFillTag();
 void NoteRasterWide(u64 size);
 
 nlohmann::json Report();
