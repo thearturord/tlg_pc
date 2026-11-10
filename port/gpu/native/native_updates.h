@@ -78,10 +78,11 @@ enum BufferIdCount : u32 { IdToldWhole, IdToldPartial, IdUnknown, IdPartsMatch, 
 /// L1 (`TLG_APPLY_COALESCE`): 0 off (default), 1 the first-time announcements of a batch are applied as merged ranges (same engine buffer, touching or overlapping bytes: the byte set is the same, the
 /// apply passes run once per merged range instead of once per piece), 2 counts what merging would do and applies as before (`coalesce` in `buffer_id`).
 [[nodiscard]] u32 ApplyCoalesceMode() noexcept;
-/// F1 class 2, marks by buffer id (`TLG_ID_MARKS`, design review sections 48 and 49): 0 off (default), 1 shadow, 2 real. Concerns the batch applies of the light constants (tag 2) and the
+/// F1 class 2, marks by buffer id (`TLG_ID_MARKS`, design review sections 48 to 51): 2 real (default since 2026-11-10, owner's play), 1 shadow, 0 off. Concerns the batch applies of the light constants (tag 2) and the
 /// scene slots (tag 12: writer 4 without a site name; with the switch on the slot announcer names each slot's engine buffer instead of announcing a block). The batch order stays.
 /// 1: the full apply decides; beside it, what the lean apply would do is compared (parts, effects, resident buffers it would not bump). 2: a range that its named buffer holds is applied lean:
-/// the bind memo erase, the buffer's dirty part and row version, its resident generation; no GPU-written supersede, no address walk, no image index, no page-wide resident walk, no batch hashes,
+/// the bind memo erase, the image index (kept: a buffer's memory can still hold an image or a waiting clear), the buffer's dirty part and row version, its resident generation; no GPU-written
+/// supersede, no address walk, no page-wide resident walk, no batch hashes,
 /// no second application (census `ab0`: those steps did nothing for these writers in 2.37 M applies, the second application found 0 changed in 3.1 M). One in 64 runs in full and is compared.
 [[nodiscard]] u32 IdMarksMode() noexcept;
 [[nodiscard]] inline bool IdMarksTag(u32 tag) noexcept {
@@ -111,6 +112,7 @@ enum IdMarksCount : u32 {
     ImLeanNoResident,        ///< lean: the named buffer is not a resident buffer
     ImAgainSkipped,          ///< mode 2: second applications skipped
     ImHashSkipped,           ///< mode 2: batch hashes skipped
+    ImLeanImageTouched,      ///< lean: the image index found an image or a waiting clear over the range (the step is kept: idmdef found 18 in 51 k samples on a later save)
     IdMarksCounts
 };
 void NoteIdMarks(IdMarksCount what, u64 n = 1) noexcept;

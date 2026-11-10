@@ -130,11 +130,15 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object)
     ApplyIdMark(address, size, newer, object, id_marks);
 }
 
-void BufferCache::IdMarkLean(VAddr address, u64 size, u64 id) {
+void BufferCache::IdMarkLean(VAddr address, u64 size, bool newer, u64 id) {
     // F1 class 2 marks by id (TLG_ID_MARKS=2, design review 49): what the full apply does for a light constant or scene slot range, by the buffer the announcer named. Kept: the bind memo erase
     // (cheap; the census saw it erase nothing for these writers), the buffer's dirty part and row version, the unattributed set losing the part, the memo epochs, the buffer's resident generation.
-    // Not done: the GPU-written supersede, the address walk of the buffers, the image index and the page-wide resident walk (0 effects in 2.37 M applies, census ab0).
+    // Not done: the GPU-written supersede, the address walk of the buffers and the page-wide resident walk (0 effects in 2.37 M applies, census ab0). The image index is kept: on a later
+    // save (idmdef) 18 of 51 k sampled full applies dirtied an image or erased a waiting clear over a light or slot buffer's memory; it returns early when no image is there.
     BindMemoErase(address, size);
+    if (Core::NativeUpdates::B8ImageMode() != 0 && texture_cache.EngineIndex().NoteAnnouncedWrite(address, size, newer) == 1) {
+        Core::NativeUpdates::NoteIdMarks(Core::NativeUpdates::ImLeanImageTouched);
+    }
     {
         std::scoped_lock lock{object_dirty_mutex};
         if (Core::NativeUpdates::LeanDirtyMode() != 2) {
@@ -173,7 +177,7 @@ void BufferCache::ApplyIdMark(VAddr address, u64 size, bool newer, u64 object, u
         static thread_local u32 sample = 0;
         if ((++sample & 63) != 0) {
             NoteIdMarks(ImLean);
-            IdMarkLean(address, size, told.id);
+            IdMarkLean(address, size, newer, told.id);
             return;
         }
         NoteIdMarks(ImSampledFull);
@@ -192,15 +196,12 @@ void BufferCache::ApplyIdMark(VAddr address, u64 size, bool newer, u64 object, u
     Core::NativeResources::t_bump_capture = nullptr;
     const u32 effects = Core::N0::t_effect;
     NoteIdMarks(ImChecked);
-    const u32 unexpected = effects & (Core::N0::EffGpuRanges | Core::N0::EffImage);
-    if (unexpected != 0) {
+    if ((effects & Core::N0::EffImage) != 0) {
+        NoteIdMarks(ImUnexpectedImage); // (counted only: the lean apply keeps the image step)
+    }
+    if ((effects & Core::N0::EffGpuRanges) != 0) {
         NoteIdMarks(ImUnexpectedEffect);
-        if ((unexpected & Core::N0::EffGpuRanges) != 0) {
-            NoteIdMarks(ImUnexpectedGpu);
-        }
-        if ((unexpected & Core::N0::EffImage) != 0) {
-            NoteIdMarks(ImUnexpectedImage);
-        }
+        NoteIdMarks(ImUnexpectedGpu);
         if (mode == 2) {
             NoteIdMarks(ImSampledUnexpected);
         }

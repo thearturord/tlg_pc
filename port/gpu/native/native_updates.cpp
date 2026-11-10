@@ -422,8 +422,11 @@ u32 ApplyCoalesceMode() noexcept {
 
 u32 IdMarksMode() noexcept {
     static const u32 mode = [] {
-        const char* e = std::getenv("TLG_ID_MARKS");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+        const char* e = std::getenv("TLG_ID_MARKS"); // default 2 (real) since 2026-11-10 after the owner's play; =0 off, =1 shadow
+        if (e == nullptr || e[0] == 0) {
+            return 2u;
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
@@ -1259,11 +1262,11 @@ nlohmann::json B2Report() {
                   {"id_marks", [] {
                        const auto c = [](IdMarksCount w) { return id_marks_counts[w].load(); };
                        return nlohmann::json{{"mode", IdMarksMode()}, {"applies", c(ImApplies)}, {"lean", c(ImLean)}, {"sampled_full", c(ImSampledFull)}, {"not_named", c(ImNotNamed)}, {"block", c(ImBlock)},
-                                             {"checked", c(ImChecked)}, {"UNEXPECTED_EFFECT_MUST_BE_0", c(ImUnexpectedEffect)}, {"unexpected_gpu_written", c(ImUnexpectedGpu)}, {"unexpected_image", c(ImUnexpectedImage)},
+                                             {"checked", c(ImChecked)}, {"UNEXPECTED_EFFECT_MUST_BE_0 (GPU-written only; the image step is kept)", c(ImUnexpectedEffect)}, {"unexpected_gpu_written", c(ImUnexpectedGpu)}, {"unexpected_image", c(ImUnexpectedImage)},
                                              {"SAMPLED_UNEXPECTED_MUST_BE_0", c(ImSampledUnexpected)}, {"unattributed_marked", c(ImUnattributed)}, {"parts_match", c(ImPartsMatch)}, {"PARTS_DIFFER_MUST_BE_0", c(ImPartsDiffer)},
                                              {"part_whole_buffer", c(ImPartWhole)}, {"part_not_whole_buffer", c(ImPartNotWhole)}, {"resident_bumped_own", c(ImResidentTold)}, {"resident_bumped_neighbor", c(ImResidentNeighbor)},
                                              {"resident_bumped_neighbor_was_synced", c(ImResidentNeighborSynced)}, {"named_but_own_not_bumped", c(ImResidentToldNone)}, {"lean_resident_bumped", c(ImLeanResident)},
-                                             {"lean_not_resident", c(ImLeanNoResident)}, {"again_skipped", c(ImAgainSkipped)}, {"hash_skipped", c(ImHashSkipped)}};
+                                             {"lean_not_resident", c(ImLeanNoResident)}, {"again_skipped", c(ImAgainSkipped)}, {"hash_skipped", c(ImHashSkipped)}, {"lean_image_touched", c(ImLeanImageTouched)}};
                    }()},
                   {"reapply_gate", {{"on", ReapplyGateOn()}, {"skipped_unchanged", ra_gate_skipped.load()}, {"applied_changed_or_unknown", ra_gate_applied.load()}}},
             {"reapply_audit", {{"on", ReapplyAuditOn()}, {"batches", ra_batches.load()}, {"misaligned_batches", ra_misaligned_batches.load()}, {"ranges_audited", ra_audited.load()}, {"unhashed", ra_unhashed.load()},
