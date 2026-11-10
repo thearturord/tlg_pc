@@ -200,6 +200,24 @@ namespace {
 std::array<std::atomic<u64>, DropCount> drops{};
 }
 
+u32 OwnImmutableMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_OWN_IMMUTABLE"); // 0 off (default), 1 shadow, 2 real (1 in 64 audited)
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
+
+namespace {
+std::array<std::atomic<u64>, OwnCount> owns{};
+}
+
+void NoteOwn(u32 what) noexcept {
+    if (what < OwnCount) {
+        owns[what].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void NoteDrop(u32 what) noexcept {
     if (what < DropCount) {
         drops[what].fetch_add(1, std::memory_order_relaxed);
@@ -214,6 +232,14 @@ nlohmann::json Report() {
         j["drop_dirty"]["mode"] = DropDirtyMode();
         for (u32 k = 0; k < DropCount; ++k) {
             j["drop_dirty"][D[k]] = drops[k].load();
+        }
+    }
+    {
+        static constexpr const char* O[OwnCount] = {"asked", "immutable_inside", "no_own_buffer", "not_synced", "bound_from_own", "compared", "DIFFERENT_MUST_BE_0",
+                                                    "OLD_PATH_DID_WORK_MUST_BE_0", "old_answer_stream_ring", "own_set", "own_cleared"};
+        j["own_immutable"]["mode"] = OwnImmutableMode();
+        for (u32 k = 0; k < OwnCount; ++k) {
+            j["own_immutable"][O[k]] = owns[k].load();
         }
     }
     if (!On()) {

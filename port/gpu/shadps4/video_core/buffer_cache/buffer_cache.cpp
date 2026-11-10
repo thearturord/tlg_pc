@@ -1754,6 +1754,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             if (immutable->synced.load(std::memory_order_acquire) && !Core::NativeResources::ImmutableCheck(*immutable) &&
                 (immutable->usage == 1 || !IsRegionCpuModified(device_addr, size))) {
                 const auto* arena = BufferFor(device_addr, size); // B9.4: the object's own Vulkan buffer when it is placed
+                if (Core::OwnMemoryCensus::OwnImmutableMode() != 0 && immutable->usage == 1 && arena->placed_begin != 0 && immutable->begin >= arena->cpu_addr &&
+                    immutable->end <= arena->cpu_addr + arena->size_bytes && immutable->own.exchange(arena, std::memory_order_acq_rel) != arena) {
+                    Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnSet); // design review 83: synchronized, and held whole by this placed buffer
+                }
                 if (immutable->resident_epoch.load(std::memory_order_relaxed) != PlacementEpoch() && immutable->begin >= arena->cpu_addr &&
                     immutable->end <= arena->cpu_addr + arena->size_bytes) {
                     // R1: the arenas moved since the synchronization; the object is resident in this one now
@@ -1789,6 +1793,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             immutable->resident_buffer.store(arena, std::memory_order_relaxed);
             immutable->resident_base.store(arena->cpu_addr, std::memory_order_relaxed);
             immutable->resident_epoch.store(PlacementEpoch(), std::memory_order_relaxed);
+            if (Core::OwnMemoryCensus::OwnImmutableMode() != 0 && immutable->usage == 1 && arena->placed_begin != 0 && immutable->begin >= arena->cpu_addr &&
+                immutable->end <= arena->cpu_addr + arena->size_bytes) {
+                // design review 83: the buffer is synchronized whole into a placed buffer of its own (or its block's): that is its own memory until the placed buffer is dropped
+                if (immutable->own.exchange(arena, std::memory_order_acq_rel) != arena) {
+                    Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnSet);
+                }
+            }
             Core::NativeResources::ImmutableSynced(*immutable, generation);
             Core::NativeResources::NoteImmutableSync();
             if (immutable->usage != 1) {

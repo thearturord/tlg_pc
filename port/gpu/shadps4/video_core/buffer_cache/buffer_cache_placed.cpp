@@ -22,6 +22,7 @@
 #include "native/native_registry.h"
 #include "native/native_updates.h"
 #include "native/native_resources.h"
+#include "native/native_own_memory_census.h"
 #include "native/native_resource_audit.h"
 #include "native/native_executor.h"
 #include "native/native_identity_log.h"
@@ -472,6 +473,10 @@ void BufferCache::DropPlaced(VAddr begin, const char* why) {
     for (const u64 id : ids) {
         if (auto* object = Core::NativeResources::FindImmutableById(id)) {
             object->resident_epoch.store(~u64{0}, std::memory_order_release); // its binding resolution is made again
+            if (object->own.load(std::memory_order_acquire) == buffer.get()) {
+                object->own.store(nullptr, std::memory_order_release); // design review 83: before the buffer is freed (deferred below)
+                Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnCleared);
+            }
         }
     }
     // freed once the GPU is done with the work recorded so far (its descriptor slots are dropped by the buffer's destructor)

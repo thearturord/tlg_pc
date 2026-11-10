@@ -4264,6 +4264,51 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
             if (cover_on) [[unlikely]] {
                 t_fseg[0] = BsegNow();
             }
+            own_compare = nullptr;
+            if (const u32 own_mode = Core::OwnMemoryCensus::OwnImmutableMode(); own_mode != 0 && !desc.is_written) {
+                // design review 83 (TLG_OWN_IMMUTABLE): a read binding of an immutable engine buffer, named by its id, bound from the buffer's own memory. Its bytes never change
+                // after the synchronization (a CPU write clears `synced`; GPU copies into it write that same buffer and the barrier query below orders them)
+                namespace OM = Core::OwnMemoryCensus;
+                const StagePlan* op = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
+                                      : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
+                                                                                                                  : nullptr;
+                const ResolvedBuffer* r = op != nullptr && buffer_index < op->resolved.size() && op->resolved[buffer_index].ahead_id != 0 ? &op->resolved[buffer_index] : nullptr;
+                if (r != nullptr) {
+                    OM::NoteOwn(OM::OwnAsked);
+                    auto* h = Core::NativeResources::FindImmutableById(r->ahead_id);
+                    if (h != nullptr && h->usage == 1 && r->ahead_address >= h->begin && r->ahead_address + r->ahead_size <= h->end && h->alive.load(std::memory_order_acquire)) {
+                        OM::NoteOwn(OM::OwnImmutable);
+                        const auto* own = static_cast<const VideoCore::Buffer*>(h->own.load(std::memory_order_acquire));
+                        if (own == nullptr) {
+                            OM::NoteOwn(OM::OwnNoOwn);
+                        } else if (!h->synced.load(std::memory_order_acquire)) {
+                            OM::NoteOwn(OM::OwnNotSynced);
+                        } else {
+                            static thread_local u32 own_tick = 0;
+                            if (own_mode == 2 && (++own_tick & 63u) != 0) {
+                                OM::NoteOwn(OM::OwnBound);
+                                const u64 offset = own->Offset(r->ahead_address);
+                                const u64 offset_aligned = Common::AlignDown(offset, alignment);
+                                const u64 adjust = offset - offset_aligned;
+                                const_cast<VideoCore::Buffer*>(own)->NoteResolveUse();
+                                push_data.AddOffset(binding.buffer, adjust);
+                                buffer_infos.emplace_back(own->Handle(), offset_aligned, r->ahead_size + adjust);
+                                bound_buffers.emplace_back(own, offset, r->ahead_size, src_access);
+                                if (BufferBarrierQuery(own, offset, r->ahead_size, false)) {
+                                    needs_barrier = true;
+                                }
+                                goto buffer_bound;
+                            }
+                            // the shadow, or the audit: the old path answers; compared at the end of the binding
+                            own_compare = own;
+                            own_compare_offset = own->Offset(r->ahead_address);
+                            own_compare_size = r->ahead_size;
+                            own_compare_slot = binding.buffer;
+                            VideoCore::BufferCache::UploadBytesReset();
+                        }
+                    }
+                }
+            }
             if (Vulkan::RowShare::Mode() == 2) {
                 // rows ahead real (design review 56): the row the front planned for this binding, still valid now, is bound without the descriptor decode, the bind context and the lookup
                 t_ahead_sample = nullptr;
@@ -4992,6 +5037,30 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
         }
 
     buffer_bound:
+        if (own_compare != nullptr) [[unlikely]] {
+            // design review 83: the own memory's answer against the old path's
+            namespace OM = Core::OwnMemoryCensus;
+            const auto& info = buffer_infos.back();
+            if (buffer_cache.IsStreamHandle(info.buffer)) {
+                OM::NoteOwn(OM::OwnOldStream);
+            } else {
+                OM::NoteOwn(OM::OwnCompared);
+                const u64 aligned = Common::AlignDown(own_compare_offset, alignment);
+                const u64 adjust = own_compare_offset - aligned;
+                if (info.buffer != own_compare->Handle() || info.offset != aligned || info.range != own_compare_size + adjust || push_data.buf_offsets[own_compare_slot] != adjust) {
+                    OM::NoteOwn(OM::OwnDifferent);
+                    static std::atomic<u32> logged{0};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+                        LOG_ERROR(Render_Vulkan, "own immutable differs: stage {:#x} buffer {}: own {:#x}+{:#x}/{:#x} adjust {}, old {:#x}+{:#x}/{:#x} adjust {}", stage.pgm_hash, buffer_index,
+                                  reinterpret_cast<u64>(static_cast<VkBuffer>(own_compare->Handle())), aligned, own_compare_size + adjust, adjust,
+                                  reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)), info.offset, info.range, push_data.buf_offsets[own_compare_slot]);
+                    }
+                } else if (VideoCore::BufferCache::UploadBytes() != 0) {
+                    OM::NoteOwn(OM::OwnOldPathWork);
+                }
+            }
+            own_compare = nullptr;
+        }
         if (t_fseg_on) [[unlikely]] {
             t_fseg[5] = BsegNow();
         }

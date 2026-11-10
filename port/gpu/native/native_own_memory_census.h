@@ -49,6 +49,23 @@ enum Drop : u32 {
     DropCount
 };
 void NoteDrop(u32 what) noexcept;
+/// Design review 83: `TLG_OWN_IMMUTABLE` (default 0; 1 shadow, 2 real, 1 in 64 audited): read bindings of immutable engine buffers bound from the buffer's own memory.
+[[nodiscard]] u32 OwnImmutableMode() noexcept;
+enum Own : u32 {
+    OwnAsked,          ///< read bindings with an engine id the front planned
+    OwnImmutable,      ///< ... naming an immutable buffer, inside it
+    OwnNoOwn,          ///< ... not in a placed buffer of its own (yet)
+    OwnNotSynced,      ///< ... with CPU bytes not synchronized
+    OwnBound,          ///< real: bound from the own memory
+    OwnCompared,       ///< shadow or the audit: compared with the old path's answer
+    OwnDifferent,      ///< DIFFERENT_MUST_BE_0
+    OwnOldPathWork,    ///< OLD_PATH_DID_WORK_MUST_BE_0: the old path uploaded bytes for it
+    OwnOldStream,      ///< the old path answered from the stream ring (a copy, not compared)
+    OwnSet,            ///< own pointers set
+    OwnCleared,        ///< own pointers cleared (placed buffer dropped)
+    OwnCount
+};
+void NoteOwn(u32 what) noexcept;
 [[nodiscard]] nlohmann::json Report();
 
 } // namespace Core::OwnMemoryCensus

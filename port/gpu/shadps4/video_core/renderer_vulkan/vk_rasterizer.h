@@ -330,6 +330,10 @@ private:
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     /// The render state of a draw that starts or changes a render pass (the work BeginRendering does when the memo below cannot answer).
     RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
+    /// Design review 83: the own memory answer of the binding being compared with the old path (shadow or audit), null when none.
+    const VideoCore::Buffer* own_compare{};
+    u64 own_compare_offset{}, own_compare_size{};
+    u32 own_compare_slot{};
 
     u32 const_ring_level = 0;
     std::unique_ptr<ConstantRing> constant_ring;

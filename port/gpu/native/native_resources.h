@@ -76,6 +76,9 @@ struct ImmutableBuffer {
     /// Design review 81 (`TLG_DROP_DIRTY_APPLIES`): set when an announced write marked the whole of this buffer's range dirty, cleared when an upload takes its dirty bytes.
     /// While set, a further write of the light constants or scene slots changes nothing a reader sees (the next reader uploads the bytes from guest memory anyway).
     std::atomic<bool> dirty_pending{false};
+    /// Design review 83 (`TLG_OWN_IMMUTABLE`): the placed Vulkan buffer (`VideoCore::Buffer`) that holds this buffer's bytes, set when it was synchronized into one,
+    /// cleared before that buffer is dropped. With `synced`, a read binding of the buffer by its id is bound from it: no row, no lookup by address, no epoch.
+    std::atomic<const void*> own{nullptr};
 };
 
 /// C1 / C3: resident engine buffers (`TLG_RESIDENT_BUFFERS=1`). The residency of the immutable buffers (a buffer synchronized once is read from the arena with no tracker query)
