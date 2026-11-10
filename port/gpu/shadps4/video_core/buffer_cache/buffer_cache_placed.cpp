@@ -17,6 +17,7 @@
 #include "core/memory.h"
 #include "native/native_debug_server.h"
 #include "native/native_device.h"
+#include "native/native_hook_owned.h"
 #include "native/native_log.h"
 #include "native/native_readbacks.h"
 #include "native/native_registry.h"
@@ -369,6 +370,9 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
         // the members' next uploads put them in)
         std::scoped_lock lock{object_dirty_mutex};
         for (const u64 id : ids) {
+            if (Core::HookOwned::Pinned(id)) [[unlikely]] {
+                continue; // note 92: a hook-owned member stays dirty (its writes are not announced)
+            }
             if (const auto it = object_dirty.find(id); it != object_dirty.end()) {
                 for (const auto& [a, n] : rest) {
                     it->second.Subtract(a, n);

@@ -1429,12 +1429,18 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
     if (B2NativeMode() != 0 && !ring_out) {
         // note 90 (TLG_HOOK_OWNED): the light and slot buffers' membership, decided here in game order; the shadow announces everything and carries the mark
         const u8 hook_mark = HookOwned::Mode() != 0 ? HookOwned::OnWrite((writer & 7) | t_announce_site_class, t_announce_object, address, size) : u8{0};
+        if (hook_mark == HookOwned::MarkOwned && HookOwned::Mode() == 2) {
+            // note 92, real: a member's write is not announced; the raster thread keeps the member pinned dirty, so every upload over it reads guest memory as it is then
+            HookOwned::NoteDropped();
+            goto announced;
+        }
         std::scoped_lock lock{pending_mutex};
         // memory the engine writes fresh every frame (the frame rings): applied early on the raster thread
         const bool fresh = EarlyAnnounceOn() && (writer == 1 || writer == 2 || writer == 4 || ring);
         (fresh ? pending_ring_ranges : pending_ranges).emplace_back(address, size);
         (fresh ? pending_ring_writers : pending_writers).push_back(Tag{static_cast<u8>((writer & 7) | t_announce_site_class), t_announce_object, static_cast<u8>(ring_candidate ? 1 : 0), hook_mark});
     }
+announced:
     NativeResources::NoteAnnouncedWrite(address, size); // C1: resident buffers on those pages are not synchronized any more
     NativeUploads::Announce(writer, address, size, thread == render_thread.load(std::memory_order_relaxed), NativeDraw::NextSeq());
     // A1.0: the constant buffer copies (writer 3) and the Maps of buffers are not image content: nothing reads their bytes from the store

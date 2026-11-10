@@ -21,7 +21,7 @@ namespace Core::HookOwned {
 u32 Mode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_HOOK_OWNED");
-        return e != nullptr && e[0] == '1' ? 1u : 0u; // (2, real, is not built yet)
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
@@ -101,6 +101,8 @@ enum HookCount : u32 {
     HkExcludeCalls,      ///< buffers a texture creation named
     HkGone,              ///< named buffers deleted
     HkAwaiting,          ///< writes of a proposed buffer before the raster thread confirmed it (announced)
+    HkAudited,           ///< real mode: owned writes announced as the audit (one in 64)
+    HkDropped,           ///< real mode: owned writes left out of the batch
     HkCount
 };
 std::array<std::atomic<u64>, HkCount> hk{};
@@ -120,6 +122,13 @@ enum RasterCount : u32 {
     RcRefusedGpu,           ///< joins refused: GPU-written bytes are in it
     RcRefusedUnknown,       ///< joins refused: the buffer's image list (B8.5) holds a live image, or the index does not know the buffer
     RcConfirmLost,          ///< confirmed, but the hook had excluded the buffer meanwhile
+    RcAudits,               ///< real mode: audit applies of a member
+    RcAuditNotPinned,       ///< ... whose dirty set did not hold the written range (MUST_BE_0)
+    RcAuditImageTouched,    ///< ... whose image step touched an image or a waiting clear (MUST_BE_0)
+    RcAuditMemoErased,      ///< ... whose memo erase removed an entry (MUST_BE_0: no memo keeps an answer over a member)
+    RcAuditNotMember,       ///< audit mark, but the raster thread had removed the member
+    RcMemoRefused,          ///< real mode: memo inserts refused over a member
+    RcExcludedByGuard,      ///< real mode: members excluded after a guard event (a GPU write or an image over them)
     RcOwnedApplies,         ///< applies of writes the real mode would not announce (member, mark owned)
     RcOwnedImageTouched,    ///< ... whose image step touched an image or a waiting clear (MUST_BE_0)
     RcOwnedMemoErased,      ///< ... whose memo erase removed an entry (the real mode never makes that entry)
@@ -135,6 +144,7 @@ enum RasterCount : u32 {
 };
 std::array<std::atomic<u64>, RcCount> rc{};
 thread_local bool t_captured = false;
+thread_local bool t_audit = false;
 
 bool IntersectsLocked(u64 address, u64 size, u64* overlap = nullptr) {
     auto it = by_address.lower_bound(address >= max_len ? address - max_len : 0);
@@ -164,6 +174,27 @@ void RemoveLocked(u64 id) {
     member_count.store(members.size(), std::memory_order_relaxed);
 }
 
+/// Real mode, after a guard event: the members over [address, address + size) leave (the hook announces their writes again).
+void ExcludeOverLocked(u64 address, u64 size) {
+    if (Mode() != 2) {
+        return;
+    }
+    std::vector<u64> gone;
+    const u64 end = address + size;
+    for (auto it = by_address.lower_bound(address >= max_len ? address - max_len : 0); it != by_address.end() && it->first < end; ++it) {
+        if (it->second.first > address) {
+            gone.push_back(it->second.second);
+        }
+    }
+    for (const u64 id : gone) {
+        if (Slot* s = Find(id)) {
+            s->state.store(Excluded, std::memory_order_release);
+        }
+        RemoveLocked(id);
+        rc[RcExcludedByGuard].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void LogFew(std::atomic<u32>& logged, const char* what, u64 address, u64 size) {
     if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
         LOG_ERROR(Render_Vulkan, "hook owned: {} {:#x}+{:#x}", what, address, size);
@@ -185,6 +216,13 @@ u8 OnWrite(u32 tag, u64 id, u64 address, u64 size) noexcept {
             if (address >= s.begin.load(std::memory_order_relaxed) && address + size <= s.end.load(std::memory_order_relaxed)) {
                 hk[HkOwnedWrites].fetch_add(1, std::memory_order_relaxed);
                 hk_owned_by_tag[tag & 15].fetch_add(1, std::memory_order_relaxed);
+                if (Mode() == 2) {
+                    static thread_local u32 audit_tick = 0;
+                    if ((++audit_tick & 63u) == 0) {
+                        hk[HkAudited].fetch_add(1, std::memory_order_relaxed);
+                        return MarkAudit; // announced, checked at its apply
+                    }
+                }
                 return MarkOwned;
             }
             hk[HkOwnedOutside].fetch_add(1, std::memory_order_relaxed);
@@ -290,13 +328,14 @@ bool ApplyBegin(u64 object, u64 address, u64 size, u64& join_begin, u64& join_en
         }
         return false;
     }
-    if (mark == MarkOwned) {
+    if (mark == MarkOwned || mark == MarkAudit) {
         if (!members.contains(object)) {
-            rc[RcOwnedNotMember].fetch_add(1, std::memory_order_relaxed);
+            rc[mark == MarkAudit ? RcAuditNotMember : RcOwnedNotMember].fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        rc[RcOwnedApplies].fetch_add(1, std::memory_order_relaxed);
+        rc[mark == MarkAudit ? RcAudits : RcOwnedApplies].fetch_add(1, std::memory_order_relaxed);
         t_captured = true;
+        t_audit = mark == MarkAudit;
         return true;
     }
     if (object != 0 && members.contains(object)) {
@@ -311,34 +350,72 @@ void ApplyEnd(u32 effects) noexcept {
     }
     t_captured = false;
     if ((effects & N0::EffImage) != 0) {
-        rc[RcOwnedImageTouched].fetch_add(1, std::memory_order_relaxed);
+        rc[t_audit ? RcAuditImageTouched : RcOwnedImageTouched].fetch_add(1, std::memory_order_relaxed);
+        if (t_audit) {
+            static std::atomic<u32> logged{0};
+            LogFew(logged, "the audit apply of a member touched an image or a waiting clear", 0, 0);
+        }
     }
     if ((effects & N0::EffMemo) != 0) {
-        rc[RcOwnedMemoErased].fetch_add(1, std::memory_order_relaxed);
+        rc[t_audit ? RcAuditMemoErased : RcOwnedMemoErased].fetch_add(1, std::memory_order_relaxed);
     }
+    t_audit = false;
 }
 
-void Confirm(u64 id, u64 begin, u64 end, u32 refuse) noexcept {
+bool Confirm(u64 id, u64 begin, u64 end, u32 refuse) noexcept {
     Slot* s = Find(id);
     if (s == nullptr) {
-        return;
+        return false;
     }
     if (refuse != RefuseNone) {
         s->state.store(Excluded, std::memory_order_release);
         rc[refuse == RefuseImage ? RcRefusedImage : refuse == RefuseGpuWritten ? RcRefusedGpu : RcRefusedUnknown].fetch_add(1, std::memory_order_relaxed);
-        return;
+        return false;
     }
+    std::scoped_lock lock{rmutex}; // (taken before the state moves: a Pinned() true is always backed by the raster's member entry)
     u32 proposed = Proposed;
     if (!s->state.compare_exchange_strong(proposed, Owned, std::memory_order_acq_rel)) {
         rc[RcConfirmLost].fetch_add(1, std::memory_order_relaxed);
-        return;
+        return false;
     }
-    std::scoped_lock lock{rmutex};
     members[id] = {begin, end};
     by_address[begin] = {end, id};
     max_len = std::max(max_len, end - begin);
     member_count.store(members.size(), std::memory_order_relaxed);
     rc[RcJoins].fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool Pinned(u64 id) noexcept {
+    if (Mode() != 2 || member_count.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    const Slot* s = Find(id);
+    return s != nullptr && s->state.load(std::memory_order_acquire) == Owned;
+}
+
+bool MemberIn(u64 address, u64 size) noexcept {
+    if (Mode() != 2 || member_count.load(std::memory_order_relaxed) == 0 || size == 0) {
+        return false;
+    }
+    std::scoped_lock lock{rmutex};
+    if (IntersectsLocked(address, size)) {
+        rc[RcMemoRefused].fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
+void NoteAuditPinned(bool pinned) noexcept {
+    if (!pinned) {
+        rc[RcAuditNotPinned].fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<u32> logged{0};
+        LogFew(logged, "the audit found a member's write not pinned", 0, 0);
+    }
+}
+
+void NoteDropped() noexcept {
+    hk[HkDropped].fetch_add(1, std::memory_order_relaxed);
 }
 
 void Event(u32 what, u64 id, u64 address, u64 bytes) noexcept {
@@ -375,6 +452,7 @@ void GpuWrite(u64 address, u64 size) noexcept {
         rc[RcGpuWriteOverMember].fetch_add(1, std::memory_order_relaxed);
         static std::atomic<u32> logged{0};
         LogFew(logged, "a GPU-written request over a member", address, size);
+        ExcludeOverLocked(address, size);
     }
 }
 
@@ -387,6 +465,7 @@ void ImageRegistered(u64 address, u64 size) noexcept {
         rc[RcImageOverMember].fetch_add(1, std::memory_order_relaxed);
         static std::atomic<u32> logged{0};
         LogFew(logged, "an image registered over a member", address, size);
+        ExcludeOverLocked(address, size);
     }
 }
 
@@ -411,6 +490,8 @@ nlohmann::json Report() {
                  {"of_them_light_constants_tag_2", hk_owned_by_tag[2].load()},
                  {"of_them_scene_slots_tag_12", hk_owned_by_tag[12].load()},
                  {"joins_proposed", h(HkJoins)},
+                 {"real_writes_left_out_of_the_batch", h(HkDropped)},
+                 {"real_writes_announced_as_audit", h(HkAudited)},
                  {"writes_awaiting_confirmation", h(HkAwaiting)},
                  {"join_refused_texture_in_memory", h(HkJoinTexture)},
                  {"join_refused_not_inside_buffer", h(HkJoinNotInside)},
@@ -437,6 +518,13 @@ nlohmann::json Report() {
                    {"joins_refused_gpu_written", r(RcRefusedGpu)},
                    {"joins_refused_by_the_buffers_image_list", r(RcRefusedUnknown)},
                    {"confirm_lost_to_exclusion", r(RcConfirmLost)},
+                   {"real_audits", r(RcAudits)},
+                   {"AUDIT_NOT_PINNED_MUST_BE_0", r(RcAuditNotPinned)},
+                   {"AUDIT_IMAGE_TOUCHED_MUST_BE_0", r(RcAuditImageTouched)},
+                   {"AUDIT_MEMO_ERASED_MUST_BE_0", r(RcAuditMemoErased)},
+                   {"audit_mark_after_member_left", r(RcAuditNotMember)},
+                   {"real_memo_inserts_refused", r(RcMemoRefused)},
+                   {"real_members_excluded_by_guard", r(RcExcludedByGuard)},
                    {"GPU_WRITE_OVER_HOOK_OWNED_MUST_BE_0", r(RcGpuWriteOverMember)},
                    {"IMAGE_OVER_HOOK_OWNED_MUST_BE_0", r(RcImageOverMember)},
                    {"address_requests_over_members", r(RcRequests)},

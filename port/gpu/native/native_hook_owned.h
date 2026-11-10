@@ -5,7 +5,7 @@
 #include <nlohmann/json_fwd.hpp>
 #include "common/types.h"
 
-/// Design review note 90, section 79 step 2 (`TLG_HOOK_OWNED`: 0 off (default), 1 shadow; 2 real is not built yet): the light constant and scene slot buffers (writer tags 2 and 12)
+/// Design review notes 90 to 92, section 79 step 2 (`TLG_HOOK_OWNED`: 0 off (default), 1 shadow, 2 real with 1 in 64 owned writes still announced as an audit): the light constant and scene slot buffers (writer tags 2 and 12)
 /// become *hook-owned*. Their writes leave the announce batch; the address path treats their bytes as always changed (pinned dirty, no cached answer over them).
 ///
 /// Membership in two steps. The hook proposes it, in game order: the first light or slot write of a buffer with no engine texture in its memory is announced marked "join".
@@ -20,8 +20,17 @@ namespace Core::HookOwned {
 
 [[nodiscard]] u32 Mode() noexcept;
 
-/// The mark a write carries through the batch.
-enum Mark : u8 { MarkNone = 0, MarkJoin = 1, MarkOwned = 2 };
+/// The mark a write carries through the batch. Real mode: an owned write is not announced (never reaches the batch) except the audit one in 64.
+enum Mark : u8 { MarkNone = 0, MarkJoin = 1, MarkOwned = 2, MarkAudit = 3 };
+
+/// Real mode: buffer `id` is a confirmed member, so its bytes are pinned dirty (every upload walk takes them, no subtraction removes them). Lock-free, any thread.
+[[nodiscard]] bool Pinned(u64 id) noexcept;
+/// Real mode: [address, address + size) meets a member (raster thread; a bind or obtain memo must not keep an answer over it).
+[[nodiscard]] bool MemberIn(u64 address, u64 size) noexcept;
+/// Real mode, the audit apply: whether the member's dirty set held the written range (it must: the pin).
+void NoteAuditPinned(bool pinned) noexcept;
+/// Real mode: an owned write left out of the batch (hook side).
+void NoteDropped() noexcept;
 
 // ---- hook side (any game thread) ----
 /// A write with writer tag `tag` (writer | 8 without a site name) naming engine buffer `id`: its mark.
@@ -39,7 +48,8 @@ extern thread_local u8 t_mark;
 [[nodiscard]] bool ApplyBegin(u64 object, u64 address, u64 size, u64& join_begin, u64& join_end) noexcept;
 /// The raster thread's answer to a join: why it refuses (0 none: confirmed).
 enum Refuse : u32 { RefuseNone = 0, RefuseImage = 1, RefuseGpuWritten = 2, RefuseUnknownBuffer = 3 };
-void Confirm(u64 id, u64 begin, u64 end, u32 refuse) noexcept;
+/// Returns true when the buffer is now a member (the caller pins it in real mode).
+[[nodiscard]] bool Confirm(u64 id, u64 begin, u64 end, u32 refuse) noexcept;
 /// The captured effects of the apply (N0 effect bits).
 void ApplyEnd(u32 effects) noexcept;
 /// An engine object event of the batch (`what` as in `NoteEngineDelete` / `NoteEngineCreate`: 2 texture created, 4 buffer deleted).

@@ -149,7 +149,24 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object)
                     refuse = Refuse::RefuseUnknownBuffer;
                 }
             }
-            Core::HookOwned::Confirm(object, join_begin, join_end, refuse);
+            if (Core::HookOwned::Confirm(object, join_begin, join_end, refuse) && Core::HookOwned::Mode() == 2) {
+                // note 92, the pin: the member's whole memory is dirty from now on; no upload subtracts it (B9 walk, placement), so every upload over it takes guest memory
+                {
+                    std::scoped_lock lock{object_dirty_mutex};
+                    object_dirty[object].Add(join_begin, join_end - join_begin);
+                    if (Core::NativeUpdates::LeanDirtyMode() != 2) {
+                        all_object_dirty.Add(join_begin, join_end - join_begin);
+                    }
+                    OwnDirtyNote(object, true);
+                }
+                BindMemoErase(join_begin, join_end - join_begin); // (no answer cached over it before the pin survives)
+                cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
+            }
+        }
+        if (capture && Core::HookOwned::t_mark == Core::HookOwned::MarkAudit) {
+            std::scoped_lock lock{object_dirty_mutex};
+            const auto it = object_dirty.find(object);
+            Core::HookOwned::NoteAuditPinned(it != object_dirty.end() && it->second.Contains(address, size));
         }
         if (capture) {
             const bool force_before = Core::N0::t_force_effect;
@@ -1490,7 +1507,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferBody(VAddr device_addr, u
     lookup_scope.End();
     const auto result = ObtainBufferUncached(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
     TLG_PROF_LEVEL("buffer.obtain.memo_insert", 3);
-    if (memo.tick == tick) {
+    if (memo.tick == tick && !Core::HookOwned::MemberIn(device_addr, size)) { // note 92: no answer is kept over a hook-owned member
         auto& list = memo.entries[device_addr];
         list.erase(std::remove_if(list.begin(), list.end(), [&](const BindMemoEntry& e) { return e.size == size && e.texel == is_texel_buffer; }), list.end());
         // the epochs as they were before the request: anything the request itself changed makes the next one ask again
@@ -2034,7 +2051,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
         }
     }
     const u64 offset = arena->Offset(device_addr);
-    if (memo) {
+    if (memo && !Core::HookOwned::MemberIn(device_addr, size)) { // note 92: no answer is kept over a hook-owned member
         // the epoch read before the work: an upload this call did makes the entry stale, as it should
         *memo = {device_addr, size, is_written ? 1u : 0u, arena, offset, epoch_before, scheduler.ResolveEpoch(), epoch_before - cand_before};
     }
@@ -2532,7 +2549,12 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 b9_gaps.emplace_back(at, held_hi - at);
             }
             std::scoped_lock lock{object_dirty_mutex};
+            boost::container::small_vector<std::pair<u64, u64>, 4> pinned_pieces; // note 92: hook-owned members, taken whole every time and never subtracted
             for (const auto& part : parts) {
+                if (Core::HookOwned::Pinned(part.id)) [[unlikely]] {
+                    pinned_pieces.emplace_back(part.begin, part.end - part.begin);
+                    continue;
+                }
                 // (a subtraction only where the walk found bytes: with nothing in the range it changes nothing, and it is the costly half of the call)
                 if (const auto it = object_dirty.find(part.id); it != object_dirty.end()) {
                     const size_t before = b9_pieces.size();
@@ -2558,6 +2580,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                     all_object_dirty.Subtract(a, n);
                 }
             }
+            b9_pieces.insert(b9_pieces.end(), pinned_pieces.begin(), pinned_pieces.end());
         }
         Core::NativeUpdates::NoteB9(b9_object != 0 ? Core::NativeUpdates::B9SyncByObject : Core::NativeUpdates::B9SyncNoObject);
     }
