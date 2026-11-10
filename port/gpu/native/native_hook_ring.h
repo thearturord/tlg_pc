@@ -40,6 +40,13 @@ const u8* Data(u64 offset);
 /// Mode 2: the front bound a range from the storage (`checked`: it was also compared with game memory).
 void NoteBound(u64 size, bool checked);
 
+/// F1 1b shadow (`TLG_HOOK_RING_1B=1`, default off; needs every writer filling: `TLG_HOOK_RING_WRITERS=0xff`): the raster thread's ring uploads compared with
+/// the hook ring. `cls`: 0 read-only binding up to 64 KiB, 1 texel binding. The wide read bindings (above 64 KiB, the 4 MB dynamic buffers of section 12) stay
+/// on the old path by design and are only counted (`NoteRasterWide`). The source bytes are game memory now (what the old path uploads).
+bool Raster1bOn() noexcept;
+void CompareRaster(u32 cls, u64 address, u64 size);
+void NoteRasterWide(u64 size);
+
 nlohmann::json Report();
 
 } // namespace Core::HookRing

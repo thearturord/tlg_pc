@@ -49,6 +49,7 @@
 #include "video_core/texture_cache/texture_cache.h"
 #include "native/native_split_census.h"
 #include "native/native_ring_census.h"
+#include "native/native_hook_ring.h"
 
 #include <vk_mem_alloc.h>
 
@@ -2141,6 +2142,16 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             ring_lo = lo;
             ring_hi = hi;
             Core::RingCensus::NoteUse(Core::NativeUploads::PreSyncActive() ? Core::RingCensus::SiteRasterPreSync : Core::RingCensus::SiteRasterSync, lo, hi - lo); // TLG_RING_CENSUS (counters only)
+            if (Core::HookRing::Raster1bOn() && !Core::NativeUploads::PreSyncActive()) {
+                // F1 1b shadow: what the old path uploads here against the hook ring (the wide read bindings stay on the old path by design)
+                if (is_texel_buffer) {
+                    Core::HookRing::CompareRaster(1, lo, hi - lo);
+                } else if (hi - lo <= 65536) {
+                    Core::HookRing::CompareRaster(0, lo, hi - lo);
+                } else {
+                    Core::HookRing::NoteRasterWide(hi - lo);
+                }
+            }
             // Untracked upload ring: nobody told us what the CPU wrote, so the requested part is uploaded.
             if (device_addr < lo) {
                 announced_ranges(device_addr, lo - device_addr);

@@ -40,6 +40,12 @@ struct Example {
 };
 std::mutex g_example_mutex;
 std::vector<Example> g_examples;
+struct RasterStats {
+    std::atomic<u64> compares{0}, bytes{0}, equal{0}, diff_compares{0}, diff_bytes{0}, unfilled_compares{0}, unfilled_bytes{0}, partial{0};
+};
+RasterStats g_raster[2];
+std::atomic<u64> c_raster_wide{0}, c_raster_wide_bytes{0};
+std::vector<Example> g_raster_examples;
 
 u32 Mode() noexcept {
     // default 2 since 2026-11-10 (owner play good); =0 turns it off, =1 is the shadow
@@ -244,6 +250,74 @@ void Compare(u64 address, u64 size, const void* copied) {
     }
 }
 
+bool Raster1bOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_HOOK_RING_1B");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on && On();
+}
+
+void NoteRasterWide(u64 size) {
+    c_raster_wide.fetch_add(1, std::memory_order_relaxed);
+    c_raster_wide_bytes.fetch_add(size, std::memory_order_relaxed);
+}
+
+void CompareRaster(u32 cls, u64 address, u64 size) {
+    if (!Raster1bOn() || size == 0) {
+        return;
+    }
+    u8* bytes = g_bytes.load(std::memory_order_acquire);
+    if (bytes == nullptr) {
+        return;
+    }
+    auto& st = g_raster[cls & 1];
+    u64 lo, hi;
+    if (!Clip(address, size, lo, hi)) {
+        return;
+    }
+    if (lo != address || hi != address + size) {
+        st.partial.fetch_add(1, std::memory_order_relaxed); // the caller passes the ring part; counted, compared as clipped
+    }
+    const u64 base = g_base.load(std::memory_order_relaxed);
+    const auto* filled = g_filled.load(std::memory_order_acquire);
+    const auto* half = g_half.load(std::memory_order_acquire);
+    const u8* theirs = reinterpret_cast<const u8*>(lo); // game memory now: what the old path uploads
+    u64 diff = 0, unfilled = 0, first_diff = ~0ull;
+    for (u64 g = (lo - base) >> GranuleShift; g <= (hi - 1 - base) >> GranuleShift; ++g) {
+        const u64 g_lo = std::max(lo, base + (g << GranuleShift)) - lo, g_hi = std::min(hi, base + ((g + 1) << GranuleShift)) - lo;
+        if (filled[g].load(std::memory_order_acquire) == 0) {
+            unfilled += g_hi - g_lo;
+            continue;
+        }
+        const u8* mine = bytes + CopyOffset(lo - base, half[g].load(std::memory_order_relaxed));
+        for (u64 i = g_lo; i < g_hi; ++i) {
+            if (mine[i] != theirs[i]) {
+                ++diff;
+                first_diff = std::min(first_diff, i);
+            }
+        }
+    }
+    st.compares.fetch_add(1, std::memory_order_relaxed);
+    st.bytes.fetch_add(hi - lo, std::memory_order_relaxed);
+    if (diff == 0 && unfilled == 0) {
+        st.equal.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (diff != 0) {
+        st.diff_compares.fetch_add(1, std::memory_order_relaxed);
+        st.diff_bytes.fetch_add(diff, std::memory_order_relaxed);
+    }
+    if (unfilled != 0) {
+        st.unfilled_compares.fetch_add(1, std::memory_order_relaxed);
+        st.unfilled_bytes.fetch_add(unfilled, std::memory_order_relaxed);
+    }
+    std::scoped_lock lock{g_example_mutex};
+    if (g_raster_examples.size() < 32) {
+        g_raster_examples.push_back({(lo - base) | (static_cast<u64>(cls & 1) << 63), hi - lo, first_diff, diff, unfilled});
+    }
+}
+
 bool Resolve(u64 address, u64 size, u64& offset) {
     if (!RealOn() || size == 0 || g_bytes.load(std::memory_order_acquire) == nullptr) {
         return false;
@@ -307,7 +381,24 @@ nlohmann::json Report() {
                  {"old_path_outside_ring", c_resolve_outside.load()},
                  {"old_path_unfilled", c_resolve_unfilled.load()},
                  {"old_path_two_halves", c_resolve_two_halves.load()}};
+    static constexpr const char* cls_names[2] = {"read_up_to_64k", "texel"};
+    j["raster_1b"]["on"] = Raster1bOn();
+    for (u32 k = 0; k < 2; ++k) {
+        const auto& st = g_raster[k];
+        j["raster_1b"][cls_names[k]] = {{"compares", st.compares.load()},   {"bytes", st.bytes.load()},
+                                        {"equal", st.equal.load()},         {"with_diff", st.diff_compares.load()},
+                                        {"DIFF_BYTES_MUST_BE_0", st.diff_bytes.load()}, {"with_unfilled", st.unfilled_compares.load()},
+                                        {"UNFILLED_BYTES_MUST_BE_0", st.unfilled_bytes.load()}, {"partial_ranges", st.partial.load()}};
+    }
+    j["raster_1b"]["wide_reads_old_path"] = {{"count", c_raster_wide.load()}, {"bytes", c_raster_wide_bytes.load()}};
     std::scoped_lock lock{g_example_mutex};
+    {
+        auto& rl = j["raster_1b"]["examples"] = nlohmann::json::array();
+        for (const auto& e : g_raster_examples) {
+            rl.push_back({{"class", cls_names[e.offset >> 63]}, {"ring_offset", fmt::format("{:#x}", e.offset & ~(u64{1} << 63))}, {"size", e.size},
+                          {"first_diff", e.first_diff == ~0ull ? -1 : static_cast<s64>(e.first_diff)}, {"diff_bytes", e.diff_bytes}, {"unfilled", e.unfilled}});
+        }
+    }
     auto& list = j["examples"] = nlohmann::json::array();
     for (const auto& e : g_examples) {
         list.push_back({{"ring_offset", fmt::format("{:#x}", e.offset)}, {"size", e.size}, {"first_diff", e.first_diff == ~0ull ? -1 : static_cast<s64>(e.first_diff)},

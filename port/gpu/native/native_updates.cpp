@@ -86,13 +86,13 @@ std::map<std::pair<u64, u64>, OpenMap> open_maps; ///< (thread, resource id) -> 
 std::atomic<u64> c_open_replaced{0}, c_open_replaced_bytes{0}, c_open_replaced_in_ring{0}, c_unmap_unmatched{0};
 std::atomic<u64> c_replace_announced{0}, c_replace_announced_bytes{0};
 
-/// `TLG_MAP_REPLACE_ANNOUNCE=1` (design review section 10; default off until the owner plays it): a Map of a resource that this thread mapped before and has not unmapped
+/// `TLG_MAP_REPLACE_ANNOUNCE` (design review section 10; default on since 2026-11-10 after the owner's play, =0 turns it off): a Map of a resource that this thread mapped before and has not unmapped
 /// announces the earlier window first, as its Unmap would have (the thread has moved on to a new Map of the same resource, so the earlier window's writes are done).
 /// Before, the new entry replaced the old one and the old window was never announced. Adds announcements (and uploads), removes none.
 bool ReplaceAnnounceOn() {
     static const bool on = [] {
         const char* e = std::getenv("TLG_MAP_REPLACE_ANNOUNCE");
-        return e != nullptr && e[0] == '1';
+        return e == nullptr || e[0] != '0';
     }();
     return on;
 }
