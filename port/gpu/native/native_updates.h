@@ -125,7 +125,7 @@ enum IdMarksCount : u32 {
     IdMarksCounts
 };
 void NoteIdMarks(IdMarksCount what, u64 n = 1) noexcept;
-/// Design review 63/64 (`TLG_IMAGE_BY_ID`): 0 off (default), 1 shadow (the image step of a lean mark asks the id and the address and compares; the address decides), 2 real (a mark whose
+/// Design review 63 to 65 (`TLG_IMAGE_BY_ID`): 2 real (default since 2026-11-10, owner's play), 0 off, 1 shadow (the image step of a lean mark asks the id and the address and compares; the address decides), 2 real (a mark whose
 /// id says no image and no waiting clear skips the image step; one in 64 runs it anyway and must find nothing).
 [[nodiscard]] u32 ImageByIdMode() noexcept;
 /// Batch census (`TLG_BATCH_CENSUS=1`, design review 62, counters only): the time of each apply of the batch by writer tag, and of the lean mark's steps (one mark in 16 timed:
