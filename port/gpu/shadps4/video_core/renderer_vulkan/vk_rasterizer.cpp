@@ -4067,14 +4067,15 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     rc[5].fetch_add(1, std::memory_order_relaxed);
                 } else {
                     static thread_local u32 ahead_tick = 0;
-                    if ((++ahead_tick & 63u) == 0) {
+                    const u64 clock_now = Core::NativeIdentity::Clock();
+                    if (Core::NativeIdentity::ChangedSince(a->plan_clock, a->ahead_address, a->ahead_address + a->ahead_size) != Core::NativeIdentity::Change::None) {
+                        rc[4].fetch_add(1, std::memory_order_relaxed);
+                    } else if ((++ahead_tick & 63u) == 0) {
+                        // (sampled only among the rows the whole check accepts, the identity walk included: those are the ones the fast path binds)
                         rc[1].fetch_add(1, std::memory_order_relaxed);
                         t_ahead_sample = a; // the full path answers; compared below
                     } else {
-                        const u64 clock_now = Core::NativeIdentity::Clock();
-                        if (Core::NativeIdentity::ChangedSince(a->plan_clock, a->ahead_address, a->ahead_address + a->ahead_size) != Core::NativeIdentity::Change::None) {
-                            rc[4].fetch_add(1, std::memory_order_relaxed);
-                        } else {
+                        {
                             rc[0].fetch_add(1, std::memory_order_relaxed);
                             const VAddr address = a->ahead_address;
                             const u64 size = a->ahead_size;
@@ -4542,8 +4543,8 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         }
                     }
                 }
-                if (Vulkan::RowShare::Mode() != 0 && w31_id != 0) [[unlikely]] {
-                    // rows ahead shadow (design review 55): the row the front planned against the answer the raster thread gave
+                if (Vulkan::RowShare::Mode() == 1 && w31_id != 0) [[unlikely]] {
+                    // rows ahead shadow (design review 55; shadow mode only: beside the real mode its identity walk from old row clocks cost about 3 ms per frame): the row the front planned against the answer the raster thread gave
                     auto& c = rows_ahead_shadow[stage.sw_stage == Shader::SwStage::Compute ? 1 : 0];
                     c[0].fetch_add(1, std::memory_order_relaxed);
                     const StagePlan* ap = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
@@ -4560,7 +4561,8 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     } else {
                         c[1].fetch_add(1, std::memory_order_relaxed);
                         const bool valid = a->plan_epoch == buffer_cache.PlacementEpoch() && a->plan_version == Core::RowVersion::Of(w31_id) &&
-                                           (a->plan_flags & Vulkan::RowShare::FlagInside) != 0;
+                                           (a->plan_flags & Vulkan::RowShare::FlagInside) != 0 &&
+                                           Core::NativeIdentity::ChangedSince(a->plan_clock, a->ahead_address, a->ahead_address + a->ahead_size) == Core::NativeIdentity::Change::None;
                         if (!valid) {
                             c[7].fetch_add(1, std::memory_order_relaxed);
                         } else {

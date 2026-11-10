@@ -107,11 +107,15 @@ inline void Erase(u64 key) noexcept {
     return true;
 }
 
-/// 0 off (default), 1 shadow, 2 real (a planned row valid at the bind is bound without the stage loop's lookup; one in 64 takes the full path and is compared).
+/// 2 real (default since 2026-11-10 after the owner's play: a planned row valid at the bind is bound without the stage loop's lookup; one in 64 takes the full path and is
+/// compared), 1 shadow, 0 off.
 [[nodiscard]] inline u32 Mode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_ROWS_AHEAD");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+        if (e == nullptr || e[0] == 0) {
+            return 2u;
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
