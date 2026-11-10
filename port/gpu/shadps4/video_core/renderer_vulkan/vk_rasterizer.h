@@ -661,7 +661,12 @@ private:
     void ViewTableShadow(const Shader::Info& stage, u32 first_info, size_t bound_before, const TextureSetEntry* answers, const bool* answers_ok);
     /// Note 103 (`TLG_TARGET_TABLE=1`, shadow): target `slot` (0..7 color, 8 depth) of the draw, found by the old path as `image_id` (`old_find`: by FindImage), against the
     /// table's entry for the view the record names; `use` keeps apart what changes the target's description. Returns the entry's key (0: not in the class) for the render pass.
-    u64 TargetTableShadow(u32 slot, u64 use, VideoCore::ImageId image_id, bool old_find, bool& in_class, bool& served);
+    u64 TargetTableShadow(u32 slot, u64 use, VideoCore::ImageId image_id, const VideoCore::TextureCache::ImageDesc& desc, bool& in_class, bool& served);
+    /// Note 104 (`TLG_TARGET_TABLE=2`): target `slot`'s image and description from the table (true), or nothing done (false: the old path finds it).
+    bool TargetTableTake(u32 slot, u64 use, VideoCore::ImageId& image_id, VideoCore::TextureCache::ImageDesc& desc);
+    /// The use a target is keyed with besides its view: the slot and the bytes its description takes besides the view.
+    static u64 TargetUse(u64 slot, const void* bytes, size_t size) noexcept;
+    std::unordered_map<u64, VideoCore::TextureCache::ImageDesc> target_descs; ///< note 104: the old path's description of each target table entry
     /// ... at the render pass: the view the old path chose for target `slot`.
     void TargetViewShadow(u32 slot, vk::ImageView view);
     std::array<u64, 9> target_use{}; ///< note 103: the use the draw's targets were looked up with (0: not in the class)

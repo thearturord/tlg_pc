@@ -25,7 +25,7 @@ u32 Mode() noexcept {
 u32 TargetMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_TARGET_TABLE");
-        return e != nullptr && e[0] == '1' ? 1u : 0u; // (2, real, is not built yet)
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
@@ -123,7 +123,9 @@ nlohmann::json Report() {
     j["targets"] = {{"mode", TargetMode()}, {"draws", c(TgDraws)}, {"draws_all_in_class", c(TgDrawsAllInClass)}, {"draws_would_be_served_by_the_table", c(TgDrawsWouldServe)},
                     {"draws_in_class_where_the_old_path_ran_findimage", c(TgDrawsOldFind)}, {"targets_in_class", c(TgTargets)}, {"same", c(TgSame)},
                     {"TARGET_TABLE_DIFFERENT_MUST_BE_0", c(TgDifferent)}, {"no_entry_made", c(TgNoEntry)}, {"stale_remade", c(TgStale)}, {"no_view", c(TgNoView)},
-                    {"view_same", c(TgViewSame)}, {"TARGET_VIEW_DIFFERENT_MUST_BE_0", c(TgViewDifferent)}, {"view_recorded", c(TgViewNoEntry)}};
+                    {"view_same", c(TgViewSame)}, {"TARGET_VIEW_DIFFERENT_MUST_BE_0", c(TgViewDifferent)}, {"view_recorded", c(TgViewNoEntry)},
+                    {"TARGET_DESC_DIFFERENT_MUST_BE_0", c(TgDescDifferent)}, {"real_targets_taken", c(TgTaken)}, {"real_draws_taken", c(TgDrawsTaken)},
+                    {"real_draws_audited", c(TgAudits)}};
     j["real"] = {{"stages_bound_from_the_table", c(RealServed)}, {"image_bindings_bound_from_the_table", c(RealServedImages)}, {"stages_audited_by_the_old_path", c(RealAudited)},
                  {"stages_whose_image_checks_failed", c(RealCheckFailed)}};
     return j;

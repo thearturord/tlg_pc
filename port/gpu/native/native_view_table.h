@@ -66,6 +66,10 @@ enum Count : u32 {
     TgViewSame,             ///< at the render pass: the target view equals the entry's
     TgViewDifferent,        ///< ... differs (TARGET_VIEW_DIFFERENT_MUST_BE_0)
     TgViewNoEntry,          ///< ... the entry had no view yet (recorded now)
+    TgDescDifferent,        ///< same image, but the old path's description differs from the stored one (TARGET_DESC_DIFFERENT_MUST_BE_0)
+    TgTaken,                ///< real mode: targets taken from the table
+    TgDrawsTaken,           ///< real mode: draws whose every target came from the table
+    TgAudits,               ///< real mode: draws audited by the old path (one in 64)
     Count_
 };
 void Note(Count c, u64 n = 1) noexcept;
