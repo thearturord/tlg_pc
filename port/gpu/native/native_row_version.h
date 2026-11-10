@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // F2 item 2 (design review 2026-11-09, section 29): the row check becomes one integer compare. A version per engine buffer id, bumped wherever bytes of that buffer are marked
 // changed (the places that add to `object_dirty`), and one version for the bytes no engine buffer holds (the places that add to `b9_unattributed`). A row stores the versions it
-// was answered under; it is clean when they did not move. Stage 1 (`TLG_ROW_VERSION=1`, default off): shadow, the sets still decide and every row check is compared.
+// was answered under; it is clean when they did not move. `TLG_ROW_VERSION`: 2 real (default since 2026-11-10), 1 shadow (the sets decide, every check compared), 0 off.
 #pragma once
 
 #include <atomic>
@@ -12,8 +12,8 @@
 
 namespace Core::RowVersion {
 
-/// 0 off (default), 1 shadow (the sets decide, the versions are compared), 2 real (the version decides; rows are learned only inside their buffer; one check in 64 also asks
-/// the sets, and a row they call dirty is not served).
+/// 0 off, 1 shadow (the sets decide, the versions are compared), 2 real (the version decides; rows are learned only inside their buffer; one check in 64 also asks
+/// the sets, and a row they call dirty is not served; default since 2026-11-10).
 [[nodiscard]] u32 Mode() noexcept;
 
 /// Bytes of engine buffer `id` were marked changed. Any thread. (Ids share slots: a collision only makes a row look changed.)
