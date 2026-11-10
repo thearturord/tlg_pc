@@ -20,6 +20,7 @@ thread_local u64 t_hash_ns{0};
 thread_local u32 t_effect{0};
 thread_local bool t_ring_candidate = false;
 thread_local bool t_force_effect = false;
+thread_local u32 t_writer = 16;
 
 namespace {
 constexpr const char* SyncNames[SyncSiteCount] = {"immutable_whole", "arena_read", "arena_written", "arena_texel", "download", "pre_sync"};
@@ -44,6 +45,10 @@ std::atomic<u64> row_checks[2][3]{}; // [in ring][checks, dirty, dirty only from
 std::atomic<u64> row_learns[2]{};
 std::array<ApplyStat, 128> candidate_stats; // F1 1c: the applies of ring candidates, by effect mask
 std::atomic<u64> candidate_step_ns[5]{}, candidate_step_calls[5]{};
+// announce batch census: the applies that are not ring candidates, by writer (8 unknown) and effect mask; their step times; the batch's hashes
+std::array<std::array<ApplyStat, 128>, 17> writer_stats;
+std::atomic<u64> writer_step_ns[17][5]{}, writer_step_calls[17][5]{};
+std::atomic<u64> writer_hash_ns[17][2]{}, writer_hash_calls[17][2]{};
 std::atomic<u64> image_calls{0}, image_tiled{0}, image_ns{0};
 
 struct Last {
@@ -121,6 +126,11 @@ void NoteApply(bool ring, u64 size, u32 effects, u64 ns) noexcept {
         c.calls.fetch_add(1, std::memory_order_relaxed);
         c.bytes.fetch_add(size, std::memory_order_relaxed);
         c.ns.fetch_add(ns, std::memory_order_relaxed);
+    } else {
+        auto& w = writer_stats[t_writer < 16 ? t_writer : 16][effects & 127];
+        w.calls.fetch_add(1, std::memory_order_relaxed);
+        w.bytes.fetch_add(size, std::memory_order_relaxed);
+        w.ns.fetch_add(ns, std::memory_order_relaxed);
     }
     s.calls.fetch_add(1, std::memory_order_relaxed);
     s.bytes.fetch_add(size, std::memory_order_relaxed);
@@ -139,10 +149,23 @@ void NoteRowCheck(bool in_ring, bool dirty, bool only_unattributed) noexcept {
 }
 
 void NoteCandidateStep(u32 step, u64 ns) noexcept {
-    if (step < 5) {
+    if (step >= 5) {
+        return;
+    }
+    if (t_ring_candidate) {
         candidate_step_ns[step].fetch_add(ns, std::memory_order_relaxed);
         candidate_step_calls[step].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        const u32 w = t_writer < 16 ? t_writer : 16;
+        writer_step_ns[w][step].fetch_add(ns, std::memory_order_relaxed);
+        writer_step_calls[w][step].fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+void NoteBatchHash(u32 writer, bool again, u64 ns) noexcept {
+    const u32 w = writer < 16 ? writer : 16;
+    writer_hash_ns[w][again ? 1 : 0].fetch_add(ns, std::memory_order_relaxed);
+    writer_hash_calls[w][again ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
 }
 
 std::atomic<u64> ring_out[OutCount]{};
@@ -216,6 +239,34 @@ nlohmann::json Report() {
         static constexpr const char* StepNames[5] = {"memo_erase", "gpu_written_supersede", "resident_note", "buffer_marks", "image_index"};
         for (u32 k = 0; k < 5; ++k) {
             j["ring_candidate_steps"][StepNames[k]] = {{"calls", candidate_step_calls[k].load()}, {"ms", candidate_step_ns[k].load() / 1e6}};
+        }
+    }
+    {
+        static constexpr const char* StepNames[5] = {"memo_erase", "gpu_written_supersede", "resident_note", "buffer_marks", "image_index"};
+        for (u32 w = 0; w < 17; ++w) {
+            nlohmann::json o = nlohmann::json::object();
+            u64 total = 0;
+            for (u32 m = 0; m < 128; ++m) {
+                const auto& s = writer_stats[w][m];
+                if (const u64 n = s.calls.load()) {
+                    o["by_effect"][std::to_string(m)] = {{"calls", n}, {"bytes", s.bytes.load()}, {"ms", s.ns.load() / 1e6}};
+                    total += n;
+                }
+            }
+            for (u32 k = 0; k < 5; ++k) {
+                if (const u64 n = writer_step_calls[w][k].load()) {
+                    o["steps"][StepNames[k]] = {{"calls", n}, {"ms", writer_step_ns[w][k].load() / 1e6}};
+                }
+            }
+            for (u32 a = 0; a < 2; ++a) {
+                if (const u64 n = writer_hash_calls[w][a].load()) {
+                    o[a ? "hash_again" : "hash_first"] = {{"calls", n}, {"ms", writer_hash_ns[w][a].load() / 1e6}};
+                }
+            }
+            if (!o.empty()) {
+                o["applies"] = total;
+                j["apply_by_writer"][w < 8 ? std::to_string(w) : w < 16 ? std::to_string(w - 8) + "_no_site" : std::string("unknown")] = o;
+            }
         }
     }
     j["apply_effect_bits"] = "1 memo, 2 recipe, 4 gpu-written ranges, 8 resident buffers, 16 engine buffer parts, 32 image index, 64 unattributed marks";

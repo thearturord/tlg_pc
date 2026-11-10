@@ -46,6 +46,7 @@ enum Effect : u32 { EffMemo = 1, EffRecipe = 2, EffGpuRanges = 4, EffResident = 
 extern thread_local u32 t_effect;
 extern thread_local bool t_ring_candidate; ///< F1 1c: set by the batch around the apply of a range tagged as a ring candidate
 extern thread_local bool t_force_effect; ///< F1 1c real: the sampled full apply records its effects even with the census off
+extern thread_local u32 t_writer; ///< announce batch census: the writer tag of the range being applied (0-7, 8-15 the same writers without a site name; 16 unknown)
 inline void SetEffect(u32 bit) noexcept {
     if (g_on || t_force_effect) {
         t_effect |= bit;
@@ -74,12 +75,12 @@ void NoteRowCheck(bool in_ring, bool dirty, bool only_unattributed) noexcept;
 void NoteRowLearn(bool in_ring) noexcept;
 /// F1 1c: the time of one step of `ApplyCpuWrite` for a ring candidate (0 memo erase, 1 GPU-written supersede, 2 resident note, 3 buffer marks, 4 image index).
 void NoteCandidateStep(u32 step, u64 ns) noexcept;
-/// Times one step of the apply when the census is on and the range is a ring candidate.
+/// Times one step of the apply when the census is on (ring candidates and, by writer, every other range: the announce batch census).
 struct CandidateStep {
     u32 step;
     u64 start;
     explicit CandidateStep(u32 step_) noexcept : step(step_), start(0) {
-        if (g_on && t_ring_candidate) {
+        if (g_on) {
             start = NowNs();
         }
     }
@@ -109,6 +110,8 @@ void NoteRingOut(RingOut what, u64 n = 1) noexcept;
 /// The sum of the buffer cache's memo epochs that ring candidate applies added (raster thread).
 extern std::atomic<u64> g_cand_epoch;
 void NoteFromImage(u64 ns, bool tiled) noexcept;
+/// Announce batch census: the hash the batch takes of a range of `writer` (first list: the gate's next comparison; again list: the comparison itself).
+void NoteBatchHash(u32 writer, bool again, u64 ns) noexcept;
 [[nodiscard]] nlohmann::json Report();
 
 /// Times one SynchronizeMemory call. `uploaded` is the thread's upload counter (it is reset by the caller before the call), read again at the end.

@@ -807,7 +807,11 @@ void ApplyBatch(const Batch& batch) {
                     N0::NoteApplied(size, true);
                     {
                         TLG_PROF_LEVEL("updates.again_hash", 3); // D2: the hash that decides whether a range is applied a second time
+                        const u64 hash_start = N0::On() ? N0::NowNs() : 0;
                         unchanged = before.ok && before.address == address && before.size == size && NativeContent::HashGuarded64(address, size, now) && now == before.hash;
+                        if (hash_start != 0) {
+                            N0::NoteBatchHash(writer, true, N0::NowNs() - hash_start);
+                        }
                     }
                     if (before.ok && now != 0) {
                         (unchanged ? again_unchanged_by_writer : again_changed_by_writer)[writer].fetch_add(1, std::memory_order_relaxed);
@@ -822,8 +826,10 @@ void ApplyBatch(const Batch& batch) {
                 }
                 ra_gate_applied.fetch_add(1, std::memory_order_relaxed);
                 N0::t_ring_candidate = at - 1 < writers.size() && writers[at - 1].ring_candidate != 0;
+                N0::t_writer = writer;
                 apply_fn(apply_context, address, size, false, object);
                 N0::t_ring_candidate = false;
+                N0::t_writer = 16;
             }
         };
         again_list(batch.again, batch.again_writer);
@@ -862,7 +868,11 @@ void ApplyBatch(const Batch& batch) {
         N0::NoteApplied(size, false);
         FirstHash h{address, size, 0, false};
         if (hash_here && size != 0 && size <= (u64{1} << 20) && !(first_mode == 1 && (first_trust >> writer & 1) != 0)) {
+            const u64 hash_start = N0::On() ? N0::NowNs() : 0;
             h.ok = NativeContent::HashGuarded64(address, size, h.hash);
+            if (hash_start != 0) {
+                N0::NoteBatchHash(writer, false, N0::NowNs() - hash_start);
+            }
         }
         bool skipped = false;
         if (skip_on && plain) {
@@ -894,12 +904,14 @@ void ApplyBatch(const Batch& batch) {
         if (!skipped) {
             TLG_PROF_ADD("updates.bytes_first", size);
             if (coalesce_mode != 0 && size != 0) {
-                todo.push_back({object, address, size});
+                todo.push_back({object, address, size, writer});
             }
             if (coalesce_mode != 1) {
                 N0::t_ring_candidate = ring_candidate;
+                N0::t_writer = writer;
                 apply_fn(apply_context, address, size, true, object);
                 N0::t_ring_candidate = false;
+                N0::t_writer = 16;
             }
             b2_applied_bytes.fetch_add(size, std::memory_order_relaxed);
         }
@@ -956,7 +968,9 @@ void ApplyBatch(const Batch& batch) {
                             coalesce_merged_groups.fetch_add(1, std::memory_order_relaxed);
                             coalesce_merged_pieces.fetch_add(b - a, std::memory_order_relaxed);
                             coalesce_gap_bytes.fetch_add((run_end - run_begin) > piece_bytes ? (run_end - run_begin) - piece_bytes : 0, std::memory_order_relaxed);
+                            N0::t_writer = todo[a].writer;
                             apply_fn(apply_context, run_begin, run_end - run_begin, true, object);
+                            N0::t_writer = 16;
                             ++out;
                             return;
                         }
@@ -970,7 +984,9 @@ void ApplyBatch(const Batch& batch) {
                         coalesce_refused_pieces.fetch_add(b - a, std::memory_order_relaxed);
                     }
                     for (size_t k = a; k < b; ++k) {
+                        N0::t_writer = todo[k].writer;
                         apply_fn(apply_context, todo[k].address, todo[k].size, true, todo[k].object);
+                        N0::t_writer = 16;
                         ++out;
                     }
                 };

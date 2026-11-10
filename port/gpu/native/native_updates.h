@@ -85,6 +85,7 @@ void NoteMergeRefused(u32 why, u64 pieces) noexcept;
 /// One announced piece of a batch.
 struct AnnouncedPiece {
     u64 object, address, size;
+    u32 writer{16}; ///< (announce batch census: the writer tag, 16 unknown)
 };
 /// L1: the buffer cache says whether the pieces (sorted, one engine buffer or none named) may be applied as the one range [begin, begin + size): true when the bytes between the pieces are
 /// not GPU written, no clear waits for an image, no image is in the range that no piece touches, and a named buffer holds the whole range.
