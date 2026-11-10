@@ -24,6 +24,7 @@
 #include "native/native_registry.h"
 #include "native/native_resource_audit.h"
 #include "native/native_executor.h"
+#include "native/native_dispatch_split.h"
 #include "native/native_split_census.h"
 #include "native/native_executor_tasks.h"
 #include "native/native_debug_server.h"
@@ -455,6 +456,10 @@ DispatchStat& DispatchStatFor(u64 caller, u64 program, bool indirect, bool asc) 
 
 void NativeExecutor::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw_plan,
                                const Vulkan::DispatchPlan* dispatch_plan) {
+    namespace DS = Core::DispatchSplit;
+    if (c.kind == RasterCall::Kind::DispatchDirect && DS::On()) [[unlikely]] {
+        DS::Begin(); // design review 71: the steps of one sampled direct dispatch
+    }
     const auto run = [&](auto&& body) {
         if (c.no_marker) {
             body();
@@ -474,9 +479,11 @@ void NativeExecutor::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan*
         TLG_PROF_NAMED_LEVEL(prof_ring, "raster.ring_use", 3);
         rasterizer->BeginRingUse(draw_plan, dispatch_plan);
     }
+    DS::Stamp(DS::PRingUse);
     if (c.kind != RasterCall::Kind::Draw) {
         VideoCore::RecordQueue::Drain(VideoCore::RecordQueue::NonDraw); // P3e.4b: a dispatch records its own commands and reads the state the draws that wait leave
     }
+    DS::Stamp(DS::PRecordDrain);
     // TLG_RASTER_SKIP (default 0, measurement only, the picture is wrong): bit 0 skips draws, bit 1 skips dispatches on the raster thread, so the rate of everything upstream of the raster back end can be
     // measured (master plan experiment E2: which wall comes after the raster thread).
     static const u32 skip_mode = [] {
@@ -517,9 +524,12 @@ void NativeExecutor::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan*
             Core::NativeDraw::VerifyComputeRecord(c.tag.seq, cs_program.words.data());
         }
         {
+            DS::Stamp(DS::PCallerFill);
             const u64 start = VideoCore::ReadbackStats::NowNs();
             rasterizer->SetExplicitImageReadback(c.tag.valid && c.tag.seq != 0 && Core::NativeDraw::RecordReadsBack(c.tag.seq));
+            DS::Stamp(DS::PReadbackFlag);
             run([&] { rasterizer->DispatchDirect(dispatch_plan); });
+            DS::Stamp(DS::PExit);
             rasterizer->SetExplicitImageReadback(false);
             auto& s = DispatchStatFor(c.tag.valid ? Core::NativeDraw::RecordCaller(c.tag.seq) : 0, cs_program.address, false, c.asc);
             ++s.count;
@@ -528,6 +538,7 @@ void NativeExecutor::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan*
             s.dim_x = cs_program.dim_x;
             s.dim_y = cs_program.dim_y;
             s.dim_z = cs_program.dim_z;
+            DS::Stamp(DS::PStats);
         }
         break;
     case RasterCall::Kind::DispatchIndirect:
@@ -550,7 +561,10 @@ void NativeExecutor::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan*
         TLG_PROF_NAMED_LEVEL(prof_ring, "raster.ring_use", 3);
         rasterizer->EndRingUse();
     }
+    DS::Stamp(DS::PRingEnd);
     rasterizer->MaybeFlushRecorded();
+    DS::Stamp(DS::PFlushRecorded);
+    DS::End();
 }
 
 void NativeExecutor::RasterConsumer::ThreadStarted() {

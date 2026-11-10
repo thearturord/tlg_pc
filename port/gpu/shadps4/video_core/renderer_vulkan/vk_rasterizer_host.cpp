@@ -4,6 +4,7 @@
 // The rasterizer as the native executor's host (native/native_raster_host.h): the plan accessors and the interval statistics. The rest of the interface is the rasterizer's own.
 
 #include "native/native_row_version.h"
+#include "native/native_dispatch_split.h"
 #include <nlohmann/json.hpp>
 
 #include "native/native_debug_server.h"
@@ -315,6 +316,9 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
         }
         if (Core::RowVersion::Mode() != 0) {
             Core::DebugServer::Publish("row_version", Core::RowVersion::Report()); // F2 row version shadow
+        }
+        if (Core::DispatchSplit::On()) {
+            Core::DebugServer::Publish("dispatch_split", Core::DispatchSplit::Report()); // design review 71
         }
         const auto r = TakeResolveStats();
         Core::DebugServer::Publish("native_backend", {{"buffers_resolved_by_the_command_processor", r[0]}, {"bound_from_the_resolution", r[1]},

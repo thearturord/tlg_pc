@@ -18,6 +18,7 @@
 #include "native/native_content.h"
 #include "native/native_n0_census.h"
 #include "native/native_row_version.h"
+#include "native/native_dispatch_split.h"
 #include "native/native_prof.h"
 #include "native/native_marker.h"
 #include "native/native_ui_trace.h"
@@ -1423,6 +1424,7 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
             v[47] += t_w3.rd_row_n;
         }
     } w3_scope{this};
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PEntry);
     Core::NativeDevice::NoteClearUse(Core::NativeDevice::UseDispatch, engine_clear_on);
     if (SkipForEngineClear() && plan != nullptr) {
         const bool own = IsEngineClearOwnWork(plan->native_seq);
@@ -1438,11 +1440,13 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
         TLG_PROF_TAG_HEX("caller", plan != nullptr && plan->native_seq != 0 ? Core::NativeDraw::RecordCallerGhidra(plan->native_seq) : 0);
         TLG_PROF_TAG("pass_class", 3, PassClassName(3));
     }
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PClassTags);
 
     {
         TLG_PROF_LEVEL("raster.pop_pending", 3);
         scheduler.PopPendingOperations();
     }
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PPopPending);
 
     {
         TLG_PROF_LEVEL("raster.dispatch_fill", 3);
@@ -1451,6 +1455,7 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
             return;
         }
     }
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PFill);
 
     current_cs = plan ? &plan->cs : &no_program;
     current_bc_base = plan ? &plan->ta_bc_base : &no_border_colors;
@@ -1475,10 +1480,12 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
         group_in_use = it->second;
         runtime.SetIndependentGroup(it->second ? 1u : 0u);
     }
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::POpGroup);
     const ComputePipeline* pipeline = ResolveDispatchPipeline(plan);
     if (!pipeline) {
         return;
     }
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PPipeline);
     if (Core::LightRecorder::On()) {
         Core::LightRecorder::FrameOp(Core::DebugServer::PresentCount(), 0, cs_program.address, texture_cache.ImageGeneration());
     }
@@ -1489,8 +1496,10 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
             return;
         }
     }
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PLightHle);
 
     binder_plan = DispatchBinderFor(plan);
+    Core::DispatchSplit::NotePlanned(binder_plan != nullptr);
     resolved_dispatch = binder_plan != nullptr ? plan : nullptr;
     const bool light_recorded = Core::LightRecorder::On() && plan != nullptr && plan->native_seq != 0 && Core::LightRecorder::IsLightCaller(Core::NativeDraw::RecordCallerGhidra(plan->native_seq));
     {
@@ -1526,7 +1535,9 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     if (light_recorded) {
         Core::LightRecorder::Begin(Core::DebugServer::PresentCount(), Core::NativeDraw::RecordCallerGhidra(plan->native_seq), cs_program.address);
     }
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PBinderPlan);
     const bool dispatch_bound = BindResources(pipeline);
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PBind);
     w3_scope.barrier = needs_barrier;
     if (light_recorded) {
         Core::LightRecorder::End();
@@ -1640,18 +1651,23 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
             BarrierCensus::SimSlots(slots.data(), index.data(), n_read, readable);
         }
     }
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PAfterBindCensus);
     if (needs_barrier) {
         TLG_PROF_LEVEL("raster.flush_barriers", 2);
         runtime.FlushBarriers();
     }
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PFlushBarriers);
 
     {
         TLG_PROF_LEVEL("sched.end_rendering", 3);
         scheduler.EndRendering();
     }
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PEndRendering);
     pipeline->BindResources(set_writes, push_data);
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PDescriptorPush);
 
     NoteMarkerRow(2, 3, pipeline, plan != nullptr ? plan->native_seq : 0, nullptr, cs_program.dim_x, cs_program.dim_y);
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PMarkerRow);
     const auto cmdbuf = scheduler.CommandBuffer();
     {
         TLG_PROF_LEVEL("raster.record_dispatch", 2);
@@ -1660,10 +1676,13 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
         cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
         scheduler.StampDispatch(false, cs_program.address);
     }
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PRecord);
     DebugState.IncDispatch();
     ++recorded_work;
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PCount);
 
     ResetBindings(true);
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PResetBindings);
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const DispatchPlan* plan) {
@@ -3679,8 +3698,10 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
 void Rasterizer::ResetBindings(bool is_compute) {
     TLG_PROF_LEVEL("raster.reset_bindings", 2);
     VideoCore::ResolveCommands::Run();
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PResetResolveCmds);
     // Plan S step P2c: two halves, each with its own owner. Same order as before.
     ResetImageBindings();
+    Core::DispatchSplit::Stamp(Core::DispatchSplit::PResetImages);
     RecordBufferAccess(is_compute);
 }
 
@@ -3696,8 +3717,10 @@ void Rasterizer::RecordBufferAccess(bool is_compute, u64 op_sequence) {
     // record side: the barrier plan learns what this draw reads and writes; the draw's own barrier flag ends here
     for (const auto [buffer, offset, size, src_access] : bound_buffers) {
         if (buffer_cache.IsStreamBuffer(buffer) && !(src_access & vk::AccessFlagBits2::eShaderWrite)) {
+            Core::DispatchSplit::NoteAccess(0);
             continue; // R5: only the host writes the stream ring, so a read of it is no hazard for anything later
         }
+        Core::DispatchSplit::NoteAccess((src_access & vk::AccessFlagBits2::eShaderWrite) ? 2 : 1);
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
                                           : vk::PipelineStageFlagBits2::eAllGraphics;
         runtime.AccessBuffer(buffer, offset, size, dst_stage, src_access);
