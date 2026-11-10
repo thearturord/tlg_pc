@@ -336,6 +336,9 @@ void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, st
     for (const auto& [a, e] : own_gaps) {
         b9_unattributed.Add(a, e - a);
     }
+    if (!own_gaps.empty()) {
+        Core::N0::SetEffect(Core::N0::EffUnattributed); // F1 1c census
+    }
     if (!parts.empty()) {
         b9_epoch.fetch_add(1, std::memory_order_acq_rel);
     }
@@ -1763,6 +1766,13 @@ bool BufferCache::ObjectRangeDirtyClock(u64 id, const Buffer* buffer, VAddr addr
 bool BufferCache::ObjectRangeDirty(u64 id, VAddr addr, u64 size) {
     std::scoped_lock lock{object_dirty_mutex};
     const auto it = object_dirty.find(id);
+    if (Core::N0::On()) [[unlikely]] {
+        // F1 1c census: does a row check inside the frame ring depend on the unattributed marks that the in-ring announcements leave?
+        const bool by_object = it != object_dirty.end() && it->second.Intersects(addr, size);
+        const bool by_unattributed = b9_unattributed.Intersects(addr, size);
+        Core::N0::NoteRowCheck(Core::NativeContent::InRing(addr, size), by_object || by_unattributed, !by_object && by_unattributed);
+        return by_object || by_unattributed;
+    }
     return (it != object_dirty.end() && it->second.Intersects(addr, size)) || b9_unattributed.Intersects(addr, size);
 }
 

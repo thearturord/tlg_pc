@@ -148,7 +148,7 @@ u32 NativeImageIndex::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
     if (!clears && !any_image) {
         return 0; // no image in this memory (most announcements: buffer contents); the page table answers that in a few lookups
     }
-    N0::SetEffect(N0::EffImage);
+    bool census_touch = false; // F1 1c census: an image really dirtied or kept for the GPU, or a waiting clear erased (the return value keeps its old meaning)
     SmallVector<ImageId, 8> image_ids;
     // B8.4: a range the engine's textures cover finds its images through them (their lists); B8.5: a range engine buffers cover, through the buffers' lists;
     // only memory neither covers whole asks the page table
@@ -159,7 +159,9 @@ u32 NativeImageIndex::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
     if (!pending_clears.empty()) {
         // B11: a CPU write to a texture whose clear waits for its first image comes after the clear: the clear is gone
         for (const u64 id : ids) {
-            touched |= pending_clears.erase(id) != 0;
+            const bool erased = pending_clears.erase(id) != 0;
+            touched |= erased;
+            census_touch |= erased;
         }
     }
     if (covered_by_textures) {
@@ -178,15 +180,20 @@ u32 NativeImageIndex::NoteAnnouncedWrite(VAddr addr, size_t size, bool newer) {
             break;
         case Host::Announced::KeptForGpu:
             touched = true;
+            census_touch = true;
             // the GPU wrote the image after the first application: its bytes are newer than the CPU's
             NativeUpdates::NoteB8(NativeUpdates::B8AnnouncedOnImage);
             NativeUpdates::NoteB8(NativeUpdates::B8KeptForGpu);
             break;
         case Host::Announced::Dirtied:
             touched = true;
+            census_touch = true;
             NativeUpdates::NoteB8(NativeUpdates::B8AnnouncedOnImage);
             break;
         }
+    }
+    if (census_touch) {
+        N0::SetEffect(N0::EffImage);
     }
     return touched ? 1u : 2u;
 }

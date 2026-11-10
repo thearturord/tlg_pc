@@ -15,6 +15,7 @@
 #include "native/native_identity_log.h"
 #include "native/native_image_caller.h"
 #include "native/native_content.h"
+#include "native/native_n0_census.h"
 #include "native/native_prof.h"
 #include "native/native_marker.h"
 #include "native/native_ui_trace.h"
@@ -2095,6 +2096,9 @@ bool Rasterizer::RowsServe(u64 id, VAddr address, u64 size, bool texel, const Vi
 void Rasterizer::RowsLearn(u64 id, VAddr address, u64 size, bool texel, const VideoCore::Buffer* buffer, u64 offset, u64 epoch_pre, u64 clock_pre, bool gpu_pre) noexcept {
     if (id == 0 || buffer == nullptr || buffer_cache.IsStreamBuffer(buffer)) {
         return;
+    }
+    if (Core::N0::On()) [[unlikely]] {
+        Core::N0::NoteRowLearn(Core::NativeContent::InRing(address, size)); // F1 1c census
     }
     if (texel && (texture_cache.AnyImageOverlaps(address, size) || texture_cache.IsMeta(address))) {
         w1s_counts[133].fetch_add(1, std::memory_order_relaxed); // a texel buffer over an image: its bytes change with the image, no stamp covers that

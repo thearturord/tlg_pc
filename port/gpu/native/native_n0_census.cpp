@@ -18,6 +18,7 @@ bool g_on = [] {
 thread_local SyncSite t_sync_site{SyncArenaRead};
 thread_local u64 t_hash_ns{0};
 thread_local u32 t_effect{0};
+thread_local bool t_ring_candidate = false;
 
 namespace {
 constexpr const char* SyncNames[SyncSiteCount] = {"immutable_whole", "arena_read", "arena_written", "arena_texel", "download", "pre_sync"};
@@ -37,7 +38,10 @@ std::array<std::atomic<u64>, 4> cause_bytes{}, cause_pieces{};
 struct ApplyStat {
     std::atomic<u64> calls{0}, bytes{0}, ns{0};
 };
-std::array<std::array<ApplyStat, 64>, 2> apply_stats; // [ring][effect mask]
+std::array<std::array<ApplyStat, 128>, 2> apply_stats; // [ring][effect mask]
+std::atomic<u64> row_checks[2][3]{}; // [in ring][checks, dirty, dirty only from the unattributed set]
+std::atomic<u64> row_learns[2]{};
+std::array<ApplyStat, 128> candidate_stats; // F1 1c: the applies of ring candidates, by effect mask
 std::atomic<u64> image_calls{0}, image_tiled{0}, image_ns{0};
 
 struct Last {
@@ -109,10 +113,31 @@ void NoteFromImage(u64 ns, bool tiled) noexcept {
 
 void NoteApply(bool ring, u64 size, u32 effects, u64 ns) noexcept {
     Touch();
-    auto& s = apply_stats[ring ? 1 : 0][effects & 63];
+    auto& s = apply_stats[ring ? 1 : 0][effects & 127];
+    if (t_ring_candidate) {
+        auto& c = candidate_stats[effects & 127];
+        c.calls.fetch_add(1, std::memory_order_relaxed);
+        c.bytes.fetch_add(size, std::memory_order_relaxed);
+        c.ns.fetch_add(ns, std::memory_order_relaxed);
+    }
     s.calls.fetch_add(1, std::memory_order_relaxed);
     s.bytes.fetch_add(size, std::memory_order_relaxed);
     s.ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+void NoteRowCheck(bool in_ring, bool dirty, bool only_unattributed) noexcept {
+    auto& r = row_checks[in_ring ? 1 : 0];
+    r[0].fetch_add(1, std::memory_order_relaxed);
+    if (dirty) {
+        r[1].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (only_unattributed) {
+        r[2].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void NoteRowLearn(bool in_ring) noexcept {
+    row_learns[in_ring ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
 }
 
 void NoteApplied(u64 size, bool again) noexcept {
@@ -143,13 +168,24 @@ nlohmann::json Report() {
         j["upload_cause"][CauseNames[i]] = {{"pieces", cause_pieces[i].load()}, {"bytes", cause_bytes[i].load()}};
     }
     for (u32 r = 0; r < 2; ++r) {
-        for (u32 m = 0; m < 64; ++m) {
+        for (u32 m = 0; m < 128; ++m) {
             const auto& s = apply_stats[r][m];
             if (const u64 n = s.calls.load()) {
                 j["apply"][r ? "ring" : "other"][std::to_string(m)] = {{"calls", n}, {"bytes", s.bytes.load()}, {"ms", s.ns.load() / 1e6}};
             }
         }
     }
+    for (u32 r = 0; r < 2; ++r) {
+        j["rows_vs_ring"][r ? "in_ring" : "outside_ring"] = {{"row_checks", row_checks[r][0].load()}, {"dirty", row_checks[r][1].load()},
+                                                             {"dirty_only_from_unattributed", row_checks[r][2].load()}, {"row_learn_attempts", row_learns[r].load()}};
+    }
+    for (u32 m = 0; m < 128; ++m) {
+        const auto& c = candidate_stats[m];
+        if (const u64 n = c.calls.load()) {
+            j["ring_candidates"][std::to_string(m)] = {{"calls", n}, {"bytes", c.bytes.load()}, {"ms", c.ns.load() / 1e6}};
+        }
+    }
+    j["apply_effect_bits"] = "1 memo, 2 recipe, 4 gpu-written ranges, 8 resident buffers, 16 engine buffer parts, 32 image index, 64 unattributed marks";
     j["from_image"] = {{"calls", image_calls.load()}, {"tiled_calls", image_tiled.load()}, {"ms", image_ns.load() / 1e6}};
     for (u32 i = 0; i < 24; ++i) {
         if (const u64 n = applied_first_log2[i].load()) {

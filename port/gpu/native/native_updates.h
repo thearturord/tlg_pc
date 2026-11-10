@@ -86,6 +86,7 @@ void NoteBufferId(BufferIdCount what);
 struct Tag {
     u8 writer{};
     u64 object{};
+    u8 ring_candidate{}; ///< F1 1c: inside the frame ring and a constant buffer copy (writer 3) or a buffer's Map window (writer 0, not a texture): a range that could leave the batch
 };
 /// The announcements of one submission: applied once (`first`) and the previous submission's again (`again`)
 struct Batch {

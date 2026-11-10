@@ -41,8 +41,9 @@ enum CopySite : u32 {
 extern bool g_on;
 extern thread_local SyncSite t_sync_site;
 /// What one applied announcement did that a later draw could observe (N1 census). Each place that changes shared state for a range sets its bit.
-enum Effect : u32 { EffMemo = 1, EffRecipe = 2, EffGpuRanges = 4, EffResident = 8, EffBufferParts = 16, EffImage = 32 };
+enum Effect : u32 { EffMemo = 1, EffRecipe = 2, EffGpuRanges = 4, EffResident = 8, EffBufferParts = 16, EffImage = 32, EffUnattributed = 64 }; ///< 64: F1 1c, the apply marked bytes no engine buffer holds
 extern thread_local u32 t_effect;
+extern thread_local bool t_ring_candidate; ///< F1 1c: set by the batch around the apply of a range tagged as a ring candidate
 inline void SetEffect(u32 bit) noexcept {
     if (g_on) {
         t_effect |= bit;
@@ -64,6 +65,11 @@ void NoteApplied(u64 size, bool again) noexcept;
 /// Why bytes were uploaded: 0 the frame ring part is uploaded whole (nobody announced what changed), 1 the announced bytes of an engine buffer, 2 announced bytes of memory no engine buffer holds.
 void NoteCause(u32 cause, u64 bytes) noexcept;
 void NoteApply(bool ring, u64 size, u32 effects, u64 ns) noexcept;
+/// F1 1c (who reads what an in-ring announcement leaves behind): a row check (`ObjectRangeDirty`) over a range inside the frame ring or outside it, its answer, and whether
+/// the answer was "dirty" only because of the unattributed set (bytes no engine buffer held when they were announced).
+void NoteRowCheck(bool in_ring, bool dirty, bool only_unattributed) noexcept;
+/// F1 1c: a row the raster thread tried to learn, over a range inside the frame ring or outside it.
+void NoteRowLearn(bool in_ring) noexcept;
 void NoteFromImage(u64 ns, bool tiled) noexcept;
 [[nodiscard]] nlohmann::json Report();
 

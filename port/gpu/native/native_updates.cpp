@@ -748,7 +748,9 @@ void ApplyBatch(const Batch& batch) {
                     }
                 }
                 ra_gate_applied.fetch_add(1, std::memory_order_relaxed);
+                N0::t_ring_candidate = at - 1 < writers.size() && writers[at - 1].ring_candidate != 0;
                 apply_fn(apply_context, address, size, false, object);
+                N0::t_ring_candidate = false;
             }
         };
         again_list(batch.again, batch.again_writer);
@@ -783,7 +785,7 @@ void ApplyBatch(const Batch& batch) {
     const u32 coalesce_mode = ApplyCoalesceMode();
     static std::vector<Piece> todo;
     todo.clear();
-    const auto first_one = [&](u64 address, u64 size, bool plain, u32 writer, u64 object) {
+    const auto first_one = [&](u64 address, u64 size, bool plain, u32 writer, u64 object, bool ring_candidate) {
         N0::NoteApplied(size, false);
         FirstHash h{address, size, 0, false};
         if (hash_here && size != 0 && size <= (u64{1} << 20) && !(first_mode == 1 && (first_trust >> writer & 1) != 0)) {
@@ -822,7 +824,9 @@ void ApplyBatch(const Batch& batch) {
                 todo.push_back({object, address, size});
             }
             if (coalesce_mode != 1) {
+                N0::t_ring_candidate = ring_candidate;
                 apply_fn(apply_context, address, size, true, object);
+                N0::t_ring_candidate = false;
             }
             b2_applied_bytes.fetch_add(size, std::memory_order_relaxed);
         }
@@ -833,12 +837,14 @@ void ApplyBatch(const Batch& batch) {
     {
         size_t at = 0;
         for (const auto& [address, size] : batch.first) {
-            first_one(address, size, true, at < batch.first_writer.size() ? batch.first_writer[at].writer : 0u, at < batch.first_writer.size() ? batch.first_writer[at].object : 0u);
+            first_one(address, size, true, at < batch.first_writer.size() ? batch.first_writer[at].writer : 0u, at < batch.first_writer.size() ? batch.first_writer[at].object : 0u,
+                      at < batch.first_writer.size() && batch.first_writer[at].ring_candidate != 0);
             ++at;
         }
         at = 0;
         for (const auto& [address, size] : batch.ring_first) {
-            first_one(address, size, false, at < batch.ring_first_writer.size() ? batch.ring_first_writer[at].writer : 0u, at < batch.ring_first_writer.size() ? batch.ring_first_writer[at].object : 0u);
+            first_one(address, size, false, at < batch.ring_first_writer.size() ? batch.ring_first_writer[at].writer : 0u, at < batch.ring_first_writer.size() ? batch.ring_first_writer[at].object : 0u,
+                      at < batch.ring_first_writer.size() && batch.ring_first_writer[at].ring_candidate != 0);
             ++at;
         }
     }
@@ -1172,7 +1178,8 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
         // memory the engine writes fresh every frame (the frame rings): applied early on the raster thread
         const bool fresh = EarlyAnnounceOn() && (writer == 1 || writer == 2 || writer == 4 || ring);
         (fresh ? pending_ring_ranges : pending_ranges).emplace_back(address, size);
-        (fresh ? pending_ring_writers : pending_writers).push_back(Tag{static_cast<u8>((writer & 7) | t_announce_site_class), t_announce_object});
+        const bool ring_candidate = N0::On() && NativeContent::InRing(address, size) && ((writer & 7) == 3 || ((writer & 7) == 0 && !t_announce_texture)); // F1 1c census
+        (fresh ? pending_ring_writers : pending_writers).push_back(Tag{static_cast<u8>((writer & 7) | t_announce_site_class), t_announce_object, static_cast<u8>(ring_candidate ? 1 : 0)});
     }
     NativeResources::NoteAnnouncedWrite(address, size); // C1: resident buffers on those pages are not synchronized any more
     NativeUploads::Announce(writer, address, size, thread == render_thread.load(std::memory_order_relaxed), NativeDraw::NextSeq());
