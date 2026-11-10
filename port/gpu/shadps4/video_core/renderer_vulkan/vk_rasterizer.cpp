@@ -22,6 +22,7 @@
 #include "native/native_own_memory_census.h"
 #include "native/native_legacy.h"
 #include "native/native_view_table.h"
+#include "native/native_texture_version.h"
 #include "native/native_prof.h"
 #include "native/native_marker.h"
 #include "native/native_ui_trace.h"
@@ -6761,6 +6762,18 @@ void Rasterizer::ViewTableShadow(const Shader::Info& stage, u32 first_info, size
             e.has_payload = answers_ok[i] && answers[i].id == bound && answers[i].view == view;
             if (e.has_payload) {
                 std::memcpy(e.payload, &answers[i], sizeof(TextureSetEntry));
+            }
+            if (Core::TextureVersion::Mode() != 0 && e.resource_id != 0) [[unlikely]] {
+                // note 100: the image of the view's texture keeps that texture's version slot; an image clean now starts at the current version
+                if (auto* slot = Core::TextureVersion::Find(e.resource_id); slot != nullptr && slot->InClass()) {
+                    const VideoCore::ImageId own = answers_ok[i] && answers[i].found ? answers[i].found : bound;
+                    auto& image = texture_cache.GetImage(own);
+                    if (image.tv_slot != slot) {
+                        image.tv_slot = slot;
+                        image.tv_uploaded = False(image.flags & VideoCore::ImageFlagBits::Dirty) ? slot->version.load(std::memory_order_acquire) : ~0ull;
+                        Core::TextureVersion::Note(Core::TextureVersion::ImagesLinked);
+                    }
+                }
             }
         };
         Entry* e = Find(view_id, flags);

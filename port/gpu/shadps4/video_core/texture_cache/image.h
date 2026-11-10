@@ -158,6 +158,9 @@ public:
     /// render target, or by the fast clear eliminate; until then the memory (and a texture read of it) keeps the old pixels
     std::optional<vk::ClearValue> pending_fast_clear;
     u8 b8_marks{};  ///< B8: 8 the engine deleted the image's texture (used-after-delete audit), 16 listed by an engine texture
+    /// Note 100 (`TLG_TEXTURE_VERSION`): the content version slot of the class texture the image belongs to (linked at a view table entry), and the version at its last upload
+    const void* tv_slot{};
+    u64 tv_uploaded{~0ull};
     u64 lru_id{};
     u64 tick_accessed_last{};
 

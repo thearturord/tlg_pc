@@ -55,6 +55,7 @@
 #include "native/native_target_desc.h"
 #include "native/native_content.h"
 #include "native/native_updates.h"
+#include "native/native_texture_version.h"
 #include "native/native_sync.h"
 #include "native/native_zpass_gen.h"
 #include "native/native_direct.h"
@@ -8438,6 +8439,7 @@ u64 PS4_SYSV_ABI ResourceTextureInitAnnounced(u64 object, u64 a1, u64 a2, u64 a3
             const u64 memory = texture != 0 ? Rd<u64>(texture, 0x30) : 0;
             if (memory != 0 && memory == t_last_garlic_address && t_last_garlic_size != 0) {
                 NativeUpdates::NoteWriterRange(6, memory, t_last_garlic_size, "texture 1D/3D creation");
+                Core::TextureVersion::Bump(Rd<u64>(texture, 0x10)); // note 100
             }
             return 0;
         });
@@ -8449,6 +8451,7 @@ u64 PS4_SYSV_ABI ResourceTextureInitAnnounced(u64 object, u64 a1, u64 a2, u64 a3
         const u64 size = Rd<u64>(object, 0x38);
         if (memory != 0 && size != 0 && size <= (1ull << 32)) {
             NativeUpdates::NoteWriterRange(6, memory, size, "texture 2D initialization");
+            Core::TextureVersion::Bump(Rd<u64>(object, 0x10)); // note 100
         }
         return 0;
     });
@@ -8870,6 +8873,7 @@ u64 PS4_SYSV_ABI TextureUpdateSubresource(u64 context, u64 resource, u64 subreso
         bytes.fetch_add(size, std::memory_order_relaxed);
         if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed) && memory != 0 && size != 0 && size < (1ull << 32)) {
             Core::NativeUpdates::NoteWriterRange(6, memory, size, "UpdateSubresource texture");
+            Core::TextureVersion::Bump(Rd<u64>(resource, 0x10)); // note 100 (the original ran above)
             announced.fetch_add(1, std::memory_order_relaxed);
         }
         {

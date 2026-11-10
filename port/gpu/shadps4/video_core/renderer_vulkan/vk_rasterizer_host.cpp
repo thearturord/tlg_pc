@@ -9,6 +9,7 @@
 #include "native/native_hook_owned.h"
 #include "native/native_legacy.h"
 #include "native/native_view_table.h"
+#include "native/native_texture_version.h"
 #include <nlohmann/json.hpp>
 
 #include "native/native_debug_server.h"
@@ -327,6 +328,9 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
         }
         if (Core::ViewTable::Mode() != 0) {
             Core::DebugServer::Publish("view_table", Core::ViewTable::Report()); // note 95
+        }
+        if (Core::TextureVersion::Mode() != 0) {
+            Core::DebugServer::Publish("texture_version", Core::TextureVersion::Report()); // note 100
         }
         if (Core::OwnMemoryCensus::On() || Core::OwnMemoryCensus::DropDirtyMode() != 0 || Core::OwnMemoryCensus::OwnImmutableMode() != 0 || Core::OwnMemoryCensus::OwnMutableMode() != 0 || Core::OwnMemoryCensus::OwnCloseMode() != 0) {
             Core::DebugServer::Publish("own_memory_census", Core::OwnMemoryCensus::Report()); // design review 79, step 1a

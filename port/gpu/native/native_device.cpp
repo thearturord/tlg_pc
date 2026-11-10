@@ -24,6 +24,7 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "native/native_hook_owned.h"
+#include "native/native_texture_version.h"
 #include "common/thread.h"
 #include "native/native_hooks.h"
 #include "native/native_draw.h"
@@ -149,6 +150,30 @@ void Insert(const Object& object) {
     id_by_object[object.object] = object.id;
     if (object.kind >= Kind::Buffer && object.kind <= Kind::Texture3D && object.address != 0) {
         const u64 bytes = object.kind == Kind::Buffer ? std::max<u64>(object.bytes, 1) : object.bytes;
+        if (bytes != 0 && Core::TextureVersion::Mode() != 0) {
+            // note 100: a texture is in the class when it is not dynamic and its memory holds no other live buffer or texture; a resource created over a class texture excludes it
+            // (looked at before this resource's own entry replaces one at the same address)
+            const VAddr end = object.address + bytes;
+            bool overlap = false;
+            auto it = resource_by_address.lower_bound(end);
+            u32 below = 0;
+            while (it != resource_by_address.begin() && below < 16) {
+                --it;
+                if (it->first < object.address) {
+                    ++below;
+                }
+                if (it->second.id == object.id || it->second.end <= object.address || it->second.kind < Kind::Buffer || it->second.kind > Kind::Texture3D) {
+                    continue;
+                }
+                overlap = true;
+                if (it->second.kind != Kind::Buffer) {
+                    Core::TextureVersion::Exclude(it->second.id);
+                }
+            }
+            if (object.kind != Kind::Buffer) {
+                Core::TextureVersion::Created(object.id, !overlap && object.usage != 2);
+            }
+        }
         resource_by_address[object.address] = AddrEntry{object.id, object.address + bytes, object.kind, object.usage, object.cpu_access};
         if (object.kind != Kind::Buffer && bytes != 0 && Core::HookOwned::Mode() != 0) {
             // note 90: a texture in a buffer's memory excludes the buffer from the hook-owned class for good (here, in game order, before any later write of it)

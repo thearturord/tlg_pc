@@ -3,6 +3,7 @@
 
 #include "native/native_hook_ring.h"
 #include "native/native_hook_owned.h"
+#include "native/native_texture_version.h"
 #include "video_core/half_phase.h"
 #include <chrono>
 #include <fstream>
@@ -1225,6 +1226,34 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
 void TextureCache::RefreshImage(Image& image, Core::ImageCaller caller) {
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseImgRefresh};
     Core::SplitCensus::Touch(Core::SplitCensus::TexRefresh);
+    if (image.tv_slot != nullptr) [[unlikely]] {
+        // note 100 shadow: the class texture's version against the flags the address route set; an upload below takes the version read here
+        using namespace Core::TextureVersion;
+        const auto* slot = static_cast<const Slot*>(image.tv_slot);
+        if (slot->InClass()) {
+            const u64 now = slot->version.load(std::memory_order_acquire);
+            Note(RefreshChecked);
+            if (True(image.flags & ImageFlagBits::GpuModified)) {
+                Note(RefreshGpuSkipped);
+            } else if (image.tv_uploaded == ~0ull) {
+                Note(RefreshFirstUpload);
+            } else {
+                const bool version_dirty = image.tv_uploaded != now;
+                const bool flags_dirty = True(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty));
+                Note(version_dirty ? (flags_dirty ? BothDirty : VersionOnly) : (flags_dirty ? FlagsOnly : BothClean));
+                if (flags_dirty && !version_dirty) {
+                    static std::atomic<u32> logged{0};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+                        LOG_ERROR(Render_Vulkan, "texture version: image {:#x}+{:#x} ({}x{}) is dirty by its flags ({:#x}), its texture's version did not move", image.info.guest_address,
+                                  image.info.guest_size, image.info.size.width, image.info.size.height, static_cast<u32>(image.flags));
+                    }
+                }
+            }
+            if (True(image.flags & ImageFlagBits::Dirty)) {
+                image.tv_uploaded = now;
+            }
+        }
+    }
     TLG_PROF_LEVEL("texture.refresh_image", 3);
     Core::NativeCensus::NoteImage(Core::NativeCensus::ImageRefresh, image.info.guest_size);
     // E3.3: the shared page edges of an image are no longer harvested here. The engine's announced writes tell when an image's content changed (E3.1 census: the harvest alone
@@ -1738,6 +1767,13 @@ Core::NativeImageIndex::Host::Announced TextureCache::ApplyAnnounced(ImageId id,
             Core::N0::NoteRingOut(Core::N0::OutImageDirtied);
         } else {
             image.b8_marks |= B8OtherDirty;
+        }
+    }
+    if (image.tv_slot != nullptr && (Core::N0::t_writer & 7) != 6 && static_cast<const Core::TextureVersion::Slot*>(image.tv_slot)->InClass()) [[unlikely]] {
+        Core::TextureVersion::Note(Core::TextureVersion::AddressWriteOnClass); // note 100 guard: only the writer 6 hooks write a class texture
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+            LOG_ERROR(Render_Vulkan, "texture version: writer tag {} announced {:#x}+{:#x} over image {:#x} of a class texture", Core::N0::t_writer, address, size, image.info.guest_address);
         }
     }
     image.flags |= ImageFlagBits::CpuDirty;
