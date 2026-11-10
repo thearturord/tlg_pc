@@ -6033,6 +6033,15 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set,
         ++texture_set_stats.generation;
         return false;
     }
+    if (!BindTexturesFromEntries(stage, set, count, binding)) {
+        ++texture_set_stats.image_check;
+        return false;
+    }
+    ++texture_set_stats.hits;
+    return true;
+}
+
+bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const TextureSet& set, u32 count, Shader::Backend::Bindings& binding) {
     // Everything the slow path does to an image before it looks at the view: touch and refresh. Idempotent, so a miss after it costs nothing.
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];
@@ -6052,11 +6061,9 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set,
         const auto associated = texture_cache.GetAssociatedDepth(texture_cache.GetImage(entry.found));
         if (image.backing != entry.backing || image.binding.needs_rebind || image.binding.force_general || image.binding.is_target ||
             (image.backing->num_samples > 1) != (image.info.num_samples > 1) || (redirected ? associated != entry.id : bool(associated))) {
-            ++texture_set_stats.image_check;
             return false;
         }
     }
-    ++texture_set_stats.hits;
     const u32 first_image_idx = image_infos.size();
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];
@@ -6133,6 +6140,18 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
     // Texture set memo: the set of resolved images for these T#s, when the stage qualifies (no written image, no mip fallback binding, at most 16 images).
+    if (Core::ViewTable::Mode() == 2 && ViewTableBind(stage, binding)) {
+        Census(census_base + CImageTotal, static_cast<u32>(stage.images.size()));
+        BindSamplers(stage, binding);
+        return;
+    }
+    // note 96/97: the old path's answer per image binding, kept for the view table (`vt_ok`: the answer can be bound from the table)
+    static thread_local std::array<TextureSetEntry, TextureSet::MaxImages> vt_answers;
+    static thread_local std::array<bool, TextureSet::MaxImages> vt_ok;
+    const bool vt_on = Core::ViewTable::Mode() != 0;
+    if (vt_on) {
+        vt_ok.fill(false);
+    }
     TextureSet* set_slot = nullptr;
     std::array<std::array<u32, 8>, TextureSet::MaxImages> set_raws;
     std::array<u64, TextureSet::MaxImages> set_flags{};
@@ -6184,8 +6203,9 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
                 TLG_PROF_COUNT("texture.set_hit");
                 Census(census_base + CImageTotal, stage_images);
                 Census(census_base + CImageSetHit, stage_images);
-                if (Core::ViewTable::Mode() != 0) [[unlikely]] {
-                    ViewTableShadow(stage, first_image_idx, view_table_bound_before);
+                if (vt_on) [[unlikely]] {
+                    vt_ok.fill(true); // (a recorded set holds no target, storage or forced-general image)
+                    ViewTableShadow(stage, first_image_idx, view_table_bound_before, set_slot->entries.data(), vt_ok.data());
                 }
                 BindSamplers(stage, binding);
                 return;
@@ -6395,7 +6415,7 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
                     Core::LightRecorder::Watch(desc.info.guest_address, desc.info.guest_size);
                 }
             }
-            if (set_record) {
+            if (set_record || (vt_on && num_images - 1 < TextureSet::MaxImages)) {
                 set_found[num_images - 1] = image_id;
             }
             auto* image = &texture_cache.GetImage(image_id);
@@ -6442,11 +6462,13 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
         if (!image_id) {
             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         } else {
+            bool vt_rebound = false;
             if (auto& old_image = texture_cache.GetImage(image_id);
                 old_image.binding.needs_rebind) {
                 old_image.binding = {};
                 image_id = texture_cache.FindImage(desc);
                 set_record = false;
+                vt_rebound = true;
             }
 
             bound_images.emplace_back(image_id);
@@ -6534,6 +6556,19 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
             if (recipe_active) {
                 recipe_image_ranges.emplace_back(image.info.guest_address, static_cast<u32>(std::min<u64>(image.info.guest_size, 0xffffffffull)));
             }
+            if (vt_on && i < TextureSet::MaxImages) {
+                auto& ve = vt_answers[i];
+                ve = {};
+                ve.id = image_id;
+                ve.found = vt_rebound ? image_id : set_found[i];
+                ve.found_uid = texture_cache.Uid(ve.found);
+                ve.id_uid = texture_cache.Uid(image_id);
+                ve.view = *image_view.image_view;
+                ve.backing = image.backing;
+                ve.range = desc.view_info.range;
+                ve.array_key = image_keys[std::min<u32>(i, Shader::NUM_IMAGES - 1)];
+                vt_ok[i] = !(binding.force_general || binding.is_target || is_storage || vt_rebound);
+            }
             if (set_record && i < TextureSet::MaxImages) {
                 if (binding.force_general || binding.is_target || is_storage) {
                     set_record = false;
@@ -6610,13 +6645,67 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
         ++texture_set_stats.recorded;
         TextureSetShadowCompare(*set_slot);
     }
-    if (Core::ViewTable::Mode() != 0) [[unlikely]] {
-        ViewTableShadow(stage, first_image_idx, view_table_bound_before);
+    if (vt_on) [[unlikely]] {
+        ViewTableShadow(stage, first_image_idx, view_table_bound_before, vt_answers.data(), vt_ok.data());
     }
     BindSamplers(stage, binding);
 }
 
-void Rasterizer::ViewTableShadow(const Shader::Info& stage, u32 first_info, size_t bound_before) {
+bool Rasterizer::ViewTableBind(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    using namespace Core::ViewTable;
+    const u32 n = static_cast<u32>(stage.images.size());
+    if (n == 0 || n > TextureSet::MaxImages || binder_plan == nullptr) {
+        return false;
+    }
+    static thread_local TextureSet from_table;
+    static_assert(sizeof(TextureSetEntry) <= sizeof(Entry::payload) && std::is_trivially_copyable_v<TextureSetEntry>);
+    for (u32 i = 0; i < n; ++i) {
+        const auto& res = stage.images[i];
+        if (res.is_written || res.mip_fallback_mode != Shader::MipStorageFallbackMode::None || res.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad ||
+            res.NumBindings(stage) != 1) {
+            return false;
+        }
+        // the view the record names: an index into the plan, no T# word is read
+        u32 identity_binding = ~0u;
+        const u32* words = nullptr;
+        if (!PlannedImageWords(stage, i, res.is_r128 ? 4 : 8, words, identity_binding)) {
+            words = BinderWords(stage, res.sharp_fetch.offsets[0], res.is_r128 ? 4 : 8, 2, &identity_binding);
+        }
+        if (words == nullptr || identity_binding == ~0u) {
+            return false;
+        }
+        const u64 view_id = binder_plan->bindings[identity_binding].view_id;
+        if (view_id == 0) {
+            return false;
+        }
+        const Entry* e = Find(view_id, ImageUseFlags(res));
+        if (e == nullptr || !e->in_class || !e->has_payload) {
+            return false;
+        }
+        TextureSetEntry& te = from_table.entries[i];
+        std::memcpy(&te, e->payload, sizeof(TextureSetEntry));
+        if (te.id_uid == 0 || texture_cache.ImageUid(te.id) != te.id_uid || False(texture_cache.GetImage(te.id).flags & VideoCore::ImageFlagBits::Registered) ||
+            (te.found != te.id && texture_cache.ImageUid(te.found) != te.found_uid)) {
+            return false;
+        }
+        te.array_key = res.array_key;
+    }
+    from_table.count = n;
+    static thread_local u32 audit_tick = 0;
+    if ((++audit_tick & 63u) == 0) {
+        Note(RealAudited); // the old path binds this one; the shadow compare at its end must find the same images
+        return false;
+    }
+    if (!BindTexturesFromEntries(stage, from_table, n, binding)) {
+        Note(RealCheckFailed);
+        return false;
+    }
+    Note(RealServed);
+    Note(RealServedImages, n);
+    return true;
+}
+
+void Rasterizer::ViewTableShadow(const Shader::Info& stage, u32 first_info, size_t bound_before, const TextureSetEntry* answers, const bool* answers_ok) {
     using namespace Core::ViewTable;
     const u32 n = static_cast<u32>(stage.images.size());
     if (n == 0) {
@@ -6669,6 +6758,10 @@ void Rasterizer::ViewTableShadow(const Shader::Info& stage, u32 first_info, size
             e.image_index = bound.index;
             e.image_uid = texture_cache.ImageUid(bound);
             e.view_handle = view_bits;
+            e.has_payload = answers_ok[i] && answers[i].id == bound && answers[i].view == view;
+            if (e.has_payload) {
+                std::memcpy(e.payload, &answers[i], sizeof(TextureSetEntry));
+            }
         };
         Entry* e = Find(view_id, flags);
         if (e == nullptr) {

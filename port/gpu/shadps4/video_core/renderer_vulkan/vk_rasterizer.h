@@ -375,9 +375,6 @@ private:
     std::array<std::array<std::atomic<u64>, 3>, 2> rows_ahead_walk{};
     std::array<std::array<std::atomic<u64>, 8>, 2> rows_ahead_fseg{}; ///< design review 66: [side][6 segments ns, count, of them indexed]
     void NoteFastSegments(u32 side, bool indexed) noexcept;
-    /// Design review note 95 (`TLG_VIEW_TABLE=1`, shadow): after a stage's images were bound by the old path, the view table's answer for each read-only binding of a
-    /// non-dynamic engine texture view is compared with it (`first_info`: the stage's first image info; `bound_before`: the bound image list's size before the stage).
-    void ViewTableShadow(const Shader::Info& stage, u32 first_info, size_t bound_before);
     /// Design review 67 to 69 (`TLG_BARRIER_GUARD`: 2 real (default since 2026-11-10, owner's play), 1 shadow, 0 off): the barrier query of a read-only buffer binding. A read can only need a barrier against a write the
     /// planner holds since its last barrier; with none (`PlanHasWrites` false) the query is not asked (real) or asked and compared (shadow). The read itself is still recorded at the
     /// finish (`AccessBuffer` over the bound list). One in 64 skipped queries is asked anyway.
@@ -656,6 +653,14 @@ private:
     /// True when the stage's images were bound from the set (the descriptor writes are done).
     bool BindTexturesFromSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count,
                              Shader::Backend::Bindings& binding);
+    /// The set hit's tail (touch and refresh, the per-image checks, transitions, descriptor writes): false when a check fails (nothing bound; touch and refresh are idempotent).
+    bool BindTexturesFromEntries(const Shader::Info& stage, const TextureSet& set, u32 count, Shader::Backend::Bindings& binding);
+    /// Design review notes 95 and 96 (`TLG_VIEW_TABLE`): after a stage's images were bound by the old path, the view table's answer for each read-only binding of a non-dynamic
+    /// engine texture view is compared with it, and the entry is made or remade from it (`first_info`: the stage's first image info; `bound_before`: the bound image list's size
+    /// before the stage; `answers`/`answers_ok`: the old path's per-image record and whether it can be bound from the table).
+    void ViewTableShadow(const Shader::Info& stage, u32 first_info, size_t bound_before, const TextureSetEntry* answers, const bool* answers_ok);
+    /// Note 97 (`TLG_VIEW_TABLE=2`): the stage's images bound from the view table (true), or nothing done (false: the old path binds them).
+    bool ViewTableBind(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool ResolveTextureSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count, TextureResolved& r);
     /// F2 item 4 (`TLG_TEXSET_BY_ID`, default 2 since 2026-11-10; 0 off, 1 shadow): a texture set whose generation moved is still right when none of its images changed by identity (the texture
     /// cache's event ring: no image registered or unregistered over their memory since the set was recorded). Returns true when the set may be used (real mode, all unchanged).

@@ -14,7 +14,7 @@ namespace Core::ViewTable {
 u32 Mode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_VIEW_TABLE");
-        return e != nullptr && e[0] == '1' ? 1u : 0u; // (2, real, is not built yet)
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
@@ -109,6 +109,8 @@ nlohmann::json Report() {
                    {"stale_remade", c(ImagesStale)}};
     j["not_in_class"] = {{"no_view", c(NotClassNoView)}, {"dynamic_or_unknown_texture", c(NotClassDynamic)}, {"written_fallback_or_multi", c(NotClassUse)}, {"null", c(NotClassNull)}};
     j["entries_dropped_by_delete_events"] = c(DroppedByEvent);
+    j["real"] = {{"stages_bound_from_the_table", c(RealServed)}, {"image_bindings_bound_from_the_table", c(RealServedImages)}, {"stages_audited_by_the_old_path", c(RealAudited)},
+                 {"stages_whose_image_checks_failed", c(RealCheckFailed)}};
     return j;
 }
 
