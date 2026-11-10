@@ -255,6 +255,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         if (!hook_ring_buffer->mapped_data.empty()) {
             Core::HookRing::SetStorage(hook_ring_buffer->mapped_data.data(), hook_capacity,
                                        [](void* context, u64 offset, u64 size) { static_cast<VideoCore::Buffer*>(context)->Flush(offset, size); }, hook_ring_buffer.get());
+            buffer_cache.SetHookRing(hook_ring_buffer.get()); // F1 1b real (TLG_HOOK_RING_1B=2): ObtainBuffer binds whole ring ranges from it
             LOG_INFO(Render, "hook ring (F1 1a): {} MB of GPU-visible memory, constants bound from it", hook_capacity >> 20);
         } else {
             LOG_ERROR(Render, "hook ring (F1 1a): the buffer is not mapped, the old path stays");
@@ -4208,7 +4209,9 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     obtained = obtain_old();
                 }
                 if (rows_on && !desc.is_written && !row_served) {
-                    RowsLearn(w31_id, vsharp.address, size, desc.is_formatted, obtained.first, obtained.second, rows_epoch_pre, rows_clock_pre, rows_gpu_pre);
+                    if (!buffer_cache.IsHookRing(obtained.first)) { // a hook ring answer moves with the ring's laps: never learned
+                        RowsLearn(w31_id, vsharp.address, size, desc.is_formatted, obtained.first, obtained.second, rows_epoch_pre, rows_clock_pre, rows_gpu_pre);
+                    }
                 }
                 if (cover_on) [[unlikely]] {
                     w3_row = row_served;

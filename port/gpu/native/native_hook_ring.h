@@ -43,7 +43,11 @@ void NoteBound(u64 size, bool checked);
 /// F1 1b shadow (`TLG_HOOK_RING_1B=1`, default off; needs every writer filling: `TLG_HOOK_RING_WRITERS=0xff`): the raster thread's ring uploads compared with
 /// the hook ring. `cls`: 0 read-only binding up to 64 KiB, 1 texel binding. The wide read bindings (above 64 KiB, the 4 MB dynamic buffers of section 12) stay
 /// on the old path by design and are only counted (`NoteRasterWide`). The source bytes are game memory now (what the old path uploads).
-bool Raster1bOn() noexcept;
+bool Raster1bOn() noexcept;   ///< TLG_HOOK_RING_1B=1 (shadow) or 2 (real)
+/// F1 1b real (`TLG_HOOK_RING_1B=2`, default off): the raster thread binds texel ranges and reads up to 64 KiB of the frame ring straight from the hook ring
+/// (BufferCache::ObtainBuffer) instead of uploading them from game memory; 1 in 64 is compared with game memory. Every writer fills in this mode.
+bool Raster1bReal() noexcept;
+void NoteRasterBound(u32 cls, u64 size, bool checked);
 void CompareRaster(u32 cls, u64 address, u64 size, bool gpu_written);
 /// A GPU result was written into game memory at [address, address + size) (readbacks, image downloads, fence and label writes): the 1b shadow files a later
 /// difference over it under "a GPU result landed since the fill".

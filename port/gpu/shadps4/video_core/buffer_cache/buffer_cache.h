@@ -222,6 +222,13 @@ public:
     /// N5e: byte precise. True when a shader or a GPU copy wrote bytes of [addr, addr + size) that were not downloaded since (the set `gpu_modified_ranges`), as against
     /// `IsRegionGpuModified`, which answers per 4 KB page and keeps the answer for as long as the page lives.
     [[nodiscard]] bool IsRangeGpuWritten(VAddr addr, size_t size);
+    /// F1 1b real (TLG_HOOK_RING_1B=2): the rasterizer's hook ring buffer, bound for frame ring ranges the hook ring holds whole
+    void SetHookRing(const Buffer* buffer) noexcept {
+        hook_ring = buffer;
+    }
+    [[nodiscard]] bool IsHookRing(const Buffer* buffer) const noexcept {
+        return buffer != nullptr && buffer == hook_ring;
+    }
     /// N5h: new contents were written into the range by the CPU (a creation, an initialization, a Map / Unmap): what the GPU wrote there before is gone.
     void SupersedeGpuWritten(VAddr addr, size_t size);
 
@@ -255,6 +262,7 @@ public:
     u32 WaitForExplicitDownloads(VAddr device_addr, u64 size, u32 timeout_ms);
 
 private:
+    const Buffer* hook_ring = nullptr; ///< F1 1b real
     /// Drops the reusable stream copies if a guest memory write overlaps them.
     void InvalidateStreamReuse(VAddr device_addr, u64 size);
 

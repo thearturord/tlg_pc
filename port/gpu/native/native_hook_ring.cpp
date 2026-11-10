@@ -17,6 +17,8 @@
 
 namespace Core::HookRing {
 
+u32 Raster1bMode() noexcept; // 1b mode: 0 off, 1 shadow, 2 real (defined below)
+
 namespace {
 
 constexpr u64 GranuleShift = 4; // 16 bytes
@@ -166,7 +168,7 @@ bool FillsWriter(u32 writer) noexcept {
         if (const char* e = std::getenv("TLG_HOOK_RING_WRITERS"); e != nullptr && *e != 0) {
             return static_cast<u32>(std::strtoul(e, nullptr, 0));
         }
-        return Mode() == 2 ? (1u << 3) : 0xffu;
+        return Mode() == 2 && Raster1bMode() == 0 ? (1u << 3) : 0xffu; // 1b (shadow or real) needs every writer
     }();
     return Mode() != 0 && writer < 8 && (mask & (1u << writer)) != 0;
 }
@@ -310,12 +312,34 @@ void Compare(u64 address, u64 size, const void* copied) {
     }
 }
 
-bool Raster1bOn() noexcept {
-    static const bool on = [] {
+u32 Raster1bMode() noexcept {
+    static const u32 mode = [] {
+        // default 2 (real) since 2026-11-10 after the owner's play; =0 off, =1 shadow
         const char* e = std::getenv("TLG_HOOK_RING_1B");
-        return e != nullptr && e[0] == '1';
+        if (e == nullptr || e[0] == 0) {
+            return 2u;
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
-    return on && On();
+    return On() ? mode : 0u;
+}
+
+bool Raster1bOn() noexcept {
+    return Raster1bMode() != 0;
+}
+
+bool Raster1bReal() noexcept {
+    return Raster1bMode() == 2 && RealOn();
+}
+
+std::atomic<u64> c_raster_bound[2]{}, c_raster_bound_bytes[2]{}, c_raster_bound_checked{0};
+
+void NoteRasterBound(u32 cls, u64 size, bool checked) {
+    c_raster_bound[cls & 1].fetch_add(1, std::memory_order_relaxed);
+    c_raster_bound_bytes[cls & 1].fetch_add(size, std::memory_order_relaxed);
+    if (checked) {
+        c_raster_bound_checked.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void NoteRasterWide(u64 size) {
@@ -497,6 +521,10 @@ nlohmann::json Report() {
                  {"old_path_two_halves", c_resolve_two_halves.load()}};
     static constexpr const char* cls_names[2] = {"read_up_to_64k", "texel"};
     j["raster_1b"]["on"] = Raster1bOn();
+    j["raster_1b"]["real"] = Raster1bReal();
+    j["raster_1b"]["bound_from_hook_ring"] = {{"reads_up_to_64k", c_raster_bound[0].load()}, {"reads_bytes", c_raster_bound_bytes[0].load()},
+                                              {"texel", c_raster_bound[1].load()}, {"texel_bytes", c_raster_bound_bytes[1].load()},
+                                              {"checked", c_raster_bound_checked.load()}};
     for (u32 k = 0; k < 2; ++k) {
         const auto& st = g_raster[k];
         j["raster_1b"][cls_names[k]] = {{"compares", st.compares.load()},   {"bytes", st.bytes.load()},

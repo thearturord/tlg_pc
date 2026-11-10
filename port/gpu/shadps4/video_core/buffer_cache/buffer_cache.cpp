@@ -974,6 +974,24 @@ static void PageClockSync(VAddr lo, VAddr hi, const boost::container::small_vect
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                         Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
+    if (hook_ring != nullptr && !is_written && (is_texel_buffer || size <= 65536) && Core::HookRing::Raster1bReal()) {
+        // F1 1b real: a frame ring range the hook ring holds whole (filled at the finished writes, one lap half) is bound from it: no upload from game memory.
+        // GPU-modified ranges keep the old path (the arena holds the GPU's bytes).
+        const auto& ring = UntrackedRing::Get();
+        if (ring.Active() && device_addr >= ring.Start() && device_addr + size <= ring.End() && !IsRegionGpuModified(device_addr, size) &&
+            !IsRangeGpuWritten(device_addr, size)) {
+            u64 hook_offset = 0;
+            if (Core::HookRing::Resolve(device_addr, size, hook_offset)) {
+                static std::atomic<u32> sample{0};
+                const bool check = (sample.fetch_add(1, std::memory_order_relaxed) & 63) == 0;
+                if (check) {
+                    Core::HookRing::CompareRaster(is_texel_buffer ? 1 : 0, device_addr, size, false);
+                }
+                Core::HookRing::NoteRasterBound(is_texel_buffer ? 1 : 0, size, check);
+                return {hook_ring, hook_offset};
+            }
+        }
+    }
     const auto result = ObtainBufferBody(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
     if (result.first != nullptr) {
         const_cast<Buffer*>(result.first)->NoteResolveUse(); // P3c: asked for by the operation being resolved (every answer, memo hits too)
