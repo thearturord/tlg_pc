@@ -5,6 +5,7 @@
 
 #include "native/native_row_version.h"
 #include "native/native_dispatch_split.h"
+#include "native/native_render_memo.h"
 #include <nlohmann/json.hpp>
 
 #include "native/native_debug_server.h"
@@ -316,6 +317,9 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
         }
         if (Core::RowVersion::Mode() != 0) {
             Core::DebugServer::Publish("row_version", Core::RowVersion::Report()); // F2 row version shadow
+        }
+        if (Core::RenderMemo::Mode() != 0) {
+            Core::DebugServer::Publish("render_state_memo", Core::RenderMemo::Report()); // design review 79
         }
         if (Core::DispatchSplit::On() || Core::DispatchSplit::PlannerOn() || Core::DispatchSplit::DrawOn()) {
             Core::DebugServer::Publish("dispatch_split", Core::DispatchSplit::Report()); // design review 71

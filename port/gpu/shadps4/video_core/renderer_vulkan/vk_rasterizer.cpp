@@ -19,6 +19,7 @@
 #include "native/native_n0_census.h"
 #include "native/native_row_version.h"
 #include "native/native_dispatch_split.h"
+#include "native/native_render_memo.h"
 #include "native/native_prof.h"
 #include "native/native_marker.h"
 #include "native/native_ui_trace.h"
@@ -3763,12 +3764,8 @@ void Rasterizer::RecordDraw(DrawJob& d) {
 }
 
 bool Rasterizer::RenderStateMemoEnabled() {
-    // Off by default until it is checked in play (documents/tlg/pc-port-draw-pipeline-architecture.md): TLG_RENDER_STATE_MEMO=1 turns it on.
-    static const bool enabled = [] {
-        const char* env = std::getenv("TLG_RENDER_STATE_MEMO");
-        return env && env[0] == '1';
-    }();
-    return enabled;
+    // The real memo (design review 79: TLG_RENDER_STATE_MEMO=2; =1 is the shadow now, which keeps every other path as with the memo off).
+    return Core::RenderMemo::Mode() == 2;
 }
 
 void Rasterizer::ResolveDrawJob(const GraphicsPipeline* pipeline, DrawJob& job) {
@@ -7312,8 +7309,12 @@ Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     TLG_PROF_LEVEL("raster.begin_rendering", 2);
-    if (!RenderStateMemoEnabled()) {
+    const u32 memo_mode = Core::RenderMemo::Mode();
+    if (memo_mode == 0) {
         return BeginRenderingFull(pipeline);
+    }
+    if (memo_mode == 1) {
+        return BeginRenderingMemoShadow(pipeline);
     }
     const auto& regs = *draw_inputs;
     BeginSignature signature = MakeBeginSignature(pipeline);
@@ -7327,6 +7328,11 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
     }
     if (usable) {
+        static thread_local u32 memo_sample = 0;
+        if ((++memo_sample & 63u) == 0) {
+            return BeginRenderingMemoShadow(pipeline); // design review 79: the audit (the same decision, the full setup answers and is compared)
+        }
+        Core::RenderMemo::Note(Core::RenderMemo::Served);
         attachment_feedback_loop = false;
         return begin_memo.state;
     }
@@ -7344,6 +7350,107 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         if (!clears) {
             begin_memo = {true, MakeBeginSignature(pipeline), state};
         }
+    }
+    return state;
+}
+
+RenderState Rasterizer::BeginRenderingMemoShadow(const GraphicsPipeline* pipeline) {
+    // Design review 79 (TLG_RENDER_STATE_MEMO=1): the memo decides as the real one would, the full setup still runs and answers, and its state is compared
+    // with the memo's on every draw the memo would have answered. The memo is kept and stored exactly as the real one keeps and stores it.
+    namespace RM = Core::RenderMemo;
+    const auto& regs = *draw_inputs;
+    RM::Note(RM::Asked);
+    const BeginSignature signature = MakeBeginSignature(pipeline);
+    const bool valid = begin_memo.valid;
+    const bool open = valid && scheduler.IsRenderingWith(begin_memo.state);
+    const bool no_clear = !regs.depth_render_control.depth_clear_enable && !regs.depth_render_control.stencil_clear_enable;
+    const bool same = valid && signature == begin_memo.signature;
+    bool unsampled = true;
+    for (const auto id : signature.ids) {
+        if (id) {
+            const auto& image = texture_cache.GetImage(id);
+            unsampled = unsampled && !image.binding.is_bound && !image.binding.needs_rebind;
+        }
+    }
+    if (valid) {
+        RM::Note(RM::MemoValid);
+    }
+    if (open) {
+        RM::Note(RM::PassOpen);
+        if (no_clear) {
+            RM::Note(RM::NoClear);
+            if (same) {
+                RM::Note(RM::SignatureSame);
+            }
+        }
+    }
+    const bool usable = open && no_clear && same && unsampled;
+    if (usable) {
+        RM::Note(RM::WouldHit);
+    }
+    const bool barrier_before = needs_barrier;
+    needs_barrier = false;
+    const auto* list = scheduler.CommandBuffer().List();
+    const u64 commands_before = list != nullptr ? list->Size() : 0;
+    const u64 upload_before = VideoCore::BufferCache::UploadBytes();
+    const u64 t0 = Core::DispatchSplit::Tsc();
+    RenderState state = BeginRenderingFull(pipeline);
+    RM::NoteTicks(usable, Core::DispatchSplit::Tsc() - t0);
+    const bool full_barrier = needs_barrier;
+    needs_barrier |= barrier_before;
+    if (usable) {
+        RM::Note(RM::Compared);
+        const auto* list_after = scheduler.CommandBuffer().List();
+        const u64 commands_after = list_after != nullptr ? list_after->Size() : 0;
+        if (!(state == begin_memo.state)) {
+            RM::Note(RM::Different);
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1) < 10) {
+                u32 first = 99;
+                for (u32 i = 0; i < state.color_attachments.size() && first == 99; ++i) {
+                    if (std::memcmp(&state.color_attachments[i], &begin_memo.state.color_attachments[i], sizeof(state.color_attachments[i])) != 0) {
+                        first = i;
+                    }
+                }
+                const bool depth = std::memcmp(&state.depth_stencil_attachment, &begin_memo.state.depth_stencil_attachment, sizeof(state.depth_stencil_attachment)) != 0;
+                LOG_ERROR(Render_Vulkan,
+                          "render state memo differs: {}x{}x{} {} colour (memo {}x{}x{} {}); first colour attachment differing {} (layout {} memo {}, clear {} memo {}); depth differs {} (layout {} memo {})",
+                          state.width, state.height, state.num_layers, state.num_color_attachments, begin_memo.state.width, begin_memo.state.height,
+                          begin_memo.state.num_layers, begin_memo.state.num_color_attachments, first,
+                          first < 8 ? vk::to_string(state.color_attachments[first].image_layout) : std::string{"-"},
+                          first < 8 ? vk::to_string(begin_memo.state.color_attachments[first].image_layout) : std::string{"-"},
+                          first < 8 ? state.color_attachments[first].is_clear : 0, first < 8 ? begin_memo.state.color_attachments[first].is_clear : 0, depth,
+                          vk::to_string(state.depth_stencil_attachment.image_layout), vk::to_string(begin_memo.state.depth_stencil_attachment.image_layout));
+            }
+        }
+        if (full_barrier) {
+            RM::Note(RM::WorkBarrier);
+        }
+        if (commands_after != commands_before) {
+            RM::Note(RM::WorkCommands);
+        }
+        if (VideoCore::BufferCache::UploadBytes() != upload_before) {
+            RM::Note(RM::WorkUpload);
+        }
+        if (attachment_feedback_loop) {
+            RM::Note(RM::FeedbackLoop);
+        }
+        return state; // (the real memo keeps its state here)
+    }
+    begin_memo.valid = false;
+    if (attachment_feedback_loop) {
+        RM::Note(RM::NotStoredFeedback);
+        return state;
+    }
+    bool clears = state.depth_stencil_attachment.depth_clear || state.depth_stencil_attachment.stencil_clear;
+    for (u32 i = 0; i < state.num_color_attachments; ++i) {
+        clears |= state.color_attachments[i].is_clear != 0;
+    }
+    if (clears) {
+        RM::Note(RM::NotStoredClear);
+    } else {
+        begin_memo = {true, MakeBeginSignature(pipeline), state};
+        RM::Note(RM::Stored);
     }
     return state;
 }
