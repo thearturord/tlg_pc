@@ -44,8 +44,9 @@ extern thread_local SyncSite t_sync_site;
 enum Effect : u32 { EffMemo = 1, EffRecipe = 2, EffGpuRanges = 4, EffResident = 8, EffBufferParts = 16, EffImage = 32, EffUnattributed = 64 }; ///< 64: F1 1c, the apply marked bytes no engine buffer holds
 extern thread_local u32 t_effect;
 extern thread_local bool t_ring_candidate; ///< F1 1c: set by the batch around the apply of a range tagged as a ring candidate
+extern thread_local bool t_force_effect; ///< F1 1c real: the sampled full apply records its effects even with the census off
 inline void SetEffect(u32 bit) noexcept {
-    if (g_on) {
+    if (g_on || t_force_effect) {
         t_effect |= bit;
     }
 }
@@ -70,6 +71,23 @@ void NoteApply(bool ring, u64 size, u32 effects, u64 ns) noexcept;
 void NoteRowCheck(bool in_ring, bool dirty, bool only_unattributed) noexcept;
 /// F1 1c: a row the raster thread tried to learn, over a range inside the frame ring or outside it.
 void NoteRowLearn(bool in_ring) noexcept;
+/// F1 1c: the time of one step of `ApplyCpuWrite` for a ring candidate (0 memo erase, 1 GPU-written supersede, 2 resident note, 3 buffer marks, 4 image index).
+void NoteCandidateStep(u32 step, u64 ns) noexcept;
+/// Times one step of the apply when the census is on and the range is a ring candidate.
+struct CandidateStep {
+    u32 step;
+    u64 start;
+    explicit CandidateStep(u32 step_) noexcept : step(step_), start(0) {
+        if (g_on && t_ring_candidate) {
+            start = NowNs();
+        }
+    }
+    ~CandidateStep() {
+        if (start != 0) {
+            NoteCandidateStep(step, NowNs() - start);
+        }
+    }
+};
 void NoteFromImage(u64 ns, bool tiled) noexcept;
 [[nodiscard]] nlohmann::json Report();
 

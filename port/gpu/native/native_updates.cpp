@@ -672,6 +672,21 @@ void NoteEngineDelete(u64 id, u64 address, u64 bytes, u32 what) {
     pending_deleted.push_back({id, address, bytes, what});
 }
 
+bool RingLeanApplyOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_RING_LEAN_APPLY");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+std::atomic<u64> c_ring_lean[4]{};
+void NoteRingLean(u32 what) noexcept {
+    if (what < 4) {
+        c_ring_lean[what].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 bool EarlyAnnounceOn() noexcept {
     static const bool on = [] {
         const char* e = std::getenv("TLG_EARLY_ANNOUNCE");
@@ -1178,7 +1193,7 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
         // memory the engine writes fresh every frame (the frame rings): applied early on the raster thread
         const bool fresh = EarlyAnnounceOn() && (writer == 1 || writer == 2 || writer == 4 || ring);
         (fresh ? pending_ring_ranges : pending_ranges).emplace_back(address, size);
-        const bool ring_candidate = N0::On() && NativeContent::InRing(address, size) && ((writer & 7) == 3 || ((writer & 7) == 0 && !t_announce_texture)); // F1 1c census
+        const bool ring_candidate = (N0::On() || RingLeanApplyOn()) && NativeContent::InRing(address, size) && ((writer & 7) == 3 || ((writer & 7) == 0 && !t_announce_texture)); // F1 1c census
         (fresh ? pending_ring_writers : pending_writers).push_back(Tag{static_cast<u8>((writer & 7) | t_announce_site_class), t_announce_object, static_cast<u8>(ring_candidate ? 1 : 0)});
     }
     NativeResources::NoteAnnouncedWrite(address, size); // C1: resident buffers on those pages are not synchronized any more
@@ -1196,6 +1211,8 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
 nlohmann::json Report() {
     nlohmann::json j = nlohmann::json::object();
     j["enabled"] = enabled.load();
+    j["ring_lean_apply"] = {{"on", RingLeanApplyOn()}, {"applied_lean", c_ring_lean[0].load()}, {"sampled_full", c_ring_lean[1].load()},
+                            {"SAMPLED_WITH_BUFFER_MEMO_RECIPE_OR_RESIDENT_EFFECT_MUST_BE_0", c_ring_lean[2].load()}, {"rows_not_learned_in_ring", c_ring_lean[3].load()}};
     for (u32 w = 0; w < 8; ++w) {
         j["announced_by_writer"][std::to_string(w)] = {{"ranges", announced_ranges_by_writer[w].load()}, {"bytes", announced_bytes_by_writer[w].load()}};
         j["announced_by_writer"][std::to_string(w)]["in_frame_ring"] = {{"ranges", announced_in_ring[w][0].load()}, {"bytes", announced_in_ring[w][1].load()}};

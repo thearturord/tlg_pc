@@ -19,6 +19,7 @@ thread_local SyncSite t_sync_site{SyncArenaRead};
 thread_local u64 t_hash_ns{0};
 thread_local u32 t_effect{0};
 thread_local bool t_ring_candidate = false;
+thread_local bool t_force_effect = false;
 
 namespace {
 constexpr const char* SyncNames[SyncSiteCount] = {"immutable_whole", "arena_read", "arena_written", "arena_texel", "download", "pre_sync"};
@@ -42,6 +43,7 @@ std::array<std::array<ApplyStat, 128>, 2> apply_stats; // [ring][effect mask]
 std::atomic<u64> row_checks[2][3]{}; // [in ring][checks, dirty, dirty only from the unattributed set]
 std::atomic<u64> row_learns[2]{};
 std::array<ApplyStat, 128> candidate_stats; // F1 1c: the applies of ring candidates, by effect mask
+std::atomic<u64> candidate_step_ns[5]{}, candidate_step_calls[5]{};
 std::atomic<u64> image_calls{0}, image_tiled{0}, image_ns{0};
 
 struct Last {
@@ -136,6 +138,13 @@ void NoteRowCheck(bool in_ring, bool dirty, bool only_unattributed) noexcept {
     }
 }
 
+void NoteCandidateStep(u32 step, u64 ns) noexcept {
+    if (step < 5) {
+        candidate_step_ns[step].fetch_add(ns, std::memory_order_relaxed);
+        candidate_step_calls[step].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void NoteRowLearn(bool in_ring) noexcept {
     row_learns[in_ring ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
 }
@@ -183,6 +192,12 @@ nlohmann::json Report() {
         const auto& c = candidate_stats[m];
         if (const u64 n = c.calls.load()) {
             j["ring_candidates"][std::to_string(m)] = {{"calls", n}, {"bytes", c.bytes.load()}, {"ms", c.ns.load() / 1e6}};
+        }
+    }
+    {
+        static constexpr const char* StepNames[5] = {"memo_erase", "gpu_written_supersede", "resident_note", "buffer_marks", "image_index"};
+        for (u32 k = 0; k < 5; ++k) {
+            j["ring_candidate_steps"][StepNames[k]] = {{"calls", candidate_step_calls[k].load()}, {"ms", candidate_step_ns[k].load() / 1e6}};
         }
     }
     j["apply_effect_bits"] = "1 memo, 2 recipe, 4 gpu-written ranges, 8 resident buffers, 16 engine buffer parts, 32 image index, 64 unattributed marks";

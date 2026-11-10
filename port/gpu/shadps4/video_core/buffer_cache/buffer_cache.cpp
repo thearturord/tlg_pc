@@ -152,16 +152,47 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object)
     if (Core::RingMirror::ShadowOn()) {
         Core::RingMirror::NoteAnnounced(address, size);
     }
-    {
+    // F1 1c real (TLG_RING_LEAN_APPLY=1): an in-ring constant copy or buffer Map window keeps only the image index and the GPU-written supersede; one in 64 runs in full
+    // and its effects are counted (the census found none of the skipped steps doing anything for these ranges in three scenes, design review section 22)
+    const bool lean_candidate = Core::N0::t_ring_candidate && Core::NativeUpdates::RingLeanApplyOn();
+    bool lean = false, lean_sampled = false;
+    if (lean_candidate) [[unlikely]] {
+        static thread_local u32 lean_count = 0;
+        lean_sampled = (++lean_count & 63) == 0;
+        lean = !lean_sampled;
+        if (lean_sampled) {
+            Core::N0::t_force_effect = true;
+        }
+    }
+    struct LeanSample {
+        bool on;
+        ~LeanSample() {
+            if (on) {
+                Core::N0::t_force_effect = false;
+                Core::NativeUpdates::NoteRingLean(1);
+                if ((Core::N0::t_effect & (Core::N0::EffMemo | Core::N0::EffRecipe | Core::N0::EffResident | Core::N0::EffBufferParts)) != 0) {
+                    Core::NativeUpdates::NoteRingLean(2);
+                }
+            }
+        }
+    } lean_sample{lean_sampled};
+    if (lean) {
+        Core::NativeUpdates::NoteRingLean(0);
+        cpu_epoch.fetch_add(1, std::memory_order_acq_rel); // (kept: the upload memo sees every applied CPU change, as with the full apply)
+    }
+    if (!lean) {
+        Core::N0::CandidateStep step_timer{0};
         TLG_PROF_LEVEL("cpuwrite.bind_memo_erase", 3);
         BindMemoErase(address, size);
     }
     if (newer) {
         // B2: the engine wrote these bytes after anything the GPU wrote there before (applied in order on the raster thread)
+        Core::N0::CandidateStep step_timer{1};
         TLG_PROF_LEVEL("cpuwrite.supersede", 3);
         SupersedeGpuWritten(address, size);
     }
-    {
+    if (!lean) {
+        Core::N0::CandidateStep step_timer{2};
         TLG_PROF_LEVEL("cpuwrite.note_resources", 3);
         Core::NativeResources::NoteCpuWrite(address, size);
     }
@@ -180,7 +211,8 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object)
             }
         }
     }
-    if (!ring_fast && Core::NativeUpdates::B9TrackerOff()) {
+    if (!ring_fast && !lean && Core::NativeUpdates::B9TrackerOff()) {
+        Core::N0::CandidateStep step_timer{3};
         TLG_PROF_LEVEL("cpuwrite.mark_buffers", 3);
         // B9.3 step 2: the page tracker only marks what no engine buffer holds
         static thread_local std::vector<std::pair<VAddr, VAddr>> gaps;
@@ -227,6 +259,7 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object)
     }
     const u32 b8 = Core::NativeUpdates::B8ImageMode();
     if (b8 != 0) {
+        Core::N0::CandidateStep step_timer{4};
         TLG_PROF_LEVEL("cpuwrite.image_index", 3);
         auto& index = texture_cache.EngineIndex();
         if (id_mode == 1 && (told_whole || buffers_only)) {

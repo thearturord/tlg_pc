@@ -41,6 +41,11 @@ void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site = nullp
 /// TLG_EARLY_ANNOUNCE=1: announcements of memory the engine writes fresh every frame (frame rings: light constants, skinning matrices, scene slots, Map into a ring window) are applied on the raster
 /// thread as soon as it can, not behind the graphics work queued before them (documents/tlg/native plan/engine/compute-lane-design.md section 13).
 [[nodiscard]] bool EarlyAnnounceOn() noexcept;
+/// F1 1c real (`TLG_RING_LEAN_APPLY=1`, default off): an in-ring constant copy or buffer Map window is applied lean on the raster thread (image index and GPU-written
+/// supersede only; no buffer marks, memo erase or resident note), one in 64 in full with its effects counted; rows do not learn ranges inside the frame ring.
+[[nodiscard]] bool RingLeanApplyOn() noexcept;
+/// Counters of the lean apply: 0 applied lean, 1 applied in full as the sampled check, 2 sampled with a buffer, memo, recipe or resident effect (MUST_BE_0), 3 rows not learned in the ring.
+void NoteRingLean(u32 what) noexcept;
 /// N5h (`TLG_RING_SUPERSEDE=1`): a write that gives memory new contents supersedes what the GPU wrote there before. The announcer is told (`fn`) for: the creation of a
 /// buffer, the initialization of a texture (any thread) and the unmap of a buffer on the render thread. Safe because anything the GPU writes into that memory afterwards is
 /// issued after the announcement; marks that older GPU writes add later are only too many.

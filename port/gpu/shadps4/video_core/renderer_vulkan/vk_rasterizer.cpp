@@ -2100,6 +2100,10 @@ void Rasterizer::RowsLearn(u64 id, VAddr address, u64 size, bool texel, const Vi
     if (Core::N0::On()) [[unlikely]] {
         Core::N0::NoteRowLearn(Core::NativeContent::InRing(address, size)); // F1 1c census
     }
+    if (Core::NativeUpdates::RingLeanApplyOn() && Core::NativeContent::InRing(address, size)) {
+        Core::NativeUpdates::NoteRingLean(3); // F1 1c real: a ring range changes every lap without the marks a row check reads; it is never learned
+        return;
+    }
     if (texel && (texture_cache.AnyImageOverlaps(address, size) || texture_cache.IsMeta(address))) {
         w1s_counts[133].fetch_add(1, std::memory_order_relaxed); // a texel buffer over an image: its bytes change with the image, no stamp covers that
         return;
