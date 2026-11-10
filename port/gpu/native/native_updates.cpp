@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <set>
 #include "native/native_switch.h"
 #include <algorithm>
 #include <array>
@@ -75,6 +76,7 @@ struct OpenMap {
     bool texture{}; ///< A1.0: a texture's Map (its window is image content), else a buffer's
     u32 map_type{};  ///< 1b shadow: the D3D11 map type (4 write discard, 5 no overwrite)
     u64 resource{};  ///< 1b shadow: the engine resource id
+    u32 frame_flushed{}; ///< TLG_MAP_KEEP_OPEN: announced at a frame start and kept open for its real Unmap (it is dropped at the next frame start)
 };
 thread_local bool t_next_map_texture = false;
 thread_local bool t_announce_texture = true; ///< A1.0: set around the announcement of a Map window: false for a buffer's
@@ -87,6 +89,20 @@ std::map<std::pair<u64, u64>, OpenMap> open_maps; ///< (thread, resource id) -> 
 // first entry (its window is lost), and an Unmap that finds no open Map
 std::atomic<u64> c_open_replaced{0}, c_open_replaced_bytes{0}, c_open_replaced_in_ring{0}, c_unmap_unmatched{0};
 std::atomic<u64> c_replace_announced{0}, c_replace_announced_bytes{0};
+// frame start flush of the open Maps (design review section 17): every thread's open Maps are announced at the render thread's frame start. A worker that is
+// still between its Map and its Unmap then loses its entry: the window is announced half written and the real Unmap finds nothing.
+std::atomic<u64> c_fs_flushed_own{0}, c_fs_flushed_other{0}, c_fs_kept{0}, c_fs_dropped_after_keep{0}, c_unmap_after_fs_flush{0}, c_unmap_kept_closed{0};
+std::set<std::pair<u64, u64>> g_fs_recent; // (thread, resource id) flushed at the last frame start (under open_map_mutex)
+
+/// `TLG_MAP_KEEP_OPEN=1` (default off): an open Map of another thread is announced at the frame start as before, and also kept open, so that its real Unmap
+/// (or a second Map of it) announces the finished window again; a Map still open at the next frame start is announced once more and dropped. Adds announcements only.
+bool KeepOpenOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_MAP_KEEP_OPEN");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
 
 /// `TLG_MAP_REPLACE_ANNOUNCE` (design review section 10; default on since 2026-11-10 after the owner's play, =0 turns it off): a Map of a resource that this thread mapped before and has not unmapped
 /// announces the earlier window first, as its Unmap would have (the thread has moved on to a new Map of the same resource, so the earlier window's writes are done).
@@ -135,10 +151,23 @@ void NoteRenderThread() {
     std::vector<std::pair<u64, OpenMap>> stale;
     {
         std::scoped_lock lock{open_map_mutex};
-        for (const auto& [key, map] : open_maps) {
-            stale.emplace_back(key.first, map);
+        const u64 me = render_thread.load(std::memory_order_relaxed);
+        g_fs_recent.clear();
+        for (auto it = open_maps.begin(); it != open_maps.end();) {
+            stale.emplace_back(it->first.first, it->second);
+            (it->first.first == me ? c_fs_flushed_own : c_fs_flushed_other).fetch_add(1, std::memory_order_relaxed);
+            g_fs_recent.insert(it->first);
+            if (KeepOpenOn() && it->first.first != me && it->second.frame_flushed == 0) {
+                it->second.frame_flushed = 1; // announced below, kept for its real Unmap
+                c_fs_kept.fetch_add(1, std::memory_order_relaxed);
+                ++it;
+            } else {
+                if (it->second.frame_flushed != 0) {
+                    c_fs_dropped_after_keep.fetch_add(1, std::memory_order_relaxed);
+                }
+                it = open_maps.erase(it);
+            }
         }
-        open_maps.clear();
     }
     for (const auto& [thread, map] : stale) {
         SetMapSite(map, MapSitesOn());
@@ -202,8 +231,22 @@ bool CloseOpenMap(u64 resource_id, u32 how) {
 } // namespace
 
 void NoteUnmap(u64 resource_id) {
-    if (!CloseOpenMap(resource_id, 0)) {
-        c_unmap_unmatched.fetch_add(1, std::memory_order_relaxed);
+    bool kept = false;
+    {
+        std::scoped_lock lock{open_map_mutex};
+        const auto it = open_maps.find({ThreadKey(), resource_id});
+        kept = it != open_maps.end() && it->second.frame_flushed != 0;
+    }
+    if (CloseOpenMap(resource_id, 0)) {
+        if (kept) {
+            c_unmap_kept_closed.fetch_add(1, std::memory_order_relaxed); // the fix at work: the finished window is announced now
+        }
+        return;
+    }
+    c_unmap_unmatched.fetch_add(1, std::memory_order_relaxed);
+    std::scoped_lock lock{open_map_mutex};
+    if (g_fs_recent.count({ThreadKey(), resource_id}) != 0) {
+        c_unmap_after_fs_flush.fetch_add(1, std::memory_order_relaxed); // the race: the frame start announced and dropped this thread's open Map before its Unmap
     }
 }
 
@@ -1158,6 +1201,13 @@ nlohmann::json Report() {
     m["open_map_REPLACED_before_unmap"] = {{"count", c_open_replaced.load()}, {"bytes", c_open_replaced_bytes.load()}, {"in_ring", c_open_replaced_in_ring.load()}};
     m["unmap_without_open_map"] = c_unmap_unmatched.load();
     m["replace_announce"] = {{"on", ReplaceAnnounceOn()}, {"announced", c_replace_announced.load()}, {"bytes", c_replace_announced_bytes.load()}};
+    m["frame_start_flush"] = {{"keep_open", KeepOpenOn()},
+                              {"flushed_render_thread", c_fs_flushed_own.load()},
+                              {"flushed_other_threads", c_fs_flushed_other.load()},
+                              {"UNMAP_AFTER_ITS_MAP_WAS_FLUSHED", c_unmap_after_fs_flush.load()},
+                              {"kept_open", c_fs_kept.load()},
+                              {"kept_then_closed_by_unmap", c_unmap_kept_closed.load()},
+                              {"kept_then_dropped_at_next_frame_start", c_fs_dropped_after_keep.load()}};
     {
         std::scoped_lock lock{open_map_mutex};
         u64 bytes = 0;
