@@ -94,12 +94,12 @@ std::atomic<u64> c_replace_announced{0}, c_replace_announced_bytes{0};
 std::atomic<u64> c_fs_flushed_own{0}, c_fs_flushed_other{0}, c_fs_kept{0}, c_fs_dropped_after_keep{0}, c_unmap_after_fs_flush{0}, c_unmap_kept_closed{0};
 std::set<std::pair<u64, u64>> g_fs_recent; // (thread, resource id) flushed at the last frame start (under open_map_mutex)
 
-/// `TLG_MAP_KEEP_OPEN=1` (default off): an open Map of another thread is announced at the frame start as before, and also kept open, so that its real Unmap
+/// `TLG_MAP_KEEP_OPEN` (default on since 2026-11-10 after the owner's play; =0 turns it off): an open Map of another thread is announced at the frame start as before, and also kept open, so that its real Unmap
 /// (or a second Map of it) announces the finished window again; a Map still open at the next frame start is announced once more and dropped. Adds announcements only.
 bool KeepOpenOn() {
     static const bool on = [] {
         const char* e = std::getenv("TLG_MAP_KEEP_OPEN");
-        return e != nullptr && e[0] == '1';
+        return e == nullptr || e[0] != '0';
     }();
     return on;
 }
