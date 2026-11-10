@@ -330,8 +330,6 @@ private:
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     /// The render state of a draw that starts or changes a render pass (the work BeginRendering does when the memo below cannot answer).
     RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
-    /// Design review 79: the render state memo's shadow (`TLG_RENDER_STATE_MEMO=1`).
-    RenderState BeginRenderingMemoShadow(const GraphicsPipeline* pipeline);
 
     u32 const_ring_level = 0;
     std::unique_ptr<ConstantRing> constant_ring;
