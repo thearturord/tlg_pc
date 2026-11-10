@@ -31,6 +31,12 @@ void NoteLearn(bool inside) noexcept;
 /// Real mode: 0 a row served by its version, 1 a check also asked of the sets, 2 the sets said dirty where the version said clean (MUST_BE_0; not served), 3 a row not learned
 /// because it is not inside its buffer, 4 a row the version called changed.
 void NoteReal(u32 what) noexcept;
+/// Census of the identity walk per row check (`TLG_ROW_WALK_CENSUS=1`, counters only): on, then one walk's events stepped over, its time, its answer (0 none, 1 overlaps, 2 unknown).
+[[nodiscard]] bool WalkCensusOn() noexcept;
+void NoteWalk(u64 steps, u64 ns, u32 answer) noexcept;
+/// Census (with the walk census): a read the old path answered and that leaves no row behind, by what answered it: 0 the hook ring, 1 the stream ring inside the frame ring,
+/// 2 the stream ring outside the frame ring, 3 a buffer inside the frame ring, 4 a buffer outside it (learned or refused later), bytes summed per class.
+void NoteOldAnswer(u32 what, u64 bytes) noexcept;
 
 [[nodiscard]] nlohmann::json Report();
 

@@ -2084,6 +2084,11 @@ bool Rasterizer::RowsServe(u64 id, VAddr address, u64 size, bool texel, const Vi
         }
         return d;
     };
+    if (Core::RowVersion::WalkCensusOn() && r.epoch == buffer_cache.PlacementEpoch()) [[unlikely]] {
+        const u64 t0 = Core::N0::NowNs();
+        const auto answer = Core::NativeIdentity::ChangedSince(r.clock, address, address + size);
+        Core::RowVersion::NoteWalk(clock_now > r.clock ? clock_now - r.clock : 0, Core::N0::NowNs() - t0, static_cast<u32>(answer));
+    }
     if (r.epoch != buffer_cache.PlacementEpoch() || Core::NativeIdentity::ChangedSince(r.clock, address, address + size) != Core::NativeIdentity::Change::None) {
         s[135].fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -4273,6 +4278,10 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     obtained = obtain_old();
                 }
                 if (rows_on && !desc.is_written && !row_served) {
+                    if (Core::RowVersion::WalkCensusOn() && w31_id != 0) [[unlikely]] {
+                        const bool in_ring = Core::NativeContent::InRing(vsharp.address, size);
+                        Core::RowVersion::NoteOldAnswer(buffer_cache.IsHookRing(obtained.first) ? 0u : buffer_cache.IsStreamBuffer(obtained.first) ? (in_ring ? 1u : 2u) : in_ring ? 3u : 4u, size);
+                    }
                     if (!buffer_cache.IsHookRing(obtained.first)) { // a hook ring answer moves with the ring's laps: never learned
                         RowsLearn(w31_id, vsharp.address, size, desc.is_formatted, obtained.first, obtained.second, rows_epoch_pre, rows_clock_pre, rows_gpu_pre, rows_version_pre, rows_unattr_pre);
                     }

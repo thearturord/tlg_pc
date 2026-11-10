@@ -17,6 +17,8 @@ std::atomic<u64> checks[2][6]{};
 std::atomic<u64> learned[2]{};
 std::atomic<u64> bumps{0}, bumps_unattributed{0};
 std::atomic<u64> real[5]{};
+std::atomic<u64> walk[7]{};
+std::atomic<u64> old_answer[5][2]{}; // calls, steps, ns, max steps, none, overlaps, unknown
 
 inline u32 SlotOf(u64 id) noexcept {
     return static_cast<u32>((id * 0x9E3779B97F4A7C15ull) >> (64 - SlotBits));
@@ -85,6 +87,31 @@ void NoteReal(u32 what) noexcept {
     }
 }
 
+bool WalkCensusOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_ROW_WALK_CENSUS");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+void NoteWalk(u64 steps, u64 ns, u32 answer) noexcept {
+    walk[0].fetch_add(1, std::memory_order_relaxed);
+    walk[1].fetch_add(steps, std::memory_order_relaxed);
+    walk[2].fetch_add(ns, std::memory_order_relaxed);
+    u64 mx = walk[3].load(std::memory_order_relaxed);
+    while (steps > mx && !walk[3].compare_exchange_weak(mx, steps)) {
+    }
+    walk[4 + (answer < 3 ? answer : 2)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteOldAnswer(u32 what, u64 bytes) noexcept {
+    if (what < 5) {
+        old_answer[what][0].fetch_add(1, std::memory_order_relaxed);
+        old_answer[what][1].fetch_add(bytes, std::memory_order_relaxed);
+    }
+}
+
 void NoteLearn(bool inside) noexcept {
     learned[inside ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
 }
@@ -94,6 +121,14 @@ nlohmann::json Report() {
     j["mode"] = Mode();
     j["bumps"] = bumps.load();
     j["bumps_unattributed"] = bumps_unattributed.load();
+    j["identity_walk"] = {{"calls", walk[0].load()}, {"events_stepped", walk[1].load()}, {"ms", walk[2].load() / 1e6}, {"max_events_one_walk", walk[3].load()},
+                          {"none", walk[4].load()}, {"overlaps", walk[5].load()}, {"unknown", walk[6].load()}};
+    {
+        static constexpr const char* Names[5] = {"hook_ring", "stream_ring_in_frame_ring", "stream_ring_outside_frame_ring", "buffer_in_frame_ring", "buffer_outside_frame_ring"};
+        for (u32 k = 0; k < 5; ++k) {
+            j["old_path_answers_without_row"][Names[k]] = {{"reads", old_answer[k][0].load()}, {"bytes", old_answer[k][1].load()}};
+        }
+    }
     j["real"] = {{"served_by_version", real[0].load()}, {"also_asked_of_the_sets", real[1].load()}, {"SETS_DIRTY_VERSION_CLEAN_MUST_BE_0", real[2].load()},
                  {"not_learned_outside_its_buffer", real[3].load()}, {"version_changed", real[4].load()}};
     for (u32 i = 0; i < 2; ++i) {
