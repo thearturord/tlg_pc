@@ -613,7 +613,7 @@ private:
     bool BindTexturesFromSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count,
                              Shader::Backend::Bindings& binding);
     bool ResolveTextureSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count, TextureResolved& r);
-    /// F2 item 4 (`TLG_TEXSET_BY_ID`, default 0 off; 1 shadow, 2 real): a texture set whose generation moved is still right when none of its images changed by identity (the texture
+    /// F2 item 4 (`TLG_TEXSET_BY_ID`, default 2 since 2026-11-10; 0 off, 1 shadow): a texture set whose generation moved is still right when none of its images changed by identity (the texture
     /// cache's event ring: no image registered or unregistered over their memory since the set was recorded). Returns true when the set may be used (real mode, all unchanged).
     bool TextureSetGenerationMiss(const TextureSet& set);
     /// Shadow: after a set was recorded again, its new entries against the ones the by-id check called still right.
