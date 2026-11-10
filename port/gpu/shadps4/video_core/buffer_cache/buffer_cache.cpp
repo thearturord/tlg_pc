@@ -1061,13 +1061,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         // one lap half; one in 16 compares that block with game memory first and a window that differs takes the old path
         Core::HookRing::NoteWideRows(0);
         const auto& ring = UntrackedRing::Get();
-        u64 hook_offset = 0, prefix = 0;
+        u64 hook_offset = 0;
         if (!ring.Active() || device_addr < ring.Start() || device_addr + size > ring.End() || IsRegionGpuModified(device_addr, size) || IsRangeGpuWritten(device_addr, size)) {
             Core::HookRing::NoteWideRows(1);
-        } else if (Core::HookRing::ResolveWide(device_addr, size, hook_offset, prefix)) {
+        } else if (Core::HookRing::ResolveWideFast(device_addr, size, hook_offset)) {
             static thread_local u32 wide_sample = 0;
             bool bind = true;
-            if ((++wide_sample & 15) == 0) {
+            if ((++wide_sample & 255) == 0) { // (the block compare walks about 195 KB)
                 Core::HookRing::NoteWideRows(6);
                 if (Core::HookRing::ComparePrefix(device_addr, size) != 0) {
                     Core::HookRing::NoteWideRows(7);

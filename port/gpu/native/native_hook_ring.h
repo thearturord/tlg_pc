@@ -68,6 +68,8 @@ void CompareWide(u64 address, u64 size, bool probe);
 [[nodiscard]] u32 WideRowsMode() noexcept;
 /// The offset in the storage of the window [address, address + size) when its filled prefix (the block from its start) lies in one lap half; `prefix` its length.
 bool ResolveWide(u64 address, u64 size, u64& offset, u64& prefix);
+/// The same for the bind, in constant time: the window's first granule filled; its lap half gives the offset (the block's length is not walked).
+bool ResolveWideFast(u64 address, u64 size, u64& offset);
 /// The bytes of the window's filled prefix that differ from game memory now.
 u64 ComparePrefix(u64 address, u64 size);
 /// Counters of the stage: 0 asked, 1 outside the ring or GPU written, 2 no prefix, 3 prefix in two halves, 4 resolved, 5 bound, 6 compared, 7 PREFIX_DIFFERS (MUST_BE_0; not bound),

@@ -388,6 +388,25 @@ bool ResolveWide(u64 address, u64 size, u64& offset, u64& prefix) {
     return true;
 }
 
+bool ResolveWideFast(u64 address, u64 size, u64& offset) {
+    if (g_bytes.load(std::memory_order_acquire) == nullptr || size == 0) {
+        return false;
+    }
+    u64 lo, hi;
+    if (!Clip(address, size, lo, hi) || lo != address || hi != address + size) {
+        return false;
+    }
+    const u64 base = g_base.load(std::memory_order_relaxed);
+    const u64 first = (lo - base) >> GranuleShift;
+    if (g_filled.load(std::memory_order_acquire)[first].load(std::memory_order_acquire) == 0) {
+        NoteWideRows(2);
+        return false;
+    }
+    offset = CopyOffset(lo - base, g_half.load(std::memory_order_acquire)[first].load(std::memory_order_relaxed));
+    NoteWideRows(4);
+    return true;
+}
+
 u64 ComparePrefix(u64 address, u64 size) {
     u8* bytes = g_bytes.load(std::memory_order_acquire);
     u64 lo, hi;
