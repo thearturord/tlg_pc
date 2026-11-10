@@ -200,7 +200,7 @@ void BufferCache::IdMarkLean(VAddr address, u64 size, bool newer, u64 id) {
             OM::NoteDrop(OM::DropCoveredNoFlag);
         }
     }
-    if (!drop_real) {
+    {
         const bool force_before = Core::N0::t_force_effect;
         const u32 effect_before = Core::N0::t_effect;
         if (would_drop) [[unlikely]] {
@@ -266,9 +266,11 @@ void BufferCache::IdMarkLean(VAddr address, u64 size, bool newer, u64 id) {
     }
     step(2);
     if (drop_real) {
-        return; // design review 81: the buffer's bytes are still marked dirty; the next reader uploads them with this write in them
-    }
-    {
+        // design review 81: the buffer's dirty set already holds the whole range (flag and set agree), so the three set operations below change nothing; only the
+        // page clock stamp of the Add is kept. The bind memo erase, the image step, the row version, the epochs and the resident generation still run: readers of
+        // ranges that span this buffer (the bind memo, the page clock rows, the resident fast path) see those (default check `dddef`: the memo erase did remove entries).
+        VideoCore::PageClockStamp(address, size);
+    } else {
         std::scoped_lock lock{object_dirty_mutex};
         if (Core::NativeUpdates::LeanDirtyMode() != 2) {
             all_object_dirty.Add(address, size);

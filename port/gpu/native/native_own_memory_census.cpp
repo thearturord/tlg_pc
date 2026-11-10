@@ -187,8 +187,11 @@ void NoteFault(u64 address, u64 size) {
 
 u32 DropDirtyMode() noexcept {
     static const u32 mode = [] {
-        const char* e = std::getenv("TLG_DROP_DIRTY_APPLIES");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // 0 off (default), 1 shadow, 2 real (1 in 64 audited)
+        const char* e = std::getenv("TLG_DROP_DIRTY_APPLIES"); // default 2 (real, 1 in 64 audited) since 2026-11-10 after the owner's play; =0 off, =1 shadow
+        if (e == nullptr || e[0] == 0) {
+            return 2u;
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
@@ -207,7 +210,7 @@ nlohmann::json Report() {
     nlohmann::json j = nlohmann::json::object();
     {
         static constexpr const char* D[DropCount] = {"asked", "no_registered_buffer", "set_held_the_range", "flag_set_would_drop", "FLAG_SET_BUT_NOT_DIRTY_MUST_BE_0",
-                                                     "set_held_but_flag_clear", "DROP_WITH_LIVE_COPY_MUST_BE_0", "DROP_ERASED_A_MEMO_MUST_BE_0", "uploads_cleared_the_flag", "dropped_real", "audited_real"};
+                                                     "set_held_but_flag_clear", "DROP_WITH_LIVE_COPY_MUST_BE_0", "memo_erase_removed_entries_kept", "uploads_cleared_the_flag", "dropped_real", "audited_real"};
         j["drop_dirty"]["mode"] = DropDirtyMode();
         for (u32 k = 0; k < DropCount; ++k) {
             j["drop_dirty"][D[k]] = drops[k].load();
