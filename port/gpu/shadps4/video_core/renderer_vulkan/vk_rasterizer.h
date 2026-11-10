@@ -373,7 +373,8 @@ private:
     /// W3.0 dispatch census (`TLG_COVER_CENSUS=1`): per compute program the sums in `W3Stat::v` (published as `consumer_census.w3_dispatch`)
     [[nodiscard]] std::vector<std::pair<u64, std::array<u64, 48>>> W3Rows() const;
     [[nodiscard]] bool RowsServe(u64 id, VAddr address, u64 size, bool texel, const VideoCore::Buffer*& buffer, u64& offset) noexcept;
-    void RowsLearn(u64 id, VAddr address, u64 size, bool texel, const VideoCore::Buffer* buffer, u64 offset, u64 epoch_pre, u64 clock_pre, bool gpu_pre) noexcept;
+    void RowsLearn(u64 id, VAddr address, u64 size, bool texel, const VideoCore::Buffer* buffer, u64 offset, u64 epoch_pre, u64 clock_pre, bool gpu_pre, u64 version_pre = 0,
+                   u64 unattr_pre = 0) noexcept;
     void W31Before(u64 id, VAddr address, u64 size) noexcept;
     void W31After(const void* buffer, u64 offset, VAddr address, bool compute, bool written) noexcept;
     void W1NoteBinding(const Pipeline* pipeline) noexcept;

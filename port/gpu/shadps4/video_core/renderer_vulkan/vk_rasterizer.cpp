@@ -16,6 +16,7 @@
 #include "native/native_image_caller.h"
 #include "native/native_content.h"
 #include "native/native_n0_census.h"
+#include "native/native_row_version.h"
 #include "native/native_prof.h"
 #include "native/native_marker.h"
 #include "native/native_ui_trace.h"
@@ -130,6 +131,8 @@ struct RealRow {
     const void* buffer{};
     u64 offset{}, epoch{}, clock{};
     bool gpu{}; ///< the range was GPU written when the answer was made (the old path chooses the stream ring for small ranges that are not)
+    u64 version{}, unattr{}; ///< F2 row version: the versions the answer was made under
+    bool inside{};           ///< the range lies inside the buffer's own bytes (the unattributed version is not asked)
 };
 thread_local std::unordered_map<u64, RealRow> t_rows_real;
 thread_local bool t_row_gpu = false, t_row_dirty_epoch = false; // (diagnostics of the last served row)
@@ -2081,8 +2084,46 @@ bool Rasterizer::RowsServe(u64 id, VAddr address, u64 size, bool texel, const Vi
         }
         return d;
     };
-    if (r.epoch != buffer_cache.PlacementEpoch() || Core::NativeIdentity::ChangedSince(r.clock, address, address + size) != Core::NativeIdentity::Change::None ||
-        sets_dirty()) { // (the GPU-written state of the range is covered by the identity events: every change of the set logs one)
+    if (r.epoch != buffer_cache.PlacementEpoch() || Core::NativeIdentity::ChangedSince(r.clock, address, address + size) != Core::NativeIdentity::Change::None) {
+        s[135].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    // (the GPU-written state of the range is covered by the identity events: every change of the set logs one)
+    if (Core::RowVersion::Mode() == 2) {
+        // F2 row version, real: one integer compare decides (rows exist only inside their buffer); one check in 64 also asks the sets, which win
+        bool clean = r.inside && r.version == Core::RowVersion::Of(id);
+        if (!clean) {
+            Core::RowVersion::NoteReal(4);
+        } else {
+            static thread_local u32 sample = 0;
+            if ((++sample & 63) == 0) {
+                Core::RowVersion::NoteReal(1);
+                if (sets_dirty()) {
+                    Core::RowVersion::NoteReal(2);
+                    static std::atomic<u32> logged{0};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+                        LOG_ERROR(Render_Vulkan, "F2 row version real: id {:#x} {:#x}+{:#x}: the sets say dirty, the version said clean (not served)", id, address, size);
+                    }
+                    clean = false;
+                }
+            }
+        }
+        if (!clean) {
+            s[135].fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        Core::RowVersion::NoteReal(0);
+    } else if (Core::RowVersion::Mode() == 1) [[unlikely]] {
+        // F2 row version, shadow: the sets decide; the versions' answer is compared with theirs
+        const bool version_clean = r.version == Core::RowVersion::Of(id) && (r.inside || r.unattr == Core::RowVersion::Unattributed());
+        const u64 t0 = Core::N0::NowNs();
+        const bool d = sets_dirty();
+        Core::RowVersion::NoteCheck(version_clean, d, r.inside, Core::N0::NowNs() - t0, id, address, size);
+        if (d) {
+            s[135].fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    } else if (sets_dirty()) {
         s[135].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -2093,7 +2134,8 @@ bool Rasterizer::RowsServe(u64 id, VAddr address, u64 size, bool texel, const Vi
     return true;
 }
 
-void Rasterizer::RowsLearn(u64 id, VAddr address, u64 size, bool texel, const VideoCore::Buffer* buffer, u64 offset, u64 epoch_pre, u64 clock_pre, bool gpu_pre) noexcept {
+void Rasterizer::RowsLearn(u64 id, VAddr address, u64 size, bool texel, const VideoCore::Buffer* buffer, u64 offset, u64 epoch_pre, u64 clock_pre, bool gpu_pre, u64 version_pre,
+                           u64 unattr_pre) noexcept {
     if (id == 0 || buffer == nullptr || buffer_cache.IsStreamBuffer(buffer)) {
         return;
     }
@@ -2124,7 +2166,17 @@ void Rasterizer::RowsLearn(u64 id, VAddr address, u64 size, bool texel, const Vi
     if (t_rows_real.size() > 400000) {
         t_rows_real.clear();
     }
-    t_rows_real[RowKey(id, address, size, texel)] = RealRow{id, address, size, texel, buffer, offset, epoch_pre, clock_pre, gpu};
+    bool inside = false;
+    if (Core::RowVersion::Mode() != 0) [[unlikely]] {
+        Core::NativeDevice::BufferPart part{};
+        inside = Core::NativeDevice::BufferPartOf(id, address, size, part) && part.begin == address && part.end == address + size;
+        Core::RowVersion::NoteLearn(inside);
+        if (!inside && Core::RowVersion::Mode() == 2) {
+            Core::RowVersion::NoteReal(3); // (the shadow found every such row called dirty by the sets: none was ever served)
+            return;
+        }
+    }
+    t_rows_real[RowKey(id, address, size, texel)] = RealRow{id, address, size, texel, buffer, offset, epoch_pre, clock_pre, gpu, version_pre, unattr_pre, inside};
     w1s_counts[132].fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -4143,11 +4195,15 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 u64 row_offset = 0;
                 const bool row_served = rows_on && !desc.is_written && RowsServe(w31_id, vsharp.address, size, desc.is_formatted, row_buffer, row_offset);
                 // (what a learn needs, taken before the old path answers; only asked of the requests the old path answers)
-                u64 rows_epoch_pre = 0, rows_clock_pre = 0;
+                u64 rows_epoch_pre = 0, rows_clock_pre = 0, rows_version_pre = 0, rows_unattr_pre = 0;
                 bool rows_gpu_pre = false;
                 if (rows_on && !desc.is_written && (!row_served || false)) {
                     rows_epoch_pre = buffer_cache.PlacementEpoch();
                     rows_clock_pre = Core::NativeIdentity::Clock();
+                    if (Core::RowVersion::Mode() != 0) [[unlikely]] {
+                        rows_version_pre = Core::RowVersion::Of(w31_id);
+                        rows_unattr_pre = Core::RowVersion::Unattributed();
+                    }
                     rows_gpu_pre = buffer_cache.IsRangeGpuWritten(vsharp.address, size);
                 }
                 // D4 sizing (2026-11-07): the same call, timed by what kind of binding it serves
@@ -4218,7 +4274,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 }
                 if (rows_on && !desc.is_written && !row_served) {
                     if (!buffer_cache.IsHookRing(obtained.first)) { // a hook ring answer moves with the ring's laps: never learned
-                        RowsLearn(w31_id, vsharp.address, size, desc.is_formatted, obtained.first, obtained.second, rows_epoch_pre, rows_clock_pre, rows_gpu_pre);
+                        RowsLearn(w31_id, vsharp.address, size, desc.is_formatted, obtained.first, obtained.second, rows_epoch_pre, rows_clock_pre, rows_gpu_pre, rows_version_pre, rows_unattr_pre);
                     }
                 }
                 if (cover_on) [[unlikely]] {

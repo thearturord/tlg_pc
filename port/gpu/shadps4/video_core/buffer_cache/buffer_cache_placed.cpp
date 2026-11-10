@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "native/native_row_version.h"
 #include "video_core/half_phase.h"
 #include <chrono>
 #include <unordered_set>
@@ -111,6 +112,7 @@ void BufferCache::NoteEngineBufferDelete(u64 id, VAddr address, u64 bytes, bool 
                 Core::NativeUpdates::NoteB9(Core::NativeUpdates::B9DeletedPending);
                 if (Core::NativeUpdates::LeanDirtyMode() != 0) {
                     // D2: the bytes a deleted buffer was announced but never uploaded stay announced for whatever owns the memory next (the by-address set kept them)
+                    Core::RowVersion::BumpUnattributed(); // F2 row version (shadow)
                     it->second.ForEach([&](u64 a, u64 e) {
                         b9_unattributed.Add(a, e - a);
                         Core::NativeUpdates::NoteB9(Core::NativeUpdates::LeanMoved, e - a);
@@ -533,6 +535,7 @@ void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, boo
                     // the block holds older bytes there (a deleted member's, a gap's): the new buffer's first upload takes all of its memory, as a placement would
                     std::scoped_lock lock{object_dirty_mutex};
                     object_dirty[id].Add(address, bytes);
+                    Core::RowVersion::Bump(id); // F2 row version (shadow)
                     if (Core::NativeUpdates::LeanDirtyMode() != 2) {
                         all_object_dirty.Add(address, bytes);
                     }

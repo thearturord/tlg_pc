@@ -21,6 +21,7 @@
 #include "native/native_device.h"
 #include "native/native_draw.h"
 #include "native/native_n0_census.h"
+#include "native/native_row_version.h"
 #include "native/native_readbacks.h"
 #include "native/native_registry.h"
 #include "native/native_updates.h"
@@ -357,6 +358,7 @@ void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, st
     }
     for (const auto& part : parts) {
         object_dirty[part.id].Add(part.begin, part.end - part.begin);
+        Core::RowVersion::Bump(part.id); // F2 row version (shadow)
     }
     dirty_scope.End();
     TLG_PROF_NAMED_LEVEL(gaps_scope, "cpuwrite.mark.unattributed", 3);
@@ -381,6 +383,9 @@ void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, st
     }
     for (const auto& [a, e] : own_gaps) {
         b9_unattributed.Add(a, e - a);
+    }
+    if (!own_gaps.empty()) {
+        Core::RowVersion::BumpUnattributed(); // F2 row version (shadow)
     }
     if (!own_gaps.empty()) {
         Core::N0::SetEffect(Core::N0::EffUnattributed); // F1 1c census
