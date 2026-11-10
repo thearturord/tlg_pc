@@ -363,6 +363,9 @@ private:
     std::array<std::array<std::atomic<u64>, 8>, 2> row_ahead_census{};
     /// Rows ahead shadow (TLG_ROWS_AHEAD=1), [graphics, compute]: see the report names in vk_rasterizer_host.cpp
     std::array<std::array<std::atomic<u64>, 12>, 2> rows_ahead_shadow{};
+    /// Rows ahead real (TLG_ROWS_AHEAD=2), [graphics, compute]: 0 bound from the planned row, 1 sampled (full path), 2 SAMPLED_DIFFERENT_MUST_BE_0, 3 sampled same,
+    /// 4 refused by the identity walk, 5 planned row stale (epoch or version), 6 static row (full path), 7 no planned row
+    std::array<std::array<std::atomic<u64>, 8>, 2> rows_ahead_real{};
     /// R1'': handle bindings the front left without an entry (cause 0), by why ResolveAhead skips them: [side * 16 + (1 written, 2 formatted, 4 program-base offset, 8 not a single load)]
     std::array<std::atomic<u64>, 32> cover_skip_n{}, cover_skip_ns{}, cover_skip_sync{};
     /// R1''': formatted (texel) engine-handle bindings: [side * 4 + (0 checked, 1 an image overlaps the range, 2 the range is image metadata, 3 GPU wrote the range)]

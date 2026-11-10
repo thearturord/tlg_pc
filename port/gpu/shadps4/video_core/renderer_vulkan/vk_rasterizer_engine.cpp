@@ -604,6 +604,7 @@ void Rasterizer::ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) 
                         r.plan_epoch = row.epoch;
                         r.plan_version = row.version;
                         r.plan_flags = row.flags;
+                        r.plan_clock = row.clock;
                     }
                 }
             }

@@ -154,7 +154,7 @@ inline void ShareRow(u64 key, const RealRow& row) noexcept {
         Vulkan::RowShare::Publish(key, Vulkan::RowShare::Row{row.id, row.address, row.size,
                                                             (row.texel ? Vulkan::RowShare::FlagTexel : 0u) | (row.written ? Vulkan::RowShare::FlagWritten : 0u) |
                                                                 (row.inside ? Vulkan::RowShare::FlagInside : 0u) | (row.is_static ? Vulkan::RowShare::FlagStatic : 0u),
-                                                            row.buffer, row.offset, row.epoch, row.version});
+                                                            row.buffer, row.offset, row.epoch, row.version, row.clock});
     }
 }
 
@@ -1964,6 +1964,7 @@ void Rasterizer::BindCensus(const Pipeline* pipeline) {
 }
 
 namespace {
+thread_local const ResolvedBuffer* t_ahead_sample = nullptr; // rows ahead real: the planned row of the binding sampled through the full path
 thread_local u64 t_bseg[6] = {}; // TLG_COVER_CENSUS: stamps of the handle path of one binding (1 after the descriptor, 2 before the row, 3 after the row, 4 after the answer, 5 before the binding is written)
 thread_local bool t_bseg_served = false;
 inline u64 BsegNow() noexcept {
@@ -4049,6 +4050,70 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
             }
         } else {
+            if (Vulkan::RowShare::Mode() == 2) {
+                // rows ahead real (design review 56): the row the front planned for this binding, still valid now, is bound without the descriptor decode, the bind context and the lookup
+                t_ahead_sample = nullptr;
+                auto& rc = rows_ahead_real[census_base != 0 ? 1 : 0];
+                const StagePlan* ap = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
+                                      : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
+                                                                                                                  : nullptr;
+                const ResolvedBuffer* a = ap != nullptr && buffer_index < ap->resolved.size() && ap->resolved[buffer_index].plan_found ? &ap->resolved[buffer_index] : nullptr;
+                static const bool rows_env_on = [] { const char* e = std::getenv("TLG_NATIVE_ROWS"); return e == nullptr || e[0] != '0'; }();
+                if (a == nullptr || !rows_env_on || (desc.is_written && !Core::RowVersion::WrittenRowsOn())) {
+                    rc[7].fetch_add(1, std::memory_order_relaxed);
+                } else if ((a->plan_flags & Vulkan::RowShare::FlagStatic) != 0) {
+                    rc[6].fetch_add(1, std::memory_order_relaxed);
+                } else if ((a->plan_flags & Vulkan::RowShare::FlagInside) == 0 || a->plan_epoch != buffer_cache.PlacementEpoch() || a->plan_version != Core::RowVersion::Of(a->ahead_id)) {
+                    rc[5].fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    static thread_local u32 ahead_tick = 0;
+                    if ((++ahead_tick & 63u) == 0) {
+                        rc[1].fetch_add(1, std::memory_order_relaxed);
+                        t_ahead_sample = a; // the full path answers; compared below
+                    } else {
+                        const u64 clock_now = Core::NativeIdentity::Clock();
+                        if (Core::NativeIdentity::ChangedSince(a->plan_clock, a->ahead_address, a->ahead_address + a->ahead_size) != Core::NativeIdentity::Change::None) {
+                            rc[4].fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            rc[0].fetch_add(1, std::memory_order_relaxed);
+                            const VAddr address = a->ahead_address;
+                            const u64 size = a->ahead_size;
+                            const auto* buffer = static_cast<const VideoCore::Buffer*>(a->plan_buffer);
+                            const u64 offset = a->plan_offset;
+                            Vulkan::RowShare::TouchClock(Vulkan::RowShare::Key(a->ahead_id, address, size, desc.is_formatted, desc.is_written), clock_now);
+                            Census(census_base + CBufferHandle);
+                            w1s_counts[128].fetch_add(1, std::memory_order_relaxed);
+                            Core::NativeRegistry::SetBufferWriter(stage.pgm_hash, static_cast<u32>(stage.sw_stage));
+                            VideoCore::BufferCache::UploadBytesReset();
+                            const_cast<VideoCore::Buffer*>(buffer)->NoteResolveUse();
+                            if (desc.is_written) {
+                                // F2 item 3: what the old path's written answer does besides answering (as the row-served path above)
+                                buffer_cache.BindMemoErase(address, size);
+                                Core::NativeResources::NoteGpuWritten(address, size);
+                                Core::RowVersion::NoteWritten(0);
+                            }
+                            recipe_ranges.emplace_back(address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
+                            if (desc.is_written || size > 262144) {
+                                recipe_reusable = false;
+                            }
+                            const u64 offset_aligned = Common::AlignDown(offset, alignment);
+                            const u64 adjust = offset - offset_aligned;
+                            push_data.AddOffset(binding.buffer, adjust);
+                            buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
+                            bound_buffers.emplace_back(buffer, offset, size, src_access);
+                            if (desc.is_written) {
+                                texture_cache.InvalidateMemoryFromGPU(address, size, "a written storage buffer view");
+                            }
+                            Census(census_base + CBufferBarrierQuery);
+                            if (runtime.IsBufferAccessed(buffer, offset, size, desc.is_written)) {
+                                Census(census_base + CBufferBarrierTrue);
+                                needs_barrier = true;
+                            }
+                            goto buffer_bound;
+                        }
+                    }
+                }
+            }
             bool cp_no_object = false;
             if (const StagePlan* ns = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
                                       : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
@@ -4458,6 +4523,23 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     }
                     if (!buffer_cache.IsHookRing(obtained.first)) { // a hook ring answer moves with the ring's laps: never learned
                         RowsLearn(w31_id, vsharp.address, size, desc.is_formatted, obtained.first, obtained.second, rows_epoch_pre, rows_clock_pre, rows_gpu_pre, rows_version_pre, rows_unattr_pre);
+                    }
+                }
+                if (t_ahead_sample != nullptr) [[unlikely]] {
+                    // rows ahead real: the sampled binding's full answer against the planned row
+                    const ResolvedBuffer* a = t_ahead_sample;
+                    t_ahead_sample = nullptr;
+                    auto& rc = rows_ahead_real[stage.sw_stage == Shader::SwStage::Compute ? 1 : 0];
+                    const bool same = a->ahead_id == w31_id && a->ahead_address == vsharp.address && a->ahead_size == size && obtained.first == a->plan_buffer &&
+                                      obtained.second == a->plan_offset;
+                    rc[same ? 3 : 2].fetch_add(1, std::memory_order_relaxed);
+                    if (!same) {
+                        static std::atomic<u32> logged{0};
+                        if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+                            LOG_ERROR(Render_Vulkan, "rows ahead real: sampled binding id {:#x} {:#x}+{:#x}: planned row {:p}+{:#x} (id {:#x} {:#x}+{:#x}), full path {:p}+{:#x} (row served {})", w31_id,
+                                      vsharp.address, size, a->plan_buffer, a->plan_offset, a->ahead_id, a->ahead_address, a->ahead_size, static_cast<const void*>(obtained.first),
+                                      obtained.second, row_served);
+                        }
                     }
                 }
                 if (Vulkan::RowShare::Mode() != 0 && w31_id != 0) [[unlikely]] {

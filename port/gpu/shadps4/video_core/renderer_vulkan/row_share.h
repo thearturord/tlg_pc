@@ -31,6 +31,7 @@ struct Row {
     u64 id{}, address{}, size{}, flags{};
     const void* buffer{};
     u64 offset{}, epoch{}, version{};
+    u64 clock{}; ///< the identity clock the row was last found valid at (the raster thread moves it at each use)
 };
 
 namespace detail {
@@ -39,6 +40,7 @@ struct Slot {
     std::atomic<u64> seq{0};
     std::atomic<u64> key{0};
     std::array<std::atomic<u64>, 8> f{};
+    std::atomic<u64> clock{0};
 };
 inline Slot* Table() noexcept {
     static const std::unique_ptr<Slot[]> table{new Slot[std::size_t{1} << Bits]};
@@ -60,7 +62,16 @@ inline void Publish(u64 key, const Row& r) noexcept {
     for (u32 i = 0; i < 8; ++i) {
         s.f[i].store(v[i], std::memory_order_relaxed);
     }
+    s.clock.store(r.clock, std::memory_order_relaxed);
     s.seq.store(q + 2, std::memory_order_release);
+}
+
+/// Raster thread: the row of `key` was found valid again at `clock` (a later check walks the identity events from there).
+inline void TouchClock(u64 key, u64 clock) noexcept {
+    auto& s = detail::SlotOf(key);
+    if (s.key.load(std::memory_order_relaxed) == key) {
+        s.clock.store(clock, std::memory_order_relaxed);
+    }
 }
 
 /// Raster thread: the row of `key` is gone.
@@ -87,19 +98,20 @@ inline void Erase(u64 key) noexcept {
     for (u32 i = 0; i < 8; ++i) {
         v[i] = s.f[i].load(std::memory_order_relaxed);
     }
+    const u64 clock = s.clock.load(std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_acquire);
     if (s.seq.load(std::memory_order_relaxed) != q1) {
         return false;
     }
-    out = Row{v[0], v[1], v[2], v[3], reinterpret_cast<const void*>(v[4]), v[5], v[6], v[7]};
+    out = Row{v[0], v[1], v[2], v[3], reinterpret_cast<const void*>(v[4]), v[5], v[6], v[7], clock};
     return true;
 }
 
-/// 0 off (default), 1 shadow.
+/// 0 off (default), 1 shadow, 2 real (a planned row valid at the bind is bound without the stage loop's lookup; one in 64 takes the full path and is compared).
 [[nodiscard]] inline u32 Mode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_ROWS_AHEAD");
-        return e != nullptr && e[0] == '1' ? 1u : 0u;
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
