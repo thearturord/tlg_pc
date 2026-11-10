@@ -133,6 +133,8 @@ struct RealRow {
     bool gpu{}; ///< the range was GPU written when the answer was made (the old path chooses the stream ring for small ranges that are not)
     u64 version{}, unattr{}; ///< F2 row version: the versions the answer was made under
     bool inside{};           ///< the range lies inside the buffer's own bytes (the unattributed version is not asked)
+    bool is_static{};        ///< F1 class 2 static row: learned from the one upload of ObtainStatic
+    u64 hash{};              ///< ... the guest bytes' hash at that upload
 };
 thread_local std::unordered_map<u64, RealRow> t_rows_real;
 struct StaticSeen {
@@ -140,6 +142,8 @@ struct StaticSeen {
 };
 thread_local std::unordered_map<u64, StaticSeen> t_static_seen; // static-row census: the previous stream copy of a request
 thread_local bool t_row_gpu = false, t_row_dirty_epoch = false; // (diagnostics of the last served row)
+thread_local bool t_row_static = false; // the last served row is a static row
+thread_local u64 t_row_hash = 0;
 inline u64 RowKey(u64 id, u64 address, u64 size, bool texel) noexcept {
     u64 h = 0xcbf29ce484222325ull;
     for (const u64 v : {id, address, size, static_cast<u64>(texel)}) {
@@ -2140,6 +2144,8 @@ bool Rasterizer::RowsServe(u64 id, VAddr address, u64 size, bool texel, const Vi
     buffer = static_cast<const VideoCore::Buffer*>(r.buffer);
     offset = r.offset;
     t_row_gpu = r.gpu;
+    t_row_static = r.is_static;
+    t_row_hash = r.hash;
     return true;
 }
 
@@ -4241,7 +4247,32 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     }
                 };
                 std::pair<const VideoCore::Buffer*, u64> obtained;
-                if (row_served) {
+                if (row_served && t_row_static) {
+                    // F1 class 2 static row: one read in 64 hashes the guest bytes against the learn's hash; a change nothing announced is not served
+                    Core::RowVersion::NoteStaticReal(1);
+                    static thread_local u32 static_tick = 0;
+                    bool keep = true;
+                    if ((++static_tick & 63u) == 0) {
+                        Core::RowVersion::NoteStaticReal(2);
+                        u64 now_hash = 0;
+                        if (!Core::NativeContent::HashGuarded64(vsharp.address, size, now_hash) || now_hash != t_row_hash) {
+                            Core::RowVersion::NoteStaticReal(3);
+                            static std::atomic<u32> logged{0};
+                            if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+                                LOG_ERROR(Render_Vulkan, "static row: id {:#x} {:#x}+{:#x}: guest bytes changed since the learn, the version did not move (not served)", w31_id, vsharp.address, size);
+                            }
+                            t_rows_real.erase(RowKey(w31_id, vsharp.address, size, desc.is_formatted));
+                            keep = false;
+                        }
+                    }
+                    if (keep) {
+                        VideoCore::BufferCache::UploadBytesReset();
+                        const_cast<VideoCore::Buffer*>(row_buffer)->NoteResolveUse();
+                        obtained = {row_buffer, row_offset};
+                    } else {
+                        obtained = obtain_old();
+                    }
+                } else if (row_served) {
                     w1s_counts[128].fetch_add(1, std::memory_order_relaxed);
                     static std::atomic<u64> verify_tick{0};
                     if ((verify_tick.fetch_add(1, std::memory_order_relaxed) & 63u) == 0) {
@@ -4280,6 +4311,32 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     }
                 } else {
                     obtained = obtain_old();
+                }
+                if (rows_on && !desc.is_written && !row_served && Core::RowVersion::StaticRowsOn() && w31_id != 0 && buffer_cache.IsStreamBuffer(obtained.first) &&
+                    !Core::NativeContent::InRing(vsharp.address, size) && !buffer_cache.IsRangeGpuWritten(vsharp.address, size) &&
+                    !(desc.is_formatted && (texture_cache.AnyImageOverlaps(vsharp.address, size) || texture_cache.IsMeta(vsharp.address)))) {
+                    // F1 class 2 static rows: the stream ring answered this time (the bytes are right); the buffer's own memory gets them once and the row is learned from it
+                    Core::NativeDevice::BufferPart part{};
+                    u64 learn_hash = 0;
+                    if (Core::NativeDevice::BufferPartOf(w31_id, vsharp.address, size, part) && part.begin == vsharp.address && part.end == vsharp.address + size &&
+                        Core::NativeContent::HashGuarded64(vsharp.address, size, learn_hash)) {
+                        u64 uploaded = 0;
+                        const auto [static_buffer, static_offset] = buffer_cache.ObtainStatic(w31_id, vsharp.address, size, uploaded);
+                        Core::RowVersion::NoteStaticReal(4, uploaded);
+                        if (static_buffer != nullptr && !buffer_cache.IsStreamBuffer(static_buffer) && !buffer_cache.IsHookRing(static_buffer)) {
+                            if (t_rows_real.size() > 400000) {
+                                t_rows_real.clear();
+                            }
+                            t_rows_real[RowKey(w31_id, vsharp.address, size, desc.is_formatted)] =
+                                RealRow{w31_id, vsharp.address, size, desc.is_formatted, static_buffer, static_offset, rows_epoch_pre, rows_clock_pre, false, rows_version_pre, rows_unattr_pre,
+                                        true, true, learn_hash};
+                            Core::RowVersion::NoteStaticReal(0);
+                        } else {
+                            Core::RowVersion::NoteStaticReal(5);
+                        }
+                    } else {
+                        Core::RowVersion::NoteStaticReal(5);
+                    }
                 }
                 if (rows_on && !desc.is_written && !row_served) {
                     if (Core::RowVersion::StaticCensusOn() && w31_id != 0 && buffer_cache.IsStreamBuffer(obtained.first) &&

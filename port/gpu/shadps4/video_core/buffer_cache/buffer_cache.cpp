@@ -1680,6 +1680,20 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForDownload(VAddr device_
     return {arena, arena->Offset(device_addr)};
 }
 
+std::pair<const Buffer*, u64> BufferCache::ObtainStatic(u64 id, VAddr device_addr, u32 size, u64& uploaded) {
+    {
+        std::scoped_lock lock{object_dirty_mutex};
+        object_dirty[id].Add(device_addr, size); // (the whole range is taken from guest memory now: the device copy equals it after this call)
+    }
+    const auto* arena = BufferFor(device_addr, size, true, false);
+    last_upload_bytes = 0;
+    Core::N0::SetSyncSite(Core::N0::SyncArenaRead);
+    SynchronizeMemory(arena, device_addr, size, false, false);
+    uploaded = last_upload_bytes;
+    BindMemoErase(device_addr, size);
+    return {arena, arena->Offset(device_addr)};
+}
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseBufResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::BufObtain);

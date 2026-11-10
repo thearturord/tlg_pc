@@ -176,6 +176,9 @@ public:
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
+    /// F1 class 2 static rows: [device_addr, +size) of engine buffer `id` is uploaded from guest memory whole into the buffer's device memory (its placed buffer or the arena), so a row can
+    /// name it; the bytes uploaded are returned in `uploaded`. The version of the buffer is not bumped (its content did not change).
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainStatic(u64 id, VAddr device_addr, u32 size, u64& uploaded);
 
     /// Return true when a region is modified from the CPU
     [[nodiscard]] bool IsRegionCpuModified(VAddr addr, size_t size);
