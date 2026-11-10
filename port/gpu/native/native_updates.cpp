@@ -36,6 +36,7 @@
 #include "native/native_ring_census.h"
 #include "native/native_hook_ring.h"
 #include "native/native_hook_owned.h"
+#include "native/native_view_table.h"
 
 namespace Core::NativeUpdates {
 
@@ -830,6 +831,9 @@ void ApplyBatch(const Batch& batch) {
             const u32 what = static_cast<u32>(d[3] & 0xff);
             if (HookOwned::Mode() != 0) {
                 HookOwned::Event(what, d[0], d[1], d[2]); // note 90: a texture created over a member, or a member deleted, removes it (batch order)
+            }
+            if (ViewTable::Mode() != 0) {
+                ViewTable::Event(what, d[0]); // note 95: a deleted view or texture drops its view table entries (batch order)
             }
             if (what == 2 || what == 5) {
                 if (create_fn != nullptr) {

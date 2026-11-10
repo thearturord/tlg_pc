@@ -21,6 +21,7 @@
 #include "native/native_dispatch_split.h"
 #include "native/native_own_memory_census.h"
 #include "native/native_legacy.h"
+#include "native/native_view_table.h"
 #include "native/native_prof.h"
 #include "native/native_marker.h"
 #include "native/native_ui_trace.h"
@@ -6126,6 +6127,7 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
         }
     }
     const u32 first_image_idx = image_infos.size();
+    const size_t view_table_bound_before = bound_images.size(); // note 95 shadow
     const u32 census_base = stage.sw_stage == Shader::SwStage::Compute ? 32u : 0u;
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
@@ -6182,6 +6184,9 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
                 TLG_PROF_COUNT("texture.set_hit");
                 Census(census_base + CImageTotal, stage_images);
                 Census(census_base + CImageSetHit, stage_images);
+                if (Core::ViewTable::Mode() != 0) [[unlikely]] {
+                    ViewTableShadow(stage, first_image_idx, view_table_bound_before);
+                }
                 BindSamplers(stage, binding);
                 return;
             }
@@ -6605,7 +6610,127 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
         ++texture_set_stats.recorded;
         TextureSetShadowCompare(*set_slot);
     }
+    if (Core::ViewTable::Mode() != 0) [[unlikely]] {
+        ViewTableShadow(stage, first_image_idx, view_table_bound_before);
+    }
     BindSamplers(stage, binding);
+}
+
+void Rasterizer::ViewTableShadow(const Shader::Info& stage, u32 first_info, size_t bound_before) {
+    using namespace Core::ViewTable;
+    const u32 n = static_cast<u32>(stage.images.size());
+    if (n == 0) {
+        return;
+    }
+    Note(StagesWithImages);
+    if (image_infos.size() - first_info != n) {
+        Note(NotClassUse, n); // (an image with several bindings: the infos do not line up one per image; the stage stays on the old path)
+        return;
+    }
+    bool all_in = true, all_served = true, any_diff = false;
+    size_t bound_at = bound_before;
+    for (u32 i = 0; i < n; ++i) {
+        const auto& res = stage.images[i];
+        const vk::ImageView view = image_infos[first_info + i].imageView;
+        VideoCore::ImageId bound{};
+        if (view && bound_at < bound_images.size()) {
+            bound = bound_images[bound_at++];
+        }
+        if (res.is_written || res.mip_fallback_mode != Shader::MipStorageFallbackMode::None || res.NumBindings(stage) != 1) {
+            Note(NotClassUse);
+            all_in = false;
+            continue;
+        }
+        if (!view || !bound) {
+            Note(NotClassNull);
+            all_in = false;
+            continue;
+        }
+        // the view the record names (as the slow path finds it)
+        u64 view_id = 0;
+        if (binder_plan != nullptr && res.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad) {
+            u32 identity_binding = ~0u;
+            const u32* words = nullptr;
+            if (!PlannedImageWords(stage, i, res.is_r128 ? 4 : 8, words, identity_binding)) {
+                words = BinderWords(stage, res.sharp_fetch.offsets[0], res.is_r128 ? 4 : 8, 2, &identity_binding);
+            }
+            if (words != nullptr && identity_binding != ~0u) {
+                view_id = binder_plan->bindings[identity_binding].view_id;
+            }
+        }
+        if (view_id == 0) {
+            Note(NotClassNoView);
+            all_in = false;
+            continue;
+        }
+        const u64 flags = ImageUseFlags(res);
+        const u64 view_bits = reinterpret_cast<u64>(static_cast<VkImageView>(view));
+        const auto fill = [&](Entry& e) {
+            e.image_index = bound.index;
+            e.image_uid = texture_cache.ImageUid(bound);
+            e.view_handle = view_bits;
+        };
+        Entry* e = Find(view_id, flags);
+        if (e == nullptr) {
+            Entry& made = Put(view_id, flags);
+            Core::NativeDevice::Object v{}, t{};
+            made.in_class = Core::NativeDevice::Lookup(view_id, v) && v.resource_id != 0 && Core::NativeDevice::Lookup(v.resource_id, t) && t.usage != 2;
+            made.resource_id = v.resource_id;
+            if (made.resource_id != 0) {
+                LinkResource(made.resource_id, view_id);
+            }
+            fill(made);
+            if (!made.in_class) {
+                Note(NotClassDynamic);
+                all_in = false;
+                continue;
+            }
+            Note(ImagesInClass);
+            Note(ImagesNoEntry);
+            all_served = false;
+            continue;
+        }
+        if (!e->in_class) {
+            Note(NotClassDynamic);
+            all_in = false;
+            continue;
+        }
+        Note(ImagesInClass);
+        const VideoCore::ImageId entry_image{e->image_index};
+        const bool valid = e->image_uid != 0 && texture_cache.ImageUid(entry_image) == e->image_uid &&
+                           True(texture_cache.GetImage(entry_image).flags & VideoCore::ImageFlagBits::Registered);
+        if (!valid) {
+            Note(ImagesStale);
+            all_served = false;
+            fill(*e);
+            continue;
+        }
+        if (entry_image == bound && e->view_handle == view_bits) {
+            Note(ImagesSame);
+            continue;
+        }
+        Note(ImagesDifferent);
+        any_diff = true;
+        all_served = false;
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+            const auto& old_image = texture_cache.GetImage(bound);
+            const auto& table_image = texture_cache.GetImage(entry_image);
+            LOG_ERROR(Render_Vulkan, "view table: view {:#x} (use {:#x}) answered image {} {:#x} {}x{} view {:#x}; the old path bound image {} {:#x} {}x{} view {:#x} (program {:#x})", view_id, flags,
+                      entry_image.index, table_image.info.guest_address, table_image.info.size.width, table_image.info.size.height, e->view_handle, bound.index,
+                      old_image.info.guest_address, old_image.info.size.width, old_image.info.size.height, view_bits, stage.pgm_hash);
+        }
+        fill(*e);
+    }
+    if (all_in) {
+        Note(StagesAllInClass);
+        if (all_served) {
+            Note(StagesWouldServe);
+        }
+    }
+    if (any_diff) {
+        Note(StagesWithDifference);
+    }
 }
 
 void Rasterizer::ResolveTextures(const Shader::Info& stage, TextureResolved& r) {

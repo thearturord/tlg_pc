@@ -8,6 +8,7 @@
 #include "native/native_own_memory_census.h"
 #include "native/native_hook_owned.h"
 #include "native/native_legacy.h"
+#include "native/native_view_table.h"
 #include <nlohmann/json.hpp>
 
 #include "native/native_debug_server.h"
@@ -323,6 +324,9 @@ Core::RasterHost::IntervalStats Rasterizer::PublishIntervalStats() {
         Core::DebugServer::Publish("legacy", Core::Legacy::Report()); // design review 89: the index of old-path switches as read at startup
         if (Core::HookOwned::Mode() != 0) {
             Core::DebugServer::Publish("hook_owned", Core::HookOwned::Report()); // note 90
+        }
+        if (Core::ViewTable::Mode() != 0) {
+            Core::DebugServer::Publish("view_table", Core::ViewTable::Report()); // note 95
         }
         if (Core::OwnMemoryCensus::On() || Core::OwnMemoryCensus::DropDirtyMode() != 0 || Core::OwnMemoryCensus::OwnImmutableMode() != 0 || Core::OwnMemoryCensus::OwnMutableMode() != 0 || Core::OwnMemoryCensus::OwnCloseMode() != 0) {
             Core::DebugServer::Publish("own_memory_census", Core::OwnMemoryCensus::Report()); // design review 79, step 1a
