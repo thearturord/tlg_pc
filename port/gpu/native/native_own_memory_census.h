@@ -73,7 +73,7 @@ void NoteOwn(u32 what, u32 cls = 0) noexcept;
 /// Design review 85: `TLG_OWN_MUTABLE` (default 2 real since the owner's play 2026-11-10, 1 in 64 audited; 0 off, 1 shadow): bindings of default and dynamic engine buffers (reads and GPU writes) bound
 /// from the buffer's own placed buffer by id while no CPU bytes wait for it.
 [[nodiscard]] u32 OwnMutableMode() noexcept;
-/// Design review 87: `TLG_OWN_CLOSE` (default 0; 1 shadow, 2 real): a binding whose buffer has no own pointer resolves it once from the placed block that holds the
+/// Design review 87: `TLG_OWN_CLOSE` (default 2 real since the owner's play 2026-11-10; 0 off, 1 shadow): a binding whose buffer has no own pointer resolves it once from the placed block that holds the
 /// whole buffer. Shadow: bindings valid only through such a pointer are compared with the old path.
 [[nodiscard]] u32 OwnCloseMode() noexcept;
 [[nodiscard]] nlohmann::json Report();
