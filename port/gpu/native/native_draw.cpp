@@ -8447,6 +8447,7 @@ u64 PS4_SYSV_ABI ResourceTextureInitAnnounced(u64 object, u64 a1, u64 a2, u64 a3
         const u64 created_result = reinterpret_cast<GuestFunction6>(original)(object, a1, a2, a3, a4, a5);
         Guarded([&]() -> u64 {
             const u64 texture = a3 != 0 ? Rd<u64>(a3, 0) : 0;
+            NativeDevice::NoteTextureCreated(texture); // note 114 (before its initial data is announced)
             const u64 memory = texture != 0 ? Rd<u64>(texture, 0x30) : 0;
             if (memory != 0 && memory == t_last_garlic_address && t_last_garlic_size != 0) {
                 NativeUpdates::NoteWriterRange(6, memory, t_last_garlic_size, "texture 1D/3D creation");
@@ -8458,6 +8459,7 @@ u64 PS4_SYSV_ABI ResourceTextureInitAnnounced(u64 object, u64 a1, u64 a2, u64 a3
     }
     const u64 result = reinterpret_cast<GuestFunction6>(original)(object, a1, a2, a3, a4, a5);
     Guarded([&]() -> u64 {
+        NativeDevice::NoteTextureCreated(object); // note 114 (before its initial data is announced)
         const u64 memory = Rd<u64>(object, 0x30);
         const u64 size = Rd<u64>(object, 0x38);
         if (memory != 0 && size != 0 && size <= (1ull << 32)) {

@@ -57,6 +57,11 @@ struct Object {
 void NoteResource(u64 object);
 /// A view object after its creation returned
 void NoteView(Kind kind, u64 view_object, u64 desc = 0);
+/// Note 114 (`TLG_TEXTURE_AT_CREATION`: 0 off by default, 1 shadow, 2 real): a texture after its initialization or creation returned. Without it the table learns a texture
+/// only at its first view, so a texture that never gets a view (the copy-only textures of note 113) is unknown to it: no engine create or delete event, no hook-owned exclusion.
+/// Real mode notes the texture here (before its initial data is announced); the shadow only counts what that would change.
+void NoteTextureCreated(u64 object);
+[[nodiscard]] u32 TextureAtCreationMode() noexcept;
 /// `AddDelayDeleteObject`: the object leaves (its id is never used again)
 void NoteDelete(u64 object);
 

@@ -68,6 +68,24 @@ struct AddrEntry {
 absl::btree_map<VAddr, AddrEntry> resource_by_address; // a B-tree: the walks by memory (BuffersIn, TexturesIn, ResourceAt) were a cache miss per level of a node tree
 
 std::atomic<u64> resources_noted{0}, views_noted{0}, deletes_noted{0}, deletes_unknown{0}, bad_reads{0};
+/// note 114: textures at their creation
+enum Tac : u32 {
+    TacCreated,         ///< textures read after their creation returned
+    TacBadRead,         ///< ... unreadable then
+    TacAlreadyKnown,    ///< ... already in the table (the id seen before)
+    TacInserted,        ///< real mode: noted in the table at creation
+    TacLaterViewed,     ///< shadow: not in the table at creation, got a view later (the real mode notes them earlier)
+    TacDeletedUnviewed, ///< shadow: deleted without ever getting a view (the real mode gives them an engine delete event)
+    TacBufferOverlap,   ///< created over a live buffer's memory (the real mode excludes such a buffer from the hook-owned class, note 90)
+    TacHookMember,      ///< ... over a hook-owned member
+    TacReadDiffers,     ///< the creation read differs from the read at the first view (CREATION_READ_DIFFERS_MUST_BE_0; textures that are not dynamic)
+    TacReadDiffersDyn,  ///< ... of a dynamic texture (its memory may move with a Map before its first view)
+    TacCount_
+};
+std::array<std::atomic<u64>, TacCount_> tac{};
+std::mutex tac_mutex;
+std::unordered_map<u64, Object> tac_pending;       ///< shadow: id -> the creation read, until a view or the delete
+std::unordered_map<u64, u64> tac_pending_by_object; ///< shadow: object -> id
 /// AddDelayDeleteObject (native-v3-writers): the game's own delay (frames until the object is freed) by age of the object's stamp, and the extra delay TLG_DELETE_DELAY adds
 std::atomic<u64> delay_by_age[6]{}, delay_added{0}, delay_requeued{0};
 std::atomic<u64> deferred_count{0}, deferred_released{0}, deferred_forced{0}, deferred_max_pending{0};
@@ -194,6 +212,12 @@ void Insert(const Object& object) {
     live_by_kind[static_cast<u32>(object.kind)].fetch_add(1, std::memory_order_relaxed);
 }
 
+/// note 114 guard: the fields a creation read and a view-time read of the same texture must agree on
+bool SameRead(const Object& a, const Object& b) {
+    return a.id == b.id && a.object == b.object && a.kind == b.kind && a.address == b.address && a.bytes == b.bytes && a.width == b.width && a.height == b.height &&
+           a.depth == b.depth && a.mips == b.mips && a.layers == b.layers && a.format == b.format && a.usage == b.usage && a.bind == b.bind && a.cpu_access == b.cpu_access;
+}
+
 template <Kind ViewKind>
 u64 ViewCreated(const char* hook_name, u64 resource, u64 desc, u64 out, u64 a3, u64 a4, u64 a5) {
     static std::atomic<u64> original_entry{0};
@@ -272,8 +296,19 @@ void NoteView(Kind kind, u64 view_object, u64 desc) {
     view.format = resource.format, view.usage = resource.usage, view.bind = resource.bind, view.misc = resource.misc;
     views_noted.fetch_add(1, std::memory_order_relaxed);
     Insert(view);
+    if (TextureAtCreationMode() != 0) {
+        std::scoped_lock lock{tac_mutex};
+        if (const auto it = tac_pending.find(resource.id); it != tac_pending.end()) {
+            tac[TacLaterViewed].fetch_add(1, std::memory_order_relaxed);
+            if (!SameRead(it->second, resource)) {
+                tac[resource.usage == 2 ? TacReadDiffersDyn : TacReadDiffers].fetch_add(1, std::memory_order_relaxed);
+            }
+            tac_pending_by_object.erase(it->second.object);
+            tac_pending.erase(it);
+        }
+    }
     {
-        // the resource itself is known from here on as well (textures are read once their initialization returned; their view creation comes after)
+        // the resource itself is known from here on as well (textures are read once their initialization returned; their view creation comes after; note 114: or at their creation)
         std::shared_lock lock{table_mutex};
         if (by_id.contains(resource.id)) {
             return;
@@ -282,9 +317,81 @@ void NoteView(Kind kind, u64 view_object, u64 desc) {
     Insert(resource);
 }
 
+u32 TextureAtCreationMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_TEXTURE_AT_CREATION");
+        if (!Enabled() || e == nullptr || e[0] == 0) {
+            return 0u; // default 0 (note 114): a texture enters the table at its first view; =1 shadow, =2 real
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
+
+void NoteTextureCreated(u64 object) {
+    const u32 mode = TextureAtCreationMode();
+    if (mode == 0 || object == 0) {
+        return;
+    }
+    Object entry;
+    if (!ReadResourceObject(object, entry) || entry.kind < Kind::Texture1D || entry.kind > Kind::Texture3D) {
+        tac[TacBadRead].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    tac[TacCreated].fetch_add(1, std::memory_order_relaxed);
+    {
+        std::shared_lock lock{table_mutex};
+        if (by_id.contains(entry.id)) {
+            tac[TacAlreadyKnown].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (entry.address != 0 && entry.bytes != 0) {
+            // what the hook-owned exclusion of Insert would find (note 90)
+            const VAddr end = entry.address + entry.bytes;
+            auto it = resource_by_address.lower_bound(end);
+            u32 below = 0;
+            bool overlap = false;
+            while (it != resource_by_address.begin() && below < 16) {
+                --it;
+                if (it->first < entry.address) {
+                    ++below;
+                }
+                overlap |= it->second.kind == Kind::Buffer && it->second.end > entry.address;
+            }
+            if (overlap) {
+                tac[TacBufferOverlap].fetch_add(1, std::memory_order_relaxed);
+                if (Core::HookOwned::Mode() != 0 && Core::HookOwned::MemberIn(entry.address, entry.bytes)) {
+                    tac[TacHookMember].fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+    {
+        // both modes: the creation read waits for the first view (the guard) or the delete
+        std::scoped_lock lock{tac_mutex};
+        if (tac_pending.size() < 400000) {
+            tac_pending[entry.id] = entry;
+            tac_pending_by_object[entry.object] = entry.id;
+        }
+    }
+    if (mode == 2) {
+        resources_noted.fetch_add(1, std::memory_order_relaxed);
+        tac[TacInserted].fetch_add(1, std::memory_order_relaxed);
+        Insert(entry);
+    }
+}
+
 void NoteDelete(u64 object) {
     if (!Enabled() || object == 0) {
         return;
+    }
+    if (TextureAtCreationMode() != 0) {
+        std::scoped_lock lock{tac_mutex};
+        if (const auto it = tac_pending_by_object.find(object); it != tac_pending_by_object.end()) {
+            tac[TacDeletedUnviewed].fetch_add(1, std::memory_order_relaxed);
+            tac_pending.erase(it->second);
+            tac_pending_by_object.erase(it);
+        }
     }
     deletes_noted.fetch_add(1, std::memory_order_relaxed);
     std::unique_lock lock{table_mutex};
@@ -826,6 +933,20 @@ nlohmann::json Report() {
         out["deferred_frees"] = {{"held", deferred_count.load()}, {"released", deferred_released.load()}, {"forced", deferred_forced.load()}, {"max_pending", deferred_max_pending.load()}};
     }
     out["unreadable_objects"] = bad_reads.load();
+    {
+        const auto t = [](Tac k) { return tac[k].load(std::memory_order_relaxed); };
+        u64 pending = 0;
+        {
+            std::scoped_lock lock{tac_mutex};
+            pending = tac_pending.size();
+        }
+        out["texture_at_creation"] = {{"mode", TextureAtCreationMode()}, {"textures_read_at_creation", t(TacCreated)}, {"unreadable", t(TacBadRead)},
+                                      {"already_known", t(TacAlreadyKnown)}, {"real_noted_at_creation", t(TacInserted)},
+                                      {"later_viewed", t(TacLaterViewed)}, {"deleted_never_viewed", t(TacDeletedUnviewed)},
+                                      {"live_never_viewed", pending}, {"created_over_a_buffer", t(TacBufferOverlap)},
+                                      {"created_over_a_hook_owned_member", t(TacHookMember)}, {"CREATION_READ_DIFFERS_MUST_BE_0", t(TacReadDiffers)},
+                                      {"creation_read_differs_dynamic", t(TacReadDiffersDyn)}};
+    }
     nlohmann::json live;
     for (u32 k = 1; k < live_by_kind.size(); ++k) {
         live[KindName(static_cast<Kind>(k))] = live_by_kind[k].load();
