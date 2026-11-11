@@ -4917,7 +4917,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                             const u64 offset_aligned = Common::AlignDown(offset, alignment);
                             const u64 adjust = offset - offset_aligned;
                             const_cast<VideoCore::Buffer*>(block)->NoteResolveUse();
-                            recipe_ranges.emplace_back(address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
+                            if (recipe_active) recipe_ranges.emplace_back(address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
                             push_data.AddOffset(binding.buffer, adjust);
                             buffer_infos.emplace_back(block->Handle(), offset_aligned, size + adjust);
                             bound_buffers.emplace_back(block, offset, size, src_access);
@@ -4977,7 +4977,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                     Core::RowVersion::NoteWritten(0);
                                     recipe_reusable = false;
                                 }
-                                recipe_ranges.emplace_back(address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
+                                if (recipe_active) recipe_ranges.emplace_back(address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
                                 if (size > 262144) {
                                     recipe_reusable = false;
                                 }
@@ -5038,7 +5038,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                     Core::RowVersion::NoteWritten(0);
                                     recipe_reusable = false;
                                 }
-                                recipe_ranges.emplace_back(address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
+                                if (recipe_active) recipe_ranges.emplace_back(address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
                                 if (size > 262144) {
                                     recipe_reusable = false;
                                 }
@@ -5123,7 +5123,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                 Core::NativeResources::NoteGpuWritten(address, size);
                                 Core::RowVersion::NoteWritten(0);
                             }
-                            recipe_ranges.emplace_back(address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
+                            if (recipe_active) recipe_ranges.emplace_back(address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
                             if (desc.is_written || size > 262144) {
                                 recipe_reusable = false;
                             }
@@ -5181,7 +5181,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         cover_cause = 9;
                         Census(census_base + CBufferResolved);
                         resolve_stats.hits.fetch_add(1, std::memory_order_relaxed);
-                        recipe_ranges.emplace_back(r.address, r.size);
+                        if (recipe_active) recipe_ranges.emplace_back(r.address, r.size);
                         goto buffer_bound;
                     }
                     const bool ready = object->alive.load(std::memory_order_acquire) && object->synced.load(std::memory_order_acquire); // the arena fields are stored before `synced`
@@ -5201,7 +5201,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         cover_cause = 10;
                         Census(census_base + CBufferResolved);
                         resolve_stats.hits.fetch_add(1, std::memory_order_relaxed);
-                        recipe_ranges.emplace_back(r.address, r.size);
+                        if (recipe_active) recipe_ranges.emplace_back(r.address, r.size);
                         goto buffer_bound;
                     }
                     // why: 0 epoch, 1 gone, 2 not synchronized, 3 generation moved, 4 arena, 5 tracker dirty
@@ -5661,7 +5661,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 }
                 const auto [buffer, offset] = obtained;
                 Core::NativeContent::ClearBindContext();
-                recipe_ranges.emplace_back(vsharp.address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
+                if (recipe_active) recipe_ranges.emplace_back(vsharp.address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
                 if (desc.is_written || size > 262144) {
                     recipe_reusable = false;
                 }
@@ -6206,7 +6206,7 @@ void Rasterizer::ResolveBufferBindingBody(const Shader::Info& stage, u32 buffer_
                         out.info = vk::DescriptorBufferInfo(copy->Handle(), offset_aligned, r.size + adjust);
                         Census(census_base + CBufferResolved);
                         resolve_stats.hits.fetch_add(1, std::memory_order_relaxed);
-                        recipe_ranges.emplace_back(r.address, r.size);
+                        if (recipe_active) recipe_ranges.emplace_back(r.address, r.size);
                         return;
                     }
                     const bool ready = object->alive.load(std::memory_order_acquire) && object->synced.load(std::memory_order_acquire); // the arena fields are stored before `synced`
@@ -6223,7 +6223,7 @@ void Rasterizer::ResolveBufferBindingBody(const Shader::Info& stage, u32 buffer_
                         out.SetQuery(arena, offset, r.size, false, true); // asked by the record pass: only when the plan has writes
                         Census(census_base + CBufferResolved);
                         resolve_stats.hits.fetch_add(1, std::memory_order_relaxed);
-                        recipe_ranges.emplace_back(r.address, r.size);
+                        if (recipe_active) recipe_ranges.emplace_back(r.address, r.size);
                         return;
                     }
                     // why: 0 epoch, 1 gone, 2 not synchronized, 3 generation moved, 4 arena, 5 tracker dirty
@@ -6362,7 +6362,7 @@ void Rasterizer::ResolveBufferBindingBody(const Shader::Info& stage, u32 buffer_
                     }
                 }();
                 Core::NativeContent::ClearBindContext();
-                recipe_ranges.emplace_back(vsharp.address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
+                if (recipe_active) recipe_ranges.emplace_back(vsharp.address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
                 if (desc.is_written || size > 262144) {
                     recipe_reusable = false;
                 }
