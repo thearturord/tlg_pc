@@ -15,6 +15,7 @@
 #include "native/native_identity_log.h"
 #include "native/native_image_caller.h"
 #include "native/native_content.h"
+#include "native/native_coverage.h"
 #include "native/native_n0_census.h"
 #include "native/native_row_version.h"
 #include "native/native_dispatch_split.h"
@@ -3139,6 +3140,7 @@ void Rasterizer::FinishBindResources(const Pipeline* pipeline, bool uses_dma, u6
 
 bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed, DrawJob* draw_job) {
     TLG_PROF_LEVEL("raster.bind_resources", 2);
+    Core::Coverage::Begin(pipeline->IsCompute()); // note 143 census (TLG_COVERAGE_CENSUS=1)
     const bool w3_time = cover_on && pipeline->IsCompute();
     const auto w3_now = [] { return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); };
     u64 w3_p[6]{};
@@ -3460,6 +3462,9 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false, false, vertex_handle, NativeHandleMode() == 2);
         Core::NativeContent::ClearBindContext();
+        if (Core::Coverage::On() && own_vertex == nullptr && !buffer_cache.IsHookRing(range.buffer)) [[unlikely]] {
+            Core::Coverage::NoteOld(Core::Coverage::OldVertex); // note 143
+        }
         if (cover_on && W1ShadowOn()) [[unlikely]] {
             W1ShadowGeometry(vertex_handle, range.base_address, range.buffer, range.offset, true);
         }
@@ -3784,6 +3789,12 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(index_address, index_buffer_size, false, false, index_handle, NativeHandleMode() == 2);
         Core::NativeContent::ClearBindContext();
+        if (Core::Coverage::On() && own_index == nullptr && !buffer_cache.IsHookRing(buffer)) [[unlikely]] {
+            Core::Coverage::NoteOld(Core::Coverage::OldIndex); // note 143
+            const auto& cov_ring = VideoCore::UntrackedRing::Get();
+            const bool cov_meets_ring = cov_ring.Active() && index_address < cov_ring.End() && index_address + index_buffer_size > cov_ring.Start();
+            Core::Coverage::NoteOldDetail(Core::Coverage::OldIndex, index_handle != nullptr ? 1u : 0u, cov_meets_ring ? 2u : buffer_cache.IsStreamBuffer(buffer) ? 0u : 1u, 0, index_buffer_size);
+        }
         if (cover_on && W1ShadowOn()) [[unlikely]] {
             W1ShadowGeometry(index_handle, index_address, buffer, offset, false);
         }
@@ -5042,6 +5053,13 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     }
                 };
                 const std::pair<const VideoCore::Buffer*, u64> obtained = obtain_old();
+                if (Core::Coverage::On() && own_compare == nullptr && !buffer_cache.IsHookRing(obtained.first)) [[unlikely]] {
+                    Core::Coverage::NoteOld(desc.is_written ? Core::Coverage::OldBufferWritten : Core::Coverage::OldBuffer); // note 143 (audits and hook ring answers are native)
+                    const auto& cov_ring = VideoCore::UntrackedRing::Get();
+                    const bool cov_meets_ring = cov_ring.Active() && vsharp.address < cov_ring.End() && vsharp.address + size > cov_ring.Start();
+                    Core::Coverage::NoteOldDetail(desc.is_written ? Core::Coverage::OldBufferWritten : Core::Coverage::OldBuffer, w31_id != 0 ? 1u : 0u,
+                                                  cov_meets_ring ? 2u : buffer_cache.IsStreamBuffer(obtained.first) ? 0u : 1u, stage.pgm_hash, size);
+                }
                 if (cover_on) [[unlikely]] {
                     w3_row = false;
                     w3_b = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -6302,6 +6320,10 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
         Census(census_base + CImageTotal, static_cast<u32>(stage.images.size()));
         BindSamplers(stage, binding);
         return;
+    }
+    if (Core::Coverage::On() && !stage.images.empty()) [[unlikely]] {
+        Core::Coverage::NoteOld(Core::Coverage::OldImageStage); // note 143: a texture stage the view table did not bind
+        Core::Coverage::NoteOldDetail(Core::Coverage::OldImageStage, 1u, 1u, stage.pgm_hash, stage.images.size());
     }
     // note 96/97: the old path's answer per image binding, kept for the view table (`vt_ok`: the answer can be bound from the table)
     static thread_local std::array<TextureSetEntry, TextureSet::MaxImages> vt_answers;
