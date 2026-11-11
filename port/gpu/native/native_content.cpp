@@ -874,7 +874,10 @@ void NoteGpuAllocation(u64 address, u64 size) {
 u32 InstanceScratchMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_INSTANCE_SCRATCH");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+        if (e == nullptr || e[0] == 0) {
+            return 2u; // default 2 since 2026-11-11 after the owner's play (note 135); LEGACY(instance_scratch): =0 announces the scratch writes into the batch again, =1 shadow
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }

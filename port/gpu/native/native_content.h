@@ -130,7 +130,7 @@ void NoteGpuAllocation(u64 address, u64 size);
 /// Note 132 (`TLG_W37_CENSUS=1`, counters only): where writers 3 (outside the frame ring) and 7 write, by the engine GPU allocation that holds the range, how soon an address is
 /// written again, and which reads meet those allocations (`kind`: a LateKind, or 100 an own-memory bind)
 [[nodiscard]] bool W37On() noexcept;
-/// Note 133 (`TLG_INSTANCE_SCRATCH`: 0 off by default, 1 shadow, 2 real): the instance group uploader's double buffer is the CPU's scratch (the engine copies it again into a
+/// Note 133 (`TLG_INSTANCE_SCRATCH`: 2 real by default since the owner's play, note 135; 1 shadow; 0 off, the old path): the instance group uploader's double buffer is the CPU's scratch (the engine copies it again into a
 /// frame ring block and points the buffer's V# there, note 132). The hook registers both halves (`ScratchNote`). Real mode: writer 7 writes inside them leave the batch
 /// (`ScratchSkip` true; the ledger note stays). A buffer cache request that meets a scratch range is counted (`READ_OVER_INSTANCE_SCRATCH_MUST_BE_0`); in real mode
 /// `ScratchRead` gives the caller the range to apply first, so even such a reader gets the bytes as they are then.
