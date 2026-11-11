@@ -1928,6 +1928,12 @@ bool SilentCensusOn() noexcept {
 std::mutex g_silent_mutex;
 std::unordered_map<u64, u32> g_silent_at;   ///< page -> the submission its newest silent write belongs to
 std::unordered_map<u64, u32> g_silent_hits; ///< page -> windows with a silent write
+std::unordered_map<u64, u32> g_silent_data_at; ///< note 128: page -> the submission of its newest silent write that left data (not all zero)
+struct PageChange {
+    u32 lo, hi, index; ///< the bytes [lo, hi) of the page the newest silent write changed (lo == hi: it changed none), at harvest `index`
+};
+std::unordered_map<u64, std::unique_ptr<std::array<u8, 4096>>> g_page_copy; ///< note 128: data pages' content at their last silent write (at most 8192 pages)
+std::unordered_map<u64, PageChange> g_page_change;
 std::atomic<u32> g_silent_gen{0};           ///< bumped by every harvest that found silent pages
 std::vector<u64> g_sc_candidates; ///< note 127: the pages the last harvest found written with no announcement yet (one harvesting thread)
 u32 g_sc_candidates_index = 0;
@@ -2226,24 +2232,88 @@ void SilentProbeNew(u32 what, u64 address, u64 bytes) {
     RingMirror::ProbeWrites(what == 0 ? (address + bytes / 2) & ~u64{4095} : bytes > 8192 ? address + 4096 : address);
 }
 
-void SilentOwnBind(u64 id, u64 address, u64 size) {
+namespace {
+std::atomic<u64> c_ob_change[3]{}; ///< note 128: own binds over a recently silent data page: [0 no diff known, 1 changed bytes outside the bound ones, 2 BOUND BYTES CHANGED]
+std::atomic<u32> c_ob_change_logged{0};
+std::atomic<u64> c_ob_tracker[2][2]{}; ///< note 128: [0 every own bind, 1 over a recently silent data page][tracker modified 0/1]
+std::atomic<u64> c_ob_compared{0}, c_ob_same{0}, c_ob_different{0}, c_ob_not_mapped{0}, c_ob_different_bytes{0}, c_ob_data_page_hits{0};
+std::atomic<u32> c_ob_logged{0};
+} // namespace
+
+bool SilentCensusActive() noexcept {
+    return SilentCensusOn();
+}
+
+void SilentOwnBind(u64 id, u64 address, u64 size, const u8* own_bytes, int tracker_modified) {
     if (!SilentCensusOn() || size == 0) {
         return;
+    }
+    if (tracker_modified >= 0) {
+        c_ob_tracker[0][tracker_modified].fetch_add(1, std::memory_order_relaxed); // note 128: every own bind, the baseline
     }
     c_own_binds.fetch_add(1, std::memory_order_relaxed);
     const u32 now = g_silent_index.load(std::memory_order_relaxed);
     const u64 first = address & ~u64{4095}, last = (address + size - 1) & ~u64{4095};
-    bool hit = false;
+    bool hit = false, data_hit = false;
+    u32 change = 0; // note 128: 0 no diff known, 1 the silent write changed bytes outside the bound ones only (or none), 2 it changed bound bytes
     {
         std::scoped_lock lock{g_silent_mutex};
         u32 n = 0;
-        for (u64 page = first; page <= last && n < 64 && !hit; page += 4096, ++n) {
+        for (u64 page = first; page <= last && n < 64; page += 4096, ++n) {
             const auto it = g_silent_at.find(page);
-            hit = it != g_silent_at.end() && it->second + 1 >= now;
+            hit |= it != g_silent_at.end() && it->second + 1 >= now;
+            const auto d = g_silent_data_at.find(page);
+            if (d != g_silent_data_at.end() && d->second + 1 >= now) {
+                data_hit = true;
+                const auto c = g_page_change.find(page);
+                if (c != g_page_change.end() && c->second.index == d->second) {
+                    const u64 lo = page + c->second.lo, hi = page + c->second.hi;
+                    change = std::max(change, lo < hi && lo < address + size && address < hi ? 2u : 1u);
+                }
+            }
+        }
+    }
+    if (data_hit) {
+        c_ob_change[change].fetch_add(1, std::memory_order_relaxed);
+        if (change == 2 && c_ob_change_logged.fetch_add(1, std::memory_order_relaxed) < 30) {
+            std::fprintf(stderr, "note 128: own bind id %llu %#llx+%#llx reads bytes a silent write changed\n", static_cast<unsigned long long>(id), static_cast<unsigned long long>(address),
+                         static_cast<unsigned long long>(size));
         }
     }
     if (hit) {
         c_own_binds_silent.fetch_add(1, std::memory_order_relaxed);
+        c_ob_data_page_hits.fetch_add(data_hit ? 1 : 0, std::memory_order_relaxed);
+        if (data_hit && tracker_modified >= 0) {
+            c_ob_tracker[1][tracker_modified].fetch_add(1, std::memory_order_relaxed);
+        }
+        // note 128: the bytes the GPU will read (the own block, as placed) against guest memory now
+        u64 nz = 0;
+        t_readable_lo = t_readable_hi = 0; // protections change between binds
+        if (own_bytes == nullptr) {
+            c_ob_not_mapped.fetch_add(1, std::memory_order_relaxed);
+        } else if (NonzeroReadable(address, size, nz)) {
+            c_ob_compared.fetch_add(1, std::memory_order_relaxed);
+            const u8* guest = reinterpret_cast<const u8*>(address);
+            u64 diff = 0, first_diff = ~u64{0};
+            for (u64 i = 0; i < size; ++i) {
+                if (guest[i] != own_bytes[i]) {
+                    ++diff;
+                    first_diff = std::min(first_diff, i);
+                }
+            }
+            if (diff == 0) {
+                c_ob_same.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                c_ob_different.fetch_add(1, std::memory_order_relaxed);
+                c_ob_different_bytes.fetch_add(diff, std::memory_order_relaxed);
+                if (c_ob_logged.fetch_add(1, std::memory_order_relaxed) < 30) {
+                    const LedgerAnswer a = LedgerQuery(address, address + size);
+                    std::fprintf(stderr, "note 128: own bind id %llu %#llx+%#llx: %llu bytes differ, first at +%#llx; data page %d; ledger covered %#llx newest writer %u submit %u now %u\n",
+                                 static_cast<unsigned long long>(id), static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), static_cast<unsigned long long>(diff),
+                                 static_cast<unsigned long long>(first_diff), data_hit ? 1 : 0, static_cast<unsigned long long>(a.covered), a.newest_writer, a.newest_submit, now);
+                }
+            }
+        }
         std::scoped_lock lock{g_owner_mutex};
         ++g_own_bind_silent_ids[id];
     }
@@ -2283,6 +2353,10 @@ void SilentHarvest(u32 index) {
             if (it != g_silent_at.end() && it->second == k) {
                 g_silent_at.erase(it); // marked when it was a candidate
             }
+            const auto d = g_silent_data_at.find(page);
+            if (d != g_silent_data_at.end() && d->second == k) {
+                g_silent_data_at.erase(d);
+            }
         }
         for (const u64 page : confirmed) {
             ++g_silent_hits[page];
@@ -2292,8 +2366,31 @@ void SilentHarvest(u32 index) {
     {
         // this harvest's candidates are marked at once, so a read before the next harvest is still checked against them
         std::scoped_lock lock{g_silent_mutex};
+        t_readable_lo = t_readable_hi = 0;
         for (const u64 page : ctx.silent) {
             g_silent_at[page] = index;
+            u64 nz = 0;
+            if (NonzeroReadable(page, 4096, nz) && nz != 0) {
+                g_silent_data_at[page] = index; // note 128
+                const u8* now_bytes = reinterpret_cast<const u8*>(page);
+                auto it = g_page_copy.find(page);
+                if (it != g_page_copy.end()) {
+                    u32 lo = 4096, hi = 0;
+                    const auto& old = *it->second;
+                    for (u32 i = 0; i < 4096; ++i) {
+                        if (old[i] != now_bytes[i]) {
+                            lo = std::min(lo, i);
+                            hi = i + 1;
+                        }
+                    }
+                    g_page_change[page] = PageChange{lo < hi ? lo : 0u, lo < hi ? hi : 0u, index};
+                    std::memcpy(it->second->data(), now_bytes, 4096);
+                } else if (g_page_copy.size() < 8192) {
+                    auto copy = std::make_unique<std::array<u8, 4096>>();
+                    std::memcpy(copy->data(), now_bytes, 4096);
+                    g_page_copy.emplace(page, std::move(copy));
+                }
+            }
         }
         if (!ctx.silent.empty()) {
             g_silent_gen.fetch_add(1, std::memory_order_relaxed); // as before note 127: the image checks look again at once
@@ -2310,15 +2407,26 @@ void SilentHarvest(u32 index) {
 }
 
 namespace {
+std::atomic<u64> c_sd_reads[LateKinds][2]{}; ///< note 128: reads over a page with silent data from the same or the previous window: [kind][0 no engine resource, 1 engine resource]
+std::mutex g_sd_mutex;
+std::unordered_map<u64, u64> g_sd_pages; ///< page -> reads over it
 void SilentCheck(size_t k, u64 address, u64 size, u32 submit) {
     c_sc_reads_checked.fetch_add(1, std::memory_order_relaxed);
     const u64 first = address & ~u64{4095}, last = (address + size - 1) & ~u64{4095};
     u32 newest = 0;
-    u64 newest_page = 0, hits = 0;
+    u64 newest_page = 0, hits = 0, data_page = 0;
     {
         std::scoped_lock lock{g_silent_mutex};
         if (g_silent_at.empty()) {
             return;
+        }
+        const u32 now = g_silent_index.load(std::memory_order_relaxed);
+        u32 m = 0;
+        for (u64 page = first; page <= last && m < 4096 && data_page == 0; page += 4096, ++m) {
+            const auto d = g_silent_data_at.find(page);
+            if (d != g_silent_data_at.end() && d->second + 1 >= now) {
+                data_page = page;
+            }
         }
         u32 n = 0;
         for (u64 page = first; page <= last && n < 4096; page += 4096, ++n) {
@@ -2330,6 +2438,21 @@ void SilentCheck(size_t k, u64 address, u64 size, u32 submit) {
         }
         if (newest != 0) {
             hits = g_silent_hits[newest_page];
+        }
+    }
+    if (data_page != 0) {
+        // note 128: does any read path take bytes from memory a silent writer left data in?
+        static thread_local std::vector<NativeDevice::BufferPart> parts;
+        static thread_local std::vector<u64> textures;
+        parts.clear();
+        textures.clear();
+        NativeDevice::BuffersIn(data_page, 4096, parts);
+        const bool any_texture = NativeDevice::TexturesIn(data_page, 4096, textures);
+        const bool owned = !parts.empty() || any_texture || !textures.empty();
+        c_sd_reads[k][owned ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+        std::scoped_lock lock{g_sd_mutex};
+        if (g_sd_pages.size() < 100000) {
+            ++g_sd_pages[data_page];
         }
     }
     if (newest <= submit) {
@@ -2779,6 +2902,43 @@ nlohmann::json SilentReport() {
     }
     out["top_pages"] = std::move(pages);
     out["owners"] = SilentOwnerReport(); // note 126
+    {
+        // note 128
+        nlohmann::json r = nlohmann::json::object();
+        for (size_t k = 0; k < LateKinds; ++k) {
+            if (c_sd_reads[k][0].load() + c_sd_reads[k][1].load() != 0) {
+                r[LateKindNames[k]] = {{"no_engine_resource", c_sd_reads[k][0].load()}, {"ENGINE_RESOURCE", c_sd_reads[k][1].load()}};
+            }
+        }
+        std::vector<std::pair<u64, u64>> top;
+        {
+            std::scoped_lock lock{g_sd_mutex};
+            for (const auto& [p, n] : g_sd_pages) {
+                top.emplace_back(n, p);
+            }
+        }
+        std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+        nlohmann::json tp = nlohmann::json::array();
+        for (size_t i = 0; i < top.size() && i < 20; ++i) {
+            tp.push_back({{"page", fmt::format("{:#x}", top[i].second)}, {"reads", top[i].first}});
+        }
+        out["READS_OVER_SILENT_DATA"] = {{"by_kind", std::move(r)}, {"distinct_pages", top.size()}, {"top_pages", std::move(tp)}};
+        out["OWN_BINDS_OVER_SILENT_PAGES_BYTES"] = {{"compared", c_ob_compared.load()}, {"same", c_ob_same.load()}, {"DIFFERENT", c_ob_different.load()}, {"different_bytes", c_ob_different_bytes.load()},
+                                                   {"block_not_host_mapped", c_ob_not_mapped.load()}, {"over_a_data_page", c_ob_data_page_hits.load()},
+                                                   {"tracker_all_own_binds_clean_modified", {c_ob_tracker[0][0].load(), c_ob_tracker[0][1].load()}},
+                                                   {"TRACKER_OVER_DATA_PAGE_clean_modified", {c_ob_tracker[1][0].load(), c_ob_tracker[1][1].load()}},
+                                                   {"over_data_page_no_diff_known", c_ob_change[0].load()}, {"over_data_page_change_outside_bound_bytes", c_ob_change[1].load()},
+                                                   {"BOUND_BYTES_CHANGED_BY_SILENT_WRITE", c_ob_change[2].load()}};
+        {
+            std::scoped_lock lock{g_silent_mutex};
+            u64 none = 0, some = 0, bytes = 0;
+            for (const auto& [pg, c] : g_page_change) {
+                (c.hi > c.lo ? some : none) += 1;
+                bytes += c.hi - c.lo;
+            }
+            out["SILENT_DATA_PAGE_DIFFS"] = {{"pages_with_a_copy", g_page_copy.size()}, {"diffed_changed_nothing", none}, {"diffed_changed_bytes", some}, {"changed_span_bytes", bytes}};
+        }
+    }
     out["file_reads"] = {{"announced_calls", c_hw_calls.load()}, {"bytes", c_hw_bytes.load()}, {"NOT_ANNOUNCED_UPDATES_OFF", c_hw_not_announced.load()}, {"in_frame_ring", c_hw_in_ring.load()},
                          {"LEDGER_MISSING_AFTER", c_hw_ledger_missing.load()}, {"ledger_newest_other_writer", c_hw_ledger_other.load()}, {"ledger_ok", c_hw_ledger_ok.load()}}; // note 127
     return out;

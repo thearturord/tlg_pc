@@ -66,7 +66,11 @@ void SilentImageUploaded(u64 address, u64 size, bool gpu_source);
 void SilentImageKept(u64 address, u64 size);
 /// Note 126 (TLG_SILENT_CENSUS=1): a bind served from an engine buffer's own memory (`id`, [address, address + size)); counts the binds over a page written silently in this or the
 /// window before (the own block holds the bytes of its last upload: a silent write after it is not in it)
-void SilentOwnBind(u64 id, u64 address, u64 size);
+/// Note 128: `own_bytes` (may be null) are the own block's bytes for the range when the block is host mapped; over a recently silent page they are compared with guest memory.
+/// `tracker_modified`: the old page tracker's answer for the range (1 it saw a CPU write not yet uploaded, 0 not, -1 not asked).
+void SilentOwnBind(u64 id, u64 address, u64 size, const u8* own_bytes = nullptr, int tracker_modified = -1);
+/// TLG_SILENT_CENSUS=1
+[[nodiscard]] bool SilentCensusActive() noexcept;
 /// Note 126 (`TLG_SILENT_PROBE=1`, with the census): arm the writer probe (`RingMirror::ProbeWrites`: the page read only, the first store's instruction and stack recorded) on a sample of
 /// new engine buffers above 1 MB (`what` 0) and new textures (`what` 1), right after their creation hook announced the initial data. A later silent write is caught as it happens.
 void SilentProbeNew(u32 what, u64 address, u64 bytes);
