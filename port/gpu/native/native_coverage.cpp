@@ -38,6 +38,8 @@ std::array<std::array<std::atomic<u64>, 6>, OldCount> details{}; // [class][id c
 std::array<std::array<std::atomic<u64>, 6>, OldCount> detail_bytes{};
 std::mutex g_program_mutex;
 std::unordered_map<u64, u64> g_programs; // (class << 60) ^ program -> old-path bindings
+std::array<std::atomic<u64>, IrCount> image_reasons{};
+std::unordered_map<u64, u64> g_reason_programs; // (reason << 56) ^ program -> stages (under g_program_mutex)
 
 nlohmann::json Report() {
     static constexpr const char* names[OldCount] = {"buffer_read", "buffer_written", "image_stage", "vertex", "index"};
@@ -69,6 +71,23 @@ nlohmann::json Report() {
         std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.second > y.second; });
         for (size_t i = 0; i < top.size() && i < 16; ++i) {
             j["top_programs"].push_back({{"class", names[top[i].first >> 60]}, {"program", fmt::format("{:#x}", top[i].first & 0x0fffffffffffffffull)}, {"bindings", top[i].second}});
+        }
+    }
+    {
+        static constexpr const char* rnames[IrCount] = {"no_images_or_no_plan", "written_storage_not_real", "mip_fallback", "sharp_not_single_load", "several_bindings",
+                                                       "no_record_words", "no_view_id", "no_entry_yet", "not_in_class_dynamic_or_unknown", "no_payload_answer_not_bindable",
+                                                       "entry_image_stale", "audit_one_in_64", "tail_same_image_twice", "tail_check_failed", "storage_mark_mismatch", "view_table_off"};
+        for (u32 r = 0; r < IrCount; ++r) {
+            if (const u64 n = image_reasons[r].load(std::memory_order_relaxed); n != 0) {
+                j["image_stage_reasons_note_151"][rnames[r]] = n;
+            }
+        }
+        std::scoped_lock lock{g_program_mutex};
+        std::vector<std::pair<u64, u64>> top(g_reason_programs.begin(), g_reason_programs.end());
+        std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.second > y.second; });
+        for (size_t i = 0; i < top.size() && i < 16; ++i) {
+            j["image_stage_reason_top_programs"].push_back({{"reason", rnames[std::min<u64>(top[i].first >> 56, IrCount - 1)]},
+                                                            {"program", fmt::format("{:#x}", top[i].first & 0x00ffffffffffffffull)}, {"stages", top[i].second}});
         }
     }
     j["note"] = "note 143, cumulative; an operation counts as native when no binding of it took the old path (own-memory audits and hook ring answers count as native)";
@@ -123,6 +142,18 @@ void NoteOldDetail(Old what, u32 cls, u32 answer, u64 program, u64 size) noexcep
     std::scoped_lock lock{g_program_mutex};
     if (g_programs.size() < 4096) {
         ++g_programs[(static_cast<u64>(what) << 60) ^ (program & 0x0fffffffffffffffull)];
+    }
+}
+
+void NoteImageReason(u32 reason, u64 program) noexcept {
+    if (!g_on || !t_open) {
+        return;
+    }
+    const u32 r = reason < IrCount ? reason : IrCount - 1;
+    image_reasons[r].fetch_add(1, std::memory_order_relaxed);
+    std::scoped_lock lock{g_program_mutex};
+    if (g_reason_programs.size() < 4096) {
+        ++g_reason_programs[(static_cast<u64>(r) << 56) ^ (program & 0x00ffffffffffffffull)];
     }
 }
 

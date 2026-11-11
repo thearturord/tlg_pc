@@ -283,6 +283,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
     plan->op_class = 0xff;
     plan->depth_copy = plan->stencil_copy = false;
     plan->fixed = native;
+    plan->fixed_source = &native; // note 154 (the record's cached state: never freed)
     plan->inputs = cached->second;
     // E1b: the draw's arguments are the typed values the record builder set (the argument registers of the record are not decoded any more); a field the record did
     // not set keeps what the cached inputs hold, as before.

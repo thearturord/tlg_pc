@@ -219,28 +219,9 @@ bool BufferCache::PlacedMeets(VAddr address, u64 size) const {
 const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
     Core::SplitCensus::Touch(Core::SplitCensus::BufPlaced);
     const VAddr base = begin & ~VAddr{255};
-    // zero copy: engine buffers the CPU writes (not the ones it reads back) live in video memory the CPU can write (resizable BAR), so their announced bytes
-    // can be written there directly (SynchronizeMemory). A device without such memory keeps device local buffers (the GPU must not read system memory: N7.5).
-    bool zero_copy = ZeroCopyOn();
-    if (zero_copy) {
-        for (const u64 id : ids) {
-            Core::NativeDevice::Object object;
-            if (LookupView(id, object) && (object.usage == 3 || (object.cpu_access & 0x20000) != 0)) {
-                zero_copy = false;
-            }
-        }
-    }
-    auto buffer = std::make_unique<Buffer>(instance, base, end - base + PlacedSlack, zero_copy ? MemoryType::DeviceMapped : MemoryType::DeviceLocal,
+    // (note 149: the zero-copy placement, TLG_ZERO_COPY, is deleted: engine buffers are device local)
+    auto buffer = std::make_unique<Buffer>(instance, base, end - base + PlacedSlack, MemoryType::DeviceLocal,
                                            fmt::format("engine buffer {}{} {:#x}+{:#x}", ids.front(), ids.size() > 1 ? "+" : "", begin, end - begin));
-    if (zero_copy && (!buffer->is_device_local || buffer->mapped_data.empty())) {
-        static std::atomic<bool> logged{false};
-        if (!logged.exchange(true)) {
-            TLG_LOG(BUFFER, Warn, "zero copy: no device local memory the CPU can write (resizable BAR off?): engine buffers stay device local");
-        }
-        zero_copy_unavailable.store(true, std::memory_order_relaxed);
-        buffer = std::make_unique<Buffer>(instance, base, end - base + PlacedSlack, MemoryType::DeviceLocal,
-                                          fmt::format("engine buffer {}{} {:#x}+{:#x}", ids.front(), ids.size() > 1 ? "+" : "", begin, end - begin));
-    }
     Buffer* dst = buffer.get();
     dst->placed_begin = begin;
     dst->placed_end = end;
@@ -382,9 +363,6 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
         }
         for (const auto& [a, n] : rest) {
             b9_unattributed.Subtract(a, n);
-            if (Core::NativeUpdates::LeanDirtyMode() != 2) {
-                all_object_dirty.Subtract(a, n);
-            }
         }
     }
     if (g_page_clock_on) [[unlikely]] {
@@ -570,9 +548,6 @@ void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, boo
                     object_dirty[id].Add(address, bytes);
                     OwnDirtyNote(id, true);
                     Core::RowVersion::Bump(id); // F2 row version (shadow)
-                    if (Core::NativeUpdates::LeanDirtyMode() != 2) {
-                        all_object_dirty.Add(address, bytes);
-                    }
                 }
                 BindMemoErase(address, bytes); // D4: the new buffer's first upload must not be skipped by a memo answer
                 b9_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -596,14 +571,6 @@ u64 BufferCache::BufferHolding(VAddr addr, size_t size) const {
         return object.id;
     }
     return 0;
-}
-
-bool BufferCache::ZeroCopyOn() const noexcept {
-    static const bool on = [] {
-        const char* e = std::getenv("TLG_ZERO_COPY");
-        return e != nullptr && *e == '1';
-    }();
-    return on && !zero_copy_unavailable.load(std::memory_order_relaxed);
 }
 
 void BufferCache::BuffersInView(VAddr address, u64 size, std::vector<Core::NativeDevice::BufferPart>& out) {
@@ -665,15 +632,7 @@ void BufferCache::OrderedViewCheck(VAddr address, u64 size, bool written) {
 }
 
 nlohmann::json BufferCache::ZeroCopyReport() const {
-    return {{"on", ZeroCopyOn()},
-            {"ordered_view_check", ordered.CheckReport()},
-            {"direct_writes", zero_copy_counts[0].load()},
-            {"direct_write_ranges", zero_copy_counts[1].load()},
-            {"direct_write_bytes", zero_copy_counts[2].load()},
-            {"uploads_copied_gpu_still_using_the_buffer", zero_copy_counts[3].load()},
-            {"bytes_copied_gpu_still_using_the_buffer", zero_copy_counts[4].load()},
-            {"uploads_into_placed_device_local", zero_copy_counts[8].load()},
-            {"uploads_into_placed_cpu_writable", zero_copy_counts[9].load()}};
+    return {{"deleted", "note 149: the zero-copy path is gone"}, {"ordered_view_check", ordered.CheckReport()}};
 }
 
 } // namespace VideoCore

@@ -38,6 +38,8 @@
 #include "native/native_executor.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "native/native_audit.h"
+#include "native/native_dispatch_executor.h"
 #include "video_core/buffer_cache/readback_batch.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "native/native_readback_policy.h"
@@ -154,9 +156,6 @@ void BufferCache::ApplyCpuWrite(VAddr address, u64 size, bool newer, u64 object)
                 {
                     std::scoped_lock lock{object_dirty_mutex};
                     object_dirty[object].Add(join_begin, join_end - join_begin);
-                    if (Core::NativeUpdates::LeanDirtyMode() != 2) {
-                        all_object_dirty.Add(join_begin, join_end - join_begin);
-                    }
                     OwnDirtyNote(object, true);
                 }
                 BindMemoErase(join_begin, join_end - join_begin); // (no answer cached over it before the pin survives)
@@ -217,7 +216,7 @@ void BufferCache::IdMarkLean(VAddr address, u64 size, bool newer, u64 id) {
     bool drop_real = false; // real (2): the write is dropped after the image step
     if (drop_mode == 2 && drop_resident != nullptr && drop_resident->dirty_pending.load(std::memory_order_acquire)) {
         static thread_local u32 drop_tick = 0;
-        if ((++drop_tick & 63u) != 0) {
+        if (!Core::Audit::Due(drop_tick)) {
             drop_real = true;
             OM::NoteDrop(OM::DropDropped);
         } else {
@@ -305,7 +304,7 @@ void BufferCache::IdMarkLean(VAddr address, u64 size, bool newer, u64 id) {
         if (index.NoImageInBuffer(id, address, size)) {
             run_image = false;
             static thread_local u32 image_tick = 0;
-            if ((++image_tick & 63u) == 0) {
+            if (Core::Audit::Due(image_tick)) {
                 Core::NativeUpdates::NoteIdMarks(Core::NativeUpdates::ImImgIdSampled);
                 if (index.NoteAnnouncedWrite(address, size, newer) == 1) {
                     Core::NativeUpdates::NoteIdMarks(Core::NativeUpdates::ImImgIdSkippedTouched);
@@ -330,9 +329,6 @@ void BufferCache::IdMarkLean(VAddr address, u64 size, bool newer, u64 id) {
         VideoCore::PageClockStamp(address, size);
     } else {
         std::scoped_lock lock{object_dirty_mutex};
-        if (Core::NativeUpdates::LeanDirtyMode() != 2) {
-            all_object_dirty.Add(address, size);
-        }
         object_dirty[id].Add(address, size);
         b9_unattributed.Subtract(address, size);
         OwnDirtyNote(id, true);
@@ -377,7 +373,7 @@ void BufferCache::ApplyIdMark(VAddr address, u64 size, bool newer, u64 object, u
             return;
         }
         static thread_local u32 sample = 0;
-        if ((++sample & 63) != 0) {
+        if (!Core::Audit::Due(sample)) {
             NoteIdMarks(ImLean);
             IdMarkLean(address, size, newer, told.id);
             return;
@@ -664,9 +660,6 @@ void BufferCache::MarkBuffersChanged(VAddr address, u64 size, bool announced, st
         Core::N0::SetEffect(Core::N0::EffBufferParts);
     }
     std::scoped_lock lock{object_dirty_mutex};
-    if (Core::NativeUpdates::LeanDirtyMode() != 2) {
-        all_object_dirty.Add(address, size); // audit: every changed byte, by address
-    }
     if (announced) {
         Core::NativeUpdates::NoteB9(parts.empty() ? Core::NativeUpdates::B9AnnouncedNoBuffer
                                     : parts.size() == 1 && parts[0].begin == address && parts[0].end == address + size ? Core::NativeUpdates::B9AnnouncedOnBuffer
@@ -1355,6 +1348,7 @@ static void PageClockSync(VAddr lo, VAddr hi, const boost::container::small_vect
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                         Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
+    Core::DispatchExecutor::NoteAddressCall(0); // note 152 shadow
     if (hook_ring != nullptr && !is_written && (is_texel_buffer || size <= 65536) && Core::HookRing::Raster1bReal()) {
         // F1 1b real: a frame ring range the hook ring holds whole (filled at the finished writes, one lap half) is bound from it: no upload from game memory.
         // GPU-modified ranges keep the old path (the arena holds the GPU's bytes).
@@ -2240,23 +2234,10 @@ const Buffer* BufferCache::BufferFor(VAddr address, u64 size, bool demote_spanni
 bool BufferCache::NativeCpuQuery(VAddr addr, size_t size) {
     // E4: memory no engine buffer answers for: changed when announced bytes of it were not uploaded yet
     std::scoped_lock lock{object_dirty_mutex};
-    const u32 lean = Core::NativeUpdates::LeanDirtyMode();
     if (Core::RingMirror::FillMode() == 1 && ring_fill_pending.Intersects(addr, size)) {
         return true;
     }
-    if (lean == 2) {
-        return b9_unattributed.Intersects(addr, size);
-    }
-    const bool unattributed = b9_unattributed.Intersects(addr, size);
-    const bool answer = all_object_dirty.Intersects(addr, size) || unattributed || (Core::RingMirror::FillMode() == 1 && ring_fill_pending.Intersects(addr, size));
-    if (lean == 1) {
-        Core::NativeUpdates::NoteB9(Core::NativeUpdates::LeanChecked);
-        if (answer && !unattributed) {
-            Core::NativeUpdates::NoteB9(Core::NativeUpdates::LeanMissing, size);
-            Core::RareEvents::Note("d2_lean_cpu_query_missing", fmt::format("{:#x}+{:#x}", addr, size));
-        }
-    }
-    return answer;
+    return b9_unattributed.Intersects(addr, size); // (note 149: the by-address audit set of TLG_LEAN_DIRTY=0/1 is deleted)
 }
 
 bool BufferCache::ObjectRangeDirtyClock(u64 id, const Buffer* buffer, VAddr addr, u64 size) {
@@ -2599,11 +2580,6 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                     b9_unattributed.Subtract(part.begin, part.end - part.begin);
                 }
             }
-            if (Core::NativeUpdates::LeanDirtyMode() != 2) {
-                for (const auto& [a, n] : b9_pieces) {
-                    all_object_dirty.Subtract(a, n);
-                }
-            }
             b9_pieces.insert(b9_pieces.end(), pinned_pieces.begin(), pinned_pieces.end());
         }
         Core::NativeUpdates::NoteB9(b9_object != 0 ? Core::NativeUpdates::B9SyncByObject : Core::NativeUpdates::B9SyncNoObject);
@@ -2627,56 +2603,8 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         boost::container::small_vector<std::pair<u64, u64>, 8> from_announced;
         {
             std::scoped_lock lock{object_dirty_mutex};
-            const u32 lean = Core::NativeUpdates::LeanDirtyMode();
-            if (lean == 2) {
-                b9_unattributed.ForEachInRange(x, xn, [&](u64 lo, u64 e) { from_announced.emplace_back(lo, e - lo); });
-            } else {
-                all_object_dirty.ForEachInRange(x, xn, [&](u64 lo, u64 e) { from_announced.emplace_back(lo, e - lo); });
-                if (lean == 1) {
-                    // compare with the unattributed set alone: every byte of the audit set must be in it (missing = stale if the audit set were dropped)
-                    boost::container::small_vector<std::pair<u64, u64>, 8> lean_pieces;
-                    b9_unattributed.ForEachInRange(x, xn, [&](u64 lo, u64 e) { lean_pieces.emplace_back(lo, e - lo); });
-                    const auto covered = [](const auto& list, u64 lo, u64 n) {
-                        u64 at = lo;
-                        for (const auto& [a, an] : list) { // (merged, sorted, disjoint)
-                            if (a + an <= at) {
-                                continue;
-                            }
-                            if (a > at) {
-                                break;
-                            }
-                            at = a + an;
-                            if (at >= lo + n) {
-                                break;
-                            }
-                        }
-                        return at >= lo + n;
-                    };
-                    u64 missing = 0, extra = 0;
-                    for (const auto& [lo, n] : from_announced) {
-                        if (!covered(lean_pieces, lo, n)) {
-                            missing += n;
-                        }
-                    }
-                    for (const auto& [lo, n] : lean_pieces) {
-                        if (!covered(from_announced, lo, n)) {
-                            extra += n;
-                        }
-                    }
-                    Core::NativeUpdates::NoteB9(Core::NativeUpdates::LeanChecked);
-                    if (missing != 0) {
-                        Core::NativeUpdates::NoteB9(Core::NativeUpdates::LeanMissing, missing);
-                        Core::RareEvents::Note("d2_lean_take_announced_missing", fmt::format("{:#x}+{:#x}: {} bytes", x, xn, missing));
-                    }
-                    if (extra != 0) {
-                        Core::NativeUpdates::NoteB9(Core::NativeUpdates::LeanExtra, extra);
-                    }
-                }
-            }
+            b9_unattributed.ForEachInRange(x, xn, [&](u64 lo, u64 e) { from_announced.emplace_back(lo, e - lo); }); // (note 149: the by-address audit set is deleted)
             for (const auto& [lo, n] : from_announced) {
-                if (lean != 2) {
-                    all_object_dirty.Subtract(lo, n);
-                }
                 b9_unattributed.Subtract(lo, n);
             }
         }
@@ -2760,9 +2688,6 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                     for (const auto& [a, n] : unfilled) {
                         ring_filled.Add(a, n);
                         b9_unattributed.Subtract(a, n); // (the marks before the upload are in it)
-                        if (Core::NativeUpdates::LeanDirtyMode() != 2) {
-                            all_object_dirty.Subtract(a, n);
-                        }
                     }
                 }
                 u64 whole = 0;
@@ -2933,58 +2858,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     if (!copies.empty() && g_cover_sync_on) {
         ++t_cover_sync_copies;
     }
-    if (!copies.empty()) {
-        // where uploads go: the arena (memory no placed buffer holds), a placed buffer in plain device memory, a placed buffer the CPU can write
-        zero_copy_counts[arena->mem_type == MemoryType::DeviceMapped ? 9 : 8].fetch_add(1, std::memory_order_relaxed);
-    }
-    if (!copies.empty() && arena->mem_type == MemoryType::DeviceMapped && arena->is_device_local && !arena->mapped_data.empty() && arena->CpuAddr() != 0) {
-        // zero copy: the GPU is done with this engine buffer (every submission that used it finished): its bytes are written straight into its video memory,
-        // with no staging and no copy in the stream (the submission that follows makes the host writes visible). Otherwise the copy below runs as before.
-        const bool tick_idle = (arena->last_gpu_tick[0] == 0 || scheduler.IsFree(arena->last_gpu_tick[0])) &&
-                               (arena->last_gpu_tick[1] == 0 || scheduler.IsFree(arena->last_gpu_tick[1]));
-        // P3c: the GPU being done with what the record side noted is not enough once the resolve side runs ahead: the operations resolved before this one must have been recorded too
-        // (TLG_SPLIT_BIND=1 uses both; 2 uses the tick as before and counts where the sequence would have said no)
-        static const u32 split_mode = [] {
-            const char* e = std::getenv("TLG_SPLIT_BIND");
-            return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u;
-        }();
-        const bool seq_idle = arena->EarlierUsesRetired();
-        if (split_mode == 2) {
-            static std::atomic<u64> checked{0}, would_refuse{0};
-            const u64 n = checked.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (tick_idle && !seq_idle && would_refuse.fetch_add(1) < 20) {
-                LOG_WARNING(Render_Vulkan, "split bind verify: zero copy idle by tick but an earlier operation ({}) is not retired ({})", arena->resolve_prev_seq,
-                            VideoCore::OpSequence::retired.load());
-            }
-            if ((n & (n - 1)) == 0) {
-                LOG_WARNING(Render_Vulkan, "split bind verify: {} zero copy idle tests, {} refused by sequence only", n, would_refuse.load());
-            }
-        }
-        const bool idle = tick_idle && (split_mode != 1 || seq_idle);
-        if (idle) {
-            u8* const base = const_cast<u8*>(arena->mapped_data.data());
-            for (const auto& copy : copies) {
-                u8* const dst = base + (copy.dstOffset - arena->cpu_addr);
-                {
-                    Core::N0::CopyScope n0{Core::N0::CopyZeroDirect, copy.dstOffset, copy.size};
-                    memory->CopySparseMemory(copy.dstOffset, dst, copy.size);
-                    n0.Done(dst);
-                }
-                // M2b: the announced bytes are those of the submission being worked on (the raster thread applies announcements in order), so the game having run ahead is undone here
-                Core::NativeContent::FrameStoreServe(Core::NativeContent::LateKind::BufferArenaSync, copy.dstOffset, dst, copy.size);
-            }
-            if (!arena->is_coherent) {
-                const_cast<Buffer*>(arena)->Flush(0, arena->SizeBytes());
-            }
-            zero_copy_counts[0].fetch_add(1, std::memory_order_relaxed);
-            zero_copy_counts[1].fetch_add(copies.size(), std::memory_order_relaxed);
-            zero_copy_counts[2].fetch_add(total_size_bytes, std::memory_order_relaxed);
-            copies.clear();
-        } else {
-            zero_copy_counts[3].fetch_add(1, std::memory_order_relaxed);
-            zero_copy_counts[4].fetch_add(total_size_bytes, std::memory_order_relaxed);
-        }
-    }
+    // (note 149: the zero-copy direct write into CPU-writable video memory, TLG_ZERO_COPY, is deleted)
     if (!copies.empty()) {
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
         for (auto& copy : copies) {

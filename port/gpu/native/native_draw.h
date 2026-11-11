@@ -297,6 +297,8 @@ std::string DescribeMissingRecord(u64 seq);
 bool TakeDispatchBindings(u64 seq, RecordBinding* out, u32 max, u32& count);
 /// The call site (ghidra address) that made the record `seq`; 0 when the record was recycled.
 u64 RecordCallerGhidra(u64 seq);
+/// Note 154 shadow: 0 the record slot of `seq` still holds that record and the same `n` bindings, 1 the slot was reused, 2 other bindings, 3 no record.
+u32 RecordBindingsState(u64 seq, const RecordBinding* b, u32 n);
 
 /// The constants of a synthesized compute record live in the table arena, in host memory. The GPU reads buffer data through guest addresses
 /// below 2^40 and the guest memory backing, so the descriptor of such a constant buffer holds an address in a window of unused guest

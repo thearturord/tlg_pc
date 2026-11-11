@@ -58,6 +58,9 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "native/native_audit.h"
+#include "native/native_hook_diff.h"
+#include "native/native_dispatch_executor.h"
 #include "video_core/half_phase.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -553,6 +556,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(DrawIndirectParams params, const 
     plan->stencil_copy = no_operation.stencil_copy;
     Core::NativeDraw::Live().fixed_native.fetch_add(1, std::memory_order_relaxed);
     plan->fixed = native;
+    plan->fixed_source = nullptr; // (note 154: planned from the registers)
     plan->inputs = Core::NativeDrawInputs::FromRecord(record, index_count);
     Core::NativeDraw::Live().key_targets[10].fetch_add(1, std::memory_order_relaxed);
     {
@@ -665,7 +669,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const Fixe
     // image and description: no register compare, no generation, no decode, no FindImage; one draw in 64 takes the old path and is compared)
     const u32 tg_mode = Core::ViewTable::TargetMode();
     static thread_local u32 tg_tick = 0;
-    const bool tg_audit = tg_mode == 2 && (++tg_tick & 63u) == 0;
+    const bool tg_audit = tg_mode == 2 && Core::Audit::Due(tg_tick);
     const bool tg_take = tg_mode == 2 && !tg_audit;
     bool tg_any = false, tg_all_in = true, tg_all_served = true, tg_old_find = false, tg_all_taken = true;
     if (tg_mode != 0) [[unlikely]] {
@@ -1074,7 +1078,7 @@ void Rasterizer::InvalidateWrittenBuffer(u64 id, VAddr address, u64 size, bool i
     if (WrittenMode() == 2 && id_none) {
         // note 108, real: no image can be based in the buffer's memory, so the walk is skipped; one in 64 walks anyway and must mark nothing
         static thread_local u32 audit_tick = 0;
-        if ((++audit_tick & 63u) != 0) {
+        if (!Core::Audit::Due(audit_tick)) {
             Note(WbSkipped);
             return;
         }
@@ -1689,6 +1693,13 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
     const FixedState& fixed = plan->fixed;
+    if (Core::HookDiff::PointersOn() && plan != nullptr && plan->executed) [[unlikely]] {
+        // note 154 shadow: could the plan have pointed at its sources instead of copying them
+        if (plan->fixed_source != nullptr) {
+            Core::HookDiff::NotePlanFixed(std::memcmp(&plan->fixed, plan->fixed_source, sizeof(FixedState)) == 0);
+        }
+        Core::HookDiff::NotePlanBindings(Core::NativeDraw::RecordBindingsState(plan->native_seq, plan->bindings.data(), plan->binding_count));
+    }
     draw_inputs = &plan->inputs;
     current_bc_base = &draw_inputs->ta_bc_base;
     current_cb_extent = plan ? &plan->cb_extent : &executor->RasterCbExtents();
@@ -3216,6 +3227,8 @@ void Rasterizer::FinishBindResources(const Pipeline* pipeline, bool uses_dma, u6
 bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed, DrawJob* draw_job) {
     TLG_PROF_LEVEL("raster.bind_resources", 2);
     Core::Coverage::Begin(pipeline->IsCompute()); // note 143 census (TLG_COVERAGE_CENSUS=1)
+    Core::DispatchExecutor::Begin(pipeline->IsCompute()); // note 152 shadow (TLG_DISPATCH_EXECUTOR=1)
+    const size_t dx_bound_at_begin = bound_buffers.size();
     const bool w3_time = cover_on && pipeline->IsCompute();
     const auto w3_now = [] { return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); };
     u64 w3_p[6]{};
@@ -3368,6 +3381,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
         uses_dma |= stage->uses_dma;
     }
     const u64 resolve_ns = timed_resolve ? static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - resolve_begin).count()) : 0;
+    Core::DispatchExecutor::End(static_cast<u32>(bound_buffers.size() - dx_bound_at_begin), needs_barrier); // note 152
 
     if (w3_time) {
         for (u32 k = 0; k < 5; ++k) {
@@ -3477,7 +3491,7 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
             own_vertex_shadow = false;
             own_vertex = OwnGeometry(range.base_address, size, 8);
             static thread_local u32 vertex_tick = 0;
-            if (own_vertex != nullptr && geo_mode == 2 && !own_vertex_shadow && (++vertex_tick & 63u) != 0) {
+            if (own_vertex != nullptr && geo_mode == 2 && !own_vertex_shadow && !Core::Audit::Due(vertex_tick)) {
                 Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnBound, own_vertex_cls); Core::NativeContent::SilentOwnBind(0, range.base_address, size, (!own_vertex->mapped_data.empty() ? own_vertex->mapped_data.data() + own_vertex->Offset(range.base_address) : nullptr), Core::NativeContent::SilentCensusActive() ? (buffer_cache.IsRegionCpuModified(range.base_address, size) ? 1 : 0) : -1); // note 126 census
                 const_cast<VideoCore::Buffer*>(own_vertex)->NoteResolveUse();
                 range.buffer = const_cast<VideoCore::Buffer*>(own_vertex);
@@ -3509,7 +3523,7 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
                     }
                 } else {
                     static thread_local u32 split_tick = 0;
-                    if (split_mode == 2 && (++split_tick & 63u) != 0) {
+                    if (split_mode == 2 && !Core::Audit::Due(split_tick)) {
                         range.split = true;
                         for (size_t gi = 0; gi < guest_buffers.size(); ++gi) {
                             const auto& gb = guest_buffers[gi];
@@ -3539,6 +3553,8 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
         Core::NativeContent::ClearBindContext();
         if (Core::Coverage::On() && own_vertex == nullptr && !buffer_cache.IsHookRing(range.buffer)) [[unlikely]] {
             Core::Coverage::NoteOld(Core::Coverage::OldVertex); // note 143
+            Core::Coverage::NoteOldDetail(Core::Coverage::OldVertex, geometry_plan != nullptr && geometry_plan->geometry_id_count != 0 ? 1u : 0u,
+                                          buffer_cache.IsStreamBuffer(range.buffer) ? 0u : 1u, 0, size); // note 151
         }
         if (cover_on && W1ShadowOn()) [[unlikely]] {
             W1ShadowGeometry(vertex_handle, range.base_address, range.buffer, range.offset, true);
@@ -3833,7 +3849,7 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
                    own_index_shadow = false;
                    own_index = OwnGeometry(index_address, index_buffer_size, 7);
                    static thread_local u32 index_tick = 0;
-                   if (own_index == nullptr || geo_mode != 2 || own_index_shadow || (++index_tick & 63u) == 0) {
+                   if (own_index == nullptr || geo_mode != 2 || own_index_shadow || Core::Audit::Due(index_tick)) {
                        VideoCore::BufferCache::UploadBytesReset();
                        return false; // the old path answers (compared below)
                    }
@@ -4531,11 +4547,13 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 const u64 adjust = ring->offset - aligned;
                 push_data.AddOffset(binding.buffer, adjust);
                 buffer_infos.emplace_back(hook_ring_buffer->Handle(), aligned, ring->size + adjust);
+                Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcHookRing); // note 152
             } else {
                 if (!desc.IsSpecial()) {
                     push_data.AddOffset(binding.buffer, 0);
                 }
                 buffer_infos.emplace_back(constant_ring->Handle(), ring->offset, ring->size);
+                Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcConstantRing); // note 152
             }
             ring_use.bound.fetch_add(1, std::memory_order_relaxed);
             static const bool ring_verify = [] { const char* e = std::getenv("TLG_RING_VERIFY"); return e != nullptr && e[0] == '1'; }();
@@ -4599,6 +4617,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
                 buffer_infos.emplace_back(gds_buf->Handle(), 0, gds_buf->SizeBytes());
+                Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcGds); // note 152
                 Core::ResourceAudit::Note(Core::ResourceAudit::BufferUse, 0xfffff0000000ull, gds_buf->SizeBytes(), desc.is_written);
                 needs_barrier |=
                     runtime.IsBufferAccessed(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written);
@@ -4617,6 +4636,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 const u64 offset =
                     vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcFlatUserData); // note 152
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.
@@ -4647,6 +4667,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 std::memset(data, 0, lds_size);
                 lds_buffer.Commit();
                 buffer_infos.emplace_back(lds_buffer.Handle(), offset, lds_size);
+                Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcSharedMemory); // note 152
             } else {
                 UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
             }
@@ -4748,7 +4769,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         // (any read size: a read over the stream threshold is served by the object's copy in the stream ring, R1b, the same bytes again; note 125)
                         if (own == nullptr && eff != 0 && OM::OwnPlaceMode() == 2 && !large && !desc.is_written &&
                             h->end - h->begin <= Core::NativeResources::ResidentCap() && !buffer_cache.PlacedMeetsRange(h->begin, h->end - h->begin) &&
-                            !buffer_cache.IsRegionGpuModified(h->begin, h->end - h->begin) && (++place_tick & 63u) != 0) {
+                            !buffer_cache.IsRegionGpuModified(h->begin, h->end - h->begin) && !Core::Audit::Due(place_tick)) {
                             // note 121 real: the read the old path would copy into the stream ring; the buffer is placed whole from guest memory instead (the same bytes) and bound from it
                             u64 uploaded = 0;
                             const auto [block, block_offset] = buffer_cache.ObtainStatic(h->id, h->begin, static_cast<u32>(h->end - h->begin), uploaded);
@@ -4773,6 +4794,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                             if (recipe_active) recipe_ranges.emplace_back(address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
                             push_data.AddOffset(binding.buffer, adjust);
                             buffer_infos.emplace_back(block->Handle(), offset_aligned, size + adjust);
+                            Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcOwnPlaced); // note 152
                             bound_buffers.emplace_back(block, offset, size, src_access);
                             if (BufferBarrierQuery(block, offset, size, false)) {
                                 needs_barrier = true;
@@ -4814,7 +4836,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                 OM::NoteOwn(OM::OwnByResolved, cls);
                             }
                             static thread_local u32 own_tick = 0;
-                            if (eff == 2 && (++own_tick & 63u) != 0) {
+                            if (eff == 2 && !Core::Audit::Due(own_tick)) {
                                 OM::NoteOwn(OM::OwnBound, cls); Core::NativeContent::SilentOwnBind(r->ahead_id, r->ahead_address, r->ahead_size, (!own->mapped_data.empty() ? own->mapped_data.data() + own->Offset(r->ahead_address) : nullptr), Core::NativeContent::SilentCensusActive() ? (buffer_cache.IsRegionCpuModified(r->ahead_address, r->ahead_size) ? 1 : 0) : -1); // note 126 census
                                 const VAddr address = r->ahead_address;
                                 const u64 size = r->ahead_size;
@@ -4836,6 +4858,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                 }
                                 push_data.AddOffset(binding.buffer, adjust);
                                 buffer_infos.emplace_back(own->Handle(), offset_aligned, size + adjust);
+                                Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcOwn); // note 152
                                 bound_buffers.emplace_back(own, offset, size, src_access);
                                 if (desc.is_written) {
                                     InvalidateWrittenBuffer(r->ahead_id, address, size, true);
@@ -4878,7 +4901,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                             OM::NoteOwn(OM::OwnNotGpuMarked, xcls);
                         } else {
                             static thread_local u32 crossing_tick = 0;
-                            if (crossing_mode == 2 && (++crossing_tick & 63u) != 0) {
+                            if (crossing_mode == 2 && !Core::Audit::Due(crossing_tick)) {
                                 OM::NoteOwn(OM::OwnBound, xcls); Core::NativeContent::SilentOwnBind(r->ahead_id, r->ahead_address, r->ahead_size, (!holder->mapped_data.empty() ? holder->mapped_data.data() + holder->Offset(r->ahead_address) : nullptr), Core::NativeContent::SilentCensusActive() ? (buffer_cache.IsRegionCpuModified(r->ahead_address, r->ahead_size) ? 1 : 0) : -1); // note 126 census
                                 const u64 offset = holder->Offset(address);
                                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
@@ -4897,6 +4920,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                 }
                                 push_data.AddOffset(binding.buffer, adjust);
                                 buffer_infos.emplace_back(holder->Handle(), offset_aligned, size + adjust);
+                                Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcOwnCrossing); // note 152
                                 bound_buffers.emplace_back(holder, offset, size, src_access);
                                 if (desc.is_written) {
                                     InvalidateWrittenBuffer(r->ahead_id, address, size, false); // (the range is not the buffer's alone: the id does not decide)
@@ -4942,6 +4966,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         const u64 adjust = copy_offset - offset_aligned;
                         push_data.AddOffset(binding.buffer, adjust);
                         buffer_infos.emplace_back(copy->Handle(), offset_aligned, r.size + adjust);
+                        Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcResolvedCopy); // note 152
                         cover_cause = 9;
                         Census(census_base + CBufferResolved);
                         resolve_stats.hits.fetch_add(1, std::memory_order_relaxed);
@@ -4958,6 +4983,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         const u64 adjust = offset - offset_aligned;
                         push_data.AddOffset(binding.buffer, adjust);
                         buffer_infos.emplace_back(arena->Handle(), offset_aligned, r.size + adjust);
+                        Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcResolvedResident); // note 152
                         bound_buffers.emplace_back(arena, offset, r.size, src_access);
                         if (runtime.PlanHasWrites() && runtime.IsBufferAccessed(arena, offset, r.size, false)) {
                             needs_barrier = true;
@@ -5012,6 +5038,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
             if (vsharp.address == 0 || vsharp.size == 0) {
                 Census(census_base + CBufferNull);
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcNull); // note 152
             } else if (vsharp.size >= (1ull << 30) && !memory->IsValidMapping(vsharp.address)) {
                 LOG_ERROR(Render, "buffer sharp at unmapped address {:#x} of {} bytes for stage {:#x}: bound as null", vsharp.address,
                           vsharp.size, stage.pgm_hash);
@@ -5066,6 +5093,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         const u64 adjust = pc_offset - offset_aligned;
                         push_data.AddOffset(binding.buffer, adjust);
                         buffer_infos.emplace_back(program_consts_buffer->Handle(), offset_aligned, size + adjust);
+                        Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcProgramConsts); // note 152
                         Core::NativeContent::ClearBindContext();
                         goto buffer_bound; // (never written by the GPU: no barrier, no bound-list entry)
                     }
@@ -5097,6 +5125,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                             const u64 adjust = window.offset - aligned;
                             push_data.AddOffset(binding.buffer, adjust);
                             buffer_infos.emplace_back(window.buffer, aligned, size + adjust);
+                            Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcInPlace); // note 152
                             inplace_taken.fetch_add(1, std::memory_order_relaxed);
                             inplace_bytes.fetch_add(size, std::memory_order_relaxed);
                         } else {
@@ -5298,6 +5327,11 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 push_data.AddOffset(binding.buffer, adjust);
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
                 bound_buffers.emplace_back(buffer, offset, size, src_access);
+                if (Core::DispatchExecutor::On()) [[unlikely]] {
+                    Core::DispatchExecutor::Note(buffer_cache.IsHookRing(buffer) ? Core::DispatchExecutor::SrcHookRingWindow
+                                                 : buffer_cache.IsStreamBuffer(buffer) ? Core::DispatchExecutor::SrcObtainStream
+                                                                                       : Core::DispatchExecutor::SrcObtainOther); // note 152
+                }
                 if (cover_on && W1ShadowOn()) [[unlikely]] {
                     W31After(buffer, offset, vsharp.address, stage.sw_stage == Shader::SwStage::Compute, desc.is_written);
                 }
@@ -5516,7 +5550,7 @@ bool Rasterizer::BufferBarrierQuery(const VideoCore::Buffer* buffer, u64 offset,
         return runtime.IsBufferAccessed(buffer, offset, size, false);
     }
     static thread_local u32 tick = 0;
-    if ((++tick & 63u) == 0) {
+    if (Core::Audit::Due(tick)) {
         barrier_guard[5].fetch_add(1, std::memory_order_relaxed);
         const bool asked = runtime.IsBufferAccessed(buffer, offset, size, false);
         if (asked) {
@@ -6342,6 +6376,10 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set,
     return true;
 }
 
+namespace {
+thread_local u32 t_vt_refuse = Core::Coverage::IrTableOff; // note 151: why ViewTableBind last refused (raster thread)
+}
+
 bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const TextureSet& set, u32 count, Shader::Backend::Bindings& binding) {
     // Everything the slow path does to an image before it looks at the view: touch and refresh. Idempotent, so a miss after it costs nothing.
     // Note 147: a written (storage) image is refreshed at its commit, after it is marked GPU-modified, in FindTexture's order.
@@ -6366,6 +6404,7 @@ bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const Textur
             for (u32 j = i + 1; j < count; ++j) {
                 if (!set.entries[j].null_entry && set.entries[j].id == set.entries[i].id && (set.entries[i].storage || set.entries[j].storage)) {
                     Core::ViewTable::Note(Core::ViewTable::StRealRefusedTwice);
+                    t_vt_refuse = Core::Coverage::IrTailSameImageTwice;
                     return false;
                 }
             }
@@ -6382,6 +6421,7 @@ bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const Textur
         // (a written image's own transit is the same with force_general set: only a sampled one refuses it)
         if (image.backing != entry.backing || image.binding.needs_rebind || (!entry.storage && image.binding.force_general) || image.binding.is_target ||
             (image.backing->num_samples > 1) != (image.info.num_samples > 1) || (redirected ? associated != entry.id : bool(associated))) {
+            t_vt_refuse = Core::Coverage::IrTailCheckFailed;
             return false;
         }
     }
@@ -6478,13 +6518,18 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
 
     // Texture set memo: the set of resolved images for these T#s, when the stage qualifies (no written image, no mip fallback binding, at most 16 images).
     if (Core::ViewTable::Mode() == 2 && ViewTableBind(stage, binding)) {
+        Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcTextureTable); // note 152
         Census(census_base + CImageTotal, static_cast<u32>(stage.images.size()));
         BindSamplers(stage, binding);
         return;
     }
+    if (!stage.images.empty()) {
+        Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcTextureOld); // note 152
+    }
     if (Core::Coverage::On() && !stage.images.empty()) [[unlikely]] {
         Core::Coverage::NoteOld(Core::Coverage::OldImageStage); // note 143: a texture stage the view table did not bind
         Core::Coverage::NoteOldDetail(Core::Coverage::OldImageStage, 1u, 1u, stage.pgm_hash, stage.images.size());
+        Core::Coverage::NoteImageReason(Core::ViewTable::Mode() == 2 ? t_vt_refuse : Core::Coverage::IrTableOff, stage.pgm_hash); // note 151
     }
     // note 96/97: the old path's answer per image binding, kept for the view table (`vt_ok`: the answer can be bound from the table)
     static thread_local std::array<TextureSetEntry, TextureSet::MaxImages> vt_answers;
@@ -6998,6 +7043,7 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
 bool Rasterizer::ViewTableBind(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     using namespace Core::ViewTable;
     const u32 n = static_cast<u32>(stage.images.size());
+    t_vt_refuse = Core::Coverage::IrNoImagesOrPlan;
     if (n == 0 || n > TextureSet::MaxImages || binder_plan == nullptr) {
         return false;
     }
@@ -7011,6 +7057,11 @@ bool Rasterizer::ViewTableBind(const Shader::Info& stage, Shader::Backend::Bindi
         written_count += res.is_written;
         if ((res.is_written && !storage_real) || res.mip_fallback_mode != Shader::MipStorageFallbackMode::None || res.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad ||
             res.NumBindings(stage) != 1) {
+            using namespace Core::Coverage;
+            t_vt_refuse = res.is_written && !storage_real ? IrWrittenNotReal
+                          : res.mip_fallback_mode != Shader::MipStorageFallbackMode::None ? IrMipFallback
+                          : res.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad ? IrNotSingleLoad
+                                                                                                                 : IrSeveralBindings;
             return false;
         }
         // the view the record names: an index into the plan, no T# word is read
@@ -7020,19 +7071,27 @@ bool Rasterizer::ViewTableBind(const Shader::Info& stage, Shader::Backend::Bindi
             words = BinderWords(stage, res.sharp_fetch.offsets[0], res.is_r128 ? 4 : 8, 2, &identity_binding);
         }
         if (words == nullptr || identity_binding == ~0u) {
+            t_vt_refuse = Core::Coverage::IrNoRecordWords;
             return false;
         }
         const u64 view_id = binder_plan->bindings[identity_binding].view_id;
         if (view_id == 0) {
+            t_vt_refuse = Core::Coverage::IrNoViewId;
             return false;
         }
         const Entry* e = Find(view_id, ImageUseFlags(res));
         if (e == nullptr || !e->in_class || !e->has_payload) {
+            t_vt_refuse = e == nullptr ? Core::Coverage::IrNoEntry : !e->in_class ? Core::Coverage::IrNotInClass : Core::Coverage::IrNoPayload;
             return false;
         }
         TextureSetEntry& te = from_table.entries[i];
         std::memcpy(&te, e->payload, sizeof(TextureSetEntry));
-        if (te.storage != res.is_written || te.null_entry || te.id_uid == 0 || texture_cache.ImageUid(te.id) != te.id_uid || False(texture_cache.GetImage(te.id).flags & VideoCore::ImageFlagBits::Registered) ||
+        if (te.storage != res.is_written || te.null_entry) {
+            t_vt_refuse = Core::Coverage::IrStorageMarkMismatch;
+            return false;
+        }
+        t_vt_refuse = Core::Coverage::IrStale;
+        if (te.id_uid == 0 || texture_cache.ImageUid(te.id) != te.id_uid || False(texture_cache.GetImage(te.id).flags & VideoCore::ImageFlagBits::Registered) ||
             (te.found != te.id && texture_cache.ImageUid(te.found) != te.found_uid)) {
             return false;
         }
@@ -7040,7 +7099,8 @@ bool Rasterizer::ViewTableBind(const Shader::Info& stage, Shader::Backend::Bindi
     }
     from_table.count = n;
     static thread_local u32 audit_tick = 0;
-    if ((++audit_tick & 63u) == 0) {
+    if (Core::Audit::Due(audit_tick)) {
+        t_vt_refuse = Core::Coverage::IrAudit;
         Note(RealAudited); // the old path binds this one; the shadow compare at its end must find the same images
         return false;
     }
@@ -7939,11 +7999,13 @@ void Rasterizer::BindSamplersLegacy(const Shader::Info& stage, Shader::Backend::
             std::memcpy(&raw, record_words, sizeof(raw));
             ssharp = sampler.PostOp(raw, aniso_dw3);
             Core::NativeRegistry::NoteBinder(7);
+            Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcSamplerRecord); // note 152
         } else if (sampler.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Sampler>::Summary::MultiLoad && sampler.sharp_fetch.load_mask == 0 &&
                    sampler.post_op != Shader::SharpFetchPostOp::DisableAnisoIfSingleLod) {
             // F5: the sampler is the shader's own immediates (no flat user data dword is read), so a stage whose flat user data was skipped still has it
             ssharp = sampler.GetSharp(stage);
             Core::NativeRegistry::NoteBinder(11);
+            Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcSamplerRecord); // note 152
         } else if (StageFlatSkipped(stage)) {
             Core::NativeRegistry::NoteBinder(6); // must not happen
             if (stage.sw_stage == Shader::SwStage::Compute) {
@@ -7952,6 +8014,7 @@ void Rasterizer::BindSamplersLegacy(const Shader::Info& stage, Shader::Backend::
             ssharp = AmdGpu::Sampler{};
         } else {
             ssharp = sampler.GetSharp(stage);
+            Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcSamplerUserData); // note 152
         }
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
                                 current_bc_base->Address() == 0)) {

@@ -100,6 +100,7 @@ struct StagePlan {
 struct DrawPlan {
     const GraphicsPipeline* pipeline{}; ///< Null if the pipeline lookup failed.
     FixedState fixed{};
+    const FixedState* fixed_source{}; ///< note 154 shadow: the cached state `fixed` was copied from (null: planned another way)
     DrawInputs inputs{};
     bool executed{}; ///< the draw was executed from a record: no register based classification
     u8 op_class{0xff}; ///< not 0xff: one of the game's own transition operations (Rasterizer::DrawClass) that the raster thread performs from this plan, no pipeline

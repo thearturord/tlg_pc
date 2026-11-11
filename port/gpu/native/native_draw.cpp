@@ -43,6 +43,7 @@
 #include "native/native_image_desc.h"
 #include "native/native_view_table.h"
 #include "native/native_draw.h"
+#include "native/native_hook_diff.h"
 #include "native/native_flight.h"
 #include "native/native_invariant.h"
 #include "native/native_job_gen.h"
@@ -1296,6 +1297,7 @@ void AddGeometryId(NativeRecord& record, u64 object) {
     }
     record.geometry_ids[record.geometry_id_count++] = id;
 }
+thread_local std::array<u64, MaxRecordBindings> t_bind_obj{}; // note 153 shadow: the object behind each binding of the record being built
 void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* words, u32 dwords, u32 table_sgpr = 0xff, u32 entry_dwords = 0, u32 table_base = 0) {
     if (binding_record == nullptr || (stage > 1 && stage != 5)) { // B2: the compute stage (5) names its resources too
         return;
@@ -1306,6 +1308,7 @@ void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* word
         return;
     }
     RecordBinding& binding = record.bindings[record.binding_count++];
+    t_bind_obj[record.binding_count - 1] = last_descriptor_object.object;
     binding = {};
     binding.stage = static_cast<u8>(stage);
     binding.kind = static_cast<u8>(kind);
@@ -1327,6 +1330,50 @@ void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* word
             std::memcpy(binding.words, derived, sizeof(derived));
         }
     }
+}
+
+/// Notes 153 and 154: two bindings say the same (every field the binder reads).
+bool SameBinding(const RecordBinding& a, const RecordBinding& b) noexcept {
+    if (a.stage != b.stage || a.kind != b.kind || a.offset != b.offset || a.slot != b.slot || a.dwords != b.dwords || a.table_sgpr != b.table_sgpr ||
+        a.entry_dwords != b.entry_dwords || a.table_base != b.table_base || a.id != b.id || a.view_id != b.view_id) {
+        return false;
+    }
+    for (u32 i = 0; i < a.dwords && i < 8; ++i) {
+        if (a.words[i] != b.words[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+thread_local std::array<RecordBinding, MaxRecordBindings> t_prev_bind{};
+thread_local std::array<u64, MaxRecordBindings> t_prev_obj{};
+thread_local u32 t_prev_bind_count = 0;
+thread_local bool t_prev_bind_valid = false;
+/// Note 153 shadow: this draw record's binding list against the previous one built on this guest thread (by slot: the same object, and whether it gave the same binding).
+template <typename R>
+void HookDiffBindings(const R& rec) {
+    const u32 n = std::min<u32>(rec.binding_count, MaxRecordBindings);
+    u32 same_obj = 0, same_obj_same = 0, other_obj_same = 0;
+    bool all_same = t_prev_bind_valid && n == t_prev_bind_count;
+    for (u32 i = 0; i < n; ++i) {
+        const bool have = t_prev_bind_valid && i < t_prev_bind_count;
+        const bool same = have && SameBinding(rec.bindings[i], t_prev_bind[i]);
+        all_same &= same;
+        if (have && t_bind_obj[i] == t_prev_obj[i] && t_bind_obj[i] != 0 && rec.bindings[i].stage == t_prev_bind[i].stage && rec.bindings[i].kind == t_prev_bind[i].kind &&
+            rec.bindings[i].offset == t_prev_bind[i].offset && rec.bindings[i].slot == t_prev_bind[i].slot) {
+            ++same_obj;
+            same_obj_same += same ? 1u : 0u;
+        } else if (same) {
+            ++other_obj_same;
+        }
+    }
+    Core::HookDiff::NoteBindings(n, t_prev_bind_valid && n == t_prev_bind_count, same_obj, same_obj_same, other_obj_same, all_same);
+    for (u32 i = 0; i < n; ++i) {
+        t_prev_bind[i] = rec.bindings[i];
+        t_prev_obj[i] = t_bind_obj[i];
+    }
+    t_prev_bind_count = n;
+    t_prev_bind_valid = true;
 }
 
 /// Adds the descriptor just built to the draw's binding list (`offset` 0xffff: an entry of a table behind a pointer).
@@ -2228,9 +2275,27 @@ struct Entry {
 };
 std::mutex mutex;
 std::unordered_multimap<u64, std::unique_ptr<Entry>> states;
+// note 153 shadow (TLG_HOOK_DIFF=1): the key words of the last Build on this guest thread and of the draw before it
+thread_local std::array<u64, KeyWords> t_key{};
+thread_local bool t_key_valid = false;
+thread_local std::array<u64, KeyWords> t_prev_key{};
+thread_local const Vulkan::FixedState* t_prev_state = nullptr;
+thread_local bool t_prev_valid = false;
+/// note 153: the state just built against the previous draw's (same key words: the same state, by construction of the cache)
+void ShadowCompare(const Vulkan::FixedState* got) {
+    if (!t_key_valid || got == nullptr) {
+        return;
+    }
+    const bool same_key = t_prev_valid && t_prev_key == t_key;
+    Core::HookDiff::NoteFixed(t_prev_valid, same_key, t_prev_valid && got == t_prev_state);
+    t_prev_key = t_key;
+    t_prev_state = got;
+    t_prev_valid = true;
+}
 
 /// The fixed-function state of the draw the context describes, or null when an object is not what the builder knows.
 const Vulkan::FixedState* Build(u64 ctx, const DeviceAddresses& dev) {
+    t_key_valid = false;
     u64 blend = Rd<u64>(ctx, Ctx::BlendState);
     u64 raster = Rd<u64>(ctx, Ctx::RasterizerState);
     u64 ds = Rd<u64>(ctx, Ctx::DepthStencilState);
@@ -2277,6 +2342,10 @@ const Vulkan::FixedState* Build(u64 ctx, const DeviceAddresses& dev) {
     u64 hash = 0xcbf29ce484222325ull;
     for (const u64 word : key) {
         hash = (hash ^ word) * 0x100000001b3ull;
+    }
+    if (Core::HookDiff::DiffOn()) [[unlikely]] {
+        t_key = key;
+        t_key_valid = true;
     }
     std::lock_guard lock{mutex};
     for (auto [it, end] = states.equal_range(hash); it != end; ++it) {
@@ -2696,6 +2765,26 @@ void StorePackage(u64 key, const NativeRecord& slot) {
 
 /// The package's content equals what the synthesis just produced (`slot` and the thread's synthesis outputs).
 /// Guest thread: builds the record of a draw. Returns its number.
+u32 RecordBindingsStateImpl(u64 seq, const RecordBinding* b, u32 n) {
+    // note 154 shadow: would a pointer to the record slot's bindings still be valid when the draw executes (the raster thread reads while the hook may refill the slot)
+    if (seq == 0) {
+        return 3;
+    }
+    const auto& s = Slot(seq);
+    if (s.seq.load(std::memory_order_acquire) != seq || s.bindings_for != seq) {
+        return 1;
+    }
+    if (s.binding_count != n) {
+        return 2;
+    }
+    for (u32 i = 0; i < n && i < MaxRecordBindings; ++i) {
+        if (!SameBinding(s.bindings[i], b[i])) {
+            return 2;
+        }
+    }
+    return 0;
+}
+
 u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     PhaseClockMr mr;
     const u64 seq = TakeSeq();
@@ -2761,6 +2850,9 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     slot.fixed = nullptr;
     if (kind <= 2) {
         slot.fixed = Fixed::Build(ctx, ResolveDevice());
+        if (Core::HookDiff::DiffOn()) [[unlikely]] {
+            Fixed::ShadowCompare(slot.fixed); // note 153
+        }
     }
     mr.Mark(2);
     slot.cb_extent = synth_cb_extent;
@@ -2812,6 +2904,9 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
         SynthesizeUserData(ctx, 1, pixel_shader + 0x30, slot.ps_gnm, 0x3c, ShBase + 0x0c, slot.regs.data(), n, slot);
         mr.Mark(4);
         binding_record = nullptr;
+        if (Core::HookDiff::DiffOn() && kind <= 2) [[unlikely]] {
+            HookDiffBindings(slot); // note 153
+        }
         slot.no_inputs = slot.binding_count == 0 && (slot.vs_gnm != 0 || slot.ps_gnm != 0) && (slot.vs_gnm == 0 || Rd<u8>(slot.vs_gnm, 3) == 0) &&
                          (slot.ps_gnm == 0 || Rd<u8>(slot.ps_gnm, 3) == 0);
         slot.desc_key = synth_desc_key;
@@ -4533,6 +4628,10 @@ void MaterializeRegs(ExecDraw& d) {
     }
     d.lazy = nullptr;
     lazy_materialized.fetch_add(1, std::memory_order_relaxed);
+}
+
+u32 RecordBindingsState(u64 seq, const RecordBinding* b, u32 n) {
+    return RecordBindingsStateImpl(seq, b, n); // note 154
 }
 
 u64 RecordCallerGhidra(u64 seq) {

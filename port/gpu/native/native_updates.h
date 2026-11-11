@@ -382,9 +382,8 @@ void NoteB9(B9Count what, u64 n = 1) noexcept;
 }
 [[nodiscard]] nlohmann::json B9Report();
 
-/// D2 (`TLG_LEAN_DIRTY`): 0 keeps `all_object_dirty`, the by-address copy of every announced byte, as the answer for memory no engine buffer holds (today's behaviour);
-/// 1 keeps it and compares each of its answers with the one the unattributed set alone gives (counters `Lean*`); 2 does not keep it (a deleted buffer's pending bytes move to
-/// the unattributed set instead).
+/// D2: always 2 since note 149: no by-address copy of every announced byte is kept (a deleted buffer's pending bytes move to the unattributed set). Modes 0 and 1
+/// (`all_object_dirty`) are deleted.
 [[nodiscard]] u32 LeanDirtyMode() noexcept;
 
 /// Load address of the executable (for turning code addresses in diagnostics into offsets).

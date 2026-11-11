@@ -328,7 +328,6 @@ private:
     /// S3b.2 real: the same answer for the row of `buffer`, from the per-buffer clock (lock-free); one call in 64 is also asked of the sets, and where the sets say dirty the answer is dirty.
     [[nodiscard]] bool ObjectRangeDirtyClock(u64 id, const Buffer* buffer, VAddr addr, u64 size);
   private:
-    StampedRangeSet all_object_dirty; ///< B9.1 audit: the same bytes of all buffers by address
     /// B9.4: the Vulkan buffer of [address, address + size): a placed engine buffer's own when the range is inside one (placing it at its first use), else the arena
     /// (resident). `demote_spanning`: a range over a placed buffer's edge moves that buffer back into the arena first; false: such a range gets nullptr
     const Buffer* BufferFor(VAddr address, u64 size, bool demote_spanning = true, bool written = false);
@@ -391,9 +390,6 @@ private:
     std::array<std::atomic<u64>, 32> bind_memo_wide_counts{}; // [0..9] widened class, [10..19] the classic class (same meaning, mode 1 only) ///< widened class: answers used, compared (mode 1), different answer, stream answers, uncached call did work, hits seen
     std::pair<const Buffer*, u64> ObtainBufferUncached(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
                                                        Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object);
-    // zero copy (TLG_ZERO_COPY=1, zero-copy-dynamic-buffers.md): counters
-    std::array<std::atomic<u64>, 10> zero_copy_counts{};
-    std::atomic<bool> zero_copy_unavailable{false};
     /// The engine buffers as the in order create and delete events know them: the raster thread's view. The live table of the game thread is ahead of the raster thread at frames in flight 2
     /// (it has deleted what the raster thread still works on and created what it has not reached). `TLG_ORDERED_VIEW=1`: the buffer cache asks this view (BuffersInView, ResourceAtView,
     /// LookupView); otherwise it asks the live table. `TLG_ORDERED_VIEW_CHECK=1` counts the requests where the two disagree.
@@ -404,7 +400,9 @@ private:
     [[nodiscard]] bool LookupView(u64 id, Core::NativeDevice::Object& out) const;
 
 public:
-    [[nodiscard]] bool ZeroCopyOn() const noexcept;
+    [[nodiscard]] bool ZeroCopyOn() const noexcept {
+        return false; // note 149: the zero-copy path (TLG_ZERO_COPY) is deleted
+    }
     [[nodiscard]] nlohmann::json ZeroCopyReport() const;
 
 private:

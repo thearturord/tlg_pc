@@ -5,6 +5,7 @@
 #include "native/native_hook_owned.h"
 #include "native/native_texture_version.h"
 #include "native/native_view_table.h"
+#include "native/native_dispatch_executor.h"
 #include "video_core/half_phase.h"
 #include <chrono>
 #include <fstream>
@@ -631,6 +632,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id, Core:
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+    Core::DispatchExecutor::NoteAddressCall(1); // note 152 shadow
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseImgResolve};
     Core::SplitCensus::Touch(Core::SplitCensus::TexFind);
     TLG_PROF_LEVEL("texture.find_image", 2);

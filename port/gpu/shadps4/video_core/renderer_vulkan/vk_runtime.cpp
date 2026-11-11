@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "native/native_readback_policy.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
+#include "native/native_audit.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
@@ -1583,7 +1584,7 @@ void Runtime::FlushBarriers() {
                     epoch_entries.clear();
                     ++epoch_stats.cap_clears;
                 }
-                epoch_audit = EpochPlannerMode() != 2 || (epoch_flushes & 63) == 0;
+                epoch_audit = EpochPlannerMode() != 2 || ((epoch_flushes & 63) == 0 && Core::Audit::On()); // note 150: TLG_AUDITS=0 has no audit windows
                 epoch_stats.audit_windows += epoch_audit && EpochPlannerMode() == 2 ? 1 : 0;
             }
             if (BarrierCensus::On()) {

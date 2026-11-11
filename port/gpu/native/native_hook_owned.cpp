@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 tlg_pc
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "native/native_hook_owned.h"
+#include "native/native_audit.h"
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -245,7 +246,7 @@ u8 OnWrite(u32 tag, u64 id, u64 address, u64 size) noexcept {
                 }
                 if (Mode() == 2) {
                     static thread_local u32 audit_tick = 0;
-                    if ((++audit_tick & 63u) == 0) {
+                    if (Core::Audit::Due(audit_tick)) {
                         hk[HkAudited].fetch_add(1, std::memory_order_relaxed);
                         return MarkAudit; // announced, checked at its apply
                     }
