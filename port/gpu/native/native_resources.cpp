@@ -533,6 +533,7 @@ std::shared_mutex large_mutex;
 std::unordered_map<u64, std::shared_ptr<ImmutableBuffer>> large_by_id;
 std::unordered_map<u64, std::shared_ptr<ImmutableBuffer>> large_by_object;
 std::vector<std::shared_ptr<ImmutableBuffer>> large_dead;
+std::atomic<u64> large_epoch{1}; ///< bumped by every add and removal (the per-thread cache of `FindLargeById` is valid for one epoch)
 
 void AddLarge(const Resource& resource) {
     auto entry = std::make_shared<ImmutableBuffer>();
@@ -549,13 +550,32 @@ void AddLarge(const Resource& resource) {
     }
     large_by_object[entry->object] = entry;
     large_by_id[entry->id] = entry;
+    large_epoch.fetch_add(1, std::memory_order_release);
 }
 } // namespace
 
 ImmutableBuffer* FindLargeById(u64 id) {
-    std::shared_lock lock{large_mutex};
-    const auto it = large_by_id.find(id);
-    return it != large_by_id.end() && it->second->alive.load(std::memory_order_acquire) ? it->second.get() : nullptr;
+    // as FindImmutableById: a per-thread cache by id, each entry valid for the epoch it was filled at (negative answers too)
+    struct Entry {
+        u64 id{};
+        ImmutableBuffer* buffer{};
+        u64 epoch{~u64{0}};
+    };
+    static thread_local std::unique_ptr<Entry[]> cache{new Entry[8192]};
+    const u64 epoch = large_epoch.load(std::memory_order_acquire);
+    Entry& entry = cache[(id * 0x9E3779B97F4A7C15ull) >> 51];
+    if (entry.id == id && entry.epoch == epoch) {
+        return entry.buffer != nullptr && entry.buffer->alive.load(std::memory_order_acquire) ? entry.buffer : nullptr;
+    }
+    ImmutableBuffer* found = nullptr;
+    {
+        std::shared_lock lock{large_mutex};
+        if (const auto it = large_by_id.find(id); it != large_by_id.end() && it->second->alive.load(std::memory_order_acquire)) {
+            found = it->second.get();
+        }
+    }
+    entry = {id, found, epoch};
+    return found;
 }
 
 ImmutableBuffer* FindOwnRecordById(u64 id) {
@@ -596,6 +616,7 @@ bool NoteBufferDestroyed(u64 object) {
             large_dead.push_back(it->second);
             large_by_id.erase(it->second->id);
             large_by_object.erase(it);
+            large_epoch.fetch_add(1, std::memory_order_release);
         }
     }
     bool had_immutable_entry = false;
