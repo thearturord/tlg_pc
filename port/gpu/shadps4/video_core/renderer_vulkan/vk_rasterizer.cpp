@@ -4831,7 +4831,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         }
                         if (own == nullptr || eff == 0) {
                             OM::NoteOwn(OM::OwnNoOwn, cls);
-                            if (own == nullptr && (OM::DiagOn() || OM::OwnPlaceMode() != 0)) [[unlikely]] {
+                            if (own == nullptr && (OM::DiagOn() || OM::OwnPlaceMode() == 1)) [[unlikely]] {
                                 t_f1_no_own = true;
                                 t_f1_no_own_begin = h->begin;
                                 t_f1_no_own_end = h->end;
@@ -5719,7 +5719,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
             if (OM::DiagOn()) {
                 OM::NoteDiag(streamed ? OM::DiagNoOwnOldStream : now != nullptr && info.buffer == now->Handle() ? OM::DiagNoOwnOldPlacedNow : OM::DiagNoOwnOldOther);
             }
-            if (streamed && !t_f1_no_own_written && OM::OwnPlaceMode() != 0) {
+            if (streamed && !t_f1_no_own_written && OM::OwnPlaceMode() == 1) {
                 // note 121 shadow: placing this buffer on its first bind; the block would be CPU-writable when the engine writes it with the CPU (as Place decides with zero copy)
                 Core::NativeDevice::Object o{};
                 const bool cpu_written = Core::NativeDevice::Lookup(t_f1_no_own_id, o) && o.usage != 3 && (o.cpu_access & 0x10000) != 0;

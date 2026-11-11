@@ -238,7 +238,7 @@ u32 OwnRangeMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_OWN_RANGE");
         if (e == nullptr || e[0] == 0) {
-            return 0u; // default 0 (note 120); =1 shadow, =2 real
+            return 2u; // default 2 since 2026-11-11 after the owner's play (note 124); LEGACY(own_range): =0 through ObtainBuffer, =1 shadow
         }
         return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
@@ -259,7 +259,10 @@ u32 OwnGeometryMode() noexcept {
 u32 OwnExactEndMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_OWN_EXACT_END");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // default 0 (note 122)
+        if (e == nullptr || e[0] == 0) {
+            return 2u; // default 2 since 2026-11-11 after the owner's play (note 124); LEGACY(own_exact_end): =0 the rounded end only, =1 shadow
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
@@ -275,7 +278,10 @@ u32 OwnVertexSplitMode() noexcept {
 u32 OwnPlaceMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_OWN_PLACE");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // default 0 (note 121); =1 shadow, =2 real
+        if (e == nullptr || e[0] == 0) {
+            return 2u; // default 2 since 2026-11-11 after the owner's play (note 124); LEGACY(own_place): =0 small reads copied into the stream ring, =1 shadow
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
