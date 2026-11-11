@@ -44,6 +44,17 @@ u32 WrittenMode() noexcept {
     return mode;
 }
 
+u32 StorageMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_STORAGE_TABLE");
+        if (Mode() == 0 || e == nullptr || e[0] == 0) {
+            return 0u; // default 0 (note 111): storage images by their T# as before; =1 shadow, =2 real
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
+
 namespace {
 std::mutex mutex; // (the raster thread binds and applies the batch's events; the lock only guards a second recording thread)
 std::unordered_map<u64, Entry> entries;                       // key: view id and use flags
@@ -143,6 +154,11 @@ nlohmann::json Report() {
     j["written_buffers"] = {{"mode", WrittenMode()}, {"walks", c(WbCalls)}, {"named_whole", c(WbNamed)}, {"id_says_no_image", c(WbIdNone)}, {"walk_marked_an_image", c(WbWalkFound)},
                             {"ID_SAID_NO_IMAGE_BUT_WALK_FOUND_MUST_BE_0", c(WbIdNoneWalkFound)}, {"not_named", c(WbNotNamed)}, {"real_walks_skipped", c(WbSkipped)},
                             {"real_audited", c(WbAudited)}, {"AUDIT_WALK_FOUND_MUST_BE_0", c(WbAuditFound)}};
+    j["storage"] = {{"mode", StorageMode()}, {"stages_with_a_written_image", c(StStages)}, {"stages_all_in_class", c(StStagesAllInClass)},
+                    {"stages_would_be_served_by_the_table", c(StStagesWouldServe)}, {"stages_refused_same_image_twice", c(StStagesSameImageTwice)},
+                    {"stages_refused_not_bindable", c(StStagesNotBindable)}, {"written_in_class", c(StInClass)}, {"same", c(StSame)},
+                    {"STORAGE_TABLE_DIFFERENT_MUST_BE_0", c(StDifferent)}, {"no_entry_made", c(StNoEntry)}, {"stale_remade", c(StStale)},
+                    {"not_in_class", {{"no_view", c(StNoView)}, {"dynamic_or_unknown_texture", c(StDynamic)}, {"fallback_or_multi", c(StOtherUse)}, {"null", c(StNull)}}}};
     j["real"] = {{"stages_bound_from_the_table", c(RealServed)}, {"image_bindings_bound_from_the_table", c(RealServedImages)}, {"stages_audited_by_the_old_path", c(RealAudited)},
                  {"stages_whose_image_checks_failed", c(RealCheckFailed)}};
     return j;

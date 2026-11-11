@@ -6847,7 +6847,10 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
                 ve.backing = image.backing;
                 ve.range = desc.view_info.range;
                 ve.array_key = image_keys[std::min<u32>(i, Shader::NUM_IMAGES - 1)];
-                vt_ok[i] = !(binding.force_general || binding.is_target || is_storage || vt_rebound);
+                ve.storage = is_storage;
+                // note 111: a written binding's own transit is the same with or without force_general; a target (feedback loop) or a rebind is not bindable from the table
+                vt_ok[i] = is_storage ? Core::ViewTable::StorageMode() != 0 && !(binding.is_target || vt_rebound)
+                                      : !(binding.force_general || binding.is_target || vt_rebound);
             }
             if (set_record && i < TextureSet::MaxImages) {
                 if (binding.force_general || binding.is_target || is_storage) {
@@ -6992,26 +6995,42 @@ void Rasterizer::ViewTableShadow(const Shader::Info& stage, u32 first_info, size
         return;
     }
     Note(StagesWithImages);
+    const bool storage_on = StorageMode() != 0; // note 111: written bindings compared too
+    bool any_written = false;
+    if (storage_on) {
+        for (const auto& res : stage.images) {
+            any_written |= res.is_written;
+        }
+        if (any_written) {
+            Note(StStages);
+        }
+    }
     if (image_infos.size() - first_info != n) {
         Note(NotClassUse, n); // (an image with several bindings: the infos do not line up one per image; the stage stays on the old path)
         return;
     }
-    bool all_in = true, all_served = true, any_diff = false;
+    bool all_in = true, all_served = true, any_diff = false, all_bindable = true;
+    std::array<VideoCore::ImageId, TextureSet::MaxImages> stage_bound{};
     size_t bound_at = bound_before;
     for (u32 i = 0; i < n; ++i) {
         const auto& res = stage.images[i];
+        const bool written = res.is_written;
+        const auto pick = [written](Count sampled, Count storage) { return written ? storage : sampled; };
         const vk::ImageView view = image_infos[first_info + i].imageView;
         VideoCore::ImageId bound{};
         if (view && bound_at < bound_images.size()) {
             bound = bound_images[bound_at++];
         }
-        if (res.is_written || res.mip_fallback_mode != Shader::MipStorageFallbackMode::None || res.NumBindings(stage) != 1) {
-            Note(NotClassUse);
+        if (i < TextureSet::MaxImages) {
+            stage_bound[i] = bound;
+        }
+        if ((written && !storage_on) || res.mip_fallback_mode != Shader::MipStorageFallbackMode::None || res.NumBindings(stage) != 1) {
+            Note(written && storage_on ? StOtherUse : NotClassUse);
             all_in = false;
             continue;
         }
         if (!view || !bound) {
-            Note(NotClassNull);
+            Note(pick(NotClassNull, StNull));
             all_in = false;
             continue;
         }
@@ -7028,9 +7047,12 @@ void Rasterizer::ViewTableShadow(const Shader::Info& stage, u32 first_info, size
             }
         }
         if (view_id == 0) {
-            Note(NotClassNoView);
+            Note(pick(NotClassNoView, StNoView));
             all_in = false;
             continue;
+        }
+        if (!answers_ok[i]) {
+            all_bindable = false;
         }
         const u64 flags = ImageUseFlags(res);
         const u64 view_bits = reinterpret_cast<u64>(static_cast<VkImageView>(view));
@@ -7066,48 +7088,72 @@ void Rasterizer::ViewTableShadow(const Shader::Info& stage, u32 first_info, size
             }
             fill(made);
             if (!made.in_class) {
-                Note(NotClassDynamic);
+                Note(pick(NotClassDynamic, StDynamic));
                 all_in = false;
                 continue;
             }
-            Note(ImagesInClass);
-            Note(ImagesNoEntry);
+            Note(pick(ImagesInClass, StInClass));
+            Note(pick(ImagesNoEntry, StNoEntry));
             all_served = false;
             continue;
         }
         if (!e->in_class) {
-            Note(NotClassDynamic);
+            Note(pick(NotClassDynamic, StDynamic));
             all_in = false;
             continue;
         }
-        Note(ImagesInClass);
+        Note(pick(ImagesInClass, StInClass));
         const VideoCore::ImageId entry_image{e->image_index};
         const bool valid = e->image_uid != 0 && texture_cache.ImageUid(entry_image) == e->image_uid &&
                            True(texture_cache.GetImage(entry_image).flags & VideoCore::ImageFlagBits::Registered);
         if (!valid) {
-            Note(ImagesStale);
+            Note(pick(ImagesStale, StStale));
             all_served = false;
             fill(*e);
             continue;
         }
         if (entry_image == bound && e->view_handle == view_bits) {
-            Note(ImagesSame);
+            Note(pick(ImagesSame, StSame));
             continue;
         }
-        Note(ImagesDifferent);
+        Note(pick(ImagesDifferent, StDifferent));
         any_diff = true;
         all_served = false;
         static std::atomic<u32> logged{0};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
             const auto& old_image = texture_cache.GetImage(bound);
             const auto& table_image = texture_cache.GetImage(entry_image);
-            LOG_ERROR(Render_Vulkan, "view table: view {:#x} (use {:#x}) answered image {} {:#x} {}x{} view {:#x}; the old path bound image {} {:#x} {}x{} view {:#x} (program {:#x})", view_id, flags,
-                      entry_image.index, table_image.info.guest_address, table_image.info.size.width, table_image.info.size.height, e->view_handle, bound.index,
-                      old_image.info.guest_address, old_image.info.size.width, old_image.info.size.height, view_bits, stage.pgm_hash);
+            LOG_ERROR(Render_Vulkan, "view table{}: view {:#x} (use {:#x}) answered image {} {:#x} {}x{} view {:#x}; the old path bound image {} {:#x} {}x{} view {:#x} (program {:#x})",
+                      written ? " (storage)" : "", view_id, flags, entry_image.index, table_image.info.guest_address, table_image.info.size.width, table_image.info.size.height,
+                      e->view_handle, bound.index, old_image.info.guest_address, old_image.info.size.width, old_image.info.size.height, view_bits, stage.pgm_hash);
         }
         fill(*e);
     }
-    if (all_in) {
+    if (any_written) {
+        // note 111: the real mode's stage terms (every image in the class with a valid equal entry, every answer bindable by the tail, no image bound twice with one binding written)
+        bool twice = false;
+        for (u32 i = 0; i < n && i < TextureSet::MaxImages && !twice; ++i) {
+            if (!stage.images[i].is_written || !stage_bound[i]) {
+                continue;
+            }
+            for (u32 k = 0; k < n && k < TextureSet::MaxImages; ++k) {
+                if (k != i && stage_bound[k] == stage_bound[i]) {
+                    twice = true;
+                    break;
+                }
+            }
+        }
+        if (all_in) {
+            Note(StStagesAllInClass);
+            if (twice) {
+                Note(StStagesSameImageTwice);
+            } else if (!all_bindable) {
+                Note(StStagesNotBindable);
+            } else if (all_served) {
+                Note(StStagesWouldServe);
+            }
+        }
+    } else if (all_in) {
         Note(StagesAllInClass);
         if (all_served) {
             Note(StagesWouldServe);

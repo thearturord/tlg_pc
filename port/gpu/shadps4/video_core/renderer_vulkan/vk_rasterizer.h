@@ -626,6 +626,7 @@ private:
         const void* backing{};
         VideoCore::SubresourceRange range{};
         bool null_entry{};
+        bool storage{}; ///< note 111: a written (storage) binding of the image
         u32 array_key{}; ///< tlg C9: the image's descriptor array (Shader::Indexed::ImageKey of its T#)
         u64 found_uid{}, id_uid{}; ///< F2 item 4: the images' uids (a slot can be reused by another image)
     };

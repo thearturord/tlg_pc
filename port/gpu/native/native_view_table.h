@@ -17,6 +17,9 @@ namespace Core::ViewTable {
 /// Notes 107 to 110 (`TLG_WRITTEN_NO_IMAGE`: 2 real by default since the owner's play, note 110, one in 64 walked as the audit; 1 shadow; 0 off, the old path): a written binding of an engine buffer whose image list holds no live image and no
 /// waiting clear needs no texture cache walk for images based in its memory (`NativeImageIndex::NoImageInBuffer`).
 [[nodiscard]] u32 WrittenMode() noexcept;
+/// Note 111 (`TLG_STORAGE_TABLE`: 0 off by default, 1 shadow; 0 also while `TLG_VIEW_TABLE=0`): storage (written) image bindings of non-dynamic engine textures by their view id, in this same
+/// table (the use flags hold `is_written`).
+[[nodiscard]] u32 StorageMode() noexcept;
 
 struct Entry {
     u64 view_id{};
@@ -83,6 +86,20 @@ enum Count : u32 {
     WbSkipped,              ///< real mode: walks skipped (the id says no image)
     WbAudited,              ///< real mode: ... walked anyway as the audit (one in 64)
     WbAuditFound,           ///< real mode: ... and the audit's walk marked an image (AUDIT_WALK_FOUND_MUST_BE_0)
+    StStages,               ///< note 111 shadow: stages with a written image binding
+    StStagesAllInClass,     ///< ... every image binding in the class
+    StStagesWouldServe,     ///< ... every entry valid and equal, every answer bindable, no image twice: the real mode binds them from the table
+    StStagesSameImageTwice, ///< ... refused: the same image bound twice, one binding written
+    StStagesNotBindable,    ///< ... refused: an answer the tail cannot bind (a target, a rebind, a forced-general sampled image)
+    StInClass,              ///< written image bindings in the class
+    StSame,                 ///< ... valid entry equal to the old path's answer
+    StDifferent,            ///< ... valid entry that differs (STORAGE_TABLE_DIFFERENT_MUST_BE_0)
+    StNoEntry,              ///< ... entry made
+    StStale,                ///< ... entry remade (uid moved or unregistered)
+    StNoView,               ///< written bindings whose record names no view
+    StDynamic,              ///< ... whose view's texture is dynamic or unknown
+    StOtherUse,             ///< ... a mip fallback store or several bindings
+    StNull,                 ///< ... a null or rejected image
     Count_
 };
 void Note(Count c, u64 n = 1) noexcept;
