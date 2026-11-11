@@ -4652,6 +4652,7 @@ void Rasterizer::BindBufferLegacy(const Shader::Info& stage, u32 buffer_index, S
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.
+                Core::DispatchExecutor::Note(Core::DispatchExecutor::SrcClipPlanes); // note 165
                 if (clip_plane_mask == 0) {
                     buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
                 } else {
@@ -5573,8 +5574,11 @@ void Rasterizer::EmitBufferWrite(const Shader::Info& stage, u32 buffer_index, Sh
 // ---- Note 159: the dispatch executor (plan R2.10, `TLG_DISPATCH_EXECUTOR`) ----
 
 u32 Rasterizer::ExecutorDispatchMode(const Pipeline* pipeline) {
-    const u32 mode = Core::DispatchExecutor::Mode();
-    if (mode == 0 || !pipeline->IsCompute()) {
+    // note 165: a draw takes the draw executor's mode (TLG_DRAW_EXECUTOR), a dispatch the dispatch executor's
+    const bool draw = !pipeline->IsCompute();
+    const u32 mode = draw ? Core::DispatchExecutor::DrawMode() : Core::DispatchExecutor::Mode();
+    Core::DispatchExecutor::SelectSet(draw);
+    if (mode == 0) {
         return 0;
     }
     static const bool usable = [this] {
@@ -5591,8 +5595,8 @@ u32 Rasterizer::ExecutorDispatchMode(const Pipeline* pipeline) {
     if (!usable || Core::LightRecorder::On()) {
         return 0;
     }
-    static thread_local u32 audit_tick = 0;
-    return mode == 2 && !Core::Audit::Due(audit_tick) ? 2u : 1u;
+    static thread_local u32 audit_tick[2] = {};
+    return mode == 2 && !Core::Audit::Due(audit_tick[draw ? 1 : 0]) ? 2u : 1u;
 }
 
 bool Rasterizer::ExecutorDecide(const Shader::Info& stage, u32 buffer_index, ExecAnswer& a) {
@@ -5628,13 +5632,20 @@ bool Rasterizer::ExecutorDecide(const Shader::Info& stage, u32 buffer_index, Exe
             a.size = stage.flattened_ud_buf.size() * sizeof(u32);
             return true;
         }
-        if (desc.buffer_type == Shader::BufferType::SharedMemory && !(indexed_active && stage.indexed)) {
+        if (desc.buffer_type == Shader::BufferType::SharedMemory && stage.sw_stage == Shader::SwStage::Compute && !(indexed_active && stage.indexed)) {
             a.kind = ExShared;
             a.handle = buffer_cache.GetStreamBuffer().Handle();
             a.size = u64{current_cs->SharedMemSize()} * current_cs->NumWorkgroups();
             return true;
         }
-        return refuse(RfSpecial); // (clip planes: draws only; the shared memory of an indexed stage: the old body notes it)
+        if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
+            // note 165: the draw's own state, no address: null when no plane is enabled, else a stream copy of the planes
+            a.kind = ExClipPlanes;
+            a.handle = clip_plane_mask == 0 ? vk::Buffer{} : buffer_cache.GetStreamBuffer().Handle();
+            a.size = clip_plane_mask == 0 ? VK_WHOLE_SIZE : AmdGpu::NUM_CLIP_PLANES * 4 * sizeof(float);
+            return true;
+        }
+        return refuse(RfSpecial); // (the shared memory of an indexed stage or of a draw stage: the old body notes it)
     }
     const StagePlan* op = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
                           : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
@@ -5896,6 +5907,24 @@ bool Rasterizer::ExecutorCommit(const Shader::Info& stage, u32 buffer_index, Exe
     case ExNull:
         buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
         break;
+    case ExClipPlanes:
+        if (clip_plane_mask == 0) {
+            buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+        } else {
+            auto& vk_buffer = buffer_cache.GetStreamBuffer();
+            std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
+            for (u32 i = 0; i < AmdGpu::NUM_CLIP_PLANES; ++i) {
+                const auto& plane = draw_inputs->clip_user_data[i];
+                planes[i * 4 + 0] = std::bit_cast<float>(plane.data_x);
+                planes[i * 4 + 1] = std::bit_cast<float>(plane.data_y);
+                planes[i * 4 + 2] = std::bit_cast<float>(plane.data_z);
+                planes[i * 4 + 3] = std::bit_cast<float>(plane.data_w);
+            }
+            const u32 ubo_size = static_cast<u32>(sizeof(planes));
+            a.offset = vk_buffer.Copy(planes.data(), ubo_size, alignment);
+            buffer_infos.emplace_back(vk_buffer.Handle(), a.offset, ubo_size);
+        }
+        break;
     case ExHookRingWindow:
         Core::NativeRegistry::SetBufferWriter(stage.pgm_hash, static_cast<u32>(stage.sw_stage));
         if (recipe_active) {
@@ -5918,9 +5947,7 @@ bool Rasterizer::ExecutorCommit(const Shader::Info& stage, u32 buffer_index, Exe
 }
 
 bool Rasterizer::ExecutorBindBuffer(const Shader::Info& stage, u32 buffer_index, Shader::Backend::Bindings& binding, Shader::PushData& push_data, u64 alignment, u32 census_base) {
-    if (stage.sw_stage != Shader::SwStage::Compute) {
-        return false;
-    }
+    // (note 165: every stage of a draw too; the dispatch-only binding kinds refuse in a draw, clip planes refuse in both)
     ExecAnswer a;
     const bool native = ExecutorDecide(stage, buffer_index, a);
     ++exec_bindings;
@@ -6023,6 +6050,9 @@ void Rasterizer::ExecutorCompare(const Shader::Info& stage, u32 buffer_index, co
         break;
     case ExNull:
         same = !info.buffer && !bound_added;
+        break;
+    case ExClipPlanes:
+        same = (clip_plane_mask == 0 ? !info.buffer && info.range == VK_WHOLE_SIZE : info.buffer == a.handle && info.range == a.size) && !bound_added;
         break;
     case ExOwnPlaced: {
         // the block the old body placed: it must hold the range and be bound as the executor binds it

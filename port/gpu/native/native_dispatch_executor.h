@@ -68,6 +68,7 @@ enum ExecKind : u32 {
     ExNull,
     ExHookRingWindow,
     ExOwnSync, ///< note 162: own memory after the CPU bytes waiting in the range were uploaded into it
+    ExClipPlanes, ///< note 165: a draw's clip planes (null when none is enabled, else a stream copy of the draw's planes)
     ExKindCount
 };
 /// Note 159: why the executor left a binding to the old body.
@@ -122,6 +123,10 @@ enum Compare : u32 { CmpSame, CmpAudited, CmpRefusedOldNative, CmpRefusedOldOld,
 /// Note 162 (`TLG_OWN_SYNC`: 2 real by default, 1 shadow, 0 off): a read binding of an engine buffer whose own block waits for CPU bytes is synchronized and bound from it
 /// (instead of the R1b copy of the whole object in the stream ring). LEGACY(own_sync): =0.
 [[nodiscard]] u32 OwnSyncMode() noexcept;
+/// Note 165 (plan R2.11, `TLG_DRAW_EXECUTOR`: 0 off by default, 1 shadow, 2 real): the same executor for the buffer bindings of a draw's stages. LEGACY(draw_executor): =0.
+[[nodiscard]] u32 DrawMode() noexcept;
+/// Note 165: the counters the next notes go to (dispatches or draws).
+void SelectSet(bool draw) noexcept;
 /// Note 162: the shadow would synchronize (mode 1); the real sync left CPU bytes in the range (must not happen).
 void NoteOwnSync(bool would, bool left_bytes) noexcept;
 void NoteCompare(u32 what, u32 refusal) noexcept;

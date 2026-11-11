@@ -30,19 +30,30 @@ std::array<std::atomic<u64>, SrcCount> blocked_only_by{}; ///< dispatches whose 
 std::array<std::atomic<u64>, 2> calls_in_eligible{}, calls_all{};
 thread_local u64 t_since_publish = 0;
 // note 159
-std::array<std::atomic<u64>, ExKindCount> x_bound{};
-std::array<std::atomic<u64>, RfCount> x_refused{};
-std::array<std::atomic<u64>, CmpCount> x_compare{};
-std::array<std::atomic<u64>, RfCount> x_refused_old_native{};
-std::array<std::array<std::atomic<u64>, OwCount>, RfCount> x_refused_own_why{};
-std::atomic<u64> x_real{0}, x_real_all_executor{0}, x_shadowed{0}, x_real_bindings{0}, x_real_refused{0};
+// note 165: one set of counters for the dispatches (0) and one for the draws (1), chosen per operation (raster thread)
+struct Set {
+    std::array<std::atomic<u64>, ExKindCount> bound{};
+    std::array<std::atomic<u64>, RfCount> refused{};
+    std::array<std::atomic<u64>, CmpCount> compare{};
+    std::array<std::atomic<u64>, RfCount> refused_old_native{};
+    std::array<std::array<std::atomic<u64>, OwCount>, RfCount> refused_own_why{};
+    std::atomic<u64> real{0}, real_all_executor{0}, shadowed{0}, real_bindings{0}, real_refused{0}, sync_would{0}, sync_left{0};
+};
+std::array<Set, 2> g_sets{};
+thread_local u32 t_set = 0;
+Set& S() noexcept {
+    return g_sets[t_set];
+}
 
 constexpr const char* SrcNames[SrcCount] = {"hook_ring", "constant_ring", "gds", "flat_user_data", "clip_planes", "shared_memory", "own", "own_crossing", "own_placed",
                                             "program_consts", "hook_ring_window", "null", "texture_table", "sampler_record", "OLD_resolved_copy",
                                             "OLD_resolved_resident", "OLD_in_place", "OLD_obtain_stream", "OLD_obtain_other", "OLD_texture_stage", "OLD_sampler_user_data"};
 constexpr const char* KindNames[ExKindCount] = {"refused", "hook_ring", "constant_ring", "gds", "flat_user_data", "flat_user_data_indexed", "shared_memory", "own_placed",
-                                                "own", "own_crossing", "program_consts", "null", "hook_ring_window", "own_after_sync"};
-std::atomic<u64> x_sync_would{0}, x_sync_left{0};
+                                                "own", "own_crossing", "program_consts", "null", "hook_ring_window", "own_after_sync", "clip_planes"};
+const u32 g_draw_mode = [] {
+    const char* e = std::getenv("TLG_DRAW_EXECUTOR");
+    return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // note 165: 0 off by default (the owner's play decides), 1 shadow, 2 real
+}();
 const u32 g_own_sync = [] {
     const char* e = std::getenv("TLG_OWN_SYNC");
     return e == nullptr || e[0] == 0 ? 2u : e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u; // default 2 since 2026-11-12 (note 162); LEGACY(own_sync): =0, =1 shadow
@@ -75,41 +86,47 @@ nlohmann::json Report() {
             }
         }
     }
-    // note 159
-    auto& x = j["executor"];
-    x["dispatches_real"] = r(x_real);
-    x["dispatches_real_every_buffer_by_executor"] = r(x_real_all_executor);
-    x["dispatches_compared"] = r(x_shadowed);
-    x["real_buffer_bindings"] = r(x_real_bindings);
-    x["real_buffer_bindings_refused"] = r(x_real_refused);
-    for (u32 k = 1; k < ExKindCount; ++k) {
-        if (const u64 n = r(x_bound[k]); n != 0) {
-            x["bound_by_source"][KindNames[k]] = n;
-        }
-    }
-    for (u32 k = 1; k < RfCount; ++k) {
-        if (const u64 n = r(x_refused[k]); n != 0) {
-            x["refused_by_reason"][RefusalNames[k]] = n;
-        }
-        for (u32 w = 0; w < OwCount; ++w) {
-            if (const u64 n = r(x_refused_own_why[k][w]); n != 0) {
-                x["refused_why_own_memory_did_not_answer"][RefusalNames[k]][OwnWhyNames[w]] = n;
+    // note 159 (dispatches) and note 165 (draws)
+    for (u32 k2 = 0; k2 < 2; ++k2) {
+        const Set& c = g_sets[k2];
+        auto& x = j[k2 == 0 ? "executor" : "draw_executor"];
+        const char* ops = k2 == 0 ? "dispatches" : "draws";
+        x["mode"] = k2 == 0 ? g_mode : g_draw_mode;
+        x[std::string(ops) + "_real"] = r(c.real);
+        x[std::string(ops) + "_real_every_buffer_by_executor"] = r(c.real_all_executor);
+        x[std::string(ops) + "_compared"] = r(c.shadowed);
+        x["real_buffer_bindings"] = r(c.real_bindings);
+        x["real_buffer_bindings_refused"] = r(c.real_refused);
+        for (u32 k = 1; k < ExKindCount; ++k) {
+            if (const u64 n = r(c.bound[k]); n != 0) {
+                x["bound_by_source"][KindNames[k]] = n;
             }
         }
-        if (const u64 n = r(x_refused_old_native[k]); n != 0) {
-            x["compare_refused_where_the_old_body_was_native"][RefusalNames[k]] = n;
+        for (u32 k = 1; k < RfCount; ++k) {
+            if (const u64 n = r(c.refused[k]); n != 0) {
+                x["refused_by_reason"][RefusalNames[k]] = n;
+            }
+            for (u32 w = 0; w < OwCount; ++w) {
+                if (const u64 n = r(c.refused_own_why[k][w]); n != 0) {
+                    x["refused_why_own_memory_did_not_answer"][RefusalNames[k]][OwnWhyNames[w]] = n;
+                }
+            }
+            if (const u64 n = r(c.refused_old_native[k]); n != 0) {
+                x["compare_refused_where_the_old_body_was_native"][RefusalNames[k]] = n;
+            }
         }
+        x["compare_same"] = r(c.compare[CmpSame]);
+        x["compare_own_sync_where_the_old_body_copied"] = r(c.compare[CmpOwnSyncOld]);
+        x["own_sync_mode"] = g_own_sync;
+        x["own_sync_shadow_would_sync"] = r(c.sync_would);
+        x["compare_old_body_audited"] = r(c.compare[CmpAudited]);
+        x["compare_refused_old_body_old_source"] = r(c.compare[CmpRefusedOldOld]);
+        x["compare_refused_old_body_native"] = r(c.compare[CmpRefusedOldNative]);
+        const std::string p = k2 == 0 ? "" : "DRAW_";
+        j[p + "EXECUTOR_DIFFERENT_MUST_BE_0"] = r(c.compare[CmpDifferent]);
+        j[p + "EXECUTOR_OTHER_SOURCE_MUST_BE_0"] = r(c.compare[CmpOtherSource]);
+        j[p + "OWN_SYNC_LEFT_CPU_BYTES_MUST_BE_0"] = r(c.sync_left);
     }
-    x["compare_same"] = r(x_compare[CmpSame]);
-    x["compare_own_sync_where_the_old_body_copied"] = r(x_compare[CmpOwnSyncOld]);
-    x["own_sync_mode"] = g_own_sync;
-    x["own_sync_shadow_would_sync"] = r(x_sync_would);
-    x["compare_old_body_audited"] = r(x_compare[CmpAudited]);
-    x["compare_refused_old_body_old_source"] = r(x_compare[CmpRefusedOldOld]);
-    x["compare_refused_old_body_native"] = r(x_compare[CmpRefusedOldNative]);
-    j["EXECUTOR_DIFFERENT_MUST_BE_0"] = r(x_compare[CmpDifferent]);
-    j["EXECUTOR_OTHER_SOURCE_MUST_BE_0"] = r(x_compare[CmpOtherSource]);
-    j["OWN_SYNC_LEFT_CPU_BYTES_MUST_BE_0"] = r(x_sync_left);
     j["note"] = "note 152 tags (mode 1) and note 159 executor: per buffer binding of a compute stage, native sources decided with the old loop's tests, refusals to the old body";
     return j;
 }
@@ -141,6 +158,8 @@ Source SourceOf(u32 kind) noexcept {
         return SrcHookRingWindow;
     case ExOwnSync:
         return SrcOwn;
+    case ExClipPlanes:
+        return SrcClipPlanes;
     default:
         return SrcCount;
     }
@@ -178,26 +197,34 @@ void NoteAddressCall(u32 kind) noexcept {
 
 void NoteBound(u32 kind) noexcept {
     if (kind < ExKindCount) {
-        x_bound[kind].fetch_add(1, std::memory_order_relaxed);
+        S().bound[kind].fetch_add(1, std::memory_order_relaxed);
     }
 }
 
 void NoteRefused(u32 refusal, u32 own_why) noexcept {
     if (refusal < RfCount) {
-        x_refused[refusal].fetch_add(1, std::memory_order_relaxed);
+        S().refused[refusal].fetch_add(1, std::memory_order_relaxed);
         if (own_why < OwCount) {
-            x_refused_own_why[refusal][own_why].fetch_add(1, std::memory_order_relaxed);
+            S().refused_own_why[refusal][own_why].fetch_add(1, std::memory_order_relaxed);
         }
     }
 }
 
 void NoteCompare(u32 what, u32 refusal) noexcept {
     if (what < CmpCount) {
-        x_compare[what].fetch_add(1, std::memory_order_relaxed);
+        S().compare[what].fetch_add(1, std::memory_order_relaxed);
     }
     if (what == CmpRefusedOldNative && refusal < RfCount) {
-        x_refused_old_native[refusal].fetch_add(1, std::memory_order_relaxed);
+        S().refused_old_native[refusal].fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+u32 DrawMode() noexcept {
+    return g_draw_mode;
+}
+
+void SelectSet(bool draw) noexcept {
+    t_set = draw ? 1u : 0u;
 }
 
 u32 OwnSyncMode() noexcept {
@@ -206,23 +233,23 @@ u32 OwnSyncMode() noexcept {
 
 void NoteOwnSync(bool would, bool left_bytes) noexcept {
     if (would) {
-        x_sync_would.fetch_add(1, std::memory_order_relaxed);
+        S().sync_would.fetch_add(1, std::memory_order_relaxed);
     }
     if (left_bytes) {
-        x_sync_left.fetch_add(1, std::memory_order_relaxed);
+        S().sync_left.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
 void DispatchDone(bool real, u32 bindings, u32 refused) noexcept {
     if (real) {
-        x_real.fetch_add(1, std::memory_order_relaxed);
-        x_real_bindings.fetch_add(bindings, std::memory_order_relaxed);
-        x_real_refused.fetch_add(refused, std::memory_order_relaxed);
+        S().real.fetch_add(1, std::memory_order_relaxed);
+        S().real_bindings.fetch_add(bindings, std::memory_order_relaxed);
+        S().real_refused.fetch_add(refused, std::memory_order_relaxed);
         if (refused == 0) {
-            x_real_all_executor.fetch_add(1, std::memory_order_relaxed);
+            S().real_all_executor.fetch_add(1, std::memory_order_relaxed);
         }
     } else {
-        x_shadowed.fetch_add(1, std::memory_order_relaxed);
+        S().shadowed.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -266,7 +293,7 @@ void End(u32 bound_entries, bool barrier) noexcept {
             blocked_only_by[last_old].fetch_add(1, std::memory_order_relaxed);
         }
     }
-    if (g_mode != 0 && ++t_since_publish >= 4096) {
+    if ((g_mode != 0 || g_draw_mode != 0) && ++t_since_publish >= 4096) {
         t_since_publish = 0;
         Core::DebugServer::Publish("dispatch_executor", Report());
     }
