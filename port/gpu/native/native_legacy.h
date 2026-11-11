@@ -57,6 +57,7 @@
 ///   TLG_STORAGE_TABLE=0        storage (written) images found by their T# words at every bind, outside the view table (notes 111, 112, 147)
 ///   TLG_HOOK_DIFF=0            every draw record looks its fixed state up in the shared cache under its lock (notes 153, 157)
 ///   TLG_DISPATCH_EXECUTOR=0    every buffer binding of a dispatch through the old body (BindBufferLegacy) instead of the executor's native sources (note 159)
+///   TLG_TARGET_TAIL=0          a sampled render target of the draw (a feedback loop) is not learnt by the view table and is bound by the old texture path (note 160)
 namespace Core::Legacy {
 
 

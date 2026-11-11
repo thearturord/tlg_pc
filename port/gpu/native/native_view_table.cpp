@@ -188,7 +188,7 @@ nlohmann::json Report() {
                     {"real_note_147", {{"stages_bound_from_the_table", c(StRealServed)}, {"written_bindings_bound_from_the_table", c(StRealServedWritten)},
                                         {"stages_refused_same_image_twice", c(StRealRefusedTwice)}}}};
     j["real"] = {{"stages_bound_from_the_table", c(RealServed)}, {"image_bindings_bound_from_the_table", c(RealServedImages)}, {"stages_audited_by_the_old_path", c(RealAudited)},
-                 {"stages_whose_image_checks_failed", c(RealCheckFailed)}};
+                 {"stages_whose_image_checks_failed", c(RealCheckFailed)}, {"sampled_targets_bound_note_160", c(RealServedTargets)}};
     return j;
 }
 

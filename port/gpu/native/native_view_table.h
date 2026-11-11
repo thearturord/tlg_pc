@@ -129,6 +129,7 @@ enum Count : u32 {
     StRealServedWritten,    ///< ... their written image bindings
     StRealRefusedTwice,     ///< ... stages refused at the tail: the same image twice, one binding written
     NewImageEvents,         ///< ... the events (a texture with linked views got a new image)
+    RealServedTargets,      ///< note 160: sampled render targets (feedback loops) bound by the tail with the old path's layout
     Count_
 };
 void Note(Count c, u64 n = 1) noexcept;

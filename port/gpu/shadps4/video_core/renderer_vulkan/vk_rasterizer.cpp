@@ -6870,6 +6870,16 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set,
 
 namespace {
 thread_local u32 t_vt_refuse = Core::Coverage::IrTableOff; // note 151: why ViewTableBind last refused (raster thread)
+/// Note 160 (`TLG_TARGET_TAIL`, plan pass 3 item 2): a sampled image that is a render target of the current draw (a feedback loop) in the view table: 0 refused by the tail
+/// and never learnt (the old path binds it); 1 shadow: the table learns and compares those stages, the tail still refuses them; 2 real: the tail binds them with the old path's
+/// feedback-loop layout. Default 2 since 2026-11-11; LEGACY(target_tail): =0.
+u32 TargetTailMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_TARGET_TAIL");
+        return e == nullptr || e[0] == 0 ? 2u : e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
 }
 
 bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const TextureSet& set, u32 count, Shader::Backend::Bindings& binding) {
@@ -6911,11 +6921,13 @@ bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const Textur
         const bool redirected = entry.id != entry.found;
         const auto associated = texture_cache.GetAssociatedDepth(texture_cache.GetImage(entry.found));
         // (a written image's own transit is the same with force_general set: only a sampled one refuses it)
-        if (image.backing != entry.backing || image.binding.needs_rebind || (!entry.storage && image.binding.force_general) || image.binding.is_target ||
+        // (note 160: a sampled render target takes the old path's feedback-loop layout below; a written one is still refused)
+        const bool target_refused = image.binding.is_target && (entry.storage || TargetTailMode() != 2);
+        if (image.backing != entry.backing || image.binding.needs_rebind || (!entry.storage && image.binding.force_general) || target_refused ||
             (image.backing->num_samples > 1) != (image.info.num_samples > 1) || (redirected ? associated != entry.id : bool(associated))) {
             using namespace Core::Coverage;
             t_vt_refuse = image.backing != entry.backing ? IrTailBacking : image.binding.needs_rebind ? IrTailRebind : (!entry.storage && image.binding.force_general) ? IrTailForceGeneral
-                          : image.binding.is_target ? IrTailTarget : (image.backing->num_samples > 1) != (image.info.num_samples > 1) ? IrTailSamples : IrTailDepth; // note 157
+                          : target_refused ? IrTailTarget : (image.backing->num_samples > 1) != (image.info.num_samples > 1) ? IrTailSamples : IrTailDepth; // note 157
             return false;
         }
     }
@@ -6948,6 +6960,22 @@ bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const Textur
         }
         image.binding.is_bound = 1u;
         bound_images.emplace_back(entry.id);
+        if (image.binding.is_target && !image.info.props.is_depth) {
+            // note 160: a render target of this draw sampled by it (a feedback loop), as the old path's second pass binds it: the feedback-loop layout where the device has it,
+            // otherwise general with read and write
+            vk::ImageLayout transit_layout = vk::ImageLayout::eGeneral;
+            if (instance.IsAttachmentFeedbackLoopLayoutSupported()) {
+                transit_layout = vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+                needs_barrier |= runtime.Transit(&image, vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT, vk::PipelineStageFlagBits2::eAllGraphics, vk::AccessFlagBits2::eShaderRead);
+            } else {
+                needs_barrier |= runtime.Transit(&image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                                                 vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, entry.range);
+            }
+            image.usage.texture |= 1u;
+            image_infos.emplace_back(VK_NULL_HANDLE, entry.view, !image.backing || !runtime.PlannerDecidesLayouts() ? runtime.CurrentLayout(image) : transit_layout);
+            Core::ViewTable::Note(Core::ViewTable::RealServedTargets);
+            continue;
+        }
         const auto new_layout = image.info.props.is_depth ? vk::ImageLayout::eDepthStencilReadOnlyOptimal : vk::ImageLayout::eShaderReadOnlyOptimal;
         needs_barrier |= runtime.Transit(&image, new_layout, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead, entry.range);
         image.usage.texture |= 1u;
@@ -7449,8 +7477,9 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
                 ve.array_key = image_keys[std::min<u32>(i, Shader::NUM_IMAGES - 1)];
                 ve.storage = is_storage;
                 // note 111: a written binding's own transit is the same with or without force_general; a target (feedback loop) or a rebind is not bindable from the table
+                // note 160: a sampled target is learnt and compared too (its layout is decided at the bind, not kept in the entry)
                 vt_ok[i] = is_storage ? Core::ViewTable::StorageMode() != 0 && !(binding.is_target || vt_rebound)
-                                      : !(binding.force_general || binding.is_target || vt_rebound);
+                                      : !(binding.force_general || (binding.is_target && TargetTailMode() == 0) || vt_rebound);
             }
             if (set_record && i < TextureSet::MaxImages) {
                 if (binding.force_general || binding.is_target || is_storage) {
