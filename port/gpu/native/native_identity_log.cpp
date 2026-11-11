@@ -4,7 +4,6 @@
 
 #include "native/native_identity_log.h"
 #include <cstdlib>
-#include "native/native_legacy.h"
 
 namespace Core::NativeIdentity {
 
@@ -22,11 +21,11 @@ std::atomic<u64> clock{0};
 std::array<std::atomic<u64>, KindCount> counts{};
 } // namespace
 
-/// Note 140: the events are walked only by the legacy rows (LEGACY(engine_rows), LEGACY(geometry_rows)) and the recipe censuses; with none of them on nothing is recorded.
+/// Notes 140, 141: the events are walked only by the recipe censuses (the rows that walked them are deleted); with neither on nothing is recorded.
 bool Needed() noexcept {
     static const bool on = [] {
         const auto one = [](const char* n) { const char* e = std::getenv(n); return e != nullptr && e[0] == '1'; };
-        return Core::Legacy::EngineRows() || Core::Legacy::GeometryRows() || one("TLG_REUSE_CENSUS") || one("TLG_VERSION_CENSUS");
+        return one("TLG_REUSE_CENSUS") || one("TLG_VERSION_CENSUS");
     }();
     return on;
 }

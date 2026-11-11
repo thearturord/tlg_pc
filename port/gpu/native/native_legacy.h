@@ -8,17 +8,12 @@
 /// without searching the code. All of them are read once at startup (environment variable, or the overlay the launcher passes). Each site the switch gates in the
 /// code carries a comment `LEGACY(<name>)` so `grep -rn "LEGACY(" port/gpu` finds them all.
 ///
-/// Deleted paths kept behind a switch here (default off; `=1` brings the old path back):
-///   TLG_LEGACY_ENGINE_ROWS=1   `engine_rows`: rows for shader buffer bindings of engine buffers, on the front (rows ahead: `RowShare::Find`) and the raster thread
-///                              (`RowsServe`, `RowsLearn`, the rows-ahead bind). Deleted 2026-11-10 (design review 89): own memory by id answers them, the rest take
-///                              `ObtainBuffer`, whose answer the rows cached. Not covered: the index buffer rows (`TLG_GEOMETRY_ROWS`), which stay.
-///   TLG_LEGACY_GEOMETRY_ROWS=1 `geometry_rows`: the index buffer rows (design review 76-78). Deleted 2026-11-11 (note 122) while `TLG_OWN_GEOMETRY` is on: own memory by
-///                              the draw's geometry ids answers index reads first, the rest take `ObtainBuffer`, whose answer the rows cached.
+/// Deleted paths kept behind a switch: none. The rows for engine buffer bindings (`TLG_LEGACY_ENGINE_ROWS`, design review 89) and the index buffer rows
+/// (`TLG_LEGACY_GEOMETRY_ROWS`, note 122) were deleted for good in note 141: they had rotted once the writers left the batch (note 140).
 ///
 /// Steps whose old path is the switch's `=0` (each default on; listed so the whole set is in one place):
 ///   TLG_EPOCH_PLANNER=0        the barrier planner's per-flush maps (design review 72-74)
 ///   TLG_BARRIER_GUARD=0        the barrier query on every read binding (67-69)
-///   TLG_GEOMETRY_ROWS=0        the index buffer by address (76-78)
 ///   TLG_DROP_DIRTY_APPLIES=0   the light and slot writes' dirty-set work (81-82)
 ///   TLG_HOOK_OWNED=0           the light and slot writes announced and applied on the raster thread, one batch entry per write (90-94)
 ///   TLG_HOOK_OWNED_RECORDING=0 the three BeginRecording buffers announced whole and applied on the raster thread every frame (129-131)
@@ -58,10 +53,6 @@
 ///   TLG_OWN_VERTEX_SLACK=0     merged vertex ranges ending up to 64 bytes past their buffer (fetch rounding) through ObtainBuffer (note 139)
 namespace Core::Legacy {
 
-/// TLG_LEGACY_ENGINE_ROWS=1: the rows for shader buffer bindings of engine buffers (see above).
-[[nodiscard]] bool EngineRows() noexcept;
-/// TLG_LEGACY_GEOMETRY_ROWS=1: the index buffer rows (see above).
-[[nodiscard]] bool GeometryRows() noexcept;
 
 /// Every switch of the index with its value as read at startup ("unset" = the default), and whether a deleted path is back. Published as `legacy`.
 [[nodiscard]] nlohmann::json Report();

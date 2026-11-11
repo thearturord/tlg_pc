@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "native/native_row_version.h"
-#include "native/native_legacy.h"
 #include "native/native_own_memory_census.h"
 
 #include <array>
@@ -42,15 +41,15 @@ u32 Mode() noexcept {
     return mode;
 }
 
-/// Note 140: the versions are read only by the legacy rows (`TLG_LEGACY_ENGINE_ROWS`, `TLG_LEGACY_GEOMETRY_ROWS`), the row version shadow, the rows-ahead and walk censuses
-/// and the placement shadow. With none of them on, nothing reads a version, so nothing bumps one (LEGACY(engine_rows), LEGACY(geometry_rows)).
+/// Notes 140, 141: the versions are read only by the rows-ahead and walk censuses and the placement shadow (the rows are deleted). With none of them on, nothing
+/// reads a version, so nothing bumps one.
 bool Needed() noexcept {
     static const bool on = [] {
         if (Mode() == 0) {
             return false;
         }
         const char* a = std::getenv("TLG_ROW_AHEAD_CENSUS");
-        return Core::Legacy::EngineRows() || Core::Legacy::GeometryRows() || Mode() == 1 || (a != nullptr && a[0] == '1') || WalkCensusOn() ||
+        return (a != nullptr && a[0] == '1') || WalkCensusOn() ||
                Core::OwnMemoryCensus::OwnPlaceMode() == 1;
     }();
     return on;

@@ -9,7 +9,6 @@
 #include <windows.h>
 #endif
 #include "common/debug.h"
-#include "video_core/renderer_vulkan/row_share.h"
 #include "native/native_row_version.h"
 #include "native/native_debug_server.h"
 #include "native/native_log.h"
@@ -593,9 +592,8 @@ void Rasterizer::ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) 
             resolve_stats.planned.fetch_add(1, std::memory_order_relaxed);
         }
         static const bool ahead_census = [] { const char* e = std::getenv("TLG_ROW_AHEAD_CENSUS"); return e != nullptr && e[0] == '1'; }();
-        // the engine id, range and version of every buffer binding with a record entry: what own memory by id reads (design review 83-88), and what the rows ahead keyed by
-        // (LEGACY(engine_rows): the row lookup below runs only with TLG_LEGACY_ENGINE_ROWS=1, design review 89)
-        if (ahead_census || RowShare::Mode() != 0 || Core::OwnMemoryCensus::OwnImmutableMode() != 0 || Core::OwnMemoryCensus::OwnMutableMode() != 0) {
+        // the engine id and range of every buffer binding with a record entry: what own memory by id reads (design review 83-88; the rows ahead are deleted, note 141)
+        if (ahead_census || Core::OwnMemoryCensus::OwnImmutableMode() != 0 || Core::OwnMemoryCensus::OwnMutableMode() != 0) {
             // rows ahead census (design review 54): every buffer binding with a record entry and an engine id, written and texel ones too: what the front would key a row by
             for (u32 i = 0; i < info.buffers.size(); ++i) {
                 const auto& desc = info.buffers[i];
@@ -615,21 +613,6 @@ void Rasterizer::ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) 
                 r.ahead_id = list[first].id;
                 r.ahead_address = v.address;
                 r.ahead_size = memory->ClampRangeSize(v.address, v.size);
-                r.ahead_version = Core::RowVersion::Of(list[first].id);
-                if (RowShare::Mode() != 0) {
-                    // rows ahead shadow: the row the raster thread published for this key
-                    RowShare::Row row{};
-                    if (RowShare::Find(RowShare::Key(r.ahead_id, r.ahead_address, r.ahead_size, desc.is_formatted, desc.is_written), row) && row.id == r.ahead_id &&
-                        row.address == r.ahead_address && row.size == r.ahead_size) {
-                        r.plan_found = true;
-                        r.plan_buffer = row.buffer;
-                        r.plan_offset = row.offset;
-                        r.plan_epoch = row.epoch;
-                        r.plan_version = row.version;
-                        r.plan_flags = row.flags;
-                        r.plan_clock = row.clock;
-                    }
-                }
             }
         }
     };
