@@ -1409,6 +1409,9 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
         announced_in_ring[writer & 7][1].fetch_add(size, std::memory_order_relaxed);
     }
     Core::RingCensus::NoteAnnounce(writer, address, size); // TLG_RING_CENSUS (counters only)
+    if ((writer == 3 || writer == 7) && NativeContent::W37On()) [[unlikely]] {
+        NativeContent::W37Write(writer, address, size); // note 132 (counters only)
+    }
     if (RowVersion::Watched(address, size)) [[unlikely]] {
         static std::atomic<u32> logged{0};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 40) {

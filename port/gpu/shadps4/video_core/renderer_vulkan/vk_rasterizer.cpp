@@ -3469,6 +3469,9 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
         if (Core::OwnMemoryCensus::On()) [[unlikely]] {
             Core::OwnMemoryCensus::NoteGeometryRead(range.base_address, range.GetSize()); // design review 79, step 1a
         }
+        if (Core::NativeContent::W37On()) [[unlikely]] {
+            Core::NativeContent::W37Read(20, range.base_address, range.GetSize()); // note 132: a vertex range bound
+        }
         if (range.GetSize() >= (1ull << 30) && !memory->IsValidMapping(range.base_address)) {
             LOG_ERROR(Render, "vertex buffer range at unmapped address {:#x} of {} bytes: ignored", range.base_address, range.GetSize());
             range.buffer = nullptr;
@@ -5206,6 +5209,9 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     } else if (desc.is_formatted && (texture_cache.AnyImageOverlaps(vsharp.address, size) || texture_cache.IsMeta(vsharp.address))) {
                         inplace_image_or_meta.fetch_add(1, std::memory_order_relaxed);
                     } else {
+                        if (Core::NativeContent::W37On()) [[unlikely]] {
+                            Core::NativeContent::W37Read(22, vsharp.address, size); // note 132: an in-place binding (the GPU reads the backing as it is)
+                        }
                         const auto window = host_import->Find(vsharp.address, size);
                         const u64 aligned = Common::AlignDown(window.offset, alignment);
                         if (window.buffer && window.offset - aligned + size <= window.chunk_remaining + (window.offset - aligned)) {
@@ -6190,6 +6196,9 @@ void Rasterizer::ResolveBufferBindingBody(const Shader::Info& stage, u32 buffer_
                     } else if (desc.is_formatted && (texture_cache.AnyImageOverlaps(vsharp.address, size) || texture_cache.IsMeta(vsharp.address))) {
                         inplace_image_or_meta.fetch_add(1, std::memory_order_relaxed);
                     } else {
+                        if (Core::NativeContent::W37On()) [[unlikely]] {
+                            Core::NativeContent::W37Read(22, vsharp.address, size); // note 132: an in-place binding (the GPU reads the backing as it is)
+                        }
                         const auto window = host_import->Find(vsharp.address, size);
                         const u64 aligned = Common::AlignDown(window.offset, alignment);
                         if (window.buffer && window.offset - aligned + size <= window.chunk_remaining + (window.offset - aligned)) {
@@ -9168,6 +9177,9 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     Core::ResourceAudit::Note(src_gds ? Core::ResourceAudit::GdsFill : Core::ResourceAudit::MemoryCopySrc, src, num_bytes, false);
     if (!dst_gds && !src_gds) {
         Core::NativeContent::NoteCopy(dst, src, num_bytes); // F2.2 shadow: the destination's content is the source's, resolved from the store
+    }
+    if (!src_gds && Core::NativeContent::W37On()) [[unlikely]] {
+        Core::NativeContent::W37Read(21, src, num_bytes); // note 132: the source of a GPU memory copy
     }
     if (!dst_gds && !src_gds && Core::NativeResources::ImageCopyEnabled() && TryCopyImages(dst, src, num_bytes)) {
         return;

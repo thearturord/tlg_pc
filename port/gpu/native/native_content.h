@@ -127,6 +127,11 @@ void NoteTextureMap(u64 resource_id, u64 pointer, u64 announced_bytes, u32 row_p
 /// The engine's own GPU memory allocation (AllocGarlicMemory / AllocOnionMemory): always kept (a newer allocation drops the older ones it overlaps) so that the owner-less lookups outside the ring
 /// can be answered from the allocation they lie in (F2.3 ring image index).
 void NoteGpuAllocation(u64 address, u64 size);
+/// Note 132 (`TLG_W37_CENSUS=1`, counters only): where writers 3 (outside the frame ring) and 7 write, by the engine GPU allocation that holds the range, how soon an address is
+/// written again, and which reads meet those allocations (`kind`: a LateKind, or 100 an own-memory bind)
+[[nodiscard]] bool W37On() noexcept;
+void W37Write(u32 writer, u64 address, u64 size);
+void W37Read(u32 kind, u64 address, u64 size);
 /// [address, address + size) lies inside one allocation the engine made.
 [[nodiscard]] bool InGpuAllocation(u64 address, u64 size);
 void ClassifyRingLookup(u64 address, u64 size, u32 binding_type);

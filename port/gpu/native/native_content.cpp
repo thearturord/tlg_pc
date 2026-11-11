@@ -870,6 +870,118 @@ void NoteGpuAllocation(u64 address, u64 size) {
     g_gpu_windows.emplace(address, RingWindow{size, ++g_window_serial});
 }
 
+// ---- note 132: the memory of writers 3 and 7 ----
+bool W37On() noexcept {
+    static const bool on = [] { const char* e = std::getenv("TLG_W37_CENSUS"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+namespace {
+struct W37Alloc {
+    u64 size{}, serial{};
+    u64 writes[2]{}, bytes[2]{};   ///< by writer: [0] writer 3, [1] writer 7
+    u64 reads[32]{};               ///< by read kind (31: an own-memory bind)
+    std::unordered_map<u64, u32> last; ///< write start -> submission of its last write (capped)
+    u64 regap[6]{};                ///< the same start written again after 0, 1, 2, 3, 4-7, 8+ submissions
+    u64 lo{~u64{0}}, hi{};         ///< span of the written bytes inside the allocation
+};
+std::mutex g_w37_mutex;
+std::map<u64, W37Alloc> g_w37; ///< allocation start -> its counts (only allocations writers 3 or 7 wrote)
+std::atomic<u64> c_w37_writes[2][3]{}; ///< [writer][0 in an allocation, 1 in no allocation, 2 inside the frame ring (writer 3 only)]
+std::atomic<u64> c_w37_bytes[2]{};
+std::atomic<u64> c_w37_reads[32]{}, c_w37_reads_checked{0};
+std::map<u64, std::pair<u64, u64>> g_w37_outside; ///< writes in no allocation: 1 MB block -> (writes, bytes)
+std::map<u64, std::array<u64, 32>> g_w37_outside_reads; ///< reads that meet such a block, by kind
+std::atomic<u64> c_w37_outside_reads[32]{};
+/// The engine allocation holding [address, address + size): its start and window (under g_windows_mutex), or 0
+u64 W37AllocOf(u64 address, u64 size, RingWindow& window) {
+    std::scoped_lock lock{g_windows_mutex};
+    auto it = g_gpu_windows.upper_bound(address);
+    if (it == g_gpu_windows.begin()) {
+        return 0;
+    }
+    --it;
+    if (it->first + it->second.size < address + size) {
+        return 0;
+    }
+    window = it->second;
+    return it->first;
+}
+} // namespace
+
+void W37Write(u32 writer, u64 address, u64 size) {
+    if (!W37On() || size == 0 || (writer != 3 && writer != 7)) {
+        return;
+    }
+    const u32 w = writer == 3 ? 0 : 1;
+    if (InRing(address, size)) {
+        c_w37_writes[w][2].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    c_w37_bytes[w].fetch_add(size, std::memory_order_relaxed);
+    RingWindow window{};
+    const u64 start = W37AllocOf(address, size, window);
+    std::scoped_lock lock{g_w37_mutex};
+    if (start == 0) {
+        c_w37_writes[w][1].fetch_add(1, std::memory_order_relaxed);
+        auto& o = g_w37_outside[address >> 20];
+        ++o.first;
+        o.second += size;
+        return;
+    }
+    c_w37_writes[w][0].fetch_add(1, std::memory_order_relaxed);
+    auto [it, inserted] = g_w37.try_emplace(start);
+    W37Alloc& a = it->second;
+    if (inserted || a.serial != window.serial) {
+        a = W37Alloc{};
+        a.size = window.size;
+        a.serial = window.serial;
+    }
+    ++a.writes[w];
+    a.bytes[w] += size;
+    a.lo = std::min(a.lo, address - start);
+    a.hi = std::max(a.hi, address + size - start);
+    const u32 now = g_submit_count.load(std::memory_order_relaxed);
+    auto l = a.last.find(address);
+    if (l != a.last.end()) {
+        const u32 gap = now - l->second;
+        ++a.regap[gap == 0 ? 0 : gap == 1 ? 1 : gap == 2 ? 2 : gap == 3 ? 3 : gap < 8 ? 4 : 5];
+        l->second = now;
+    } else if (a.last.size() < 4096) {
+        a.last.emplace(address, now);
+    }
+}
+
+void W37Read(u32 kind, u64 address, u64 size) {
+    if (!W37On() || size == 0) {
+        return;
+    }
+    c_w37_reads_checked.fetch_add(1, std::memory_order_relaxed);
+    const u32 k = kind < 31 ? kind : 31;
+    std::scoped_lock lock{g_w37_mutex};
+    if (!g_w37_outside.empty()) {
+        for (u64 mb = address >> 20, last = (address + size - 1) >> 20; mb <= last && mb < (address >> 20) + 64; ++mb) {
+            if (g_w37_outside.contains(mb)) {
+                ++g_w37_outside_reads[mb][k];
+                c_w37_outside_reads[k].fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+        }
+    }
+    if (g_w37.empty()) {
+        return;
+    }
+    auto it = g_w37.upper_bound(address + size - 1);
+    if (it == g_w37.begin()) {
+        return;
+    }
+    --it;
+    if (it->first + it->second.size <= address) {
+        return;
+    }
+    ++it->second.reads[k];
+    c_w37_reads[k].fetch_add(1, std::memory_order_relaxed);
+}
+
 void ClassifyRingLookup(u64 address, u64 size, u32 binding_type) {
     if (!RingWindowsOn() || size == 0) {
         return;
@@ -2245,6 +2357,9 @@ bool SilentCensusActive() noexcept {
 }
 
 void SilentOwnBind(u64 id, u64 address, u64 size, const u8* own_bytes, int tracker_modified) {
+    if (W37On()) [[unlikely]] {
+        W37Read(31, address, size); // note 132: an own-memory bind over their memory
+    }
     if (!SilentCensusOn() || size == 0) {
         return;
     }
@@ -3009,6 +3124,9 @@ std::string DescribeBind() {
 
 void NoteLateRead(LateKind kind, u64 address, u64 size, u64 seq) {
     TLG_PROF_LEVEL("ledger.note_late_read", 3);
+    if (W37On()) [[unlikely]] {
+        W37Read(static_cast<u32>(kind), address, size); // note 132
+    }
     if (Core::UiTrace::Active()) [[unlikely]] {
         Core::UiTrace::NoteRead(LateKindNames[static_cast<size_t>(kind)], address, size);
     }
@@ -3565,10 +3683,69 @@ void CompareImage(const ImageUpload& upload) {
     }
 }
 
+nlohmann::json W37Report() {
+    nlohmann::json j;
+    static constexpr const char* W[2] = {"writer_3_constant_copies", "writer_7_instance_staging"};
+    for (u32 w = 0; w < 2; ++w) {
+        j[W[w]] = {{"in_an_engine_allocation", c_w37_writes[w][0].load()}, {"in_no_allocation", c_w37_writes[w][1].load()}, {"inside_the_frame_ring", c_w37_writes[w][2].load()},
+                   {"bytes_outside_the_ring", c_w37_bytes[w].load()}};
+    }
+    j["frame_ring"] = fmt::format("{:#x}..{:#x}", g_ring_begin.load(), g_ring_end.load());
+    nlohmann::json reads = nlohmann::json::object();
+    for (u32 k = 0; k < 32; ++k) {
+        if (c_w37_reads[k].load() != 0) {
+            reads[k == 31 ? std::string("own_memory_bind") : k == 20 ? std::string("vertex_range_bound") : k == 21 ? std::string("gpu_memory_copy_source") : k == 22 ? std::string("in_place_binding") : k == 23 ? std::string("buffer_cache_request") : k < LateKinds ? std::string(LateKindNames[k]) : std::to_string(k)] = c_w37_reads[k].load();
+        }
+    }
+    j["reads_checked"] = c_w37_reads_checked.load();
+    {
+        nlohmann::json ro = nlohmann::json::object();
+        for (u32 k = 0; k < 32; ++k) {
+            if (c_w37_outside_reads[k].load() != 0) {
+                ro[k == 31 ? std::string("own_memory_bind") : k == 20 ? std::string("vertex_range_bound") : k == 21 ? std::string("gpu_memory_copy_source") : k == 22 ? std::string("in_place_binding") : k == 23 ? std::string("buffer_cache_request") : k < LateKinds ? std::string(LateKindNames[k]) : std::to_string(k)] = c_w37_outside_reads[k].load();
+            }
+        }
+        j["READS_OVER_THE_BLOCKS_OUTSIDE_ANY_ALLOCATION"] = std::move(ro);
+    }
+    j["READS_OVER_THEIR_ALLOCATIONS"] = std::move(reads);
+    std::scoped_lock lock{g_w37_mutex};
+    std::vector<std::pair<u64, u64>> order;
+    for (const auto& [start, a] : g_w37) {
+        order.emplace_back(a.writes[0] + a.writes[1], start);
+    }
+    std::sort(order.begin(), order.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+    nlohmann::json top = nlohmann::json::array();
+    for (size_t i = 0; i < order.size() && i < 25; ++i) {
+        const W37Alloc& a = g_w37[order[i].second];
+        nlohmann::json r = nlohmann::json::object();
+        for (u32 k = 0; k < 32; ++k) {
+            if (a.reads[k] != 0) {
+                r[k == 31 ? std::string("own_memory_bind") : k == 20 ? std::string("vertex_range_bound") : k == 21 ? std::string("gpu_memory_copy_source") : k == 22 ? std::string("in_place_binding") : k == 23 ? std::string("buffer_cache_request") : k < LateKinds ? std::string(LateKindNames[k]) : std::to_string(k)] = a.reads[k];
+            }
+        }
+        top.push_back({{"allocation", fmt::format("{:#x}+{:#x}", order[i].second, a.size)}, {"writes_3_7", {a.writes[0], a.writes[1]}}, {"bytes_3_7", {a.bytes[0], a.bytes[1]}},
+                       {"written_span", fmt::format("+{:#x}..+{:#x}", a.lo, a.hi)}, {"distinct_starts", a.last.size()},
+                       {"rewritten_after_0_1_2_3_4to7_8plus_submissions", {a.regap[0], a.regap[1], a.regap[2], a.regap[3], a.regap[4], a.regap[5]}}, {"reads", std::move(r)}});
+    }
+    j["allocations"] = g_w37.size();
+    j["top_allocations"] = std::move(top);
+    nlohmann::json out = nlohmann::json::array();
+    for (const auto& [mb, o] : g_w37_outside) {
+        if (out.size() < 20) {
+            out.push_back({{"block_1mb", fmt::format("{:#x}", mb << 20)}, {"writes", o.first}, {"bytes", o.second}});
+        }
+    }
+    j["outside_any_allocation"] = std::move(out);
+    return j;
+}
+
 nlohmann::json Report() {
     nlohmann::json out;
     if (SilentCensusOn()) {
         out["w15_silent_census"] = SilentReport();
+    }
+    if (W37On()) {
+        out["w37_census"] = W37Report(); // note 132
     }
     if (RingWindowsOn()) {
         nlohmann::json w;

@@ -1413,6 +1413,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferBody(VAddr device_addr, u
         TLG_PROF_LEVEL("buffer.obtain.written_erase", 3);
         BindMemoErase(device_addr, size); // the GPU writes it: answers over this memory are stale
     }
+    if (Core::NativeContent::W37On()) [[unlikely]] {
+        Core::NativeContent::W37Read(23, device_addr, size); // note 132: a buffer cache request
+    }
     if (Core::HookOwned::Mode() != 0) [[unlikely]] {
         if (is_written) {
             Core::HookOwned::GpuWrite(device_addr, size); // note 90 guard: GPU_WRITE_OVER_HOOK_OWNED_MUST_BE_0
