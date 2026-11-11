@@ -66,6 +66,9 @@ enum Own : u32 {
     OwnNotGpuMarked,   ///< written: the range is not marked GPU-written yet (the old path marks it)
     OwnResolved,       ///< own pointers found by the lazy resolution
     OwnByResolved,     ///< bindings valid only through a resolved pointer
+    OwnNoIdRing,       ///< note 139: geometry read no geometry id holds, meeting the frame ring
+    OwnNoIdOutside,    ///< note 139: geometry read no geometry id holds, outside the frame ring, some id record alive
+    OwnNoIdNoRecord,   ///< note 139: ... no id of the draw has a live record
     OwnCount
 };
 /// `cls` 0 immutable read, 1 mutable read, 2 mutable written (design review 85); 3 large read, 4 large written (note 117); 5 range read, 6 range written (notes 117, 120).
@@ -85,6 +88,11 @@ void NoteOwn(u32 what, u32 cls = 0) noexcept;
 /// Note 138 (`TLG_OWN_GEOMETRY_RANGE`: 0 off, the old path; 1 shadow; 2 real): an index read the draw's geometry ids do not hold whole (it runs past the named buffer's end) is bound from the
 /// placed block that holds the whole range while no CPU bytes wait in it: the range class rule of notes 120 and 123 (counted as class 10, `own_index_range`).
 [[nodiscard]] u32 OwnGeometryRangeMode() noexcept;
+/// Note 139 (`TLG_OWN_VERTEX_RANGE`: 0 off, the old path; 1 shadow; 2 real): the same rule for a merged vertex range no geometry id holds whole (class 11, `own_vertex_range`).
+[[nodiscard]] u32 OwnVertexRangeMode() noexcept;
+/// Note 139 (`TLG_OWN_VERTEX_SLACK`: 0 off; 1 shadow; 2 real): a merged vertex range that starts inside a geometry id's buffer and ends at most 64 bytes past it (vertex fetch rounding, the
+/// placed blocks' slack) belongs to that buffer; bound from its own memory when the Vulkan buffer covers it (counted in class 11).
+[[nodiscard]] u32 OwnVertexSlackMode() noexcept;
 
 /// Note 119 (`TLG_F1_DIAG=1`, counters and the first examples in the log only; default off): why a shader buffer binding is not bound from own memory, by cause.
 [[nodiscard]] bool DiagOn() noexcept;

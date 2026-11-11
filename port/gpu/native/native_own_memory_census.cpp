@@ -264,6 +264,22 @@ u32 OwnGeometryRangeMode() noexcept {
     return mode;
 }
 
+u32 OwnVertexRangeMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_OWN_VERTEX_RANGE");
+        return e == nullptr || e[0] == 0 ? 2u : e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u; // default 2 since 2026-11-11 (note 139); LEGACY(own_vertex_range): =0 through ObtainBuffer, =1 shadow
+    }();
+    return mode;
+}
+
+u32 OwnVertexSlackMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_OWN_VERTEX_SLACK");
+        return e == nullptr || e[0] == 0 ? 2u : e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u; // default 2 since 2026-11-11 (note 139); LEGACY(own_vertex_slack): =0 through ObtainBuffer, =1 shadow
+    }();
+    return mode;
+}
+
 u32 OwnExactEndMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_OWN_EXACT_END");
@@ -361,11 +377,11 @@ u32 OwnCloseMode() noexcept {
 }
 
 namespace {
-std::array<std::array<std::atomic<u64>, OwnCount>, 11> owns{};
+std::array<std::array<std::atomic<u64>, OwnCount>, 12> owns{};
 }
 
 void NoteOwn(u32 what, u32 cls) noexcept {
-    if (what < OwnCount && cls < 11) {
+    if (what < OwnCount && cls < 12) {
         owns[cls][what].fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -401,11 +417,11 @@ nlohmann::json Report() {
     {
         static constexpr const char* O[OwnCount] = {"asked", "immutable_inside", "no_own_buffer", "not_synced", "bound_from_own", "compared", "DIFFERENT_MUST_BE_0",
                                                     "OLD_PATH_DID_WORK_MUST_BE_0", "old_answer_stream_ring", "own_set", "own_cleared", "not_gpu_marked_yet", "own_resolved_lazily",
-                                                    "bindings_valid_only_by_a_resolved_pointer"};
-        static constexpr const char* C[11] = {"own_immutable", "own_mutable_read", "own_mutable_written", "own_large_read", "own_large_written", "own_range_read", "own_range_written",
-                                             "own_index", "own_vertex", "own_vertex_split", "own_index_range"};
-        for (u32 c = 0; c < 11; ++c) {
-            j[C[c]]["mode"] = c == 10 ? OwnGeometryRangeMode() : c == 0 ? OwnImmutableMode() : c >= 7 ? OwnGeometryMode() : c >= 5 ? OwnRangeMode() : c >= 3 ? OwnLargeMode() : OwnMutableMode();
+                                                    "bindings_valid_only_by_a_resolved_pointer", "no_id_holds_it_meets_frame_ring", "no_id_holds_it_outside_ring", "no_id_holds_it_no_live_record"};
+        static constexpr const char* C[12] = {"own_immutable", "own_mutable_read", "own_mutable_written", "own_large_read", "own_large_written", "own_range_read", "own_range_written",
+                                             "own_index", "own_vertex", "own_vertex_split", "own_index_range", "own_vertex_range"};
+        for (u32 c = 0; c < 12; ++c) {
+            j[C[c]]["mode"] = c == 11 ? OwnVertexRangeMode() : c == 10 ? OwnGeometryRangeMode() : c == 0 ? OwnImmutableMode() : c >= 7 ? OwnGeometryMode() : c >= 5 ? OwnRangeMode() : c >= 3 ? OwnLargeMode() : OwnMutableMode();
             j[C[c]]["close_mode"] = OwnCloseMode();
             for (u32 k = 0; k < OwnCount; ++k) {
                 j[C[c]][O[k]] = owns[c][k].load();

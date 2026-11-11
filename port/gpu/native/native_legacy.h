@@ -54,6 +54,8 @@
 ///   TLG_RING_OUT_UNSAMPLED=0   one ring write in 64 still applied in the batch as a check
 ///   TLG_OWN_GEOMETRY_RANGE=0   index reads that run past their buffer's end through ObtainBuffer
 ///   TLG_OWN_VERTEX_SPLIT=0     merged vertex ranges through ObtainBuffer instead of each member buffer's own memory
+///   TLG_OWN_VERTEX_RANGE=0     merged vertex ranges past their buffer's end through ObtainBuffer (note 139)
+///   TLG_OWN_VERTEX_SLACK=0     merged vertex ranges ending up to 64 bytes past their buffer (fetch rounding) through ObtainBuffer (note 139)
 namespace Core::Legacy {
 
 /// TLG_LEGACY_ENGINE_ROWS=1: the rows for shader buffer bindings of engine buffers (see above).

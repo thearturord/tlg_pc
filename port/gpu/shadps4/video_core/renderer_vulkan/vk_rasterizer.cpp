@@ -962,27 +962,74 @@ const VideoCore::Buffer* Rasterizer::OwnGeometry(VAddr address, u64 size, u32 cl
             break;
         }
     }
+    bool slack = false;
+    if (h == nullptr && cls == 8 && OM::OwnVertexSlackMode() != 0) {
+        // note 139: a merged vertex range that ends up to 64 bytes past a named buffer (vertex fetch rounding) is that buffer's
+        for (u32 i = 0; i < geometry_plan->geometry_id_count; ++i) {
+            auto* c = Core::NativeResources::FindOwnRecordById(geometry_plan->geometry_ids[i]);
+            if (c != nullptr && address >= c->begin && address < c->end && address + size <= c->end + 64 && c->alive.load(std::memory_order_acquire)) {
+                h = c;
+                slack = true;
+                OM::NoteOwn(OM::OwnAsked, 11);
+                OM::NoteOwn(OM::OwnImmutable, 11);
+                break;
+            }
+        }
+    }
+    if (h == nullptr && cls != 7) {
+        // note 139 census: why no geometry id holds this vertex read
+        const auto& vring = VideoCore::UntrackedRing::Get();
+        if (vring.Active() && address < vring.End() && address + size > vring.Start()) {
+            OM::NoteOwn(OM::OwnNoIdRing, cls);
+        } else {
+            bool any = false;
+            for (u32 i = 0; i < geometry_plan->geometry_id_count && !any; ++i) {
+                const auto* c = Core::NativeResources::FindOwnRecordById(geometry_plan->geometry_ids[i]);
+                any = c != nullptr && c->alive.load(std::memory_order_acquire);
+            }
+            OM::NoteOwn(any ? OM::OwnNoIdOutside : OM::OwnNoIdNoRecord, cls);
+        }
+    }
     if (h == nullptr) {
-        if (cls == 7 && OM::OwnGeometryRangeMode() != 0) {
-            // note 138: an index read no geometry id holds whole (past the named buffer's end): the placed block holding the whole range, while nothing waits in it (notes 120, 123)
-            OM::NoteOwn(OM::OwnAsked, 10);
-            OM::NoteOwn(OM::OwnImmutable, 10);
-            const auto& index_ring = VideoCore::UntrackedRing::Get();
-            if (Core::NativeContent::InRing(address, size) || (index_ring.Active() && address < index_ring.End() && address + size > index_ring.Start())) {
-                OM::NoteOwn(OM::OwnOldStream, 10); // (a range that meets the frame ring is the hook ring's; the block's ring part is not current)
+        const u32 range_mode = cls == 7 ? OM::OwnGeometryRangeMode() : cls == 8 ? OM::OwnVertexRangeMode() : 0u;
+        if (range_mode != 0) {
+            // notes 138, 139: an index read or a merged vertex range no geometry id holds whole (past the named buffer's end): the placed block holding the whole range,
+            // while nothing waits in it and it does not meet the frame ring (notes 120, 123, 138)
+            const u32 rcls = cls == 7 ? 10u : 11u;
+            OM::NoteOwn(OM::OwnAsked, rcls);
+            OM::NoteOwn(OM::OwnImmutable, rcls);
+            const auto& geo_ring = VideoCore::UntrackedRing::Get();
+            if (Core::NativeContent::InRing(address, size) || (geo_ring.Active() && address < geo_ring.End() && address + size > geo_ring.Start())) {
+                OM::NoteOwn(OM::OwnOldStream, rcls); // (a range that meets the frame ring is the hook ring's; the block's ring part is not current)
                 return nullptr;
             }
             const auto* holder = buffer_cache.PlacedWhole(address, size);
             if (holder == nullptr) {
-                OM::NoteOwn(OM::OwnNoOwn, 10);
+                OM::NoteOwn(OM::OwnNoOwn, rcls);
+                static std::atomic<u32> vlogged{0};
+                if (rcls == 11 && vlogged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    // note 139 diagnostic: a merged vertex range no geometry id and no placed block holds whole
+                    std::string ids;
+                    for (u32 i = 0; i < geometry_plan->geometry_id_count; ++i) {
+                        const auto* c = Core::NativeResources::FindOwnRecordById(geometry_plan->geometry_ids[i]);
+                        ids += c != nullptr ? fmt::format(" {}:{:#x}..{:#x}/u{}", c->id, c->begin, c->end, c->usage) : fmt::format(" {}:none", geometry_plan->geometry_ids[i]);
+                    }
+                    LOG_WARNING(Render_Vulkan, "note 139: vertex range {:#x}+{:#x} held by no id and no placed block (placed meets {}); ids{}", address, size,
+                                buffer_cache.PlacedMeetsRange(address, size), ids);
+                }
                 return nullptr;
             }
             if (buffer_cache.IsRegionCpuModified(address, size)) {
-                OM::NoteOwn(OM::OwnNotSynced, 10);
+                OM::NoteOwn(OM::OwnNotSynced, rcls);
                 return nullptr;
             }
-            own_index_cls = 10;
-            own_index_shadow = OM::OwnGeometryRangeMode() == 1;
+            if (cls == 7) {
+                own_index_cls = rcls;
+                own_index_shadow = range_mode == 1;
+            } else {
+                own_vertex_cls = rcls;
+                own_vertex_shadow = range_mode == 1;
+            }
             return holder;
         }
         return nullptr;
@@ -1008,6 +1055,14 @@ const VideoCore::Buffer* Rasterizer::OwnGeometry(VAddr address, u64 size, u32 cl
     if (waiting) {
         OM::NoteOwn(OM::OwnNotSynced, cls);
         return nullptr;
+    }
+    if (slack) {
+        if (!own->IsInBounds(address, size)) {
+            OM::NoteOwn(OM::OwnNoOwn, 11); // (the Vulkan buffer does not cover the rounded end)
+            return nullptr;
+        }
+        own_vertex_cls = 11;
+        own_vertex_shadow = OM::OwnVertexSlackMode() == 1;
     }
     return own;
 }
@@ -3514,10 +3569,12 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
         const VideoCore::Buffer* own_vertex = nullptr;
         if (const u32 geo_mode = Core::OwnMemoryCensus::OwnGeometryMode(); geo_mode != 0) {
             // note 117: the vertex buffer the draw names by id, from its own memory
+            own_vertex_cls = 8;
+            own_vertex_shadow = false;
             own_vertex = OwnGeometry(range.base_address, size, 8);
             static thread_local u32 vertex_tick = 0;
-            if (own_vertex != nullptr && geo_mode == 2 && (++vertex_tick & 63u) != 0) {
-                Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnBound, 8); Core::NativeContent::SilentOwnBind(0, range.base_address, size, (!own_vertex->mapped_data.empty() ? own_vertex->mapped_data.data() + own_vertex->Offset(range.base_address) : nullptr), Core::NativeContent::SilentCensusActive() ? (buffer_cache.IsRegionCpuModified(range.base_address, size) ? 1 : 0) : -1); // note 126 census
+            if (own_vertex != nullptr && geo_mode == 2 && !own_vertex_shadow && (++vertex_tick & 63u) != 0) {
+                Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnBound, own_vertex_cls); Core::NativeContent::SilentOwnBind(0, range.base_address, size, (!own_vertex->mapped_data.empty() ? own_vertex->mapped_data.data() + own_vertex->Offset(range.base_address) : nullptr), Core::NativeContent::SilentCensusActive() ? (buffer_cache.IsRegionCpuModified(range.base_address, size) ? 1 : 0) : -1); // note 126 census
                 const_cast<VideoCore::Buffer*>(own_vertex)->NoteResolveUse();
                 range.buffer = const_cast<VideoCore::Buffer*>(own_vertex);
                 range.offset = own_vertex->Offset(range.base_address);
@@ -3580,7 +3637,7 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
             W1ShadowGeometry(vertex_handle, range.base_address, range.buffer, range.offset, true);
         }
         if (own_vertex != nullptr) [[unlikely]] {
-            OwnGeometryCompare(own_vertex, range.base_address, range.buffer->Handle(), range.offset, 8);
+            OwnGeometryCompare(own_vertex, range.base_address, range.buffer->Handle(), range.offset, own_vertex_cls);
         }
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
         bound_buffers.emplace_back(range.buffer, range.offset, size,
