@@ -19,9 +19,12 @@
 namespace Core::HookOwned {
 
 [[nodiscard]] u32 Mode() noexcept;
+/// Note 129 (`TLG_HOOK_OWNED_RECORDING`: 0 off by default, 1 shadow, 2 real; needs `TLG_HOOK_OWNED` on): the three buffers `RenderDev::BeginRecording` fills once a frame
+/// (writer 4 with the site "BeginRecording buffers", tag 4) join the same class. Shadow: they join and are counted, never pinned, and their writes stay announced (mark shadow).
+[[nodiscard]] u32 RecordingMode() noexcept;
 
 /// The mark a write carries through the batch. Real mode: an owned write is not announced (never reaches the batch) except the audit one in 64.
-enum Mark : u8 { MarkNone = 0, MarkJoin = 1, MarkOwned = 2, MarkAudit = 3 };
+enum Mark : u8 { MarkNone = 0, MarkJoin = 1, MarkOwned = 2, MarkAudit = 3, MarkShadow = 4 }; ///< MarkShadow: a shadow member's write (announced, its apply counted as one real mode would skip)
 
 /// Real mode: buffer `id` is a confirmed member, so its bytes are pinned dirty (every upload walk takes them, no subtraction removes them). Lock-free, any thread.
 [[nodiscard]] bool Pinned(u64 id) noexcept;

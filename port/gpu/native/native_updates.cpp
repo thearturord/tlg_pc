@@ -1074,12 +1074,14 @@ void ApplyBatch(const Batch& batch) {
                             coalesce_gap_bytes.fetch_add((run_end - run_begin) > piece_bytes ? (run_end - run_begin) - piece_bytes : 0, std::memory_order_relaxed);
                             N0::t_writer = todo[a].writer;
                             {
-                                bool all_owned = true, any_none = false;
+                                bool all_owned = true, any_none = false, all_shadow = true, any_shadow = false;
                                 for (size_t k = a; k < b; ++k) {
                                     all_owned = all_owned && todo[k].hook == HookOwned::MarkOwned;
                                     any_none = any_none || todo[k].hook == HookOwned::MarkNone;
+                                    all_shadow = all_shadow && todo[k].hook == HookOwned::MarkShadow; // note 129
+                                    any_shadow = any_shadow || todo[k].hook == HookOwned::MarkShadow;
                                 }
-                                HookOwned::t_mark = all_owned ? HookOwned::MarkOwned : any_none ? HookOwned::MarkNone : HookOwned::MarkJoin;
+                                HookOwned::t_mark = all_owned ? HookOwned::MarkOwned : all_shadow ? HookOwned::MarkShadow : (any_none || any_shadow) ? HookOwned::MarkNone : HookOwned::MarkJoin;
                             }
                             apply_fn(apply_context, run_begin, run_end - run_begin, true, object);
                             HookOwned::t_mark = HookOwned::MarkNone;

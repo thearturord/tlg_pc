@@ -29,6 +29,14 @@ u32 Mode() noexcept {
     return mode;
 }
 
+u32 RecordingMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_HOOK_OWNED_RECORDING");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
+
 thread_local u8 t_mark = MarkNone;
 
 namespace {
@@ -41,6 +49,7 @@ struct Slot {
     std::atomic<u64> id{0};
     std::atomic<u32> state{Empty};
     std::atomic<u64> begin{0}, end{0}; ///< the buffer's whole memory (set before the state becomes Owned)
+    std::atomic<u8> shadow{0};          ///< note 129: a shadow member (never pinned, writes announced)
 };
 Slot* Table() noexcept {
     static const std::unique_ptr<Slot[]> table{new Slot[std::size_t{1} << Bits]};
@@ -115,6 +124,7 @@ std::array<std::atomic<u64>, 16> hk_owned_by_tag{};
 std::mutex rmutex;
 std::unordered_map<u64, std::pair<u64, u64>> members; // id -> [begin, end)
 std::map<u64, std::pair<u64, u64>> by_address;        // begin -> (end, id)
+std::unordered_map<u64, bool> shadow_members;         // note 129: the members that are only shadow (never pinned, no memo refused over them)
 u64 max_len = 0;
 std::atomic<u64> member_count{0};
 
@@ -143,17 +153,23 @@ enum RasterCount : u32 {
     RcImageOverMember,      ///< an image registered over a member (MUST_BE_0)
     RcRequests,             ///< read requests of the address path that meet a member (the real mode copies their member bytes each time)
     RcRequestMemberBytes,   ///< ... the member bytes they cover
+    RcShadowRequests,       ///< note 129: memo inserts over a shadow member (real mode refuses them: the copies it makes each time)
+    RcShadowJoins,          ///< note 129: shadow members confirmed
     RcCount
 };
 std::array<std::atomic<u64>, RcCount> rc{};
 thread_local bool t_captured = false;
 thread_local bool t_audit = false;
 
-bool IntersectsLocked(u64 address, u64 size, u64* overlap = nullptr) {
+/// `which`: 0 every member, 1 real members only, 2 shadow members only (note 129)
+bool IntersectsLocked(u64 address, u64 size, u64* overlap = nullptr, u32 which = 0) {
     auto it = by_address.lower_bound(address >= max_len ? address - max_len : 0);
     bool any = false;
     const u64 end = address + size;
     for (; it != by_address.end() && it->first < end; ++it) {
+        if (which != 0 && (shadow_members.contains(it->second.second) ? 2u : 1u) != which) {
+            continue;
+        }
         if (it->second.first > address) {
             any = true;
             if (overlap == nullptr) {
@@ -174,6 +190,7 @@ void RemoveLocked(u64 id) {
         by_address.erase(at);
     }
     members.erase(it);
+    shadow_members.erase(id);
     member_count.store(members.size(), std::memory_order_relaxed);
 }
 
@@ -207,8 +224,9 @@ void LogFew(std::atomic<u32>& logged, const char* what, u64 address, u64 size) {
 } // namespace
 
 u8 OnWrite(u32 tag, u64 id, u64 address, u64 size) noexcept {
-    if ((tag != 2 && tag != 12) || id == 0 || id == Core::NativeUpdates::kBuffersOnly || size == 0) {
-        if (tag == 2 || tag == 12) {
+    const bool recording = tag == 4 && RecordingMode() != 0; // note 129
+    if ((tag != 2 && tag != 12 && !recording) || id == 0 || id == Core::NativeUpdates::kBuffersOnly || size == 0) {
+        if (tag == 2 || tag == 12 || recording) {
             hk[HkNotClass].fetch_add(1, std::memory_order_relaxed);
         }
         return MarkNone;
@@ -219,6 +237,9 @@ u8 OnWrite(u32 tag, u64 id, u64 address, u64 size) noexcept {
             if (address >= s.begin.load(std::memory_order_relaxed) && address + size <= s.end.load(std::memory_order_relaxed)) {
                 hk[HkOwnedWrites].fetch_add(1, std::memory_order_relaxed);
                 hk_owned_by_tag[tag & 15].fetch_add(1, std::memory_order_relaxed);
+                if (s.shadow.load(std::memory_order_relaxed) != 0) {
+                    return MarkShadow; // note 129: announced; the apply is counted as one real mode would skip
+                }
                 if (Mode() == 2) {
                     static thread_local u32 audit_tick = 0;
                     if ((++audit_tick & 63u) == 0) {
@@ -262,6 +283,7 @@ u8 OnWrite(u32 tag, u64 id, u64 address, u64 size) noexcept {
     }
     s->begin.store(part.object_begin, std::memory_order_relaxed);
     s->end.store(part.object_end, std::memory_order_relaxed);
+    s->shadow.store(recording && (RecordingMode() == 1 || Mode() != 2) ? 1 : 0, std::memory_order_relaxed);
     std::vector<u64> textures;
     (void)NativeDevice::TexturesIn(part.object_begin, part.object_end - part.object_begin, textures);
     if (!textures.empty()) {
@@ -331,7 +353,7 @@ bool ApplyBegin(u64 object, u64 address, u64 size, u64& join_begin, u64& join_en
         }
         return false;
     }
-    if (mark == MarkOwned || mark == MarkAudit) {
+    if (mark == MarkOwned || mark == MarkAudit || mark == MarkShadow) {
         if (!members.contains(object)) {
             rc[mark == MarkAudit ? RcAuditNotMember : RcOwnedNotMember].fetch_add(1, std::memory_order_relaxed);
             return false;
@@ -384,9 +406,13 @@ bool Confirm(u64 id, u64 begin, u64 end, u32 refuse) noexcept {
     members[id] = {begin, end};
     by_address[begin] = {end, id};
     max_len = std::max(max_len, end - begin);
+    const bool shadow = s->shadow.load(std::memory_order_relaxed) != 0;
+    if (shadow) {
+        shadow_members[id] = true;
+    }
     member_count.store(members.size(), std::memory_order_relaxed);
-    rc[RcJoins].fetch_add(1, std::memory_order_relaxed);
-    return true;
+    rc[shadow ? RcShadowJoins : RcJoins].fetch_add(1, std::memory_order_relaxed);
+    return !shadow; // note 129: a shadow member is not pinned
 }
 
 bool Pinned(u64 id) noexcept {
@@ -394,7 +420,7 @@ bool Pinned(u64 id) noexcept {
         return false;
     }
     const Slot* s = Find(id);
-    return s != nullptr && s->state.load(std::memory_order_acquire) == Owned;
+    return s != nullptr && s->state.load(std::memory_order_acquire) == Owned && s->shadow.load(std::memory_order_relaxed) == 0;
 }
 
 bool MemberIn(u64 address, u64 size) noexcept {
@@ -402,9 +428,12 @@ bool MemberIn(u64 address, u64 size) noexcept {
         return false;
     }
     std::scoped_lock lock{rmutex};
-    if (IntersectsLocked(address, size)) {
+    if (IntersectsLocked(address, size, nullptr, shadow_members.empty() ? 0u : 1u)) {
         rc[RcMemoRefused].fetch_add(1, std::memory_order_relaxed);
         return true;
+    }
+    if (!shadow_members.empty() && IntersectsLocked(address, size, nullptr, 2)) {
+        rc[RcShadowRequests].fetch_add(1, std::memory_order_relaxed); // note 129: real mode would refuse it (and copy the member bytes at each such read)
     }
     return false;
 }
@@ -489,9 +518,11 @@ nlohmann::json Report() {
     const auto r = [](RasterCount c) { return rc[c].load(std::memory_order_relaxed); };
     nlohmann::json j;
     j["mode"] = Mode();
+    j["recording_mode"] = RecordingMode(); // note 129
     j["hook"] = {{"writes_not_announced_by_real_mode", h(HkOwnedWrites)},
                  {"of_them_light_constants_tag_2", hk_owned_by_tag[2].load()},
                  {"of_them_scene_slots_tag_12", hk_owned_by_tag[12].load()},
+                 {"of_them_recording_buffers_tag_4", hk_owned_by_tag[4].load()},
                  {"joins_proposed", h(HkJoins)},
                  {"real_writes_left_out_of_the_batch", h(HkDropped)},
                  {"real_writes_announced_as_audit", h(HkAudited)},
@@ -531,7 +562,9 @@ nlohmann::json Report() {
                    {"GPU_WRITE_OVER_HOOK_OWNED_MUST_BE_0", r(RcGpuWriteOverMember)},
                    {"IMAGE_OVER_HOOK_OWNED_MUST_BE_0", r(RcImageOverMember)},
                    {"address_requests_over_members", r(RcRequests)},
-                   {"address_request_member_bytes", r(RcRequestMemberBytes)}};
+                   {"address_request_member_bytes", r(RcRequestMemberBytes)},
+                   {"recording_shadow_members_confirmed", r(RcShadowJoins)},
+                   {"recording_shadow_memo_inserts_real_mode_would_refuse", r(RcShadowRequests)}};
     return j;
 }
 
