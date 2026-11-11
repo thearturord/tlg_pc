@@ -3,7 +3,7 @@
 """The Last Guardian launcher (Tkinter, Linux and Windows), in pt_BR and en_US.
 
 Game folder, game and interface language, display, FPS overlay, VRAM budget and native audio;
-Play starts the game through tlg_run.py (the same code path as run_tlg.sh) and shows its log.
+Play starts the game through tlg_run.py (the same code path as the command line) and shows its log.
 Settings live in ~/.config/tlg-launcher/settings.json (%APPDATA% on Windows).
 """
 import locale
@@ -41,8 +41,8 @@ TEXT = {
     'fps_60': ('60 FPS', '60 FPS'),
     'fps_120': ('120 FPS (needs a 120 Hz display)', '120 FPS (precisa de monitor de 120 Hz)'),
     'fps_unlocked': ('Unlocked (up to the display)', 'Livre (até a taxa do monitor)'),
-    'fps_hint': ('60/unlocked patch eboot 1.03 in memory; see docs/60fps.md',
-                 '60/livre alteram o eboot 1.03 na memória; ver docs/60fps.md'),
+    'fps_hint': ('60/unlocked patch eboot 1.03 in memory',
+                 '60/livre alteram o eboot 1.03 na memória'),
     'show_fps': ('Show FPS overlay at start (F10 toggles)', 'Mostrar overlay de FPS ao iniciar (F10 alterna)'),
     'vram': ('Texture cache budget (MB of VRAM)', 'Orçamento do cache de texturas (MB de VRAM)'),
     'vram_hint': ('6 GB card: 5600 · 8 GB: 7000 · 12 GB: 10500 · 16 GB: 14000 · 24 GB: 21500. This is video card memory (VRAM), not RAM; never above your card\'s VRAM.',

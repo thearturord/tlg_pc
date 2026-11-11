@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Prepare and run The Last Guardian (CUSA03627 v1.03) through the native loader.
 
-Shared by the command line (run_tlg.sh -> `tlg_run.py [seconds]`) and the launcher window
+Shared by the command line (`tlg_run.py [seconds]`) and the launcher window
 (tlg_launcher.py), so both start the game the same way:
   1. prepare.py / link_modules.py / content_profile.py build out/boot-linked.bin from the game
      folder (eboot 1.03 + the game's libc/Fios2, and libSceNgs2.sprx from the console firmware
@@ -65,7 +65,7 @@ DEFAULT_ENV = {
     'TLG_UPSCALER': 'off',         # native image: GoW3's temporal upscalers made it shake
     'TLG_JITTER': '0',
     'TLG_OBJECT_MOTION': '0',
-    'TLG_FRAME_STATS': '1',        # FPS in the log every 5 s (scripts/watch_session.sh heartbeat)
+    'TLG_FRAME_STATS': '1',        # FPS in the log every 5 s
 }
 
 DEFAULT_SETTINGS = {
