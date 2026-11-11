@@ -80,6 +80,7 @@ enum Tac : u32 {
     TacHookMember,      ///< ... over a hook-owned member
     TacReadDiffers,     ///< the creation read differs from the read at the first view (CREATION_READ_DIFFERS_MUST_BE_0; textures that are not dynamic)
     TacReadDiffersDyn,  ///< ... of a dynamic texture (its memory may move with a Map before its first view)
+    TacReinit,          ///< note 116: the object was already in the table, alive, under another id (the engine initialized a live texture object again)
     TacCount_
 };
 std::array<std::atomic<u64>, TacCount_> tac{};
@@ -320,8 +321,11 @@ void NoteView(Kind kind, u64 view_object, u64 desc) {
 u32 TextureAtCreationMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_TEXTURE_AT_CREATION");
-        if (!Enabled() || e == nullptr || e[0] == 0) {
-            return 0u; // default 0 (note 114): a texture enters the table at its first view; =1 shadow, =2 real
+        if (!Enabled()) {
+            return 0u;
+        }
+        if (e == nullptr || e[0] == 0) {
+            return 0u; // default 0: parked 2026-11-11 (note 116: owner play clean, but one view table difference in the default check, cause not found); =1 shadow, =2 real
         }
         return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
@@ -341,6 +345,17 @@ void NoteTextureCreated(u64 object) {
     tac[TacCreated].fetch_add(1, std::memory_order_relaxed);
     {
         std::shared_lock lock{table_mutex};
+        if (const auto o = id_by_object.find(object); o != id_by_object.end() && o->second != entry.id) {
+            if (const auto old = by_id.find(o->second); old != by_id.end() && old->second.alive) {
+                tac[TacReinit].fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<u32> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+                    LOG_WARNING(Render_Vulkan, "texture at creation: object {:#x} initialized again: was id {} {:#x}+{:#x} {}x{} mips {} format {} usage {}, now id {} {:#x}+{:#x} {}x{} mips {} format {} usage {}",
+                                object, old->second.id, old->second.address, old->second.bytes, old->second.width, old->second.height, old->second.mips, old->second.format,
+                                old->second.usage, entry.id, entry.address, entry.bytes, entry.width, entry.height, entry.mips, entry.format, entry.usage);
+                }
+            }
+        }
         if (by_id.contains(entry.id)) {
             tac[TacAlreadyKnown].fetch_add(1, std::memory_order_relaxed);
             return;
@@ -945,7 +960,8 @@ nlohmann::json Report() {
                                       {"later_viewed", t(TacLaterViewed)}, {"deleted_never_viewed", t(TacDeletedUnviewed)},
                                       {"live_never_viewed", pending}, {"created_over_a_buffer", t(TacBufferOverlap)},
                                       {"created_over_a_hook_owned_member", t(TacHookMember)}, {"CREATION_READ_DIFFERS_MUST_BE_0", t(TacReadDiffers)},
-                                      {"creation_read_differs_dynamic", t(TacReadDiffersDyn)}};
+                                      {"creation_read_differs_dynamic", t(TacReadDiffersDyn)},
+                                      {"live_object_initialized_again", t(TacReinit)}};
     }
     nlohmann::json live;
     for (u32 k = 1; k < live_by_kind.size(); ++k) {

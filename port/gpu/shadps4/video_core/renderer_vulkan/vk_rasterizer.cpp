@@ -7149,6 +7149,19 @@ void Rasterizer::ViewTableShadow(const Shader::Info& stage, u32 first_info, size
             LOG_ERROR(Render_Vulkan, "view table{}: view {:#x} (use {:#x}) answered image {} {:#x} {}x{} view {:#x}; the old path bound image {} {:#x} {}x{} view {:#x} (program {:#x})",
                       written ? " (storage)" : "", view_id, flags, entry_image.index, table_image.info.guest_address, table_image.info.size.width, table_image.info.size.height,
                       e->view_handle, bound.index, old_image.info.guest_address, old_image.info.size.width, old_image.info.size.height, view_bits, stage.pgm_hash);
+            // note 116: the objects behind the difference
+            Core::NativeDevice::Object vo{}, ro{};
+            const bool vk = Core::NativeDevice::Lookup(view_id, vo);
+            const bool rk = vk && Core::NativeDevice::Lookup(vo.resource_id, ro);
+            LOG_ERROR(Render_Vulkan,
+                      "view table difference detail: view known {} resource {} kind {} T# words 2..4 {:#x} {:#x} {:#x} created submit {}; resource known {} alive {} {}x{} mips {} layers {} format {} usage {} bind {:#x} bytes {:#x} "
+                      "created submit {} deleted submit {}; table image uid {} (entry {}) size {:#x} format {} tile {} mips {} pitch {}; old image uid {} size {:#x} format {} tile {} mips {} pitch {}; "
+                      "submit now {} present {}",
+                      vk, vo.resource_id, static_cast<u32>(vo.kind), vo.tsharp[2], vo.tsharp[3], vo.tsharp[4], vo.created_submit, rk, ro.alive, ro.width, ro.height, ro.mips, ro.layers, ro.format,
+                      ro.usage, ro.bind, ro.bytes, ro.created_submit, ro.deleted_submit, texture_cache.ImageUid(entry_image), e->image_uid, table_image.info.guest_size,
+                      static_cast<u32>(table_image.info.pixel_format), static_cast<u32>(table_image.info.tile_mode), table_image.info.resources.levels, table_image.info.pitch,
+                      texture_cache.ImageUid(bound), old_image.info.guest_size, static_cast<u32>(old_image.info.pixel_format), static_cast<u32>(old_image.info.tile_mode),
+                      old_image.info.resources.levels, old_image.info.pitch, Core::NativeContent::SubmitCount(), Core::DebugServer::PresentCount());
         }
         fill(*e);
     }
