@@ -1346,9 +1346,8 @@ static void PageClockSync(VAddr lo, VAddr hi, const boost::container::small_vect
     }
 }
 
-std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
-                                                        Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
-    Core::DispatchExecutor::NoteAddressCall(0); // note 152 shadow
+std::pair<const Buffer*, u64> BufferCache::HookRingAnswer(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer) {
+    // note 156: the hook ring's answers (F1 1b real, the wide windows of section 41), asked by the binder before the address-keyed lookup; ObtainBuffer asks them first too
     if (hook_ring != nullptr && !is_written && (is_texel_buffer || size <= 65536) && Core::HookRing::Raster1bReal()) {
         // F1 1b real: a frame ring range the hook ring holds whole (filled at the finished writes, one lap half) is bound from it: no upload from game memory.
         // GPU-modified ranges keep the old path (the arena holds the GPU's bytes).
@@ -1390,6 +1389,15 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                 return {hook_ring, hook_offset};
             }
         }
+    }
+    return {nullptr, 0};
+}
+
+std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
+                                                        Core::NativeResources::ImmutableBuffer* immutable_hint, bool verify_hint, bool known_no_object) {
+    Core::DispatchExecutor::NoteAddressCall(0); // note 152 shadow
+    if (const auto answer = HookRingAnswer(device_addr, size, is_written, is_texel_buffer); answer.first != nullptr) {
+        return answer;
     }
     const auto result = ObtainBufferBody(device_addr, size, is_written, is_texel_buffer, immutable_hint, verify_hint, known_no_object);
     if (result.first != nullptr) {

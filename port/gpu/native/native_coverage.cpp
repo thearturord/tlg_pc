@@ -76,7 +76,8 @@ nlohmann::json Report() {
     {
         static constexpr const char* rnames[IrCount] = {"no_images_or_no_plan", "written_storage_not_real", "mip_fallback", "sharp_not_single_load", "several_bindings",
                                                        "no_record_words", "no_view_id", "no_entry_yet", "not_in_class_dynamic_or_unknown", "no_payload_answer_not_bindable",
-                                                       "entry_image_stale", "audit_one_in_64", "tail_same_image_twice", "tail_check_failed", "storage_mark_mismatch", "view_table_off"};
+                                                       "entry_image_stale", "audit_one_in_64", "tail_same_image_twice", "tail_check_failed", "storage_mark_mismatch", "view_table_off",
+                                                       "tail_backing_moved", "tail_needs_rebind", "tail_forced_general", "tail_image_is_a_target", "tail_samples", "tail_depth_association"};
         for (u32 r = 0; r < IrCount; ++r) {
             if (const u64 n = image_reasons[r].load(std::memory_order_relaxed); n != 0) {
                 j["image_stage_reasons_note_151"][rnames[r]] = n;

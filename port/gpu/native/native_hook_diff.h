@@ -13,7 +13,11 @@
 /// Published as `hook_diff`.
 namespace Core::HookDiff {
 
-[[nodiscard]] bool DiffOn() noexcept;
+[[nodiscard]] bool DiffOn() noexcept;     ///< mode 1 or 2
+[[nodiscard]] bool DiffShadow() noexcept; ///< mode 1: the binding list is compared too
+/// Note 157 (`TLG_HOOK_DIFF=2`, default): a draw whose fixed-state key words equal the previous draw's (same guest thread) takes the previous state: no lock, no map.
+[[nodiscard]] bool DiffReal() noexcept;
+void NoteReused() noexcept;
 [[nodiscard]] bool PointersOn() noexcept;
 
 /// R3.1, the fixed state of a draw record: whether a previous draw existed, its key words were the same, and the state built was the same.

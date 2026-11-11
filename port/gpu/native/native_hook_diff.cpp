@@ -10,9 +10,9 @@
 namespace Core::HookDiff {
 
 namespace {
-const bool g_diff = [] {
+const unsigned g_diff = [] {
     const char* e = std::getenv("TLG_HOOK_DIFF");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr || e[0] == 0 ? 2u : e[0] == '1' || e[0] == '2' ? static_cast<unsigned>(e[0] - '0') : 0u; // default 2 since 2026-11-11 (note 157); LEGACY(hook_diff): =0 looks every fixed state up under the lock
 }();
 const bool g_pointers = [] {
     const char* e = std::getenv("TLG_PLAN_POINTERS");
@@ -20,7 +20,7 @@ const bool g_pointers = [] {
 }();
 
 enum C : u32 {
-    FxRecords, FxNoPrev, FxSameKey, FxSameKeyOtherState, FxOtherKey, FxOtherKeySameState,
+    FxReused, FxRecords, FxNoPrev, FxSameKey, FxSameKeyOtherState, FxOtherKey, FxOtherKeySameState,
     BdRecords, BdSameCount, BdAllSame, BdSlots, BdSameObject, BdSameObjectSameBinding, BdSameObjectOtherBinding, BdOtherObjectSameBinding,
     PfChecked, PfSame, PfDiffer,
     PbSame, PbReused, PbOther, PbNoRecord,
@@ -36,7 +36,8 @@ void Add(C k, u64 n = 1) noexcept {
 nlohmann::json Report() {
     const auto r = [](C k) { return c[k].load(std::memory_order_relaxed); };
     nlohmann::json j;
-    j["hook_diff_mode"] = g_diff ? 1 : 0;
+    j["hook_diff_mode"] = g_diff;
+    j["fixed_state_reused_without_lock_note_157"] = r(FxReused);
     j["plan_pointers_mode"] = g_pointers ? 1 : 0;
     j["fixed_state"] = {{"records", r(FxRecords)}, {"no_previous", r(FxNoPrev)}, {"same_key_as_previous", r(FxSameKey)},
                         {"SAME_KEY_OTHER_STATE_MUST_BE_0", r(FxSameKeyOtherState)}, {"other_key", r(FxOtherKey)}, {"other_key_same_state", r(FxOtherKeySameState)}};
@@ -58,7 +59,19 @@ void MaybePublish() noexcept {
 } // namespace
 
 bool DiffOn() noexcept {
-    return g_diff;
+    return g_diff != 0;
+}
+
+bool DiffShadow() noexcept {
+    return g_diff == 1;
+}
+
+bool DiffReal() noexcept {
+    return g_diff == 2;
+}
+
+void NoteReused() noexcept {
+    Add(FxReused);
 }
 
 bool PointersOn() noexcept {

@@ -31,7 +31,8 @@ void NoteOldDetail(Old what, u32 cls, u32 answer, u64 program, u64 size) noexcep
 /// Note 151 (plan R2.5): why the view table did not bind a texture stage (`ImageReason`).
 enum ImageReason : u32 {
     IrNoImagesOrPlan, IrWrittenNotReal, IrMipFallback, IrNotSingleLoad, IrSeveralBindings, IrNoRecordWords, IrNoViewId, IrNoEntry, IrNotInClass, IrNoPayload,
-    IrStale, IrAudit, IrTailSameImageTwice, IrTailCheckFailed, IrStorageMarkMismatch, IrTableOff, IrCount
+    IrStale, IrAudit, IrTailSameImageTwice, IrTailCheckFailed, IrStorageMarkMismatch, IrTableOff,
+    IrTailBacking, IrTailRebind, IrTailForceGeneral, IrTailTarget, IrTailSamples, IrTailDepth, IrCount // note 157: which of the tail's checks failed
 };
 void NoteImageReason(u32 reason, u64 program) noexcept;
 

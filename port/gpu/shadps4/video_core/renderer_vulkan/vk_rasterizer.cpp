@@ -1484,6 +1484,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     }
     TLG_PROF_NAMED_LEVEL(prof_inputs, "raster.plan_inputs", 3);
     const FixedState& fixed = plan->fixed;
+    if (Core::HookDiff::PointersOn() && plan->executed) [[unlikely]] {
+        // note 154 shadow, the main draw path (note 157)
+        if (plan->fixed_source != nullptr) {
+            Core::HookDiff::NotePlanFixed(std::memcmp(&plan->fixed, plan->fixed_source, sizeof(FixedState)) == 0);
+        }
+        Core::HookDiff::NotePlanBindings(Core::NativeDraw::RecordBindingsState(plan->native_seq, plan->bindings.data(), plan->binding_count));
+    }
     if (Core::UiTrace::Active()) {
         for (u32 i = 0; i < fixed.viewport_count; ++i) {
             const auto& v = fixed.viewports[i];
@@ -5206,7 +5213,11 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         return r;
                     }
                 };
-                const std::pair<const VideoCore::Buffer*, u64> obtained = obtain_old();
+                // note 156: the hook ring answers first (the same answer ObtainBuffer would give first), with no address-keyed lookup
+                std::pair<const VideoCore::Buffer*, u64> obtained = buffer_cache.HookRingAnswer(vsharp.address, size, desc.is_written, desc.is_formatted);
+                if (obtained.first == nullptr) {
+                    obtained = obtain_old();
+                }
                 if (Core::Coverage::On() && own_compare == nullptr && !buffer_cache.IsHookRing(obtained.first)) [[unlikely]] {
                     Core::Coverage::NoteOld(desc.is_written ? Core::Coverage::OldBufferWritten : Core::Coverage::OldBuffer); // note 143 (audits and hook ring answers are native)
                     const auto& cov_ring = VideoCore::UntrackedRing::Get();
@@ -6421,7 +6432,9 @@ bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const Textur
         // (a written image's own transit is the same with force_general set: only a sampled one refuses it)
         if (image.backing != entry.backing || image.binding.needs_rebind || (!entry.storage && image.binding.force_general) || image.binding.is_target ||
             (image.backing->num_samples > 1) != (image.info.num_samples > 1) || (redirected ? associated != entry.id : bool(associated))) {
-            t_vt_refuse = Core::Coverage::IrTailCheckFailed;
+            using namespace Core::Coverage;
+            t_vt_refuse = image.backing != entry.backing ? IrTailBacking : image.binding.needs_rebind ? IrTailRebind : (!entry.storage && image.binding.force_general) ? IrTailForceGeneral
+                          : image.binding.is_target ? IrTailTarget : (image.backing->num_samples > 1) != (image.info.num_samples > 1) ? IrTailSamples : IrTailDepth; // note 157
             return false;
         }
     }

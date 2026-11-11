@@ -2346,6 +2346,11 @@ const Vulkan::FixedState* Build(u64 ctx, const DeviceAddresses& dev) {
     if (Core::HookDiff::DiffOn()) [[unlikely]] {
         t_key = key;
         t_key_valid = true;
+        if (Core::HookDiff::DiffReal() && t_prev_valid && t_prev_state != nullptr && t_prev_key == key) {
+            // note 157: the same key words as the previous draw on this thread: the cache's own answer for them (entries are never freed), with no lock and no map
+            Core::HookDiff::NoteReused();
+            return t_prev_state;
+        }
     }
     std::lock_guard lock{mutex};
     for (auto [it, end] = states.equal_range(hash); it != end; ++it) {
@@ -2904,8 +2909,8 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
         SynthesizeUserData(ctx, 1, pixel_shader + 0x30, slot.ps_gnm, 0x3c, ShBase + 0x0c, slot.regs.data(), n, slot);
         mr.Mark(4);
         binding_record = nullptr;
-        if (Core::HookDiff::DiffOn() && kind <= 2) [[unlikely]] {
-            HookDiffBindings(slot); // note 153
+        if (Core::HookDiff::DiffShadow() && kind <= 2) [[unlikely]] {
+            HookDiffBindings(slot); // note 153 (shadow mode only)
         }
         slot.no_inputs = slot.binding_count == 0 && (slot.vs_gnm != 0 || slot.ps_gnm != 0) && (slot.vs_gnm == 0 || Rd<u8>(slot.vs_gnm, 3) == 0) &&
                          (slot.ps_gnm == 0 || Rd<u8>(slot.ps_gnm, 3) == 0);
