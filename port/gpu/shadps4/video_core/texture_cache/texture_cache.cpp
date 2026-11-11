@@ -4,6 +4,7 @@
 #include "native/native_hook_ring.h"
 #include "native/native_hook_owned.h"
 #include "native/native_texture_version.h"
+#include "native/native_view_table.h"
 #include "video_core/half_phase.h"
 #include <chrono>
 #include <fstream>
@@ -805,6 +806,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             list.erase(std::remove_if(list.begin(), list.end(), [&](const auto& e) { return !slot_images.IsAllocated(e.first) || slot_images[e.first].image_uid != e.second; }), list.end());
             list.emplace_back(found, image.image_uid);
             slot_images[found].b8_listed_by = owner_id;
+            Core::ViewTable::ResourceImageAdded(owner_id); // note 146: this lookup now answers the newest image; the view and target table entries of the texture go
             Core::NativeUpdates::NoteB8(Core::NativeUpdates::B8FindOwned);
             if (const auto pending = engine_index.pending_clears.find(owner_id); pending != engine_index.pending_clears.end()) {
                 // B11 step 6: the texture's clear that came before its first image
@@ -1087,15 +1089,19 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     TLG_PROF_LEVEL("texture.find_view", 3);
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
-        image.flags |= ImageFlagBits::GpuModified;
-        if (((readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) || explicit_download) &&
-            image.info.guest_address != 0) {
-            std::unique_lock lk{download_images_mutex};
-            download_images.emplace(image_id);
-        }
+        MarkStorageWrite(image_id);
     }
     UpdateImage(image_id, Core::ImageCaller::FindTexture);
     return image.FindView(desc.view_info);
+}
+
+void TextureCache::MarkStorageWrite(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    image.flags |= ImageFlagBits::GpuModified;
+    if (((readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) || explicit_download) && image.info.guest_address != 0) {
+        std::unique_lock lk{download_images_mutex};
+        download_images.emplace(image_id);
+    }
 }
 
 void TextureCache::RegisterMeta(VAddr address, MetaDataInfo info) {

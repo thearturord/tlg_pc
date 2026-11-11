@@ -325,7 +325,7 @@ u32 TextureAtCreationMode() noexcept {
             return 0u;
         }
         if (e == nullptr || e[0] == 0) {
-            return 0u; // default 0: parked 2026-11-11 (note 116: owner play clean, but one view table difference in the default check, cause not found); =1 shadow, =2 real
+            return 2u; // default 2 since 2026-11-11 (unparked in note 147: the note 116 difference was the view table's gap fixed in note 146); LEGACY(texture_at_creation): =0 a texture is learnt at its first view, =1 shadow
         }
         return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();

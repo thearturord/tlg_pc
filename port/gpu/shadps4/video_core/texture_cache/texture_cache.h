@@ -196,6 +196,8 @@ public:
 
     /// Retrieves an image view with the properties of the specified image id.
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
+    /// Note 147: what FindTexture does to an image bound for storage before its refresh (GPU-modified, the download queue); the view table's written tail calls it too.
+    void MarkStorageWrite(ImageId image_id);
 
     /// Retrieves the render target with specified properties
     [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);

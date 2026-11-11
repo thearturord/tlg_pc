@@ -53,6 +53,8 @@
 ///   TLG_OWN_VERTEX_SLACK=0     merged vertex ranges ending up to 64 bytes past their buffer (fetch rounding) through ObtainBuffer (note 139)
 ///   TLG_PROGRAM_CONSTS=0       constants inside shader memory (reads offset by the program base) copied into the stream ring at every bind (note 144)
 ///   TLG_OWN_INDEX_BY_ADDRESS=0 index lists of draws that name no geometry id copied into the stream ring at every draw (note 145)
+///   TLG_TEXTURE_AT_CREATION=0  a texture enters the engine object table only at its first view (notes 114 to 116, 147)
+///   TLG_STORAGE_TABLE=0        storage (written) images found by their T# words at every bind, outside the view table (notes 111, 112, 147)
 namespace Core::Legacy {
 
 

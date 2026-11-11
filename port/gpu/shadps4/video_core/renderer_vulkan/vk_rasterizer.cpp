@@ -6344,13 +6344,32 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, TextureSet& set,
 
 bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const TextureSet& set, u32 count, Shader::Backend::Bindings& binding) {
     // Everything the slow path does to an image before it looks at the view: touch and refresh. Idempotent, so a miss after it costs nothing.
+    // Note 147: a written (storage) image is refreshed at its commit, after it is marked GPU-modified, in FindTexture's order.
+    bool any_storage = false;
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];
         if (entry.null_entry) {
             continue;
         }
         texture_cache.TouchFoundImage(entry.found);
-        texture_cache.UpdateImage(entry.id, Core::ImageCaller::RasterizerBindTextures);
+        any_storage |= entry.storage;
+        if (!entry.storage) {
+            texture_cache.UpdateImage(entry.id, Core::ImageCaller::RasterizerBindTextures);
+        }
+    }
+    if (any_storage) {
+        // note 111: the same image twice in the stage, one binding written: the old path's answer depends on the order of its two passes (refused)
+        for (u32 i = 0; i < count; ++i) {
+            if (set.entries[i].null_entry) {
+                continue;
+            }
+            for (u32 j = i + 1; j < count; ++j) {
+                if (!set.entries[j].null_entry && set.entries[j].id == set.entries[i].id && (set.entries[i].storage || set.entries[j].storage)) {
+                    Core::ViewTable::Note(Core::ViewTable::StRealRefusedTwice);
+                    return false;
+                }
+            }
+        }
     }
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];
@@ -6360,7 +6379,8 @@ bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const Textur
         auto& image = texture_cache.GetImage(entry.id);
         const bool redirected = entry.id != entry.found;
         const auto associated = texture_cache.GetAssociatedDepth(texture_cache.GetImage(entry.found));
-        if (image.backing != entry.backing || image.binding.needs_rebind || image.binding.force_general || image.binding.is_target ||
+        // (a written image's own transit is the same with force_general set: only a sampled one refuses it)
+        if (image.backing != entry.backing || image.binding.needs_rebind || (!entry.storage && image.binding.force_general) || image.binding.is_target ||
             (image.backing->num_samples > 1) != (image.info.num_samples > 1) || (redirected ? associated != entry.id : bool(associated))) {
             return false;
         }
@@ -6375,6 +6395,22 @@ bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const Textur
         auto& image = texture_cache.GetImage(entry.id);
         if (recipe_active) {
             recipe_image_ranges.emplace_back(image.info.guest_address, static_cast<u32>(std::min<u64>(image.info.guest_size, 0xffffffffull)));
+        }
+        if (entry.storage) {
+            // note 147: the old path's two passes for a written image, in their order: force general when already bound, bound, GPU-modified and the download queue, the refresh,
+            // the general transit with read and write access, the storage use, the bound layout
+            image.binding.force_general |= image.binding.is_bound;
+            image.binding.is_bound = 1u;
+            bound_images.emplace_back(entry.id);
+            texture_cache.MarkStorageWrite(entry.id);
+            texture_cache.UpdateImage(entry.id, Core::ImageCaller::FindTexture);
+            needs_barrier |= runtime.Transit(&image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                                             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, entry.range);
+            image.usage.storage |= 1u;
+            Core::UiTrace::NoteGpuWrite("a storage image binding", image.info.guest_address, image.info.guest_size);
+            const vk::ImageLayout bound_layout = !image.backing || !runtime.PlannerDecidesLayouts() ? runtime.CurrentLayout(image) : vk::ImageLayout::eGeneral;
+            image_infos.emplace_back(VK_NULL_HANDLE, entry.view, bound_layout);
+            continue;
         }
         image.binding.is_bound = 1u;
         bound_images.emplace_back(entry.id);
@@ -6393,7 +6429,7 @@ bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const Textur
         set_write.dstBinding = binding.unified++;
         set_write.dstArrayElement = 0;
         set_write.descriptorCount = 1;
-        set_write.descriptorType = vk::DescriptorType::eSampledImage;
+        set_write.descriptorType = !set.entries[i].null_entry && set.entries[i].storage ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eSampledImage;
         set_write.pImageInfo = &image_infos[first_image_idx + i];
     }
     return true;
@@ -6967,9 +7003,13 @@ bool Rasterizer::ViewTableBind(const Shader::Info& stage, Shader::Backend::Bindi
     }
     static thread_local TextureSet from_table;
     static_assert(sizeof(TextureSetEntry) <= sizeof(Entry::payload) && std::is_trivially_copyable_v<TextureSetEntry>);
+    // note 147: written bindings too in the real storage mode (the light recorder, a debug tool, keeps them on the old path)
+    const bool storage_real = StorageMode() == 2 && !Core::LightRecorder::On();
+    u32 written_count = 0;
     for (u32 i = 0; i < n; ++i) {
         const auto& res = stage.images[i];
-        if (res.is_written || res.mip_fallback_mode != Shader::MipStorageFallbackMode::None || res.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad ||
+        written_count += res.is_written;
+        if ((res.is_written && !storage_real) || res.mip_fallback_mode != Shader::MipStorageFallbackMode::None || res.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Image>::Summary::SingleLoad ||
             res.NumBindings(stage) != 1) {
             return false;
         }
@@ -6992,7 +7032,7 @@ bool Rasterizer::ViewTableBind(const Shader::Info& stage, Shader::Backend::Bindi
         }
         TextureSetEntry& te = from_table.entries[i];
         std::memcpy(&te, e->payload, sizeof(TextureSetEntry));
-        if (te.id_uid == 0 || texture_cache.ImageUid(te.id) != te.id_uid || False(texture_cache.GetImage(te.id).flags & VideoCore::ImageFlagBits::Registered) ||
+        if (te.storage != res.is_written || te.null_entry || te.id_uid == 0 || texture_cache.ImageUid(te.id) != te.id_uid || False(texture_cache.GetImage(te.id).flags & VideoCore::ImageFlagBits::Registered) ||
             (te.found != te.id && texture_cache.ImageUid(te.found) != te.found_uid)) {
             return false;
         }
@@ -7010,6 +7050,10 @@ bool Rasterizer::ViewTableBind(const Shader::Info& stage, Shader::Backend::Bindi
     }
     Note(RealServed);
     Note(RealServedImages, n);
+    if (written_count != 0) {
+        Note(StRealServed);
+        Note(StRealServedWritten, written_count);
+    }
     return true;
 }
 

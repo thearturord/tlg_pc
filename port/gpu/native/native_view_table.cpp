@@ -47,8 +47,11 @@ u32 WrittenMode() noexcept {
 u32 StorageMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_STORAGE_TABLE");
-        if (Mode() == 0 || e == nullptr || e[0] == 0) {
-            return 0u; // default 0 (note 111): storage images by their T# as before; =1 shadow, =2 real
+        if (Mode() == 0) {
+            return 0u;
+        }
+        if (e == nullptr || e[0] == 0) {
+            return 2u; // default 2 since 2026-11-11 (note 147); LEGACY(storage_table): =0 finds every storage image by its T# again, =1 shadow
         }
         return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
@@ -120,6 +123,26 @@ void Note(Count c, u64 n) noexcept {
     counts[c].fetch_add(n, std::memory_order_relaxed);
 }
 
+void ResourceImageAdded(u64 resource_id) noexcept {
+    if (Mode() == 0 && TargetMode() == 0) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    const auto it = views_by_resource.find(resource_id);
+    if (it == views_by_resource.end()) {
+        return;
+    }
+    counts[NewImageEvents].fetch_add(1, std::memory_order_relaxed);
+    const u64 before = counts[DroppedByEvent].load(std::memory_order_relaxed);
+    for (const u64 v : it->second) {
+        DropView(v);
+    }
+    const u64 dropped = counts[DroppedByEvent].load(std::memory_order_relaxed) - before;
+    counts[DroppedByEvent].fetch_sub(dropped, std::memory_order_relaxed);
+    counts[DroppedByNewImage].fetch_add(dropped, std::memory_order_relaxed);
+    views_by_resource.erase(it); // (an entry made again links its view again)
+}
+
 void LinkResource(u64 resource_id, u64 view_id) noexcept {
     std::scoped_lock lock{mutex};
     auto& v = views_by_resource[resource_id];
@@ -145,6 +168,7 @@ nlohmann::json Report() {
                    {"stale_remade", c(ImagesStale)}};
     j["not_in_class"] = {{"no_view", c(NotClassNoView)}, {"dynamic_or_unknown_texture", c(NotClassDynamic)}, {"written_fallback_or_multi", c(NotClassUse)}, {"null", c(NotClassNull)}};
     j["entries_dropped_by_delete_events"] = c(DroppedByEvent);
+    j["new_image_of_a_texture_note_146"] = {{"events", c(NewImageEvents)}, {"entries_dropped", c(DroppedByNewImage)}};
     j["targets"] = {{"mode", TargetMode()}, {"draws", c(TgDraws)}, {"draws_all_in_class", c(TgDrawsAllInClass)}, {"draws_would_be_served_by_the_table", c(TgDrawsWouldServe)},
                     {"draws_in_class_where_the_old_path_ran_findimage", c(TgDrawsOldFind)}, {"targets_in_class", c(TgTargets)}, {"same", c(TgSame)},
                     {"TARGET_TABLE_DIFFERENT_MUST_BE_0", c(TgDifferent)}, {"no_entry_made", c(TgNoEntry)}, {"stale_remade", c(TgStale)}, {"no_view", c(TgNoView)},
@@ -160,7 +184,9 @@ nlohmann::json Report() {
                     {"STORAGE_TABLE_DIFFERENT_MUST_BE_0", c(StDifferent)}, {"no_entry_made", c(StNoEntry)}, {"stale_remade", c(StStale)},
                     {"not_in_class", {{"no_view", c(StNoView)}, {"dynamic_or_unknown_texture", c(StDynamic)}, {"fallback_or_multi", c(StOtherUse)}, {"null", c(StNull)}}},
                     {"copy_bindings_by_texture_subresource", {{"sampled", c(KeyedImages)}, {"written", c(StKeyed)}, {"entries_not_in_class_unknown", c(KeyedUnknown)},
-                                                                {"entries_not_in_class_dynamic", c(KeyedDynamic)}, {"entries_not_in_class_other", c(KeyedOther)}}}};
+                                                                {"entries_not_in_class_dynamic", c(KeyedDynamic)}, {"entries_not_in_class_other", c(KeyedOther)}}},
+                    {"real_note_147", {{"stages_bound_from_the_table", c(StRealServed)}, {"written_bindings_bound_from_the_table", c(StRealServedWritten)},
+                                        {"stages_refused_same_image_twice", c(StRealRefusedTwice)}}}};
     j["real"] = {{"stages_bound_from_the_table", c(RealServed)}, {"image_bindings_bound_from_the_table", c(RealServedImages)}, {"stages_audited_by_the_old_path", c(RealAudited)},
                  {"stages_whose_image_checks_failed", c(RealCheckFailed)}};
     return j;

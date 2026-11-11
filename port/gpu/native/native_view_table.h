@@ -17,8 +17,8 @@ namespace Core::ViewTable {
 /// Notes 107 to 110 (`TLG_WRITTEN_NO_IMAGE`: 2 real by default since the owner's play, note 110, one in 64 walked as the audit; 1 shadow; 0 off, the old path): a written binding of an engine buffer whose image list holds no live image and no
 /// waiting clear needs no texture cache walk for images based in its memory (`NativeImageIndex::NoImageInBuffer`).
 [[nodiscard]] u32 WrittenMode() noexcept;
-/// Note 111 (`TLG_STORAGE_TABLE`: 0 off by default, 1 shadow; 0 also while `TLG_VIEW_TABLE=0`): storage (written) image bindings of non-dynamic engine textures by their view id, in this same
-/// table (the use flags hold `is_written`).
+/// Notes 111 and 147 (`TLG_STORAGE_TABLE`: 0 off, the old path; 1 shadow; 2 real, one stage in 64 audited; 0 also while `TLG_VIEW_TABLE=0`): storage (written) image bindings of non-dynamic
+/// engine textures by their view id, in this same table (the use flags hold `is_written`).
 [[nodiscard]] u32 StorageMode() noexcept;
 
 /// Note 113: the engine's texture copy dispatches (`MakeUploadRecord`: CopyResource, Map uploads) bind a texture's subresource with no view object; their T# is a function
@@ -56,6 +56,9 @@ Entry& Put(u64 view_id, u64 use_flags) noexcept;
 void Event(u32 what, u64 id) noexcept;
 /// The view `view_id` looks at texture `resource_id` (its entries go when the texture is deleted).
 void LinkResource(u64 resource_id, u64 view_id) noexcept;
+/// Note 146: texture `resource_id` got a new image in the texture cache's list (B8.3). The old path's lookup answers the newest matching image of a texture, so every entry
+/// of the texture's views (sampled, storage and target) goes and is made again from the old path's next answer.
+void ResourceImageAdded(u64 resource_id) noexcept;
 
 enum Count : u32 {
     StagesWithImages,       ///< stages that bound at least one image (shadow)
@@ -121,6 +124,11 @@ enum Count : u32 {
     KeyedUnknown,           ///< ... entries of a key whose texture the device table does not know
     KeyedDynamic,           ///< ... whose texture is dynamic (usage 2: its memory moves with every Map)
     KeyedOther,             ///< ... whose object is not a texture
+    DroppedByNewImage,      ///< note 146: entries dropped because their texture got a new image
+    StRealServed,           ///< note 147 real mode: stages with a written image bound from the table
+    StRealServedWritten,    ///< ... their written image bindings
+    StRealRefusedTwice,     ///< ... stages refused at the tail: the same image twice, one binding written
+    NewImageEvents,         ///< ... the events (a texture with linked views got a new image)
     Count_
 };
 void Note(Count c, u64 n = 1) noexcept;
