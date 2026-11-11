@@ -67,6 +67,7 @@ enum ExecKind : u32 {
     ExProgramConsts,
     ExNull,
     ExHookRingWindow,
+    ExOwnSync, ///< note 162: own memory after the CPU bytes waiting in the range were uploaded into it
     ExKindCount
 };
 /// Note 159: why the executor left a binding to the old body.
@@ -79,6 +80,24 @@ enum Refusal : u32 {
     RfProgramConstsBind, ///< the program constants copy could not be made (full)
     RfObtain,            ///< ObtainBuffer
     RfCount
+};
+
+/// Note 161 (pass 3 item 4): why own memory by id did not answer a binding the executor refused.
+enum OwnWhy : u32 {
+    OwNoId,           ///< the record names no engine id for it
+    OwNoRecord,       ///< no live buffer record for the id and no crossing block
+    OwOutsideRecord,  ///< the range is outside the id's record (crossing tried)
+    OwDead,           ///< the record is dead
+    OwImmutableWrite, ///< an immutable buffer bound for writing
+    OwNoOwnBlock,     ///< no own block, placement refused
+    OwExactEnd,       ///< the binding runs past the block's exact end
+    OwCpuBytes,       ///< CPU bytes wait in the buffer (not synchronized)
+    OwNotGpuMarked,   ///< a written range not yet GPU-marked
+    OwCrossInRing,    ///< crossing: the range is (or meets) the frame ring
+    OwCrossNoHolder,  ///< crossing: no placed block holds the range
+    OwCrossCpuBytes,  ///< crossing: CPU bytes wait in the range
+    OwCrossNotMarked, ///< crossing: a written range not yet GPU-marked
+    OwCount
 };
 
 /// The note 152 source of an executor answer (SrcCount for one the old body does not tag).
@@ -98,8 +117,13 @@ void End(u32 bound_entries, bool barrier) noexcept;
 
 /// Note 159 counters (raster thread).
 void NoteBound(u32 kind) noexcept;
-void NoteRefused(u32 refusal) noexcept;
-enum Compare : u32 { CmpSame, CmpAudited, CmpRefusedOldNative, CmpRefusedOldOld, CmpDifferent, CmpOtherSource, CmpCount };
+void NoteRefused(u32 refusal, u32 own_why) noexcept;
+enum Compare : u32 { CmpSame, CmpAudited, CmpRefusedOldNative, CmpRefusedOldOld, CmpDifferent, CmpOtherSource, CmpOwnSyncOld, CmpCount };
+/// Note 162 (`TLG_OWN_SYNC`: 2 real by default, 1 shadow, 0 off): a read binding of an engine buffer whose own block waits for CPU bytes is synchronized and bound from it
+/// (instead of the R1b copy of the whole object in the stream ring). LEGACY(own_sync): =0.
+[[nodiscard]] u32 OwnSyncMode() noexcept;
+/// Note 162: the shadow would synchronize (mode 1); the real sync left CPU bytes in the range (must not happen).
+void NoteOwnSync(bool would, bool left_bytes) noexcept;
 void NoteCompare(u32 what, u32 refusal) noexcept;
 /// A dispatch bound with the executor on: `real` (mode 2, not audited), its buffer bindings and how many the executor refused.
 void DispatchDone(bool real, u32 bindings, u32 refused) noexcept;

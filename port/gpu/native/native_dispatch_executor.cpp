@@ -34,13 +34,21 @@ std::array<std::atomic<u64>, ExKindCount> x_bound{};
 std::array<std::atomic<u64>, RfCount> x_refused{};
 std::array<std::atomic<u64>, CmpCount> x_compare{};
 std::array<std::atomic<u64>, RfCount> x_refused_old_native{};
+std::array<std::array<std::atomic<u64>, OwCount>, RfCount> x_refused_own_why{};
 std::atomic<u64> x_real{0}, x_real_all_executor{0}, x_shadowed{0}, x_real_bindings{0}, x_real_refused{0};
 
 constexpr const char* SrcNames[SrcCount] = {"hook_ring", "constant_ring", "gds", "flat_user_data", "clip_planes", "shared_memory", "own", "own_crossing", "own_placed",
                                             "program_consts", "hook_ring_window", "null", "texture_table", "sampler_record", "OLD_resolved_copy",
                                             "OLD_resolved_resident", "OLD_in_place", "OLD_obtain_stream", "OLD_obtain_other", "OLD_texture_stage", "OLD_sampler_user_data"};
 constexpr const char* KindNames[ExKindCount] = {"refused", "hook_ring", "constant_ring", "gds", "flat_user_data", "flat_user_data_indexed", "shared_memory", "own_placed",
-                                                "own", "own_crossing", "program_consts", "null", "hook_ring_window"};
+                                                "own", "own_crossing", "program_consts", "null", "hook_ring_window", "own_after_sync"};
+std::atomic<u64> x_sync_would{0}, x_sync_left{0};
+const u32 g_own_sync = [] {
+    const char* e = std::getenv("TLG_OWN_SYNC");
+    return e == nullptr || e[0] == 0 ? 2u : e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u; // default 2 since 2026-11-12 (note 162); LEGACY(own_sync): =0, =1 shadow
+}();
+constexpr const char* OwnWhyNames[OwCount] = {"no_id", "no_record", "outside_record", "dead", "immutable_written", "no_own_block", "past_exact_end", "cpu_bytes_waiting",
+                                              "written_not_gpu_marked", "crossing_in_frame_ring", "crossing_no_holder", "crossing_cpu_bytes_waiting", "crossing_not_gpu_marked"};
 constexpr const char* RefusalNames[RfCount] = {"none", "special", "resolved_r1b_r2", "no_record", "unmapped_or_clamped", "program_consts_full", "obtain_buffer"};
 
 nlohmann::json Report() {
@@ -83,16 +91,25 @@ nlohmann::json Report() {
         if (const u64 n = r(x_refused[k]); n != 0) {
             x["refused_by_reason"][RefusalNames[k]] = n;
         }
+        for (u32 w = 0; w < OwCount; ++w) {
+            if (const u64 n = r(x_refused_own_why[k][w]); n != 0) {
+                x["refused_why_own_memory_did_not_answer"][RefusalNames[k]][OwnWhyNames[w]] = n;
+            }
+        }
         if (const u64 n = r(x_refused_old_native[k]); n != 0) {
             x["compare_refused_where_the_old_body_was_native"][RefusalNames[k]] = n;
         }
     }
     x["compare_same"] = r(x_compare[CmpSame]);
+    x["compare_own_sync_where_the_old_body_copied"] = r(x_compare[CmpOwnSyncOld]);
+    x["own_sync_mode"] = g_own_sync;
+    x["own_sync_shadow_would_sync"] = r(x_sync_would);
     x["compare_old_body_audited"] = r(x_compare[CmpAudited]);
     x["compare_refused_old_body_old_source"] = r(x_compare[CmpRefusedOldOld]);
     x["compare_refused_old_body_native"] = r(x_compare[CmpRefusedOldNative]);
     j["EXECUTOR_DIFFERENT_MUST_BE_0"] = r(x_compare[CmpDifferent]);
     j["EXECUTOR_OTHER_SOURCE_MUST_BE_0"] = r(x_compare[CmpOtherSource]);
+    j["OWN_SYNC_LEFT_CPU_BYTES_MUST_BE_0"] = r(x_sync_left);
     j["note"] = "note 152 tags (mode 1) and note 159 executor: per buffer binding of a compute stage, native sources decided with the old loop's tests, refusals to the old body";
     return j;
 }
@@ -122,6 +139,8 @@ Source SourceOf(u32 kind) noexcept {
         return SrcNull;
     case ExHookRingWindow:
         return SrcHookRingWindow;
+    case ExOwnSync:
+        return SrcOwn;
     default:
         return SrcCount;
     }
@@ -163,9 +182,12 @@ void NoteBound(u32 kind) noexcept {
     }
 }
 
-void NoteRefused(u32 refusal) noexcept {
+void NoteRefused(u32 refusal, u32 own_why) noexcept {
     if (refusal < RfCount) {
         x_refused[refusal].fetch_add(1, std::memory_order_relaxed);
+        if (own_why < OwCount) {
+            x_refused_own_why[refusal][own_why].fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -175,6 +197,19 @@ void NoteCompare(u32 what, u32 refusal) noexcept {
     }
     if (what == CmpRefusedOldNative && refusal < RfCount) {
         x_refused_old_native[refusal].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+u32 OwnSyncMode() noexcept {
+    return g_own_sync;
+}
+
+void NoteOwnSync(bool would, bool left_bytes) noexcept {
+    if (would) {
+        x_sync_would.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (left_bytes) {
+        x_sync_left.fetch_add(1, std::memory_order_relaxed);
     }
 }
 

@@ -2118,6 +2118,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForDownload(VAddr device_
     return {arena, arena->Offset(device_addr)};
 }
 
+void BufferCache::SynchronizeOwn(const Buffer* own, VAddr device_addr, u32 size) {
+    last_upload_bytes = 0;
+    Core::N0::SetSyncSite(Core::N0::SyncArenaRead);
+    Core::RingCensus::SetSyncCaller(Core::RingCensus::CallerBindRead);
+    SynchronizeMemory(own, device_addr, size, false, false);
+}
+
 std::pair<const Buffer*, u64> BufferCache::ObtainStatic(u64 id, VAddr device_addr, u32 size, u64& uploaded) {
     {
         std::scoped_lock lock{object_dirty_mutex};

@@ -115,6 +115,8 @@ public:
     /// immutable_hint (N3c): the immutable engine buffer the caller resolved by the engine's id (null: found by the address).
     /// Note 156: the hook ring's answer for a frame ring range (null when it has none); no address-keyed lookup.
     [[nodiscard]] std::pair<const Buffer*, u64> HookRingAnswer(VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer);
+    /// Note 162: the CPU bytes waiting in [device_addr, +size) of an engine buffer's own block are uploaded into it, as ObtainBuffer's arena path does for a read
+    void SynchronizeOwn(const Buffer* own, VAddr device_addr, u32 size);
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
                                                              bool is_texel_buffer = false,

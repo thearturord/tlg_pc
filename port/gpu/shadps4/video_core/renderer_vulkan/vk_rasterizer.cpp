@@ -61,6 +61,7 @@
 #include "native/native_audit.h"
 #include "native/native_hook_diff.h"
 #include "native/native_dispatch_executor.h"
+#include "native/native_hook_owned.h"
 #include "video_core/half_phase.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -5639,6 +5640,7 @@ bool Rasterizer::ExecutorDecide(const Shader::Info& stage, u32 buffer_index, Exe
                           : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
                                                                                                       : nullptr;
     const ResolvedBuffer* r = op != nullptr && buffer_index < op->resolved.size() && op->resolved[buffer_index].ahead_id != 0 ? &op->resolved[buffer_index] : nullptr;
+    a.own_why = OwNoId;
     if (r != nullptr) {
         auto* h = Core::NativeResources::FindImmutableById(r->ahead_id);
         bool large = false;
@@ -5650,6 +5652,7 @@ bool Rasterizer::ExecutorDecide(const Shader::Info& stage, u32 buffer_index, Exe
         const bool mode_on = !(imm && desc.is_written); // (an immutable written binding is left alone)
         const VAddr address = r->ahead_address;
         const u64 size = r->ahead_size;
+        a.own_why = !mode_on ? OwImmutableWrite : h == nullptr ? OwNoRecord : !h->alive.load(std::memory_order_acquire) ? OwDead : OwOutsideRecord;
         if (mode_on && h != nullptr && address >= h->begin && address + size <= h->end && h->alive.load(std::memory_order_acquire)) {
             const auto* own = static_cast<const VideoCore::Buffer*>(h->own.load(std::memory_order_acquire));
             if (own == nullptr) {
@@ -5670,6 +5673,24 @@ bool Rasterizer::ExecutorDecide(const Shader::Info& stage, u32 buffer_index, Exe
             const bool dirty = by_resolved ? h->cpu_dirty.load(std::memory_order_acquire)
                                : imm       ? !h->synced.load(std::memory_order_acquire)
                                            : h->cpu_dirty.load(std::memory_order_acquire);
+            a.own_why = own == nullptr ? OwNoOwnBlock : !eff ? OwExactEnd : dirty ? OwCpuBytes : OwNotGpuMarked;
+            if (own != nullptr && eff && dirty && !imm && !desc.is_written && OwnSyncMode() != 0 && !buffer_cache.IsRegionGpuModified(address, size)) {
+                // note 162: CPU bytes wait in the range: the old body copies the whole object into the stream ring (R1b); the executor uploads the waiting bytes of the
+                // range into the own block (the arena path's synchronization) and binds it
+                if (OwnSyncMode() == 1) {
+                    NoteOwnSync(true, false);
+                } else {
+                    a.kind = ExOwnSync;
+                    a.buffer = own;
+                    a.handle = own->Handle();
+                    a.offset = own->Offset(address);
+                    a.id = r->ahead_id;
+                    a.address = address;
+                    a.size = size;
+                    a.h = h;
+                    return true;
+                }
+            }
             if (own != nullptr && eff && !dirty && !(desc.is_written && !buffer_cache.GpuWrittenContains(address, size))) {
                 a.kind = ExOwn;
                 a.buffer = own;
@@ -5686,7 +5707,9 @@ bool Rasterizer::ExecutorDecide(const Shader::Info& stage, u32 buffer_index, Exe
             const auto& range_ring = VideoCore::UntrackedRing::Get();
             const bool in_ring = Core::NativeContent::InRing(address, size) || (range_ring.Active() && address < range_ring.End() && address + size > range_ring.Start());
             const auto* holder = in_ring ? nullptr : buffer_cache.PlacedWhole(address, size);
-            if (holder != nullptr && !buffer_cache.IsRegionCpuModified(address, size) && !(desc.is_written && !buffer_cache.GpuWrittenContains(address, size))) {
+            const bool cpu_bytes = holder != nullptr && buffer_cache.IsRegionCpuModified(address, size);
+            a.own_why = in_ring ? OwCrossInRing : holder == nullptr ? OwCrossNoHolder : cpu_bytes ? OwCrossCpuBytes : OwCrossNotMarked;
+            if (holder != nullptr && !cpu_bytes && !(desc.is_written && !buffer_cache.GpuWrittenContains(address, size))) {
                 a.kind = ExOwnCrossing;
                 a.buffer = holder;
                 a.handle = holder->Handle();
@@ -5823,6 +5846,11 @@ bool Rasterizer::ExecutorCommit(const Shader::Info& stage, u32 buffer_index, Exe
         a.offset = offset;
         break;
     }
+    case ExOwnSync:
+        buffer_cache.SynchronizeOwn(a.buffer, a.address, static_cast<u32>(a.size)); // note 162
+        // (a hook-owned buffer's bytes are pinned in its dirty set by design, note 92: every sync takes them whole and never subtracts them, so they always read as waiting)
+        NoteOwnSync(false, !Core::HookOwned::Pinned(a.id) && buffer_cache.IsRegionCpuModified(a.address, a.size));
+        [[fallthrough]];
     case ExOwn:
     case ExOwnCrossing: {
         const auto* own = a.buffer;
@@ -5901,7 +5929,7 @@ bool Rasterizer::ExecutorBindBuffer(const Shader::Info& stage, u32 buffer_index,
             Core::DispatchExecutor::NoteBound(a.kind);
             return true;
         }
-        Core::DispatchExecutor::NoteRefused(a.refusal);
+        Core::DispatchExecutor::NoteRefused(a.refusal, a.own_why);
         ++exec_refused;
         return false; // the old body binds it, from the state the executor found
     }
@@ -5943,6 +5971,10 @@ void Rasterizer::ExecutorCompare(const Shader::Info& stage, u32 buffer_index, co
                       a.offset, a.size, static_cast<u32>(old), reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)), info.offset, info.range, push_data.buf_offsets[slot]);
         }
     };
+    if (a.kind == ExOwnSync && old != SrcOwn) {
+        NoteCompare(CmpOwnSyncOld, 0); // (by design: the old body copies the object into the stream ring; the executor would upload the waiting bytes into the own block)
+        return;
+    }
     if (SourceOf(a.kind) != old) {
         fail(CmpOtherSource, "source");
         return;
@@ -6005,6 +6037,7 @@ void Rasterizer::ExecutorCompare(const Shader::Info& stage, u32 buffer_index, co
         break;
     }
     case ExOwn:
+    case ExOwnSync:
     case ExOwnCrossing:
     case ExHookRingWindow:
         same = aligned_same(a.handle, a.offset, a.size) && bound_same(a.buffer, a.offset, a.size);

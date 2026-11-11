@@ -533,6 +533,7 @@ private:
     struct ExecAnswer {
         u32 kind{};    ///< Core::DispatchExecutor::ExecKind (ExRefuse: the old body binds it)
         u32 refusal{}; ///< Core::DispatchExecutor::Refusal
+        u32 own_why{}; ///< Core::DispatchExecutor::OwnWhy: why own memory did not answer (reported with the refusals)
         const VideoCore::Buffer* buffer{};
         vk::Buffer handle{};
         u64 offset{}; ///< in `buffer` / `handle`, before the alignment
