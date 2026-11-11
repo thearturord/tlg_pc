@@ -327,7 +327,8 @@ constexpr const char* DiagNames[DiagCount] = {"outside_starts_below", "outside_s
                                               "no_record_staging", "no_record_other_refused", "no_record_not_a_buffer", "no_record_unknown_id", "no_own_no_block_meets",
                                               "no_own_blocks_meet_none_whole", "no_id_in_frame_ring", "no_id_inside_one_engine_buffer", "no_id_over_several_engine_buffers",
                                               "no_id_no_engine_buffer", "no_id_reason_offset_by_program_base", "no_id_reason_not_single_load", "no_id_reason_no_record_words",
-                                              "no_id_reason_id_zero", "no_id_reason_other", "no_own_old_path_stream_ring", "no_own_old_path_placed_it_now", "no_own_old_path_other"};
+                                              "no_id_reason_id_zero", "no_id_reason_other", "no_own_old_path_stream_ring", "no_own_old_path_placed_it_now", "no_own_old_path_other",
+                                              "placed_first_time", "placed_again", "no_own_placement_audit", "no_own_written", "no_own_large", "no_own_read_over_threshold"};
 } // namespace
 
 void NoteDiag(Diag what, const char* detail) noexcept {

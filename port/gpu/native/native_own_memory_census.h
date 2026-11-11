@@ -109,6 +109,12 @@ enum Diag : u32 {
     DiagNoOwnOldStream,   ///< a binding with no own block: the old path answered from the stream ring (a copy)
     DiagNoOwnOldPlacedNow,///< ... the old path placed a block that holds the buffer whole (its first use, or after a drop)
     DiagNoOwnOldOther,    ///< ... another buffer
+    DiagPlacedFirst,      ///< note 125: the placement real mode placed a buffer the first time
+    DiagPlacedAgain,      ///< ... placed one again (its block was dropped since)
+    DiagNoOwnAudit,       ///< ... a placement candidate left to the old path as the audit
+    DiagNoOwnWritten,     ///< a binding with no own block that is written (the placement takes reads only)
+    DiagNoOwnLarge,       ///< ... of a large buffer
+    DiagNoOwnBigRead,     ///< ... a read over the stream threshold
     DiagCount
 };
 void NoteDiag(Diag what, const char* detail = nullptr) noexcept;

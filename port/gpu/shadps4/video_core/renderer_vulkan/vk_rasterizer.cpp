@@ -76,7 +76,8 @@ thread_local VAddr t_f1_no_own_begin = 0, t_f1_no_own_end = 0;
 thread_local u64 t_f1_no_own_id = 0;           // note 121: the buffer's id
 thread_local bool t_f1_no_own_dirty = false;   // ... CPU bytes waiting at the bind
 thread_local bool t_f1_no_own_written = false;
-thread_local bool t_f1_no_id = false; // note 119 diagnostic: this binding had no engine id at the own-memory step
+thread_local bool t_f1_no_id = false;
+thread_local std::unordered_map<u64, u32> t_f1_placed_by_us; // note 125 diagnostic: ids the placement real mode placed, and how often // note 119 diagnostic: this binding had no engine id at the own-memory step
 thread_local u32 t_cover_class = 15; // R-slice census: the draw class of the draw being timed
 thread_local u64 t_w1_draw_begin = 0, t_w1_bind_begin = 0, t_w1_bind_end = 0; // W1.2 census: the clock at the start of Draw(), of BindResources and at its end (ns)
 
@@ -4807,12 +4808,24 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                             }
                         }
                         // (an immutable buffer too: after the placement its own pointer is found by the lazy resolution and served while its dirty set holds nothing, note 121)
-                        if (own == nullptr && eff != 0 && OM::OwnPlaceMode() == 2 && !large && !desc.is_written && r->ahead_size <= buffer_cache.StreamThreshold() &&
+                        // (any read size: a read over the stream threshold is served by the object's copy in the stream ring, R1b, the same bytes again; note 125)
+                        if (own == nullptr && eff != 0 && OM::OwnPlaceMode() == 2 && !large && !desc.is_written &&
                             h->end - h->begin <= Core::NativeResources::ResidentCap() && !buffer_cache.PlacedMeetsRange(h->begin, h->end - h->begin) &&
                             !buffer_cache.IsRegionGpuModified(h->begin, h->end - h->begin) && (++place_tick & 63u) != 0) {
                             // note 121 real: the read the old path would copy into the stream ring; the buffer is placed whole from guest memory instead (the same bytes) and bound from it
                             u64 uploaded = 0;
                             const auto [block, block_offset] = buffer_cache.ObtainStatic(h->id, h->begin, static_cast<u32>(h->end - h->begin), uploaded);
+                            if (OM::DiagOn()) [[unlikely]] {
+                                const u32 times = ++t_f1_placed_by_us[h->id];
+                                OM::NoteDiag(times == 1 ? OM::DiagPlacedFirst : OM::DiagPlacedAgain);
+                                const auto* whole = buffer_cache.PlacedWhole(h->begin, h->end - h->begin);
+                                static std::atomic<u32> logged{0};
+                                if ((times == 2 || times == 100) && logged.fetch_add(1, std::memory_order_relaxed) < 40) {
+                                    LOG_WARNING(Render_Vulkan, "F1 diag placed id {} usage {} buffer {:#x}..{:#x} (exact end {:#x}) time {}: block {:#x}..{:#x} whole-by-rounded {} own now {} cpu_dirty {} uploaded {}",
+                                                h->id, h->usage, h->begin, h->end, h->bytes_end, times, block->placed_begin, block->placed_end, whole != nullptr,
+                                                h->own.load(std::memory_order_acquire) != nullptr, h->cpu_dirty.load(std::memory_order_acquire), uploaded);
+                                }
+                            }
                             OM::NoteOwn(OM::OwnBound, cls);
                             const VAddr address = r->ahead_address;
                             const u64 size = r->ahead_size;
@@ -4840,6 +4853,15 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                 t_f1_no_own_dirty = imm ? !h->synced.load(std::memory_order_acquire) : h->cpu_dirty.load(std::memory_order_acquire);
                             }
                             if (own == nullptr && OM::DiagOn()) [[unlikely]] {
+                                if (desc.is_written) {
+                                    OM::NoteDiag(OM::DiagNoOwnWritten);
+                                } else if (large) {
+                                    OM::NoteDiag(OM::DiagNoOwnLarge);
+                                } else if (r->ahead_size > buffer_cache.StreamThreshold()) {
+                                    OM::NoteDiag(OM::DiagNoOwnBigRead);
+                                } else if (OM::OwnPlaceMode() == 2 && !buffer_cache.PlacedMeetsRange(h->begin, h->end - h->begin)) {
+                                    OM::NoteDiag(OM::DiagNoOwnAudit);
+                                }
                                 const bool meets = buffer_cache.PlacedMeetsRange(h->begin, h->end - h->begin);
                                 OM::NoteDiag(meets ? OM::DiagNoOwnPartial : OM::DiagNoOwnNone,
                                              fmt::format("id {} usage {} buffer {:#x}..{:#x} binding {:#x}+{:#x} written {} program {:#x}", h->id, h->usage, h->begin, h->end, r->ahead_address,
