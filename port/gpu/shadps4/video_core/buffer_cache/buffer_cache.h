@@ -339,6 +339,10 @@ private:
     /// null when no placed block holds it (then not asked again until the placements change).
     const Buffer* OwnResolve(Core::NativeResources::ImmutableBuffer& h);
     /// Note 117: the placed block that holds [address, address + size) whole, without its slack, or null (raster thread).
+    /// Note 119 diagnostic: whether any placed block meets the range (raster thread).
+    [[nodiscard]] bool PlacedMeetsRange(VAddr address, u64 size) const {
+        return PlacedMeets(address, size);
+    }
     [[nodiscard]] const Buffer* PlacedWhole(VAddr address, u64 size) {
         const PlacedBuffer* entry = PlacedAt(address, size, true);
         return entry != nullptr ? entry->buffer.get() : nullptr;

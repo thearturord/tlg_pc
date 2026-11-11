@@ -71,6 +71,7 @@
 #include "native/native_hook_ring.h"
 
 namespace {
+thread_local bool t_f1_no_id = false; // note 119 diagnostic: this binding had no engine id at the own-memory step
 thread_local u32 t_cover_class = 15; // R-slice census: the draw class of the draw being timed
 thread_local u64 t_w1_draw_begin = 0, t_w1_bind_begin = 0, t_w1_bind_end = 0; // W1.2 census: the clock at the start of Draw(), of BindResources and at its end (ns)
 
@@ -4664,6 +4665,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                       : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
                                                                                                                   : nullptr;
                 const ResolvedBuffer* r = op != nullptr && buffer_index < op->resolved.size() && op->resolved[buffer_index].ahead_id != 0 ? &op->resolved[buffer_index] : nullptr;
+                t_f1_no_id = r == nullptr;
                 if (r != nullptr) {
                     auto* h = Core::NativeResources::FindImmutableById(r->ahead_id);
                     const u32 large_mode = Core::OwnMemoryCensus::OwnLargeMode();
@@ -4671,6 +4673,29 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     if (h == nullptr && large_mode != 0 && mutable_mode != 0) {
                         h = Core::NativeResources::FindLargeById(r->ahead_id); // note 117: a default or dynamic buffer above the resident cap
                         large = h != nullptr;
+                    }
+                    if (OM::DiagOn()) [[unlikely]] {
+                        // note 119: why this binding with an id will not be bound from own memory (record missing, or the range outside it)
+                        const auto detail = [&](const char* what) {
+                            return fmt::format("{} id {} binding {:#x}+{:#x} written {} program {:#x} stage {}", what, r->ahead_id, r->ahead_address, r->ahead_size, desc.is_written,
+                                               stage.pgm_hash, static_cast<u32>(stage.sw_stage));
+                        };
+                        if (h == nullptr) {
+                            Core::NativeDevice::Object o{};
+                            const bool known = Core::NativeDevice::Lookup(r->ahead_id, o);
+                            const OM::Diag d = !known ? OM::DiagNoRecordUnknown : o.kind != Core::NativeDevice::Kind::Buffer ? OM::DiagNoRecordNotBuffer
+                                               : (o.misc & 0x80000) != 0 ? OM::DiagNoRecordCaller : o.usage == 3 ? OM::DiagNoRecordStaging : OM::DiagNoRecordOther;
+                            OM::NoteDiag(d, detail(fmt::format("object kind {} usage {} misc {:#x} cpu {:#x} memory {:#x}+{:#x}:", static_cast<u32>(o.kind), o.usage, o.misc, o.cpu_access,
+                                                               o.address, o.bytes).c_str()).c_str());
+                        } else if (!h->alive.load(std::memory_order_acquire)) {
+                            OM::NoteDiag(OM::DiagOutsideDead, detail(fmt::format("record {:#x}..{:#x}:", h->begin, h->end).c_str()).c_str());
+                        } else if (r->ahead_address < h->begin) {
+                            OM::NoteDiag(OM::DiagOutsideBelow, detail(fmt::format("record {:#x}..{:#x} usage {}:", h->begin, h->end, h->usage).c_str()).c_str());
+                        } else if (r->ahead_address >= h->end) {
+                            OM::NoteDiag(OM::DiagOutsidePast, detail(fmt::format("record {:#x}..{:#x} usage {}:", h->begin, h->end, h->usage).c_str()).c_str());
+                        } else if (r->ahead_address + r->ahead_size > h->end) {
+                            OM::NoteDiag(OM::DiagOutsideCrossing, detail(fmt::format("record {:#x}..{:#x} usage {}:", h->begin, h->end, h->usage).c_str()).c_str());
+                        }
                     }
                     const bool imm = h != nullptr && h->usage == 1;
                     // class: 0 immutable read, 1 mutable read, 2 mutable written (design review 85), 3 large read, 4 large written (note 117); an immutable written binding is left alone
@@ -4696,6 +4721,12 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         }
                         if (own == nullptr || eff == 0) {
                             OM::NoteOwn(OM::OwnNoOwn, cls);
+                            if (own == nullptr && OM::DiagOn()) [[unlikely]] {
+                                const bool meets = buffer_cache.PlacedMeetsRange(h->begin, h->end - h->begin);
+                                OM::NoteDiag(meets ? OM::DiagNoOwnPartial : OM::DiagNoOwnNone,
+                                             fmt::format("id {} usage {} buffer {:#x}..{:#x} binding {:#x}+{:#x} written {} program {:#x}", h->id, h->usage, h->begin, h->end, r->ahead_address,
+                                                         r->ahead_size, desc.is_written, stage.pgm_hash).c_str());
+                            }
                         } else if (by_resolved ? h->cpu_dirty.load(std::memory_order_acquire)
                                                : imm ? !h->synced.load(std::memory_order_acquire) : h->cpu_dirty.load(std::memory_order_acquire)) {
                             OM::NoteOwn(OM::OwnNotSynced, cls);
@@ -4992,6 +5023,30 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 if (size != vsharp.size) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.size, size, stage.pgm_hash);
+                }
+                if (t_f1_no_id && Core::OwnMemoryCensus::DiagOn()) [[unlikely]] {
+                    // note 119: a binding with no engine id: where its memory is, and why the front had no id
+                    namespace OM = Core::OwnMemoryCensus;
+                    t_f1_no_id = false;
+                    const bool in_ring = Core::NativeContent::InRing(vsharp.address, size);
+                    static thread_local std::vector<Core::NativeDevice::BufferPart> parts;
+                    parts.clear();
+                    if (!in_ring) {
+                        Core::NativeDevice::BuffersIn(vsharp.address, size, parts);
+                    }
+                    const bool inside_one = parts.size() == 1 && parts[0].begin <= vsharp.address && parts[0].end >= vsharp.address + size;
+                    const u64 rec_id = record_binding != ~0u && binder_plan != nullptr ? binder_plan->bindings[record_binding].id : 0;
+                    const OM::Diag reason = desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase ? OM::DiagNoIdOffsetBase
+                                            : desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad ? OM::DiagNoIdNotSingle
+                                            : !from_record ? OM::DiagNoIdNoWords : rec_id == 0 ? OM::DiagNoIdZero : OM::DiagNoIdOther;
+                    const std::string detail = fmt::format("{:#x}+{:#x} written {} program {:#x} stage {} plan {} from record {} record id {} parts {} first part id {}", vsharp.address, size,
+                                                           desc.is_written, stage.pgm_hash, static_cast<u32>(stage.sw_stage), binder_plan != nullptr, from_record, rec_id, parts.size(),
+                                                           parts.empty() ? 0 : parts[0].id);
+                    OM::NoteDiag(in_ring ? OM::DiagNoIdRing : inside_one ? OM::DiagNoIdEngine : !parts.empty() ? OM::DiagNoIdEngineSpan : OM::DiagNoIdNone,
+                                 in_ring ? nullptr : detail.c_str());
+                    if (!in_ring) {
+                        OM::NoteDiag(reason, detail.c_str());
+                    }
                 }
                 // N7.5: a read-only buffer of guest memory bound where it is (imported view of the runtime's backing), no copy, no dirty tracking
                 bool in_place = false;

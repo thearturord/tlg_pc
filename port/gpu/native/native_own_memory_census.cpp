@@ -8,6 +8,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <nlohmann/json.hpp>
+#include "common/logging/log.h"
 
 namespace Core::OwnMemoryCensus {
 
@@ -226,7 +227,7 @@ u32 OwnLargeMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_OWN_LARGE");
         if (e == nullptr || e[0] == 0) {
-            return 0u; // default 0 (note 117); =1 shadow, =2 real
+            return 2u; // default 2 since 2026-11-11 after the owner's play (note 119); LEGACY(own_large): =0 buffers above the resident cap through ObtainBuffer, =1 shadow
         }
         return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
@@ -248,11 +249,39 @@ u32 OwnGeometryMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_OWN_GEOMETRY");
         if (e == nullptr || e[0] == 0) {
-            return 0u; // default 0 (note 117); =1 shadow, =2 real
+            return 2u; // default 2 since 2026-11-11 after the owner's play (note 119); LEGACY(own_geometry): =0 index and vertex reads by rows and ObtainBuffer, =1 shadow
         }
         return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
+}
+
+bool DiagOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_F1_DIAG");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+namespace {
+std::array<std::atomic<u64>, DiagCount> diags{};
+std::array<std::atomic<u32>, DiagCount> diag_logged{};
+constexpr const char* DiagNames[DiagCount] = {"outside_starts_below", "outside_starts_past_end", "outside_crossing", "outside_dead_record", "no_record_caller_memory",
+                                              "no_record_staging", "no_record_other_refused", "no_record_not_a_buffer", "no_record_unknown_id", "no_own_no_block_meets",
+                                              "no_own_blocks_meet_none_whole", "no_id_in_frame_ring", "no_id_inside_one_engine_buffer", "no_id_over_several_engine_buffers",
+                                              "no_id_no_engine_buffer", "no_id_reason_offset_by_program_base", "no_id_reason_not_single_load", "no_id_reason_no_record_words",
+                                              "no_id_reason_id_zero", "no_id_reason_other"};
+} // namespace
+
+void NoteDiag(Diag what, const char* detail) noexcept {
+    if (what >= DiagCount) {
+        return;
+    }
+    diags[what].fetch_add(1, std::memory_order_relaxed);
+    if (detail != nullptr && diag_logged[what].fetch_add(1, std::memory_order_relaxed) < 6) {
+        LOG_WARNING(Render_Vulkan, "F1 diag {}: {}", DiagNames[what], detail);
+    }
 }
 
 u32 OwnCloseMode() noexcept {
@@ -287,6 +316,11 @@ nlohmann::json Report() {
     {
         static constexpr const char* D[DropCount] = {"asked", "no_registered_buffer", "set_held_the_range", "flag_set_would_drop", "FLAG_SET_BUT_NOT_DIRTY_MUST_BE_0",
                                                      "set_held_but_flag_clear", "DROP_WITH_LIVE_COPY_MUST_BE_0", "memo_erase_removed_entries_kept", "uploads_cleared_the_flag", "dropped_real", "audited_real"};
+        if (DiagOn()) {
+            for (u32 k = 0; k < DiagCount; ++k) {
+                j["f1_diag"][DiagNames[k]] = diags[k].load();
+            }
+        }
         j["drop_dirty"]["mode"] = DropDirtyMode();
         for (u32 k = 0; k < DropCount; ++k) {
             j["drop_dirty"][D[k]] = drops[k].load();

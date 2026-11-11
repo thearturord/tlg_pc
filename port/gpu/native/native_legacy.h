@@ -25,6 +25,8 @@
 ///   TLG_OWN_IMMUTABLE=0        immutable buffers bound through rows and `ObtainBuffer` (83-84)
 ///   TLG_OWN_MUTABLE=0          default and dynamic buffers bound through rows and `ObtainBuffer` (85-86)
 ///   TLG_OWN_CLOSE=0            no lazy own pointer (87-88)
+///   TLG_OWN_LARGE=0            default and dynamic engine buffers above the resident cap bound through ObtainBuffer (117-119)
+///   TLG_OWN_GEOMETRY=0         index and vertex reads through the geometry rows and ObtainBuffer instead of the buffer's own memory by id (117-119)
 ///   TLG_ID_MARKS=0             light and slot applies by address (49-51)
 ///   TLG_IMAGE_BY_ID=0          the image step by address (63-65)
 ///   TLG_ROW_VERSION=0, TLG_STATIC_ROWS=0, TLG_WRITTEN_ROWS=0, TLG_WIDE_ROWS=0, TLG_TEXSET_BY_ID=0, TLG_HOOK_RING=0 (sections 13-47)
