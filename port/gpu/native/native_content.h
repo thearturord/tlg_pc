@@ -109,6 +109,8 @@ void SetRing(u64 begin, u64 end);
 /// lookup anywhere else is refused (`RefusedNoOwner`: counted, written to rare_events.txt, a new image is made), the page table scan it used to do is gone.
 /// [address, address + size) lies inside the frame ring.
 [[nodiscard]] bool InRing(u64 address, u64 size) noexcept;
+/// Note 127 (TLG_SILENT_CENSUS=1): the emulator's file read announced [address, address + size) (writer 5); checks right after that the ledger holds it
+void CheckHostWrite(u64 address, u64 size, bool announced);
 enum class RingIndexEvent : u32 { ReusedExact, CreatedNew, StaleFreed, StaleKept, RefusedNoOwner, Count };
 void NoteRingIndex(RingIndexEvent event) noexcept;
 void NoteRingWindow(u64 address, u64 size);

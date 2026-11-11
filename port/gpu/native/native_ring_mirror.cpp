@@ -84,7 +84,7 @@ std::array<std::atomic<u64>, ProbePages> probe_pages{};
 std::array<std::atomic<u64>, ProbePages> probe_targets{}; // the block that stayed unannounced, per protected page
 struct ProbeWriter {
     std::atomic<u64> rip{0}, count{0}, exact{0}, first_address{0}, thread{0};
-    std::array<std::atomic<u64>, 48> stack{};
+    std::array<std::atomic<u64>, 128> stack{}; // note 127: 128 words, so a write deep in host code still shows its host callers
 };
 std::array<ProbeWriter, ProbeWriters> probe_writers{};
 std::atomic<u64> probe_protected{0}, probe_faults{0}, probe_other_faults{0};
@@ -292,6 +292,27 @@ bool ShadowOn() noexcept {
 
 void ProbeWrites(VAddr address) {
     ProbeProtect(address);
+}
+
+std::atomic<u64> probe_reprotects{0};
+void ProbeReprotect(VAddr address, u64 size) {
+#ifdef _WIN32
+    if (!probe_installed.load(std::memory_order_relaxed) || size == 0) {
+        return;
+    }
+    for (const auto& slot : probe_pages) {
+        const u64 page = slot.load(std::memory_order_acquire);
+        if (page != 0 && page + 4096 > address && page < address + size) {
+            DWORD old;
+            if (VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READONLY, &old) && old != PAGE_READONLY) {
+                probe_reprotects.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+#else
+    (void)address;
+    (void)size;
+#endif
 }
 
 namespace {
@@ -624,7 +645,7 @@ nlohmann::json Report() {
                  return j;
              }()},
             {"writer_probe", [] {
-                 nlohmann::json j = {{"pages_protected", probe_protected.load()}, {"faults", probe_faults.load()}, {"writers", nlohmann::json::array()}};
+                 nlohmann::json j = {{"pages_protected", probe_protected.load()}, {"faults", probe_faults.load()}, {"protection_lifted_by_others_and_restored", probe_reprotects.load()}, {"writers", nlohmann::json::array()}};
                  for (const auto& w : probe_writers) {
                      if (w.rip.load() != 0) {
                          const u64 base = NativeDraw::ImageBase();
@@ -661,6 +682,23 @@ nlohmann::json Report() {
                                                              s += fmt::format("{:#x} ", v - base + 0x1000000);
                                                          }
                                                      }
+                                                     return s;
+                                                 }()},
+                                                 {"stack_in_host_exe", [&] {
+                                                     // note 127: the words that point into the emulator's own executable (its offset there; `llvm-symbolizer --obj=tlg-probe.exe 0x140000000+offset`)
+                                                     std::string s;
+#ifdef _WIN32
+                                                     const HMODULE exe = GetModuleHandleA(nullptr);
+                                                     u32 n = 0;
+                                                     for (const auto& word : w.stack) {
+                                                         const u64 v = word.load();
+                                                         HMODULE m = nullptr;
+                                                         if (n < 16 && v > 0x10000 && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(v), &m) && m == exe) {
+                                                             s += fmt::format("{:#x} ", v - reinterpret_cast<u64>(exe));
+                                                             ++n;
+                                                         }
+                                                     }
+#endif
                                                      return s;
                                                  }()},
                                                  {"thread", w.thread.load()}});

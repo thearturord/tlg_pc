@@ -30,6 +30,8 @@ namespace Core::RingMirror {
 [[nodiscard]] bool ShadowOn() noexcept;
 /// Diagnostics: makes the page of `address` read only once; the first write is recorded with its code address (`ring_mirror.writer_probe` in /updates).
 void ProbeWrites(VAddr address);
+/// Note 127: after a page protection change of [address, address + size) (the page tracker's), the probed pages in it are made read only again, so a writer after an unprotect still faults
+void ProbeReprotect(VAddr address, u64 size);
 /// The real mirror served a window: `uploaded_whole` bytes were read for the first time, `announced` bytes came from announcements; the rest of the window needed no upload.
 void NoteReal(u64 window, u64 uploaded_whole, u64 announced, u64 pieces_in, u64 pieces_out, u64 merged_bytes);
 /// Announced pieces closer than this many bytes are uploaded as one copy (`TLG_RING_MERGE`, default 2048, 0 off): a copy has a fixed cost, the gap bytes are current guest memory.

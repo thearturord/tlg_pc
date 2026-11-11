@@ -21,6 +21,7 @@
 #include <xxhash.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #endif
 #ifdef TLG_PORT
 #include "tlg_toggles.h" // sigjmp_buf, tlg_setjmp, runtime_fault_recover
@@ -1928,6 +1929,9 @@ std::mutex g_silent_mutex;
 std::unordered_map<u64, u32> g_silent_at;   ///< page -> the submission its newest silent write belongs to
 std::unordered_map<u64, u32> g_silent_hits; ///< page -> windows with a silent write
 std::atomic<u32> g_silent_gen{0};           ///< bumped by every harvest that found silent pages
+std::vector<u64> g_sc_candidates; ///< note 127: the pages the last harvest found written with no announcement yet (one harvesting thread)
+u32 g_sc_candidates_index = 0;
+std::atomic<u64> c_sc_announced_after{0};
 std::atomic<u64> c_sc_harvests{0}, c_sc_written{0}, c_sc_ring{0}, c_sc_announced_now{0}, c_sc_announced_before{0}, c_sc_silent{0}, c_sc_ns{0}, c_sc_max_ns{0};
 std::atomic<u64> c_sc_late[LateKinds][2]{}, c_sc_late_bytes[LateKinds][2]{}, c_sc_reads_checked{0};
 struct HarvestContext {
@@ -1951,8 +1955,7 @@ void SilentPage(uintptr_t page, void* context) {
         c_sc_announced_before.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    c_sc_silent.fetch_add(1, std::memory_order_relaxed);
-    ctx.silent.push_back(page);
+    ctx.silent.push_back(page); // note 127: a candidate; the next harvest decides (an announcement made after the write, in the next window, is not silent)
 }
 
 bool SilentProbeOn() noexcept {
@@ -1969,11 +1972,70 @@ std::array<std::atomic<u64>, 4> c_sc_owner_windows{}; // 0 engine buffer, 1 engi
 std::array<std::unordered_set<u64>, 4> g_owner_pages;
 std::unordered_map<u64, std::array<u64, 3>> g_owner_buffers; // engine buffer id -> {silent page-windows, usage, own memory 0/1}
 std::unordered_map<std::string, u64> g_owner_sites;            // "class: ledger's newest site / writer" -> page-windows
+std::unordered_map<u64, std::array<u64, 2>> g_owner_textures;  // note 127: texture id -> {silent page-windows, submissions from its creation to its first silent page + 1}
+std::unordered_map<std::string, u64> g_owner_texture_kinds;   // note 127: "usage/bind/cpu/misc, age" -> page-windows
+// note 127: the big textures' content at creation, compared when the census first finds one of their pages silent: did the bytes change?
+struct BigTexture {
+    u64 address, bytes, resident; ///< pages in the working set at creation (QueryWorkingSetEx: reads nothing)
+    u32 state;                    // 0 not silent yet, 1 all zero when found silent, 2 not all zero, 3 not readable
+    u64 resident_after, nonzero_after;
+};
+u64 ResidentPages(u64 address, u64 bytes) {
+#ifdef _WIN32
+    static thread_local std::vector<PSAPI_WORKING_SET_EX_INFORMATION> info;
+    const u64 pages = bytes / 4096;
+    info.resize(pages);
+    for (u64 i = 0; i < pages; ++i) {
+        info[i].VirtualAddress = reinterpret_cast<void*>(address + i * 4096);
+    }
+    if (!K32QueryWorkingSetEx(GetCurrentProcess(), info.data(), static_cast<DWORD>(pages * sizeof(PSAPI_WORKING_SET_EX_INFORMATION)))) {
+        return ~u64{0};
+    }
+    u64 n = 0;
+    for (const auto& e : info) {
+        n += e.VirtualAttributes.Valid ? 1 : 0;
+    }
+    return n;
+#else
+    (void)address;
+    (void)bytes;
+    return 0;
+#endif
+}
+std::vector<BigTexture> g_big_textures;
+std::array<std::atomic<u64>, 3> c_sc_content{}; // note 127: confirmed silent page-windows: 0 all zero, 1 data, 2 not readable
+thread_local u64 t_readable_lo = 0, t_readable_hi = 0; ///< note 127: the last readable run VirtualQuery found (reset by each ClassifySilent call: protections change between harvests)
+bool NonzeroReadable(u64 address, u64 bytes, u64& nonzero) {
+#ifdef _WIN32
+    for (u64 at = address; at < address + bytes;) {
+        if (at >= t_readable_lo && at < t_readable_hi) {
+            at = t_readable_hi;
+            continue;
+        }
+        MEMORY_BASIC_INFORMATION m{};
+        if (VirtualQuery(reinterpret_cast<void*>(at), &m, sizeof(m)) == 0 || m.State != MEM_COMMIT || (m.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) == 0 ||
+            (m.Protect & PAGE_GUARD) != 0) {
+            return false;
+        }
+        t_readable_lo = reinterpret_cast<u64>(m.BaseAddress);
+        t_readable_hi = t_readable_lo + m.RegionSize;
+        at = t_readable_hi;
+    }
+#endif
+    u64 nz = 0;
+    const u64* w = reinterpret_cast<const u64*>(address);
+    for (u64 i = 0; i < bytes / 8; ++i) {
+        nz += w[i] != 0 ? 1 : 0;
+    }
+    nonzero = nz;
+    return true;
+}
 std::atomic<u32> g_silent_index{0};
 std::atomic<u64> c_own_binds{0}, c_own_binds_silent{0};
 std::unordered_map<u64, u64> g_own_bind_silent_ids; // id -> binds over a recently silent page
 
 void ClassifySilent(const std::vector<u64>& pages) {
+    t_readable_lo = t_readable_hi = 0;
     static thread_local std::vector<NativeDevice::BufferPart> parts;
     static thread_local std::vector<u64> textures;
     for (const u64 page : pages) {
@@ -1997,6 +2059,28 @@ void ClassifySilent(const std::vector<u64>& pages) {
             }
             b[2] |= has_own ? 1 : 0;
         }
+        if (cls == 1) {
+            for (auto& b : g_big_textures) {
+                if (b.state == 0 && page >= b.address && page < b.address + b.bytes) {
+                    b.resident_after = ResidentPages(b.address, b.bytes); // before the read below
+                    b.state = NonzeroReadable(b.address, b.bytes, b.nonzero_after) ? (b.nonzero_after == 0 ? 1u : 2u) : 3u;
+                }
+            }
+            // note 127: which textures
+            for (const u64 tid : textures) {
+                auto& t = g_owner_textures[tid];
+                ++t[0];
+                NativeDevice::Object o{};
+                const bool known = NativeDevice::Lookup(tid, o);
+                const u32 idx = g_silent_index.load(std::memory_order_relaxed);
+                const u32 age = known && idx > o.created_submit ? idx - o.created_submit : 0;
+                if (t[1] == 0) {
+                    t[1] = age + 1;
+                }
+                ++g_owner_texture_kinds[known ? fmt::format("usage {} bind {:#x} cpu {:#x} misc {:#x} mips {} {}", o.usage, o.bind, o.cpu_access, o.misc, o.mips, age < 4 ? "created 0-3 submissions before" : age < 64 ? "created 4-63 before" : "created 64+ before")
+                                              : std::string("not in the device table")];
+            }
+        }
         c_sc_owner_windows[cls].fetch_add(1, std::memory_order_relaxed);
         if (cls == 2 && !g_owner_pages[2].insert(page).second && SilentProbeOn() && probe_armed[2].fetch_add(1, std::memory_order_relaxed) < 20) {
             RingMirror::ProbeWrites(page); // note 126: a no-owner page silent a second time: its next store is recorded
@@ -2006,10 +2090,20 @@ void ClassifySilent(const std::vector<u64>& pages) {
             c_sc_owner_windows[3].fetch_add(1, std::memory_order_relaxed);
             g_owner_pages[3].insert(page);
         }
+        // note 127: a page whose every byte is zero carries no data (the first touch of memory never used before is reported as written, inv14); "data" otherwise
+        u64 nz = 0;
+        const bool readable = NonzeroReadable(page, 4096, nz);
+        const char* content = !readable ? " [not readable]" : nz == 0 ? " [all zero]" : " [data]";
+        ++c_sc_content[!readable ? 2 : nz == 0 ? 0 : 1];
         static constexpr const char* C[3] = {"buffer", "texture", "none"};
+        // note 127: how many submissions ago, and the writer before it (prev 15: none)
+        const u32 idx = g_silent_index.load(std::memory_order_relaxed);
+        const u32 age = idx > a.newest_submit ? idx - a.newest_submit : 0;
         const std::string site = a.covered == 0 ? std::string("never announced")
-                                                : fmt::format("last announced by writer {} at {}", a.newest_writer, a.newest_site < g_site_names.size() ? g_site_names[a.newest_site] : std::string("?"));
-        ++g_owner_sites[fmt::format("{}{}: {}", C[cls], own ? " (own memory)" : "", site)];
+                                                : fmt::format("last announced by writer {} {} submissions ago (before it: writer {}, {} ago){}", a.newest_writer, age < 8 ? std::to_string(age) : age < 64 ? std::string("8-63") : std::string("64+"),
+                                                              a.newest_prev, idx > a.newest_prev_submit ? (idx - a.newest_prev_submit < 8 ? std::to_string(idx - a.newest_prev_submit) : std::string("8+")) : std::string("0"),
+                                                              a.covered < 4096 ? " partly covered" : "");
+        ++g_owner_sites[fmt::format("{}{}{}: {}", C[cls], own ? " (own memory)" : "", content, site)];
     }
 }
 
@@ -2030,6 +2124,7 @@ nlohmann::json SilentOwnerReport() {
         t.push_back({{"what", sites[i].second}, {"page_windows", sites[i].first}});
     }
     j["by_owner_and_last_announcer"] = std::move(t);
+    j["CONTENT"] = {{"all_zero_no_data", c_sc_content[0].load()}, {"DATA", c_sc_content[1].load()}, {"not_readable", c_sc_content[2].load()}}; // note 127
     std::vector<std::pair<u64, u64>> bufs;
     for (const auto& [id, b] : g_owner_buffers) {
         bufs.emplace_back(b[0], id);
@@ -2042,6 +2137,48 @@ nlohmann::json SilentOwnerReport() {
         const bool known = NativeDevice::Lookup(bufs[i].second, o);
         tb.push_back({{"id", bufs[i].second}, {"silent_page_windows", b[0]}, {"usage", static_cast<int>(b[1]) - 1}, {"own_memory", b[2] != 0}, {"memory", known ? fmt::format("{:#x}+{:#x}", o.address, o.bytes) : std::string("?")},
                       {"cpu_access", known ? o.cpu_access : 0}, {"bind", known ? o.bind : 0}});
+    }
+    {
+        // note 127
+        std::vector<std::pair<u64, u64>> tex;
+        for (const auto& [id, t] : g_owner_textures) {
+            tex.emplace_back(t[0], id);
+        }
+        std::sort(tex.begin(), tex.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+        nlohmann::json tt = nlohmann::json::array();
+        for (size_t i = 0; i < tex.size() && i < 30; ++i) {
+            NativeDevice::Object o{};
+            const bool known = NativeDevice::Lookup(tex[i].second, o);
+            tt.push_back({{"id", tex[i].second}, {"silent_page_windows", tex[i].first}, {"first_silent_submissions_after_creation", static_cast<s64>(g_owner_textures[tex[i].second][1]) - 1},
+                          {"memory", known ? fmt::format("{:#x}+{:#x}", o.address, o.bytes) : std::string("?")}, {"usage", known ? o.usage : 0}, {"bind", known ? o.bind : 0}, {"cpu_access", known ? o.cpu_access : 0},
+                          {"misc", known ? o.misc : 0}, {"format", known ? o.format : 0}, {"size", known ? fmt::format("{}x{}x{} mips {} layers {}", o.width, o.height, o.depth, o.mips, o.layers) : std::string("?")},
+                          {"alive", known && o.alive}, {"created_submit", known ? o.created_submit : 0}});
+        }
+        j["distinct_textures"] = g_owner_textures.size();
+        j["top_textures"] = std::move(tt);
+        nlohmann::json tk = nlohmann::json::array();
+        std::vector<std::pair<u64, std::string>> kinds;
+        for (const auto& [k, n] : g_owner_texture_kinds) {
+            kinds.emplace_back(n, k);
+        }
+        std::sort(kinds.begin(), kinds.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+        for (size_t i = 0; i < kinds.size() && i < 30; ++i) {
+            tk.push_back({{"what", kinds[i].second}, {"page_windows", kinds[i].first}});
+        }
+        j["texture_kinds"] = std::move(tk);
+    }
+    {
+        nlohmann::json bt = nlohmann::json::array();
+        u32 counts[4]{};
+        for (const auto& b : g_big_textures) {
+            ++counts[b.state];
+            if (b.state != 0 && bt.size() < 40) {
+                static constexpr const char* S[4] = {"not silent", "ALL ZERO", "NOT ALL ZERO", "not readable"};
+                bt.push_back({{"memory", fmt::format("{:#x}+{:#x}", b.address, b.bytes)}, {"content_when_silent", S[b.state]}, {"pages", b.bytes / 4096}, {"resident_pages_at_creation", b.resident},
+                              {"resident_pages_when_silent", b.resident_after}, {"nonzero_words_when_silent", b.nonzero_after}});
+            }
+        }
+        j["big_textures_content"] = {{"recorded", g_big_textures.size()}, {"not_silent", counts[0]}, {"silent_all_zero", counts[1]}, {"silent_not_all_zero", counts[2]}, {"not_readable", counts[3]}, {"list", std::move(bt)}};
     }
     j["distinct_buffers"] = g_owner_buffers.size();
     j["top_buffers"] = std::move(tb);
@@ -2059,7 +2196,23 @@ nlohmann::json SilentOwnerReport() {
 } // namespace
 
 void SilentProbeNew(u32 what, u64 address, u64 bytes) {
+    if (SilentCensusOn() && what == 1 && address != 0 && bytes >= (4u << 20) && bytes <= (1ull << 30)) {
+        // note 127: residency at creation, without touching the pages (a read at creation made the later silent "write" disappear, inv13)
+        BigTexture b{address, bytes, ResidentPages(address, bytes), 0, 0, 0};
+        std::scoped_lock lock{g_owner_mutex};
+        if (g_big_textures.size() < 256) {
+            g_big_textures.push_back(b);
+        }
+    }
     if (!SilentProbeOn() || address == 0 || what > 1 || (what == 0 && bytes < (1u << 20))) {
+        return;
+    }
+    if (what == 1 && bytes >= (16u << 20)) {
+        // note 127: textures of 16 MB and more (the 4K render and depth targets, whose whole memory is written once a few submissions after creation): every one, up to 16, in the middle
+        static std::atomic<u32> big{0};
+        if (big.fetch_add(1, std::memory_order_relaxed) < 16) {
+            RingMirror::ProbeWrites((address + bytes / 2) & ~u64{4095});
+        }
         return;
     }
     static std::array<std::atomic<u32>, 2> seen{};
@@ -2103,16 +2256,51 @@ void SilentHarvest(u32 index) {
     const auto start = std::chrono::steady_clock::now();
     HarvestContext ctx{index, {}};
     runtime_memory_census_harvest(&SilentPage, &ctx, nullptr);
+    // note 127: the last harvest's candidates, decided now. A writer that announces after its copy (the emulator's file read: `bounce_read` copies up to 4 MB over GPU protected
+    // pages, one fault per page, then announces) is often caught by a harvest in the middle of the copy. Its announcement then lands in the window the harvest opened: announced, not silent.
+    std::vector<u64> confirmed;
+    if (!g_sc_candidates.empty()) {
+        const u32 k = g_sc_candidates_index;
+        confirmed.reserve(g_sc_candidates.size());
+        std::vector<u64> late;
+        for (const u64 page : g_sc_candidates) {
+            const LedgerAnswer a = LedgerQuery(page, page + 4096);
+            if (a.covered != 0 && a.newest_submit + 1 >= k && a.newest_submit <= k) {
+                late.push_back(page);
+            } else {
+                confirmed.push_back(page);
+            }
+        }
+        c_sc_announced_after.fetch_add(late.size(), std::memory_order_relaxed);
+        c_sc_silent.fetch_add(confirmed.size(), std::memory_order_relaxed);
+        g_silent_index.store(k, std::memory_order_relaxed);
+        if (!confirmed.empty()) {
+            ClassifySilent(confirmed); // note 126
+        }
+        std::scoped_lock lock{g_silent_mutex};
+        for (const u64 page : late) {
+            const auto it = g_silent_at.find(page);
+            if (it != g_silent_at.end() && it->second == k) {
+                g_silent_at.erase(it); // marked when it was a candidate
+            }
+        }
+        for (const u64 page : confirmed) {
+            ++g_silent_hits[page];
+        }
+    }
     g_silent_index.store(index, std::memory_order_relaxed);
-    if (!ctx.silent.empty()) {
-        ClassifySilent(ctx.silent); // note 126
+    {
+        // this harvest's candidates are marked at once, so a read before the next harvest is still checked against them
         std::scoped_lock lock{g_silent_mutex};
         for (const u64 page : ctx.silent) {
             g_silent_at[page] = index;
-            ++g_silent_hits[page];
         }
-        g_silent_gen.fetch_add(1, std::memory_order_relaxed);
+        if (!ctx.silent.empty()) {
+            g_silent_gen.fetch_add(1, std::memory_order_relaxed); // as before note 127: the image checks look again at once
+        }
     }
+    g_sc_candidates = std::move(ctx.silent);
+    g_sc_candidates_index = index;
     c_sc_harvests.fetch_add(1, std::memory_order_relaxed);
     const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
     c_sc_ns.fetch_add(ns, std::memory_order_relaxed);
@@ -2427,6 +2615,48 @@ void SilentImageKept(u64 address, u64 size) {
 }
 
 namespace {
+std::atomic<u64> c_hw_calls{0}, c_hw_bytes{0}, c_hw_not_announced{0}, c_hw_in_ring{0}, c_hw_ledger_missing{0}, c_hw_ledger_other{0}, c_hw_ledger_ok{0};
+std::atomic<u32> c_hw_logged{0};
+} // namespace
+
+void CheckHostWrite(u64 address, u64 size, bool announced) {
+    if (!SilentCensusOn() || size == 0) {
+        return;
+    }
+    c_hw_calls.fetch_add(1, std::memory_order_relaxed);
+    c_hw_bytes.fetch_add(size, std::memory_order_relaxed);
+    if (!announced) {
+        c_hw_not_announced.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (InRing(address, size)) {
+        c_hw_in_ring.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const LedgerAnswer a = LedgerQuery(address, address + size);
+    if (a.covered < size) {
+        c_hw_ledger_missing.fetch_add(1, std::memory_order_relaxed);
+    } else if (a.newest_writer != 5) {
+        c_hw_ledger_other.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        c_hw_ledger_ok.fetch_add(1, std::memory_order_relaxed);
+        // note 127 (with TLG_SILENT_PROBE=1): a sample of finished file reads gets the probe on one page, so the next store after the read (the silent one) is caught
+        static std::atomic<u32> seen{0}, armed{0};
+        const u64 page = (address + 4095) & ~u64{4095};
+        if (SilentProbeOn() && size >= 65536 && page + 4096 <= address + size) {
+            const u32 n = seen.fetch_add(1, std::memory_order_relaxed);
+            if (n >= 64 && (n & 15) == 0 && armed.fetch_add(1, std::memory_order_relaxed) < 24) {
+                RingMirror::ProbeWrites(page);
+            }
+        }
+        return;
+    }
+    if (c_hw_logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+        std::fprintf(stderr, "note 127: file read %#llx+%#llx: ledger covered %#llx, newest writer %u, ledger on %d\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), static_cast<unsigned long long>(a.covered), a.newest_writer, LedgerOn() ? 1 : 0);
+    }
+}
+
+namespace {
 nlohmann::json SilentReport() {
     nlohmann::json out;
     {
@@ -2521,6 +2751,7 @@ nlohmann::json SilentReport() {
     out["pages_in_the_frame_ring"] = c_sc_ring.load();
     out["pages_announced_in_this_window"] = c_sc_announced_now.load();
     out["pages_announced_in_the_window_before"] = c_sc_announced_before.load();
+    out["pages_announced_after_the_write_in_the_next_window"] = c_sc_announced_after.load(); // note 127: the write was harvested before its announcement landed
     out["pages_silent"] = c_sc_silent.load();
     out["pages_dropped_as_gpu_side_writes"] = gpu_side;
     out["raster_reads_checked"] = c_sc_reads_checked.load();
@@ -2548,6 +2779,8 @@ nlohmann::json SilentReport() {
     }
     out["top_pages"] = std::move(pages);
     out["owners"] = SilentOwnerReport(); // note 126
+    out["file_reads"] = {{"announced_calls", c_hw_calls.load()}, {"bytes", c_hw_bytes.load()}, {"NOT_ANNOUNCED_UPDATES_OFF", c_hw_not_announced.load()}, {"in_frame_ring", c_hw_in_ring.load()},
+                         {"LEDGER_MISSING_AFTER", c_hw_ledger_missing.load()}, {"ledger_newest_other_writer", c_hw_ledger_other.load()}, {"ledger_ok", c_hw_ledger_ok.load()}}; // note 127
     return out;
 }
 } // namespace

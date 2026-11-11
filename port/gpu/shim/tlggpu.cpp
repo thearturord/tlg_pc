@@ -10,6 +10,8 @@
 #include "core/guest_heap.h"
 #include "native/native_draw.h"
 #include "native/native_updates.h"
+#include "native/native_content.h"
+#include "native/native_ring_mirror.h"
 #include "core/emulator_settings.h"
 #include "tlg_write_log.h"
 // tlg: glue between the C loader and the vendored shadPS4 video core.
@@ -178,6 +180,7 @@ void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms)
     }
     runtime_memory_gpu_protect(virtual_addr, size, True(perms & MemoryPermission::Read),
                                True(perms & MemoryPermission::Write));
+    Core::RingMirror::ProbeReprotect(virtual_addr, size); // note 127 (the writer probe only; nothing when it is off)
 }
 boost::icl::interval_set<VAddr> AddressSpace::GetUsableRegions() {
     boost::icl::interval_set<VAddr> set;
@@ -319,9 +322,11 @@ extern "C" uintptr_t tlggpu_resolve(const char* scoped_nid) {
 }
 
 extern "C" void tlggpu_note_host_write(const void* address, uint64_t size) {
-    if (Core::NativeUpdates::enabled.load(std::memory_order_relaxed)) {
+    const bool on = Core::NativeUpdates::enabled.load(std::memory_order_relaxed);
+    if (on) {
         Core::NativeUpdates::NoteWriterRange(5, reinterpret_cast<u64>(address), size);
     }
+    Core::NativeContent::CheckHostWrite(reinterpret_cast<u64>(address), size, on); // note 127 (census only)
 }
 
 extern "C" int tlggpu_handle_fault(void* ucontext, void* address) {
