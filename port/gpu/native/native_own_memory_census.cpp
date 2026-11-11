@@ -234,11 +234,11 @@ u32 OwnLargeMode() noexcept {
     return mode;
 }
 
-u32 OwnCrossingMode() noexcept {
+u32 OwnRangeMode() noexcept {
     static const u32 mode = [] {
-        const char* e = std::getenv("TLG_OWN_CROSSING");
+        const char* e = std::getenv("TLG_OWN_RANGE");
         if (e == nullptr || e[0] == 0) {
-            return 0u; // default 0 (note 117); =1 shadow, =2 real
+            return 0u; // default 0 (note 120); =1 shadow, =2 real
         }
         return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
@@ -271,7 +271,7 @@ constexpr const char* DiagNames[DiagCount] = {"outside_starts_below", "outside_s
                                               "no_record_staging", "no_record_other_refused", "no_record_not_a_buffer", "no_record_unknown_id", "no_own_no_block_meets",
                                               "no_own_blocks_meet_none_whole", "no_id_in_frame_ring", "no_id_inside_one_engine_buffer", "no_id_over_several_engine_buffers",
                                               "no_id_no_engine_buffer", "no_id_reason_offset_by_program_base", "no_id_reason_not_single_load", "no_id_reason_no_record_words",
-                                              "no_id_reason_id_zero", "no_id_reason_other"};
+                                              "no_id_reason_id_zero", "no_id_reason_other", "no_own_old_path_stream_ring", "no_own_old_path_placed_it_now", "no_own_old_path_other"};
 } // namespace
 
 void NoteDiag(Diag what, const char* detail) noexcept {
@@ -330,10 +330,10 @@ nlohmann::json Report() {
         static constexpr const char* O[OwnCount] = {"asked", "immutable_inside", "no_own_buffer", "not_synced", "bound_from_own", "compared", "DIFFERENT_MUST_BE_0",
                                                     "OLD_PATH_DID_WORK_MUST_BE_0", "old_answer_stream_ring", "own_set", "own_cleared", "not_gpu_marked_yet", "own_resolved_lazily",
                                                     "bindings_valid_only_by_a_resolved_pointer"};
-        static constexpr const char* C[9] = {"own_immutable", "own_mutable_read", "own_mutable_written", "own_large_read", "own_large_written", "own_crossing_read", "own_crossing_written",
+        static constexpr const char* C[9] = {"own_immutable", "own_mutable_read", "own_mutable_written", "own_large_read", "own_large_written", "own_range_read", "own_range_written",
                                              "own_index", "own_vertex"};
         for (u32 c = 0; c < 9; ++c) {
-            j[C[c]]["mode"] = c == 0 ? OwnImmutableMode() : c >= 7 ? OwnGeometryMode() : c >= 5 ? OwnCrossingMode() : c >= 3 ? OwnLargeMode() : OwnMutableMode();
+            j[C[c]]["mode"] = c == 0 ? OwnImmutableMode() : c >= 7 ? OwnGeometryMode() : c >= 5 ? OwnRangeMode() : c >= 3 ? OwnLargeMode() : OwnMutableMode();
             j[C[c]]["close_mode"] = OwnCloseMode();
             for (u32 k = 0; k < OwnCount; ++k) {
                 j[C[c]][O[k]] = owns[c][k].load();

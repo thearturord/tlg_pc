@@ -71,6 +71,8 @@
 #include "native/native_hook_ring.h"
 
 namespace {
+thread_local bool t_f1_no_own = false; // note 120 diagnostic: this binding's buffer had no own block (the old path's answer is classified at the end)
+thread_local VAddr t_f1_no_own_begin = 0, t_f1_no_own_end = 0;
 thread_local bool t_f1_no_id = false; // note 119 diagnostic: this binding had no engine id at the own-memory step
 thread_local u32 t_cover_class = 15; // R-slice census: the draw class of the draw being timed
 thread_local u64 t_w1_draw_begin = 0, t_w1_bind_begin = 0, t_w1_bind_end = 0; // W1.2 census: the clock at the start of Draw(), of BindResources and at its end (ns)
@@ -4722,6 +4724,9 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         if (own == nullptr || eff == 0) {
                             OM::NoteOwn(OM::OwnNoOwn, cls);
                             if (own == nullptr && OM::DiagOn()) [[unlikely]] {
+                                t_f1_no_own = true;
+                                t_f1_no_own_begin = h->begin;
+                                t_f1_no_own_end = h->end;
                                 const bool meets = buffer_cache.PlacedMeetsRange(h->begin, h->end - h->begin);
                                 OM::NoteDiag(meets ? OM::DiagNoOwnPartial : OM::DiagNoOwnNone,
                                              fmt::format("id {} usage {} buffer {:#x}..{:#x} binding {:#x}+{:#x} written {} program {:#x}", h->id, h->usage, h->begin, h->end, r->ahead_address,
@@ -4776,16 +4781,21 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                             own_compare_cls = cls;
                             VideoCore::BufferCache::UploadBytesReset();
                         }
-                    } else if (const u32 crossing_mode = OM::OwnCrossingMode(); crossing_mode != 0 && mode != 0 && h != nullptr && h->alive.load(std::memory_order_acquire) &&
-                                                                               r->ahead_address >= h->begin && r->ahead_address < h->end && r->ahead_address + r->ahead_size > h->end) {
-                        // note 117: a binding that starts inside its buffer and ends past it: the placed block that holds the whole range, while nothing waits in the range
+                    } else if (const u32 crossing_mode = OM::OwnRangeMode(); crossing_mode != 0 && mode != 0 && (h == nullptr || h->alive.load(std::memory_order_acquire))) {
+                        // notes 117 and 120: a binding its record does not hold (no record: caller memory; outside it: a moved dynamic buffer, or past the end): the placed block that
+                        // holds the whole range, while nothing waits in the range
                         const u32 xcls = desc.is_written ? 6u : 5u;
                         OM::NoteOwn(OM::OwnAsked, xcls);
                         OM::NoteOwn(OM::OwnImmutable, xcls);
                         const VAddr address = r->ahead_address;
                         const u64 size = r->ahead_size;
-                        const auto* holder = buffer_cache.PlacedWhole(address, size);
-                        if (holder == nullptr) {
+                        // note 120: a range in the frame ring is the hook ring's (F1 class 1): the ring's pseudo block over the same memory is not its current copy (the shadow f1s2 found
+                        // 2,230 such answers different)
+                        const bool in_ring = Core::NativeContent::InRing(address, size);
+                        const auto* holder = in_ring ? nullptr : buffer_cache.PlacedWhole(address, size);
+                        if (in_ring) {
+                            OM::NoteOwn(OM::OwnOldStream, xcls);
+                        } else if (holder == nullptr) {
                             OM::NoteOwn(OM::OwnNoOwn, xcls);
                         } else if (buffer_cache.IsRegionCpuModified(address, size)) {
                             OM::NoteOwn(OM::OwnNotSynced, xcls);
@@ -5586,6 +5596,15 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
         }
 
     buffer_bound:
+        if (t_f1_no_own) [[unlikely]] {
+            // note 120 diagnostic: what the old path bound for a buffer with no own block
+            namespace OM = Core::OwnMemoryCensus;
+            t_f1_no_own = false;
+            const auto& info = buffer_infos.back();
+            const auto* now = buffer_cache.PlacedWhole(t_f1_no_own_begin, t_f1_no_own_end - t_f1_no_own_begin);
+            OM::NoteDiag(buffer_cache.IsStreamHandle(info.buffer) ? OM::DiagNoOwnOldStream : now != nullptr && info.buffer == now->Handle() ? OM::DiagNoOwnOldPlacedNow
+                                                                                                                                         : OM::DiagNoOwnOldOther);
+        }
         if (own_compare != nullptr) [[unlikely]] {
             // design review 83: the own memory's answer against the old path's
             namespace OM = Core::OwnMemoryCensus;

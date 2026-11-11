@@ -68,17 +68,17 @@ enum Own : u32 {
     OwnByResolved,     ///< bindings valid only through a resolved pointer
     OwnCount
 };
-/// `cls` 0 immutable read, 1 mutable read, 2 mutable written (design review 85); 3 large read, 4 large written (note 117); 5 crossing read, 6 crossing written (note 117).
-/// For the crossing classes `OwnImmutable` counts the bindings that start inside their buffer and end past it. 7 index buffer, 8 vertex buffer (note 117): `OwnImmutable`
+/// `cls` 0 immutable read, 1 mutable read, 2 mutable written (design review 85); 3 large read, 4 large written (note 117); 5 range read, 6 range written (notes 117, 120).
+/// For the range classes `OwnImmutable` counts the bindings its record does not hold. 7 index buffer, 8 vertex buffer (note 117): `OwnImmutable`
 /// counts the reads a geometry id's buffer holds whole.
 void NoteOwn(u32 what, u32 cls = 0) noexcept;
 /// Notes 117 to 119 (`TLG_OWN_LARGE`: 2 real by default since the owner's play, note 119; 1 shadow; 0 the old path): default and dynamic engine buffers above the resident cap (`TLG_RESIDENT_CAP`) get a record of their own
 /// (`NativeResources::FindLargeById`) that only the own-memory path and its upkeep read, and are bound from their placed block like the mutable class.
 [[nodiscard]] u32 OwnLargeMode() noexcept;
-/// Note 117 (`TLG_OWN_CROSSING`: 0 off by default, 1 shadow, 2 real): a binding named by an engine id whose range starts inside the buffer and ends past it is bound from the
-/// placed block that holds the whole range (no slack) while the range has no CPU bytes waiting (`IsRegionCpuModified`: every engine buffer part and the bytes between them)
-/// and, written, is GPU-marked.
-[[nodiscard]] u32 OwnCrossingMode() noexcept;
+/// Notes 117 and 120 (`TLG_OWN_RANGE`: 0 off by default, 1 shadow, 2 real): a binding named by an engine id that its record does not hold (no record: a buffer on caller memory;
+/// a range outside the record: a dynamic buffer whose memory a Map moved, or a range past the buffer's end) is bound from the placed block that holds the whole range (no slack)
+/// while the range has no CPU bytes waiting (`IsRegionCpuModified`: every engine buffer part and the bytes between them) and, written, is GPU-marked.
+[[nodiscard]] u32 OwnRangeMode() noexcept;
 /// Notes 117 to 119 (`TLG_OWN_GEOMETRY`: 2 real by default since the owner's play, note 119; 1 shadow; 0 the old path): index and vertex reads of an engine buffer the draw names by id (the record's geometry ids) are bound
 /// from that buffer's own memory, on the terms of its class (immutable: synchronized; default and dynamic: no CPU bytes waiting).
 [[nodiscard]] u32 OwnGeometryMode() noexcept;
@@ -106,6 +106,9 @@ enum Diag : u32 {
     DiagNoIdNoWords,      ///< (reason) no record words
     DiagNoIdZero,         ///< (reason) record words, id 0
     DiagNoIdOther,        ///< (reason) words and id, but no plan entry (address or size the front refused)
+    DiagNoOwnOldStream,   ///< a binding with no own block: the old path answered from the stream ring (a copy)
+    DiagNoOwnOldPlacedNow,///< ... the old path placed a block that holds the buffer whole (its first use, or after a drop)
+    DiagNoOwnOldOther,    ///< ... another buffer
     DiagCount
 };
 void NoteDiag(Diag what, const char* detail = nullptr) noexcept;
