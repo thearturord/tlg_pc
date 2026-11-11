@@ -64,6 +64,12 @@ void SilentResidentUse(u32 path, u64 key, u64 address, u64 size, u32 usage);
 /// W1.5 census for the texture cache: an image was uploaded from memory / used again without an upload (not dirty, not GPU written, not in the ring)
 void SilentImageUploaded(u64 address, u64 size, bool gpu_source);
 void SilentImageKept(u64 address, u64 size);
+/// Note 126 (TLG_SILENT_CENSUS=1): a bind served from an engine buffer's own memory (`id`, [address, address + size)); counts the binds over a page written silently in this or the
+/// window before (the own block holds the bytes of its last upload: a silent write after it is not in it)
+void SilentOwnBind(u64 id, u64 address, u64 size);
+/// Note 126 (`TLG_SILENT_PROBE=1`, with the census): arm the writer probe (`RingMirror::ProbeWrites`: the page read only, the first store's instruction and stack recorded) on a sample of
+/// new engine buffers above 1 MB (`what` 0) and new textures (`what` 1), right after their creation hook announced the initial data. A later silent write is caught as it happens.
+void SilentProbeNew(u32 what, u64 address, u64 bytes);
 /// M1 (memory-ownership-plan.md phase 1): the frame data store, in shadow. `TLG_FRAME_STORE=1` (default off, read once): at each graphics submission the bytes of the ranges the game announced
 /// since the previous one are copied (`ranges`, the submission's `Batch::first`), stamped with the submission's index; the buffer readers compare what they find in the game's memory with the store
 /// (`m0_late_reads.<kind>.frame_store_shadow`). Nothing reads the store for rendering. Whether or not the store is on, the submission is counted (the late-read census uses it).

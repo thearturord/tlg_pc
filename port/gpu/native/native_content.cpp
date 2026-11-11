@@ -34,6 +34,8 @@
 #include "native/native_invariant.h"
 #include "native/native_prof.h"
 #include "native/native_registry.h"
+#include "native/native_resources.h"
+#include "native/native_ring_mirror.h"
 #include "native/native_tsharp_watch.h"
 #include "native/native_updates.h"
 
@@ -1952,7 +1954,147 @@ void SilentPage(uintptr_t page, void* context) {
     c_sc_silent.fetch_add(1, std::memory_order_relaxed);
     ctx.silent.push_back(page);
 }
+
+bool SilentProbeOn() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_SILENT_PROBE");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+std::array<std::atomic<u32>, 3> probe_armed{}; // 0 big buffers, 1 textures, 2 repeating no-owner pages
+// note 126: who owns the silent pages (engine buffers, textures, nothing), by distinct page and by page-window, and the writer the ledger last saw there
+std::mutex g_owner_mutex;
+std::array<std::atomic<u64>, 4> c_sc_owner_windows{}; // 0 engine buffer, 1 engine texture only, 2 no engine resource, 3 a buffer with own memory
+std::array<std::unordered_set<u64>, 4> g_owner_pages;
+std::unordered_map<u64, std::array<u64, 3>> g_owner_buffers; // engine buffer id -> {silent page-windows, usage, own memory 0/1}
+std::unordered_map<std::string, u64> g_owner_sites;            // "class: ledger's newest site / writer" -> page-windows
+std::atomic<u32> g_silent_index{0};
+std::atomic<u64> c_own_binds{0}, c_own_binds_silent{0};
+std::unordered_map<u64, u64> g_own_bind_silent_ids; // id -> binds over a recently silent page
+
+void ClassifySilent(const std::vector<u64>& pages) {
+    static thread_local std::vector<NativeDevice::BufferPart> parts;
+    static thread_local std::vector<u64> textures;
+    for (const u64 page : pages) {
+        parts.clear();
+        textures.clear();
+        NativeDevice::BuffersIn(page, 4096, parts);
+        const bool any_texture = NativeDevice::TexturesIn(page, 4096, textures);
+        u32 cls = !parts.empty() ? 0u : any_texture || !textures.empty() ? 1u : 2u;
+        bool own = false;
+        const LedgerAnswer a = LedgerQuery(page, page + 4096);
+        std::scoped_lock lock{g_owner_mutex};
+        for (const auto& part : parts) {
+            auto* h = NativeResources::FindOwnRecordById(part.id);
+            const bool has_own = h != nullptr && h->own.load(std::memory_order_acquire) != nullptr;
+            own |= has_own;
+            auto& b = g_owner_buffers[part.id];
+            ++b[0];
+            NativeDevice::Object o{};
+            if (b[1] == 0 && NativeDevice::Lookup(part.id, o)) {
+                b[1] = o.usage + 1;
+            }
+            b[2] |= has_own ? 1 : 0;
+        }
+        c_sc_owner_windows[cls].fetch_add(1, std::memory_order_relaxed);
+        if (cls == 2 && !g_owner_pages[2].insert(page).second && SilentProbeOn() && probe_armed[2].fetch_add(1, std::memory_order_relaxed) < 20) {
+            RingMirror::ProbeWrites(page); // note 126: a no-owner page silent a second time: its next store is recorded
+        }
+        g_owner_pages[cls].insert(page);
+        if (own) {
+            c_sc_owner_windows[3].fetch_add(1, std::memory_order_relaxed);
+            g_owner_pages[3].insert(page);
+        }
+        static constexpr const char* C[3] = {"buffer", "texture", "none"};
+        const std::string site = a.covered == 0 ? std::string("never announced")
+                                                : fmt::format("last announced by writer {} at {}", a.newest_writer, a.newest_site < g_site_names.size() ? g_site_names[a.newest_site] : std::string("?"));
+        ++g_owner_sites[fmt::format("{}{}: {}", C[cls], own ? " (own memory)" : "", site)];
+    }
+}
+
+nlohmann::json SilentOwnerReport() {
+    nlohmann::json j;
+    std::scoped_lock lock{g_owner_mutex};
+    static constexpr const char* C[4] = {"engine_buffer", "engine_texture_only", "no_engine_resource", "buffer_with_own_memory"};
+    for (u32 k = 0; k < 4; ++k) {
+        j["by_owner"][C[k]] = {{"page_windows", c_sc_owner_windows[k].load()}, {"distinct_pages", g_owner_pages[k].size()}};
+    }
+    std::vector<std::pair<u64, std::string>> sites;
+    for (const auto& [k, n] : g_owner_sites) {
+        sites.emplace_back(n, k);
+    }
+    std::sort(sites.begin(), sites.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+    nlohmann::json t = nlohmann::json::array();
+    for (size_t i = 0; i < sites.size() && i < 30; ++i) {
+        t.push_back({{"what", sites[i].second}, {"page_windows", sites[i].first}});
+    }
+    j["by_owner_and_last_announcer"] = std::move(t);
+    std::vector<std::pair<u64, u64>> bufs;
+    for (const auto& [id, b] : g_owner_buffers) {
+        bufs.emplace_back(b[0], id);
+    }
+    std::sort(bufs.begin(), bufs.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+    nlohmann::json tb = nlohmann::json::array();
+    for (size_t i = 0; i < bufs.size() && i < 30; ++i) {
+        const auto& b = g_owner_buffers[bufs[i].second];
+        NativeDevice::Object o{};
+        const bool known = NativeDevice::Lookup(bufs[i].second, o);
+        tb.push_back({{"id", bufs[i].second}, {"silent_page_windows", b[0]}, {"usage", static_cast<int>(b[1]) - 1}, {"own_memory", b[2] != 0}, {"memory", known ? fmt::format("{:#x}+{:#x}", o.address, o.bytes) : std::string("?")},
+                      {"cpu_access", known ? o.cpu_access : 0}, {"bind", known ? o.bind : 0}});
+    }
+    j["distinct_buffers"] = g_owner_buffers.size();
+    j["top_buffers"] = std::move(tb);
+    j["own_memory_binds_checked"] = c_own_binds.load();
+    j["OWN_BINDS_OVER_A_RECENTLY_SILENT_PAGE"] = c_own_binds_silent.load();
+    nlohmann::json ti = nlohmann::json::array();
+    for (const auto& [id, n] : g_own_bind_silent_ids) {
+        if (ti.size() < 30) {
+            ti.push_back({{"id", id}, {"binds", n}});
+        }
+    }
+    j["own_binds_over_silent_pages_by_buffer"] = std::move(ti);
+    return j;
+}
 } // namespace
+
+void SilentProbeNew(u32 what, u64 address, u64 bytes) {
+    if (!SilentProbeOn() || address == 0 || what > 1 || (what == 0 && bytes < (1u << 20))) {
+        return;
+    }
+    static std::array<std::atomic<u32>, 2> seen{};
+    // one in 8 after the first 32 creations (the loading screen's first objects), at most 20 per class; the page past the first (the initial data's first page may be written again by the
+    // creation's own tail)
+    const u32 n = seen[what].fetch_add(1, std::memory_order_relaxed);
+    // buffers: every one over 1 MB, up to 40, armed on a page in its middle; textures: one in 8 after the first 32, up to 6 (their writers are known, note 126)
+    if (what == 0 ? probe_armed[0].fetch_add(1, std::memory_order_relaxed) >= 40 : (n < 32 || (n & 7) != 0 || probe_armed[1].fetch_add(1, std::memory_order_relaxed) >= 6)) {
+        return;
+    }
+    RingMirror::ProbeWrites(what == 0 ? (address + bytes / 2) & ~u64{4095} : bytes > 8192 ? address + 4096 : address);
+}
+
+void SilentOwnBind(u64 id, u64 address, u64 size) {
+    if (!SilentCensusOn() || size == 0) {
+        return;
+    }
+    c_own_binds.fetch_add(1, std::memory_order_relaxed);
+    const u32 now = g_silent_index.load(std::memory_order_relaxed);
+    const u64 first = address & ~u64{4095}, last = (address + size - 1) & ~u64{4095};
+    bool hit = false;
+    {
+        std::scoped_lock lock{g_silent_mutex};
+        u32 n = 0;
+        for (u64 page = first; page <= last && n < 64 && !hit; page += 4096, ++n) {
+            const auto it = g_silent_at.find(page);
+            hit = it != g_silent_at.end() && it->second + 1 >= now;
+        }
+    }
+    if (hit) {
+        c_own_binds_silent.fetch_add(1, std::memory_order_relaxed);
+        std::scoped_lock lock{g_owner_mutex};
+        ++g_own_bind_silent_ids[id];
+    }
+}
 
 void SilentHarvest(u32 index) {
     if (!SilentCensusOn()) {
@@ -1961,7 +2103,9 @@ void SilentHarvest(u32 index) {
     const auto start = std::chrono::steady_clock::now();
     HarvestContext ctx{index, {}};
     runtime_memory_census_harvest(&SilentPage, &ctx, nullptr);
+    g_silent_index.store(index, std::memory_order_relaxed);
     if (!ctx.silent.empty()) {
+        ClassifySilent(ctx.silent); // note 126
         std::scoped_lock lock{g_silent_mutex};
         for (const u64 page : ctx.silent) {
             g_silent_at[page] = index;
@@ -2403,6 +2547,7 @@ nlohmann::json SilentReport() {
                          {"in_gpu_allocation", InGpuAllocation(top[i].second, 4096)}});
     }
     out["top_pages"] = std::move(pages);
+    out["owners"] = SilentOwnerReport(); // note 126
     return out;
 }
 } // namespace

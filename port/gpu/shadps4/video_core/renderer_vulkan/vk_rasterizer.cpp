@@ -3492,7 +3492,7 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
             own_vertex = OwnGeometry(range.base_address, size, 8);
             static thread_local u32 vertex_tick = 0;
             if (own_vertex != nullptr && geo_mode == 2 && (++vertex_tick & 63u) != 0) {
-                Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnBound, 8);
+                Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnBound, 8); Core::NativeContent::SilentOwnBind(0, range.base_address, size); // note 126 census
                 const_cast<VideoCore::Buffer*>(own_vertex)->NoteResolveUse();
                 range.buffer = const_cast<VideoCore::Buffer*>(own_vertex);
                 range.offset = own_vertex->Offset(range.base_address);
@@ -3846,7 +3846,7 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
                        VideoCore::BufferCache::UploadBytesReset();
                        return false; // the old path answers (compared below)
                    }
-                   Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnBound, 7);
+                   Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnBound, 7); Core::NativeContent::SilentOwnBind(0, index_address, index_buffer_size); // note 126 census
                    const u64 offset = own_index->Offset(index_address);
                    const_cast<VideoCore::Buffer*>(own_index)->NoteResolveUse();
                    needs_barrier |= BufferBarrierQuery(own_index, offset, index_buffer_size, false);
@@ -4826,7 +4826,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                                 h->own.load(std::memory_order_acquire) != nullptr, h->cpu_dirty.load(std::memory_order_acquire), uploaded);
                                 }
                             }
-                            OM::NoteOwn(OM::OwnBound, cls);
+                            OM::NoteOwn(OM::OwnBound, cls); Core::NativeContent::SilentOwnBind(r->ahead_id, r->ahead_address, r->ahead_size); // note 126 census
                             const VAddr address = r->ahead_address;
                             const u64 size = r->ahead_size;
                             const u64 offset = block->Offset(address);
@@ -4878,7 +4878,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                             }
                             static thread_local u32 own_tick = 0;
                             if (eff == 2 && (++own_tick & 63u) != 0) {
-                                OM::NoteOwn(OM::OwnBound, cls);
+                                OM::NoteOwn(OM::OwnBound, cls); Core::NativeContent::SilentOwnBind(r->ahead_id, r->ahead_address, r->ahead_size); // note 126 census
                                 const VAddr address = r->ahead_address;
                                 const u64 size = r->ahead_size;
                                 const u64 offset = own->Offset(address);
@@ -4939,7 +4939,7 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         } else {
                             static thread_local u32 crossing_tick = 0;
                             if (crossing_mode == 2 && (++crossing_tick & 63u) != 0) {
-                                OM::NoteOwn(OM::OwnBound, xcls);
+                                OM::NoteOwn(OM::OwnBound, xcls); Core::NativeContent::SilentOwnBind(r->ahead_id, r->ahead_address, r->ahead_size); // note 126 census
                                 const u64 offset = holder->Offset(address);
                                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                                 const u64 adjust = offset - offset_aligned;

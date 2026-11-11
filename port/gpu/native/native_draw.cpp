@@ -8404,6 +8404,7 @@ u64 PS4_SYSV_ABI ResourceBufferCreated(u64 device, u64 description, u64 initial,
                 const u64 width = Rd<u32>(created, 0x180);
                 if (width != 0 && width <= (1ull << 30)) {
                     NativeUpdates::NoteWriterRange(5, Rd<u64>(created, 0x30), width, "CreateBuffer");
+                    NativeContent::SilentProbeNew(0, Rd<u64>(created, 0x30), width); // note 126 probe (off by default)
                 }
                 return 0;
             });
@@ -8464,6 +8465,7 @@ u64 PS4_SYSV_ABI ResourceTextureInitAnnounced(u64 object, u64 a1, u64 a2, u64 a3
         const u64 size = Rd<u64>(object, 0x38);
         if (memory != 0 && size != 0 && size <= (1ull << 32)) {
             NativeUpdates::NoteWriterRange(6, memory, size, "texture 2D initialization");
+            NativeContent::SilentProbeNew(1, memory, size); // note 126 probe (off by default)
             Core::TextureVersion::Bump(Rd<u64>(object, 0x10)); // note 100
         }
         return 0;

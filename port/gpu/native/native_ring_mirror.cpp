@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "native/native_ring_mirror.h"
+#include "native/native_device.h"
 #include "native/native_switch.h"
 
 #include <algorithm>
@@ -627,7 +628,31 @@ nlohmann::json Report() {
                  for (const auto& w : probe_writers) {
                      if (w.rip.load() != 0) {
                          const u64 base = NativeDraw::ImageBase();
-                         j["writers"].push_back({{"rip", fmt::format("{:#x}", w.rip.load() - base + 0x1000000)}, {"count", w.count.load()}, {"exact_block", w.exact.load()}, {"first_address", fmt::format("{:#x}", w.first_address.load())},
+                         const u64 raw = w.rip.load();
+                         std::string where = fmt::format("{:#x}", raw - base + 0x1000000);
+#ifdef _WIN32
+                         if (raw < base || raw - base >= 0x4000000) {
+                             // note 126: a host instruction: the module and the offset in it
+                             HMODULE module = nullptr;
+                             char name[MAX_PATH] = {};
+                             if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(raw), &module) &&
+                                 GetModuleFileNameA(module, name, MAX_PATH) != 0) {
+                                 const char* slash = std::strrchr(name, 92);
+                                 where = fmt::format("host {}+{:#x}", slash != nullptr ? slash + 1 : name, raw - reinterpret_cast<u64>(module));
+                             } else {
+                                 where = fmt::format("host {:#x} (no module)", raw);
+                             }
+                         }
+#endif
+                         std::string owner = "no engine resource";
+                         {
+                             NativeDevice::Object o{};
+                             if (NativeDevice::ResourceAt(w.first_address.load(), o)) {
+                                 owner = fmt::format("{} id {} usage {} cpu {:#x} memory {:#x}+{:#x}", o.kind == NativeDevice::Kind::Buffer ? "buffer" : "texture", o.id, o.usage, o.cpu_access,
+                                                     o.address, o.bytes);
+                             }
+                         }
+                         j["writers"].push_back({{"rip", where}, {"owner", owner}, {"count", w.count.load()}, {"exact_block", w.exact.load()}, {"first_address", fmt::format("{:#x}", w.first_address.load())},
                                                  {"stack_in_game_image", [&] {
                                                      std::string s;
                                                      for (const auto& word : w.stack) {
