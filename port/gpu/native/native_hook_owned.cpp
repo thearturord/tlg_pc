@@ -32,7 +32,10 @@ u32 Mode() noexcept {
 u32 RecordingMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_HOOK_OWNED_RECORDING");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+        if (e == nullptr || e[0] == 0) {
+            return 2u; // default 2 since 2026-11-11 after the owner's play (note 131); LEGACY(hook_owned_recording): =0 announces the BeginRecording buffers again, =1 shadow
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }

@@ -19,7 +19,7 @@
 namespace Core::HookOwned {
 
 [[nodiscard]] u32 Mode() noexcept;
-/// Note 129 (`TLG_HOOK_OWNED_RECORDING`: 0 off by default, 1 shadow, 2 real; needs `TLG_HOOK_OWNED` on): the three buffers `RenderDev::BeginRecording` fills once a frame
+/// Note 129 (`TLG_HOOK_OWNED_RECORDING`: 2 real by default since the owner's play, note 131; 1 shadow; 0 off, the old path; needs `TLG_HOOK_OWNED` on): the three buffers `RenderDev::BeginRecording` fills once a frame
 /// (writer 4 with the site "BeginRecording buffers", tag 4) join the same class. Shadow: they join and are counted, never pinned, and their writes stay announced (mark shadow).
 [[nodiscard]] u32 RecordingMode() noexcept;
 
