@@ -391,6 +391,10 @@ private:
     u32 own_index_cls{7};          ///< note 138: 7, or 10 when own_index came from the range rule
     bool own_index_shadow{false};  ///< note 138: own_index came from the range rule in its shadow mode (compared, not bound)
     u32 own_vertex_cls{8};         ///< note 139: 8, or 11 when the merged vertex range's own memory came from the range rule
+    /// Note 144 (`TLG_PROGRAM_CONSTS`): constants a shader reads through a descriptor offset by its program base (data inside the shader's own memory). Raster thread only.
+    /// Each (address, size) keeps a copy in `program_consts_buffer`; a bind compares the guest bytes with it and copies again, into a fresh slot, only when they differ.
+    [[nodiscard]] bool ProgramConstsBind(VAddr address, u64 size, u64& offset);
+    std::unique_ptr<VideoCore::Buffer> program_consts_buffer;
     bool own_vertex_shadow{false}; ///< note 139: ... in its shadow mode (compared, not bound)
     /// [0 read queries, 1 of them with no planned write, 2 SHADOW_NO_WRITES_BUT_BARRIER_MUST_BE_0, 3 real: asked (writes pending), 4 real: skipped, 5 real: sampled, 6 SAMPLED_BARRIER_MUST_BE_0]
     std::array<std::atomic<u64>, 8> barrier_guard{};

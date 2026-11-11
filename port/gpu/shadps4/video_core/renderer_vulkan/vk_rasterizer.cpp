@@ -2410,6 +2410,44 @@ void Rasterizer::BindCensus(const Pipeline* pipeline) {
 }
 
 namespace {
+/// Note 144: `TLG_PROGRAM_CONSTS` (0 off, the old path; 1 shadow: the table is kept and counted, the old path binds; 2 real: the table's copy is bound).
+u32 ProgramConstsMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_PROGRAM_CONSTS");
+        return e == nullptr || e[0] == 0 ? 2u : e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u; // default 2 since 2026-11-11 (note 144); LEGACY(program_consts): =0 copied into the stream ring at every bind, =1 shadow
+    }();
+    return mode;
+}
+struct ProgramConstsEntry {
+    u64 offset{};
+    std::vector<u8> bytes;
+};
+std::unordered_map<u64, ProgramConstsEntry> g_program_consts; // raster thread only: (address, size) -> the slot holding the bytes last seen
+u64 g_program_consts_used = 0;
+constexpr u64 ProgramConstsCapacity = 16ull << 20;
+enum ProgramConstsCount : u32 { PcAsked, PcServedSame, PcCopiedNew, PcCopiedChanged, PcFull, PcNoBuffer, PcSkippedFormatted, PcSkippedGpuWritten, PcSkippedRing, PcSkippedLarge, PcBound, PcCount };
+std::array<std::atomic<u64>, PcCount> c_program_consts{};
+void PublishPc() noexcept;
+void NotePc(ProgramConstsCount k) noexcept {
+    const u64 n = c_program_consts[k].fetch_add(1, std::memory_order_relaxed) + 1;
+    if (k == PcAsked && (n & 4095) == 1) {
+        PublishPc();
+    }
+}
+
+void PublishPc() noexcept {
+static constexpr const char* names[PcCount] = {"asked", "served_same_bytes", "copied_new_range", "copied_bytes_changed", "table_full", "no_mapped_buffer",
+                                                   "skipped_texel_over_image", "skipped_gpu_written", "skipped_frame_ring", "skipped_large", "bound_real"};
+    nlohmann::json j;
+    j["mode"] = ProgramConstsMode();
+    for (u32 k = 0; k < PcCount; ++k) {
+        j[names[k]] = c_program_consts[k].load(std::memory_order_relaxed);
+    }
+    j["ranges"] = g_program_consts.size();
+    j["bytes_used"] = g_program_consts_used;
+    Core::DebugServer::Publish("program_consts", std::move(j));
+}
+
 thread_local u64 t_fseg[7] = {}; // design review 66 (TLG_COVER_CENSUS, one fast binding in 8): stamps through the rows ahead fast path and the tail of the loop
 thread_local bool t_fseg_on = false;
 thread_local u64 t_bseg[6] = {}; // TLG_COVER_CENSUS: stamps of the handle path of one binding (1 after the descriptor, 2 before the row, 3 after the row, 4 after the answer, 5 before the binding is written)
@@ -2523,6 +2561,41 @@ void Rasterizer::W1ShadowGeometry(const Core::NativeResources::ImmutableBuffer* 
     if (!stream) {
         W1ShadowRow(hint != nullptr ? hint->id : 0, address, buffer, offset, 30);
     }
+}
+
+bool Rasterizer::ProgramConstsBind(VAddr address, u64 size, u64& offset) {
+    if (!program_consts_buffer) {
+        program_consts_buffer = std::make_unique<VideoCore::Buffer>(instance, 0, ProgramConstsCapacity, VideoCore::MemoryType::Stream, "program constants"); // (mapped, as the hook ring)
+    }
+    if (program_consts_buffer->mapped_data.empty()) {
+        NotePc(PcNoBuffer);
+        return false;
+    }
+    static thread_local std::vector<u8> now;
+    now.resize(size);
+    memory->CopySparseMemory(address, now.data(), size);
+    const u64 key = (address * 0x9E3779B97F4A7C15ull) ^ (size << 1);
+    auto it = g_program_consts.find(key);
+    if (it != g_program_consts.end() && it->second.bytes.size() == size && std::memcmp(it->second.bytes.data(), now.data(), size) == 0) {
+        NotePc(PcServedSame);
+        offset = it->second.offset;
+        return true;
+    }
+    // a new range, or its bytes moved: a fresh slot (the old slot may still be read by work in flight, so it is never written again)
+    const u64 slot = Common::AlignUp(g_program_consts_used, 256);
+    if (slot + size > ProgramConstsCapacity) {
+        NotePc(PcFull);
+        return false;
+    }
+    g_program_consts_used = slot + size;
+    std::memcpy(program_consts_buffer->mapped_data.data() + slot, now.data(), size);
+    program_consts_buffer->Flush(slot, size);
+    NotePc(it == g_program_consts.end() ? PcCopiedNew : PcCopiedChanged);
+    auto& e = g_program_consts[key];
+    e.offset = slot;
+    e.bytes = now;
+    offset = slot;
+    return true;
 }
 
 /// W3.1 counters in `w1s_counts`, 88 + 16 * (compute ? 1 : 0) + 8 * (written ? 1 : 0) + n: 0 predicted valid, no work, same answer (good), 1 predicted valid but the old path did work (MUST_BE_0),
@@ -4943,6 +5016,30 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                                  in_ring ? nullptr : detail.c_str());
                     if (!in_ring) {
                         OM::NoteDiag(reason, detail.c_str());
+                    }
+                }
+                if (const u32 pc_mode = ProgramConstsMode(); pc_mode != 0 && desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase && !desc.is_written) [[unlikely]] {
+                    // note 144: constants inside the shader's own memory (written once, at the shader's creation): the copy kept for this range, copied again only if the bytes moved
+                    NotePc(PcAsked);
+                    const auto& pc_ring = VideoCore::UntrackedRing::Get();
+                    u64 pc_offset = 0;
+                    if (desc.is_formatted && (texture_cache.AnyImageOverlaps(vsharp.address, size) || texture_cache.IsMeta(vsharp.address))) {
+                        NotePc(PcSkippedFormatted); // (a texel read over an image or image metadata: the old path decides, as for the in-place binding)
+                    } else if (size > 65536) {
+                        NotePc(PcSkippedLarge);
+                    } else if (pc_ring.Active() && vsharp.address < pc_ring.End() && vsharp.address + size > pc_ring.Start()) {
+                        NotePc(PcSkippedRing);
+                    } else if (buffer_cache.IsRangeGpuWritten(vsharp.address, size)) {
+                        NotePc(PcSkippedGpuWritten);
+                    } else if (ProgramConstsBind(vsharp.address, size, pc_offset) && pc_mode == 2) {
+                        NotePc(PcBound);
+                        Census(census_base + CBufferInPlace);
+                        const u64 offset_aligned = Common::AlignDown(pc_offset, alignment);
+                        const u64 adjust = pc_offset - offset_aligned;
+                        push_data.AddOffset(binding.buffer, adjust);
+                        buffer_infos.emplace_back(program_consts_buffer->Handle(), offset_aligned, size + adjust);
+                        Core::NativeContent::ClearBindContext();
+                        goto buffer_bound; // (never written by the GPU: no barrier, no bound-list entry)
                     }
                 }
                 // N7.5: a read-only buffer of guest memory bound where it is (imported view of the runtime's backing), no copy, no dirty tracking
