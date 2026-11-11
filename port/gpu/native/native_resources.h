@@ -113,6 +113,11 @@ std::string ExplainImmutableMiss(const ImmutableBuffer* handle, VAddr address);
 /// N3c: the live immutable buffer of the engine id `id` that contains [address, address + size) (size 0: the id alone), or null. Per thread cache by id, valid while
 /// `ImmutableEpoch` does not change (a buffer was registered or destroyed). The pointer is only good for the epoch read together with it.
 ImmutableBuffer* FindImmutableById(u64 id);
+/// Note 117 (`TLG_OWN_LARGE`): the record of a live default or dynamic engine buffer above the resident cap, or null. Not in the address map, the handles or the residency:
+/// only the own-memory path and its upkeep (own pointer, `cpu_dirty`) read it.
+ImmutableBuffer* FindLargeById(u64 id);
+/// The registry's record, else the large record (the own-memory upkeep: placement, drop, dirty notes).
+ImmutableBuffer* FindOwnRecordById(u64 id);
 u64 ImmutableEpoch();
 /// N3c counters of the handle path (0 handle used, 1 handle stale because the epoch changed, 2 the id names no immutable buffer, 3 the request is outside the
 /// handle's range, 4 verify mode: the handle differs from the address lookup).

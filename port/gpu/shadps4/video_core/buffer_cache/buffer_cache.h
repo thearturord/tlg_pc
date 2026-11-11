@@ -338,6 +338,11 @@ private:
     /// Design review 87: the placed block holding the whole of engine buffer `h` becomes its own memory (`own`, `own_new`), with `cpu_dirty` taken from its dirty set;
     /// null when no placed block holds it (then not asked again until the placements change).
     const Buffer* OwnResolve(Core::NativeResources::ImmutableBuffer& h);
+    /// Note 117: the placed block that holds [address, address + size) whole, without its slack, or null (raster thread).
+    [[nodiscard]] const Buffer* PlacedWhole(VAddr address, u64 size) {
+        const PlacedBuffer* entry = PlacedAt(address, size, true);
+        return entry != nullptr ? entry->buffer.get() : nullptr;
+    }
   private:
     static constexpr u64 PlacedSlack = 64; ///< B9.4: a read may run this far past a placed buffer's end (vertex fetch rounding); the bytes there are not memory's
     struct PlacedBuffer {

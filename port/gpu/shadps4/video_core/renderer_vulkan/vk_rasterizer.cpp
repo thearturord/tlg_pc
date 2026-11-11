@@ -941,6 +941,64 @@ u64 Rasterizer::TargetTableShadow(u32 slot, u64 use, VideoCore::ImageId image_id
     return flags;
 }
 
+const VideoCore::Buffer* Rasterizer::OwnGeometry(VAddr address, u64 size, u32 cls) {
+    namespace OM = Core::OwnMemoryCensus;
+    if (geometry_plan == nullptr || geometry_plan->geometry_id_count == 0 || size == 0) {
+        return nullptr;
+    }
+    OM::NoteOwn(OM::OwnAsked, cls);
+    Core::NativeResources::ImmutableBuffer* h = nullptr;
+    for (u32 i = 0; i < geometry_plan->geometry_id_count; ++i) {
+        auto* c = Core::NativeResources::FindOwnRecordById(geometry_plan->geometry_ids[i]);
+        if (c != nullptr && address >= c->begin && address + size <= c->end && c->alive.load(std::memory_order_acquire)) {
+            h = c;
+            break;
+        }
+    }
+    if (h == nullptr) {
+        return nullptr;
+    }
+    OM::NoteOwn(OM::OwnImmutable, cls);
+    if (h->usage != 1 && OM::OwnMutableMode() == 0) {
+        OM::NoteOwn(OM::OwnNoOwn, cls); // (`cpu_dirty` is kept only with the mutable class on)
+        return nullptr;
+    }
+    const auto* own = static_cast<const VideoCore::Buffer*>(h->own.load(std::memory_order_acquire));
+    if (own == nullptr && OM::OwnCloseMode() != 0) {
+        own = buffer_cache.OwnResolve(*h);
+    }
+    if (own == nullptr) {
+        OM::NoteOwn(OM::OwnNoOwn, cls);
+        return nullptr;
+    }
+    const bool by_resolved = h->own_new.load(std::memory_order_acquire);
+    const bool waiting = h->usage == 1 && !by_resolved ? !h->synced.load(std::memory_order_acquire) : h->cpu_dirty.load(std::memory_order_acquire);
+    if (waiting) {
+        OM::NoteOwn(OM::OwnNotSynced, cls);
+        return nullptr;
+    }
+    return own;
+}
+
+void Rasterizer::OwnGeometryCompare(const VideoCore::Buffer* own, VAddr address, vk::Buffer bound, u64 offset, u32 cls) {
+    namespace OM = Core::OwnMemoryCensus;
+    if (buffer_cache.IsStreamHandle(bound) || bound == constant_ring->Handle()) {
+        OM::NoteOwn(OM::OwnOldStream, cls);
+        return;
+    }
+    OM::NoteOwn(OM::OwnCompared, cls);
+    if (bound != own->Handle() || offset != own->Offset(address)) {
+        OM::NoteOwn(OM::OwnDifferent, cls);
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+            LOG_ERROR(Render_Vulkan, "own memory differs (class {}, {} read) at {:#x}: own {:#x}+{:#x}, old {:#x}+{:#x}", cls, cls == 7 ? "index" : "vertex", address,
+                      reinterpret_cast<u64>(static_cast<VkBuffer>(own->Handle())), own->Offset(address), reinterpret_cast<u64>(static_cast<VkBuffer>(bound)), offset);
+        }
+    } else if (VideoCore::BufferCache::UploadBytes() != 0) {
+        OM::NoteOwn(OM::OwnOldPathWork, cls);
+    }
+}
+
 void Rasterizer::InvalidateWrittenBuffer(u64 id, VAddr address, u64 size, bool inside) {
     using namespace Core::ViewTable;
     if (WrittenMode() == 0) [[likely]] {
@@ -3415,6 +3473,22 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
                 continue;
             }
         }
+        const VideoCore::Buffer* own_vertex = nullptr;
+        if (const u32 geo_mode = Core::OwnMemoryCensus::OwnGeometryMode(); geo_mode != 0) {
+            // note 117: the vertex buffer the draw names by id, from its own memory
+            own_vertex = OwnGeometry(range.base_address, size, 8);
+            static thread_local u32 vertex_tick = 0;
+            if (own_vertex != nullptr && geo_mode == 2 && (++vertex_tick & 63u) != 0) {
+                Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnBound, 8);
+                const_cast<VideoCore::Buffer*>(own_vertex)->NoteResolveUse();
+                range.buffer = const_cast<VideoCore::Buffer*>(own_vertex);
+                range.offset = own_vertex->Offset(range.base_address);
+                needs_barrier |= BufferBarrierQuery(own_vertex, range.offset, size, false);
+                bound_buffers.emplace_back(own_vertex, range.offset, size, vk::AccessFlagBits2::eVertexAttributeRead);
+                continue;
+            }
+            VideoCore::BufferCache::UploadBytesReset();
+        }
         auto* vertex_handle = GeometryHandle(range.base_address, size);
         Census(vertex_handle != nullptr ? CGeometryVertexHandle : CGeometryVertexAddress);
         Core::NativeContent::SetBindContext({"vertex", 0, 0, 0, 0, vertex_handle != nullptr, false, range.base_address, size});
@@ -3426,6 +3500,9 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
         Core::NativeContent::ClearBindContext();
         if (cover_on && W1ShadowOn()) [[unlikely]] {
             W1ShadowGeometry(vertex_handle, range.base_address, range.buffer, range.offset, true);
+        }
+        if (own_vertex != nullptr) [[unlikely]] {
+            OwnGeometryCompare(own_vertex, range.base_address, range.buffer->Handle(), range.offset, 8);
         }
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
         bound_buffers.emplace_back(range.buffer, range.offset, size,
@@ -3695,6 +3772,33 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
         ilap(4);
         ilap(5);
     } else if (index_buffer_size != 0 && [&] {
+                   // note 117 (TLG_OWN_GEOMETRY): the index buffer the draw names by id, from its own memory
+                   const u32 geo_mode = Core::OwnMemoryCensus::OwnGeometryMode();
+                   if (geo_mode == 0) {
+                       return false;
+                   }
+                   own_index = OwnGeometry(index_address, index_buffer_size, 7);
+                   static thread_local u32 index_tick = 0;
+                   if (own_index == nullptr || geo_mode != 2 || (++index_tick & 63u) == 0) {
+                       VideoCore::BufferCache::UploadBytesReset();
+                       return false; // the old path answers (compared below)
+                   }
+                   Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnBound, 7);
+                   const u64 offset = own_index->Offset(index_address);
+                   const_cast<VideoCore::Buffer*>(own_index)->NoteResolveUse();
+                   needs_barrier |= BufferBarrierQuery(own_index, offset, index_buffer_size, false);
+                   bound_buffers.emplace_back(own_index, offset, index_buffer_size, vk::AccessFlagBits2::eIndexRead);
+                   index_buffer = own_index->Handle();
+                   buffer_offset = offset;
+                   own_index = nullptr; // (bound from it: nothing to compare)
+                   ipath = 1;
+                   ilap(3);
+                   ilap(4);
+                   ilap(5);
+                   return true;
+               }()) {
+        // (bound from own memory above)
+    } else if (index_buffer_size != 0 && [&] {
                    // design review 76 (TLG_GEOMETRY_ROWS): the index buffer by row (engine id of the plan's geometry handle)
                    const u32 grm = Core::RowVersion::GeometryRowsMode();
                    if (grm == 0) {
@@ -3811,6 +3915,10 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
         index_buffer = null_buffer->Handle();
     }
 
+    if (own_index != nullptr) [[unlikely]] {
+        OwnGeometryCompare(own_index, index_address, index_buffer, buffer_offset, 7);
+        own_index = nullptr;
+    }
     if (verify_slots_on) {
         verify_index = {index_buffer, buffer_offset, index_buffer_size, buffer_cache.IsStreamHandle(index_buffer)};
     }
@@ -4558,10 +4666,16 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                 const ResolvedBuffer* r = op != nullptr && buffer_index < op->resolved.size() && op->resolved[buffer_index].ahead_id != 0 ? &op->resolved[buffer_index] : nullptr;
                 if (r != nullptr) {
                     auto* h = Core::NativeResources::FindImmutableById(r->ahead_id);
+                    const u32 large_mode = Core::OwnMemoryCensus::OwnLargeMode();
+                    bool large = false;
+                    if (h == nullptr && large_mode != 0 && mutable_mode != 0) {
+                        h = Core::NativeResources::FindLargeById(r->ahead_id); // note 117: a default or dynamic buffer above the resident cap
+                        large = h != nullptr;
+                    }
                     const bool imm = h != nullptr && h->usage == 1;
-                    // class: 0 immutable read, 1 mutable read, 2 mutable written (design review 85); an immutable written binding is left alone
-                    const u32 cls = imm ? 0u : desc.is_written ? 2u : 1u;
-                    const u32 mode = imm ? (desc.is_written ? 0u : own_mode) : mutable_mode;
+                    // class: 0 immutable read, 1 mutable read, 2 mutable written (design review 85), 3 large read, 4 large written (note 117); an immutable written binding is left alone
+                    const u32 cls = imm ? 0u : large ? (desc.is_written ? 4u : 3u) : desc.is_written ? 2u : 1u;
+                    const u32 mode = imm ? (desc.is_written ? 0u : own_mode) : large ? (large_mode == 1 ? 1u : mutable_mode) : mutable_mode;
                     if (mode != 0) {
                         OM::NoteOwn(OM::OwnAsked, cls);
                     }
@@ -4576,6 +4690,9 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         u32 eff = mode;
                         if (by_resolved) {
                             eff = close_mode == 0 ? 0u : close_mode == 1 ? 1u : mode; // shadow: compared; real: as its class
+                        }
+                        if (large && large_mode == 1 && eff != 0) {
+                            eff = 1u; // note 117 shadow: compared only
                         }
                         if (own == nullptr || eff == 0) {
                             OM::NoteOwn(OM::OwnNoOwn, cls);
@@ -4626,6 +4743,58 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                             own_compare_size = r->ahead_size;
                             own_compare_slot = binding.buffer;
                             own_compare_cls = cls;
+                            VideoCore::BufferCache::UploadBytesReset();
+                        }
+                    } else if (const u32 crossing_mode = OM::OwnCrossingMode(); crossing_mode != 0 && mode != 0 && h != nullptr && h->alive.load(std::memory_order_acquire) &&
+                                                                               r->ahead_address >= h->begin && r->ahead_address < h->end && r->ahead_address + r->ahead_size > h->end) {
+                        // note 117: a binding that starts inside its buffer and ends past it: the placed block that holds the whole range, while nothing waits in the range
+                        const u32 xcls = desc.is_written ? 6u : 5u;
+                        OM::NoteOwn(OM::OwnAsked, xcls);
+                        OM::NoteOwn(OM::OwnImmutable, xcls);
+                        const VAddr address = r->ahead_address;
+                        const u64 size = r->ahead_size;
+                        const auto* holder = buffer_cache.PlacedWhole(address, size);
+                        if (holder == nullptr) {
+                            OM::NoteOwn(OM::OwnNoOwn, xcls);
+                        } else if (buffer_cache.IsRegionCpuModified(address, size)) {
+                            OM::NoteOwn(OM::OwnNotSynced, xcls);
+                        } else if (desc.is_written && !buffer_cache.GpuWrittenContains(address, size)) {
+                            OM::NoteOwn(OM::OwnNotGpuMarked, xcls);
+                        } else {
+                            static thread_local u32 crossing_tick = 0;
+                            if (crossing_mode == 2 && (++crossing_tick & 63u) != 0) {
+                                OM::NoteOwn(OM::OwnBound, xcls);
+                                const u64 offset = holder->Offset(address);
+                                const u64 offset_aligned = Common::AlignDown(offset, alignment);
+                                const u64 adjust = offset - offset_aligned;
+                                const_cast<VideoCore::Buffer*>(holder)->NoteResolveUse();
+                                if (desc.is_written) {
+                                    Core::NativeRegistry::SetBufferWriter(stage.pgm_hash, static_cast<u32>(stage.sw_stage));
+                                    buffer_cache.BindMemoErase(address, size);
+                                    Core::NativeResources::NoteGpuWritten(address, size);
+                                    Core::RowVersion::NoteWritten(0);
+                                    recipe_reusable = false;
+                                }
+                                recipe_ranges.emplace_back(address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
+                                if (size > 262144) {
+                                    recipe_reusable = false;
+                                }
+                                push_data.AddOffset(binding.buffer, adjust);
+                                buffer_infos.emplace_back(holder->Handle(), offset_aligned, size + adjust);
+                                bound_buffers.emplace_back(holder, offset, size, src_access);
+                                if (desc.is_written) {
+                                    InvalidateWrittenBuffer(r->ahead_id, address, size, false); // (the range is not the buffer's alone: the id does not decide)
+                                }
+                                if (BufferBarrierQuery(holder, offset, size, desc.is_written)) {
+                                    needs_barrier = true;
+                                }
+                                goto buffer_bound;
+                            }
+                            own_compare = holder;
+                            own_compare_offset = holder->Offset(address);
+                            own_compare_size = size;
+                            own_compare_slot = binding.buffer;
+                            own_compare_cls = xcls;
                             VideoCore::BufferCache::UploadBytesReset();
                         }
                     }

@@ -1661,7 +1661,7 @@ void BufferCache::OwnDirtyNote(u64 id, bool added) {
     if (Core::OwnMemoryCensus::OwnMutableMode() == 0) [[likely]] {
         return;
     }
-    auto* h = Core::NativeResources::FindImmutableById(id);
+    auto* h = Core::NativeResources::FindOwnRecordById(id); // (note 117: the large records too)
     if (h == nullptr) {
         return;
     }

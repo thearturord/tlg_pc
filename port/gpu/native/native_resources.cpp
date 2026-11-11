@@ -527,6 +527,44 @@ Located Locate(VAddr address, u64 size_hint) {
 
 } // namespace
 
+namespace {
+/// note 117: records of the engine buffers above the resident cap (never in `immutables`); a dead record is kept (the raster thread may hold its pointer)
+std::shared_mutex large_mutex;
+std::unordered_map<u64, std::shared_ptr<ImmutableBuffer>> large_by_id;
+std::unordered_map<u64, std::shared_ptr<ImmutableBuffer>> large_by_object;
+std::vector<std::shared_ptr<ImmutableBuffer>> large_dead;
+
+void AddLarge(const Resource& resource) {
+    auto entry = std::make_shared<ImmutableBuffer>();
+    entry->usage = static_cast<u8>(resource.usage);
+    entry->begin = resource.address;
+    entry->end = resource.address + ((u64{resource.width} + 3) & ~u64{3});
+    entry->object = resource.object;
+    entry->id = resource.id;
+    std::unique_lock lock{large_mutex};
+    if (const auto it = large_by_object.find(entry->object); it != large_by_object.end()) {
+        it->second->alive.store(false, std::memory_order_release);
+        large_dead.push_back(it->second);
+        large_by_id.erase(it->second->id);
+    }
+    large_by_object[entry->object] = entry;
+    large_by_id[entry->id] = entry;
+}
+} // namespace
+
+ImmutableBuffer* FindLargeById(u64 id) {
+    std::shared_lock lock{large_mutex};
+    const auto it = large_by_id.find(id);
+    return it != large_by_id.end() && it->second->alive.load(std::memory_order_acquire) ? it->second.get() : nullptr;
+}
+
+ImmutableBuffer* FindOwnRecordById(u64 id) {
+    if (auto* h = FindImmutableById(id)) {
+        return h;
+    }
+    return OwnMemoryCensus::OwnLargeMode() != 0 ? FindLargeById(id) : nullptr;
+}
+
 void NoteBufferObject(u64 object) {
     Resource resource;
     if (ReadResource(object, resource)) {
@@ -538,6 +576,9 @@ void NoteBufferObject(u64 object) {
                    ResidentBuffersEnabled()) {
             AddImmutable(resource); // C1: resident default / dynamic buffer
             NoteResident(5);
+        } else if (resource.kind == 1 && (resource.usage == 0 || resource.usage == 2) && (resource.misc & 0x80000) == 0 && resource.width != 0 &&
+                   OwnMemoryCensus::OwnLargeMode() != 0) {
+            AddLarge(resource); // note 117: above the cap (or residency off): a record for own memory only
         }
     }
 }
@@ -548,6 +589,15 @@ void NoteTextureObject(u64 object) {
 }
 
 bool NoteBufferDestroyed(u64 object) {
+    if (OwnMemoryCensus::OwnLargeMode() != 0) {
+        std::unique_lock lock{large_mutex};
+        if (const auto it = large_by_object.find(object); it != large_by_object.end()) {
+            it->second->alive.store(false, std::memory_order_release);
+            large_dead.push_back(it->second);
+            large_by_id.erase(it->second->id);
+            large_by_object.erase(it);
+        }
+    }
     bool had_immutable_entry = false;
     {
         std::unique_lock lock{immutable_mutex};

@@ -403,7 +403,7 @@ const Buffer* BufferCache::Place(std::vector<u64> ids, VAddr begin, VAddr end) {
         // design review 85: every registered engine buffer this block holds whole lives here now (its own memory until the block is dropped)
         std::scoped_lock lock{object_dirty_mutex};
         for (const u64 id : ids) {
-            if (auto* h = Core::NativeResources::FindImmutableById(id); h != nullptr && h->usage != 1 && h->begin >= begin && h->end <= end) {
+            if (auto* h = Core::NativeResources::FindOwnRecordById(id); h != nullptr && h->usage != 1 && h->begin >= begin && h->end <= end) {
                 h->own_new.store(false, std::memory_order_release);
                 h->own.store(dst, std::memory_order_release);
                 Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnSet, 1);
@@ -489,6 +489,14 @@ void BufferCache::DropPlaced(VAddr begin, const char* why) {
     }
     range_epoch.fetch_add(1, std::memory_order_acq_rel);
     Core::NativeIdentity::Note(dropped_begin, dropped_end, Core::NativeIdentity::BufferDropped);
+    if (Core::OwnMemoryCensus::OwnLargeMode() != 0) {
+        for (const u64 id : ids) {
+            if (auto* large = Core::NativeResources::FindLargeById(id); large != nullptr && large->own.load(std::memory_order_acquire) == buffer.get()) {
+                large->own.store(nullptr, std::memory_order_release); // note 117: before the buffer is freed (deferred below)
+                Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnCleared, 3);
+            }
+        }
+    }
     for (const u64 id : ids) {
         if (auto* object = Core::NativeResources::FindImmutableById(id)) {
             object->resident_epoch.store(~u64{0}, std::memory_order_release); // its binding resolution is made again

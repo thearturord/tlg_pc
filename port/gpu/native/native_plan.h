@@ -124,6 +124,9 @@ struct DrawPlan {
     std::array<Core::NativeResources::ImmutableBuffer*, Core::NativeDraw::MaxGeometryIds> geometry_handles{};
     u32 geometry_handle_count{};
     bool has_geometry_handles{};
+    /// Note 117: the record's vertex and index buffer ids themselves (own memory by id reads them at the bind, with no epoch)
+    std::array<u64, Core::NativeDraw::MaxGeometryIds> geometry_ids{};
+    u32 geometry_id_count{};
     /// N5g: vertex ranges (`index` = GeometryVertex) and the index range (`GeometryIndex`) the command processor copied into the constant ring
     boost::container::small_vector<RingBinding, 4> geometry_ring;
 };

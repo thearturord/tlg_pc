@@ -381,6 +381,12 @@ private:
     [[nodiscard]] bool BufferBarrierQuery(const VideoCore::Buffer* buffer, u64 offset, u64 size, bool written);
     /// Design review 76: the plan's geometry handle holding [address, address + size) (alive, the plan's epoch current), without the compare mode's lookup by address.
     [[nodiscard]] const Core::NativeResources::ImmutableBuffer* GeometryHandleOfPlan(VAddr address, u64 size) const noexcept;
+    /// Note 117 (`TLG_OWN_GEOMETRY`): the own memory of the engine buffer the draw's geometry ids name that holds [address, address + size), when its bytes are current
+    /// (immutable: synchronized; default and dynamic: no CPU bytes waiting), else null. `cls` 7 index, 8 vertex.
+    [[nodiscard]] const VideoCore::Buffer* OwnGeometry(VAddr address, u64 size, u32 cls);
+    /// Note 117 shadow and audit: the old path's index or vertex answer against the own memory's
+    void OwnGeometryCompare(const VideoCore::Buffer* own, VAddr address, vk::Buffer bound, u64 offset, u32 cls);
+    const VideoCore::Buffer* own_index{}; ///< note 117: the index read's own memory, compared after the old path bound it
     /// [0 read queries, 1 of them with no planned write, 2 SHADOW_NO_WRITES_BUT_BARRIER_MUST_BE_0, 3 real: asked (writes pending), 4 real: skipped, 5 real: sampled, 6 SAMPLED_BARRIER_MUST_BE_0]
     std::array<std::atomic<u64>, 8> barrier_guard{};
     /// Texture census (TLG_TEXTURE_CENSUS=1, design review 58), [graphics, compute][class][calls, ns, images]: classes 0 no image, 1 more than 16 images, 2 memo off, 3 a written image,

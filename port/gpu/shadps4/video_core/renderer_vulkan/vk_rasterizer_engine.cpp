@@ -307,6 +307,13 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
     plan->has_handles = false;
     plan->has_geometry_handles = false;
     plan->geometry_handle_count = 0;
+    plan->geometry_id_count = 0;
+    if (Core::OwnMemoryCensus::OwnGeometryMode() != 0 && draw.bindings_complete) {
+        plan->geometry_id_count = std::min<u32>(draw.geometry_id_count, Core::NativeDraw::MaxGeometryIds);
+        for (u32 i = 0; i < plan->geometry_id_count; ++i) {
+            plan->geometry_ids[i] = draw.geometry_ids[i];
+        }
+    }
     if (NativeHandleMode() != 0 && binder_mode != 0 && draw.bindings_complete && Core::NativeResources::ImmutableResidencyEnabled()) {
         plan->handle_epoch = Core::NativeResources::ImmutableEpoch();
         plan->geometry_handle_count = draw.geometry_id_count;
