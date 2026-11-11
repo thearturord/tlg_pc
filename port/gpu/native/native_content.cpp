@@ -870,6 +870,124 @@ void NoteGpuAllocation(u64 address, u64 size) {
     g_gpu_windows.emplace(address, RingWindow{size, ++g_window_serial});
 }
 
+// ---- note 133: the instance uploader's scratch ----
+u32 InstanceScratchMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_INSTANCE_SCRATCH");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
+namespace {
+std::mutex g_scratch_mutex;
+std::map<u64, u64> g_scratch; ///< scratch range start -> end
+u64 g_scratch_max_len = 0;
+std::atomic<u64> c_scratch_ranges{0};
+enum ScratchCount : u32 { ScNotes, ScReplaced, ScWrites, ScWritesInside, ScWritesOutside, ScDropped, ScReads, ScReadsOver, ScReadsApplied, ScCount };
+std::array<std::atomic<u64>, ScCount> c_scratch{};
+std::atomic<u32> c_scratch_logged{0};
+void ScratchAddLocked(u64 begin, u64 end) {
+    auto it = g_scratch.lower_bound(begin >= g_scratch_max_len ? begin - g_scratch_max_len : 0);
+    while (it != g_scratch.end() && it->first < end) {
+        if (it->second > begin) {
+            if (it->first == begin && it->second == end) {
+                return; // known
+            }
+            it = g_scratch.erase(it);
+            c_scratch[ScReplaced].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            ++it;
+        }
+    }
+    g_scratch.emplace(begin, end);
+    g_scratch_max_len = std::max(g_scratch_max_len, end - begin);
+    c_scratch_ranges.store(g_scratch.size(), std::memory_order_relaxed);
+}
+/// The scratch range meeting [address, address + size), or g_scratch.end() (under g_scratch_mutex)
+std::map<u64, u64>::iterator ScratchMeetLocked(u64 address, u64 size) {
+    auto it = g_scratch.lower_bound(address >= g_scratch_max_len ? address - g_scratch_max_len : 0);
+    for (; it != g_scratch.end() && it->first < address + size; ++it) {
+        if (it->second > address) {
+            return it;
+        }
+    }
+    return g_scratch.end();
+}
+} // namespace
+
+void ScratchNote(u64 first, u64 second, u64 bytes) {
+    if (InstanceScratchMode() == 0 || bytes == 0 || bytes > (64u << 20)) {
+        return;
+    }
+    c_scratch[ScNotes].fetch_add(1, std::memory_order_relaxed);
+    std::scoped_lock lock{g_scratch_mutex};
+    if (first != 0) {
+        ScratchAddLocked(first, first + bytes);
+    }
+    if (second != 0 && second != first) {
+        ScratchAddLocked(second, second + bytes);
+    }
+}
+
+bool ScratchSkip(u64 address, u64 size) {
+    if (InstanceScratchMode() == 0 || size == 0) {
+        return false;
+    }
+    c_scratch[ScWrites].fetch_add(1, std::memory_order_relaxed);
+    bool inside = false;
+    {
+        std::scoped_lock lock{g_scratch_mutex};
+        const auto it = ScratchMeetLocked(address, size);
+        inside = it != g_scratch.end() && it->first <= address && address + size <= it->second;
+    }
+    c_scratch[inside ? ScWritesInside : ScWritesOutside].fetch_add(1, std::memory_order_relaxed);
+    if (!inside || InstanceScratchMode() != 2) {
+        return false;
+    }
+    c_scratch[ScDropped].fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool ScratchRead(u64 address, u64 size, u64& begin, u64& end) {
+    begin = end = 0;
+    if (InstanceScratchMode() == 0 || size == 0 || c_scratch_ranges.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    c_scratch[ScReads].fetch_add(1, std::memory_order_relaxed);
+    std::scoped_lock lock{g_scratch_mutex};
+    const auto it = ScratchMeetLocked(address, size);
+    if (it == g_scratch.end()) {
+        return false;
+    }
+    c_scratch[ScReadsOver].fetch_add(1, std::memory_order_relaxed);
+    if (c_scratch_logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+        std::fprintf(stderr, "note 133: a buffer cache request %#llx+%#llx meets instance scratch %#llx..%#llx\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+                     static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(it->second));
+    }
+    if (InstanceScratchMode() == 2) {
+        // the writes left out of the batch are applied now, before the request: the reader takes guest memory as it is
+        begin = it->first;
+        end = it->second;
+        c_scratch[ScReadsApplied].fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+nlohmann::json ScratchReport() {
+    const auto c = [](ScratchCount k) { return c_scratch[k].load(std::memory_order_relaxed); };
+    return {{"mode", InstanceScratchMode()},
+            {"ranges_now", c_scratch_ranges.load()},
+            {"uploader_notes", c(ScNotes)},
+            {"ranges_replaced", c(ScReplaced)},
+            {"writer_7_writes", c(ScWrites)},
+            {"inside_scratch", c(ScWritesInside)},
+            {"outside_scratch_announced", c(ScWritesOutside)},
+            {"real_left_out_of_the_batch", c(ScDropped)},
+            {"buffer_requests_checked", c(ScReads)},
+            {"READ_OVER_INSTANCE_SCRATCH_MUST_BE_0", c(ScReadsOver)},
+            {"real_reads_applied_first", c(ScReadsApplied)}};
+}
+
 // ---- note 132: the memory of writers 3 and 7 ----
 bool W37On() noexcept {
     static const bool on = [] { const char* e = std::getenv("TLG_W37_CENSUS"); return e != nullptr && e[0] == '1'; }();
@@ -3746,6 +3864,9 @@ nlohmann::json Report() {
     }
     if (W37On()) {
         out["w37_census"] = W37Report(); // note 132
+    }
+    if (InstanceScratchMode() != 0) {
+        out["instance_scratch"] = ScratchReport(); // note 133
     }
     if (RingWindowsOn()) {
         nlohmann::json w;

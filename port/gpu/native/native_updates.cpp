@@ -1435,6 +1435,9 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
         ring_out = (++out_count & 63) != 0;
         c_ring_out[ring_out ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
     }
+    if ((writer & 7) == 7 && NativeContent::ScratchSkip(address, size)) {
+        goto announced; // note 133, real: the uploader's scratch has no GPU reader; a buffer request over it applies the range first (ScratchRead)
+    }
     if (B2NativeMode() != 0 && !ring_out) {
         // note 90 (TLG_HOOK_OWNED): the light and slot buffers' membership, decided here in game order; the shadow announces everything and carries the mark
         const u8 hook_mark = HookOwned::Mode() != 0 ? HookOwned::OnWrite((writer & 7) | t_announce_site_class, t_announce_object, address, size) : u8{0};

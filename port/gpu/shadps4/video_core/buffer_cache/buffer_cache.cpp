@@ -1416,6 +1416,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferBody(VAddr device_addr, u
     if (Core::NativeContent::W37On()) [[unlikely]] {
         Core::NativeContent::W37Read(23, device_addr, size); // note 132: a buffer cache request
     }
+    if (Core::NativeContent::InstanceScratchMode() != 0) [[unlikely]] {
+        // note 133 guard (READ_OVER_INSTANCE_SCRATCH_MUST_BE_0); real mode: the writes left out of the batch are applied before the request
+        u64 scratch_begin = 0, scratch_end = 0;
+        if (Core::NativeContent::ScratchRead(device_addr, size, scratch_begin, scratch_end) && scratch_end > scratch_begin) {
+            ApplyCpuWrite(scratch_begin, scratch_end - scratch_begin, true, 0);
+        }
+    }
     if (Core::HookOwned::Mode() != 0) [[unlikely]] {
         if (is_written) {
             Core::HookOwned::GpuWrite(device_addr, size); // note 90 guard: GPU_WRITE_OVER_HOOK_OWNED_MUST_BE_0

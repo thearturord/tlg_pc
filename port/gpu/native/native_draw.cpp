@@ -9230,6 +9230,7 @@ u64 PS4_SYSV_ABI InstanceGroupBind(u64 inner, u64 group, u64 view, u64 a3, u64 a
         if ((index & ~1) != 0 || bytes <= 0) {
             return 0;
         }
+        Core::NativeContent::ScratchNote(Rd<u64>(uploader, 0x18), Rd<u64>(uploader, 0x20), static_cast<u64>(bytes)); // note 133 (off by default)
         Core::NativeUpdates::NoteWriterRange(7, Rd<u64>(uploader, 0x18 + static_cast<u64>(index) * 8), static_cast<u32>(bytes), "instance group staging");
         return 0;
     });
