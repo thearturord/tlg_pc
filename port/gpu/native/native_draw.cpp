@@ -5724,7 +5724,8 @@ bool FrameAllocLocked() {
         const char* e = std::getenv("TLG_LIGHT_RING");
         const char* s = std::getenv("TLG_SLOT_RING");
         const char* k = std::getenv("TLG_SKIN_RING");
-        return (e != nullptr && e[0] == '1') || (s != nullptr && s[0] == '1') || (k != nullptr && k[0] == '1') || Core::NativeContent::RingLapFenceOn();
+        // default on since 2026-11-11 (review notes A3): each ring is on unless its switch is =0
+        return (e == nullptr || e[0] != '0') || (s == nullptr || s[0] != '0') || (k == nullptr || k[0] != '0') || Core::NativeContent::RingLapFenceOn();
     }();
     return on;
 }
@@ -6871,7 +6872,7 @@ void SkinWritesAnnounce(u64 ring, u64 scene);
 // read them there; after the pass the memory pointer is put back (the engine's object stays its own). (The old TLG_SKIN_GATE wait is removed.)
 namespace {
 bool SkinRingOn() {
-    static const bool on = [] { const char* e = std::getenv("TLG_SKIN_RING"); return e != nullptr && e[0] == '1'; }();
+    static const bool on = [] { const char* e = std::getenv("TLG_SKIN_RING"); return e == nullptr || e[0] != '0'; }(); // LEGACY(skin_ring): default on since 2026-11-11 (review notes A3), =0 old path
     return on;
 }
 std::atomic<u64> c_skr_passes{0}, c_skr_renamed{0}, c_skr_bytes{0}, c_skr_declined{0}, c_skr_alloc_failed{0};
@@ -7031,7 +7032,7 @@ u64 PS4_SYSV_ABI LightWrites(u64 object, u64 source, u64 a2, u64 a3, u64 a4, u64
     // native-v3-writers (TLG_LIGHT_RING=1): the light constants sit in a ring of three buffers that the game rewrites 4 submissions (about 2 frames) after a draw recorded them, while the raster thread
     // may still read them with the game two frames ahead (late read samples, 2026-11-04: record submit 597, slot rewritten at 601). The game runs here; the 160 bytes it wrote are then copied into a
     // fresh block of the frame ring (64 MB, lapped after about 50 frames) and the buffer's descriptor is pointed at the block, the way the game's UpdateSubresource does it for a dynamic constant buffer.
-    static const bool light_ring = [] { const char* e = std::getenv("TLG_LIGHT_RING"); return e != nullptr && e[0] == '1'; }();
+    static const bool light_ring = [] { const char* e = std::getenv("TLG_LIGHT_RING"); return e == nullptr || e[0] != '0'; }(); // LEGACY(light_ring): default on since 2026-11-11 (review notes A3), =0 old path
     static const u64 original = Core::GuestHooks::OriginalEntry("LightWrites");
     if (!light_ring || original == 0 || !IsHeapPointer(object)) {
         return 0;
@@ -7129,7 +7130,7 @@ u64 PS4_SYSV_ABI RecordingWrites(u64 device, u64 a1, u64 a2, u64 a3, u64 a4, u64
     // TLG_RECORDING_RING=1 (memory-ownership-plan writer table): the two buffers BeginRecording fills by plain stores (+0x2830 through AsyncMap, which returns the V# address,
     // and +0x26e0) are one buffer each; the async dispatches of the frame read them through their views. Rename for the call: the memory pointer, the buffer's V# and the
     // V# of every view of it point at a fresh frame-ring block, the original runs, then the memory pointer is put back (the V#s keep the block until the next frame).
-    static const bool ring_on = [] { const char* e = std::getenv("TLG_RECORDING_RING"); return e != nullptr && e[0] == '1'; }();
+    static const bool ring_on = [] { const char* e = std::getenv("TLG_RECORDING_RING"); return e == nullptr || e[0] != '0'; }(); // LEGACY(recording_ring): default on since 2026-11-11 (review notes A3), =0 old path
     static const u64 original = Core::GuestHooks::OriginalEntry("RecordingWrites");
     if (!ring_on || original == 0) {
         return 0;
@@ -7297,7 +7298,7 @@ u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4
             // native-v3-writers (TLG_MAP_RING=1): the game's Map writes a buffer in place when the buffer was last used (stamp [resource + 0x2c]) three or more frames ago, else into frame ring memory with
             // a GPU ordered copy at the Unmap. Dynamic shader resource / vertex buffers that the draw and dispatch bind code never stamps (frame minus stamp 12 or more in 100 % of their Maps, callers
             // 0x1c4594d, 0x1c446f0, 0x1c55885 and more) are always written in place while the raster thread may still read them. Stamping a WRITE_DISCARD buffer as used now sends it down the ring path.
-            static const bool map_ring = [] { const char* e = std::getenv("TLG_MAP_RING"); return e != nullptr && e[0] == '1'; }();
+            static const bool map_ring = [] { const char* e = std::getenv("TLG_MAP_RING"); return e == nullptr || e[0] != '0'; }(); // LEGACY(map_ring): default on since 2026-11-11 (review notes A3), =0 old path
             if (map_ring && type == 4) {
                 Wr<u32>(resource, 0x2c, Rd<u32>(ctx, 0x47ac));
             }
@@ -8664,7 +8665,7 @@ void AnnounceSceneSlotRange(u64 frame, u32 upto, bool remember_group) {
 // Check: the slots copied are compared with their memory again before the next call and at the group switch; a difference means a write after the copy (lost to the draw).
 namespace {
 bool SlotRingOn() {
-    static const bool on = [] { const char* e = std::getenv("TLG_SLOT_RING"); return e != nullptr && e[0] == '1'; }();
+    static const bool on = [] { const char* e = std::getenv("TLG_SLOT_RING"); return e == nullptr || e[0] != '0'; }(); // LEGACY(slot_ring): default on since 2026-11-11 (review notes A3), =0 old path
     return on;
 }
 struct SlotCopy {

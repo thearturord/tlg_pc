@@ -37,6 +37,16 @@
 ///   TLG_ID_MARKS=0             light and slot applies by address (49-51)
 ///   TLG_IMAGE_BY_ID=0          the image step by address (63-65)
 ///   TLG_ROW_VERSION=0, TLG_STATIC_ROWS=0, TLG_WRITTEN_ROWS=0, TLG_WIDE_ROWS=0, TLG_TEXSET_BY_ID=0, TLG_HOOK_RING=0 (sections 13-47)
+///
+/// The play set, default on since 2026-11-11 (review notes A3: every fast-lane check and play ran with them, so the code default is now what was tested; before, only
+/// play_start.ps1 set them):
+///   TLG_MAP_RING=0             dynamic buffers the bind code never stamps written in place by the game's Map while the raster thread may read them
+///   TLG_LIGHT_RING=0           the light constants read from the engine's three-buffer ring instead of a frame-ring copy
+///   TLG_SLOT_RING=0            the scene slots read from their own memory instead of a frame-ring copy
+///   TLG_SKIN_RING=0            the skinning matrices written into the slot's own memory instead of a frame-ring block
+///   TLG_RECORDING_RING=0       the BeginRecording buffers written in place instead of renamed onto frame-ring blocks
+///   TLG_FREE_HOLD=0            engine frees run at once instead of after the raster thread is done (TLG_FREE_HOLD_FRAMES default 3, =0 no frame rule)
+///   TLG_ORDERED_VIEW=0         the buffer index without the ordered create and delete view
 namespace Core::Legacy {
 
 /// TLG_LEGACY_ENGINE_ROWS=1: the rows for shader buffer bindings of engine buffers (see above).

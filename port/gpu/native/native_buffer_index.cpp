@@ -12,9 +12,9 @@ namespace Core::NativeBufferIndex {
 
 bool Ordered::On() noexcept {
     static const bool on = [] {
-        const char* e = std::getenv("TLG_ORDERED_VIEW");
+        const char* e = std::getenv("TLG_ORDERED_VIEW"); // LEGACY(ordered_view): default on since 2026-11-11 (review notes A3), =0 old path
         // the ordered view needs the create and delete events of buffers (placement and lifetime modes of the native updates)
-        return e != nullptr && e[0] == '1' && NativeUpdates::B9PlaceOn() && NativeUpdates::B2NativeMode() != 0 && NativeUpdates::B9LifetimeMode() != 0;
+        return (e == nullptr || e[0] != '0') && NativeUpdates::B9PlaceOn() && NativeUpdates::B2NativeMode() != 0 && NativeUpdates::B9LifetimeMode() != 0;
     }();
     return on;
 }

@@ -1047,7 +1047,7 @@ struct HeldFree {
 /// TLG_FREE_HOLD_FRAMES=N: also keep a freed block N engine frames (the game's own rule: an object lives 3 frames after its last use, but never-stamped objects are freed at once
 /// while draws the game built ahead still use them), then until the raster thread has finished everything recorded up to then
 u32 FreeHoldFrames() {
-    static const u32 n = [] { const char* e = std::getenv("TLG_FREE_HOLD_FRAMES"); return e != nullptr ? static_cast<u32>(std::atoi(e)) : 0u; }();
+    static const u32 n = [] { const char* e = std::getenv("TLG_FREE_HOLD_FRAMES"); return e != nullptr && e[0] != 0 ? static_cast<u32>(std::atoi(e)) : 3u; }(); // default 3 since 2026-11-11 (review notes A3; the play set's value), =0 no frame rule
     return n;
 }
 std::atomic<u64> hold_bucket_count[6], hold_bucket_bytes[6];
@@ -1076,7 +1076,7 @@ bool FreeHoldMidOn() {
 }
 
 bool FreeHoldOn() {
-    static const bool on = [] { const char* e = std::getenv("TLG_FREE_HOLD"); return e != nullptr && e[0] == '1'; }();
+    static const bool on = [] { const char* e = std::getenv("TLG_FREE_HOLD"); return e == nullptr || e[0] != '0'; }(); // LEGACY(free_hold): default on since 2026-11-11 (review notes A3), =0 old path
     return on;
 }
 
