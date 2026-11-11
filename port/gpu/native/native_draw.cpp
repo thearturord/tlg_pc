@@ -1261,6 +1261,7 @@ thread_local NativeRegistry::DrawResources* v2_collect = nullptr; ///< the draw 
 /// The object the last descriptor helper (ResourceDescriptor, ConstBufferDescriptor, SamplerDescriptor) read, for the binding list of the description.
 thread_local struct {
     u64 object, resource, id, view_id;
+    u32 version; ///< note 164: the engine id's version when the object was read (shadow only)
 } last_descriptor_object;
 
 void SetLastDescriptorObject(u64 object, bool sampler = false) {
@@ -1277,7 +1278,8 @@ void SetLastDescriptorObject(u64 object, bool sampler = false) {
             view_id = Rd<u64>(object, 0x10);
         }
     }
-    last_descriptor_object = {object, resource, resource != 0 ? Rd<u64>(resource, 0x10) : 0, view_id};
+    const u64 id = resource != 0 ? Rd<u64>(resource, 0x10) : 0;
+    last_descriptor_object = {object, resource, id, view_id, Core::HookDiff::DiffShadow() ? Core::HookDiff::VersionOf(id) : 1u};
 }
 
 /// The record whose user data are being built (NativeDraw v2 bindings go into it).
@@ -1298,6 +1300,8 @@ void AddGeometryId(NativeRecord& record, u64 object) {
     record.geometry_ids[record.geometry_id_count++] = id;
 }
 thread_local std::array<u64, MaxRecordBindings> t_bind_obj{}; // note 153 shadow: the object behind each binding of the record being built
+thread_local std::array<u64, MaxRecordBindings> t_bind_id{};  // note 164 shadow: its engine id
+thread_local std::array<u32, MaxRecordBindings> t_bind_ver{}; // note 164 shadow: that id's version when the object was read
 void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* words, u32 dwords, u32 table_sgpr = 0xff, u32 entry_dwords = 0, u32 table_base = 0) {
     if (binding_record == nullptr || (stage > 1 && stage != 5)) { // B2: the compute stage (5) names its resources too
         return;
@@ -1309,6 +1313,8 @@ void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* word
     }
     RecordBinding& binding = record.bindings[record.binding_count++];
     t_bind_obj[record.binding_count - 1] = last_descriptor_object.object;
+    t_bind_id[record.binding_count - 1] = last_descriptor_object.id;
+    t_bind_ver[record.binding_count - 1] = last_descriptor_object.version;
     binding = {};
     binding.stage = static_cast<u8>(stage);
     binding.kind = static_cast<u8>(kind);
@@ -1347,13 +1353,15 @@ bool SameBinding(const RecordBinding& a, const RecordBinding& b) noexcept {
 }
 thread_local std::array<RecordBinding, MaxRecordBindings> t_prev_bind{};
 thread_local std::array<u64, MaxRecordBindings> t_prev_obj{};
+thread_local std::array<u64, MaxRecordBindings> t_prev_id{};
+thread_local std::array<u32, MaxRecordBindings> t_prev_ver{};
 thread_local u32 t_prev_bind_count = 0;
 thread_local bool t_prev_bind_valid = false;
 /// Note 153 shadow: this draw record's binding list against the previous one built on this guest thread (by slot: the same object, and whether it gave the same binding).
 template <typename R>
 void HookDiffBindings(const R& rec) {
     const u32 n = std::min<u32>(rec.binding_count, MaxRecordBindings);
-    u32 same_obj = 0, same_obj_same = 0, other_obj_same = 0;
+    u32 same_obj = 0, same_obj_same = 0, other_obj_same = 0, same_ver = 0, same_ver_other = 0;
     bool all_same = t_prev_bind_valid && n == t_prev_bind_count;
     for (u32 i = 0; i < n; ++i) {
         const bool have = t_prev_bind_valid && i < t_prev_bind_count;
@@ -1363,14 +1371,43 @@ void HookDiffBindings(const R& rec) {
             rec.bindings[i].offset == t_prev_bind[i].offset && rec.bindings[i].slot == t_prev_bind[i].slot) {
             ++same_obj;
             same_obj_same += same ? 1u : 0u;
+            if (t_bind_id[i] != 0 && t_bind_id[i] == t_prev_id[i] && t_bind_ver[i] == t_prev_ver[i] && (t_bind_ver[i] & 1) == 0) {
+                ++same_ver; // note 164: no Map of the id ran (or was running) between the two reads
+                same_ver_other += same ? 0u : 1u;
+                if (!same) {
+                    const auto& a = rec.bindings[i];
+                    const auto& b = t_prev_bind[i];
+                    u32 field = 7;
+                    if (a.dwords != b.dwords) {
+                        field = 5;
+                    } else if (a.id != b.id || a.view_id != b.view_id) {
+                        field = 6;
+                    } else if (a.table_base != b.table_base) {
+                        field = 3;
+                    } else if (a.table_sgpr != b.table_sgpr || a.entry_dwords != b.entry_dwords) {
+                        field = 4;
+                    } else {
+                        for (u32 w = 0; w < a.dwords && w < 8; ++w) {
+                            if (a.words[w] != b.words[w]) {
+                                field = w < 2 ? 0u : w < 4 ? 1u : 2u;
+                                break;
+                            }
+                        }
+                    }
+                    Core::HookDiff::NoteVersionDiffField(field, a.kind);
+                }
+            }
         } else if (same) {
             ++other_obj_same;
         }
     }
     Core::HookDiff::NoteBindings(n, t_prev_bind_valid && n == t_prev_bind_count, same_obj, same_obj_same, other_obj_same, all_same);
+    Core::HookDiff::NoteBindingVersions(same_ver, same_ver_other);
     for (u32 i = 0; i < n; ++i) {
         t_prev_bind[i] = rec.bindings[i];
         t_prev_obj[i] = t_bind_obj[i];
+        t_prev_id[i] = t_bind_id[i];
+        t_prev_ver[i] = t_bind_ver[i];
     }
     t_prev_bind_count = n;
     t_prev_bind_valid = true;
@@ -7406,7 +7443,14 @@ u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4
             if (map_ring && type == 4) {
                 Wr<u32>(resource, 0x2c, Rd<u32>(ctx, 0x47ac));
             }
+            const bool versions = Core::HookDiff::DiffShadow(); // note 164: odd while the Map runs, even again after it
+            if (versions) {
+                Core::HookDiff::BumpVersion(Rd<u64>(resource, 0x10));
+            }
             const u64 result = reinterpret_cast<GuestMap7>(original_map)(ctx, resource, subresource, type, a4, size, out_map);
+            if (versions) {
+                Core::HookDiff::BumpVersion(Rd<u64>(resource, 0x10));
+            }
             Core::NativeUpdates::NoteMap(Rd<u64>(resource, 0x10), Core::NativeResources::ResourceUsage(resource), static_cast<u32>(type), Rd<u64>(out_map, 0),
                                          Rd<u32>(out_map, 8), Rd<u64>(resource, 0x30), ret, size, Rd<u32>(ctx, 0x47ac), Rd<u32>(resource, 0x2c), Rd<u32>(resource, 0x188));
             Core::NativeDevice::NoteMapped(Rd<u64>(resource, 0x10), Rd<u64>(out_map, 0), Rd<u32>(out_map, 8), static_cast<u32>(type));

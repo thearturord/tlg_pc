@@ -26,6 +26,14 @@ void NoteReused() noexcept;
 void NoteFixed(bool have_prev, bool same_key, bool same_state) noexcept;
 /// R3.1, the binding list of a draw record against the previous draw's.
 void NoteBindings(u32 count, bool same_count, u32 same_object_slots, u32 same_object_same_binding, u32 other_object_same_binding, bool all_same) noexcept;
+/// Note 164 (plan R3.1 bindings, `TLG_HOOK_DIFF=1` shadow): an engine buffer's version, made odd when a Map of it starts and even again when it returned (a hash slot per id:
+/// a bump can only make other ids look changed, never hide a change).
+void BumpVersion(u64 id) noexcept;
+[[nodiscard]] u32 VersionOf(u64 id) noexcept;
+/// Note 164: slots with the same object, the same engine id and the same even version as in the previous draw, and those of them whose binding still differs (must be 0).
+void NoteBindingVersions(u32 same_version_slots, u32 same_version_other_binding) noexcept;
+/// Note 164: which field of such a binding differs first (0 words 0-1, 1 words 2-3, 2 words 4-7, 3 table base, 4 table register or entry size, 5 dword count, 6 id or view id, 7 kind 1 / 2 / 3 split by `kind` in bits 8+)
+void NoteVersionDiffField(u32 field, u32 kind) noexcept;
 /// R3.3 at the draw's execution: the plan's fixed state equals the cached state it was copied from.
 void NotePlanFixed(bool same) noexcept;
 /// R3.3 at the draw's execution: 0 the record slot still holds the record and its bindings equal the plan's, 1 the slot was reused, 2 the same record but other bindings, 3 no record.

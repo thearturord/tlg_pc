@@ -24,9 +24,12 @@ enum C : u32 {
     BdRecords, BdSameCount, BdAllSame, BdSlots, BdSameObject, BdSameObjectSameBinding, BdSameObjectOtherBinding, BdOtherObjectSameBinding,
     PfChecked, PfSame, PfDiffer,
     PbSame, PbReused, PbOther, PbNoRecord,
+    BvSameVersion, BvSameVersionOther,
     CCount
 };
 std::array<std::atomic<u64>, CCount> c{};
+std::array<std::atomic<u32>, 65536> g_versions{}; // note 164
+std::array<std::atomic<u64>, 32> g_ver_field{};
 std::atomic<u64> since_publish{0};
 
 void Add(C k, u64 n = 1) noexcept {
@@ -44,6 +47,18 @@ nlohmann::json Report() {
     j["bindings"] = {{"records", r(BdRecords)}, {"same_count_as_previous", r(BdSameCount)}, {"every_binding_same_as_previous", r(BdAllSame)}, {"slots", r(BdSlots)},
                      {"slots_same_object", r(BdSameObject)}, {"same_object_same_binding", r(BdSameObjectSameBinding)},
                      {"same_object_other_binding_needs_a_version", r(BdSameObjectOtherBinding)}, {"other_object_same_binding", r(BdOtherObjectSameBinding)}};
+    j["binding_versions_note_164"] = {{"same_object_same_version_slots", r(BvSameVersion)}, {"SAME_VERSION_OTHER_BINDING_MUST_BE_0", r(BvSameVersionOther)}};
+    {
+        static constexpr const char* fields[8] = {"words_0_1", "words_2_3", "words_4_7", "table_base", "table_register_or_entry", "dwords", "id_or_view", "other"};
+        static constexpr const char* kinds[4] = {"kind0", "buffer", "image", "sampler"};
+        for (u32 k = 0; k < 4; ++k) {
+            for (u32 f = 0; f < 8; ++f) {
+                if (const u64 n = g_ver_field[(k << 3) | f].load(std::memory_order_relaxed); n != 0) {
+                    j["binding_versions_note_164"]["first_field_that_differs"][kinds[k]][fields[f]] = n;
+                }
+            }
+        }
+    }
     j["plan_pointers"] = {{"fixed_checked", r(PfChecked)}, {"fixed_same_as_cached", r(PfSame)}, {"fixed_differs_from_cached", r(PfDiffer)},
                           {"bindings_slot_still_holds_the_record", r(PbSame)}, {"bindings_slot_reused_before_execution", r(PbReused)},
                           {"bindings_same_record_other_bindings", r(PbOther)}, {"bindings_no_record", r(PbNoRecord)}};
@@ -97,6 +112,25 @@ void NoteFixed(bool have_prev, bool same_key, bool same_state) noexcept {
             Add(FxOtherKeySameState);
         }
     }
+}
+
+void BumpVersion(u64 id) noexcept {
+    if (id != 0) {
+        g_versions[(id * 0x9E3779B97F4A7C15ull) >> 48].fetch_add(1, std::memory_order_acq_rel);
+    }
+}
+
+u32 VersionOf(u64 id) noexcept {
+    return id != 0 ? g_versions[(id * 0x9E3779B97F4A7C15ull) >> 48].load(std::memory_order_acquire) : 1u;
+}
+
+void NoteVersionDiffField(u32 field, u32 kind) noexcept {
+    g_ver_field[(std::min<u32>(kind, 3) << 3) | (field & 7)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteBindingVersions(u32 same_version_slots, u32 same_version_other_binding) noexcept {
+    Add(BvSameVersion, same_version_slots);
+    Add(BvSameVersionOther, same_version_other_binding);
 }
 
 void NoteBindings(u32 count, bool same_count, u32 same_object_slots, u32 same_object_same_binding, u32 other_object_same_binding, bool all_same) noexcept {
