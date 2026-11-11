@@ -58,6 +58,7 @@
 ///   TLG_HOOK_DIFF=0            every draw record looks its fixed state up in the shared cache under its lock (notes 153, 157)
 ///   TLG_DISPATCH_EXECUTOR=0    every buffer binding of a dispatch through the old body (BindBufferLegacy) instead of the executor's native sources (note 159)
 ///   TLG_TARGET_TAIL=0          a sampled render target of the draw (a feedback loop) is not learnt by the view table and is bound by the old texture path (note 160)
+///   TLG_PLAN_POINTERS=0        every draw plan copies the record's fixed state (about 1 KB) instead of pointing at the cached state (note 161)
 namespace Core::Legacy {
 
 

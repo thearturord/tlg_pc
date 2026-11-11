@@ -71,7 +71,7 @@ u64 Rasterizer::DrawPlanSeq(const DrawPlan& plan) {
 }
 
 bool Rasterizer::DrawPlanIsDepthOnly(const DrawPlan& plan) {
-    return plan.fixed.NoColorTargets();
+    return plan.fixed->NoColorTargets();
 }
 
 void Rasterizer::SetDrawPlanTargets(DrawPlan& plan, const ColorExtents& cb_extent, const DepthExtent& db_extent, const std::array<u64, 18>& target_resources) {

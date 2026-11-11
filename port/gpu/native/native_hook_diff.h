@@ -18,7 +18,9 @@ namespace Core::HookDiff {
 /// Note 157 (`TLG_HOOK_DIFF=2`, default): a draw whose fixed-state key words equal the previous draw's (same guest thread) takes the previous state: no lock, no map.
 [[nodiscard]] bool DiffReal() noexcept;
 void NoteReused() noexcept;
-[[nodiscard]] bool PointersOn() noexcept;
+[[nodiscard]] bool PointersOn() noexcept; ///< `TLG_PLAN_POINTERS=1`: the shadow compares the plan's copies with their sources
+/// Note 161 (`TLG_PLAN_POINTERS=2`, default): a draw plan points at the record's cached fixed state instead of copying it.
+[[nodiscard]] bool FixedPointerReal() noexcept;
 
 /// R3.1, the fixed state of a draw record: whether a previous draw existed, its key words were the same, and the state built was the same.
 void NoteFixed(bool have_prev, bool same_key, bool same_state) noexcept;

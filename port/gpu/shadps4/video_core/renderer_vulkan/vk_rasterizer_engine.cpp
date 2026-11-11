@@ -10,6 +10,7 @@
 #endif
 #include "common/debug.h"
 #include "native/native_row_version.h"
+#include "native/native_hook_diff.h"
 #include "native/native_debug_server.h"
 #include "native/native_log.h"
 #include "native/native_image_caller.h"
@@ -282,7 +283,12 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
     }
     plan->op_class = 0xff;
     plan->depth_copy = plan->stencil_copy = false;
-    plan->fixed = native;
+    if (Core::HookDiff::FixedPointerReal()) {
+        plan->fixed = &native; // note 161: the record's cached state (never freed, never changed)
+    } else {
+        plan->fixed_copy = native; // LEGACY(plan_pointers)
+        plan->fixed = &plan->fixed_copy;
+    }
     plan->fixed_source = &native; // note 154 (the record's cached state: never freed)
     plan->inputs = cached->second;
     // E1b: the draw's arguments are the typed values the record builder set (the argument registers of the record are not decoded any more); a field the record did
@@ -298,7 +304,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
     if ((binder_mode == 1 || binder_mode == 2) && !draw.bindings_complete) {
         Core::NativeRegistry::NoteBinderReason(draw_class, 2, draw.bindings_overflow ? 10 : 1); // the whole draw keeps the flat user data: its binding list is not complete
     }
-    if (!pipeline_cache.PlanGraphicsTyped(exec_key, plan->fixed, vertex_user_data, pixel_user_data, *plan, skip_flat ? &draw : nullptr, draw_class)) {
+    if (!pipeline_cache.PlanGraphicsTyped(exec_key, *plan->fixed, vertex_user_data, pixel_user_data, *plan, skip_flat ? &draw : nullptr, draw_class)) {
         Core::NativeDraw::Live().plan_null[2].fetch_add(1, std::memory_order_relaxed);
         RecyclePlan(std::move(plan));
         return nullptr;

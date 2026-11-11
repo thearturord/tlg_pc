@@ -97,10 +97,16 @@ struct StagePlan {
     VAddr pgm_base{};
 };
 
+/// Note 161: what a plan's fixed state points at before a draw ever set it (the copy started as a default state too).
+inline const FixedState g_no_fixed_state{};
+
 struct DrawPlan {
     const GraphicsPipeline* pipeline{}; ///< Null if the pipeline lookup failed.
-    FixedState fixed{};
-    const FixedState* fixed_source{}; ///< note 154 shadow: the cached state `fixed` was copied from (null: planned another way)
+    /// R3.3 (note 161, `TLG_PLAN_POINTERS=2`): the fixed state of the draw, the record's cached state (the cache never frees or changes an entry). A plan taken from the pool
+    /// and not given a state (the game's own operations) keeps its last pointer, as the copy kept its last bytes.
+    const FixedState* fixed{&g_no_fixed_state};
+    FixedState fixed_copy{}; ///< LEGACY(plan_pointers): the copy (`TLG_PLAN_POINTERS=0` and 1); `fixed` points at it then
+    const FixedState* fixed_source{}; ///< note 154 shadow: the cached state the copy was made from
     DrawInputs inputs{};
     bool executed{}; ///< the draw was executed from a record: no register based classification
     u8 op_class{0xff}; ///< not 0xff: one of the game's own transition operations (Rasterizer::DrawClass) that the raster thread performs from this plan, no pipeline

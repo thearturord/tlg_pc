@@ -78,7 +78,7 @@ u64 HashStages(const std::array<StagePlan, Core::NativePlan::StageCount>& stages
 
 DrawKey MakeDrawKey(const DrawPlan& p) {
     DrawKey k;
-    const auto& f = p.fixed;
+    const auto& f = *p.fixed;
     k.part[DPipeline] = reinterpret_cast<u64>(p.pipeline);
     u64 t = 7;
     for (const u64 id : p.target_resources) {

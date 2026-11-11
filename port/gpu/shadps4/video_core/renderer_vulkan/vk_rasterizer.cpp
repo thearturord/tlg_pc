@@ -436,7 +436,7 @@ bool Rasterizer::FilterDraw(const DrawPlan* plan) {
     const AmdGpu::CbDbExtent& db_extent = plan->db_extent;
     current_target_resources = &plan->target_resources; // E3: the game's own transition operations name their targets too
     const DrawClassification classified = plan->op_class != 0xff ? DrawClassification{static_cast<DrawClass>(plan->op_class), plan->depth_copy, plan->stencil_copy}
-                                                                  : ClassifyRemaining(plan->inputs, plan->fixed);
+                                                                  : ClassifyRemaining(plan->inputs, *plan->fixed);
     {
         // how often the game's own transition draws (fast clear eliminate, fmask, resolve, depth copy) occur
         static std::array<u64, 12> class_counts{};
@@ -533,7 +533,7 @@ bool Rasterizer::FilterDraw(const DrawPlan* plan) {
     }
     {
         // Which depth targets do the depth-only draws go to? (debug server /policy)
-        const bool no_color = !plan->fixed.color_enabled || plan->fixed.NoColorTargets();
+        const bool no_color = !plan->fixed->color_enabled || plan->fixed->NoColorTargets();
         if (no_color && inputs.depth_buffer.DepthValid()) {
             VideoCore::ReadbackPolicy::Get().NoteDepthOnly(inputs.depth_buffer.Pitch(), inputs.depth_buffer.Height());
         }
@@ -555,8 +555,13 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(DrawIndirectParams params, const 
     plan->depth_copy = no_operation.depth_copy;
     plan->stencil_copy = no_operation.stencil_copy;
     Core::NativeDraw::Live().fixed_native.fetch_add(1, std::memory_order_relaxed);
-    plan->fixed = native;
-    plan->fixed_source = nullptr; // (note 154: planned from the registers)
+    if (Core::HookDiff::FixedPointerReal()) {
+        plan->fixed = &native; // note 161: the record's cached state (MakeDrawPlan is given the record's `fixed`, a cache entry)
+    } else {
+        plan->fixed_copy = native; // LEGACY(plan_pointers)
+        plan->fixed = &plan->fixed_copy;
+    }
+    plan->fixed_source = &native;
     plan->inputs = Core::NativeDrawInputs::FromRecord(record, index_count);
     Core::NativeDraw::Live().key_targets[10].fetch_add(1, std::memory_order_relaxed);
     {
@@ -579,7 +584,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(DrawIndirectParams params, const 
     if (inputs_key != 0 && plan->executed) {
         exec_inputs.insert_or_assign(inputs_key, plan->inputs);
     }
-    pipeline_cache.PlanGraphics(plan->fixed, params, *plan, exec_key);
+    pipeline_cache.PlanGraphics(*plan->fixed, params, *plan, exec_key);
     return plan;
 }
 
@@ -1483,11 +1488,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         Core::LightRecorder::FrameOp(Core::DebugServer::PresentCount(), draw_class < 5 ? draw_class + 1 : 6, reinterpret_cast<u64>(pipeline), texture_cache.ImageGeneration());
     }
     TLG_PROF_NAMED_LEVEL(prof_inputs, "raster.plan_inputs", 3);
-    const FixedState& fixed = plan->fixed;
+    const FixedState& fixed = *plan->fixed;
     if (Core::HookDiff::PointersOn() && plan->executed) [[unlikely]] {
         // note 154 shadow, the main draw path (note 157)
         if (plan->fixed_source != nullptr) {
-            Core::HookDiff::NotePlanFixed(std::memcmp(&plan->fixed, plan->fixed_source, sizeof(FixedState)) == 0);
+            Core::HookDiff::NotePlanFixed(std::memcmp(plan->fixed, plan->fixed_source, sizeof(FixedState)) == 0);
         }
         Core::HookDiff::NotePlanBindings(Core::NativeDraw::RecordBindingsState(plan->native_seq, plan->bindings.data(), plan->binding_count));
     }
@@ -1699,11 +1704,11 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!pipeline) {
         return;
     }
-    const FixedState& fixed = plan->fixed;
+    const FixedState& fixed = *plan->fixed;
     if (Core::HookDiff::PointersOn() && plan != nullptr && plan->executed) [[unlikely]] {
         // note 154 shadow: could the plan have pointed at its sources instead of copying them
         if (plan->fixed_source != nullptr) {
-            Core::HookDiff::NotePlanFixed(std::memcmp(&plan->fixed, plan->fixed_source, sizeof(FixedState)) == 0);
+            Core::HookDiff::NotePlanFixed(std::memcmp(plan->fixed, plan->fixed_source, sizeof(FixedState)) == 0);
         }
         Core::HookDiff::NotePlanBindings(Core::NativeDraw::RecordBindingsState(plan->native_seq, plan->bindings.data(), plan->binding_count));
     }
