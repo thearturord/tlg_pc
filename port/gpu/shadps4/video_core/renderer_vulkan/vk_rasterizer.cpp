@@ -973,6 +973,9 @@ const VideoCore::Buffer* Rasterizer::OwnGeometry(VAddr address, u64 size, u32 cl
     if (own == nullptr && OM::OwnCloseMode() != 0) {
         own = buffer_cache.OwnResolve(*h);
     }
+    if (own != nullptr && h->own_exact.load(std::memory_order_acquire) && (OM::OwnExactEndMode() != 2 || address + size > own->placed_end)) {
+        own = nullptr; // note 122: found by the exact end; used only in its real mode, for a read that ends inside the block
+    }
     if (own == nullptr) {
         OM::NoteOwn(OM::OwnNoOwn, cls);
         return nullptr;
@@ -3859,8 +3862,9 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
         // (bound from own memory above)
     } else if (index_buffer_size != 0 && [&] {
                    // design review 76 (TLG_GEOMETRY_ROWS): the index buffer by row (engine id of the plan's geometry handle)
+                   // LEGACY(geometry_rows): deleted while own memory answers index reads (note 122); TLG_LEGACY_GEOMETRY_ROWS=1 brings them back
                    const u32 grm = Core::RowVersion::GeometryRowsMode();
-                   if (grm == 0) {
+                   if (grm == 0 || (!Core::Legacy::GeometryRows() && Core::OwnMemoryCensus::OwnGeometryMode() != 0)) {
                        return false;
                    }
                    Core::RowVersion::NoteGeometry(0);
@@ -4776,6 +4780,15 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         }
                         if (large && large_mode == 1 && eff != 0) {
                             eff = 1u; // note 117 shadow: compared only
+                        }
+                        if (own != nullptr && h->own_exact.load(std::memory_order_acquire)) {
+                            // note 122: own found by the exact end: the binding must end inside the block (the 1 to 3 rounding bytes are not the buffer's)
+                            const u32 exact_mode = OM::OwnExactEndMode();
+                            if (exact_mode == 0 || r->ahead_address + r->ahead_size > own->placed_end) {
+                                eff = 0u;
+                            } else if (exact_mode == 1 && eff != 0) {
+                                eff = 1u;
+                            }
                         }
                         static thread_local u32 place_tick = 0;
                         if (own == nullptr && eff != 0 && OM::OwnPlaceMode() == 2 && !imm && !large && !desc.is_written && r->ahead_size <= buffer_cache.StreamThreshold() &&

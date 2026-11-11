@@ -256,6 +256,14 @@ u32 OwnGeometryMode() noexcept {
     return mode;
 }
 
+u32 OwnExactEndMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_OWN_EXACT_END");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // default 0 (note 122)
+    }();
+    return mode;
+}
+
 u32 OwnVertexSplitMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_OWN_VERTEX_SPLIT");

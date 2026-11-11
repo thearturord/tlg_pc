@@ -86,6 +86,10 @@ struct ImmutableBuffer {
     /// that set it; and the placement version of the last resolution that found none (no new lookup until placements change).
     std::atomic<bool> own_new{false};
     std::atomic<u64> own_tried{0};
+    /// Note 122 (`TLG_OWN_EXACT_END`): the buffer's exact end (`begin` + its byte width; `end` is rounded up to 4 bytes), and whether `own` was found only by it (a block that
+    /// ends at the exact end, short of the rounded one)
+    u64 bytes_end{};
+    std::atomic<bool> own_exact{false};
 };
 
 /// C1 / C3: resident engine buffers (`TLG_RESIDENT_BUFFERS=1`). The residency of the immutable buffers (a buffer synchronized once is read from the arena with no tracker query)

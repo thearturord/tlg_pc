@@ -1679,6 +1679,7 @@ const Buffer* BufferCache::OwnResolve(Core::NativeResources::ImmutableBuffer& h)
         return nullptr;
     }
     const Buffer* holder = nullptr;
+    bool exact = false;
     {
         std::scoped_lock lock{placed_mutex};
         auto it = placed.upper_bound(h.begin);
@@ -1686,6 +1687,10 @@ const Buffer* BufferCache::OwnResolve(Core::NativeResources::ImmutableBuffer& h)
             --it;
             if (it->second.begin <= h.begin && it->second.end >= h.end) {
                 holder = it->second.buffer.get();
+            } else if (Core::OwnMemoryCensus::OwnExactEndMode() != 0 && h.bytes_end != 0 && h.bytes_end < h.end && it->second.begin <= h.begin &&
+                       it->second.end >= h.bytes_end) {
+                holder = it->second.buffer.get(); // note 122: the block ends at the buffer's exact end, short of the rounded one
+                exact = true;
             }
         }
     }
@@ -1699,6 +1704,7 @@ const Buffer* BufferCache::OwnResolve(Core::NativeResources::ImmutableBuffer& h)
         h.cpu_dirty.store(it != object_dirty.end() && it->second.Intersects(h.begin, h.end - h.begin), std::memory_order_release);
     }
     h.own_new.store(true, std::memory_order_release);
+    h.own_exact.store(exact, std::memory_order_release);
     h.own.store(holder, std::memory_order_release);
     Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnResolved, h.usage == 1 ? 0u : 1u);
     return holder;

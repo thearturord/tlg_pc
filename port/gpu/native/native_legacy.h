@@ -12,6 +12,8 @@
 ///   TLG_LEGACY_ENGINE_ROWS=1   `engine_rows`: rows for shader buffer bindings of engine buffers, on the front (rows ahead: `RowShare::Find`) and the raster thread
 ///                              (`RowsServe`, `RowsLearn`, the rows-ahead bind). Deleted 2026-11-10 (design review 89): own memory by id answers them, the rest take
 ///                              `ObtainBuffer`, whose answer the rows cached. Not covered: the index buffer rows (`TLG_GEOMETRY_ROWS`), which stay.
+///   TLG_LEGACY_GEOMETRY_ROWS=1 `geometry_rows`: the index buffer rows (design review 76-78). Deleted 2026-11-11 (note 122) while `TLG_OWN_GEOMETRY` is on: own memory by
+///                              the draw's geometry ids answers index reads first, the rest take `ObtainBuffer`, whose answer the rows cached.
 ///
 /// Steps whose old path is the switch's `=0` (each default on; listed so the whole set is in one place):
 ///   TLG_EPOCH_PLANNER=0        the barrier planner's per-flush maps (design review 72-74)
@@ -34,6 +36,8 @@ namespace Core::Legacy {
 
 /// TLG_LEGACY_ENGINE_ROWS=1: the rows for shader buffer bindings of engine buffers (see above).
 [[nodiscard]] bool EngineRows() noexcept;
+/// TLG_LEGACY_GEOMETRY_ROWS=1: the index buffer rows (see above).
+[[nodiscard]] bool GeometryRows() noexcept;
 
 /// Every switch of the index with its value as read at startup ("unset" = the default), and whether a deleted path is back. Published as `legacy`.
 [[nodiscard]] nlohmann::json Report();

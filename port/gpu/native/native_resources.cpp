@@ -313,6 +313,7 @@ void AddImmutable(const Resource& resource) {
     entry->usage = static_cast<u8>(resource.usage);
     entry->begin = resource.address;
     entry->end = resource.address + ((u64{resource.width} + 3) & ~u64{3});
+    entry->bytes_end = resource.address + resource.width;
     entry->object = resource.object;
     entry->id = resource.id;
     std::unique_lock lock{immutable_mutex};
@@ -540,6 +541,7 @@ void AddLarge(const Resource& resource) {
     entry->usage = static_cast<u8>(resource.usage);
     entry->begin = resource.address;
     entry->end = resource.address + ((u64{resource.width} + 3) & ~u64{3});
+    entry->bytes_end = resource.address + resource.width;
     entry->object = resource.object;
     entry->id = resource.id;
     std::unique_lock lock{large_mutex};

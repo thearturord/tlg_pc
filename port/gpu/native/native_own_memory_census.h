@@ -121,6 +121,9 @@ void NoteDiag(Diag what, const char* detail = nullptr) noexcept;
 /// Note 121 (`TLG_OWN_VERTEX_SPLIT`: 0 off by default, 1 shadow, 2 real): a merged vertex range no one engine buffer holds is bound per member buffer from each one's own memory
 /// when every member has current own memory (needs `TLG_OWN_GEOMETRY`).
 [[nodiscard]] u32 OwnVertexSplitMode() noexcept;
+/// Note 122 (`TLG_OWN_EXACT_END`: 0 off by default, 1 shadow, 2 real): the lazy own resolution also takes a placed block that ends at the buffer's exact end (the registry
+/// rounds `end` up to 4 bytes, the blocks end at the buffer's bytes); such a binding is bound from it only while it ends inside the block.
+[[nodiscard]] u32 OwnExactEndMode() noexcept;
 enum Place : u32 {
     PlaceBinds,         ///< stream-ring binds of a buffer with no own block
     PlaceBuffers,       ///< ... distinct buffers
