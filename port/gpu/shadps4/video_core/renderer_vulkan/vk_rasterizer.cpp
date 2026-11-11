@@ -73,6 +73,9 @@
 namespace {
 thread_local bool t_f1_no_own = false; // note 120 diagnostic: this binding's buffer had no own block (the old path's answer is classified at the end)
 thread_local VAddr t_f1_no_own_begin = 0, t_f1_no_own_end = 0;
+thread_local u64 t_f1_no_own_id = 0;           // note 121: the buffer's id
+thread_local bool t_f1_no_own_dirty = false;   // ... CPU bytes waiting at the bind
+thread_local bool t_f1_no_own_written = false;
 thread_local bool t_f1_no_id = false; // note 119 diagnostic: this binding had no engine id at the own-memory step
 thread_local u32 t_cover_class = 15; // R-slice census: the draw class of the draw being timed
 thread_local u64 t_w1_draw_begin = 0, t_w1_bind_begin = 0, t_w1_bind_end = 0; // W1.2 census: the clock at the start of Draw(), of BindResources and at its end (ns)
@@ -3423,6 +3426,7 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
         const VideoCore::Buffer* buffer;
         u64 offset;
         bool ring{}; ///< N5g: the bytes are in the constant ring (offset is a ring offset, buffer is null)
+        bool split{}; ///< note 121: every member buffer is bound from its own memory (`guest_own`), the range itself from nothing
 
         [[nodiscard]] size_t GetSize() const {
             return end_address - base_address;
@@ -3454,6 +3458,8 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
         }
     }
 
+    // note 121: the own memory of each guest vertex buffer of a merged range that no one engine buffer holds (all members, or none)
+    VertexInputs<const VideoCore::Buffer*> guest_own(guest_buffers.size(), nullptr);
     // Map buffers for merged ranges
     for (auto& range : ranges_merged) {
         if (Core::OwnMemoryCensus::On()) [[unlikely]] {
@@ -3491,6 +3497,46 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
                 continue;
             }
             VideoCore::BufferCache::UploadBytesReset();
+            if (const u32 split_mode = Core::OwnMemoryCensus::OwnVertexSplitMode(); own_vertex == nullptr && split_mode != 0) {
+                // note 121: no one buffer holds the merged range; its members, each from its own memory
+                bool all_own = true;
+                u32 members = 0;
+                for (size_t gi = 0; gi < guest_buffers.size(); ++gi) {
+                    const auto& gb = guest_buffers[gi];
+                    if (gb.address == 0 || gb.size == 0 || gb.address < range.base_address || gb.address >= range.end_address) {
+                        continue;
+                    }
+                    ++members;
+                    guest_own[gi] = OwnGeometry(gb.address, memory->ClampRangeSize(gb.address, gb.size), 9);
+                    all_own &= guest_own[gi] != nullptr;
+                }
+                if (members < 2 || !all_own) {
+                    for (size_t gi = 0; gi < guest_buffers.size(); ++gi) {
+                        const auto& gb = guest_buffers[gi];
+                        if (gb.address >= range.base_address && gb.address < range.end_address) {
+                            guest_own[gi] = nullptr;
+                        }
+                    }
+                } else {
+                    static thread_local u32 split_tick = 0;
+                    if (split_mode == 2 && (++split_tick & 63u) != 0) {
+                        range.split = true;
+                        for (size_t gi = 0; gi < guest_buffers.size(); ++gi) {
+                            const auto& gb = guest_buffers[gi];
+                            if (guest_own[gi] == nullptr || gb.address < range.base_address || gb.address >= range.end_address) {
+                                continue;
+                            }
+                            Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnBound, 9);
+                            const u64 member_size = memory->ClampRangeSize(gb.address, gb.size);
+                            const u64 member_offset = guest_own[gi]->Offset(gb.address);
+                            const_cast<VideoCore::Buffer*>(guest_own[gi])->NoteResolveUse();
+                            needs_barrier |= BufferBarrierQuery(guest_own[gi], member_offset, member_size, false);
+                            bound_buffers.emplace_back(guest_own[gi], member_offset, member_size, vk::AccessFlagBits2::eVertexAttributeRead);
+                        }
+                        continue;
+                    }
+                }
+            }
         }
         auto* vertex_handle = GeometryHandle(range.base_address, size);
         Census(vertex_handle != nullptr ? CGeometryVertexHandle : CGeometryVertexAddress);
@@ -3525,9 +3571,19 @@ void Rasterizer::BindVertexBuffersLegacy(const GraphicsPipeline* pipeline) {
                            buffer.address < range.end_address;
                 });
             ASSERT(host_buffer_info != ranges_merged.cend());
-            host_buffers.emplace_back(host_buffer_info->ring ? constant_ring->Handle() : host_buffer_info->buffer->Handle());
-            host_offsets.push_back(host_buffer_info->offset + buffer.address -
-                                   host_buffer_info->base_address);
+            const size_t gi = static_cast<size_t>(&buffer - guest_buffers.data());
+            if (host_buffer_info->split) {
+                // note 121: the member's own memory
+                host_buffers.emplace_back(guest_own[gi]->Handle());
+                host_offsets.push_back(guest_own[gi]->Offset(buffer.address));
+            } else {
+                host_buffers.emplace_back(host_buffer_info->ring ? constant_ring->Handle() : host_buffer_info->buffer->Handle());
+                host_offsets.push_back(host_buffer_info->offset + buffer.address -
+                                       host_buffer_info->base_address);
+                if (guest_own[gi] != nullptr) [[unlikely]] {
+                    OwnGeometryCompare(guest_own[gi], buffer.address, host_buffers.back(), host_offsets.back(), 9);
+                }
+            }
         } else {
             host_buffers.emplace_back(VK_NULL_HANDLE);
             host_offsets.push_back(0);
@@ -4721,12 +4777,40 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         if (large && large_mode == 1 && eff != 0) {
                             eff = 1u; // note 117 shadow: compared only
                         }
+                        static thread_local u32 place_tick = 0;
+                        if (own == nullptr && eff != 0 && OM::OwnPlaceMode() == 2 && !imm && !large && !desc.is_written && r->ahead_size <= buffer_cache.StreamThreshold() &&
+                            h->end - h->begin <= Core::NativeResources::ResidentCap() && !buffer_cache.PlacedMeetsRange(h->begin, h->end - h->begin) &&
+                            !buffer_cache.IsRegionGpuModified(h->begin, h->end - h->begin) && (++place_tick & 63u) != 0) {
+                            // note 121 real: the read the old path would copy into the stream ring; the buffer is placed whole from guest memory instead (the same bytes) and bound from it
+                            u64 uploaded = 0;
+                            const auto [block, block_offset] = buffer_cache.ObtainStatic(h->id, h->begin, static_cast<u32>(h->end - h->begin), uploaded);
+                            OM::NoteOwn(OM::OwnBound, cls);
+                            const VAddr address = r->ahead_address;
+                            const u64 size = r->ahead_size;
+                            const u64 offset = block->Offset(address);
+                            const u64 offset_aligned = Common::AlignDown(offset, alignment);
+                            const u64 adjust = offset - offset_aligned;
+                            const_cast<VideoCore::Buffer*>(block)->NoteResolveUse();
+                            recipe_ranges.emplace_back(address, static_cast<u32>(std::min<u64>(size, 0xffffffffull)));
+                            push_data.AddOffset(binding.buffer, adjust);
+                            buffer_infos.emplace_back(block->Handle(), offset_aligned, size + adjust);
+                            bound_buffers.emplace_back(block, offset, size, src_access);
+                            if (BufferBarrierQuery(block, offset, size, false)) {
+                                needs_barrier = true;
+                            }
+                            goto buffer_bound;
+                        }
                         if (own == nullptr || eff == 0) {
                             OM::NoteOwn(OM::OwnNoOwn, cls);
-                            if (own == nullptr && OM::DiagOn()) [[unlikely]] {
+                            if (own == nullptr && (OM::DiagOn() || OM::OwnPlaceMode() != 0)) [[unlikely]] {
                                 t_f1_no_own = true;
                                 t_f1_no_own_begin = h->begin;
                                 t_f1_no_own_end = h->end;
+                                t_f1_no_own_id = h->id;
+                                t_f1_no_own_written = desc.is_written;
+                                t_f1_no_own_dirty = imm ? !h->synced.load(std::memory_order_acquire) : h->cpu_dirty.load(std::memory_order_acquire);
+                            }
+                            if (own == nullptr && OM::DiagOn()) [[unlikely]] {
                                 const bool meets = buffer_cache.PlacedMeetsRange(h->begin, h->end - h->begin);
                                 OM::NoteDiag(meets ? OM::DiagNoOwnPartial : OM::DiagNoOwnNone,
                                              fmt::format("id {} usage {} buffer {:#x}..{:#x} binding {:#x}+{:#x} written {} program {:#x}", h->id, h->usage, h->begin, h->end, r->ahead_address,
@@ -5602,8 +5686,16 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
             t_f1_no_own = false;
             const auto& info = buffer_infos.back();
             const auto* now = buffer_cache.PlacedWhole(t_f1_no_own_begin, t_f1_no_own_end - t_f1_no_own_begin);
-            OM::NoteDiag(buffer_cache.IsStreamHandle(info.buffer) ? OM::DiagNoOwnOldStream : now != nullptr && info.buffer == now->Handle() ? OM::DiagNoOwnOldPlacedNow
-                                                                                                                                         : OM::DiagNoOwnOldOther);
+            const bool streamed = buffer_cache.IsStreamHandle(info.buffer);
+            if (OM::DiagOn()) {
+                OM::NoteDiag(streamed ? OM::DiagNoOwnOldStream : now != nullptr && info.buffer == now->Handle() ? OM::DiagNoOwnOldPlacedNow : OM::DiagNoOwnOldOther);
+            }
+            if (streamed && !t_f1_no_own_written && OM::OwnPlaceMode() != 0) {
+                // note 121 shadow: placing this buffer on its first bind; the block would be CPU-writable when the engine writes it with the CPU (as Place decides with zero copy)
+                Core::NativeDevice::Object o{};
+                const bool cpu_written = Core::NativeDevice::Lookup(t_f1_no_own_id, o) && o.usage != 3 && (o.cpu_access & 0x10000) != 0;
+                OM::NotePlace(t_f1_no_own_id, t_f1_no_own_end - t_f1_no_own_begin, Core::RowVersion::Of(t_f1_no_own_id), cpu_written && buffer_cache.ZeroCopyOn());
+            }
         }
         if (own_compare != nullptr) [[unlikely]] {
             // design review 83: the own memory's answer against the old path's

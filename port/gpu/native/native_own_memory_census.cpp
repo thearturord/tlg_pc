@@ -256,6 +256,48 @@ u32 OwnGeometryMode() noexcept {
     return mode;
 }
 
+u32 OwnVertexSplitMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_OWN_VERTEX_SPLIT");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // default 0 (note 121)
+    }();
+    return mode;
+}
+
+u32 OwnPlaceMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_OWN_PLACE");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // default 0 (note 121); =1 shadow, =2 real
+    }();
+    return mode;
+}
+
+namespace {
+std::array<std::atomic<u64>, PlaceCount> places{};
+std::mutex place_mutex;
+std::unordered_map<u64, u64> place_last_version; ///< id -> the write version at its last bind
+} // namespace
+
+void NotePlace(u64 id, u64 bytes, u64 version, bool zero_copy) noexcept {
+    places[PlaceBinds].fetch_add(1, std::memory_order_relaxed);
+    if (zero_copy) {
+        places[PlaceZeroCopy].fetch_add(1, std::memory_order_relaxed);
+    }
+    bool changed = true;
+    {
+        std::scoped_lock lock{place_mutex};
+        const auto [it, inserted] = place_last_version.try_emplace(id, version);
+        if (inserted) {
+            places[PlaceBuffers].fetch_add(1, std::memory_order_relaxed);
+            places[PlaceBytes].fetch_add(bytes, std::memory_order_relaxed);
+        } else {
+            changed = it->second != version;
+            it->second = version;
+        }
+    }
+    places[changed ? PlaceDirty : PlaceClean].fetch_add(1, std::memory_order_relaxed);
+}
+
 bool DiagOn() noexcept {
     static const bool on = [] {
         const char* e = std::getenv("TLG_F1_DIAG");
@@ -296,11 +338,11 @@ u32 OwnCloseMode() noexcept {
 }
 
 namespace {
-std::array<std::array<std::atomic<u64>, OwnCount>, 9> owns{};
+std::array<std::array<std::atomic<u64>, OwnCount>, 10> owns{};
 }
 
 void NoteOwn(u32 what, u32 cls) noexcept {
-    if (what < OwnCount && cls < 9) {
+    if (what < OwnCount && cls < 10) {
         owns[cls][what].fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -316,6 +358,13 @@ nlohmann::json Report() {
     {
         static constexpr const char* D[DropCount] = {"asked", "no_registered_buffer", "set_held_the_range", "flag_set_would_drop", "FLAG_SET_BUT_NOT_DIRTY_MUST_BE_0",
                                                      "set_held_but_flag_clear", "DROP_WITH_LIVE_COPY_MUST_BE_0", "memo_erase_removed_entries_kept", "uploads_cleared_the_flag", "dropped_real", "audited_real"};
+        if (OwnPlaceMode() != 0) {
+            static constexpr const char* P[PlaceCount] = {"stream_binds_no_own_block", "distinct_buffers", "binds_with_no_write_since_the_last_bind", "binds_after_a_write_or_first_uploads",
+                                                          "unused", "binds_of_zero_copy_buffers", "bytes_of_the_buffers"};
+            for (u32 k = 0; k < PlaceCount; ++k) {
+                j["place_shadow"][P[k]] = places[k].load();
+            }
+        }
         if (DiagOn()) {
             for (u32 k = 0; k < DiagCount; ++k) {
                 j["f1_diag"][DiagNames[k]] = diags[k].load();
@@ -330,9 +379,9 @@ nlohmann::json Report() {
         static constexpr const char* O[OwnCount] = {"asked", "immutable_inside", "no_own_buffer", "not_synced", "bound_from_own", "compared", "DIFFERENT_MUST_BE_0",
                                                     "OLD_PATH_DID_WORK_MUST_BE_0", "old_answer_stream_ring", "own_set", "own_cleared", "not_gpu_marked_yet", "own_resolved_lazily",
                                                     "bindings_valid_only_by_a_resolved_pointer"};
-        static constexpr const char* C[9] = {"own_immutable", "own_mutable_read", "own_mutable_written", "own_large_read", "own_large_written", "own_range_read", "own_range_written",
-                                             "own_index", "own_vertex"};
-        for (u32 c = 0; c < 9; ++c) {
+        static constexpr const char* C[10] = {"own_immutable", "own_mutable_read", "own_mutable_written", "own_large_read", "own_large_written", "own_range_read", "own_range_written",
+                                             "own_index", "own_vertex", "own_vertex_split"};
+        for (u32 c = 0; c < 10; ++c) {
             j[C[c]]["mode"] = c == 0 ? OwnImmutableMode() : c >= 7 ? OwnGeometryMode() : c >= 5 ? OwnRangeMode() : c >= 3 ? OwnLargeMode() : OwnMutableMode();
             j[C[c]]["close_mode"] = OwnCloseMode();
             for (u32 k = 0; k < OwnCount; ++k) {
