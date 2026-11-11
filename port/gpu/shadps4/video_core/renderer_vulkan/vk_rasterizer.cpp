@@ -6926,8 +6926,8 @@ bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const Textur
     bool any_storage = false;
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];
-        if (entry.null_entry) {
-            continue;
+        if (entry.null_entry || entry.owned) {
+            continue; // (note 163: a dynamic texture's own image is not in the cache's lists; it was refreshed when it was found)
         }
         texture_cache.TouchFoundImage(entry.found);
         any_storage |= entry.storage;
@@ -7601,6 +7601,66 @@ void Rasterizer::BindTexturesLegacy(const Shader::Info& stage, Shader::Backend::
     BindSamplers(stage, binding);
 }
 
+bool Rasterizer::DynamicEntry(const Shader::ImageResource& res, const u32* words, u64 engine_id, u64 view_id, u64 texture_id, TextureSetEntry& te) {
+    using namespace Core::ViewTable;
+    Core::NativeDevice::Object o{};
+    if (!Core::NativeDevice::Lookup(texture_id, o) || o.kind == Core::NativeDevice::Kind::Buffer || o.usage != 2) {
+        Note(DynNotDynamic);
+        return false;
+    }
+    if (res.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
+        Note(DynRefused);
+        return false;
+    }
+    // the description exactly as the old path builds it (BindTexturesLegacy, first pass): the T# from the record's words, the engine's plain description where it has one
+    const AmdGpu::Image tsharp = res.FromWords(words);
+    if (tsharp.Address() == 0 || tsharp.GetDataFmt() == Ps4Layout::DataFormat::FormatInvalid || !memory->IsValidGpuMapping(tsharp.Address(), 0)) {
+        Note(DynRefused);
+        return false;
+    }
+    Core::NativeDesc::ImageDesc native_image_desc;
+    const bool from_desc = engine_id != 0 && !res.is_r128 && Core::NativeImageDesc::FromDescOn() &&
+                           Core::NativeImageDesc::DescForBinding(engine_id, view_id, res.post_op == Shader::SharpFetchPostOp::ConvertCubeTo2DArray, res.is_depth, native_image_desc);
+    const Core::NativeDesc::ImageDesc binding_image = from_desc ? native_image_desc : VideoCore::ImageDescFromSharp(tsharp);
+    VideoCore::TextureCache::ImageDesc desc(binding_image, res);
+    desc.engine_id = engine_id;
+    if (desc.info.guest_address != tsharp.Address()) {
+        Note(DynWindowDifferent); // the description must name the window the game's T# names
+        return false;
+    }
+    bool refreshed = false;
+    const VideoCore::ImageId id = texture_cache.DynamicImage(texture_id, desc, refreshed);
+    if (!id) {
+        Note(DynRefused);
+        return false;
+    }
+    if (refreshed) {
+        Note(DynRefreshed);
+    }
+    auto& image = texture_cache.GetImage(id);
+    if (DynamicMode() == 1) {
+        // shadow: the old path's image for the same description (its FindImage runs again right after, with the same answer)
+        auto old_desc = desc;
+        const VideoCore::ImageId old_id = texture_cache.FindImage(old_desc);
+        const auto& old = texture_cache.GetImage(old_id);
+        const bool same = old_id && old.info.guest_address == desc.info.guest_address && old.info.pixel_format == image.info.pixel_format &&
+                          old.info.size.width == image.info.size.width && old.info.size.height == image.info.size.height && old.info.resources.levels == image.info.resources.levels &&
+                          old.info.resources.layers == image.info.resources.layers && old.info.tile_mode == image.info.tile_mode;
+        Note(same ? DynShadowSame : DynShadowOldOther);
+        return false;
+    }
+    te = {};
+    te.id = te.found = id;
+    te.id_uid = te.found_uid = texture_cache.ImageUid(id);
+    te.view = *image.FindView(desc.view_info).image_view;
+    te.backing = image.backing;
+    te.range = desc.view_info.range;
+    te.array_key = res.array_key;
+    te.owned = true;
+    Note(DynServed);
+    return true;
+}
+
 bool Rasterizer::ViewTableBind(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     using namespace Core::ViewTable;
     const u32 n = static_cast<u32>(stage.images.size());
@@ -7641,6 +7701,12 @@ bool Rasterizer::ViewTableBind(const Shader::Info& stage, Shader::Backend::Bindi
             return false;
         }
         const Entry* e = Find(view_id, ImageUseFlags(res));
+        if (e != nullptr && !e->in_class && DynamicMode() != 0 && !res.is_written && !res.is_depth && e->resource_id != 0) [[unlikely]] {
+            // note 163: a dynamic texture, from its own image
+            if (DynamicEntry(res, words, binder_plan->bindings[identity_binding].id, view_id, e->resource_id, from_table.entries[i])) {
+                continue;
+            }
+        }
         if (e == nullptr || !e->in_class || !e->has_payload) {
             t_vt_refuse = e == nullptr ? Core::Coverage::IrNoEntry : !e->in_class ? Core::Coverage::IrNotInClass : Core::Coverage::IrNoPayload;
             return false;

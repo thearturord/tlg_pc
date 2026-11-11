@@ -671,6 +671,7 @@ private:
         bool storage{}; ///< note 111: a written (storage) binding of the image
         u32 array_key{}; ///< tlg C9: the image's descriptor array (Shader::Indexed::ImageKey of its T#)
         u64 found_uid{}, id_uid{}; ///< F2 item 4: the images' uids (a slot can be reused by another image)
+        bool owned{}; ///< note 163: a dynamic texture's own image (not in the cache's lookup or lists; refreshed when it was found)
     };
     struct TextureSet {
         static constexpr u32 MaxImages = 32; ///< the entries' capacity; the stages the memo takes are limited by `Limit()`
@@ -718,6 +719,8 @@ private:
     std::array<u64, 9> target_use{}; ///< note 103: the use the draw's targets were looked up with (0: not in the class)
     /// Note 97 (`TLG_VIEW_TABLE=2`): the stage's images bound from the view table (true), or nothing done (false: the old path binds them).
     bool ViewTableBind(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+    /// Note 163: the view table entry of a dynamic texture's binding, from the texture's own image (false: the old path binds it; the shadow compares there)
+    bool DynamicEntry(const Shader::ImageResource& res, const u32* words, u64 engine_id, u64 view_id, u64 texture_id, TextureSetEntry& te);
     bool ResolveTextureSet(const Shader::Info& stage, TextureSet& set, const std::array<u32, 8>* raws, const u64* flags, u32 count, TextureResolved& r);
     /// F2 item 4 (`TLG_TEXSET_BY_ID`, default 2 since 2026-11-10; 0 off, 1 shadow): a texture set whose generation moved is still right when none of its images changed by identity (the texture
     /// cache's event ring: no image registered or unregistered over their memory since the set was recorded). Returns true when the set may be used (real mode, all unchanged).

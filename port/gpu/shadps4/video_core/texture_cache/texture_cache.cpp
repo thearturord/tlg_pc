@@ -631,6 +631,55 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id, Core:
     return new_image_id;
 }
 
+ImageId TextureCache::DynamicImage(u64 texture_id, const ImageDesc& desc, bool& refreshed) {
+    refreshed = false;
+    const ImageInfo& info = desc.info;
+    if (info.guest_address == 0 || info.guest_size == 0 || info.guest_size > 65536 || info.num_samples > 1 || info.props.is_depth ||
+        buffer_cache.IsRegionGpuModified(info.guest_address, info.guest_size)) {
+        return {};
+    }
+    auto& slot = dynamic_images[texture_id];
+    if (slot.id) {
+        const ImageInfo& have = slot_images[slot.id].info;
+        if (have.pixel_format != info.pixel_format || have.type != info.type || have.size.width != info.size.width || have.size.height != info.size.height ||
+            have.size.depth != info.size.depth || have.resources.levels != info.resources.levels || have.resources.layers != info.resources.layers || have.pitch != info.pitch ||
+            have.tile_mode != info.tile_mode || have.guest_size != info.guest_size) {
+            return {}; // another shape: the old path keeps it
+        }
+    } else {
+        slot.id = slot_images.Insert(instance, runtime, slot_image_views, info);
+        slot.address = 0;
+        slot.bytes.clear();
+    }
+    static thread_local std::vector<u8> now;
+    now.resize(info.guest_size);
+    Core::Memory::Instance()->CopySparseMemory(info.guest_address, now.data(), info.guest_size);
+    if (slot.address != info.guest_address || slot.bytes != now) {
+        // the bytes the T# names now, uploaded (detiled) by the old path's own refresh
+        Image& image = slot_images[slot.id];
+        image.info.guest_address = info.guest_address;
+        image.flags |= ImageFlagBits::CpuDirty;
+        RefreshImage(image, Core::ImageCaller::RasterizerBindTextures);
+        image.flags &= ~ImageFlagBits::Dirty;
+        slot.address = info.guest_address;
+        slot.bytes = now;
+        refreshed = true;
+    }
+    return slot.id;
+}
+
+void TextureCache::DropDynamicImage(u64 texture_id) {
+    const auto it = dynamic_images.find(texture_id);
+    if (it == dynamic_images.end()) {
+        return;
+    }
+    if (it->second.id) {
+        ResolveCommands::Run(); // (queued work may name the image)
+        DeleteImage(it->second.id);
+    }
+    dynamic_images.erase(it);
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     Core::DispatchExecutor::NoteAddressCall(1); // note 152 shadow
     Core::SplitCensus::PhaseScope phase_scope{Core::SplitCensus::PhaseImgResolve};

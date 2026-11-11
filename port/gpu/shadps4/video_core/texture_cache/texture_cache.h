@@ -190,6 +190,13 @@ public:
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
+    /// Note 163 (plan R2.6, `TLG_DYNAMIC_TEXTURES`): the own image of a dynamic texture (written by the CPU every frame through Map discard, so its T# names a new frame ring window
+    /// each frame), kept by the texture's engine id. It is not registered, tracked or collected: no address lookup reaches it. `desc` is built from the T# as the old path builds it;
+    /// the image is uploaded from `desc.info.guest_address` by RefreshImage whenever those bytes differ from its last upload (`refreshed`). Null: refused (another shape, too large,
+    /// GPU-modified memory).
+    [[nodiscard]] ImageId DynamicImage(u64 texture_id, const ImageDesc& desc, bool& refreshed);
+    /// Note 163: the texture was deleted: its own image goes (deferred, as every image deletion).
+    void DropDynamicImage(u64 texture_id);
 
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
@@ -431,6 +438,13 @@ private:
 
     /// Removes the image and any views/surface metas that reference it.
     void DeleteImage(ImageId image_id);
+
+    struct DynamicSlot {
+        ImageId id{};
+        VAddr address{};
+        std::vector<u8> bytes; ///< what the last upload read
+    };
+    std::unordered_map<u64, DynamicSlot> dynamic_images; ///< note 163 (raster thread)
 
     /// Touch the image in the LRU cache.
     void TouchImage(Image& image) {

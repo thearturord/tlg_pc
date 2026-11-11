@@ -154,6 +154,14 @@ void LinkResource(u64 resource_id, u64 view_id) noexcept {
     v.push_back(view_id);
 }
 
+u32 DynamicMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_DYNAMIC_TEXTURES");
+        return e == nullptr || e[0] == 0 ? 2u : e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u; // default 2 since 2026-11-12 (note 163); LEGACY(dynamic_textures): =0, =1 shadow
+    }();
+    return mode;
+}
+
 nlohmann::json Report() {
     const auto c = [](Count k) { return counts[k].load(std::memory_order_relaxed); };
     nlohmann::json j;
@@ -189,6 +197,9 @@ nlohmann::json Report() {
                                         {"stages_refused_same_image_twice", c(StRealRefusedTwice)}}}};
     j["real"] = {{"stages_bound_from_the_table", c(RealServed)}, {"image_bindings_bound_from_the_table", c(RealServedImages)}, {"stages_audited_by_the_old_path", c(RealAudited)},
                  {"stages_whose_image_checks_failed", c(RealCheckFailed)}, {"sampled_targets_bound_note_160", c(RealServedTargets)}};
+    j["dynamic_note_163"] = {{"mode", DynamicMode()}, {"bound_from_own_image", c(DynServed)}, {"uploads", c(DynRefreshed)}, {"refused", c(DynRefused)},
+                             {"not_dynamic", c(DynNotDynamic)}, {"shadow_same", c(DynShadowSame)}, {"shadow_old_path_other_image", c(DynShadowOldOther)},
+                             {"DYNAMIC_WINDOW_DIFFERENT_MUST_BE_0", c(DynWindowDifferent)}};
     return j;
 }
 

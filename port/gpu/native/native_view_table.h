@@ -130,10 +130,19 @@ enum Count : u32 {
     StRealRefusedTwice,     ///< ... stages refused at the tail: the same image twice, one binding written
     NewImageEvents,         ///< ... the events (a texture with linked views got a new image)
     RealServedTargets,      ///< note 160: sampled render targets (feedback loops) bound by the tail with the old path's layout
+    DynServed,              ///< note 163: dynamic texture bindings bound from the texture's own image
+    DynRefreshed,           ///< ... uploads into those images (the window's bytes differed from the last upload)
+    DynRefused,             ///< ... refused (another shape, too large, invalid T#, GPU-modified memory)
+    DynNotDynamic,          ///< ... entries not in class whose texture is not dynamic (unknown: the old path)
+    DynShadowSame,          ///< shadow: the old path's image is at the window with the same shape
+    DynShadowOldOther,      ///< shadow: the old path served another image (another address or shape: the overlap answer)
+    DynWindowDifferent,     ///< the description does not name the T#'s window (must be 0)
     Count_
 };
 void Note(Count c, u64 n = 1) noexcept;
 
 [[nodiscard]] nlohmann::json Report();
+/// Note 163 (`TLG_DYNAMIC_TEXTURES`: 2 real by default, 1 shadow, 0 off): dynamic textures bound from their own image by id. LEGACY(dynamic_textures): =0.
+[[nodiscard]] u32 DynamicMode() noexcept;
 
 } // namespace Core::ViewTable

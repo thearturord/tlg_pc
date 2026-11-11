@@ -260,6 +260,7 @@ void Rasterizer::EngineObjectDeleted(u64 id, VAddr address, u64 bytes, u32 what)
         return;
     }
     if (what == 1 || what == 3) {
+        texture_cache.DropDynamicImage(id); // note 163
         // a texture with a live alias at its memory keeps its images (its lists go)
         texture_cache.EngineIndex().NoteTextureDelete(id, address, bytes, Core::NativeUpdates::B8LifetimeMode() == 2 && what == 1);
     }
