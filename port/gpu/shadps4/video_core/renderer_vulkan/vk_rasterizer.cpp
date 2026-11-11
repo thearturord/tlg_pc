@@ -7051,6 +7051,10 @@ void Rasterizer::ViewTableShadow(const Shader::Info& stage, u32 first_info, size
             all_in = false;
             continue;
         }
+        const bool keyed = IsSubresourceKey(view_id); // note 113: a copy dispatch's texture subresource
+        if (keyed) {
+            Note(pick(KeyedImages, StKeyed));
+        }
         if (!answers_ok[i]) {
             all_bindable = false;
         }
@@ -7081,8 +7085,27 @@ void Rasterizer::ViewTableShadow(const Shader::Info& stage, u32 first_info, size
         if (e == nullptr) {
             Entry& made = Put(view_id, flags);
             Core::NativeDevice::Object v{}, t{};
-            made.in_class = Core::NativeDevice::Lookup(view_id, v) && v.resource_id != 0 && Core::NativeDevice::Lookup(v.resource_id, t) && t.usage != 2;
-            made.resource_id = v.resource_id;
+            if (keyed) {
+                made.resource_id = SubresourceKeyResource(view_id);
+                const bool known = Core::NativeDevice::Lookup(made.resource_id, t);
+                made.in_class = known && t.kind != Core::NativeDevice::Kind::Buffer && t.usage != 2;
+                if (!made.in_class) {
+                    Note(!known ? KeyedUnknown : t.usage == 2 ? KeyedDynamic : KeyedOther);
+                    static std::atomic<u32> logged{0};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                        const auto& img = texture_cache.GetImage(bound);
+                        Core::NativeDevice::Object owner{};
+                        const bool owned = Core::NativeDevice::ResourceAt(img.info.guest_address, owner);
+                        LOG_WARNING(Render_Vulkan, "view table: copy binding of texture {} (written {}) not in the class: known {} kind {} usage {} bind {:#x} cpu access {:#x} {}x{} mips {}; image {:#x}+{:#x} {}x{} format {}; "
+                                    "owner at the address: {} id {} kind {} usage {} alive {}", made.resource_id, res.is_written, known, static_cast<u32>(t.kind), t.usage, t.bind, t.cpu_access, t.width,
+                                    t.height, t.mips, img.info.guest_address, img.info.guest_size, img.info.size.width, img.info.size.height, static_cast<u32>(img.info.pixel_format), owned, owner.id,
+                                    static_cast<u32>(owner.kind), owner.usage, owner.alive);
+                    }
+                }
+            } else {
+                made.in_class = Core::NativeDevice::Lookup(view_id, v) && v.resource_id != 0 && Core::NativeDevice::Lookup(v.resource_id, t) && t.usage != 2;
+                made.resource_id = v.resource_id;
+            }
             if (made.resource_id != 0) {
                 LinkResource(made.resource_id, view_id);
             }

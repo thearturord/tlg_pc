@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "native/native_image_desc.h"
+#include "native/native_view_table.h"
 
 #include <algorithm>
 #include <array>
@@ -141,6 +142,9 @@ constexpr u64 HeldOffset(NativeDevice::Kind kind) noexcept {
 
 Result Derive(u64 resource_id, u64 view_id, AmdGpu::Image& out) {
     using NativeDevice::Kind;
+    if (Core::ViewTable::IsSubresourceKey(view_id)) {
+        view_id = 0; // note 113: a texture subresource key, no view object (as before the key)
+    }
     NativeDevice::Object res, view;
     if (resource_id == 0 || !NativeDevice::Lookup(resource_id, res)) {
         return Result::UnknownObject;
@@ -242,6 +246,9 @@ Result Derive(u64 resource_id, u64 view_id, AmdGpu::Image& out) {
 }
 
 bool DeriveDesc(u64 resource_id, u64 view_id, NativeDesc::ImageDesc& out) {
+    if (Core::ViewTable::IsSubresourceKey(view_id)) {
+        view_id = 0; // note 113: a texture subresource key, no view object (as before the key)
+    }
     using NativeDevice::Kind;
     NativeDevice::Object res, view;
     if (resource_id == 0 || !NativeDevice::Lookup(resource_id, res)) {

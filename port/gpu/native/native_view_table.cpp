@@ -158,7 +158,9 @@ nlohmann::json Report() {
                     {"stages_would_be_served_by_the_table", c(StStagesWouldServe)}, {"stages_refused_same_image_twice", c(StStagesSameImageTwice)},
                     {"stages_refused_not_bindable", c(StStagesNotBindable)}, {"written_in_class", c(StInClass)}, {"same", c(StSame)},
                     {"STORAGE_TABLE_DIFFERENT_MUST_BE_0", c(StDifferent)}, {"no_entry_made", c(StNoEntry)}, {"stale_remade", c(StStale)},
-                    {"not_in_class", {{"no_view", c(StNoView)}, {"dynamic_or_unknown_texture", c(StDynamic)}, {"fallback_or_multi", c(StOtherUse)}, {"null", c(StNull)}}}};
+                    {"not_in_class", {{"no_view", c(StNoView)}, {"dynamic_or_unknown_texture", c(StDynamic)}, {"fallback_or_multi", c(StOtherUse)}, {"null", c(StNull)}}},
+                    {"copy_bindings_by_texture_subresource", {{"sampled", c(KeyedImages)}, {"written", c(StKeyed)}, {"entries_not_in_class_unknown", c(KeyedUnknown)},
+                                                                {"entries_not_in_class_dynamic", c(KeyedDynamic)}, {"entries_not_in_class_other", c(KeyedOther)}}}};
     j["real"] = {{"stages_bound_from_the_table", c(RealServed)}, {"image_bindings_bound_from_the_table", c(RealServedImages)}, {"stages_audited_by_the_old_path", c(RealAudited)},
                  {"stages_whose_image_checks_failed", c(RealCheckFailed)}};
     return j;

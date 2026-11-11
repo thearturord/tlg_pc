@@ -21,6 +21,22 @@ namespace Core::ViewTable {
 /// table (the use flags hold `is_written`).
 [[nodiscard]] u32 StorageMode() noexcept;
 
+/// Note 113: the engine's texture copy dispatches (`MakeUploadRecord`: CopyResource, Map uploads) bind a texture's subresource with no view object; their T# is a function
+/// of the texture's own T# (+0x70, fixed at creation for non-dynamic textures), the subresource and read or write. Such a binding is named by this key in place of a view id:
+/// bit 63 the mark, bit 62 written, bits 40..61 the subresource, bits 0..39 the texture id; 0 (no key) when a part does not fit. Made only while `StorageMode() != 0`.
+[[nodiscard]] constexpr u64 SubresourceKey(u64 resource_id, u32 subresource, bool written) noexcept {
+    if (resource_id == 0 || resource_id >= (1ull << 40) || subresource >= (1u << 22)) {
+        return 0;
+    }
+    return 1ull << 63 | u64(written) << 62 | u64(subresource) << 40 | resource_id;
+}
+[[nodiscard]] constexpr bool IsSubresourceKey(u64 view_id) noexcept {
+    return (view_id >> 63) != 0;
+}
+[[nodiscard]] constexpr u64 SubresourceKeyResource(u64 view_id) noexcept {
+    return view_id & ((1ull << 40) - 1);
+}
+
 struct Entry {
     u64 view_id{};
     u64 resource_id{};
@@ -100,6 +116,11 @@ enum Count : u32 {
     StDynamic,              ///< ... whose view's texture is dynamic or unknown
     StOtherUse,             ///< ... a mip fallback store or several bindings
     StNull,                 ///< ... a null or rejected image
+    KeyedImages,            ///< note 113: sampled bindings named by a texture subresource key (copy dispatches)
+    StKeyed,                ///< ... written bindings named by one
+    KeyedUnknown,           ///< ... entries of a key whose texture the device table does not know
+    KeyedDynamic,           ///< ... whose texture is dynamic (usage 2: its memory moves with every Map)
+    KeyedOther,             ///< ... whose object is not a texture
     Count_
 };
 void Note(Count c, u64 n = 1) noexcept;

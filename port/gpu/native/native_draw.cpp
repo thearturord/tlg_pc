@@ -41,6 +41,7 @@
 #include "native/native_timeline.h"
 #include "native/native_device.h"
 #include "native/native_image_desc.h"
+#include "native/native_view_table.h"
 #include "native/native_draw.h"
 #include "native/native_flight.h"
 #include "native/native_invariant.h"
@@ -3420,7 +3421,7 @@ void ResourceTextureDescriptor(u64 resource, u32 subresource, bool writable, std
 /// F5: with `source_resource` and `destination_resource` (the engine's resources behind the two T#) the record names its three
 /// bindings (source image, destination image, the extent constants), so the dispatch binds from the record and not from the flat user data.
 u64 MakeUploadRecord(u64 ctx, const std::array<u32, 8>& srv, const std::array<u32, 8>& uav, u32 width, u32 height, u64 caller, bool readback = false,
-                     u64 source_resource = 0, u64 destination_resource = 0, bool source_is_scratch = false) {
+                     u64 source_resource = 0, u64 destination_resource = 0, bool source_is_scratch = false, u32 source_sub = 0, u32 destination_sub = 0) {
     const VAddr image = image_base.load(std::memory_order_relaxed);
     if (image == 0 || width == 0 || height == 0) {
         return 0;
@@ -3500,11 +3501,15 @@ u64 MakeUploadRecord(u64 ctx, const std::array<u32, 8>& srv, const std::array<u3
         binding_record = &slot;
     }
     // a descriptor goes into the list at its flat offset (an offset from 16 on is the extended user data, as in the other record builders)
-    const auto name = [&](u32 kind, u64 object, u32 start, const u32* words, u32 dwords) {
+    const auto name = [&](u32 kind, u64 object, u32 start, const u32* words, u32 dwords, u32 subresource = 0, bool written = false) {
         if (!name_bindings) {
             return;
         }
         SetLastDescriptorObject(object);
+        if (kind == 2 && last_descriptor_object.view_id == 0 && Core::ViewTable::StorageMode() != 0) {
+            // note 113: no view object; the texture, the subresource and read or write name the T# exactly
+            last_descriptor_object.view_id = Core::ViewTable::SubresourceKey(last_descriptor_object.id, subresource, written);
+        }
         AddRecordBinding(5, kind, 0, start, words, dwords);
     };
     for (u32 i = 0; i < Rd<u8>(gnm, 3) && i < 40; ++i) {
@@ -3520,10 +3525,10 @@ u64 MakeUploadRecord(u64 ctx, const std::array<u32, 8>& srv, const std::array<u3
             ++slot.unsupported_inputs;
         } else if (type == 0) {
             put(start, srv.data(), 8);
-            name(2, source_resource, start, srv.data(), 8);
+            name(2, source_resource, start, srv.data(), 8, source_sub, false);
         } else if (type == 4) {
             put(start, uav.data(), 8);
-            name(2, destination_resource, start, uav.data(), 8);
+            name(2, destination_resource, start, uav.data(), 8, destination_sub, true);
         } else if (start + 4 > 16 || checks >= slot.checks.size()) {
             ++slot.unsupported_inputs;
         } else {
@@ -3569,7 +3574,7 @@ u64 MakeCopyResourceRecord(u64 ctx, u64 destination, u32 destination_sub, u64 so
     }
     const u32 mip_shift = (source_sub % source_mips) & 0x1f;
     const bool readback = Core::NativeResources::ResourceUsage(destination) == 3;
-    return MakeUploadRecord(ctx, srv, uav, Rd<u32>(source, 0x180) >> mip_shift, Rd<u32>(source, 0x184) >> mip_shift, caller, readback, source, destination);
+    return MakeUploadRecord(ctx, srv, uav, Rd<u32>(source, 0x180) >> mip_shift, Rd<u32>(source, 0x184) >> mip_shift, caller, readback, source, destination, false, source_sub, destination_sub);
 }
 
 /// Guest thread: the record of FUN_02485c00 with a source of several different dwords: the device's copy-with-wrap shader
