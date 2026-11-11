@@ -93,6 +93,10 @@ void NoteOwn(u32 what, u32 cls = 0) noexcept;
 /// Note 139 (`TLG_OWN_VERTEX_SLACK`: 0 off; 1 shadow; 2 real): a merged vertex range that starts inside a geometry id's buffer and ends at most 64 bytes past it (vertex fetch rounding, the
 /// placed blocks' slack) belongs to that buffer; bound from its own memory when the Vulkan buffer covers it (counted in class 11).
 [[nodiscard]] u32 OwnVertexSlackMode() noexcept;
+/// Note 145 (`TLG_OWN_INDEX_BY_ADDRESS`: 0 off, the old path; 1 shadow; 2 real): an index read of a draw that names no geometry id (small index lists in buffers on the caller's
+/// memory, which the registry and the in-order view do not hold) is bound from the kept copy of note 144: the guest bytes are compared at each draw and copied again, into a
+/// fresh slot, only when they changed.
+[[nodiscard]] u32 OwnIndexByAddressMode() noexcept;
 
 /// Note 119 (`TLG_F1_DIAG=1`, counters and the first examples in the log only; default off): why a shader buffer binding is not bound from own memory, by cause.
 [[nodiscard]] bool DiagOn() noexcept;

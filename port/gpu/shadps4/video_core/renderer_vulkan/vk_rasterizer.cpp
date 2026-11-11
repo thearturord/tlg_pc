@@ -2425,7 +2425,8 @@ struct ProgramConstsEntry {
 std::unordered_map<u64, ProgramConstsEntry> g_program_consts; // raster thread only: (address, size) -> the slot holding the bytes last seen
 u64 g_program_consts_used = 0;
 constexpr u64 ProgramConstsCapacity = 16ull << 20;
-enum ProgramConstsCount : u32 { PcAsked, PcServedSame, PcCopiedNew, PcCopiedChanged, PcFull, PcNoBuffer, PcSkippedFormatted, PcSkippedGpuWritten, PcSkippedRing, PcSkippedLarge, PcBound, PcCount };
+enum ProgramConstsCount : u32 { PcAsked, PcServedSame, PcCopiedNew, PcCopiedChanged, PcFull, PcNoBuffer, PcSkippedFormatted, PcSkippedGpuWritten, PcSkippedRing, PcSkippedLarge, PcBound,
+                                PcIndexAsked, PcIndexBound, PcCount };
 std::array<std::atomic<u64>, PcCount> c_program_consts{};
 void PublishPc() noexcept;
 void NotePc(ProgramConstsCount k) noexcept {
@@ -2437,7 +2438,8 @@ void NotePc(ProgramConstsCount k) noexcept {
 
 void PublishPc() noexcept {
 static constexpr const char* names[PcCount] = {"asked", "served_same_bytes", "copied_new_range", "copied_bytes_changed", "table_full", "no_mapped_buffer",
-                                                   "skipped_texel_over_image", "skipped_gpu_written", "skipped_frame_ring", "skipped_large", "bound_real"};
+                                                   "skipped_texel_over_image", "skipped_gpu_written", "skipped_frame_ring", "skipped_large", "bound_real",
+                                                   "index_reads_asked_note_145", "index_reads_bound_note_145"};
     nlohmann::json j;
     j["mode"] = ProgramConstsMode();
     for (u32 k = 0; k < PcCount; ++k) {
@@ -3850,6 +3852,32 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
                    return true;
                }()) {
         // (bound from own memory above)
+    } else if (index_buffer_size != 0 && [&] {
+                   // note 145 (TLG_OWN_INDEX_BY_ADDRESS): a draw that names no geometry id reads a small index list on the caller's memory: the kept copy of note 144
+                   const u32 by_address = Core::OwnMemoryCensus::OwnIndexByAddressMode();
+                   if (by_address == 0 || (geometry_plan != nullptr && geometry_plan->geometry_id_count != 0) || index_buffer_size > 65536) {
+                       return false;
+                   }
+                   const auto& idx_ring = VideoCore::UntrackedRing::Get();
+                   if ((idx_ring.Active() && index_address < idx_ring.End() && index_address + index_buffer_size > idx_ring.Start()) ||
+                       buffer_cache.IsRangeGpuWritten(index_address, index_buffer_size)) {
+                       return false;
+                   }
+                   NotePc(PcIndexAsked);
+                   u64 slot = 0;
+                   if (!ProgramConstsBind(index_address, index_buffer_size, slot) || by_address != 2) {
+                       return false; // (the shadow keeps the table and counts; the old path binds)
+                   }
+                   NotePc(PcIndexBound);
+                   index_buffer = program_consts_buffer->Handle();
+                   buffer_offset = slot;
+                   ipath = 1;
+                   ilap(3);
+                   ilap(4);
+                   ilap(5);
+                   return true; // (never written by the GPU: no barrier, no bound-list entry)
+               }()) {
+        // (bound from the kept copy above)
     } else if (index_buffer_size != 0) {
         auto* index_handle = GeometryHandle(index_address, index_buffer_size);
         ilap(3);

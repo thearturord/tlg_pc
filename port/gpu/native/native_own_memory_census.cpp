@@ -280,6 +280,14 @@ u32 OwnVertexSlackMode() noexcept {
     return mode;
 }
 
+u32 OwnIndexByAddressMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_OWN_INDEX_BY_ADDRESS");
+        return e == nullptr || e[0] == 0 ? 2u : e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u; // default 2 since 2026-11-11 (note 145); LEGACY(own_index_by_address): =0 copied into the stream ring at every draw, =1 shadow
+    }();
+    return mode;
+}
+
 u32 OwnExactEndMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_OWN_EXACT_END");
