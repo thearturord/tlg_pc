@@ -976,6 +976,135 @@ bool ScratchRead(u64 address, u64 size, u64& begin, u64& end) {
     return true;
 }
 
+// ---- note 138: writer 3's constant copies inside the compute command buffer ----
+u32 ComputeConstRingMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_COMPUTE_CONST_RING");
+        return e == nullptr || e[0] == 0 ? 2u : e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u; // default 2 since 2026-11-11 (note 138); LEGACY(compute_const_ring): =0 the writes announced into the batch, =1 shadow
+    }();
+    return mode;
+}
+namespace {
+std::mutex g_cmdc_mutex;
+std::map<u64, u64> g_cmdc; ///< registered allocation start -> end (a handful: one per compute context command buffer)
+std::atomic<u64> c_cmdc_ranges{0};
+enum CmdcCount : u32 { CcNotes, CcNoAllocation, CcRegistered, CcWrites, CcInside, CcOutside, CcDropped, CcReads, CcReadsOver, CcReadsApplied, CcCount };
+std::array<std::atomic<u64>, CcCount> c_cmdc{};
+std::atomic<u32> c_cmdc_logged{0};
+/// The registered allocation meeting [address, address + size), or g_cmdc.end() (under g_cmdc_mutex)
+std::map<u64, u64>::iterator CmdcMeetLocked(u64 address, u64 size) {
+    auto it = g_cmdc.upper_bound(address);
+    if (it != g_cmdc.begin()) {
+        auto prev = std::prev(it);
+        if (prev->second > address) {
+            return prev;
+        }
+    }
+    return it != g_cmdc.end() && it->first < address + size ? it : g_cmdc.end();
+}
+} // namespace
+
+void CmdConstNote(u64 address, u64 size) {
+    if (ComputeConstRingMode() == 0 || size == 0) {
+        return;
+    }
+    c_cmdc[CcNotes].fetch_add(1, std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{g_cmdc_mutex};
+        const auto it = CmdcMeetLocked(address, size);
+        if (it != g_cmdc.end() && it->first <= address && address + size <= it->second) {
+            return; // known
+        }
+    }
+    u64 begin = 0, alloc_size = 0;
+    {
+        std::scoped_lock lock{g_windows_mutex};
+        auto it = g_gpu_windows.upper_bound(address);
+        if (it != g_gpu_windows.begin()) {
+            --it;
+            if (address + size <= it->first + it->second.size) {
+                begin = it->first;
+                alloc_size = it->second.size;
+            }
+        }
+    }
+    if (begin == 0 || alloc_size == 0 || alloc_size > (64ull << 20)) {
+        c_cmdc[CcNoAllocation].fetch_add(1, std::memory_order_relaxed); // (the write stays announced: CmdConstSkip finds no range)
+        return;
+    }
+    std::scoped_lock lock{g_cmdc_mutex};
+    const u64 end = begin + alloc_size;
+    for (auto it = g_cmdc.lower_bound(begin); it != g_cmdc.end() && it->first < end;) {
+        it = g_cmdc.erase(it); // (an allocation made again over an older one)
+    }
+    if (auto prev = g_cmdc.lower_bound(begin); prev != g_cmdc.begin() && std::prev(prev)->second > begin) {
+        g_cmdc.erase(std::prev(prev));
+    }
+    g_cmdc.emplace(begin, end);
+    c_cmdc_ranges.store(g_cmdc.size(), std::memory_order_relaxed);
+    c_cmdc[CcRegistered].fetch_add(1, std::memory_order_relaxed);
+}
+
+bool CmdConstSkip(u64 address, u64 size) {
+    if (ComputeConstRingMode() == 0 || size == 0 || c_cmdc_ranges.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    c_cmdc[CcWrites].fetch_add(1, std::memory_order_relaxed);
+    bool inside = false;
+    {
+        std::scoped_lock lock{g_cmdc_mutex};
+        const auto it = CmdcMeetLocked(address, size);
+        inside = it != g_cmdc.end() && it->first <= address && address + size <= it->second;
+    }
+    c_cmdc[inside ? CcInside : CcOutside].fetch_add(1, std::memory_order_relaxed);
+    if (!inside || ComputeConstRingMode() != 2) {
+        return false;
+    }
+    c_cmdc[CcDropped].fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool CmdConstRead(u64 address, u64 size, u64& begin, u64& end) {
+    begin = end = 0;
+    if (ComputeConstRingMode() == 0 || size == 0 || c_cmdc_ranges.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    c_cmdc[CcReads].fetch_add(1, std::memory_order_relaxed);
+    std::scoped_lock lock{g_cmdc_mutex};
+    const auto it = CmdcMeetLocked(address, size);
+    if (it == g_cmdc.end()) {
+        return false;
+    }
+    c_cmdc[CcReadsOver].fetch_add(1, std::memory_order_relaxed);
+    if (c_cmdc_logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+        std::fprintf(stderr, "note 138: a buffer cache request %#llx+%#llx meets compute command memory %#llx..%#llx\n", static_cast<unsigned long long>(address),
+                     static_cast<unsigned long long>(size), static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(it->second));
+    }
+    if (ComputeConstRingMode() == 2) {
+        // the request's own part of the allocation is applied first: the reader takes guest memory as it is
+        begin = std::max(it->first, address);
+        end = std::min(it->second, address + size);
+        c_cmdc[CcReadsApplied].fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+nlohmann::json CmdConstReport() {
+    const auto c = [](CmdcCount k) { return c_cmdc[k].load(std::memory_order_relaxed); };
+    return {{"mode", ComputeConstRingMode()},
+            {"allocations_now", c_cmdc_ranges.load()},
+            {"hook_notes", c(CcNotes)},
+            {"hook_notes_in_no_allocation", c(CcNoAllocation)},
+            {"allocations_registered", c(CcRegistered)},
+            {"writer_3_writes_checked", c(CcWrites)},
+            {"inside_command_memory", c(CcInside)},
+            {"outside_announced", c(CcOutside)},
+            {"real_left_out_of_the_batch", c(CcDropped)},
+            {"buffer_requests_checked", c(CcReads)},
+            {"BUFFER_REQUEST_OVER_COMPUTE_RING_MUST_BE_0", c(CcReadsOver)},
+            {"real_reads_applied_first", c(CcReadsApplied)}};
+}
+
 nlohmann::json ScratchReport() {
     const auto c = [](ScratchCount k) { return c_scratch[k].load(std::memory_order_relaxed); };
     return {{"mode", InstanceScratchMode()},
@@ -3870,6 +3999,9 @@ nlohmann::json Report() {
     }
     if (InstanceScratchMode() != 0) {
         out["instance_scratch"] = ScratchReport(); // note 133
+    }
+    if (ComputeConstRingMode() != 0) {
+        out["compute_const_ring"] = CmdConstReport(); // note 138
     }
     if (RingWindowsOn()) {
         nlohmann::json w;

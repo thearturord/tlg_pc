@@ -502,6 +502,7 @@ void BufferCache::ApplyCpuWriteFull(VAddr address, u64 size, bool newer, u64 obj
                 if ((Core::N0::t_effect & (Core::N0::EffMemo | Core::N0::EffRecipe | Core::N0::EffResident | Core::N0::EffBufferParts)) != 0) {
                     Core::NativeUpdates::NoteRingLean(2);
                 }
+                Core::NativeUpdates::NoteRingSampleEffect(Core::N0::t_writer, Core::N0::t_effect); // note 138: the same, with image and unattributed effects, by writer
             }
         }
     } lean_sample{lean_sampled};
@@ -1421,6 +1422,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferBody(VAddr device_addr, u
         u64 scratch_begin = 0, scratch_end = 0;
         if (Core::NativeContent::ScratchRead(device_addr, size, scratch_begin, scratch_end) && scratch_end > scratch_begin) {
             ApplyCpuWrite(scratch_begin, scratch_end - scratch_begin, true, 0);
+        }
+    }
+    if (Core::NativeContent::ComputeConstRingMode() != 0) [[unlikely]] {
+        // note 138 guard (BUFFER_REQUEST_OVER_COMPUTE_RING_MUST_BE_0); real mode: the writes left out of the batch are applied before the request
+        u64 cmdc_begin = 0, cmdc_end = 0;
+        if (Core::NativeContent::CmdConstRead(device_addr, size, cmdc_begin, cmdc_end) && cmdc_end > cmdc_begin) {
+            ApplyCpuWrite(cmdc_begin, cmdc_end - cmdc_begin, true, 0);
         }
     }
     if (Core::HookOwned::Mode() != 0) [[unlikely]] {

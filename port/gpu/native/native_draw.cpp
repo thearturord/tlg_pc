@@ -8936,6 +8936,10 @@ u64 PS4_SYSV_ABI ComputeUpdateSubresource(u64 context, u64 resource, u64 subreso
                 static const bool cbuf_announce = [] { const char* e = std::getenv("TLG_CBUF_ANNOUNCE"); return e == nullptr || *e != '0'; }();
                 if (cbuf_announce && (bind & 0x4) != 0 && width != 0 && width < (1u << 20)) {
                     const u64 version = static_cast<u64>(Rd<u32>(resource, 0x60)) | (static_cast<u64>(Rd<u32>(resource, 0x64) & 0xfffu) << 32);
+                    if (Core::NativeContent::ComputeConstRingMode() != 0 && IsHeapPointer(context) && Rd<u8>(context, 0x2310) == 0 && !Core::NativeContent::InRing(version, width)) {
+                        // note 138: the copy went into the context's own command buffer (the NOP packet payload), not into a frame ring block: register its allocation
+                        Core::NativeContent::CmdConstNote(version, width);
+                    }
                     Core::NativeUpdates::NoteWriterRange(3, version, width, "UpdateSubresource constant buffer (compute)", true);
                 }
             }

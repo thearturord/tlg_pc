@@ -333,6 +333,7 @@ private:
     /// Design review 83: the own memory answer of the binding being compared with the old path (shadow or audit), null when none.
     const VideoCore::Buffer* own_compare{};
     u64 own_compare_offset{}, own_compare_size{};
+    u64 own_compare_address{}, own_compare_id{}; ///< note 138 diagnostic: the range class audit's binding
     u32 own_compare_slot{};
     u32 own_compare_cls{};
 
@@ -387,6 +388,8 @@ private:
     /// Note 117 shadow and audit: the old path's index or vertex answer against the own memory's
     void OwnGeometryCompare(const VideoCore::Buffer* own, VAddr address, vk::Buffer bound, u64 offset, u32 cls);
     const VideoCore::Buffer* own_index{}; ///< note 117: the index read's own memory, compared after the old path bound it
+    u32 own_index_cls{7};          ///< note 138: 7, or 10 when own_index came from the range rule
+    bool own_index_shadow{false};  ///< note 138: own_index came from the range rule in its shadow mode (compared, not bound)
     /// [0 read queries, 1 of them with no planned write, 2 SHADOW_NO_WRITES_BUT_BARRIER_MUST_BE_0, 3 real: asked (writes pending), 4 real: skipped, 5 real: sampled, 6 SAMPLED_BARRIER_MUST_BE_0]
     std::array<std::atomic<u64>, 8> barrier_guard{};
     /// Texture census (TLG_TEXTURE_CENSUS=1, design review 58), [graphics, compute][class][calls, ns, images]: classes 0 no image, 1 more than 16 images, 2 memo off, 3 a written image,

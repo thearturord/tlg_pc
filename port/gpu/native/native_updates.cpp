@@ -788,6 +788,36 @@ bool RingOutOn() noexcept {
     return on;
 }
 std::atomic<u64> c_ring_out[2]{}; // 0 kept out of the batch, 1 sent to the batch as the sampled full check
+std::atomic<u64> c_skin_out[3]{}; // note 138: writer 1 ring writes: 0 shadow (applied in full), 1 real kept out, 2 real sampled
+std::atomic<u64> c_sample_eff[2][4]{}; // note 138: sampled full applies of ring candidates [writer 1, other][applies, buffer/memo/recipe/resident effect, image effect, unattributed effect]
+u32 Mode012(const char* name) noexcept {
+    const char* e = std::getenv(name);
+    return e == nullptr || e[0] == 0 ? 2u : e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u; // unset = 2
+}
+
+u32 SkinRingOutMode() noexcept {
+    static const u32 mode = Mode012("TLG_SKIN_RING_OUT"); // default 2 since 2026-11-11 (note 138); LEGACY(skin_ring_out): =0 the skinning ring writes applied in the batch, =1 shadow
+    return mode;
+}
+
+u32 RingOutUnsampledMode() noexcept {
+    static const u32 mode = Mode012("TLG_RING_OUT_UNSAMPLED"); // default 2 since 2026-11-11 (note 138); LEGACY(ring_out_unsampled): =0 one ring write in 64 still applied in the batch, =1 shadow
+    return mode;
+}
+
+void NoteRingSampleEffect(u32 writer, u32 effects) noexcept {
+    auto& c = c_sample_eff[(writer & 7) == 1 ? 0 : 1];
+    c[0].fetch_add(1, std::memory_order_relaxed);
+    if ((effects & (N0::EffMemo | N0::EffRecipe | N0::EffResident | N0::EffBufferParts)) != 0) {
+        c[1].fetch_add(1, std::memory_order_relaxed);
+    }
+    if ((effects & N0::EffImage) != 0) {
+        c[2].fetch_add(1, std::memory_order_relaxed);
+    }
+    if ((effects & N0::EffUnattributed) != 0) {
+        c[3].fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
 std::atomic<u64> c_ring_lean[4]{};
 void NoteRingLean(u32 what) noexcept {
@@ -1429,14 +1459,25 @@ void NoteWriterRangeOf(u32 writer, u64 address, u64 size, u64 thread, u64 stamp,
     }
     bool ring_out = false;
     const bool ring_candidate = B2NativeMode() != 0 && (N0::On() || RingLeanApplyOn() || RingOutOn()) && NativeContent::InRing(address, size) &&
-                                ((writer & 7) == 3 || ((writer & 7) == 0 && !t_announce_texture)); // F1 1c
+                                ((writer & 7) == 3 || ((writer & 7) == 0 && !t_announce_texture) || ((writer & 7) == 1 && SkinRingOutMode() != 0)); // F1 1c; writer 1: note 138
     if (ring_candidate && RingOutOn()) {
         static thread_local u32 out_count = 0;
-        ring_out = (++out_count & 63) != 0;
-        c_ring_out[ring_out ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+        if ((writer & 7) == 1 && SkinRingOutMode() != 2) {
+            ring_out = false; // note 138 shadow: every skinning write in the ring is applied in full and its effects counted
+            c_skin_out[0].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            ring_out = RingOutUnsampledMode() == 2 || (++out_count & 63) != 0; // note 138 real: no sampled check any more
+            c_ring_out[ring_out ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+            if ((writer & 7) == 1) {
+                c_skin_out[ring_out ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     }
     if ((writer & 7) == 7 && NativeContent::ScratchSkip(address, size)) {
         goto announced; // note 133, real: the uploader's scratch has no GPU reader; a buffer request over it applies the range first (ScratchRead)
+    }
+    if ((writer & 7) == 3 && !ring_candidate && NativeContent::CmdConstSkip(address, size)) {
+        goto announced; // note 138, real: constants inside the compute command buffer; the front reads them at its parse, as it reads the command bytes (CmdConstRead guards requests)
     }
     if (B2NativeMode() != 0 && !ring_out) {
         // note 90 (TLG_HOOK_OWNED): the light and slot buffers' membership, decided here in game order; the shadow announces everything and carries the mark
@@ -1468,7 +1509,13 @@ announced:
 nlohmann::json Report() {
     nlohmann::json j = nlohmann::json::object();
     j["enabled"] = enabled.load();
-    j["ring_out_of_batch_real"] = {{"on", RingOutOn()}, {"kept_out", c_ring_out[0].load()}, {"sent_as_sampled_full_check", c_ring_out[1].load()}};
+    j["ring_out_of_batch_real"] = {{"on", RingOutOn()}, {"kept_out", c_ring_out[0].load()}, {"sent_as_sampled_full_check", c_ring_out[1].load()}, {"unsampled_mode", RingOutUnsampledMode()}};
+    j["note_138_ring_samples"] = {{"skin_ring_out_mode", SkinRingOutMode()},
+                                  {"skin_writes_shadow_applied_in_full", c_skin_out[0].load()}, {"skin_writes_real_kept_out", c_skin_out[1].load()}, {"skin_writes_real_sampled", c_skin_out[2].load()},
+                                  {"skin_sampled_applies", c_sample_eff[0][0].load()}, {"SKIN_SAMPLED_BUFFER_MEMO_RECIPE_RESIDENT_EFFECT_MUST_BE_0", c_sample_eff[0][1].load()},
+                                  {"skin_sampled_images_dirtied_old_laps", c_sample_eff[0][2].load()}, {"skin_sampled_unattributed_marks", c_sample_eff[0][3].load()},
+                                  {"ring_sampled_applies", c_sample_eff[1][0].load()}, {"RING_SAMPLED_BUFFER_MEMO_RECIPE_RESIDENT_EFFECT_MUST_BE_0", c_sample_eff[1][1].load()},
+                                  {"ring_sampled_images_dirtied_old_laps", c_sample_eff[1][2].load()}, {"ring_sampled_unattributed_marks", c_sample_eff[1][3].load()}};
     j["ring_lean_apply"] = {{"on", RingLeanApplyOn()}, {"applied_lean", c_ring_lean[0].load()}, {"sampled_full", c_ring_lean[1].load()},
                             {"SAMPLED_WITH_BUFFER_MEMO_RECIPE_OR_RESIDENT_EFFECT_MUST_BE_0", c_ring_lean[2].load()}, {"rows_not_learned_in_ring", c_ring_lean[3].load()}};
     for (u32 w = 0; w < 8; ++w) {

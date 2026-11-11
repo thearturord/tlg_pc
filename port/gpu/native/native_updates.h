@@ -49,6 +49,15 @@ void NoteWriterRange(u32 writer, u64 address, u64 size, const char* site = nullp
 [[nodiscard]] bool RingOutOn() noexcept;
 /// Counters of the lean apply: 0 applied lean, 1 applied in full as the sampled check, 2 sampled with a buffer, memo, recipe or resident effect (MUST_BE_0), 3 rows not learned in the ring.
 void NoteRingLean(u32 what) noexcept;
+/// Note 138 (`TLG_SKIN_RING_OUT`: 0 off, the old path; 1 shadow; 2 real): with the skin ring on, the skinning matrices (writer 1) are written into a fresh frame-ring block, so their
+/// announcement is a ring write like writers 3 and 0: the hook ring holds the bytes (filled when the pass returns) and ring reads never ask the batch. Shadow: every such write is
+/// tagged a ring candidate and applied in full with its effects counted (`NoteRingSampleEffect`). Real: they leave the batch as the other ring writes do.
+[[nodiscard]] u32 SkinRingOutMode() noexcept;
+/// Note 138 (`TLG_RING_OUT_UNSAMPLED`: 0 off; 1 shadow; 2 real): the one ring write in 64 that `TLG_RING_OUT` still sends through the batch as a check stops being sent. Shadow: the
+/// sampled applies also count image and unattributed effects (`NoteRingSampleEffect`), which the check of section 26 did not report.
+[[nodiscard]] u32 RingOutUnsampledMode() noexcept;
+/// The effects (N0::Effect bits) of one sampled full apply of a ring candidate; `writer` its tag.
+void NoteRingSampleEffect(u32 writer, u32 effects) noexcept;
 /// N5h (`TLG_RING_SUPERSEDE=1`): a write that gives memory new contents supersedes what the GPU wrote there before. The announcer is told (`fn`) for: the creation of a
 /// buffer, the initialization of a texture (any thread) and the unmap of a buffer on the render thread. Safe because anything the GPU writes into that memory afterwards is
 /// issued after the announcement; marks that older GPU writes add later are only too many.

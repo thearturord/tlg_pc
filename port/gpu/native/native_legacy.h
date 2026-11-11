@@ -47,6 +47,13 @@
 ///   TLG_RECORDING_RING=0       the BeginRecording buffers written in place instead of renamed onto frame-ring blocks
 ///   TLG_FREE_HOLD=0            engine frees run at once instead of after the raster thread is done (TLG_FREE_HOLD_FRAMES default 3, =0 no frame rule)
 ///   TLG_ORDERED_VIEW=0         the buffer index without the ordered create and delete view
+///
+/// F1's last writers and leftover bindings, default on since 2026-11-11 (note 138):
+///   TLG_COMPUTE_CONST_RING=0   writer 3's constants inside the compute command buffer announced and applied on the raster thread
+///   TLG_SKIN_RING_OUT=0        writer 1's skinning matrices (frame-ring blocks) announced and applied on the raster thread
+///   TLG_RING_OUT_UNSAMPLED=0   one ring write in 64 still applied in the batch as a check
+///   TLG_OWN_GEOMETRY_RANGE=0   index reads that run past their buffer's end through ObtainBuffer
+///   TLG_OWN_VERTEX_SPLIT=0     merged vertex ranges through ObtainBuffer instead of each member buffer's own memory
 namespace Core::Legacy {
 
 /// TLG_LEGACY_ENGINE_ROWS=1: the rows for shader buffer bindings of engine buffers (see above).

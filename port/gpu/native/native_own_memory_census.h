@@ -82,6 +82,9 @@ void NoteOwn(u32 what, u32 cls = 0) noexcept;
 /// Notes 117 to 119 (`TLG_OWN_GEOMETRY`: 2 real by default since the owner's play, note 119; 1 shadow; 0 the old path): index and vertex reads of an engine buffer the draw names by id (the record's geometry ids) are bound
 /// from that buffer's own memory, on the terms of its class (immutable: synchronized; default and dynamic: no CPU bytes waiting).
 [[nodiscard]] u32 OwnGeometryMode() noexcept;
+/// Note 138 (`TLG_OWN_GEOMETRY_RANGE`: 0 off, the old path; 1 shadow; 2 real): an index read the draw's geometry ids do not hold whole (it runs past the named buffer's end) is bound from the
+/// placed block that holds the whole range while no CPU bytes wait in it: the range class rule of notes 120 and 123 (counted as class 10, `own_index_range`).
+[[nodiscard]] u32 OwnGeometryRangeMode() noexcept;
 
 /// Note 119 (`TLG_F1_DIAG=1`, counters and the first examples in the log only; default off): why a shader buffer binding is not bound from own memory, by cause.
 [[nodiscard]] bool DiagOn() noexcept;

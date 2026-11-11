@@ -963,6 +963,28 @@ const VideoCore::Buffer* Rasterizer::OwnGeometry(VAddr address, u64 size, u32 cl
         }
     }
     if (h == nullptr) {
+        if (cls == 7 && OM::OwnGeometryRangeMode() != 0) {
+            // note 138: an index read no geometry id holds whole (past the named buffer's end): the placed block holding the whole range, while nothing waits in it (notes 120, 123)
+            OM::NoteOwn(OM::OwnAsked, 10);
+            OM::NoteOwn(OM::OwnImmutable, 10);
+            const auto& index_ring = VideoCore::UntrackedRing::Get();
+            if (Core::NativeContent::InRing(address, size) || (index_ring.Active() && address < index_ring.End() && address + size > index_ring.Start())) {
+                OM::NoteOwn(OM::OwnOldStream, 10); // (a range that meets the frame ring is the hook ring's; the block's ring part is not current)
+                return nullptr;
+            }
+            const auto* holder = buffer_cache.PlacedWhole(address, size);
+            if (holder == nullptr) {
+                OM::NoteOwn(OM::OwnNoOwn, 10);
+                return nullptr;
+            }
+            if (buffer_cache.IsRegionCpuModified(address, size)) {
+                OM::NoteOwn(OM::OwnNotSynced, 10);
+                return nullptr;
+            }
+            own_index_cls = 10;
+            own_index_shadow = OM::OwnGeometryRangeMode() == 1;
+            return holder;
+        }
         return nullptr;
     }
     OM::NoteOwn(OM::OwnImmutable, cls);
@@ -3843,13 +3865,15 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
                    if (geo_mode == 0) {
                        return false;
                    }
+                   own_index_cls = 7;
+                   own_index_shadow = false;
                    own_index = OwnGeometry(index_address, index_buffer_size, 7);
                    static thread_local u32 index_tick = 0;
-                   if (own_index == nullptr || geo_mode != 2 || (++index_tick & 63u) == 0) {
+                   if (own_index == nullptr || geo_mode != 2 || own_index_shadow || (++index_tick & 63u) == 0) {
                        VideoCore::BufferCache::UploadBytesReset();
                        return false; // the old path answers (compared below)
                    }
-                   Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnBound, 7); Core::NativeContent::SilentOwnBind(0, index_address, index_buffer_size, (!own_index->mapped_data.empty() ? own_index->mapped_data.data() + own_index->Offset(index_address) : nullptr), Core::NativeContent::SilentCensusActive() ? (buffer_cache.IsRegionCpuModified(index_address, index_buffer_size) ? 1 : 0) : -1); // note 126 census
+                   Core::OwnMemoryCensus::NoteOwn(Core::OwnMemoryCensus::OwnBound, own_index_cls); Core::NativeContent::SilentOwnBind(0, index_address, index_buffer_size, (!own_index->mapped_data.empty() ? own_index->mapped_data.data() + own_index->Offset(index_address) : nullptr), Core::NativeContent::SilentCensusActive() ? (buffer_cache.IsRegionCpuModified(index_address, index_buffer_size) ? 1 : 0) : -1); // note 126 census
                    const u64 offset = own_index->Offset(index_address);
                    const_cast<VideoCore::Buffer*>(own_index)->NoteResolveUse();
                    needs_barrier |= BufferBarrierQuery(own_index, offset, index_buffer_size, false);
@@ -3983,7 +4007,7 @@ void Rasterizer::BindIndexBufferLegacy(u32 index_offset, bool is_indirect) {
     }
 
     if (own_index != nullptr) [[unlikely]] {
-        OwnGeometryCompare(own_index, index_address, index_buffer, buffer_offset, 7);
+        OwnGeometryCompare(own_index, index_address, index_buffer, buffer_offset, own_index_cls);
         own_index = nullptr;
     }
     if (verify_slots_on) {
@@ -4928,8 +4952,11 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                         const VAddr address = r->ahead_address;
                         const u64 size = r->ahead_size;
                         // note 120: a range in the frame ring is the hook ring's (F1 class 1): the ring's pseudo block over the same memory is not its current copy (the shadow f1s2 found
-                        // 2,230 such answers different)
-                        const bool in_ring = Core::NativeContent::InRing(address, size);
+                        // 2,230 such answers different). Note 138: a range that only meets the ring (a 4 MB window starting in it and running past its end) is the ring's too: the
+                        // block's ring part is not kept current (the old path uploads it at every use); before note 138 the skinning writes' batch marks refused these by chance
+                        const auto& range_ring = VideoCore::UntrackedRing::Get();
+                        const bool in_ring = Core::NativeContent::InRing(address, size) ||
+                                             (range_ring.Active() && address < range_ring.End() && address + size > range_ring.Start());
                         const auto* holder = in_ring ? nullptr : buffer_cache.PlacedWhole(address, size);
                         if (in_ring) {
                             OM::NoteOwn(OM::OwnOldStream, xcls);
@@ -4972,6 +4999,8 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                             own_compare = holder;
                             own_compare_offset = holder->Offset(address);
                             own_compare_size = size;
+                            own_compare_address = address;
+                            own_compare_id = r->ahead_id;
                             own_compare_slot = binding.buffer;
                             own_compare_cls = xcls;
                             VideoCore::BufferCache::UploadBytesReset();
@@ -5775,6 +5804,15 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                     }
                 } else if (VideoCore::BufferCache::UploadBytes() != 0) {
                     OM::NoteOwn(OM::OwnOldPathWork, cls);
+                    static std::atomic<u32> work_logged{0};
+                    if ((cls == 5 || cls == 6) && work_logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+                        // note 138 diagnostic: what the old path uploaded for a range-class binding own memory called current
+                        const auto& ring = VideoCore::UntrackedRing::Get();
+                        LOG_ERROR(Render_Vulkan, "note 138: range class audit: old path uploaded {:#x} bytes for {:#x}+{:#x} (id {}, stage {:#x}); block {:#x}..{:#x} (+{:#x}); ring {:#x}..{:#x}; cpu modified now {}",
+                                  VideoCore::BufferCache::UploadBytes(), own_compare_address, own_compare_size, own_compare_id, stage.pgm_hash, own_compare->CpuAddr(),
+                                  own_compare->CpuAddr() + own_compare->SizeBytes(), own_compare_offset, ring.Active() ? ring.Start() : 0, ring.Active() ? ring.End() : 0,
+                                  buffer_cache.IsRegionCpuModified(own_compare_address, own_compare_size));
+                    }
                 }
             }
             own_compare = nullptr;

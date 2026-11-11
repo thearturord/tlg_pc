@@ -139,6 +139,16 @@ void ScratchNote(u64 first, u64 second, u64 bytes);
 [[nodiscard]] bool ScratchSkip(u64 address, u64 size);
 /// Raster side: true when [address, address + size) meets a scratch range; `begin`/`end` get the scratch part to apply (real mode only, else equal)
 [[nodiscard]] bool ScratchRead(u64 address, u64 size, u64& begin, u64& end);
+/// Note 138 (`TLG_COMPUTE_CONST_RING`: 0 off, the old path; 1 shadow; 2 real): JsComputeContext::UpdateSubresource (Ghidra 0x24721a0) writes a constant buffer's new version either into a
+/// frame ring block or, when the context's flag `+0x2310` is 0, into its own compute command buffer as the payload of a NOP packet (`0xc0001000 | length`, marker `0x68754000`). The
+/// front reads those bytes while it parses that submission, before the submission ends, and the engine reuses command buffer memory only after the submission ends: the same rule
+/// the command bytes themselves live by (they are never announced). The hook registers the engine allocation that holds the write (`CmdConstNote`). Real mode: writer 3 writes
+/// inside a registered allocation leave the batch (`CmdConstSkip` true). A buffer cache request that meets one is counted (`BUFFER_REQUEST_OVER_COMPUTE_RING_MUST_BE_0`); in real
+/// mode `CmdConstRead` gives the caller the range to apply first, so such a reader still takes the bytes as they are then.
+[[nodiscard]] u32 ComputeConstRingMode() noexcept;
+void CmdConstNote(u64 address, u64 size);
+[[nodiscard]] bool CmdConstSkip(u64 address, u64 size);
+[[nodiscard]] bool CmdConstRead(u64 address, u64 size, u64& begin, u64& end);
 void W37Write(u32 writer, u64 address, u64 size);
 void W37Read(u32 kind, u64 address, u64 size);
 /// [address, address + size) lies inside one allocation the engine made.
