@@ -56,6 +56,7 @@
 ///   TLG_TEXTURE_AT_CREATION=0  a texture enters the engine object table only at its first view (notes 114 to 116, 147)
 ///   TLG_STORAGE_TABLE=0        storage (written) images found by their T# words at every bind, outside the view table (notes 111, 112, 147)
 ///   TLG_HOOK_DIFF=0            every draw record looks its fixed state up in the shared cache under its lock (notes 153, 157)
+///   TLG_DISPATCH_EXECUTOR=0    every buffer binding of a dispatch through the old body (BindBufferLegacy) instead of the executor's native sources (note 159)
 namespace Core::Legacy {
 
 

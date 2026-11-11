@@ -523,6 +523,35 @@ private:
     void BindBuffersBody(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                          Shader::PushData& push_data);
     void BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backend::Bindings& binding, Shader::PushData& push_data);
+    /// Note 159: the old body for one buffer binding (LEGACY(dispatch_executor): every binding with `TLG_DISPATCH_EXECUTOR=0`, the executor's refusals otherwise).
+    void BindBufferLegacy(const Shader::Info& stage, u32 buffer_index, Shader::Backend::Bindings& binding, Shader::PushData& push_data, u64 alignment, u32 census_base);
+    /// Note 159: the end of every buffer binding, the old body's and the executor's: the indexed row slot or the descriptor write, then the next slot.
+    void EmitBufferWrite(const Shader::Info& stage, u32 buffer_index, Shader::Backend::Bindings& binding, u32 census_base);
+    /// Note 159: the ring copy a buffer binding is bound from (null: none), the old body's choice; `count` counts the precision census (once per binding).
+    const RingBinding* BufferRing(const Shader::Info& stage, u32 buffer_index, bool count);
+    /// Note 159 (plan R2.10, `TLG_DISPATCH_EXECUTOR`): one buffer binding's answer from the executor, decided with the old body's tests in its order.
+    struct ExecAnswer {
+        u32 kind{};    ///< Core::DispatchExecutor::ExecKind (ExRefuse: the old body binds it)
+        u32 refusal{}; ///< Core::DispatchExecutor::Refusal
+        const VideoCore::Buffer* buffer{};
+        vk::Buffer handle{};
+        u64 offset{}; ///< in `buffer` / `handle`, before the alignment
+        u64 size{};
+        VAddr address{};
+        u64 id{};
+        Core::NativeResources::ImmutableBuffer* h{};
+    };
+    u32 exec_dispatch_mode{}; ///< note 159: 0 not followed, 1 compared (shadow, or the audited dispatch), 2 real
+    u32 exec_bindings{}, exec_refused{};
+    [[nodiscard]] u32 ExecutorDispatchMode(const Pipeline* pipeline);
+    /// The decision; changes nothing (the lazy own resolution and the hook ring's sampled checks are idempotent). False: refused.
+    bool ExecutorDecide(const Shader::Info& stage, u32 buffer_index, ExecAnswer& a);
+    /// The old body's side effects for the decided source. False: refused at the commit (nothing was changed).
+    bool ExecutorCommit(const Shader::Info& stage, u32 buffer_index, ExecAnswer& a, Shader::Backend::Bindings& binding, Shader::PushData& push_data, u64 alignment, u32 census_base);
+    /// True: the binding is bound (by the executor, or by the old body in a compared dispatch); false: the caller runs the old body.
+    bool ExecutorBindBuffer(const Shader::Info& stage, u32 buffer_index, Shader::Backend::Bindings& binding, Shader::PushData& push_data, u64 alignment, u32 census_base);
+    void ExecutorCompare(const Shader::Info& stage, u32 buffer_index, const ExecAnswer& a, bool native, u32 slot, size_t infos_before, size_t bound_before, u64 alignment,
+                         bool audited, const Shader::PushData& push_data);
     /// Plan S step P1: what the resolve half decided for one buffer binding (the record half turns it into descriptor writes).
     struct BufferBind {
         enum Kind : u8 { Info, Skip, FlatCopy, ClipCopy, LdsMap };

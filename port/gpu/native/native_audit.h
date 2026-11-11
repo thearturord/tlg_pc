@@ -19,10 +19,17 @@ inline const bool g_on = [] {
     return g_on;
 }
 
+/// Note 159: the audits that fired on this thread (the dispatch executor's shadow leaves out a binding the old body audited).
+inline thread_local u32 t_fired = 0;
+
 /// Advances the site's counter; true for the one call in 64 that is audited (never while `TLG_AUDITS=0`).
 template <typename T>
 [[nodiscard]] inline bool Due(T& tick) noexcept {
-    return (++tick & 63u) == 0 && g_on;
+    if ((++tick & 63u) == 0 && g_on) {
+        ++t_fired;
+        return true;
+    }
+    return false;
 }
 
 } // namespace Core::Audit
