@@ -4791,7 +4791,23 @@ void Rasterizer::BindBuffersBodyLegacy(const Shader::Info& stage, Shader::Backen
                             }
                         }
                         static thread_local u32 place_tick = 0;
-                        if (own == nullptr && eff != 0 && OM::OwnPlaceMode() == 2 && !imm && !large && !desc.is_written && r->ahead_size <= buffer_cache.StreamThreshold() &&
+                        if (own == nullptr && eff != 0 && OM::OwnPlaceMode() == 2 && !desc.is_written && OM::DiagOn()) [[unlikely]] {
+                            // note 123 diagnostic: which placement term refuses this read
+                            const u64 bytes = h->end - h->begin;
+                            const char* why = large ? "large" : r->ahead_size > buffer_cache.StreamThreshold() ? "binding over the stream threshold"
+                                              : bytes > Core::NativeResources::ResidentCap() ? "buffer over the cap"
+                                              : buffer_cache.PlacedMeetsRange(h->begin, bytes) ? "a placed block meets it"
+                                              : buffer_cache.IsRegionGpuModified(h->begin, bytes) ? "GPU-modified" : nullptr;
+                            if (why != nullptr && r->ahead_size <= buffer_cache.StreamThreshold()) {
+                                static std::atomic<u32> logged{0};
+                                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                                    LOG_WARNING(Render_Vulkan, "F1 diag placement refused ({}): id {} usage {} buffer {:#x}..{:#x} binding {:#x}+{:#x}", why, h->id, h->usage, h->begin, h->end,
+                                                r->ahead_address, r->ahead_size);
+                                }
+                            }
+                        }
+                        // (an immutable buffer too: after the placement its own pointer is found by the lazy resolution and served while its dirty set holds nothing, note 121)
+                        if (own == nullptr && eff != 0 && OM::OwnPlaceMode() == 2 && !large && !desc.is_written && r->ahead_size <= buffer_cache.StreamThreshold() &&
                             h->end - h->begin <= Core::NativeResources::ResidentCap() && !buffer_cache.PlacedMeetsRange(h->begin, h->end - h->begin) &&
                             !buffer_cache.IsRegionGpuModified(h->begin, h->end - h->begin) && (++place_tick & 63u) != 0) {
                             // note 121 real: the read the old path would copy into the stream ring; the buffer is placed whole from guest memory instead (the same bytes) and bound from it
