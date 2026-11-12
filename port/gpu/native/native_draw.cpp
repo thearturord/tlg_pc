@@ -1817,7 +1817,10 @@ std::array<std::atomic<u64>, 16> g_hook_plan_counts{};
 u32 HookPlanModeImpl() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_HOOK_PLAN");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // notes 183, 185: 0 off, 1 shadow, 2 real
+        if (e == nullptr || e[0] == 0) {
+            return 2u; // note 185: default 2 since 2026-11-12 (owner play p13play); LEGACY(hook_plan): =0 the front plans every draw, =1 shadow
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
@@ -4980,7 +4983,10 @@ std::atomic<u32> g_compact_logged{0};
 u32 CompactTakeMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_COMPACT_TAKE");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // note 186: 0 off, 1 shadow, 2 real
+        if (e == nullptr || e[0] == 0) {
+            return 2u; // note 186: default 2 since 2026-11-12 (owner play p13play); LEGACY(compact_take): =0 the full record take, =1 shadow
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
