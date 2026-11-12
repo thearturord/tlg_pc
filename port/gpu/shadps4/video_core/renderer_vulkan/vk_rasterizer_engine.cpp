@@ -320,9 +320,37 @@ void PublishDrawInputs(u64 key, const DrawInputs& value) {
     }
 }
 
+namespace {
+Rasterizer* g_hook_raster = nullptr; // note 185 (set once, before the planner is published)
+void* HookPlannerEntry(const Core::NativeDraw::ExecDraw& draw, std::span<const u32, 16> vs, std::span<const u32, 16> ps, u32 draw_class, u64* epoch) {
+    return g_hook_raster->PlanAtHook(draw, vs, ps, draw_class, epoch);
+}
+void HookRecyclerEntry(void* plan) {
+    g_hook_raster->RecycleDrawPlan(Core::DrawPlanPtr{static_cast<DrawPlan*>(plan)});
+}
+std::atomic<u32> g_hook_logged{0};
+std::mutex g_hook_samples_mutex;
+std::vector<std::string> g_hook_samples; ///< note 185 shadow: the first differences, in the hook ring report
+void HookSample(std::string text) {
+    std::scoped_lock lk{g_hook_samples_mutex};
+    if (g_hook_samples.size() < 40) {
+        g_hook_samples.push_back(std::move(text));
+    }
+}
+} // namespace
+
+nlohmann::json HookPlanSamplesImpl() { // note 185: for the hook ring report
+    std::scoped_lock lk{g_hook_samples_mutex};
+    return g_hook_samples;
+}
+
 std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64 exec_key, u64 inputs_key,
                                                    std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data,
                                                    const Core::NativeDraw::ExecDraw& draw, u32 index_count, u32 draw_class) {
+    if (Core::NativeDraw::HookPlanMode() != 0 && g_hook_raster == nullptr) [[unlikely]] {
+        g_hook_raster = this; // note 185: the hook plans from here on
+        Core::NativeDraw::SetHookPlanner(&HookPlannerEntry, &HookRecyclerEntry);
+    }
     // note 184 real: the inputs and the plan come from the published read-only copies; the front's caches only when the keys are not published (yet)
     const u32 published = PipelineCache::PublishedPlanMode();
     const DrawInputs* inputs_src = published == 2 ? FindInputs(inputs_key) : nullptr;
@@ -375,11 +403,10 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
         RecyclePlan(std::move(plan));
         return nullptr;
     }
-    Core::NativeDraw::Live().stage_key_typed_hits.fetch_add(1, std::memory_order_relaxed);
     if (published == 1) [[unlikely]] {
         PublishedPlanShadow(*plan, native, exec_key, inputs_key, *inputs_src, vertex_user_data, pixel_user_data, draw, index_count, skip_flat); // note 184
     }
-    if (Core::NativeDraw::HookPlanMode() != 0) [[unlikely]] {
+    if (Core::NativeDraw::HookPlanMode() == 1) [[unlikely]] {
         // note 183 shadow: the pipeline the hook found for this record's keys against the front's plan; then this plan is published for later records
         if (draw.hook_plan_state == 1) {
             Core::NativeDraw::NoteHookPlan(draw.hook_pipeline == reinterpret_cast<u64>(plan->pipeline) ? 2 : 3);
@@ -388,6 +415,13 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
         }
         Core::NativeDraw::PublishHookPlan(exec_key, reinterpret_cast<u64>(&native), reinterpret_cast<u64>(plan->pipeline));
     }
+    FinishExecPlan(*plan, draw, binder_mode);
+    return plan;
+}
+
+void Rasterizer::FinishExecPlan(DrawPlan& plan_ref, const Core::NativeDraw::ExecDraw& draw, u32 binder_mode) {
+    DrawPlan* plan = &plan_ref;
+    Core::NativeDraw::Live().stage_key_typed_hits.fetch_add(1, std::memory_order_relaxed);
     if (Core::NativeDraw::SkipUserDataMode() != 0) [[unlikely]] {
         // note 179: a stage the record covers: its shader object is published to the hook; a stage the hook skipped (or would skip) that is not covered here is a guard
         for (u32 st = 0; st < 2; ++st) {
@@ -429,7 +463,181 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
         }
     }
     Core::NativeDraw::Live().fixed_native.fetch_add(1, std::memory_order_relaxed);
+}
+
+
+DrawPlan* Rasterizer::PlanAtHook(const Core::NativeDraw::ExecDraw& draw, std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data, u32 draw_class,
+                                 u64* epoch) {
+    // the same steps as PlanExecDraw, from what another thread may read: the published inputs and exec entries (note 184), the record, the plan pool
+    const DrawInputs* inputs_src = FindInputs(draw.inputs_key);
+    if (inputs_src == nullptr) {
+        return nullptr;
+    }
+    const FixedState& native = *draw.fixed;
+    std::unique_ptr<DrawPlan> plan = plan_pool.TakeDraw();
+    plan->executed = true;
+    plan->native_seq = draw.seq;
+    plan->binding_count = draw.binding_count;
+    plan->bindings_complete = draw.bindings_complete;
+    for (u32 i = 0; i < draw.binding_count; ++i) {
+        plan->bindings[i] = draw.bindings[i];
+    }
+    plan->op_class = 0xff;
+    plan->depth_copy = plan->stencil_copy = false;
+    if (Core::HookDiff::FixedPointerReal()) {
+        plan->fixed = &native;
+    } else {
+        plan->fixed_copy = native; // LEGACY(plan_pointers)
+        plan->fixed = &plan->fixed_copy;
+    }
+    plan->fixed_source = &native;
+    plan->inputs = *inputs_src;
+    plan->hook_inputs = inputs_src;
+    Core::NativeDrawInputs::ApplyDrawArgs(plan->inputs, draw.args); // (an inline draw's count is set by the front, AdoptHookPlan)
+    const u32 binder_mode = NativeBinderMode();
+    const bool skip_flat = (binder_mode == 1 || binder_mode == 2) && draw.bindings_complete && (binder_mode == 2 || draw_class == 0);
+    const bool real = Core::NativeDraw::HookPlanMode() == 2;
+    *epoch = pipeline_cache.ExecEpoch();
+    if (!pipeline_cache.PlanFromPublished(draw.stage_key, *plan->fixed, vertex_user_data, pixel_user_data, *plan, skip_flat ? &draw : nullptr, draw_class, real, &plan->hook_entry)) {
+        RecyclePlan(std::move(plan));
+        return nullptr;
+    }
+    if (real && (binder_mode == 1 || binder_mode == 2) && !draw.bindings_complete) {
+        Core::NativeRegistry::NoteBinderReason(draw_class, 2, draw.bindings_overflow ? 10 : 1); // (as PlanExecDraw)
+    }
+    return plan.release();
+}
+
+bool Rasterizer::RefreshHookPlan(DrawPlan& plan, const Core::NativeDraw::ExecDraw& draw, u32 index_count, std::span<const u32, 16> vertex_user_data,
+                                 std::span<const u32, 16> pixel_user_data) {
+    // the cached inputs and exec entries of a key hold what the newest learning draw of the key wrote (fields outside the key, such as the depth target's HTILE, can change);
+    // the front plans with the copy of now, so the hook's plan takes the copy of now as well
+    if (PipelineCache::PublishedEntryOf(draw.stage_key, *plan.fixed) != plan.hook_entry) {
+        return false;
+    }
+    if (const DrawInputs* now = FindInputs(draw.inputs_key); now != plan.hook_inputs) {
+        if (now == nullptr) {
+            return false;
+        }
+        plan.inputs = *now;
+        plan.hook_inputs = now;
+        Core::NativeDrawInputs::ApplyDrawArgs(plan.inputs, draw.args);
+        Core::NativeDraw::NoteHookPlan(15);
+    }
+    if (index_count != ~0u) {
+        plan.inputs.num_indices = index_count; // an inline draw: the count comes with the draw packet
+    }
+    // the user data registers hold, on the GPU too, what the draws before wrote in submission order; the hook knows only its own context's. A stage whose registers differ
+    // from the front's is made again from the front's (the record's own words are the same in both: only words this draw did not write differ)
+    for (u32 s = 0; s < MaxShaderStages; ++s) {
+        auto& stage = plan.stages[s];
+        if (stage.info == nullptr) {
+            continue;
+        }
+        const auto ud = s == static_cast<u32>(Shader::SwStage::Vertex) ? vertex_user_data : pixel_user_data;
+        if (stage.user_data_count != ud.size() || !std::equal(ud.begin(), ud.end(), stage.user_data.begin())) {
+            PipelineCache::RecaptureUserData(stage, ud);
+            Core::NativeDraw::NoteHookPlan(11);
+        }
+    }
+    return true;
+}
+
+std::unique_ptr<DrawPlan> Rasterizer::AdoptHookPlanImpl(void* hook_plan, u64 epoch, const Core::NativeDraw::ExecDraw& draw, u32 index_count, std::span<const u32, 16> vertex_user_data,
+                                                    std::span<const u32, 16> pixel_user_data) {
+    std::unique_ptr<DrawPlan> plan{static_cast<DrawPlan*>(hook_plan)};
+    if (epoch != pipeline_cache.ExecEpoch() || plan->native_seq != draw.seq || !RefreshHookPlan(*plan, draw, index_count, vertex_user_data, pixel_user_data)) {
+        Core::NativeDraw::NoteHookPlan(12);
+        RecyclePlan(std::move(plan));
+        return nullptr;
+    }
+    Core::NativeDraw::Live().draw_args_typed.fetch_add(1, std::memory_order_relaxed);
+    FinishExecPlan(*plan, draw, NativeBinderMode());
+    Core::NativeDraw::NoteHookPlan(8);
     return plan;
+}
+
+void Rasterizer::CompareHookPlan(const DrawPlan& front, void* hook_plan, const Core::NativeDraw::ExecDraw& draw, u32 index_count, std::span<const u32, 16> vertex_user_data,
+                                 std::span<const u32, 16> pixel_user_data) {
+    std::unique_ptr<DrawPlan> h{static_cast<DrawPlan*>(hook_plan)};
+    if (!RefreshHookPlan(*h, draw, index_count, vertex_user_data, pixel_user_data)) {
+        Core::NativeDraw::NoteHookPlan(12); // (real mode would plan this draw on the front)
+        RecyclePlan(std::move(h));
+        return;
+    }
+    const char* what = nullptr;
+    u32 at = 0;
+    if (h->pipeline != front.pipeline) {
+        what = "pipeline";
+    } else if (h->any_flat_skipped != front.any_flat_skipped) {
+        what = "any_flat_skipped";
+    } else if (h->native_seq != front.native_seq || h->fixed_source != front.fixed_source) {
+        what = "record or fixed state";
+    } else if (h->binding_count != front.binding_count || h->bindings_complete != front.bindings_complete ||
+               std::memcmp(h->bindings.data(), front.bindings.data(), sizeof(h->bindings[0]) * h->binding_count) != 0) {
+        what = "bindings";
+    } else if (std::memcmp(&h->inputs, &front.inputs, sizeof(DrawInputs)) != 0) {
+        what = "inputs";
+        const auto* x = reinterpret_cast<const u8*>(&h->inputs);
+        const auto* y = reinterpret_cast<const u8*>(&front.inputs);
+        while (at < sizeof(DrawInputs) && x[at] == y[at]) {
+            ++at;
+        }
+    }
+    for (u32 s = 0; s < MaxShaderStages && what == nullptr; ++s) {
+        const auto& a = h->stages[s];
+        const auto& b = front.stages[s];
+        if ((a.info == nullptr) != (b.info == nullptr) || (a.info != nullptr && a.info != b.info)) {
+            what = "stage info";
+        } else if (a.info == nullptr) {
+            continue;
+        } else if (a.pgm_base != b.pgm_base) {
+            what = "program base";
+        } else if (a.flat_skipped != b.flat_skipped) {
+            what = "flat skipped";
+        } else if (a.flat != b.flat) {
+            what = "flat user data";
+            u32 k = 0;
+            while (k < a.flat.size() && k < b.flat.size() && a.flat[k] == b.flat[k]) {
+                ++k;
+            }
+            static std::atomic<u32> flat_logged{0};
+            if (flat_logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+                HookSample(fmt::format("FLAT record {} stage {}: word {} of {}/{}: hook {:#x} front {:#x}; ud count {}; ud words {:#x} {:#x} {:#x} {:#x} vs {:#x} {:#x} {:#x} {:#x}; pgm {:#x}",
+                                       front.native_seq, s, k, a.flat.size(), b.flat.size(), k < a.flat.size() ? a.flat[k] : 0u, k < b.flat.size() ? b.flat[k] : 0u,
+                                       a.user_data_count, a.user_data[k & 12], a.user_data[(k & 12) + 1], a.user_data[(k & 12) + 2], a.user_data[(k & 12) + 3],
+                                       b.user_data[k & 12], b.user_data[(k & 12) + 1], b.user_data[(k & 12) + 2], b.user_data[(k & 12) + 3], b.pgm_base));
+            }
+        } else if (a.user_data_count != b.user_data_count || !std::equal(a.user_data.begin(), a.user_data.begin() + a.user_data_count, b.user_data.begin())) {
+            what = "user data";
+        }
+    }
+    if (what != nullptr) {
+        Core::NativeDraw::NoteHookPlan(10);
+        if (g_hook_logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+            if (std::strcmp(what, "inputs") != 0) {
+                at = 0;
+            }
+            static constexpr std::pair<const char*, size_t> InputFields[] = {{"raw_targets", offsetof(DrawInputs, raw_targets)}, {"color_buffers", offsetof(DrawInputs, color_buffers)}, {"depth_buffer", offsetof(DrawInputs, depth_buffer)}, {"depth_view", offsetof(DrawInputs, depth_view)}, {"depth_control", offsetof(DrawInputs, depth_control)}, {"depth_htile_data_base", offsetof(DrawInputs, depth_htile_data_base)}, {"depth_render_control", offsetof(DrawInputs, depth_render_control)}, {"depth_clear", offsetof(DrawInputs, depth_clear)}, {"stencil_clear", offsetof(DrawInputs, stencil_clear)}, {"num_indices", offsetof(DrawInputs, num_indices)}, {"num_instances", offsetof(DrawInputs, num_instances)}, {"index_offset", offsetof(DrawInputs, index_offset)}, {"vgt_instance_step_rate_0", offsetof(DrawInputs, vgt_instance_step_rate_0)}, {"vgt_instance_step_rate_1", offsetof(DrawInputs, vgt_instance_step_rate_1)}, {"index_base_address", offsetof(DrawInputs, index_base_address)}, {"index_buffer_type", offsetof(DrawInputs, index_buffer_type)}, {"max_index_size", offsetof(DrawInputs, max_index_size)}, {"ta_bc_base", offsetof(DrawInputs, ta_bc_base)}, {"clip_user_data", offsetof(DrawInputs, clip_user_data)}};
+            const char* field = "?";
+            for (const auto& [name, offset] : InputFields) {
+                if (offset <= at) {
+                    field = name;
+                }
+            }
+            u32 hv = 0, fv = 0;
+            if (at + 4 <= sizeof(DrawInputs)) {
+                std::memcpy(&hv, reinterpret_cast<const u8*>(&h->inputs) + (at & ~3u), 4);
+                std::memcpy(&fv, reinterpret_cast<const u8*>(&front.inputs) + (at & ~3u), 4);
+            }
+            HookSample(fmt::format("field {} hook {:#x} front {:#x}; size {}", field, hv, fv, sizeof(DrawInputs)));
+            HookSample(fmt::format("DIFF record {}: {} (byte {}; index count {:#x}; hook pipeline {}, front {})", front.native_seq, what, at, index_count, fmt::ptr(h->pipeline),
+                                   fmt::ptr(front.pipeline)));
+        }
+    } else {
+        Core::NativeDraw::NoteHookPlan(9);
+    }
+    RecyclePlan(std::move(h));
 }
 
 
@@ -1268,4 +1476,8 @@ void Rasterizer::OcclusionClose(VAddr address) {
 
 nlohmann::json TlgPublishedPlanReport() { // note 184: for the hook ring report
     return Vulkan::Rasterizer::PublishedPlanReport();
+}
+
+nlohmann::json TlgHookPlanSamples() { // note 185
+    return Vulkan::HookPlanSamplesImpl();
 }

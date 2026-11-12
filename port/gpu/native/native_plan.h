@@ -117,6 +117,8 @@ struct DrawPlan {
     std::array<StagePlan, StageCount> stages{};
     u64 ring_end{}; ///< T1: the constant ring position after this plan's copies
     u64 native_seq{}; ///< the record the plan was made from (0: planned from the registers); diagnostics
+    const void* hook_inputs{}; ///< note 185: the published inputs copy a hook plan was made from (a newer copy for the key makes the front refresh the inputs)
+    const void* hook_entry{};  ///< note 185: the published exec entry a hook plan was made from (a newer one makes the front plan the draw itself)
     /// NativeDraw v2: the descriptors of the record in the user data of its stages; the native binder reads them by (stage, flat offset)
     std::array<Core::NativeDraw::RecordBinding, Core::NativeDraw::MaxRecordBindings> bindings{};
     u32 binding_count{};

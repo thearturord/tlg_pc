@@ -69,6 +69,11 @@ public:
                                                    u32 index_count) = 0;
     [[nodiscard]] virtual DrawPlanPtr MakeExecDrawPlan(const Vulkan::FixedState& native, u64 exec_key, u64 inputs_key, std::span<const u32, 16> vertex_user_data,
                                                        std::span<const u32, 16> pixel_user_data, const NativeDraw::ExecDraw& draw, u32 index_count, u32 draw_class) = 0;
+    /// Note 185: the plan the hook made for the draw's record (taken over; null: not usable now, it was handed back) and the shadow's comparison with the front's own plan.
+    [[nodiscard]] virtual DrawPlanPtr AdoptHookPlan(void* hook_plan, u64 epoch, const NativeDraw::ExecDraw& draw, u32 index_count, std::span<const u32, 16> vertex_user_data,
+                                                    std::span<const u32, 16> pixel_user_data) = 0;
+    virtual void CompareHookPlan(const Vulkan::DrawPlan& front, void* hook_plan, const NativeDraw::ExecDraw& draw, u32 index_count, std::span<const u32, 16> vertex_user_data,
+                                 std::span<const u32, 16> pixel_user_data) = 0;
     /// The plan of a fast clear eliminate record.
     [[nodiscard]] virtual DrawPlanPtr MakeOperationPlan(const NativeDraw::ExecDraw& draw) = 0;
     [[nodiscard]] virtual DispatchPlanPtr MakeDispatchPlan(const NativeDispatch::DispatchInputs& cs) = 0;

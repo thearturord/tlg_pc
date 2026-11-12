@@ -1103,6 +1103,8 @@ struct NativeRecord {
     u8 ud_skipped{}, ud_would_skip{}; ///< note 179
     u64 hook_pipeline{}; ///< note 183
     u8 hook_plan_state{}; ///< note 183
+    std::atomic<void*> hook_plan{nullptr}; ///< note 185: the plan the hook made (owned by the record until the front takes it)
+    u64 hook_plan_seq{}, hook_plan_epoch{}; ///< note 185
     MapUpload map_upload{}; ///< note 173: the Map upload copy of this record (valid when `map_upload.seq` is this record's number)
     u32 count{};
     const StatePackage* package{}; ///< A5.3: the state package the first `package->count` registers are a copy of (valid when `package_for` is this record's number)
@@ -1206,8 +1208,16 @@ void NoteConsumed(u64 seq) {
 }
 
 /// Takes the next record number. L5: a record number more than RecordSlots ahead of the newest one the command processor consumed reuses a slot whose record may still be needed.
+NativeRecord& Slot(u64 seq);
+void RecycleHookPlanImpl(void* plan) noexcept;
+void NoteHookPlanImpl(u32 what) noexcept;
+
 u64 TakeSeq() {
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    if (void* left = Slot(seq).hook_plan.exchange(nullptr, std::memory_order_acq_rel); left != nullptr) [[unlikely]] {
+        RecycleHookPlanImpl(left); // note 185: a plan the front never took (its tag was not executed)
+        NoteHookPlanImpl(14);
+    }
     const u64 consumed = consumed_seq.load(std::memory_order_relaxed);
     if (seq > consumed + RecordSlots && consumed != 0) [[unlikely]] {
         Core::Invariant::Hit(Core::Invariant::RecordOverwritten, seq, consumed, seq - consumed);
@@ -1801,15 +1811,18 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out);
 // ---- note 183: the typed plans' pipelines by (stage key, fixed state), published by the front, read by the hook
 std::array<std::atomic<u64>, 65536> g_plan_key{};
 std::array<std::atomic<u64>, 65536> g_plan_pipeline{};
-std::array<std::atomic<u64>, 6> g_hook_plan_counts{};
+std::array<std::atomic<u64>, 16> g_hook_plan_counts{};
 
 u32 HookPlanModeImpl() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_HOOK_PLAN");
-        return e != nullptr && e[0] == '1' ? 1u : 0u; // note 183: 0 off, 1 shadow
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // notes 183, 185: 0 off, 1 shadow, 2 real
     }();
     return mode;
 }
+
+std::atomic<HookPlanner> g_hook_planner{nullptr};
+std::atomic<HookPlanRecycler> g_hook_recycler{nullptr};
 
 u64 PlanKey(u64 stage_key, u64 fixed) noexcept {
     const u64 k = (stage_key ^ (fixed * 0x9E3779B97F4A7C15ull)) * 0xC2B2AE3D27D4EB4Full;
@@ -1829,6 +1842,21 @@ u64 LookupHookPlan(u64 key) noexcept {
         }
     }
     return 0;
+}
+
+void NoteHookPlanImpl(u32 what) noexcept {
+    if (what < g_hook_plan_counts.size()) {
+        g_hook_plan_counts[what].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void RecycleHookPlanImpl(void* plan) noexcept {
+    if (plan == nullptr) {
+        return;
+    }
+    if (const auto recycler = g_hook_recycler.load(std::memory_order_acquire); recycler != nullptr) {
+        recycler(plan);
+    }
 }
 
 // ---- note 179: covered shader objects (published by the planner, read by the hook)
@@ -2798,7 +2826,7 @@ void SignRecord(NativeRecord& slot, const Signature& sig, u64 ctx) {
     slot.group_sig[GroupTargets] = sign({sig.group[Targets]});
     slot.group_sig[GroupOther] = sign({sig.group[States], sig.group[InputObjects], sig.group[Shaders], sig.group[Targets]});
     // note 183: the group identities are complete here
-    if (HookPlanModeImpl() != 0 && slot.kind <= 2 && slot.fixed != nullptr) [[unlikely]] {
+    if (HookPlanModeImpl() == 1 && slot.kind <= 2 && slot.fixed != nullptr) [[unlikely]] {
         // note 183 shadow: the stage key as TakeExecDraw makes it, from the record's group identities and descriptor key, then the published plan of (key, fixed state)
         const std::array<u32, 5> needed{GroupOther, GroupVsProgram, GroupPsProgram, GroupInterpolants, GroupTargets};
         bool known = true;
@@ -4998,12 +5026,28 @@ void PublishHookPlan(u64 stage_key, u64 fixed, u64 pipeline) noexcept {
     }
 }
 void NoteHookPlan(u32 what) noexcept {
-    if (what < g_hook_plan_counts.size()) {
-        g_hook_plan_counts[what].fetch_add(1, std::memory_order_relaxed);
-    }
+    NoteHookPlanImpl(what);
 }
-std::array<u64, 6> HookPlanCounts() noexcept {
-    std::array<u64, 6> out{};
+void SetHookPlanner(HookPlanner planner, HookPlanRecycler recycler) noexcept {
+    g_hook_recycler.store(recycler, std::memory_order_release);
+    g_hook_planner.store(planner, std::memory_order_release);
+}
+void* TakeHookPlan(u64 seq, u64& epoch) noexcept {
+    auto& slot = Slot(seq);
+    void* plan = slot.hook_plan.exchange(nullptr, std::memory_order_acq_rel);
+    if (plan != nullptr && slot.hook_plan_seq != seq) {
+        RecycleHookPlanImpl(plan); // (the plan of another record in this slot)
+        NoteHookPlanImpl(14);
+        return nullptr;
+    }
+    epoch = slot.hook_plan_epoch;
+    return plan;
+}
+void RecycleHookPlan(void* plan) noexcept {
+    RecycleHookPlanImpl(plan);
+}
+std::array<u64, 16> HookPlanCounts() noexcept {
+    std::array<u64, 16> out{};
     for (u32 i = 0; i < out.size(); ++i) {
         out[i] = g_hook_plan_counts[i].load(std::memory_order_relaxed);
     }
@@ -5079,6 +5123,78 @@ void RebuildSkippedUserData(const ExecDraw& draw, std::array<u32, 16>& vs, std::
         }
         NoteSkipUserData(3);
     }
+}
+
+namespace {
+/// Note 185: the typed user data the front would hold for a draw, kept per device context on the recording thread (the front keeps one set in submission order; the
+/// shadow compares them apart, `user data differs`).
+struct HookUserData {
+    u64 ctx{};
+    std::array<u32, 16> vs{}, ps{};
+};
+thread_local std::array<HookUserData, 4> hook_user_data;
+thread_local u32 hook_user_data_next;
+thread_local std::unique_ptr<ExecDraw> hook_draw;
+
+HookUserData& HookUserDataOf(u64 ctx) {
+    for (auto& state : hook_user_data) {
+        if (state.ctx == ctx) {
+            return state;
+        }
+    }
+    auto& state = hook_user_data[hook_user_data_next++ % hook_user_data.size()];
+    state = {};
+    state.ctx = ctx;
+    return state;
+}
+} // namespace
+
+/// Note 185 (R3.4d-1): the hook plans an executed draw from its own record and the published copies, at record time (the record is this thread's until its tag is submitted).
+void HookPlanDraw(u64 seq, u64 ctx, u32 draw_class) {
+    const auto planner = g_hook_planner.load(std::memory_order_acquire);
+    if (planner == nullptr) {
+        return;
+    }
+    if (!hook_draw) {
+        hook_draw = std::make_unique<ExecDraw>();
+    }
+    ExecDraw& d = *hook_draw;
+    d.typed = false;
+    d.grouped = 0;
+    d.vs_user_data_mask = 0;
+    d.ps_user_data_mask = 0;
+    d.lazy = nullptr;
+    if (!TakeExecDrawImpl(seq, d, true, NativeListOn()) || !d.typed) {
+        return;
+    }
+    HookUserData& ud = HookUserDataOf(ctx);
+    for (u32 mask = d.vs_user_data_mask; mask != 0; mask &= mask - 1) {
+        const u32 i = static_cast<u32>(std::countr_zero(mask));
+        ud.vs[i] = d.vs_user_data[i];
+    }
+    for (u32 mask = d.ps_user_data_mask; mask != 0; mask &= mask - 1) {
+        const u32 i = static_cast<u32>(std::countr_zero(mask));
+        ud.ps[i] = d.ps_user_data[i];
+    }
+    if (d.ud_skipped != 0) {
+        RebuildSkippedUserData(d, ud.vs, ud.ps);
+    }
+    if (d.kind > 2 || d.cb_extents_only || d.fixed == nullptr || d.other_stage || d.stage_key == 0) {
+        return;
+    }
+    u64 epoch = 0;
+    void* plan = planner(d, ud.vs, ud.ps, draw_class, &epoch);
+    if (plan == nullptr) {
+        NoteHookPlanImpl(7);
+        return;
+    }
+    auto& slot = Slot(seq);
+    slot.hook_plan_seq = seq;
+    slot.hook_plan_epoch = epoch;
+    if (void* old = slot.hook_plan.exchange(plan, std::memory_order_acq_rel); old != nullptr) {
+        RecycleHookPlanImpl(old);
+    }
+    NoteHookPlanImpl(6);
 }
 
 bool TakeDispatchBindings(u64 seq, RecordBinding* out, u32 max, u32& count) {
@@ -6036,6 +6152,9 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
         NativeRegistry::StoreDraw(*v2);
     }
     const bool exec = seq != 0 && ExecEligible(ctx, seq, ret);
+    if (exec && kind <= 2 && HookPlanModeImpl() != 0) [[unlikely]] {
+        HookPlanDraw(seq, ctx, static_cast<u32>(cls)); // note 185
+    }
     if (census_site != nullptr) {
         (exec ? census_site->executed : census_site->packet_path).fetch_add(1, std::memory_order_relaxed);
     }

@@ -42,6 +42,11 @@ Core::DrawPlanPtr Rasterizer::MakeExecDrawPlan(const FixedState& native, u64 exe
     return Core::DrawPlanPtr{PlanExecDraw(native, exec_key, inputs_key, vertex_user_data, pixel_user_data, draw, index_count, draw_class).release()};
 }
 
+Core::DrawPlanPtr Rasterizer::AdoptHookPlan(void* hook_plan, u64 epoch, const Core::NativeDraw::ExecDraw& draw, u32 index_count, std::span<const u32, 16> vertex_user_data,
+                                            std::span<const u32, 16> pixel_user_data) {
+    return Core::DrawPlanPtr{AdoptHookPlanImpl(hook_plan, epoch, draw, index_count, vertex_user_data, pixel_user_data).release()};
+}
+
 Core::DrawPlanPtr Rasterizer::MakeOperationPlan(const Core::NativeDraw::ExecDraw& draw) {
     return Core::DrawPlanPtr{PlanExecOperation(draw).release()};
 }

@@ -508,8 +508,11 @@ void PipelineCache::CapturePlanPure(StagePlan& out, Shader::Info* clone, const S
 }
 
 bool PipelineCache::PlanFromPublished(u64 exec_key, const FixedState& fixed, std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data, DrawPlan& out,
-                                      const Core::NativeDraw::ExecDraw* skip_flat_for, u32 draw_class, bool note_binder) const {
+                                      const Core::NativeDraw::ExecDraw* skip_flat_for, u32 draw_class, bool note_binder, const void** entry_used) const {
     const PublishedEntry* pe = FindPublished(ExecKeyOf(exec_key, fixed)); // (published only while TLG_PUBLISHED_PLAN is on)
+    if (entry_used != nullptr) {
+        *entry_used = pe;
+    }
     if (pe == nullptr || pe->epoch != exec_epoch || pe->pipeline == nullptr || !pe->pipeline->StagesAdopted()) {
         return false;
     }
@@ -541,6 +544,14 @@ bool PipelineCache::PlanFromPublished(u64 exec_key, const FixedState& fixed, std
         CapturePlanPure(out.stages[s], pe->clones[s], *pe->infos[s], skip, vertex ? vertex_user_data : pixel_user_data, pe->pgm_base[s]);
     }
     return true;
+}
+
+void PipelineCache::RecaptureUserData(StagePlan& stage, std::span<const u32, 16> user_data) {
+    CapturePlanPure(stage, stage.info, *stage.info, stage.flat_skipped, user_data, stage.pgm_base); // (the raster clone holds the same SRT walker as the shared info)
+}
+
+const void* PipelineCache::PublishedEntryOf(u64 exec_key, const FixedState& fixed) noexcept {
+    return FindPublished(ExecKeyOf(exec_key, fixed));
 }
 
 void PipelineCache::CapturePlan(StagePlan& out, Shader::Info* clone, const Shader::Info& shared, bool skip_flat) {

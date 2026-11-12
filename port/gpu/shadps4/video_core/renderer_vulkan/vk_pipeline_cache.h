@@ -263,15 +263,23 @@ public:
     /// Note 184 (plan R3.4d-2/4, `TLG_PUBLISHED_PLAN`: 0 off, 1 shadow, 2 real): a typed plan made only from read-only published entries (published where the cache entry is
     /// written) and the record: what another thread can plan without the front's caches. False: no published entry for the keys (the caller plans the old way).
     [[nodiscard]] static u32 PublishedPlanMode() noexcept;
+    /// Note 185: the epoch of the exec entries (bumped when a shader is replaced; read by the hook's planner).
+    [[nodiscard]] u64 ExecEpoch() const noexcept {
+        return exec_epoch.load(std::memory_order_acquire);
+    }
     bool PlanFromPublished(u64 exec_key, const FixedState& fixed, std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data, DrawPlan& out,
-                           const Core::NativeDraw::ExecDraw* skip_flat_for, u32 draw_class, bool note_binder) const;
+                           const Core::NativeDraw::ExecDraw* skip_flat_for, u32 draw_class, bool note_binder, const void** entry_used = nullptr) const;
+    /// Note 185: a stage of a plan made again from other user data (the SRT walker of the stage's own info).
+    static void RecaptureUserData(StagePlan& stage, std::span<const u32, 16> user_data);
+    /// Note 185: the published exec entry of the keys now (null: none).
+    [[nodiscard]] static const void* PublishedEntryOf(u64 exec_key, const FixedState& fixed) noexcept;
 private:
     void PublishExecEntry(u64 key, const ExecEntry& entry); ///< note 184 (the front thread only)
     static void CapturePlanPure(StagePlan& out, Shader::Info* clone, const Shader::Info& shared, bool skip_flat, std::span<const u32, 16> user_data, u64 pgm_base);
     std::array<u32, MaxShaderStages> stage_hw{};
     std::array<VAddr, MaxShaderStages> stage_base{};
     u64 lookup_exec_key{};
-    u64 exec_epoch{1}; ///< bumped when a shader is replaced (debug); adding a variant no longer invalidates the entries (2026-10-28: they hold
+    std::atomic<u64> exec_epoch{1}; ///< bumped when a shader is replaced (debug); adding a variant no longer invalidates the entries (2026-10-28: they hold
                        ///< the fetch shader as program and variant index, every other pointer is stable)
     Program* fetch_program{}; ///< the program and variant of `fetch_shader` (set together with it)
     size_t fetch_perm{};

@@ -311,12 +311,24 @@ struct MapUpload {
 /// Note 179 (plan R3.4c, `TLG_SKIP_USER_DATA`: 0 off until the owner's play, 1 shadow, 2 real): a shader object (engine id, Gnm block) whose stage the planner found covered by
 /// the record's binding list; the hook then skips that stage's descriptor user data (the constant update engine's emulation).
 [[nodiscard]] u32 SkipUserDataMode() noexcept;
-/// Note 183 (plan R3.4d-1, `TLG_HOOK_PLAN`: 0 off, 1 shadow): the front publishes each typed plan's pipeline by (stage key, fixed state); the hook looks its record's keys up at
+/// Note 183 (plan R3.4d-1, `TLG_HOOK_PLAN`): the front publishes each typed plan's pipeline by (stage key, fixed state); the hook looks its record's keys up at
 /// record time, and the front compares. 0 hook asked, 1 found at the hook, 2 compared the same, 3 different (must be 0), 4 not yet published at the hook, 5 published
+/// Note 185 (`TLG_HOOK_PLAN`: 0 off, 1 shadow, 2 real): the hook makes the whole typed plan of an executed draw at record time, from the published read-only copies (note 184),
+/// and leaves it in the record; the front takes it instead of planning (2) or compares it with its own plan (1).
+/// 6 made at the hook, 7 not made (keys not published), 8 used by the front, 9 compared the same, 10 different (must be 0), 11 a stage made again from the front's user data,
+/// 12 dropped (the pipeline epoch or the exec entry moved), 13 not used (the front did not plan the draw from its record), 14 recycled when the slot was reused,
+/// 15 inputs refreshed at the front (a newer published copy of the key's inputs)
 [[nodiscard]] u32 HookPlanMode() noexcept;
 void PublishHookPlan(u64 stage_key, u64 fixed, u64 pipeline) noexcept;
 void NoteHookPlan(u32 what) noexcept;
-[[nodiscard]] std::array<u64, 6> HookPlanCounts() noexcept;
+[[nodiscard]] std::array<u64, 16> HookPlanCounts() noexcept;
+/// The planner the hook calls (the rasterizer, thread safe): a plan (owned by the caller) or null; `epoch` gets the pipeline epoch it was made under.
+using HookPlanner = void* (*)(const ExecDraw& draw, std::span<const u32, 16> vs, std::span<const u32, 16> ps, u32 draw_class, u64* epoch);
+using HookPlanRecycler = void (*)(void* plan);
+void SetHookPlanner(HookPlanner planner, HookPlanRecycler recycler) noexcept;
+/// The plan the hook made for record `seq`; ownership passes to the caller (null: none).
+[[nodiscard]] void* TakeHookPlan(u64 seq, u64& epoch) noexcept;
+void RecycleHookPlan(void* plan) noexcept;
 void NoteCoveredShader(u64 id, u64 gnm) noexcept;
 /// Note 179: the front rebuilds the skipped descriptor user data of `draw` (stages in `ud_skipped`) from its binding list into the stage's user data registers; descriptor tables go
 /// into a front-thread arena.

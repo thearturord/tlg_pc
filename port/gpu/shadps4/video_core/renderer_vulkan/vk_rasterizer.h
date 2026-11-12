@@ -62,6 +62,17 @@ public:
     Core::DrawPlanPtr MakeExecDrawPlan(const FixedState& native, u64 exec_key, u64 inputs_key, std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data,
                                        const Core::NativeDraw::ExecDraw& draw, u32 index_count, u32 draw_class) override;
     Core::DrawPlanPtr MakeOperationPlan(const Core::NativeDraw::ExecDraw& draw) override;
+    Core::DrawPlanPtr AdoptHookPlan(void* hook_plan, u64 epoch, const Core::NativeDraw::ExecDraw& draw, u32 index_count, std::span<const u32, 16> vertex_user_data,
+                                    std::span<const u32, 16> pixel_user_data) override;
+    void CompareHookPlan(const DrawPlan& front, void* hook_plan, const Core::NativeDraw::ExecDraw& draw, u32 index_count, std::span<const u32, 16> vertex_user_data,
+                         std::span<const u32, 16> pixel_user_data) override;
+    /// Note 185: brings a hook plan to the front's state of now (the inputs copy of the key may be newer; the user data are the front's, in submission order); false: the
+    /// exec entry changed, the front plans the draw.
+    bool RefreshHookPlan(DrawPlan& plan, const Core::NativeDraw::ExecDraw& draw, u32 index_count, std::span<const u32, 16> vertex_user_data,
+                         std::span<const u32, 16> pixel_user_data);
+    /// Note 185: the typed plan of a draw on the recording thread (thread safe: published copies and the plan pool only). Null: the keys are not published yet.
+    [[nodiscard]] DrawPlan* PlanAtHook(const Core::NativeDraw::ExecDraw& draw, std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data, u32 draw_class,
+                                       u64* epoch);
     Core::DispatchPlanPtr MakeDispatchPlan(const Core::NativeDispatch::DispatchInputs& cs) override;
     u64 DrawPlanDigest(const DrawPlan& plan) override;
     u64 DispatchPlanDigest(const DispatchPlan& plan) override;
@@ -705,6 +716,10 @@ private:
     /// Note 173: the Map upload copy as an upload into the texture's image instead of the copy program's dispatch; true when done (the dispatch is skipped).
     bool NativeMapUpload(const DispatchPlan& plan, const Shader::Info& cs);
     /// Note 184 shadow: the typed plan made from the published read-only entries and the record, against the front's plan.
+    /// The part of an executed draw's planning that stays on the front (counters, covered shader notes, geometry ids and handles).
+    void FinishExecPlan(DrawPlan& plan, const Core::NativeDraw::ExecDraw& draw, u32 binder_mode);
+    std::unique_ptr<DrawPlan> AdoptHookPlanImpl(void* hook_plan, u64 epoch, const Core::NativeDraw::ExecDraw& draw, u32 index_count, std::span<const u32, 16> vertex_user_data,
+                                                std::span<const u32, 16> pixel_user_data);
     void PublishedPlanShadow(const DrawPlan& plan, const FixedState& native, u64 exec_key, u64 inputs_key, const DrawInputs& cached, std::span<const u32, 16> vertex_user_data,
                              std::span<const u32, 16> pixel_user_data, const Core::NativeDraw::ExecDraw& draw, u32 index_count, bool skip_flat);
 public:

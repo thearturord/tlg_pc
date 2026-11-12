@@ -161,6 +161,18 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
         TLG_LOG(CP, Error, "native draw: the record {} is gone, a draw is lost ({})", native_tag_pending.seq, Core::NativeDraw::DescribeMissingRecord(native_tag_pending.seq));
         return;
     }
+    // note 185: the plan the hook made for this record (handed back on every path that does not take it)
+    u64 hook_epoch = 0;
+    void* hook_plan = draw.kind <= 2 && Core::NativeDraw::HookPlanMode() != 0 ? Core::NativeDraw::TakeHookPlan(draw.seq, hook_epoch) : nullptr;
+    struct HookPlanGuard {
+        void*& plan;
+        ~HookPlanGuard() {
+            if (plan != nullptr) {
+                Core::NativeDraw::RecycleHookPlan(plan);
+                Core::NativeDraw::NoteHookPlan(13);
+            }
+        }
+    } hook_plan_guard{hook_plan};
     if (asc_vqid != ~0u && asc_vqid < NumTotalQueues && draw.kind != 10 && draw.kind != 6) {
         asc_noncopy_issued[asc_vqid].fetch_add(1, std::memory_order_release); // a result the CPU may read (dispatch, counter read-back, ...): a fence of this queue must wait for the raster thread
     }
@@ -382,9 +394,18 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
                                                     native_tag_pending.valid ? (native_tag_pending.meta & 0xff) : 15u);
                 };
                 Core::DrawPlanPtr plan;
-                {
+                if (hook_plan != nullptr && Core::NativeDraw::HookPlanMode() == 2) {
+                    TLG_PROF_LEVEL("front.adopt_hook_plan", 2);
+                    plan = rasterizer->AdoptHookPlan(hook_plan, hook_epoch, draw, index_count, exec_vertex_user_data, exec_pixel_user_data); // note 185 (handed back when not usable)
+                    hook_plan = nullptr;
+                }
+                if (!plan) {
                     TLG_PROF_LEVEL("front.plan_exec_draw", 2);
                     plan = make_plan();
+                }
+                if (plan && hook_plan != nullptr) {
+                    rasterizer->CompareHookPlan(*plan, hook_plan, draw, index_count, exec_vertex_user_data, exec_pixel_user_data); // note 185 shadow (hands it back)
+                    hook_plan = nullptr;
                 }
                 if (plan) {
                     take(std::move(plan));
