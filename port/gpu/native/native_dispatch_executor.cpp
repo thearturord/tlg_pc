@@ -52,7 +52,10 @@ constexpr const char* KindNames[ExKindCount] = {"refused", "hook_ring", "constan
                                                 "own", "own_crossing", "program_consts", "null", "hook_ring_window", "own_after_sync", "clip_planes"};
 const u32 g_draw_mode = [] {
     const char* e = std::getenv("TLG_DRAW_EXECUTOR");
-    return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // note 165: 0 off by default (the owner's play decides), 1 shadow, 2 real
+    if (e == nullptr || e[0] == 0) {
+        return 2u; // default 2 (real) since 2026-11-12 after the owner's play p5play (note 165); LEGACY(draw_executor): =0 the old body binds every draw binding, =1 shadow
+    }
+    return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
 }();
 const u32 g_own_sync = [] {
     const char* e = std::getenv("TLG_OWN_SYNC");

@@ -61,6 +61,7 @@
 ///   TLG_PLAN_POINTERS=0        every draw plan copies the record's fixed state (about 1 KB) instead of pointing at the cached state (note 161)
 ///   TLG_OWN_SYNC=0             a dispatch read of an engine buffer with CPU bytes waiting goes to the old body (the R1b copy of the object in the stream ring) (note 162)
 ///   TLG_DYNAMIC_TEXTURES=0     a dynamic texture (Map discard every frame) found by its T# address in the texture cache instead of its own image by id (note 163)
+///   TLG_DRAW_EXECUTOR=0        every buffer binding of a draw through the old body (BindBufferLegacy) instead of the executor's native sources (note 165)
 namespace Core::Legacy {
 
 

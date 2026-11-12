@@ -123,7 +123,8 @@ enum Compare : u32 { CmpSame, CmpAudited, CmpRefusedOldNative, CmpRefusedOldOld,
 /// Note 162 (`TLG_OWN_SYNC`: 2 real by default, 1 shadow, 0 off): a read binding of an engine buffer whose own block waits for CPU bytes is synchronized and bound from it
 /// (instead of the R1b copy of the whole object in the stream ring). LEGACY(own_sync): =0.
 [[nodiscard]] u32 OwnSyncMode() noexcept;
-/// Note 165 (plan R2.11, `TLG_DRAW_EXECUTOR`: 0 off by default, 1 shadow, 2 real): the same executor for the buffer bindings of a draw's stages. LEGACY(draw_executor): =0.
+/// Note 165 (plan R2.11, `TLG_DRAW_EXECUTOR`: 2 real by default since 2026-11-12, 1 shadow, 0 off): the same executor for the buffer bindings of a draw's stages.
+/// LEGACY(draw_executor): =0. One GPU fault (NVIDIA Xid 13 + 153) in its first real run, not reproduced since: see documents/tlg/native plan/reference/gpu-driver-crashes.md.
 [[nodiscard]] u32 DrawMode() noexcept;
 /// Note 165: the counters the next notes go to (dispatches or draws).
 void SelectSet(bool draw) noexcept;
