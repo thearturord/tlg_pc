@@ -370,7 +370,10 @@ std::atomic<u64> c_past_end[7]{};
 u32 WidePastEndMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_WIDE_PAST_END");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // note 167: 0 off until the owner's play, 1 shadow, 2 real
+        if (e == nullptr || e[0] == 0) {
+            return 2u; // note 167: default 2 since 2026-11-12 (owner play p6play); LEGACY(wide_past_end): =0 those windows through ObtainBuffer, =1 shadow
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }

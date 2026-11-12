@@ -60,7 +60,7 @@ const u32 g_draw_mode = [] {
 }();
 const u32 g_resolved = [] {
     const char* e = std::getenv("TLG_RESOLVED_ANSWERS");
-    return e == nullptr || e[0] == 0 ? 2u : e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u; // note 166: 2 (as before) until the owner's play, 1 shadow, 0 deleted
+    return e == nullptr || e[0] == 0 ? 0u : e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u; // note 166: 0 deleted by default since 2026-11-12 (owner play p6play); LEGACY(resolved_answers): =2, =1 shadow
 }();
 const u32 g_own_sync = [] {
     const char* e = std::getenv("TLG_OWN_SYNC");

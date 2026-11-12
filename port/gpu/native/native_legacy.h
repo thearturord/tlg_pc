@@ -62,6 +62,8 @@
 ///   TLG_OWN_SYNC=0             a dispatch read of an engine buffer with CPU bytes waiting goes to the old body (the R1b copy of the object in the stream ring) (note 162)
 ///   TLG_DYNAMIC_TEXTURES=0     a dynamic texture (Map discard every frame) found by its T# address in the texture cache instead of its own image by id (note 163)
 ///   TLG_DRAW_EXECUTOR=0        every buffer binding of a draw through the old body (BindBufferLegacy) instead of the executor's native sources (note 165)
+///   TLG_RESOLVED_ANSWERS=2     the R1b / R2 answers back: the front resolves an engine object per read binding, the binder takes its stream copy or resident arena (note 166)
+///   TLG_WIDE_PAST_END=0        4 MB windows that start in the frame ring and run past its end through ObtainBuffer instead of the hook ring (note 167)
 namespace Core::Legacy {
 
 
