@@ -15,6 +15,7 @@
 #include "native/native_content.h"
 #include <cstdio>
 #include "native/native_hook_ring.h"
+#include "native/native_hook_diff.h"
 #include "native/native_ring_mirror.h"
 #include "native/native_updates.h"
 #include "native/native_untracked_ring.h"
@@ -872,6 +873,7 @@ nlohmann::json Report() {
                                                                           {"with_unfilled", sh.unfilled_compares.load()}, {"unfilled_bytes", sh.unfilled_bytes.load()}};
     }
     j["raster_1b"]["bound_answers_refused_by_their_compare"] = c_bound_refused.load();
+    j["typed_buffers_note_175"] = Core::HookDiff::TypedReport();
     j["raster_1b"]["open_map_guard_note_168"] = {{"mode", OpenMapGuardMode()}, {"small_reads_over_an_open_map", c_open_guard[0].load()},
                                                   {"wide_windows_over_an_open_map", c_open_guard[1].load()}, {"past_end_windows_over_an_open_map", c_open_guard[2].load()}};
     j["raster_1b"]["wide_reads_old_path"] = {{"count", c_raster_wide.load()}, {"bytes", c_raster_wide_bytes.load()}};

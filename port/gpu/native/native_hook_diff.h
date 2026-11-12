@@ -3,6 +3,7 @@
 #pragma once
 
 #include "common/types.h"
+#include <nlohmann/json.hpp>
 
 /// Notes 153 and 154 (plan R3.1 and R3.3): two shadows of the hook and the plan. Nothing they count changes what is drawn.
 /// * `TLG_HOOK_DIFF=1` (R3.1): the hook builds every draw's fixed state and binding list from the context again. The shadow keeps the previous draw's (per guest thread) and
@@ -38,5 +39,12 @@ void NoteVersionDiffField(u32 field, u32 kind) noexcept;
 void NotePlanFixed(bool same) noexcept;
 /// R3.3 at the draw's execution: 0 the record slot still holds the record and its bindings equal the plan's, 1 the slot was reused, 2 the same record but other bindings, 3 no record.
 void NotePlanBindings(u32 state) noexcept;
+/// Note 175 (plan R3.4a, `TLG_TYPED_BUFFERS`: 0 off by default, 1 shadow): a buffer binding's address and size taken from the engine's objects (the view's first element and
+/// count, the resource's base, width, flags, stride and format: what CreateShaderResourceView 0x2493620 builds its V# from), compared with the V# the hook copied.
+[[nodiscard]] unsigned TypedBuffersMode() noexcept;
+/// 0 asked, 1 same, 2 different, 3 not an engine view, 4 not a buffer shader resource view (another layout: UAV, constant buffer), 5 out of the engine's own range
+void NoteTypedBuffer(u32 what) noexcept;
+/// Note 175: the typed buffer counters (written into the hook ring report, which every check reads).
+[[nodiscard]] nlohmann::json TypedReport();
 
 } // namespace Core::HookDiff

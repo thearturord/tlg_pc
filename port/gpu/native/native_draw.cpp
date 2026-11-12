@@ -1299,6 +1299,81 @@ void AddGeometryId(NativeRecord& record, u64 object) {
     }
     record.geometry_ids[record.geometry_id_count++] = id;
 }
+/// Note 175 shadow: the buffer binding's address and size from the engine's objects, as CreateShaderResourceView (0x2493620) builds the view's V#, against the copied V#.
+void TypedBufferShadow(u64 view, const u32* words) {
+    using Core::HookDiff::NoteTypedBuffer;
+    NoteTypedBuffer(0);
+    const u32 tag = view != 0 ? Rd<u32>(view, 0x18) : 0;
+    const u64 word_address = u64{words[0]} | (u64{words[1]} & 0xfff) << 32;
+    const u32 word_stride = (words[1] >> 16) & 0x3fff;
+    const u64 word_size = word_stride != 0 ? u64{words[2]} * word_stride : words[2];
+    const auto compare = [&](u64 address, u64 size, u32 what) {
+        const bool same = address == word_address && size == word_size;
+        NoteTypedBuffer(same ? 1 : 2);
+        if (!same) {
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+                LOG_WARNING(Core, "note 175 ({}): typed buffer {:#x}+{:#x} vs V# {:#x}+{:#x} (stride {} records {})", what == 0 ? "srv" : what == 1 ? "uav" : "constant buffer", address, size,
+                            word_address, word_size, word_stride, words[2]);
+            }
+        }
+    };
+    if (view != 0 && !(tag >= 22 && tag <= 25) && Rd<u32>(view, 0x60) == words[0]) {
+        // a constant buffer: the buffer resource itself, its V# at +0x60 (base and the whole width)
+        compare(u64{Rd<u32>(view, 0x60)} | (u64{Rd<u32>(view, 0x64)} & 0xfff) << 32, Rd<u32>(view, 0x180), 2);
+        return;
+    }
+    const u64 resource = tag >= 22 && tag <= 25 ? Obj(Rd<u64>(view, 0x30)) : 0;
+    if (resource == 0) {
+        NoteTypedBuffer(3);
+        return;
+    }
+    const u32 dim = Rd<u32>(view, 0x44);
+    const bool srv = Rd<u32>(view, 0x78) == words[0], uav = !srv && Rd<u32>(view, 0x74) == words[0];
+    if ((dim != 1 && dim != 0xb) || !(srv || uav)) {
+        NoteTypedBuffer(4);
+        return;
+    }
+    const u64 base = u64{Rd<u32>(resource, 0x60)} | (u64{Rd<u32>(resource, 0x64)} & 0xfff) << 32;
+    const u32 first = Rd<u32>(view, 0x48), count = Rd<u32>(view, 0x4c);
+    const u32 width = Rd<u32>(resource, 0x180), misc = Rd<u32>(resource, 0x190), structure_stride = Rd<u32>(resource, 0x194);
+    u64 address = 0, size = 0;
+    bool ok = false;
+    if ((misc & 0x40) != 0) { // structured: the structure stride
+        const u32 elements = structure_stride != 0 ? width / structure_stride : 0;
+        if (first < elements) {
+            address = base + u64{first} * structure_stride;
+            size = u64{std::min(count, elements - first)} * structure_stride;
+            ok = true;
+        }
+    } else if ((misc & 0x20) != 0) { // raw (byte address): BUFFEREX with the raw flag (a UAV: BUFFER with its raw flag)
+        if ((dim == 0xb || uav) && (Rd<u32>(view, 0x50) & 1) != 0 && first < width) {
+            address = base + first;
+            size = std::min(count, width - first);
+            ok = true;
+        }
+    } else { // typed: the format's element size
+        const VAddr image = image_base.load(std::memory_order_relaxed);
+        const u32 format = Rd<u32>(image + 0x6b035a0 - 0x1000000, Rd<u32>(view, 0x40) * 4);
+        const u32 bits = format & 0xff;
+        u32 element = bits < 0x3d ? Rd<u32>(image + 0x25e0620 - 0x1000000, bits * 4) >> 3 : 0;
+        if (element == 0) {
+            element = structure_stride;
+        }
+        const u32 elements = element != 0 ? width / element : 0;
+        if (first < elements) {
+            address = base + u64{first} * element;
+            size = u64{std::min(count, elements - first)} * element;
+            ok = true;
+        }
+    }
+    if (!ok) {
+        NoteTypedBuffer(5);
+        return;
+    }
+    compare(address, size, uav ? 1 : 0);
+}
+
 thread_local std::array<u64, MaxRecordBindings> t_bind_obj{}; // note 153 shadow: the object behind each binding of the record being built
 thread_local std::array<u64, MaxRecordBindings> t_bind_id{};  // note 164 shadow: its engine id
 thread_local std::array<u32, MaxRecordBindings> t_bind_ver{}; // note 164 shadow: that id's version when the object was read
@@ -1326,6 +1401,9 @@ void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* word
     binding.table_base = static_cast<u16>(table_base);
     binding.id = last_descriptor_object.id;
     binding.view_id = last_descriptor_object.view_id;
+    if (kind == 1 && dwords >= 4 && Core::HookDiff::TypedBuffersMode() != 0) [[unlikely]] {
+        TypedBufferShadow(last_descriptor_object.object, words); // note 175
+    }
     for (u32 i = 0; i < binding.dwords; ++i) {
         binding.words[i] = words[i];
     }

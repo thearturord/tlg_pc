@@ -25,6 +25,7 @@ enum C : u32 {
     PfChecked, PfSame, PfDiffer,
     PbSame, PbReused, PbOther, PbNoRecord,
     BvSameVersion, BvSameVersionOther,
+    TbAsked, TbSame, TbDiffer, TbNotView, TbNotSrvBuffer, TbOutOfRange,
     CCount
 };
 std::array<std::atomic<u64>, CCount> c{};
@@ -62,6 +63,8 @@ nlohmann::json Report() {
     j["plan_pointers"] = {{"fixed_checked", r(PfChecked)}, {"fixed_same_as_cached", r(PfSame)}, {"fixed_differs_from_cached", r(PfDiffer)},
                           {"bindings_slot_still_holds_the_record", r(PbSame)}, {"bindings_slot_reused_before_execution", r(PbReused)},
                           {"bindings_same_record_other_bindings", r(PbOther)}, {"bindings_no_record", r(PbNoRecord)}};
+    j["typed_buffers_note_175"] = {{"mode", TypedBuffersMode()}, {"asked", r(TbAsked)}, {"same_as_the_words", r(TbSame)}, {"different_from_the_words", r(TbDiffer)},
+                                   {"not_an_engine_view", r(TbNotView)}, {"not_a_buffer_srv", r(TbNotSrvBuffer)}, {"outside_the_engine_range", r(TbOutOfRange)}};
     j["note"] = "notes 153 and 154 shadows; nothing here changes what is drawn";
     return j;
 }
@@ -153,6 +156,26 @@ void NotePlanFixed(bool same) noexcept {
     Add(PfChecked);
     Add(same ? PfSame : PfDiffer);
     MaybePublish();
+}
+
+unsigned TypedBuffersMode() noexcept {
+    static const unsigned mode = [] {
+        const char* e = std::getenv("TLG_TYPED_BUFFERS");
+        return e != nullptr && e[0] == '1' ? 1u : 0u; // note 175: 0 off, 1 shadow
+    }();
+    return mode;
+}
+
+nlohmann::json TypedReport() {
+    const auto r = [](C k) { return c[k].load(std::memory_order_relaxed); };
+    return {{"mode", TypedBuffersMode()}, {"asked", r(TbAsked)}, {"same_as_the_words", r(TbSame)}, {"different_from_the_words", r(TbDiffer)},
+            {"not_an_engine_view", r(TbNotView)}, {"not_a_buffer_srv", r(TbNotSrvBuffer)}, {"outside_the_engine_range", r(TbOutOfRange)}};
+}
+
+void NoteTypedBuffer(u32 what) noexcept {
+    if (what < 6) {
+        Add(static_cast<C>(TbAsked + what));
+    }
 }
 
 void NotePlanBindings(u32 state) noexcept {
