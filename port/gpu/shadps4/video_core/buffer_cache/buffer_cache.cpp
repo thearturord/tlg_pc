@@ -1412,8 +1412,16 @@ std::pair<const Buffer*, u64> BufferCache::HookRingAnswer(VAddr device_addr, u32
                 bool same = true;
                 if (!real || (++past_sample & 255) == 0) {
                     Core::HookRing::NotePastEnd(3);
-                    same = Core::HookRing::ComparePrefix(device_addr, size) == 0;
+                    const u64 diff = Core::HookRing::ComparePrefix(device_addr, size);
+                    same = diff == 0;
                     Core::HookRing::NotePastEnd(same ? 4 : 5);
+                    if (!same) {
+                        static std::atomic<u32> logged{0};
+                        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) { // note 176
+                            LOG_WARNING(Render_Vulkan, "R2.18: past-end window {:#x}+{:#x} refused, {} bytes of its block differ from memory; open map over it {}", device_addr, size, diff,
+                                        past_open);
+                        }
+                    }
                 }
                 if (real && same) {
                     Core::HookRing::NotePastEnd(6);
@@ -1432,9 +1440,14 @@ std::pair<const Buffer*, u64> BufferCache::HookRingAnswer(VAddr device_addr, u32
             bool bind = true;
             if ((++wide_sample & 255) == 0) { // (the block compare walks about 195 KB)
                 Core::HookRing::NoteWideRows(6);
-                if (Core::HookRing::ComparePrefix(device_addr, size) != 0) {
+                if (const u64 diff = Core::HookRing::ComparePrefix(device_addr, size); diff != 0) {
                     Core::HookRing::NoteWideRows(7);
                     bind = false;
+                    static std::atomic<u32> logged{0};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) { // note 176: where the rare refused window differs (R2.18 open)
+                        LOG_WARNING(Render_Vulkan, "R2.18: wide window {:#x}+{:#x} refused, {} bytes of its block differ from memory; open map over it {}", device_addr, size, diff,
+                                    Core::NativeUpdates::OpenMapOverlaps(device_addr, size));
+                    }
                 }
             }
             if (bind) {
