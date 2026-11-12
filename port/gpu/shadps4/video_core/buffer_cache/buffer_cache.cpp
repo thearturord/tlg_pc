@@ -1372,6 +1372,30 @@ std::pair<const Buffer*, u64> BufferCache::HookRingAnswer(VAddr device_addr, u32
         Core::HookRing::NoteWideRows(0);
         const auto& ring = UntrackedRing::Get();
         u64 hook_offset = 0;
+        const bool past_end = ring.Active() && device_addr >= ring.Start() && device_addr < ring.End() && device_addr + size > ring.End();
+        if (past_end && Core::HookRing::WidePastEndMode() != 0) [[unlikely]] {
+            // note 167: a window that runs past the ring's end, answered from the hook ring when the buffer's own block ends inside the ring
+            Core::HookRing::NotePastEnd(0);
+            const u64 in_ring = ring.End() - device_addr;
+            u64 past_offset = 0;
+            if (!IsRegionGpuModified(device_addr, in_ring) && !IsRangeGpuWritten(device_addr, in_ring) && Core::HookRing::ResolveWidePastEnd(device_addr, size, past_offset)) {
+                Core::HookRing::NotePastEnd(1);
+                static thread_local u32 past_sample = 0;
+                const bool real = Core::HookRing::WidePastEndMode() == 2;
+                bool same = true;
+                if (!real || (++past_sample & 255) == 0) {
+                    Core::HookRing::NotePastEnd(3);
+                    same = Core::HookRing::ComparePrefix(device_addr, size) == 0;
+                    Core::HookRing::NotePastEnd(same ? 4 : 5);
+                }
+                if (real && same) {
+                    Core::HookRing::NotePastEnd(6);
+                    return {hook_ring, past_offset};
+                }
+            } else {
+                Core::HookRing::NotePastEnd(2);
+            }
+        }
         if (!ring.Active() || device_addr < ring.Start() || device_addr + size > ring.End() || IsRegionGpuModified(device_addr, size) || IsRangeGpuWritten(device_addr, size)) {
             Core::HookRing::NoteWideRows(1);
         } else if (Core::HookRing::ResolveWideFast(device_addr, size, hook_offset)) {

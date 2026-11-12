@@ -70,6 +70,13 @@ void CompareWide(u64 address, u64 size, bool probe);
 bool ResolveWide(u64 address, u64 size, u64& offset, u64& prefix);
 /// The same for the bind, in constant time: the window's first granule filled; its lap half gives the offset (the block's length is not walked).
 bool ResolveWideFast(u64 address, u64 size, u64& offset);
+/// Note 167 (plan R2.15, `TLG_WIDE_PAST_END`: 0 off by default, 1 shadow, 2 real): a wide window that starts in the frame ring and runs past its end, answered from the hook ring
+/// when the buffer's own block (the filled prefix of one lap half) ends inside the ring and the whole window range fits in the hook ring's storage (section 41's rule: the shader
+/// reads its own block only).
+[[nodiscard]] u32 WidePastEndMode() noexcept;
+bool ResolveWidePastEnd(u64 address, u64 size, u64& offset);
+/// Note 167: 0 asked, 1 resolved, 2 refused (prefix reaches the ring end, not filled, or the range past the storage), 3 compared, 4 compared the same, 5 compared different, 6 served
+void NotePastEnd(u32 what) noexcept;
 /// The bytes of the window's filled prefix that differ from game memory now.
 u64 ComparePrefix(u64 address, u64 size);
 /// Counters of the stage: 0 asked, 1 outside the ring or GPU written, 2 no prefix, 3 prefix in two halves, 4 resolved, 5 bound, 6 compared, 7 PREFIX_DIFFERS (MUST_BE_0; not bound),

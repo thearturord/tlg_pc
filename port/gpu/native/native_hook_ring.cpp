@@ -365,6 +365,51 @@ void NoteWideRows(u32 what) noexcept {
     }
 }
 
+std::atomic<u64> c_past_end[7]{};
+
+u32 WidePastEndMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_WIDE_PAST_END");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // note 167: 0 off until the owner's play, 1 shadow, 2 real
+    }();
+    return mode;
+}
+
+void NotePastEnd(u32 what) noexcept {
+    if (what < 7) {
+        c_past_end[what].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+bool ResolveWidePastEnd(u64 address, u64 size, u64& offset) {
+    u8* bytes = g_bytes.load(std::memory_order_acquire);
+    const u64 base = g_base.load(std::memory_order_relaxed), ring_size = g_size.load(std::memory_order_relaxed);
+    if (bytes == nullptr || size == 0 || address < base || address >= base + ring_size || address + size <= base + ring_size) {
+        return false;
+    }
+    const auto* filled = g_filled.load(std::memory_order_acquire);
+    const auto* half = g_half.load(std::memory_order_acquire);
+    const u64 first = (address - base) >> GranuleShift;
+    if (filled[first].load(std::memory_order_acquire) == 0) {
+        return false;
+    }
+    const u8 h0 = half[first].load(std::memory_order_relaxed);
+    // the buffer's own block (the filled prefix in one lap half) must end inside the ring: a block that reaches the ring's end goes on in memory the hook ring does not hold
+    const u64 last = (ring_size - 1) >> GranuleShift;
+    bool ended = false;
+    for (u64 g = first; g <= last; ++g) {
+        if (filled[g].load(std::memory_order_acquire) == 0 || half[g].load(std::memory_order_relaxed) != h0) {
+            ended = true;
+            break;
+        }
+    }
+    if (!ended) {
+        return false;
+    }
+    offset = CopyOffset(address - base, h0);
+    return g_storage_capacity != 0 && offset + size <= g_storage_capacity; // (the descriptor's range must stay inside the hook ring's buffer)
+}
+
 bool ResolveWide(u64 address, u64 size, u64& offset, u64& prefix) {
     if (g_bytes.load(std::memory_order_acquire) == nullptr || size == 0) {
         return false;
@@ -760,6 +805,9 @@ nlohmann::json Report() {
         static constexpr const char* RowNames[11] = {"asked", "outside_ring_or_gpu_written", "no_prefix", "prefix_in_two_halves", "resolved", "bound", "compared",
                                                      "PREFIX_DIFFERS_MUST_BE_0", "shadow_checked", "SHADOW_PREFIX_DIFFERS_MUST_BE_0", "landings_copied_into_hook_ring"};
         j["wide_rows"]["mode"] = WideRowsMode();
+        j["wide_rows"]["past_end_note_167"] = {{"mode", WidePastEndMode()}, {"asked", c_past_end[0].load()}, {"resolved", c_past_end[1].load()}, {"refused", c_past_end[2].load()},
+                                                {"compared", c_past_end[3].load()}, {"compared_same", c_past_end[4].load()},
+                                                {"PAST_END_BLOCK_DIFFERENT_MUST_BE_0", c_past_end[5].load()}, {"served", c_past_end[6].load()}};
         for (u32 k = 0; k < 11; ++k) {
             j["wide_rows"][RowNames[k]] = c_wide_rows[k].load();
         }
