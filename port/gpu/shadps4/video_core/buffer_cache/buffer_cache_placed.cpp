@@ -489,11 +489,6 @@ void BufferCache::DropPlaced(VAddr begin, const char* why) {
     scheduler.DeferOperation([b = std::move(buffer)]() mutable { b.reset(); });
 }
 
-void BufferCache::Demote(VAddr begin, bool by_request) {
-    // E4: there is no arena to move to. The block stays; the next request that reaches over it grows the block (Place copies the placed buffers inside)
-    Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4DemoteKept);
-}
-
 void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, bool texture, u32 usage, u32 cpu_access) {
     if (!texture && bytes != 0) {
         ordered.Create(id, address, bytes, usage, cpu_access);
@@ -560,8 +555,10 @@ void BufferCache::NoteEngineResourceCreate(u64 id, VAddr address, u64 bytes, boo
             }
         }
     }
-    for (const VAddr begin : under) {
-        Demote(begin, false);
+    // note 169: `Demote` deleted (it only counted since E4: there is no arena to move to). The blocks stay; the next request that reaches over one grows it (Place copies
+    // the placed buffers inside)
+    for (size_t i = 0; i < under.size(); ++i) {
+        Core::NativeUpdates::NoteB9(Core::NativeUpdates::E4DemoteKept);
     }
 }
 

@@ -795,10 +795,26 @@ u64 BufferCache::PreSynchronize(VAddr device_addr, u64 size) {
     return last_upload_bytes;
 }
 
+/// Note 169 (plan R2.12 part 2, `TLG_OBTAIN_CACHES`): the caches in front of the old lookup. 2 as before (the default until the owner's play), 1 shadow (they answer; the answers
+/// the deleted mode would look up again are counted), 0 deleted: no bind memo, no obtain memo, no mutable resident answer. The uncached lookup is the answer they skipped.
+static u32 ObtainCachesMode() {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_OBTAIN_CACHES");
+        if (e == nullptr || e[0] == 0) {
+            return 2u;
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
+/// note 169: 0 bind memo answers, 1 obtain memo answers, 2 mutable resident arena answers, 3 mutable resident whole syncs (each a full lookup in the deleted mode),
+/// 4 mutable resident requests sent to the plain path (deleted mode)
+static std::array<std::atomic<u64>, 5> g_obtain_caches{};
+
 static bool BindMemoOn() {
     static const bool on = [] {
         const char* e = std::getenv("TLG_BIND_MEMO");
-        return e == nullptr || *e != '0';
+        return (e == nullptr || *e != '0') && ObtainCachesMode() != 0; // note 169: the deleted mode has no memo
     }();
     return on;
 }
@@ -1554,6 +1570,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferBody(VAddr device_addr, u
                     bind_memo_wide_counts[cb + 0].fetch_add(1, std::memory_order_relaxed);
                 }
                 bind_memo_counts[0].fetch_add(1, std::memory_order_relaxed);
+                g_obtain_caches[0].fetch_add(1, std::memory_order_relaxed);
                 TLG_PROF_COUNT("buffer.bind_memo.hit");
                 return {e.buffer, e.offset};
             }
@@ -1773,6 +1790,9 @@ bool BufferCache::GpuWrittenContains(VAddr address, u64 size) {
 }
 
 void BufferCache::BindMemoErase(VAddr address, u64 size) {
+    if (ObtainCachesMode() == 0) {
+        return; // note 169: no memo (and no recipe: none is held)
+    }
     Core::SplitCensus::Touch(Core::SplitCensus::BufMemoErase);
     RecipeEraseRange(address, size);
     for (auto& memo : bind_memos) {
@@ -1822,6 +1842,9 @@ nlohmann::json BufferCache::BindMemoReport() const {
                                  {"CLEAN_BUT_CHANGED_total", pc_stale.load()}, {"changed_then_announced_late", pc_stale_late_announce.load()}, {"CHANGED_NEVER_ANNOUNCED_MUST_BE_0", pc_stale_unexplained.load()}, {"changed_pending", pc_stale_pending.load()}, {"unreadable", pc_unreadable.load()}, {"new_pages", pc_new_pages.load()}, {"new_runs", pc_new_runs.load()},
                                  {"new_first_use_pages", pc_new_first_use_pages.load()}};
     return {
+        {"obtain_caches_note_169", {{"mode", ObtainCachesMode()}, {"bind_memo_answers", g_obtain_caches[0].load()}, {"obtain_memo_answers", g_obtain_caches[1].load()},
+                                    {"mutable_resident_answers", g_obtain_caches[2].load()}, {"mutable_resident_whole_syncs", g_obtain_caches[3].load()},
+                                    {"mutable_resident_to_the_plain_path", g_obtain_caches[4].load()}}},
         {"page_clock", page_clock},{"on", BindMemoOn()}, {"hits", bind_memo_counts[0].load()}, {"misses", bind_memo_counts[1].load()}, {"addresses_erased_by_writes", bind_memo_counts[2].load()},
             {"recipes", {{"graphics_draws_checked", recipe_counts[0].load()}, {"no_key", recipe_counts[1].load()}, {"no_recipe_yet", recipe_counts[2].load()},
                          {"predicted_valid_and_same", recipe_counts[3].load()}, {"PREDICTED_VALID_BUT_DIFFERENT_MUST_BE_0", recipe_counts[4].load()},
@@ -1930,6 +1953,12 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             Core::NativeResources::NoteResident(4);
             immutable = nullptr;
         }
+        if (immutable != nullptr && immutable->usage != 1 && ObtainCachesMode() == 0) {
+            // note 169: no mutable resident answer (its only other reader, the R2 answer, is deleted, note 166): the plain path below, as for memory without an engine object.
+            // Immutable buffers (usage 1) keep this path: their whole synchronization is what sets their own memory (design review 83).
+            g_obtain_caches[4].fetch_add(1, std::memory_order_relaxed);
+            immutable = nullptr;
+        }
         if (immutable != nullptr) {
             // a resident buffer is also asked of the tracker: the fault handler marks a page after it bumped the generation (the mark can land after a synchronization that
             // saw nothing), so the generation alone is not enough; the tracker's dirty bit is the safety net of the engine's own knowledge
@@ -1953,6 +1982,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
                 Core::NativeContent::SilentResidentUse(0, immutable->begin, device_addr, size, immutable->usage); // W1.5 census
                 if (immutable->usage != 1) {
                     Core::NativeResources::NoteResident(0);
+                    g_obtain_caches[2].fetch_add(1, std::memory_order_relaxed);
                 }
                 TLG_PROF_COUNT("buffer.uncached.immutable_resident");
                 return {arena, arena->Offset(device_addr)};
@@ -1988,6 +2018,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             Core::NativeResources::NoteImmutableSync();
             if (immutable->usage != 1) {
                 Core::NativeResources::NoteResident(1);
+                g_obtain_caches[3].fetch_add(1, std::memory_order_relaxed);
             }
             TLG_PROF_ADD("buffer.uncached.immutable_synced (sum = bytes uploaded)", last_upload_bytes);
             return {arena, arena->Offset(device_addr)};
@@ -2043,7 +2074,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
     }
     stream_scope.End();
     TLG_PROF_NAMED_LEVEL(memo_scope, "buffer.part.arena_memo", 3);
-    const bool memoizable = !is_texel_buffer;
+    const bool memoizable = !is_texel_buffer && ObtainCachesMode() != 0; // note 169: the deleted mode has no obtain memo
     ObtainMemo* memo = nullptr;
     u64 epoch_before = 0;
     u64 cand_before = 0;
@@ -2060,6 +2091,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_add
             Core::NativeResources::NoteBufferRequest(device_addr, size, is_written,
                                                      Core::NativeResources::BufferPath::Memo, 0);
             TLG_PROF_COUNT("buffer.uncached.obtain_memo_hit");
+            g_obtain_caches[1].fetch_add(1, std::memory_order_relaxed);
             return {memo->arena, memo->offset};
         }
         if (Core::N0::On()) [[unlikely]] {

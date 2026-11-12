@@ -415,7 +415,6 @@ private:
     PlacedBuffer* PlacedAt(VAddr address, u64 size, bool written = true);
     bool PlacedMeets(VAddr address, u64 size) const;
     const Buffer* Place(std::vector<u64> ids, VAddr begin, VAddr end);
-    void Demote(VAddr begin, bool by_request);
     void DropPlaced(VAddr begin, const char* why = "?");
     /// B9.4: a resident object's binding resolution names `buffer` from now on (a placed buffer remembers it, so freeing the buffer resets it)
     void NoteResolutionUser(const Buffer* buffer, u64 id);
