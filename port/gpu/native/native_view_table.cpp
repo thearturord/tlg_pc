@@ -196,7 +196,9 @@ nlohmann::json Report() {
                     {"real_note_147", {{"stages_bound_from_the_table", c(StRealServed)}, {"written_bindings_bound_from_the_table", c(StRealServedWritten)},
                                         {"stages_refused_same_image_twice", c(StRealRefusedTwice)}}}};
     j["real"] = {{"stages_bound_from_the_table", c(RealServed)}, {"image_bindings_bound_from_the_table", c(RealServedImages)}, {"stages_audited_by_the_old_path", c(RealAudited)},
-                 {"stages_whose_image_checks_failed", c(RealCheckFailed)}, {"sampled_targets_bound_note_160", c(RealServedTargets)}};
+                 {"stages_whose_image_checks_failed", c(RealCheckFailed)}, {"sampled_targets_bound_note_160", c(RealServedTargets)},
+                 {"same_image_twice_note_170", {{"stages_the_real_mode_would_bind", c(TwiceWouldServe)}, {"stages_bound", c(TwiceServed)},
+                                                {"sampled_force_general_bindings_bound", c(ForceGeneralServed)}}}};
     j["dynamic_note_163"] = {{"mode", DynamicMode()}, {"bound_from_own_image", c(DynServed)}, {"uploads", c(DynRefreshed)}, {"refused", c(DynRefused)},
                              {"not_dynamic", c(DynNotDynamic)}, {"shadow_same", c(DynShadowSame)}, {"shadow_old_path_other_image", c(DynShadowOldOther)},
                              {"DYNAMIC_WINDOW_DIFFERENT_MUST_BE_0", c(DynWindowDifferent)}};

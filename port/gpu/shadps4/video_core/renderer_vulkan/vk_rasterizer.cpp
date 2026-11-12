@@ -6965,6 +6965,18 @@ u32 TargetTailMode() noexcept {
 }
 }
 
+namespace {
+/// Note 170 (plan R2.7, `TLG_TWICE_TAIL`: 0 off until the owner's play, 1 shadow, 2 real): a stage that binds the same image twice, one binding written, bound by the tail
+/// with the old path's two passes (all flags first, then the transits), and a sampled image with force general set bound with the old path's general transit.
+u32 TwiceTailMode() {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_TWICE_TAIL");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
+}
+
 bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const TextureSet& set, u32 count, Shader::Backend::Bindings& binding) {
     // Everything the slow path does to an image before it looks at the view: touch and refresh. Idempotent, so a miss after it costs nothing.
     // Note 147: a written (storage) image is refreshed at its commit, after it is marked GPU-modified, in FindTexture's order.
@@ -6980,21 +6992,30 @@ bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const Textur
             texture_cache.UpdateImage(entry.id, Core::ImageCaller::RasterizerBindTextures);
         }
     }
+    // note 170: the old path's first pass sets the flags of every image of the stage before its second pass makes any transit; for one image bound twice (one binding
+    // written) the flags a binding sees in the second pass are the ones after the whole first pass.
+    const u32 twice_mode = TwiceTailMode();
+    bool twice = false;
     if (any_storage) {
-        // note 111: the same image twice in the stage, one binding written: the old path's answer depends on the order of its two passes (refused)
-        for (u32 i = 0; i < count; ++i) {
+        // note 111: the same image twice in the stage, one binding written: the old path's answer depends on the order of its two passes (refused unless note 170)
+        for (u32 i = 0; i < count && !twice; ++i) {
             if (set.entries[i].null_entry) {
                 continue;
             }
             for (u32 j = i + 1; j < count; ++j) {
                 if (!set.entries[j].null_entry && set.entries[j].id == set.entries[i].id && (set.entries[i].storage || set.entries[j].storage)) {
-                    Core::ViewTable::Note(Core::ViewTable::StRealRefusedTwice);
-                    t_vt_refuse = Core::Coverage::IrTailSameImageTwice;
-                    return false;
+                    twice = true;
+                    break;
                 }
             }
         }
+        if (twice && twice_mode == 0) {
+            Core::ViewTable::Note(Core::ViewTable::StRealRefusedTwice);
+            t_vt_refuse = Core::Coverage::IrTailSameImageTwice;
+            return false;
+        }
     }
+    const bool lift_force = twice_mode == 2 || (twice && twice_mode == 1); // (the shadow checks the stage as the real mode would, then refuses it)
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];
         if (entry.null_entry) {
@@ -7006,13 +7027,32 @@ bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const Textur
         // (a written image's own transit is the same with force_general set: only a sampled one refuses it)
         // (note 160: a sampled render target takes the old path's feedback-loop layout below; a written one is still refused)
         const bool target_refused = image.binding.is_target && (entry.storage || TargetTailMode() != 2);
-        if (image.backing != entry.backing || image.binding.needs_rebind || (!entry.storage && image.binding.force_general) || target_refused ||
+        // (note 170: in the real mode a sampled image with force general takes the old path's general transit below)
+        if (image.backing != entry.backing || image.binding.needs_rebind || (!entry.storage && image.binding.force_general && !lift_force) || target_refused ||
             (image.backing->num_samples > 1) != (image.info.num_samples > 1) || (redirected ? associated != entry.id : bool(associated))) {
             using namespace Core::Coverage;
             t_vt_refuse = image.backing != entry.backing ? IrTailBacking : image.binding.needs_rebind ? IrTailRebind : (!entry.storage && image.binding.force_general) ? IrTailForceGeneral
                           : target_refused ? IrTailTarget : (image.backing->num_samples > 1) != (image.info.num_samples > 1) ? IrTailSamples : IrTailDepth; // note 157
             return false;
         }
+    }
+    if (twice) {
+        if (twice_mode == 1) {
+            Core::ViewTable::Note(Core::ViewTable::TwiceWouldServe);
+            Core::ViewTable::Note(Core::ViewTable::StRealRefusedTwice);
+            t_vt_refuse = Core::Coverage::IrTailSameImageTwice;
+            return false;
+        }
+        // note 170: the old first pass, now for real; the commits below then only read the flags
+        for (u32 i = 0; i < count; ++i) {
+            if (set.entries[i].null_entry) {
+                continue;
+            }
+            auto& img = texture_cache.GetImage(set.entries[i].id);
+            img.binding.force_general |= img.binding.is_bound && set.entries[i].storage;
+            img.binding.is_bound = 1u;
+        }
+        Core::ViewTable::Note(Core::ViewTable::TwiceServed);
     }
     const u32 first_image_idx = image_infos.size();
     for (u32 i = 0; i < count; ++i) {
@@ -7028,8 +7068,10 @@ bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const Textur
         if (entry.storage) {
             // note 147: the old path's two passes for a written image, in their order: force general when already bound, bound, GPU-modified and the download queue, the refresh,
             // the general transit with read and write access, the storage use, the bound layout
-            image.binding.force_general |= image.binding.is_bound;
-            image.binding.is_bound = 1u;
+            if (!twice) {
+                image.binding.force_general |= image.binding.is_bound;
+                image.binding.is_bound = 1u;
+            }
             bound_images.emplace_back(entry.id);
             texture_cache.MarkStorageWrite(entry.id);
             texture_cache.UpdateImage(entry.id, Core::ImageCaller::FindTexture);
@@ -7041,8 +7083,17 @@ bool Rasterizer::BindTexturesFromEntries(const Shader::Info& stage, const Textur
             image_infos.emplace_back(VK_NULL_HANDLE, entry.view, bound_layout);
             continue;
         }
-        image.binding.is_bound = 1u;
+        image.binding.is_bound = 1u; // (note 170: already set by the first pass when `twice`)
         bound_images.emplace_back(entry.id);
+        if (image.binding.force_general && !image.binding.is_target && !image.info.props.is_depth) {
+            // note 170: the old second pass for a sampled image with force general (the same image is written in this operation): general with read and write over the range
+            needs_barrier |= runtime.Transit(&image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                                             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, entry.range);
+            image.usage.texture |= 1u;
+            image_infos.emplace_back(VK_NULL_HANDLE, entry.view, !image.backing || !runtime.PlannerDecidesLayouts() ? runtime.CurrentLayout(image) : vk::ImageLayout::eGeneral);
+            Core::ViewTable::Note(Core::ViewTable::ForceGeneralServed);
+            continue;
+        }
         if (image.binding.is_target && !image.info.props.is_depth) {
             // note 160: a render target of this draw sampled by it (a feedback loop), as the old path's second pass binds it: the feedback-loop layout where the device has it,
             // otherwise general with read and write

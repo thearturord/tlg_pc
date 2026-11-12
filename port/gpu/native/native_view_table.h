@@ -130,6 +130,9 @@ enum Count : u32 {
     StRealRefusedTwice,     ///< ... stages refused at the tail: the same image twice, one binding written
     NewImageEvents,         ///< ... the events (a texture with linked views got a new image)
     RealServedTargets,      ///< note 160: sampled render targets (feedback loops) bound by the tail with the old path's layout
+    TwiceWouldServe,        ///< note 170 shadow: stages refused only for the same image twice (one binding written) that the real mode would bind
+    TwiceServed,            ///< note 170 real: those stages bound by the tail with the old path's two passes
+    ForceGeneralServed,     ///< note 170 real: sampled image bindings with force general set, bound with the old path's general transit
     DynServed,              ///< note 163: dynamic texture bindings bound from the texture's own image
     DynRefreshed,           ///< ... uploads into those images (the window's bytes differed from the last upload)
     DynRefused,             ///< ... refused (another shape, too large, invalid T#, GPU-modified memory)
