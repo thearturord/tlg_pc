@@ -126,6 +126,10 @@ enum Compare : u32 { CmpSame, CmpAudited, CmpRefusedOldNative, CmpRefusedOldOld,
 /// Note 165 (plan R2.11, `TLG_DRAW_EXECUTOR`: 2 real by default since 2026-11-12, 1 shadow, 0 off): the same executor for the buffer bindings of a draw's stages.
 /// LEGACY(draw_executor): =0. One GPU fault (NVIDIA Xid 13 + 153) in its first real run, not reproduced since: see documents/tlg/native plan/reference/gpu-driver-crashes.md.
 [[nodiscard]] u32 DrawMode() noexcept;
+/// Note 166 (plan R2.12, `TLG_RESOLVED_ANSWERS`: 2 the R1b / R2 answers as before, the default until the owner's play; 1 shadow: they still answer, and the executor
+/// counts where each binding they answer would go without them; 0 deleted: the front resolves no object and the binder never takes them).
+[[nodiscard]] u32 ResolvedMode() noexcept;
+void NoteResolvedShadow(bool native) noexcept;
 /// Note 165: the counters the next notes go to (dispatches or draws).
 void SelectSet(bool draw) noexcept;
 /// Note 162: the shadow would synchronize (mode 1); the real sync left CPU bytes in the range (must not happen).

@@ -38,6 +38,7 @@ struct Set {
     std::array<std::atomic<u64>, RfCount> refused_old_native{};
     std::array<std::array<std::atomic<u64>, OwCount>, RfCount> refused_own_why{};
     std::atomic<u64> real{0}, real_all_executor{0}, shadowed{0}, real_bindings{0}, real_refused{0}, sync_would{0}, sync_left{0};
+    std::atomic<u64> resolved_shadow_native{0}, resolved_shadow_old{0}; ///< note 166
 };
 std::array<Set, 2> g_sets{};
 thread_local u32 t_set = 0;
@@ -56,6 +57,10 @@ const u32 g_draw_mode = [] {
         return 2u; // default 2 (real) since 2026-11-12 after the owner's play p5play (note 165); LEGACY(draw_executor): =0 the old body binds every draw binding, =1 shadow
     }
     return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
+}();
+const u32 g_resolved = [] {
+    const char* e = std::getenv("TLG_RESOLVED_ANSWERS");
+    return e == nullptr || e[0] == 0 ? 2u : e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u; // note 166: 2 (as before) until the owner's play, 1 shadow, 0 deleted
 }();
 const u32 g_own_sync = [] {
     const char* e = std::getenv("TLG_OWN_SYNC");
@@ -119,6 +124,7 @@ nlohmann::json Report() {
             }
         }
         x["compare_same"] = r(c.compare[CmpSame]);
+        x["resolved_answers_note_166"] = {{"mode", g_resolved}, {"shadow_would_be_native", r(c.resolved_shadow_native)}, {"shadow_would_take_the_old_body", r(c.resolved_shadow_old)}};
         x["compare_own_sync_where_the_old_body_copied"] = r(c.compare[CmpOwnSyncOld]);
         x["own_sync_mode"] = g_own_sync;
         x["own_sync_shadow_would_sync"] = r(c.sync_would);
@@ -220,6 +226,14 @@ void NoteCompare(u32 what, u32 refusal) noexcept {
     if (what == CmpRefusedOldNative && refusal < RfCount) {
         S().refused_old_native[refusal].fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+u32 ResolvedMode() noexcept {
+    return g_resolved;
+}
+
+void NoteResolvedShadow(bool native) noexcept {
+    (native ? S().resolved_shadow_native : S().resolved_shadow_old).fetch_add(1, std::memory_order_relaxed);
 }
 
 u32 DrawMode() noexcept {

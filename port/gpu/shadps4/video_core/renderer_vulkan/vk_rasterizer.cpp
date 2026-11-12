@@ -4965,7 +4965,7 @@ void Rasterizer::BindBufferLegacy(const Shader::Info& stage, u32 buffer_index, S
             if (const StagePlan* rs = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
                                       : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
                                                                                                                   : nullptr;
-                rs != nullptr && buffer_index < rs->resolved.size() && rs->resolved[buffer_index].object != nullptr) {
+                rs != nullptr && buffer_index < rs->resolved.size() && rs->resolved[buffer_index].object != nullptr && Core::DispatchExecutor::ResolvedMode() != 0) { // (note 166)
                 // R2: resolved by the command processor from the record's engine object; bound when its stamps hold
                 const ResolvedBuffer& r = rs->resolved[buffer_index];
                 if (rs->resolved_epoch == Core::NativeResources::ImmutableEpoch()) {
@@ -5732,56 +5732,71 @@ bool Rasterizer::ExecutorDecide(const Shader::Info& stage, u32 buffer_index, Exe
             }
         }
     }
-    if (op != nullptr && buffer_index < op->resolved.size() && op->resolved[buffer_index].object != nullptr && op->resolved_epoch == Core::NativeResources::ImmutableEpoch()) {
-        return refuse(RfResolved); // R1b / R2 (note 137 B): old; refused whether or not their stamps hold (a stale one goes on to the record's words, the old body decides that)
-    }
-    AmdGpu::Buffer chosen_sharp;
-    bool from_record = false;
-    if (binder_plan != nullptr && desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
-        if (const u32* words = BinderWords(stage, desc.sharp_fetch.offsets[0], 4, 1)) {
-            chosen_sharp = desc.FromWords(words, stage);
-            from_record = true;
+    // the record's descriptor words: null, program constants, the hook ring window, else ObtainBuffer (refused)
+    const auto decide_words = [&](ExecAnswer& a) -> bool {
+        const auto refuse = [&a](u32 why) {
+            a.kind = ExRefuse;
+            a.refusal = why;
+            return false;
+        };
+        AmdGpu::Buffer chosen_sharp;
+        bool from_record = false;
+        if (binder_plan != nullptr && desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
+            if (const u32* words = BinderWords(stage, desc.sharp_fetch.offsets[0], 4, 1)) {
+                chosen_sharp = desc.FromWords(words, stage);
+                from_record = true;
+            }
         }
-    }
-    if (!from_record) {
-        if (StageFlatSkipped(stage) && desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::MultiLoad) {
-            return refuse(RfNoRecord);
+        if (!from_record) {
+            if (StageFlatSkipped(stage) && desc.sharp_fetch.summary != Shader::SharpFetch<AmdGpu::Buffer>::Summary::MultiLoad) {
+                return refuse(RfNoRecord);
+            }
+            chosen_sharp = desc.GetSharp(stage);
         }
-        chosen_sharp = desc.GetSharp(stage);
-    }
-    const Core::NativeDesc::BufferDesc vsharp = Core::NativeDesc::BufferDescOf(chosen_sharp);
-    if (vsharp.address == 0 || vsharp.size == 0) {
-        a.kind = ExNull;
-        return true;
-    }
-    if (vsharp.size >= (1ull << 30) && !memory->IsValidMapping(vsharp.address)) {
-        return refuse(RfUnmapped);
-    }
-    const u64 size = memory->ClampRangeSize(vsharp.address, vsharp.size);
-    if (size != vsharp.size) {
-        return refuse(RfUnmapped);
-    }
-    a.address = vsharp.address;
-    a.size = size;
-    if (desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase && !desc.is_written) {
-        // note 144: constants inside the shader's own memory, from the kept copy (made or refreshed at the commit)
-        const auto& pc_ring = VideoCore::UntrackedRing::Get();
-        if (!(desc.is_formatted && (texture_cache.AnyImageOverlaps(vsharp.address, size) || texture_cache.IsMeta(vsharp.address))) && size <= 65536 &&
-            !(pc_ring.Active() && vsharp.address < pc_ring.End() && vsharp.address + size > pc_ring.Start()) && !buffer_cache.IsRangeGpuWritten(vsharp.address, size)) {
-            a.kind = ExProgramConsts;
+        const Core::NativeDesc::BufferDesc vsharp = Core::NativeDesc::BufferDescOf(chosen_sharp);
+        if (vsharp.address == 0 || vsharp.size == 0) {
+            a.kind = ExNull;
             return true;
         }
+        if (vsharp.size >= (1ull << 30) && !memory->IsValidMapping(vsharp.address)) {
+            return refuse(RfUnmapped);
+        }
+        const u64 size = memory->ClampRangeSize(vsharp.address, vsharp.size);
+        if (size != vsharp.size) {
+            return refuse(RfUnmapped);
+        }
+        a.address = vsharp.address;
+        a.size = size;
+        if (desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase && !desc.is_written) {
+            // note 144: constants inside the shader's own memory, from the kept copy (made or refreshed at the commit)
+            const auto& pc_ring = VideoCore::UntrackedRing::Get();
+            if (!(desc.is_formatted && (texture_cache.AnyImageOverlaps(vsharp.address, size) || texture_cache.IsMeta(vsharp.address))) && size <= 65536 &&
+                !(pc_ring.Active() && vsharp.address < pc_ring.End() && vsharp.address + size > pc_ring.Start()) && !buffer_cache.IsRangeGpuWritten(vsharp.address, size)) {
+                a.kind = ExProgramConsts;
+                return true;
+            }
+        }
+        // (in place, N7.5: off whenever the executor is on)
+        const auto [hook_buffer, hook_offset] = buffer_cache.HookRingAnswer(vsharp.address, static_cast<u32>(size), desc.is_written, desc.is_formatted); // note 156
+        if (hook_buffer == nullptr) {
+            return refuse(RfObtain);
+        }
+        a.kind = ExHookRingWindow;
+        a.buffer = hook_buffer;
+        a.handle = hook_buffer->Handle();
+        a.offset = hook_offset;
+        return true;
+    };
+    if (op != nullptr && buffer_index < op->resolved.size() && op->resolved[buffer_index].object != nullptr && op->resolved_epoch == Core::NativeResources::ImmutableEpoch() &&
+        ResolvedMode() != 0) {
+        if (ResolvedMode() == 1) {
+            // note 166 shadow: where this binding goes once the R1b / R2 answers are deleted
+            ExecAnswer alt = a;
+            NoteResolvedShadow(decide_words(alt));
+        }
+        return refuse(RfResolved); // R1b / R2 (note 137 B): old; refused whether or not their stamps hold (a stale one goes on to the record's words, the old body decides that)
     }
-    // (in place, N7.5: off whenever the executor is on)
-    const auto [hook_buffer, hook_offset] = buffer_cache.HookRingAnswer(vsharp.address, static_cast<u32>(size), desc.is_written, desc.is_formatted); // note 156
-    if (hook_buffer == nullptr) {
-        return refuse(RfObtain);
-    }
-    a.kind = ExHookRingWindow;
-    a.buffer = hook_buffer;
-    a.handle = hook_buffer->Handle();
-    a.offset = hook_offset;
-    return true;
+    return decide_words(a);
 }
 
 bool Rasterizer::ExecutorCommit(const Shader::Info& stage, u32 buffer_index, ExecAnswer& a, Shader::Backend::Bindings& binding, Shader::PushData& push_data, u64 alignment,
@@ -6315,7 +6330,7 @@ void Rasterizer::ResolveBufferBindingBody(const Shader::Info& stage, u32 buffer_
             if (const StagePlan* rs = resolved_draw != nullptr && static_cast<u32>(stage.sw_stage) < MaxShaderStages ? &resolved_draw->stages[static_cast<u32>(stage.sw_stage)]
                                       : resolved_dispatch != nullptr && stage.sw_stage == Shader::SwStage::Compute ? &resolved_dispatch->stage
                                                                                                                   : nullptr;
-                rs != nullptr && buffer_index < rs->resolved.size() && rs->resolved[buffer_index].object != nullptr) {
+                rs != nullptr && buffer_index < rs->resolved.size() && rs->resolved[buffer_index].object != nullptr && Core::DispatchExecutor::ResolvedMode() != 0) { // (note 166)
                 // R2: resolved by the command processor from the record's engine object; bound when its stamps hold
                 const ResolvedBuffer& r = rs->resolved[buffer_index];
                 if (rs->resolved_epoch == Core::NativeResources::ImmutableEpoch()) {

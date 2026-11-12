@@ -11,6 +11,7 @@
 #include "common/debug.h"
 #include "native/native_row_version.h"
 #include "native/native_hook_diff.h"
+#include "native/native_dispatch_executor.h"
 #include "native/native_debug_server.h"
 #include "native/native_log.h"
 #include "native/native_image_caller.h"
@@ -547,6 +548,8 @@ void Rasterizer::ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) 
             }
         }
         out.resolved.resize(info.buffers.size());
+        // note 166: the R1b / R2 object resolution (TLG_RESOLVED_ANSWERS=0 deletes it; the engine ids below stay, own memory reads them)
+        if (Core::DispatchExecutor::ResolvedMode() != 0)
         for (u32 i = 0; i < info.buffers.size(); ++i) {
             const auto& desc = info.buffers[i];
             if (desc.IsSpecial() || desc.is_written || desc.is_formatted || desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase ||
