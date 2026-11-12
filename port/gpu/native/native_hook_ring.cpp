@@ -883,6 +883,9 @@ nlohmann::json Report() {
         const auto hp = Core::NativeDraw::HookPlanCounts();
         j["hook_plan_note_183"] = {{"mode", Core::NativeDraw::HookPlanMode()}, {"hook_asked", hp[0]}, {"found_at_the_hook", hp[1]}, {"compared_same", hp[2]},
                                    {"HOOK_PLAN_DIFFERS_MUST_BE_0", hp[3]}, {"not_published_yet_at_the_hook", hp[4]}, {"published", hp[5]}};
+        const auto ct = Core::NativeDraw::CompactTakeCounts();
+        j["compact_take_note_186"] = {{"mode", Core::NativeDraw::CompactTakeMode()}, {"compared", ct[0]}, {"COMPACT_TAKE_DIFFERS_MUST_BE_0", ct[1]}, {"compact_takes", ct[2]},
+                                      {"fell_back_to_full_take", ct[3]}};
         j["hook_full_plan_note_185"] = {{"made_at_the_hook", hp[6]}, {"not_made_keys_unpublished", hp[7]}, {"used_by_the_front", hp[8]}, {"compared_same", hp[9]},
                                         {"HOOK_FULL_PLAN_DIFFERS_MUST_BE_0", hp[10]}, {"stages_remade_from_front_user_data", hp[11]}, {"dropped_epoch_moved", hp[12]},
                                         {"not_used_by_the_front", hp[13]}, {"recycled_at_slot_reuse", hp[14]}, {"inputs_refreshed_at_the_front", hp[15]}, {"samples", TlgHookPlanSamples()}};

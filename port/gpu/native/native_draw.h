@@ -322,6 +322,16 @@ struct MapUpload {
 void PublishHookPlan(u64 stage_key, u64 fixed, u64 pipeline) noexcept;
 void NoteHookPlan(u32 what) noexcept;
 [[nodiscard]] std::array<u64, 16> HookPlanCounts() noexcept;
+/// Note 186 (plan R3.4d-2, `TLG_COMPACT_TAKE`: 0 off, 1 shadow, 2 real): a draw the hook planned is taken from its record as a compact command: the header fields, the
+/// typed user data and the geometry ids; no binding list copy, no register grouping, no inputs hash (the hook made them). False: not a draw record (take it the full way).
+bool TakeExecDrawCompact(u64 seq, ExecDraw& out);
+[[nodiscard]] u32 CompactTakeMode() noexcept;
+/// Note 186: RebuildSkippedUserData from the record's own binding list (in place, no copy).
+void RebuildSkippedUserDataFromRecord(u64 seq, u8 ud_skipped, std::array<u32, 16>& vs, std::array<u32, 16>& ps);
+/// Note 186 shadow: the fields the front reads of a compact take against the full take. 0 compared, 1 COMPACT_TAKE_DIFFERS_MUST_BE_0, 2 real compact takes, 3 real fell back
+void CompareCompactTake(const ExecDraw& full, const ExecDraw& compact) noexcept;
+void NoteCompactTake(u32 what) noexcept;
+[[nodiscard]] std::array<u64, 4> CompactTakeCounts() noexcept;
 /// The planner the hook calls (the rasterizer, thread safe): a plan (owned by the caller) or null; `epoch` gets the pipeline epoch it was made under.
 using HookPlanner = void* (*)(const ExecDraw& draw, std::span<const u32, 16> vs, std::span<const u32, 16> ps, u32 draw_class, u64* epoch);
 using HookPlanRecycler = void (*)(void* plan);

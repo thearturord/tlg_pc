@@ -73,6 +73,7 @@
 ///   TLG_PURE_PLAN=0            the typed planner uses the shared shader infos as scratch (user data, program base, flat user data) (note 182)
 ///   TLG_PUBLISHED_PLAN=0       the typed plan reads the front's own caches (exec_inputs, exec_pipelines) instead of the published read-only copies (note 184)
 ///   TLG_HOOK_PLAN=0            the front plans every executed draw itself instead of taking the plan the hook made at record time (note 185; =1 shadow, =2 real)
+///   TLG_COMPACT_TAKE=0         a hook-planned draw is taken with its whole record (binding list copy, register grouping, inputs hash) instead of its header and user data (note 186)
 namespace Core::Legacy {
 
 

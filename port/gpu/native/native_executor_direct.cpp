@@ -151,19 +151,9 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
     native_exec_calls++;
     Core::NativeDraw::ExecDraw draw;
     bool took_record = false;
-    if (rasterizer) {
-        TLG_PROF_LEVEL("front.take_record", 2); // D0.2: the record copy, one of the unprobed parts of the front thread's own time
-        took_record = Core::NativeDraw::TakeExecDraw(native_tag_pending.seq, draw, true);
-    }
-    if (!took_record) {
-        native_tag_pending.valid = false;
-        Core::NativeReadbacks::ClearPending(native_tag_pending.seq); // M4
-        TLG_LOG(CP, Error, "native draw: the record {} is gone, a draw is lost ({})", native_tag_pending.seq, Core::NativeDraw::DescribeMissingRecord(native_tag_pending.seq));
-        return;
-    }
     // note 185: the plan the hook made for this record (handed back on every path that does not take it)
     u64 hook_epoch = 0;
-    void* hook_plan = draw.kind <= 2 && Core::NativeDraw::HookPlanMode() != 0 ? Core::NativeDraw::TakeHookPlan(draw.seq, hook_epoch) : nullptr;
+    void* hook_plan = rasterizer && Core::NativeDraw::HookPlanMode() != 0 ? Core::NativeDraw::TakeHookPlan(native_tag_pending.seq, hook_epoch) : nullptr;
     struct HookPlanGuard {
         void*& plan;
         ~HookPlanGuard() {
@@ -173,6 +163,33 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
             }
         }
     } hook_plan_guard{hook_plan};
+    bool compact = false; // note 186: the draw was taken as a compact command (no binding list, no register list)
+    if (rasterizer) {
+        TLG_PROF_LEVEL("front.take_record", 2); // D0.2: the record copy, one of the unprobed parts of the front thread's own time
+        if (hook_plan != nullptr && Core::NativeDraw::HookPlanMode() == 2 && Core::NativeDraw::CompactTakeMode() == 2) {
+            compact = Core::NativeDraw::TakeExecDrawCompact(native_tag_pending.seq, draw);
+            Core::NativeDraw::NoteCompactTake(compact ? 2 : 3);
+            took_record = compact;
+        }
+        if (!compact) {
+            took_record = Core::NativeDraw::TakeExecDraw(native_tag_pending.seq, draw, true);
+        }
+        if (took_record && hook_plan != nullptr && Core::NativeDraw::CompactTakeMode() == 1) [[unlikely]] {
+            static thread_local std::unique_ptr<Core::NativeDraw::ExecDraw> shadow;
+            if (!shadow) {
+                shadow = std::make_unique<Core::NativeDraw::ExecDraw>();
+            }
+            if (Core::NativeDraw::TakeExecDrawCompact(native_tag_pending.seq, *shadow)) {
+                Core::NativeDraw::CompareCompactTake(draw, *shadow); // note 186 shadow
+            }
+        }
+    }
+    if (!took_record) {
+        native_tag_pending.valid = false;
+        Core::NativeReadbacks::ClearPending(native_tag_pending.seq); // M4
+        TLG_LOG(CP, Error, "native draw: the record {} is gone, a draw is lost ({})", native_tag_pending.seq, Core::NativeDraw::DescribeMissingRecord(native_tag_pending.seq));
+        return;
+    }
     if (asc_vqid != ~0u && asc_vqid < NumTotalQueues && draw.kind != 10 && draw.kind != 6) {
         asc_noncopy_issued[asc_vqid].fetch_add(1, std::memory_order_release); // a result the CPU may read (dispatch, counter read-back, ...): a fence of this queue must wait for the raster thread
     }
@@ -336,7 +353,11 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
             exec_pixel_user_data[i] = draw.ps_user_data[i];
         }
         if (draw.ud_skipped != 0) [[unlikely]] {
-            Core::NativeDraw::RebuildSkippedUserData(draw, exec_vertex_user_data, exec_pixel_user_data); // note 179
+            if (compact) {
+                Core::NativeDraw::RebuildSkippedUserDataFromRecord(draw.seq, draw.ud_skipped, exec_vertex_user_data, exec_pixel_user_data); // note 186
+            } else {
+                Core::NativeDraw::RebuildSkippedUserData(draw, exec_vertex_user_data, exec_pixel_user_data); // note 179
+            }
         }
     }
     native_inputs_key = 0;
@@ -400,6 +421,12 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
                     hook_plan = nullptr;
                 }
                 if (!plan) {
+                    if (compact) {
+                        // note 186: the hook's plan is not usable now: the full record for the front's own planning (the user data are already applied)
+                        Core::NativeDraw::TakeExecDraw(native_tag_pending.seq, draw, true);
+                        compact = false;
+                        native_inputs_key = draw.inputs_key;
+                    }
                     TLG_PROF_LEVEL("front.plan_exec_draw", 2);
                     plan = make_plan();
                 }

@@ -1105,6 +1105,7 @@ struct NativeRecord {
     u8 hook_plan_state{}; ///< note 183
     std::atomic<void*> hook_plan{nullptr}; ///< note 185: the plan the hook made (owned by the record until the front takes it)
     u64 hook_plan_seq{}, hook_plan_epoch{}; ///< note 185
+    u64 hook_inputs_key{}; ///< note 186: the inputs key the hook made (valid with hook_plan_seq)
     MapUpload map_upload{}; ///< note 173: the Map upload copy of this record (valid when `map_upload.seq` is this record's number)
     u32 count{};
     const StatePackage* package{}; ///< A5.3: the state package the first `package->count` registers are a copy of (valid when `package_for` is this record's number)
@@ -4971,6 +4972,168 @@ static bool TakeExecDrawImpl(u64 seq, ExecDraw& out, bool typed, bool allow_lazy
     return slot.seq.load(std::memory_order_acquire) == seq;
 }
 
+namespace {
+std::array<std::atomic<u64>, 4> g_compact{};
+std::atomic<u32> g_compact_logged{0};
+} // namespace
+
+u32 CompactTakeMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_COMPACT_TAKE");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // note 186: 0 off, 1 shadow, 2 real
+    }();
+    return mode;
+}
+void NoteCompactTake(u32 what) noexcept {
+    if (what < g_compact.size()) {
+        g_compact[what].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+std::array<u64, 4> CompactTakeCounts() noexcept {
+    std::array<u64, 4> out{};
+    for (u32 i = 0; i < out.size(); ++i) {
+        out[i] = g_compact[i].load(std::memory_order_relaxed);
+    }
+    return out;
+}
+
+bool TakeExecDrawCompact(u64 seq, ExecDraw& out) {
+    NoteConsumed(seq);
+    out.seq = seq;
+    out.lazy = nullptr;
+    auto& slot = Slot(seq);
+    if (slot.seq.load(std::memory_order_acquire) != seq || slot.kind > 2 || slot.hook_plan_seq != seq) {
+        return false;
+    }
+    // what the full take gives a typed draw, less the binding list, the register list and the hashes the hook made
+    out.bindings_overflow = slot.bindings_for == seq && slot.bindings_overflow;
+    out.binding_count = 0;
+    out.bindings_complete = false;
+    if (slot.bindings_for == seq && !slot.bindings_overflow && (slot.binding_count != 0 || slot.no_inputs)) {
+        out.binding_count = slot.binding_count; // (the list stays in the record; the plan holds its copy)
+        out.bindings_complete = true;
+    }
+    out.geometry_id_count = 0;
+    if (slot.bindings_for == seq) {
+        out.geometry_id_count = slot.geometry_id_count;
+        for (u32 i = 0; i < slot.geometry_id_count; ++i) {
+            out.geometry_ids[i] = slot.geometry_ids[i];
+        }
+    }
+    out.typed = true;
+    out.vs_user_data_mask = 0;
+    out.ps_user_data_mask = 0;
+    const auto user_data_slot = [&](u32 index, u32 value) {
+        if (index - VsUserDataRegister < 16) {
+            out.vs_user_data[index - VsUserDataRegister] = value;
+            out.vs_user_data_mask |= 1u << (index - VsUserDataRegister);
+            return true;
+        }
+        if (index - PsUserDataRegister < 16) {
+            out.ps_user_data[index - PsUserDataRegister] = value;
+            out.ps_user_data_mask |= 1u << (index - PsUserDataRegister);
+            return true;
+        }
+        return false;
+    };
+    for (u32 i = 0; i < slot.count; ++i) {
+        user_data_slot(slot.regs[i].index, slot.regs[i].value);
+    }
+    for (u32 c = 0; c < slot.check_count; ++c) {
+        const auto& check = slot.checks[c];
+        const u64 address = check.kind == 30 || check.kind == 31 ? ArenaWindowAddress(reinterpret_cast<const void*>(check.address)) : check.address;
+        if ((check.reg + 1 - VsUserDataRegister < 16 || check.reg + 1 - PsUserDataRegister < 16) && user_data_slot(check.reg, static_cast<u32>(address))) {
+            user_data_slot(check.reg + 1, static_cast<u32>(address >> 32) | check.hi_flags);
+        }
+    }
+    out.count = 0;
+    out.grouped = slot.count != 0 ? slot.count : 1;
+    out.group_sig = slot.group_sig;
+    {
+        const std::array<u32, 5> needed{GroupOther, GroupVsProgram, GroupPsProgram, GroupInterpolants, GroupTargets};
+        bool known = true;
+        Hasher h;
+        for (const u32 group : needed) {
+            known &= slot.group_sig[group] != 0;
+            h.Add(slot.group_sig[group]);
+        }
+        h.Add(slot.desc_key[0]);
+        h.Add(slot.desc_key[1]);
+        out.stage_key = known ? h.h | 1 : 0;
+    }
+    out.inputs_key = slot.hook_inputs_key;
+    out.kind = slot.kind;
+    out.start_index = slot.a2;
+    out.a1 = slot.a1;
+    out.args_addr = slot.args_addr;
+    out.extra_addr = slot.extra_addr;
+    out.offset = slot.a2;
+    out.vertex_sgpr = slot.vertex_sgpr;
+    out.cb_extent = slot.cb_extent;
+    out.cb_extent_mask = slot.cb_extent_mask;
+    out.db_extent = slot.db_extent;
+    out.target_resources = slot.target_resources;
+    out.native_targets = slot.native_targets_seq == seq ? slot.native_targets : nullptr;
+    out.has_extents = true;
+    out.cb_extents_only = false;
+    out.instance_sgpr = slot.instance_sgpr;
+    out.fixed = slot.fixed;
+    out.args = slot.args;
+    out.vs_gnm = slot.vs_gnm;
+    out.ps_gnm = slot.ps_gnm;
+    out.shader_ids = slot.shader_ids;
+    out.hook_pipeline = slot.hook_pipeline;
+    out.hook_plan_state = slot.hook_plan_state;
+    out.ud_skipped = slot.ud_skipped;
+    out.ud_would_skip = slot.ud_would_skip;
+    out.fetch_object = slot.dbg_fetch;
+    out.other_stage = slot.other_stage;
+    out.dst_usage = ~0u;
+    return slot.seq.load(std::memory_order_acquire) == seq;
+}
+
+void CompareCompactTake(const ExecDraw& a, const ExecDraw& b) noexcept {
+    g_compact[0].fetch_add(1, std::memory_order_relaxed);
+    const char* what = nullptr;
+    const auto masked_equal = [](u16 mask, const std::array<u32, 16>& x, const std::array<u32, 16>& y) {
+        for (u32 m = mask; m != 0; m &= m - 1) {
+            const u32 i = static_cast<u32>(std::countr_zero(m));
+            if (x[i] != y[i]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (a.seq != b.seq || a.kind != b.kind || a.start_index != b.start_index || a.a1 != b.a1 || a.args_addr != b.args_addr || a.offset != b.offset ||
+        a.vertex_sgpr != b.vertex_sgpr || a.instance_sgpr != b.instance_sgpr) {
+        what = "header";
+    } else if (a.cb_extent != b.cb_extent || a.cb_extent_mask != b.cb_extent_mask || a.db_extent != b.db_extent || a.target_resources != b.target_resources ||
+               a.native_targets != b.native_targets || a.has_extents != b.has_extents || a.cb_extents_only != b.cb_extents_only) {
+        what = "targets";
+    } else if (a.fixed != b.fixed || std::memcmp(&a.args, &b.args, sizeof(a.args)) != 0 || a.other_stage != b.other_stage) {
+        what = "fixed state or arguments";
+    } else if (a.typed != b.typed || a.vs_user_data_mask != b.vs_user_data_mask || a.ps_user_data_mask != b.ps_user_data_mask ||
+               !masked_equal(a.vs_user_data_mask, a.vs_user_data, b.vs_user_data) || !masked_equal(a.ps_user_data_mask, a.ps_user_data, b.ps_user_data)) {
+        what = "user data";
+    } else if (a.stage_key != b.stage_key || a.inputs_key != b.inputs_key || (a.grouped != 0) != (b.grouped != 0)) {
+        what = "keys";
+    } else if (a.shader_ids != b.shader_ids || a.ud_skipped != b.ud_skipped || a.ud_would_skip != b.ud_would_skip || a.vs_gnm != b.vs_gnm || a.ps_gnm != b.ps_gnm ||
+               a.fetch_object != b.fetch_object) {
+        what = "shaders";
+    } else if (a.binding_count != b.binding_count || a.bindings_complete != b.bindings_complete || a.bindings_overflow != b.bindings_overflow ||
+               a.geometry_id_count != b.geometry_id_count || !std::equal(a.geometry_ids.begin(), a.geometry_ids.begin() + a.geometry_id_count, b.geometry_ids.begin())) {
+        what = "bindings or geometry";
+    }
+    if (what != nullptr) {
+        g_compact[1].fetch_add(1, std::memory_order_relaxed);
+        if (g_compact_logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+            LOG_WARNING(Core, "note 186: the compact take of record {} differs from the full take: {}", a.seq, what);
+        }
+    }
+}
+
+void RebuildSkippedUserDataFromRecord(u64 seq, u8 ud_skipped, std::array<u32, 16>& vs, std::array<u32, 16>& ps);
+
 void MaterializeRegs(ExecDraw& d) {
     if (d.lazy == nullptr) {
         return;
@@ -5063,12 +5226,24 @@ void NoteCoveredShader(u64 id, u64 gnm) noexcept {
     NoteCoveredShaderImpl(id, gnm);
 }
 
+static void RebuildSkippedUserDataList(const RecordBinding* list, u32 list_count, u8 ud_skipped, std::array<u32, 16>& vs, std::array<u32, 16>& ps);
+
 void RebuildSkippedUserData(const ExecDraw& draw, std::array<u32, 16>& vs, std::array<u32, 16>& ps) {
+    RebuildSkippedUserDataList(draw.bindings.data(), draw.binding_count, draw.ud_skipped, vs, ps);
+}
+
+void RebuildSkippedUserDataFromRecord(u64 seq, u8 ud_skipped, std::array<u32, 16>& vs, std::array<u32, 16>& ps) {
+    const auto& slot = Slot(seq);
+    const u32 n = slot.bindings_for == seq && !slot.bindings_overflow ? slot.binding_count : 0u;
+    RebuildSkippedUserDataList(slot.bindings.data(), n, ud_skipped, vs, ps); // note 186: in place (the record is the front's until it is consumed)
+}
+
+static void RebuildSkippedUserDataList(const RecordBinding* list, u32 list_count, u8 ud_skipped, std::array<u32, 16>& vs, std::array<u32, 16>& ps) {
     // note 179: the descriptors of each skipped stage back into its SGPRs, and its descriptor tables (the listed slots) into the front's arena, their pointers into the SGPRs
     static thread_local std::vector<u32> arena(1u << 18);
     static thread_local u32 arena_at = 0;
     for (u32 st = 0; st < 2; ++st) {
-        if (((draw.ud_skipped >> st) & 1) == 0) {
+        if (((ud_skipped >> st) & 1) == 0) {
             continue;
         }
         auto& ud = st == 0 ? vs : ps;
@@ -5079,8 +5254,8 @@ void RebuildSkippedUserData(const ExecDraw& draw, std::array<u32, 16>& vs, std::
         };
         std::array<Table, 8> tables{};
         u32 table_count = 0;
-        for (u32 i = 0; i < draw.binding_count; ++i) {
-            const auto& b = draw.bindings[i];
+        for (u32 i = 0; i < list_count; ++i) {
+            const auto& b = list[i];
             if (b.stage != st) {
                 continue;
             }
@@ -5109,8 +5284,8 @@ void RebuildSkippedUserData(const ExecDraw& draw, std::array<u32, 16>& vs, std::
             u32* table = arena.data() + arena_at;
             arena_at += (dwords + 63) & ~63u;
             std::memset(table, 0, dwords * sizeof(u32));
-            for (u32 i = 0; i < draw.binding_count; ++i) {
-                const auto& b = draw.bindings[i];
+            for (u32 i = 0; i < list_count; ++i) {
+                const auto& b = list[i];
                 if (b.stage == st && b.offset == 0xffff && b.table_sgpr == tables[t].sgpr) {
                     for (u32 k = 0; k < b.dwords && k < tables[t].entry; ++k) {
                         table[b.slot * tables[t].entry + k] = b.words[k];
@@ -5191,6 +5366,7 @@ void HookPlanDraw(u64 seq, u64 ctx, u32 draw_class) {
     auto& slot = Slot(seq);
     slot.hook_plan_seq = seq;
     slot.hook_plan_epoch = epoch;
+    slot.hook_inputs_key = d.inputs_key;
     if (void* old = slot.hook_plan.exchange(plan, std::memory_order_acq_rel); old != nullptr) {
         RecycleHookPlanImpl(old);
     }
