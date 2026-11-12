@@ -262,6 +262,9 @@ struct ExecDraw {
     u32 copy_bytes{};
     DrawArgs args{}; ///< E1b
     bool other_stage{}; ///< F3.2: a hull, domain or geometry shader is bound in the device context (ctx +0x4678 / +0x4680 / +0x4688)
+    std::array<u64, 2> shader_ids{}; ///< note 179: the engine ids of the vertex and pixel shader objects (0: none)
+    u8 ud_skipped{};     ///< note 179: bit per stage (0 vertex, 1 pixel) whose descriptor user data the hook did not write (rebuilt from the bindings by RebuildSkippedUserData)
+    u8 ud_would_skip{};  ///< note 179 shadow: bit per stage the real mode would skip
     u64 vs_gnm{}, ps_gnm{}, fetch_object{}; ///< E1c: the Gnm blocks of the draw's vertex and pixel shader objects and the input layout's fetch object (0: unknown)
     const Vulkan::FixedState* fixed{}; ///< draws: the fixed-function state built from the engine's objects (null: from the registers)
     u32 dst_usage{~0u};                ///< copy and counter read-back records: Usage of the destination resource (3 staging)
@@ -303,6 +306,17 @@ struct MapUpload {
     u32 width{}, height{}, bytes{}, pitch{};
     u64 destination{};  ///< the texture's memory (its T#'s base), which the destination image must be at
 };
+/// Note 179 (plan R3.4c, `TLG_SKIP_USER_DATA`: 0 off until the owner's play, 1 shadow, 2 real): a shader object (engine id, Gnm block) whose stage the planner found covered by
+/// the record's binding list; the hook then skips that stage's descriptor user data (the constant update engine's emulation).
+[[nodiscard]] u32 SkipUserDataMode() noexcept;
+void NoteCoveredShader(u64 id, u64 gnm) noexcept;
+/// Note 179: the front rebuilds the skipped descriptor user data of `draw` (stages in `ud_skipped`) from its binding list into the stage's user data registers; descriptor tables go
+/// into a front-thread arena.
+void RebuildSkippedUserData(const ExecDraw& draw, std::array<u32, 16>& vs, std::array<u32, 16>& ps);
+/// Note 179 counters: 0 shaders published covered, 1 stages skipped at the hook, 2 shadow stages the real mode would skip, 3 stages rebuilt at the front,
+/// 4 a skipped (or would-skip) stage the planner did not find covered (must be 0), 5 a covered id seen with another Gnm block (not skipped)
+void NoteSkipUserData(u32 what) noexcept;
+[[nodiscard]] std::array<u64, 6> SkipUserDataCounts() noexcept;
 /// Note 173: true and `out` when record `seq` is a Map upload copy.
 bool TakeMapUpload(u64 seq, MapUpload& out);
 /// The call site (ghidra address) that made the record `seq`; 0 when the record was recycled.

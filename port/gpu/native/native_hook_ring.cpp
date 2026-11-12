@@ -874,6 +874,12 @@ nlohmann::json Report() {
     }
     j["raster_1b"]["bound_answers_refused_by_their_compare"] = c_bound_refused.load();
     j["typed_buffers_note_175"] = Core::HookDiff::TypedReport();
+    {
+        const auto su = Core::NativeDraw::SkipUserDataCounts();
+        j["skip_user_data_note_179"] = {{"mode", Core::NativeDraw::SkipUserDataMode()}, {"shaders_published_covered", su[0]}, {"stages_skipped_at_the_hook", su[1]},
+                                        {"shadow_stages_would_skip", su[2]}, {"stages_rebuilt_at_the_front", su[3]}, {"SKIPPED_STAGE_NOT_COVERED_MUST_BE_0", su[4]},
+                                        {"covered_id_other_gnm_refused", su[5]}};
+    }
     j["raster_1b"]["open_map_guard_note_168"] = {{"mode", OpenMapGuardMode()}, {"small_reads_over_an_open_map", c_open_guard[0].load()},
                                                   {"wide_windows_over_an_open_map", c_open_guard[1].load()}, {"past_end_windows_over_an_open_map", c_open_guard[2].load()}};
     j["raster_1b"]["wide_reads_old_path"] = {{"count", c_raster_wide.load()}, {"bytes", c_raster_wide_bytes.load()}};

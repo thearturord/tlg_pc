@@ -1099,6 +1099,8 @@ struct SynthReg {
 struct StatePackage;
 struct NativeRecord {
     std::atomic<u64> seq{0};
+    std::array<u64, 2> shader_ids{}; ///< note 179
+    u8 ud_skipped{}, ud_would_skip{}; ///< note 179
     MapUpload map_upload{}; ///< note 173: the Map upload copy of this record (valid when `map_upload.seq` is this record's number)
     u32 count{};
     const StatePackage* package{}; ///< A5.3: the state package the first `package->count` registers are a copy of (valid when `package_for` is this record's number)
@@ -1794,10 +1796,80 @@ thread_local u64 dbg_fetch;
 
 u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out);
 
+// ---- note 179: covered shader objects (published by the planner, read by the hook)
+std::array<std::atomic<u64>, 8192> g_covered_id{};
+std::array<std::atomic<u64>, 8192> g_covered_gnm{};
+std::array<std::atomic<u64>, 6> g_skip_counts{};
+
+u32 SkipUserDataModeImpl() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_SKIP_USER_DATA");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // note 179: 0 off until the owner's play, 1 shadow, 2 real
+    }();
+    return mode;
+}
+
+void NoteSkipUserDataImpl(u32 what) noexcept {
+    if (what < g_skip_counts.size()) {
+        g_skip_counts[what].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+std::array<u64, 6> SkipUserDataCountsImpl() noexcept {
+    std::array<u64, 6> out{};
+    for (u32 i = 0; i < out.size(); ++i) {
+        out[i] = g_skip_counts[i].load(std::memory_order_relaxed);
+    }
+    return out;
+}
+
+void NoteCoveredShaderImpl(u64 id, u64 gnm) noexcept {
+    if (id == 0 || gnm == 0) {
+        return;
+    }
+    const u64 h = (id * 0x9E3779B97F4A7C15ull) >> 51;
+    for (u64 i = 0; i < 32; ++i) {
+        const u64 at = (h + i) & 8191;
+        u64 cur = g_covered_id[at].load(std::memory_order_acquire);
+        if (cur == id) {
+            return;
+        }
+        if (cur == 0) {
+            g_covered_gnm[at].store(gnm, std::memory_order_relaxed);
+            if (g_covered_id[at].compare_exchange_strong(cur, id, std::memory_order_acq_rel)) {
+                NoteSkipUserDataImpl(0);
+                return;
+            }
+            if (cur == id) {
+                return;
+            }
+        }
+    }
+}
+
+/// 0 not covered, 1 covered, 2 the id is covered with another Gnm block (refused)
+u32 CoveredShader(u64 id, u64 gnm) noexcept {
+    if (id == 0 || gnm == 0) {
+        return 0;
+    }
+    const u64 h = (id * 0x9E3779B97F4A7C15ull) >> 51;
+    for (u64 i = 0; i < 32; ++i) {
+        const u64 at = (h + i) & 8191;
+        const u64 cur = g_covered_id[at].load(std::memory_order_acquire);
+        if (cur == 0) {
+            return 0;
+        }
+        if (cur == id) {
+            return g_covered_gnm[at].load(std::memory_order_relaxed) == gnm ? 1u : 2u;
+        }
+    }
+    return 0;
+}
+
 /// User data of one stage (SGPR values the constant update engine would have written): descriptors of the bound
 /// objects copied by the shader's input usage table. `sgpr_base` = index of the stage's first user data register.
 void SynthesizeUserData(u64 ctx, u32 stage, u64 shader_block, u64 gnm, u64 inputs_offset, u32 sgpr_base, SynthReg* out,
-                        u32& n, NativeRecord& record) {
+                        u32& n, NativeRecord& record, bool skip = false) {
     if (!gnm) {
         return;
     }
@@ -1818,9 +1890,13 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 shader_block, u64 gnm, u64 input
     u32 pending_count = 0;
     bool have_eud_ptr = false;
     u32 eud_ptr_sgpr = 0;
-    const auto put = [&](u32 start, const u32* words, u32 size) {
+    // note 179: `skip` drops the descriptor words that would go into the SGPRs (the extended user data keeps them: rare, and its table holds other values too)
+    const auto put = [&](u32 start, const u32* words, u32 size, bool descriptor = false) {
         for (u32 i = 0; i < size; ++i) {
             const u32 reg = start + i;
+            if (reg < 16 && descriptor && skip) {
+                continue;
+            }
             if (reg < 16) {
                 sgpr[reg] = words[i];
                 sgpr_set[reg] = true;
@@ -1841,18 +1917,18 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 shader_block, u64 gnm, u64 input
         case 0: { // immediate resource (V# of 4 dwords or T# of 8)
             const u32 size = (flags & 1) ? 8 : 4;
             const u32 got = ResourceDescriptor(ctx, stage, slot, words.data(), size);
-            put(start, words.data(), size);
+            put(start, words.data(), size, true);
             NoteBinding(stage, got == 8 ? 2 : 1, slot, start, words.data(), size);
             break;
         }
         case 1: // immediate sampler
             SamplerDescriptor(ctx, stage, slot, words.data());
-            put(start, words.data(), 4);
+            put(start, words.data(), 4, true);
             NoteBinding(stage, 3, slot, start, words.data(), 4);
             break;
         case 2: // immediate constant buffer
             ConstBufferDescriptor(ctx, stage, slot, words.data());
-            put(start, words.data(), 4);
+            put(start, words.data(), 4, true);
             NoteBinding(stage, 1, slot, start, words.data(), 4);
             break;
         case 18: // pointer to the fetch shader
@@ -1866,7 +1942,7 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 shader_block, u64 gnm, u64 input
         case 4: { // immediate RW resource (compute)
             const u32 size = (flags & 1) ? 8 : 4;
             const u32 got = UavDescriptor(ctx, slot, words.data(), size);
-            put(start, words.data(), size);
+            put(start, words.data(), size, true);
             NoteBinding(stage, got == 8 ? 2 : 1, slot, start, words.data(), size);
             break;
         }
@@ -1939,6 +2015,31 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 shader_block, u64 gnm, u64 input
         case 25:   // pointer to the RW resource table (compute, 32 bytes per slot)
         case 21:   // pointer to the sampler table (16 bytes per slot)
         case 22: { // pointer to the constant buffer table (16 bytes per slot)
+            if (skip) {
+                // note 179: the slots the shader reads go into the record's list; no table, no pointer (the front rebuilds them for a path that needs the user data)
+                const auto used = EngineUsedSlots(shader_block, type);
+                const u32 limit = type == 19 ? 128u : type == 25 ? 8u : 16u;
+                std::array<u32, 8> tmp{};
+                for (u32 s = 0; s < limit; ++s) {
+                    if (((used[s >> 6] >> (s & 63)) & 1) == 0) {
+                        continue;
+                    }
+                    if (type == 19) {
+                        const u32 got = ResourceDescriptor(ctx, stage, s, tmp.data(), 8);
+                        NoteBinding(stage, got == 8 ? 2 : 1, s, 0xffff, tmp.data(), got, start, 8);
+                    } else if (type == 25) {
+                        const u32 got = UavDescriptor(ctx, s, tmp.data(), 8);
+                        NoteBinding(stage, got == 8 ? 2 : 1, s, 0xffff, tmp.data(), got, start, 8);
+                    } else if (type == 22) {
+                        ConstBufferDescriptor(ctx, stage, s, tmp.data());
+                        NoteBinding(stage, 1, s, 0xffff, tmp.data(), 4, start, 4);
+                    } else {
+                        SamplerDescriptor(ctx, stage, s, tmp.data());
+                        NoteBinding(stage, 3, s, 0xffff, tmp.data(), 4, start, 4);
+                    }
+                }
+                break;
+            }
             if (pending_count >= pending.size()) {
                 ++record.unsupported_inputs;
                 break;
@@ -3025,9 +3126,26 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
         slot.bindings_overflow = false;
         slot.bindings_for = seq;
         binding_record = &slot;
-        SynthesizeUserData(ctx, 0, vertex_shader + 0x30, slot.vs_gnm, 0x28, ShBase + 0x4c, slot.regs.data(), n, slot);
+        // note 179: a covered shader object's stage skips its descriptor user data (real mode), or is counted (shadow)
+        slot.shader_ids = {vertex_shader != 0 ? Rd<u64>(vertex_shader, 0x10) : 0, pixel_shader != 0 ? Rd<u64>(pixel_shader, 0x10) : 0};
+        slot.ud_skipped = slot.ud_would_skip = 0;
+        bool skip_stage[2] = {false, false};
+        if (const u32 skip_mode = SkipUserDataModeImpl(); skip_mode != 0 && kind <= 2) {
+            for (u32 st = 0; st < 2; ++st) {
+                const u32 covered = CoveredShader(slot.shader_ids[st], st == 0 ? slot.vs_gnm : slot.ps_gnm);
+                if (covered == 2) {
+                    NoteSkipUserDataImpl(5);
+                } else if (covered == 1) {
+                    slot.ud_would_skip |= static_cast<u8>(1u << st);
+                    skip_stage[st] = skip_mode == 2;
+                    NoteSkipUserDataImpl(skip_mode == 2 ? 1 : 2);
+                }
+            }
+        }
+        SynthesizeUserData(ctx, 0, vertex_shader + 0x30, slot.vs_gnm, 0x28, ShBase + 0x4c, slot.regs.data(), n, slot, skip_stage[0]);
         mr.Mark(3);
-        SynthesizeUserData(ctx, 1, pixel_shader + 0x30, slot.ps_gnm, 0x3c, ShBase + 0x0c, slot.regs.data(), n, slot);
+        SynthesizeUserData(ctx, 1, pixel_shader + 0x30, slot.ps_gnm, 0x3c, ShBase + 0x0c, slot.regs.data(), n, slot, skip_stage[1]);
+        slot.ud_skipped = static_cast<u8>((skip_stage[0] ? 1u : 0u) | (skip_stage[1] ? 2u : 0u));
         mr.Mark(4);
         binding_record = nullptr;
         if (Core::HookDiff::DiffShadow() && kind <= 2) [[unlikely]] {
@@ -4753,6 +4871,9 @@ static bool TakeExecDrawImpl(u64 seq, ExecDraw& out, bool typed, bool allow_lazy
     out.args = slot.args;
     out.vs_gnm = slot.vs_gnm;
     out.ps_gnm = slot.ps_gnm;
+    out.shader_ids = slot.kind <= 2 ? slot.shader_ids : std::array<u64, 2>{};
+    out.ud_skipped = slot.kind <= 2 ? slot.ud_skipped : 0;
+    out.ud_would_skip = slot.kind <= 2 ? slot.ud_would_skip : 0;
     out.fetch_object = slot.dbg_fetch;
     out.other_stage = slot.other_stage;
     out.dst_usage = slot.kind == 9 || slot.kind == 10 ? slot.dst_usage : ~0u;
@@ -4786,6 +4907,81 @@ u64 RecordCallerGhidra(u64 seq) {
 
 bool TakeMapUpload(u64 seq, MapUpload& out) {
     return TakeMapUploadImpl(seq, out); // note 173
+}
+
+u32 SkipUserDataMode() noexcept {
+    return SkipUserDataModeImpl();
+}
+void NoteSkipUserData(u32 what) noexcept {
+    NoteSkipUserDataImpl(what);
+}
+std::array<u64, 6> SkipUserDataCounts() noexcept {
+    return SkipUserDataCountsImpl();
+}
+void NoteCoveredShader(u64 id, u64 gnm) noexcept {
+    NoteCoveredShaderImpl(id, gnm);
+}
+
+void RebuildSkippedUserData(const ExecDraw& draw, std::array<u32, 16>& vs, std::array<u32, 16>& ps) {
+    // note 179: the descriptors of each skipped stage back into its SGPRs, and its descriptor tables (the listed slots) into the front's arena, their pointers into the SGPRs
+    static thread_local std::vector<u32> arena(1u << 18);
+    static thread_local u32 arena_at = 0;
+    for (u32 st = 0; st < 2; ++st) {
+        if (((draw.ud_skipped >> st) & 1) == 0) {
+            continue;
+        }
+        auto& ud = st == 0 ? vs : ps;
+        struct Table {
+            u32 sgpr;
+            u32 entry;
+            u32 slots;
+        };
+        std::array<Table, 8> tables{};
+        u32 table_count = 0;
+        for (u32 i = 0; i < draw.binding_count; ++i) {
+            const auto& b = draw.bindings[i];
+            if (b.stage != st) {
+                continue;
+            }
+            if (b.offset != 0xffff) {
+                for (u32 k = 0; k < b.dwords && b.offset + k < 16; ++k) {
+                    ud[b.offset + k] = b.words[k];
+                }
+            } else if (b.table_sgpr != 0xff && b.table_sgpr < 15 && b.entry_dwords != 0) {
+                u32 t = 0;
+                while (t < table_count && tables[t].sgpr != b.table_sgpr) {
+                    ++t;
+                }
+                if (t == table_count && table_count < tables.size()) {
+                    tables[table_count++] = {b.table_sgpr, b.entry_dwords, 0};
+                }
+                if (t < table_count) {
+                    tables[t].slots = std::max<u32>(tables[t].slots, b.slot + 1u);
+                }
+            }
+        }
+        for (u32 t = 0; t < table_count; ++t) {
+            const u32 dwords = std::max<u32>(tables[t].slots, 1u) * tables[t].entry;
+            if (arena_at + dwords > arena.size()) {
+                arena_at = 0;
+            }
+            u32* table = arena.data() + arena_at;
+            arena_at += (dwords + 63) & ~63u;
+            std::memset(table, 0, dwords * sizeof(u32));
+            for (u32 i = 0; i < draw.binding_count; ++i) {
+                const auto& b = draw.bindings[i];
+                if (b.stage == st && b.offset == 0xffff && b.table_sgpr == tables[t].sgpr) {
+                    for (u32 k = 0; k < b.dwords && k < tables[t].entry; ++k) {
+                        table[b.slot * tables[t].entry + k] = b.words[k];
+                    }
+                }
+            }
+            const u64 address = reinterpret_cast<u64>(table);
+            ud[tables[t].sgpr] = static_cast<u32>(address);
+            ud[tables[t].sgpr + 1] = static_cast<u32>(address >> 32);
+        }
+        NoteSkipUserData(3);
+    }
 }
 
 bool TakeDispatchBindings(u64 seq, RecordBinding* out, u32 max, u32& count) {

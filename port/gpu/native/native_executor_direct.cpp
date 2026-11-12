@@ -323,6 +323,9 @@ void NativeExecutor::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 ind
             const u32 i = static_cast<u32>(std::countr_zero(mask));
             exec_pixel_user_data[i] = draw.ps_user_data[i];
         }
+        if (draw.ud_skipped != 0) [[unlikely]] {
+            Core::NativeDraw::RebuildSkippedUserData(draw, exec_vertex_user_data, exec_pixel_user_data); // note 179
+        }
     }
     native_inputs_key = 0;
     {

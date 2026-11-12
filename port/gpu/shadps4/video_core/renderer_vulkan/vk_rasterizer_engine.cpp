@@ -313,6 +313,20 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
         return nullptr;
     }
     Core::NativeDraw::Live().stage_key_typed_hits.fetch_add(1, std::memory_order_relaxed);
+    if (Core::NativeDraw::SkipUserDataMode() != 0) [[unlikely]] {
+        // note 179: a stage the record covers: its shader object is published to the hook; a stage the hook skipped (or would skip) that is not covered here is a guard
+        for (u32 st = 0; st < 2; ++st) {
+            const auto& stage_plan = plan->stages[static_cast<u32>(st == 0 ? Shader::SwStage::Vertex : Shader::SwStage::Fragment)];
+            if (stage_plan.info == nullptr) {
+                continue;
+            }
+            if (stage_plan.flat_skipped) {
+                Core::NativeDraw::NoteCoveredShader(draw.shader_ids[st], st == 0 ? draw.vs_gnm : draw.ps_gnm);
+            } else if (((draw.ud_skipped | draw.ud_would_skip) >> st) & 1) {
+                Core::NativeDraw::NoteSkipUserData(4);
+            }
+        }
+    }
     plan->has_handles = false;
     plan->has_geometry_handles = false;
     plan->geometry_handle_count = 0;
