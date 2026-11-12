@@ -46,5 +46,8 @@ void NotePlanBindings(u32 state) noexcept;
 void NoteTypedBuffer(u32 what) noexcept;
 /// Note 175: the typed buffer counters (written into the hook ring report, which every check reads).
 [[nodiscard]] nlohmann::json TypedReport();
+/// Note 176 (R3.4b): a reader of a buffer binding (the front's resolution, the executor): 0 took the typed fields (mode 2), 1 compared them with the V# decode and they were the same,
+/// 2 different, 3 the binding has no typed fields (decoded)
+void NoteTypedReader(u32 what) noexcept;
 
 } // namespace Core::HookDiff

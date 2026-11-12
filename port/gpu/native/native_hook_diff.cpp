@@ -26,6 +26,7 @@ enum C : u32 {
     PbSame, PbReused, PbOther, PbNoRecord,
     BvSameVersion, BvSameVersionOther,
     TbAsked, TbSame, TbDiffer, TbNotView, TbNotSrvBuffer, TbOutOfRange,
+    TrUsed, TrSame, TrDiffer, TrNoTyped,
     CCount
 };
 std::array<std::atomic<u64>, CCount> c{};
@@ -161,7 +162,7 @@ void NotePlanFixed(bool same) noexcept {
 unsigned TypedBuffersMode() noexcept {
     static const unsigned mode = [] {
         const char* e = std::getenv("TLG_TYPED_BUFFERS");
-        return e != nullptr && e[0] == '1' ? 1u : 0u; // note 175: 0 off, 1 shadow
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<unsigned>(e[0] - '0') : 0u; // note 175: 0 off, 1 shadow; note 176: 2 the readers take the typed fields
     }();
     return mode;
 }
@@ -169,7 +170,15 @@ unsigned TypedBuffersMode() noexcept {
 nlohmann::json TypedReport() {
     const auto r = [](C k) { return c[k].load(std::memory_order_relaxed); };
     return {{"mode", TypedBuffersMode()}, {"asked", r(TbAsked)}, {"same_as_the_words", r(TbSame)}, {"different_from_the_words", r(TbDiffer)},
-            {"not_an_engine_view", r(TbNotView)}, {"not_a_buffer_srv", r(TbNotSrvBuffer)}, {"outside_the_engine_range", r(TbOutOfRange)}};
+            {"not_an_engine_view", r(TbNotView)}, {"not_a_buffer_srv", r(TbNotSrvBuffer)}, {"outside_the_engine_range", r(TbOutOfRange)},
+            {"readers_note_176", {{"used_without_the_v_sharp", r(TrUsed)}, {"compared_same", r(TrSame)}, {"TYPED_DIFFERS_FROM_THE_DECODE_MUST_BE_0", r(TrDiffer)},
+                                  {"no_typed_fields_decoded", r(TrNoTyped)}}}};
+}
+
+void NoteTypedReader(u32 what) noexcept {
+    if (what < 4) {
+        Add(static_cast<C>(TrUsed + what));
+    }
 }
 
 void NoteTypedBuffer(u32 what) noexcept {

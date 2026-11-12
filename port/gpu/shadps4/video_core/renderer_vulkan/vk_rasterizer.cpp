@@ -5741,9 +5741,21 @@ bool Rasterizer::ExecutorDecide(const Shader::Info& stage, u32 buffer_index, Exe
         };
         AmdGpu::Buffer chosen_sharp;
         bool from_record = false;
+        const Core::NativeDraw::RecordBinding* typed = nullptr; // note 176
+        bool decoded = true;
         if (binder_plan != nullptr && desc.sharp_fetch.summary == Shader::SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
-            if (const u32* words = BinderWords(stage, desc.sharp_fetch.offsets[0], 4, 1)) {
-                chosen_sharp = desc.FromWords(words, stage);
+            u32 bi = ~0u;
+            if (const u32* words = BinderWords(stage, desc.sharp_fetch.offsets[0], 4, 1, &bi)) {
+                if (bi != ~0u && binder_plan->bindings[bi].typed_ok != 0 && desc.post_op == Shader::SharpFetchPostOp::None) {
+                    typed = &binder_plan->bindings[bi];
+                }
+                static thread_local u32 typed_audit = 0;
+                if (typed == nullptr || Core::HookDiff::TypedBuffersMode() != 2 || Core::Audit::Due(typed_audit)) {
+                    chosen_sharp = desc.FromWords(words, stage);
+                } else {
+                    decoded = false; // (no V# read: the typed fields are the answer)
+                    Core::HookDiff::NoteTypedReader(0);
+                }
                 from_record = true;
             }
         }
@@ -5753,7 +5765,16 @@ bool Rasterizer::ExecutorDecide(const Shader::Info& stage, u32 buffer_index, Exe
             }
             chosen_sharp = desc.GetSharp(stage);
         }
-        const Core::NativeDesc::BufferDesc vsharp = Core::NativeDesc::BufferDescOf(chosen_sharp);
+        Core::NativeDesc::BufferDesc vsharp{};
+        if (!decoded) {
+            vsharp.address = typed->typed_address; // note 176: no V# decoded
+            vsharp.size = typed->typed_size;
+        } else {
+            vsharp = Core::NativeDesc::BufferDescOf(chosen_sharp);
+            if (Core::HookDiff::TypedBuffersMode() != 0 && from_record) {
+                Core::HookDiff::NoteTypedReader(typed == nullptr ? 3 : typed->typed_address == vsharp.address && typed->typed_size == vsharp.size ? 1 : 2);
+            }
+        }
         if (vsharp.address == 0 || vsharp.size == 0) {
             a.kind = ExNull;
             return true;

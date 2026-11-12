@@ -23,6 +23,9 @@ struct RecordBinding {
     u64 id;      ///< the engine's unique id of the resource (the registry's key)
     u64 view_id; ///< E2: the engine's unique id of the view object the descriptor was built from (0: the descriptor was built from the resource itself)
     u32 words[8];
+    u64 typed_address; ///< note 176 (R3.4b): a buffer binding's address from the engine's objects (valid when `typed_ok`)
+    u32 typed_size;    ///< ... and its size in bytes
+    u32 typed_ok;      ///< 1: the hook computed the two from the engine's view or constant buffer (TLG_TYPED_BUFFERS != 0)
 };
 
 } // namespace Core::NativeDraw

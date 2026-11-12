@@ -11,6 +11,7 @@
 #include "common/debug.h"
 #include "native/native_row_version.h"
 #include "native/native_hook_diff.h"
+#include "native/native_audit.h"
 #include "native/native_dispatch_executor.h"
 #include "native/native_debug_server.h"
 #include "native/native_log.h"
@@ -616,7 +617,22 @@ void Rasterizer::ResolveAhead(DrawPlan* draw_plan, DispatchPlan* dispatch_plan) 
                 if (words == nullptr || list[first].id == 0) {
                     continue;
                 }
-                const Core::NativeDesc::BufferDesc v = Core::NativeDesc::BufferDescOf(desc.FromWords(words, info));
+                // note 176: the typed address and size from the engine's objects, else (and as the shadow's reference) the V#'s decode
+                Core::NativeDesc::BufferDesc v{};
+                const auto& rb = list[first];
+                const unsigned typed_mode = Core::HookDiff::TypedBuffersMode();
+                static thread_local u32 typed_audit = 0;
+                if (rb.typed_ok != 0 && typed_mode == 2 && desc.post_op == Shader::SharpFetchPostOp::None && !Core::Audit::Due(typed_audit)) {
+                    v.address = rb.typed_address;
+                    v.size = rb.typed_size;
+                    Core::HookDiff::NoteTypedReader(0);
+                } else {
+                    v = Core::NativeDesc::BufferDescOf(desc.FromWords(words, info));
+                    if (typed_mode != 0) {
+                        Core::HookDiff::NoteTypedReader(rb.typed_ok == 0 || desc.post_op != Shader::SharpFetchPostOp::None ? 3
+                                                        : rb.typed_address == v.address && rb.typed_size == v.size ? 1 : 2);
+                    }
+                }
                 if (v.address == 0 || v.size == 0 || v.size >= (u64{1} << 30)) {
                     continue;
                 }

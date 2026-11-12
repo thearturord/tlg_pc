@@ -1300,7 +1300,7 @@ void AddGeometryId(NativeRecord& record, u64 object) {
     record.geometry_ids[record.geometry_id_count++] = id;
 }
 /// Note 175 shadow: the buffer binding's address and size from the engine's objects, as CreateShaderResourceView (0x2493620) builds the view's V#, against the copied V#.
-void TypedBufferShadow(u64 view, const u32* words) {
+void TypedBufferShadow(u64 view, const u32* words, RecordBinding& binding) {
     using Core::HookDiff::NoteTypedBuffer;
     NoteTypedBuffer(0);
     const u32 tag = view != 0 ? Rd<u32>(view, 0x18) : 0;
@@ -1308,6 +1308,11 @@ void TypedBufferShadow(u64 view, const u32* words) {
     const u32 word_stride = (words[1] >> 16) & 0x3fff;
     const u64 word_size = word_stride != 0 ? u64{words[2]} * word_stride : words[2];
     const auto compare = [&](u64 address, u64 size, u32 what) {
+        if (size <= 0xffffffffull) {
+            binding.typed_address = address; // note 176: the record carries them (the readers take them in TLG_TYPED_BUFFERS=2)
+            binding.typed_size = static_cast<u32>(size);
+            binding.typed_ok = 1;
+        }
         const bool same = address == word_address && size == word_size;
         NoteTypedBuffer(same ? 1 : 2);
         if (!same) {
@@ -1402,7 +1407,7 @@ void AddRecordBinding(u32 stage, u32 kind, u32 slot, u32 offset, const u32* word
     binding.id = last_descriptor_object.id;
     binding.view_id = last_descriptor_object.view_id;
     if (kind == 1 && dwords >= 4 && Core::HookDiff::TypedBuffersMode() != 0) [[unlikely]] {
-        TypedBufferShadow(last_descriptor_object.object, words); // note 175
+        TypedBufferShadow(last_descriptor_object.object, words, binding); // note 175
     }
     for (u32 i = 0; i < binding.dwords; ++i) {
         binding.words[i] = words[i];
