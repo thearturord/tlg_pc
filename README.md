@@ -9,11 +9,11 @@ An experimental fork of [HayatoG/tlg_pc](https://github.com/HayatoG/tlg_pc) that
 ## Progress (2026-11-12)
 
 ```
-Overall                  [█████████████░░░░░░░]  67%
+Overall                  [███████████████░░░░░]  74%
 Native renderer          [████████████████████] 100%   no PS4 GPU command stream, registers or address mirror
 Data ownership           [████████████████████] 100%   GPU memory follows the engine's objects, not address tracking
 Resource binding         [███████████████████░]  98%   draws and dispatches bound by engine id
-Threads and submission   [███████░░░░░░░░░░░░░]  35%   from the game's draw call to the GPU
+Threads and submission   [██████████████░░░░░░]  70%   from the game's draw call to the GPU
 Clean-up                 [░░░░░░░░░░░░░░░░░░░░]   0%   old emulator paths out of the build
 ```
 
@@ -22,7 +22,7 @@ The overall bar is the average of the five below it.
 * **Native renderer:** done. The game's renderer already talks to a Direct3D style device layer, and the port hooks that layer. Every draw, dispatch, clear, copy, fence and flip becomes a typed record that the port plans and runs on Vulkan. The PS4 command stream (PM4), the GPU registers and the mirror of the PS4 address space are gone.
 * **Data ownership:** done. The GPU copy of each buffer and texture belongs to the engine object that owns it, and the per-frame data is taken where the game writes it. Nothing has to watch memory pages or guess what changed.
 * **Resource binding:** nearly done. Almost every draw and dispatch is bound straight from the engine's ids. The emulator-style lookups (by address and PS4 descriptor words) are left only for a few rare cases.
-* **Threads and submission:** in progress. The draw state is reused and shared between threads without copies or locks. Still to do: no PS4 descriptor words at all, one compact command per draw from the game's thread to the render thread, and compute work on its own thread and queue.
+* **Threads and submission:** mostly done. Each draw is now planned on the game's own thread when the game records it, from read-only copies of the caches, and the command thread only takes it in order and passes it on (no record copy, no planning there). Buffers are described by the engine's objects instead of PS4 descriptor words. Still to do: compute work (physics, particles) on its own line and queue, so the game waits less for its results.
 * **Clean-up:** after that. Every removed emulator path is still in the code behind a switch, so it can be compared and turned back on. Once they are retired, the code is deleted, and what is left of shadPS4's Vulkan code moves into the port's own renderer. The shader translator (the game ships only PS4 GPU binaries) and the system library layer stay.
 * **Frame rate:** the frame rate is not tuned while the emulator logic is being removed. It is measured and optimized once that is finished.
 
