@@ -1099,6 +1099,7 @@ struct SynthReg {
 struct StatePackage;
 struct NativeRecord {
     std::atomic<u64> seq{0};
+    MapUpload map_upload{}; ///< note 173: the Map upload copy of this record (valid when `map_upload.seq` is this record's number)
     u32 count{};
     const StatePackage* package{}; ///< A5.3: the state package the first `package->count` registers are a copy of (valid when `package_for` is this record's number)
     u64 package_for{};
@@ -3640,6 +3641,8 @@ void ResourceTextureDescriptor(u64 resource, u32 subresource, bool writable, std
 /// The record of the texture copy dispatch (the game's copy shader: a T# in, a T# out, the extent as constants).
 /// F5: with `source_resource` and `destination_resource` (the engine's resources behind the two T#) the record names its three
 /// bindings (source image, destination image, the extent constants), so the dispatch binds from the record and not from the flat user data.
+thread_local MapUpload t_map_upload{}; ///< note 173: set by MakeMapUploadRecord around its MakeUploadRecord call
+
 u64 MakeUploadRecord(u64 ctx, const std::array<u32, 8>& srv, const std::array<u32, 8>& uav, u32 width, u32 height, u64 caller, bool readback = false,
                      u64 source_resource = 0, u64 destination_resource = 0, bool source_is_scratch = false, u32 source_sub = 0, u32 destination_sub = 0) {
     const VAddr image = image_base.load(std::memory_order_relaxed);
@@ -3780,8 +3783,24 @@ u64 MakeUploadRecord(u64 ctx, const std::array<u32, 8>& srv, const std::array<u3
     slot.readback = readback;
     slot.flags = (table_overflow || bad_object_seen ? SpecialPipeline : 0u) | synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
     FlightRecordMade(seq, slot.kind, slot.caller); // L1
+    slot.map_upload = t_map_upload; // note 173 (zero for every other upload record)
+    slot.map_upload.seq = t_map_upload.scratch != 0 ? seq : 0;
     slot.seq.store(seq, std::memory_order_release);
     return seq;
+}
+
+bool TakeMapUploadImpl(u64 seq, MapUpload& out) {
+    out = {};
+    const auto& slot = Slot(seq);
+    if (seq == 0 || slot.seq.load(std::memory_order_acquire) != seq || slot.map_upload.seq != seq) {
+        return false;
+    }
+    out = slot.map_upload;
+    if (slot.seq.load(std::memory_order_acquire) != seq) {
+        out = {};
+        return false;
+    }
+    return true;
 }
 
 u64 MakeCopyResourceRecord(u64 ctx, u64 destination, u32 destination_sub, u64 source, u32 source_sub, u64 caller) {
@@ -4763,6 +4782,10 @@ u64 RecordCallerGhidra(u64 seq) {
     auto& slot = Slot(seq);
     const u64 caller = slot.caller;
     return slot.seq.load(std::memory_order_acquire) == seq && caller >= ImageBase() ? caller - ImageBase() + 0x1000000 : 0;
+}
+
+bool TakeMapUpload(u64 seq, MapUpload& out) {
+    return TakeMapUploadImpl(seq, out); // note 173
 }
 
 bool TakeDispatchBindings(u64 seq, RecordBinding* out, u32 max, u32& count) {
@@ -7008,7 +7031,11 @@ u64 MakeMapUploadRecord(u64 ctx, u64 resource, u64 scratch, u64 caller) {
     srv[1] = (srv[1] & ~0xffu) | static_cast<u32>((base >> 32) & 0xff);
     srv[3] = (srv[3] & ~(0x1fu << 20)) | (8u << 20);
     srv[4] = (srv[4] & ~(0x3fffu << 13)) | (((pitch - 1) & 0x3fffu) << 13);
-    return MakeUploadRecord(ctx, srv, uav, width, height, caller, false, 0, resource, true);
+    // note 173: the copy's typed fields (scratch, texture id, extent, texel bytes, row pitch in texels), for the native copy at the raster thread
+    t_map_upload = {0, scratch, Rd<u64>(resource, 0x10), width, height, bytes, pitch, (u64{uav[0]} | (u64{uav[1]} & 0x3f) << 32) << 8} /* the T# base: 38 bits */;
+    const u64 made = MakeUploadRecord(ctx, srv, uav, width, height, caller, false, 0, resource, true);
+    t_map_upload = {};
+    return made;
 }
 
 using GuestMap7 = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64);

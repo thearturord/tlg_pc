@@ -199,6 +199,8 @@ nlohmann::json Report() {
                  {"stages_whose_image_checks_failed", c(RealCheckFailed)}, {"sampled_targets_bound_note_160", c(RealServedTargets)},
                  {"same_image_twice_note_170", {{"stages_the_real_mode_would_bind", c(TwiceWouldServe)}, {"stages_bound", c(TwiceServed)},
                                                 {"sampled_force_general_bindings_bound", c(ForceGeneralServed)}}}};
+    j["map_upload_note_173"] = {{"asked", c(MapAsked)}, {"refused", c(MapRefused)}, {"audited", c(MapAudited)}, {"shadow_would_copy", c(MapWould)},
+                                {"copied", c(MapCopied)}, {"bytes_from_obtain", c(MapFromObtain)}};
     j["dynamic_note_163"] = {{"mode", DynamicMode()}, {"bound_from_own_image", c(DynServed)}, {"uploads", c(DynRefreshed)}, {"refused", c(DynRefused)},
                              {"not_dynamic", c(DynNotDynamic)}, {"shadow_same", c(DynShadowSame)}, {"shadow_old_path_other_image", c(DynShadowOldOther)},
                              {"DYNAMIC_WINDOW_DIFFERENT_MUST_BE_0", c(DynWindowDifferent)}};

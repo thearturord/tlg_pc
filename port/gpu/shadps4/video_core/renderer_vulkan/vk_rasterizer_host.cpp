@@ -87,6 +87,7 @@ const Core::NativeDispatch::DispatchInputs& Rasterizer::DispatchPlanInputs(const
 void Rasterizer::TagDispatchPlan(DispatchPlan& plan, u64 seq) {
     plan.native_seq = seq;
     plan.bindings_complete = Core::NativeDraw::TakeDispatchBindings(seq, plan.bindings.data(), static_cast<u32>(plan.bindings.size()), plan.binding_count);
+    (void)Core::NativeDraw::TakeMapUpload(seq, plan.map_upload); // note 173
 }
 
 bool Rasterizer::MarkersEnabled() const noexcept {

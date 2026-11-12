@@ -133,6 +133,12 @@ enum Count : u32 {
     TwiceWouldServe,        ///< note 170 shadow: stages refused only for the same image twice (one binding written) that the real mode would bind
     TwiceServed,            ///< note 170 real: those stages bound by the tail with the old path's two passes
     ForceGeneralServed,     ///< note 170 real: sampled image bindings with force general set, bound with the old path's general transit
+    MapAsked,               ///< note 173: Map upload copies seen at the raster thread
+    MapRefused,             ///< ... refused to the old dispatch (another program or format, no entry, an image check failed, no source bytes)
+    MapAudited,             ///< ... the one in 64 the old dispatch runs (audit)
+    MapWould,               ///< ... shadow: the real mode would copy it
+    MapCopied,              ///< ... real: copied into the texture's image (no dispatch)
+    MapFromObtain,          ///< ... their bytes from ObtainBufferForImage (the hook ring did not answer)
     DynServed,              ///< note 163: dynamic texture bindings bound from the texture's own image
     DynRefreshed,           ///< ... uploads into those images (the window's bytes differed from the last upload)
     DynRefused,             ///< ... refused (another shape, too large, invalid T#, GPU-modified memory)

@@ -149,6 +149,7 @@ struct DispatchPlan {
     std::array<Core::NativeDraw::RecordBinding, Core::NativeDraw::MaxRecordBindings> bindings{};
     u32 binding_count{};
     bool bindings_complete{};
+    Core::NativeDraw::MapUpload map_upload{}; ///< note 173: valid when `map_upload.seq == native_seq`
 };
 
 

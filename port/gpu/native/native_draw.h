@@ -295,6 +295,16 @@ bool TakeExecDraw(u64 seq, ExecDraw& out, bool typed = false);
 std::string DescribeMissingRecord(u64 seq);
 /// B9: the typed bindings of a dispatch record (kind 3). Fills `out` (up to `max` entries), sets `count`; returns true when the list is complete (none dropped, at least one).
 bool TakeDispatchBindings(u64 seq, RecordBinding* out, u32 max, u32& count);
+/// Note 173 (plan R2.17): the Map upload copy of a record (the engine's linear scratch the CPU filled, copied into texture `resource_id`, mip 0, at (0, 0)).
+struct MapUpload {
+    u64 seq{};          ///< the record it belongs to (0: none)
+    u64 scratch{};      ///< the scratch's address (rows of `pitch` texels)
+    u64 resource_id{};  ///< the texture's engine id
+    u32 width{}, height{}, bytes{}, pitch{};
+    u64 destination{};  ///< the texture's memory (its T#'s base), which the destination image must be at
+};
+/// Note 173: true and `out` when record `seq` is a Map upload copy.
+bool TakeMapUpload(u64 seq, MapUpload& out);
 /// The call site (ghidra address) that made the record `seq`; 0 when the record was recycled.
 u64 RecordCallerGhidra(u64 seq);
 /// Note 154 shadow: 0 the record slot of `seq` still holds that record and the same `n` bindings, 1 the slot was reused, 2 other bindings, 3 no record.

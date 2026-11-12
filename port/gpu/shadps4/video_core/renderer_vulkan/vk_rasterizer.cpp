@@ -1806,6 +1806,10 @@ void Rasterizer::SetExplicitImageReadback(bool on) {
     texture_cache.SetExplicitDownload(on);
 }
 
+namespace {
+u32 MapUploadMode(); // note 173 (defined with NativeMapUpload)
+}
+
 void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
     struct W3Scope {
         Rasterizer* self;
@@ -1942,6 +1946,11 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
         }
     }
     Core::DispatchSplit::Stamp(Core::DispatchSplit::PLightHle);
+    if (plan != nullptr && plan->map_upload.seq != 0 && plan->map_upload.seq == plan->native_seq && MapUploadMode() != 0) [[unlikely]] {
+        if (NativeMapUpload(*plan, cs)) {
+            return; // note 173: copied into the texture's image; no dispatch, no source image
+        }
+    }
 
     binder_plan = DispatchBinderFor(plan);
     Core::DispatchSplit::NotePlanned(binder_plan != nullptr);
@@ -6984,6 +6993,95 @@ u32 TargetTailMode() noexcept {
     }();
     return mode;
 }
+}
+
+namespace {
+/// Note 173 (plan R2.17, `TLG_MAP_UPLOAD_COPY`: 0 off until the owner's play, 1 shadow, 2 real): the Map upload copy (program 0x99717856: texel (x, y) of the scratch to texel
+/// (x, y) of the texture, mip 0, a 32-bit one-channel format) as a buffer-to-image copy of the scratch's bytes.
+u32 MapUploadMode() {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_MAP_UPLOAD_COPY");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
+}
+
+bool Rasterizer::NativeMapUpload(const DispatchPlan& plan, const Shader::Info& cs) {
+    using namespace Core::ViewTable;
+    Note(MapAsked);
+    const auto& m = plan.map_upload;
+    const auto refuse = [] {
+        Note(MapRefused);
+        return false;
+    };
+    // the program: the format class's copy shader whose body is a one-channel texel copy over [0, width) x [0, height) with no offsets (the record's constants)
+    if (cs.pgm_hash != 0x99717856ull || m.width == 0 || m.height == 0 || m.bytes != 4 || m.pitch < m.width) {
+        return refuse();
+    }
+    const Shader::ImageResource* destination = nullptr;
+    u32 written = 0;
+    for (const auto& res : cs.images) {
+        if (res.is_written) {
+            destination = &res;
+            ++written;
+        }
+    }
+    if (destination == nullptr || written != 1) {
+        return refuse();
+    }
+    // the destination image: the view table's entry of the record's destination binding (note 113 key: texture, subresource 0, written), checked as the tail checks it
+    const Entry* e = Find(SubresourceKey(m.resource_id, 0, true), ImageUseFlags(*destination));
+    // (a dynamic texture's entry is not in the class, but it holds the old path's answer for this binding, kept or dropped by the same events: the image is checked below)
+    if (e == nullptr || !e->has_payload) {
+        return refuse();
+    }
+    TextureSetEntry te;
+    std::memcpy(&te, e->payload, sizeof(TextureSetEntry));
+    if (te.null_entry || !te.storage || te.owned || te.id != te.found || te.id_uid != texture_cache.Uid(te.id)) {
+        return refuse();
+    }
+    auto& image = texture_cache.GetImage(te.id);
+    const auto format = image.info.pixel_format;
+    if (image.backing != te.backing || image.info.guest_address != m.destination || image.binding.needs_rebind || image.binding.is_target || image.info.num_samples > 1 || image.info.props.is_depth ||
+        image.info.props.is_block || image.info.size.width < m.width || image.info.size.height < m.height ||
+        (format != vk::Format::eR32Sfloat && format != vk::Format::eR32Uint && format != vk::Format::eR32Sint)) {
+        return refuse();
+    }
+    static thread_local u32 audit_tick = 0;
+    if (Core::Audit::Due(audit_tick)) {
+        Note(MapAudited);
+        return false;
+    }
+    if (MapUploadMode() == 1) {
+        Note(MapWould);
+        return false;
+    }
+    // the scratch's bytes: the hook ring's copy made at the CPU's write, else what the old path's source image would have been uploaded from
+    const u32 bytes = m.pitch * m.bytes * m.height;
+    auto [source, source_offset] = buffer_cache.HookRingAnswer(m.scratch, bytes, false, false);
+    if (source == nullptr) {
+        std::tie(source, source_offset) = buffer_cache.ObtainBufferForImage(m.scratch, bytes);
+        Note(MapFromObtain);
+    }
+    if (source == nullptr) {
+        return refuse();
+    }
+    // the old path's commit of the written binding, in FindTexture's order, then the copy instead of the program
+    texture_cache.MarkStorageWrite(te.id);
+    texture_cache.UpdateImage(te.id, Core::ImageCaller::FindTexture);
+    const vk::BufferImageCopy region{
+        .bufferOffset = source_offset,
+        .bufferRowLength = m.pitch,
+        .bufferImageHeight = m.height,
+        .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {m.width, m.height, 1},
+    };
+    runtime.UploadImage(&image, source, std::span{&region, 1});
+    image.usage.storage |= 1u;
+    Note(MapCopied);
+    return true;
 }
 
 namespace {

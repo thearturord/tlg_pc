@@ -699,6 +699,8 @@ private:
                              Shader::Backend::Bindings& binding);
     /// The set hit's tail (touch and refresh, the per-image checks, transitions, descriptor writes): false when a check fails (nothing bound; touch and refresh are idempotent).
     bool BindTexturesFromEntries(const Shader::Info& stage, const TextureSet& set, u32 count, Shader::Backend::Bindings& binding);
+    /// Note 173: the Map upload copy as an upload into the texture's image instead of the copy program's dispatch; true when done (the dispatch is skipped).
+    bool NativeMapUpload(const DispatchPlan& plan, const Shader::Info& cs);
     /// Design review notes 95 and 96 (`TLG_VIEW_TABLE`): after a stage's images were bound by the old path, the view table's answer for each read-only binding of a non-dynamic
     /// engine texture view is compared with it, and the entry is made or remade from it (`first_info`: the stage's first image info; `bound_before`: the bound image list's size
     /// before the stage; `answers`/`answers_ok`: the old path's per-image record and whether it can be bound from the table).
