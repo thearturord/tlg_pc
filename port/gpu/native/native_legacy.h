@@ -68,6 +68,7 @@
 ///   TLG_OBTAIN_CACHES=2        the bind memo, the obtain memo and the mutable resident answer in front of ObtainBuffer (note 169)
 ///   TLG_TWICE_TAIL=0           stages that bind the same image twice (one binding written) refused to the old binder (note 170)
 ///   TLG_TYPED_BUFFERS=0        the front and the executor decode every buffer binding's V# instead of the typed address and size from the engine's objects (note 176)
+///   TLG_MAP_UPLOAD_COPY=0      the Map upload runs the PS4 copy program over a source image made at the scratch address instead of a buffer-to-image copy (note 177)
 namespace Core::Legacy {
 
 

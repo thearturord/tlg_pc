@@ -7001,7 +7001,10 @@ namespace {
 u32 MapUploadMode() {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_MAP_UPLOAD_COPY");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+        if (e == nullptr || e[0] == 0) {
+            return 2u; // note 177: default 2 since 2026-11-12 (owner play p9play); LEGACY(map_upload_copy): =0 the copy program's dispatch, =1 shadow
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
