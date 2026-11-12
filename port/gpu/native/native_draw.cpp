@@ -1804,7 +1804,10 @@ std::array<std::atomic<u64>, 6> g_skip_counts{};
 u32 SkipUserDataModeImpl() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_SKIP_USER_DATA");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // note 179: 0 off until the owner's play, 1 shadow, 2 real
+        if (e == nullptr || e[0] == 0) {
+            return 2u; // note 180: default 2 since 2026-11-12 (owner play p10play); LEGACY(skip_user_data): =0 the hook writes every stage's descriptor user data, =1 shadow
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
