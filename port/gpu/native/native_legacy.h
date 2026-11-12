@@ -67,6 +67,7 @@
 ///   TLG_OPEN_MAP_GUARD=0       small hook ring answers over memory the game still has mapped are given (note 168)
 ///   TLG_OBTAIN_CACHES=2        the bind memo, the obtain memo and the mutable resident answer in front of ObtainBuffer (note 169)
 ///   TLG_TWICE_TAIL=0           stages that bind the same image twice (one binding written) refused to the old binder (note 170)
+///   TLG_TYPED_BUFFERS=0        the front and the executor decode every buffer binding's V# instead of the typed address and size from the engine's objects (note 176)
 namespace Core::Legacy {
 
 

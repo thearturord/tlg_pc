@@ -162,7 +162,10 @@ void NotePlanFixed(bool same) noexcept {
 unsigned TypedBuffersMode() noexcept {
     static const unsigned mode = [] {
         const char* e = std::getenv("TLG_TYPED_BUFFERS");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<unsigned>(e[0] - '0') : 0u; // note 175: 0 off, 1 shadow; note 176: 2 the readers take the typed fields
+        if (e == nullptr || e[0] == 0) {
+            return 2u; // note 176: default 2 since 2026-11-12 (owner play p8play); LEGACY(typed_buffers): =0 every reader decodes the V#, =1 shadow
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<unsigned>(e[0] - '0') : 0u;
     }();
     return mode;
 }
