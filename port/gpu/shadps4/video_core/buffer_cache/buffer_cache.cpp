@@ -1355,14 +1355,20 @@ std::pair<const Buffer*, u64> BufferCache::HookRingAnswer(VAddr device_addr, u32
         if (ring.Active() && device_addr >= ring.Start() && device_addr + size <= ring.End() && !IsRegionGpuModified(device_addr, size) &&
             !IsRangeGpuWritten(device_addr, size)) {
             u64 hook_offset = 0;
-            if (Core::HookRing::Resolve(device_addr, size, hook_offset)) {
+            // note 168: memory the game still has mapped may still be written: no hook ring answer (mode 2), counted (1)
+            const bool open_map = Core::HookRing::OpenMapGuardMode() != 0 && Core::NativeUpdates::OpenMapOverlaps(device_addr, size);
+            if (open_map) {
+                Core::HookRing::NoteOpenMapGuard(0);
+            }
+            if (!(open_map && Core::HookRing::OpenMapGuardMode() == 2) && Core::HookRing::Resolve(device_addr, size, hook_offset)) {
                 static std::atomic<u32> sample{0};
                 const bool check = (sample.fetch_add(1, std::memory_order_relaxed) & 63) == 0;
-                if (check) {
-                    Core::HookRing::CompareRaster(is_texel_buffer ? 1 : 0, device_addr, size, false);
+                // note 168: a sampled answer that differs from game memory is not bound (the old path takes it), as the wide windows do
+                if (!check || Core::HookRing::CompareRaster(is_texel_buffer ? 1 : 0, device_addr, size, false, true) == 0) {
+                    Core::HookRing::NoteRasterBound(is_texel_buffer ? 1 : 0, size, check);
+                    return {hook_ring, hook_offset};
                 }
-                Core::HookRing::NoteRasterBound(is_texel_buffer ? 1 : 0, size, check);
-                return {hook_ring, hook_offset};
+                Core::HookRing::NoteBoundRefused();
             }
         }
     }
@@ -1378,7 +1384,12 @@ std::pair<const Buffer*, u64> BufferCache::HookRingAnswer(VAddr device_addr, u32
             Core::HookRing::NotePastEnd(0);
             const u64 in_ring = ring.End() - device_addr;
             u64 past_offset = 0;
-            if (!IsRegionGpuModified(device_addr, in_ring) && !IsRangeGpuWritten(device_addr, in_ring) && Core::HookRing::ResolveWidePastEnd(device_addr, size, past_offset)) {
+            const bool past_open = Core::HookRing::OpenMapGuardMode() != 0 && Core::NativeUpdates::OpenMapOverlaps(device_addr, in_ring);
+            if (past_open) {
+                Core::HookRing::NoteOpenMapGuard(2);
+            }
+            if (!IsRegionGpuModified(device_addr, in_ring) && !IsRangeGpuWritten(device_addr, in_ring) && // (note 168: counted only, as the wide windows)
+                Core::HookRing::ResolveWidePastEnd(device_addr, size, past_offset)) {
                 Core::HookRing::NotePastEnd(1);
                 static thread_local u32 past_sample = 0;
                 const bool real = Core::HookRing::WidePastEndMode() == 2;
@@ -1398,7 +1409,9 @@ std::pair<const Buffer*, u64> BufferCache::HookRingAnswer(VAddr device_addr, u32
         }
         if (!ring.Active() || device_addr < ring.Start() || device_addr + size > ring.End() || IsRegionGpuModified(device_addr, size) || IsRangeGpuWritten(device_addr, size)) {
             Core::HookRing::NoteWideRows(1);
-        } else if (Core::HookRing::ResolveWideFast(device_addr, size, hook_offset)) {
+        } else if (const bool wide_open = Core::HookRing::OpenMapGuardMode() != 0 && Core::NativeUpdates::OpenMapOverlaps(device_addr, size);
+                   (wide_open ? (Core::HookRing::NoteOpenMapGuard(1), true) : true) && Core::HookRing::ResolveWideFast(device_addr, size, hook_offset)) {
+            // (note 168: a wide window is only counted: the open map is mostly in the window's unread part; the block check is section 41's sampled compare)
             static thread_local u32 wide_sample = 0;
             bool bind = true;
             if ((++wide_sample & 255) == 0) { // (the block compare walks about 195 KB)

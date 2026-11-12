@@ -52,7 +52,8 @@ std::vector<Example> g_examples;
 struct RasterStats {
     std::atomic<u64> compares{0}, bytes{0}, equal{0}, diff_compares{0}, diff_bytes{0}, unfilled_compares{0}, unfilled_bytes{0}, partial{0};
 };
-RasterStats g_raster[2];
+RasterStats g_raster[4]; // note 168: [class | (bound answer ? 0 : 2)]
+std::atomic<u64> c_bound_refused{0};
 std::atomic<u64> c_raster_wide{0}, c_raster_wide_bytes{0};
 // 1b shadow, why a raster upload differs from the hook ring (one count per differing compare, the first rule that holds)
 std::atomic<u32>* g_fill_seq = nullptr; // per granule: the record sequence number when it was last filled
@@ -645,18 +646,18 @@ void NoteLanding(u64 address, u64 size) {
     c_landing_bytes.fetch_add(hi - lo, std::memory_order_relaxed);
 }
 
-void CompareRaster(u32 cls, u64 address, u64 size, bool gpu_written) {
+u64 CompareRaster(u32 cls, u64 address, u64 size, bool gpu_written, bool bound) {
     if (!Raster1bOn() || size == 0) {
-        return;
+        return 0;
     }
     u8* bytes = g_bytes.load(std::memory_order_acquire);
     if (bytes == nullptr) {
-        return;
+        return 0;
     }
-    auto& st = g_raster[cls & 1];
+    auto& st = g_raster[(cls & 1) | (bound ? 0u : 2u)];
     u64 lo, hi;
     if (!Clip(address, size, lo, hi)) {
-        return;
+        return 0;
     }
     if (lo != address || hi != address + size) {
         st.partial.fetch_add(1, std::memory_order_relaxed); // the caller passes the ring part; counted, compared as clipped
@@ -684,7 +685,7 @@ void CompareRaster(u32 cls, u64 address, u64 size, bool gpu_written) {
     st.bytes.fetch_add(hi - lo, std::memory_order_relaxed);
     if (diff == 0 && unfilled == 0) {
         st.equal.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return diff;
     }
     if (diff != 0) {
         st.diff_compares.fetch_add(1, std::memory_order_relaxed);
@@ -726,6 +727,7 @@ void CompareRaster(u32 cls, u64 address, u64 size, bool gpu_written) {
     if (g_raster_examples.size() < 32) {
         g_raster_examples.push_back({(lo - base) | (static_cast<u64>(cls & 1) << 63), hi - lo, first_diff, diff, unfilled});
     }
+    return diff;
 }
 
 bool Resolve(u64 address, u64 size, u64& offset) {
@@ -762,6 +764,26 @@ const u8* Data(u64 offset) {
     return bytes != nullptr ? bytes + offset : nullptr;
 }
 
+std::atomic<u64> c_open_guard[3]{};
+
+u32 OpenMapGuardMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_OPEN_MAP_GUARD");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // note 168: 0 off until the owner's play, 1 shadow, 2 real
+    }();
+    return mode;
+}
+
+void NoteOpenMapGuard(u32 what) noexcept {
+    if (what < 3) {
+        c_open_guard[what].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void NoteBoundRefused() noexcept {
+    c_bound_refused.fetch_add(1, std::memory_order_relaxed);
+}
+
 void NoteBound(u64 size, bool checked) {
     c_bound.fetch_add(1, std::memory_order_relaxed);
     c_bound_bytes.fetch_add(size, std::memory_order_relaxed);
@@ -783,7 +805,7 @@ nlohmann::json Report() {
                      {"with_diff", c_diff_compares.load()},
                      {"DIFF_BYTES_MUST_BE_0", c_diff_bytes.load()},
                      {"with_unfilled", c_unfilled_compares.load()},
-                     {"UNFILLED_BYTES_MUST_BE_0", c_unfilled_bytes.load()}};
+                     {"unfilled_bytes_the_front_copy_was_bound", c_unfilled_bytes.load()}}; // note 168: an unfilled range is bound from the front's copy, as designed
     j["real"] = {{"asked", c_resolve_asked.load()},
                  {"bound", c_bound.load()},
                  {"bound_bytes", c_bound_bytes.load()},
@@ -834,12 +856,21 @@ nlohmann::json Report() {
                                               {"texel", c_raster_bound[1].load()}, {"texel_bytes", c_raster_bound_bytes[1].load()},
                                               {"checked", c_raster_bound_checked.load()}};
     for (u32 k = 0; k < 2; ++k) {
+        // note 168: the answers the GPU is given (sampled at the bind); a differing one is refused, so it counts here and is not bound
         const auto& st = g_raster[k];
         j["raster_1b"][cls_names[k]] = {{"compares", st.compares.load()},   {"bytes", st.bytes.load()},
-                                        {"equal", st.equal.load()},         {"with_diff", st.diff_compares.load()},
-                                        {"DIFF_BYTES_MUST_BE_0", st.diff_bytes.load()}, {"with_unfilled", st.unfilled_compares.load()},
-                                        {"UNFILLED_BYTES_MUST_BE_0", st.unfilled_bytes.load()}, {"partial_ranges", st.partial.load()}};
+                                        {"equal", st.equal.load()},         {"with_diff_refused", st.diff_compares.load()},
+                                        {"diff_bytes_refused", st.diff_bytes.load()}, {"with_unfilled", st.unfilled_compares.load()},
+                                        {"BOUND_UNFILLED_BYTES_MUST_BE_0", st.unfilled_bytes.load()}, {"partial_ranges", st.partial.load()}};
+        // the old path's uploads compared as a shadow (unfilled granules expected: the hook ring refused those ranges)
+        const auto& sh = g_raster[k | 2];
+        j["raster_1b"][std::string("old_path_shadow_") + cls_names[k]] = {{"compares", sh.compares.load()}, {"bytes", sh.bytes.load()}, {"equal", sh.equal.load()},
+                                                                          {"with_diff", sh.diff_compares.load()}, {"diff_bytes", sh.diff_bytes.load()},
+                                                                          {"with_unfilled", sh.unfilled_compares.load()}, {"unfilled_bytes", sh.unfilled_bytes.load()}};
     }
+    j["raster_1b"]["bound_answers_refused_by_their_compare"] = c_bound_refused.load();
+    j["raster_1b"]["open_map_guard_note_168"] = {{"mode", OpenMapGuardMode()}, {"small_reads_over_an_open_map", c_open_guard[0].load()},
+                                                  {"wide_windows_over_an_open_map", c_open_guard[1].load()}, {"past_end_windows_over_an_open_map", c_open_guard[2].load()}};
     j["raster_1b"]["wide_reads_old_path"] = {{"count", c_raster_wide.load()}, {"bytes", c_raster_wide_bytes.load()}};
     j["raster_1b"]["why_differs"] = {{"gpu_result_landed_since_fill", c_why_landed.load()}, {"inside_an_open_map", c_why_open_map.load()},
                                      {"range_gpu_written", c_why_gpu_written.load()}, {"NONE_OF_THESE", c_why_none.load()}, {"first_byte_differs", c_why_whole.load()}};

@@ -48,7 +48,16 @@ bool Raster1bOn() noexcept;   ///< TLG_HOOK_RING_1B=1 (shadow) or 2 (real)
 /// (BufferCache::ObtainBuffer) instead of uploading them from game memory; 1 in 64 is compared with game memory. Every writer fills in this mode.
 bool Raster1bReal() noexcept;
 void NoteRasterBound(u32 cls, u64 size, bool checked);
-void CompareRaster(u32 cls, u64 address, u64 size, bool gpu_written);
+/// Compares a frame ring range of game memory with the hook ring's copy. Note 168: `bound` = an answer the GPU is given (HookRingAnswer; its MUST_BE_0 counters), else the old
+/// path's upload compared as a shadow (its unfilled granules are expected: the hook ring refused them). Returns the differing bytes.
+u64 CompareRaster(u32 cls, u64 address, u64 size, bool gpu_written, bool bound = false);
+/// Note 168: a bound answer whose sampled compare differed, refused (the old path binds it).
+void NoteBoundRefused() noexcept;
+/// Note 168 (`TLG_OPEN_MAP_GUARD`: 0 off until the owner's play, 1 shadow, 2 real): a hook ring answer over memory the game still has mapped (an open Map: the CPU may still
+/// write it) is not given; the old path reads game memory at the bind. `what`: 0 small reads (refused in mode 2), 1 wide windows and 2 windows past the ring's end (counted only:
+/// the open map is mostly in a window's unread part).
+[[nodiscard]] u32 OpenMapGuardMode() noexcept;
+void NoteOpenMapGuard(u32 what) noexcept;
 /// A GPU result was written into game memory at [address, address + size) (readbacks, image downloads, fence and label writes): the 1b shadow files a later
 /// difference over it under "a GPU result landed since the fill".
 void NoteLanding(u64 address, u64 size);
