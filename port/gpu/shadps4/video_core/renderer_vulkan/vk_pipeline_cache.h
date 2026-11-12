@@ -257,6 +257,11 @@ private:
         return entry.fetch_program != nullptr ? &entry.fetch_program->modules[entry.fetch_perm].spec.fetch_shader_data : nullptr;
     }
     tsl::robin_map<u64, ExecEntry> exec_pipelines;
+public:
+    /// Note 182: the counters of the plan-local capture (`TLG_PURE_PLAN`).
+    static nlohmann::json PurePlanReport();
+private:
+    static void CapturePlanPure(StagePlan& out, Shader::Info* clone, const Shader::Info& shared, bool skip_flat, std::span<const u32, 16> user_data, u64 pgm_base);
     std::array<u32, MaxShaderStages> stage_hw{};
     std::array<VAddr, MaxShaderStages> stage_base{};
     u64 lookup_exec_key{};

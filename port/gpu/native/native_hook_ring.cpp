@@ -16,6 +16,7 @@
 #include <cstdio>
 #include "native/native_hook_ring.h"
 #include "native/native_hook_diff.h"
+nlohmann::json TlgPurePlanReport(); // note 182 (vk_pipeline_cache.cpp)
 #include "native/native_ring_mirror.h"
 #include "native/native_updates.h"
 #include "native/native_untracked_ring.h"
@@ -874,6 +875,7 @@ nlohmann::json Report() {
     }
     j["raster_1b"]["bound_answers_refused_by_their_compare"] = c_bound_refused.load();
     j["typed_buffers_note_175"] = Core::HookDiff::TypedReport();
+    j["pure_plan_note_182"] = TlgPurePlanReport();
     {
         const auto su = Core::NativeDraw::SkipUserDataCounts();
         j["skip_user_data_note_179"] = {{"mode", Core::NativeDraw::SkipUserDataMode()}, {"shaders_published_covered", su[0]}, {"stages_skipped_at_the_hook", su[1]},

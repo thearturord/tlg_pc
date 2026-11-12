@@ -379,6 +379,44 @@ Shader::Info* PipelineCache::RasterInfoFor(const Shader::Info* shared) {
     return it.value().get();
 }
 
+namespace {
+/// Note 182 (plan R3.4d-0, `TLG_PURE_PLAN`: 0 off until the owner's play, 1 shadow, 2 real): the typed planner writes nothing into the shared shader infos; each stage's user
+/// data and flat user data are made in the plan from the record's user data (the walker of the shader's SRT, as RefreshFlatBuf runs it).
+u32 PurePlanMode() {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_PURE_PLAN");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+    }();
+    return mode;
+}
+std::atomic<u64> g_pure_compared{0}, g_pure_differ{0}, g_pure_planned{0};
+} // namespace
+
+nlohmann::json PipelineCache::PurePlanReport() {
+    return {{"mode", PurePlanMode()}, {"planned_without_shared_writes", g_pure_planned.load()}, {"compared", g_pure_compared.load()},
+            {"PURE_PLAN_DIFFERS_MUST_BE_0", g_pure_differ.load()}};
+}
+
+void PipelineCache::CapturePlanPure(StagePlan& out, Shader::Info* clone, const Shader::Info& shared, bool skip_flat, std::span<const u32, 16> user_data, u64 pgm_base) {
+    out.info = clone;
+    out.user_data_count = static_cast<u32>(user_data.size());
+    std::copy_n(user_data.begin(), out.user_data_count, out.user_data.begin());
+    out.flat_skipped = skip_flat;
+    out.flat.clear();
+    if (!skip_flat) {
+        // RefreshFlatBuf's work, into the plan: the user data, then the SRT walker over it
+        out.flat.resize(shared.srt_info.flattened_bufsize_dw);
+        std::memcpy(out.flat.data(), user_data.data(), std::min<size_t>(user_data.size_bytes(), out.flat.size() * sizeof(u32)));
+        if (shared.srt_info.walker_func) {
+            shared.srt_info.walker_func(user_data.data(), out.flat.data());
+        }
+        if (shared.srt_info.walker_func && Core::DrainAudit::Enabled()) {
+            Core::DrainAudit::WalkerRead(user_data.data(), static_cast<u32>(user_data.size()));
+        }
+    }
+    out.pgm_base = pgm_base;
+}
+
 void PipelineCache::CapturePlan(StagePlan& out, Shader::Info* clone, const Shader::Info& shared, bool skip_flat) {
     out.info = clone;
     out.user_data_count = static_cast<u32>(shared.user_data.size());
@@ -521,13 +559,16 @@ bool PipelineCache::PlanGraphicsTyped(u64 exec_key, const FixedState& fixed, std
     fetch_shader = FetchOf(entry);
     std::array<bool, MaxShaderStages> skip_flat{};
     plan.any_flat_skipped = false;
+    const u32 pure = PurePlanMode();
     for (u32 s = 0; s < MaxShaderStages; ++s) {
         if (!infos[s]) {
             continue;
         }
         auto* info = const_cast<Shader::Info*>(infos[s]);
-        info->pgm_base = entry.pgm_base[s];
-        info->user_data = entry.stage_hw[s] == static_cast<u32>(HwStage::Vertex) ? vertex_user_data : pixel_user_data;
+        if (pure != 2) {
+            info->pgm_base = entry.pgm_base[s]; // LEGACY(pure_plan): the shared info is the planner's scratch
+            info->user_data = entry.stage_hw[s] == static_cast<u32>(HwStage::Vertex) ? vertex_user_data : pixel_user_data;
+        }
         if (skip_flat_for != nullptr) {
             const u32 record_stage = entry.stage_hw[s] == static_cast<u32>(HwStage::Vertex) ? 0 : 1;
             const u32 coverage = StageCoverage(*info, record_stage, *skip_flat_for);
@@ -538,15 +579,34 @@ bool PipelineCache::PlanGraphicsTyped(u64 exec_key, const FixedState& fixed, std
             plan.any_flat_skipped |= skip_flat[s];
             Core::NativeRegistry::NoteBinder(skip_flat[s] ? 9 : 10);
         }
-        if (!skip_flat[s]) {
+        if (!skip_flat[s] && pure != 2) {
             info->RefreshFlatBuf();
             NoteFlat(*info);
         }
     }
     plan.pipeline = entry.pipeline;
     for (u32 i = 0; i < MaxShaderStages; ++i) {
-        if (infos[i]) {
-            CapturePlan(plan.stages[i], RasterInfoFor(infos[i]), *infos[i], skip_flat[i]);
+        if (!infos[i]) {
+            continue;
+        }
+        const auto ud = entry.stage_hw[i] == static_cast<u32>(HwStage::Vertex) ? vertex_user_data : pixel_user_data;
+        if (pure == 2) {
+            CapturePlanPure(plan.stages[i], RasterInfoFor(infos[i]), *infos[i], skip_flat[i], ud, entry.pgm_base[i]); // note 182
+            g_pure_planned.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        CapturePlan(plan.stages[i], RasterInfoFor(infos[i]), *infos[i], skip_flat[i]);
+        if (pure == 1) {
+            // note 182 shadow: the plan-local capture against the shared one
+            StagePlan alt{};
+            CapturePlanPure(alt, plan.stages[i].info, *infos[i], skip_flat[i], ud, entry.pgm_base[i]);
+            const auto& got = plan.stages[i];
+            const bool same = alt.user_data_count == got.user_data_count && std::equal(alt.user_data.begin(), alt.user_data.begin() + alt.user_data_count, got.user_data.begin()) &&
+                              alt.flat == got.flat && alt.pgm_base == got.pgm_base && alt.flat_skipped == got.flat_skipped;
+            g_pure_compared.fetch_add(1, std::memory_order_relaxed);
+            if (!same) {
+                g_pure_differ.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
     auto* mutable_pipeline = const_cast<GraphicsPipeline*>(entry.pipeline);
@@ -1062,3 +1122,7 @@ std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::
     return code;
 }
 } // namespace Vulkan
+
+nlohmann::json TlgPurePlanReport() { // note 182: for the hook ring report
+    return Vulkan::PipelineCache::PurePlanReport();
+}
