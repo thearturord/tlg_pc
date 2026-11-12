@@ -263,6 +263,8 @@ struct ExecDraw {
     DrawArgs args{}; ///< E1b
     bool other_stage{}; ///< F3.2: a hull, domain or geometry shader is bound in the device context (ctx +0x4678 / +0x4680 / +0x4688)
     std::array<u64, 2> shader_ids{}; ///< note 179: the engine ids of the vertex and pixel shader objects (0: none)
+    u64 hook_pipeline{};   ///< note 183 shadow: the pipeline the hook found for the record's keys (0: none)
+    u8 hook_plan_state{};  ///< note 183: 0 not looked up, 1 found at the hook, 2 not published yet at the hook
     u8 ud_skipped{};     ///< note 179: bit per stage (0 vertex, 1 pixel) whose descriptor user data the hook did not write (rebuilt from the bindings by RebuildSkippedUserData)
     u8 ud_would_skip{};  ///< note 179 shadow: bit per stage the real mode would skip
     u64 vs_gnm{}, ps_gnm{}, fetch_object{}; ///< E1c: the Gnm blocks of the draw's vertex and pixel shader objects and the input layout's fetch object (0: unknown)
@@ -309,6 +311,12 @@ struct MapUpload {
 /// Note 179 (plan R3.4c, `TLG_SKIP_USER_DATA`: 0 off until the owner's play, 1 shadow, 2 real): a shader object (engine id, Gnm block) whose stage the planner found covered by
 /// the record's binding list; the hook then skips that stage's descriptor user data (the constant update engine's emulation).
 [[nodiscard]] u32 SkipUserDataMode() noexcept;
+/// Note 183 (plan R3.4d-1, `TLG_HOOK_PLAN`: 0 off, 1 shadow): the front publishes each typed plan's pipeline by (stage key, fixed state); the hook looks its record's keys up at
+/// record time, and the front compares. 0 hook asked, 1 found at the hook, 2 compared the same, 3 different (must be 0), 4 not yet published at the hook, 5 published
+[[nodiscard]] u32 HookPlanMode() noexcept;
+void PublishHookPlan(u64 stage_key, u64 fixed, u64 pipeline) noexcept;
+void NoteHookPlan(u32 what) noexcept;
+[[nodiscard]] std::array<u64, 6> HookPlanCounts() noexcept;
 void NoteCoveredShader(u64 id, u64 gnm) noexcept;
 /// Note 179: the front rebuilds the skipped descriptor user data of `draw` (stages in `ud_skipped`) from its binding list into the stage's user data registers; descriptor tables go
 /// into a front-thread arena.

@@ -1101,6 +1101,8 @@ struct NativeRecord {
     std::atomic<u64> seq{0};
     std::array<u64, 2> shader_ids{}; ///< note 179
     u8 ud_skipped{}, ud_would_skip{}; ///< note 179
+    u64 hook_pipeline{}; ///< note 183
+    u8 hook_plan_state{}; ///< note 183
     MapUpload map_upload{}; ///< note 173: the Map upload copy of this record (valid when `map_upload.seq` is this record's number)
     u32 count{};
     const StatePackage* package{}; ///< A5.3: the state package the first `package->count` registers are a copy of (valid when `package_for` is this record's number)
@@ -1795,6 +1797,39 @@ thread_local u64 dbg_vs;
 thread_local u64 dbg_fetch;
 
 u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out);
+
+// ---- note 183: the typed plans' pipelines by (stage key, fixed state), published by the front, read by the hook
+std::array<std::atomic<u64>, 65536> g_plan_key{};
+std::array<std::atomic<u64>, 65536> g_plan_pipeline{};
+std::array<std::atomic<u64>, 6> g_hook_plan_counts{};
+
+u32 HookPlanModeImpl() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_HOOK_PLAN");
+        return e != nullptr && e[0] == '1' ? 1u : 0u; // note 183: 0 off, 1 shadow
+    }();
+    return mode;
+}
+
+u64 PlanKey(u64 stage_key, u64 fixed) noexcept {
+    const u64 k = (stage_key ^ (fixed * 0x9E3779B97F4A7C15ull)) * 0xC2B2AE3D27D4EB4Full;
+    return k != 0 ? k : 1;
+}
+
+u64 LookupHookPlan(u64 key) noexcept {
+    const u64 h = key >> 48;
+    for (u64 i = 0; i < 32; ++i) {
+        const u64 at = (h + i) & 65535;
+        const u64 cur = g_plan_key[at].load(std::memory_order_acquire);
+        if (cur == 0) {
+            return 0;
+        }
+        if (cur == key) {
+            return g_plan_pipeline[at].load(std::memory_order_acquire);
+        }
+    }
+    return 0;
+}
 
 // ---- note 179: covered shader objects (published by the planner, read by the hook)
 std::array<std::atomic<u64>, 8192> g_covered_id{};
@@ -2762,6 +2797,27 @@ void SignRecord(NativeRecord& slot, const Signature& sig, u64 ctx) {
     slot.group_sig[GroupInterpolants] = sign({vs, ps});
     slot.group_sig[GroupTargets] = sign({sig.group[Targets]});
     slot.group_sig[GroupOther] = sign({sig.group[States], sig.group[InputObjects], sig.group[Shaders], sig.group[Targets]});
+    // note 183: the group identities are complete here
+    if (HookPlanModeImpl() != 0 && slot.kind <= 2 && slot.fixed != nullptr) [[unlikely]] {
+        // note 183 shadow: the stage key as TakeExecDraw makes it, from the record's group identities and descriptor key, then the published plan of (key, fixed state)
+        const std::array<u32, 5> needed{GroupOther, GroupVsProgram, GroupPsProgram, GroupInterpolants, GroupTargets};
+        bool known = true;
+        Hasher h;
+        for (const u32 group : needed) {
+            known &= slot.group_sig[group] != 0;
+            h.Add(slot.group_sig[group]);
+        }
+        h.Add(slot.desc_key[0]);
+        h.Add(slot.desc_key[1]);
+        if (known) {
+            g_hook_plan_counts[0].fetch_add(1, std::memory_order_relaxed);
+            slot.hook_pipeline = LookupHookPlan(PlanKey(h.h | 1, reinterpret_cast<u64>(slot.fixed)));
+            slot.hook_plan_state = slot.hook_pipeline != 0 ? 1 : 2;
+            if (slot.hook_pipeline != 0) {
+                g_hook_plan_counts[1].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
 }
 
 /// A1: census of the tagged draws by call site.
@@ -3245,6 +3301,8 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
         slot.reason = synth_reason | (table_overflow ? ReasonTableOverflow : 0u) | (bad_object_seen ? ReasonBadObject : 0u);
     }
     GroupRegisters(slot);
+    slot.hook_pipeline = 0;
+    slot.hook_plan_state = 0;
     slot.seq.store(seq, std::memory_order_release);
     return seq;
 }
@@ -4875,6 +4933,8 @@ static bool TakeExecDrawImpl(u64 seq, ExecDraw& out, bool typed, bool allow_lazy
     out.vs_gnm = slot.vs_gnm;
     out.ps_gnm = slot.ps_gnm;
     out.shader_ids = slot.kind <= 2 ? slot.shader_ids : std::array<u64, 2>{};
+    out.hook_pipeline = slot.kind <= 2 ? slot.hook_pipeline : 0;
+    out.hook_plan_state = slot.kind <= 2 ? slot.hook_plan_state : 0;
     out.ud_skipped = slot.kind <= 2 ? slot.ud_skipped : 0;
     out.ud_would_skip = slot.kind <= 2 ? slot.ud_would_skip : 0;
     out.fetch_object = slot.dbg_fetch;
@@ -4914,6 +4974,40 @@ bool TakeMapUpload(u64 seq, MapUpload& out) {
 
 u32 SkipUserDataMode() noexcept {
     return SkipUserDataModeImpl();
+}
+u32 HookPlanMode() noexcept {
+    return HookPlanModeImpl();
+}
+void PublishHookPlan(u64 stage_key, u64 fixed, u64 pipeline) noexcept {
+    // (one writer, the front thread: the value first, then the key)
+    const u64 key = PlanKey(stage_key, fixed);
+    const u64 h = key >> 48;
+    for (u64 i = 0; i < 32; ++i) {
+        const u64 at = (h + i) & 65535;
+        const u64 cur = g_plan_key[at].load(std::memory_order_acquire);
+        if (cur == key) {
+            g_plan_pipeline[at].store(pipeline, std::memory_order_release);
+            return;
+        }
+        if (cur == 0) {
+            g_plan_pipeline[at].store(pipeline, std::memory_order_release);
+            g_plan_key[at].store(key, std::memory_order_release);
+            g_hook_plan_counts[5].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+void NoteHookPlan(u32 what) noexcept {
+    if (what < g_hook_plan_counts.size()) {
+        g_hook_plan_counts[what].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+std::array<u64, 6> HookPlanCounts() noexcept {
+    std::array<u64, 6> out{};
+    for (u32 i = 0; i < out.size(); ++i) {
+        out[i] = g_hook_plan_counts[i].load(std::memory_order_relaxed);
+    }
+    return out;
 }
 void NoteSkipUserData(u32 what) noexcept {
     NoteSkipUserDataImpl(what);

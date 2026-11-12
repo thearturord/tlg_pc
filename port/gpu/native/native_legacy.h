@@ -71,6 +71,7 @@
 ///   TLG_MAP_UPLOAD_COPY=0      the Map upload runs the PS4 copy program over a source image made at the scratch address instead of a buffer-to-image copy (note 177)
 ///   TLG_SKIP_USER_DATA=0       the hook writes every stage's descriptor user data and tables (the constant update engine's emulation) instead of skipping covered shaders (note 180)
 ///   TLG_PURE_PLAN=0            the typed planner uses the shared shader infos as scratch (user data, program base, flat user data) (note 182)
+///   TLG_PUBLISHED_PLAN=0       the typed plan reads the front's own caches (exec_inputs, exec_pipelines) instead of the published read-only copies (note 184; =2 real)
 namespace Core::Legacy {
 
 

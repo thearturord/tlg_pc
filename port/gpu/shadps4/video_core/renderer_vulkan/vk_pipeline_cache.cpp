@@ -331,6 +331,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         entry.fetch_program = fetch_shader != nullptr ? fetch_program : nullptr;
         entry.fetch_perm = fetch_perm;
         entry.epoch = exec_epoch;
+        if (PublishedPlanMode() != 0) [[unlikely]] {
+            PublishExecEntry(lookup_exec_key, entry); // note 184: every write of the entry is published
+        }
     }
     return it->second.get();
 }
@@ -395,9 +398,90 @@ u32 PurePlanMode() {
 std::atomic<u64> g_pure_compared{0}, g_pure_differ{0}, g_pure_planned{0};
 } // namespace
 
+namespace {
+u32 StageCoverage(const Shader::Info& info, u32 record_stage, const Core::NativeDraw::ExecDraw& draw); // (defined below)
+}
+static u64 ExecKeyOf(u64 key, const FixedState& fixed); // (defined below)
+
+// ---- note 184: published read-only exec entries (one writer: the front's PlanGraphicsTyped)
+struct PublishedEntry {
+    const GraphicsPipeline* pipeline{};
+    std::array<const Shader::Info*, MaxShaderStages> infos{};
+    std::array<Shader::Info*, MaxShaderStages> clones{};
+    std::array<u32, MaxShaderStages> stage_hw{};
+    std::array<VAddr, MaxShaderStages> pgm_base{};
+    u64 epoch{};
+};
+std::array<std::atomic<u64>, 65536> g_pub_key{};
+std::array<std::atomic<PublishedEntry*>, 65536> g_pub_entry{};
+std::vector<std::unique_ptr<PublishedEntry>> g_pub_storage;
+std::atomic<u64> g_pub_count{0};
+
+u32 PipelineCache::PublishedPlanMode() noexcept {
+    static const u32 mode = [] {
+        const char* e = std::getenv("TLG_PUBLISHED_PLAN");
+        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // note 184: 0 off, 1 shadow, 2 real
+    }();
+    return mode;
+}
+
+static const PublishedEntry* FindPublished(u64 key) noexcept {
+    const u64 h = (key * 0x9E3779B97F4A7C15ull) >> 48;
+    for (u64 i = 0; i < 32; ++i) {
+        const u64 at = (h + i) & 65535;
+        const u64 cur = g_pub_key[at].load(std::memory_order_acquire);
+        if (cur == 0) {
+            return nullptr;
+        }
+        if (cur == key) {
+            return g_pub_entry[at].load(std::memory_order_acquire);
+        }
+    }
+    return nullptr;
+}
+
+static void Publish(u64 key, const PublishedEntry& value) {
+    if (key == 0) {
+        return;
+    }
+    const u64 h = (key * 0x9E3779B97F4A7C15ull) >> 48;
+    for (u64 i = 0; i < 32; ++i) {
+        const u64 at = (h + i) & 65535;
+        const u64 cur = g_pub_key[at].load(std::memory_order_acquire);
+        if (cur == key) {
+            const PublishedEntry* old = g_pub_entry[at].load(std::memory_order_acquire);
+            if (old != nullptr && std::memcmp(old, &value, sizeof(PublishedEntry)) == 0) {
+                return;
+            }
+        } else if (cur != 0) {
+            continue;
+        }
+        // (an entry, once published, is never freed or written: a replaced one stays allocated)
+        g_pub_storage.push_back(std::make_unique<PublishedEntry>(value));
+        g_pub_entry[at].store(g_pub_storage.back().get(), std::memory_order_release);
+        g_pub_key[at].store(key, std::memory_order_release);
+        g_pub_count.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+}
+
+void PipelineCache::PublishExecEntry(u64 key, const ExecEntry& entry) {
+    // the entry, as another thread may read it (the raster clones are made here, on the front)
+    PublishedEntry pub{};
+    pub.pipeline = entry.pipeline;
+    pub.infos = entry.infos;
+    pub.stage_hw = entry.stage_hw;
+    pub.pgm_base = entry.pgm_base;
+    pub.epoch = entry.epoch;
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        pub.clones[i] = entry.infos[i] != nullptr ? RasterInfoFor(entry.infos[i]) : nullptr;
+    }
+    Publish(key, pub);
+}
+
 nlohmann::json PipelineCache::PurePlanReport() {
     return {{"mode", PurePlanMode()}, {"planned_without_shared_writes", g_pure_planned.load()}, {"compared", g_pure_compared.load()},
-            {"PURE_PLAN_DIFFERS_MUST_BE_0", g_pure_differ.load()}};
+            {"PURE_PLAN_DIFFERS_MUST_BE_0", g_pure_differ.load()}, {"published_entries_note_184", g_pub_count.load()}};
 }
 
 void PipelineCache::CapturePlanPure(StagePlan& out, Shader::Info* clone, const Shader::Info& shared, bool skip_flat, std::span<const u32, 16> user_data, u64 pgm_base) {
@@ -418,6 +502,42 @@ void PipelineCache::CapturePlanPure(StagePlan& out, Shader::Info* clone, const S
         }
     }
     out.pgm_base = pgm_base;
+}
+
+bool PipelineCache::PlanFromPublished(u64 exec_key, const FixedState& fixed, std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data, DrawPlan& out,
+                                      const Core::NativeDraw::ExecDraw* skip_flat_for, u32 draw_class, bool note_binder) const {
+    const PublishedEntry* pe = FindPublished(ExecKeyOf(exec_key, fixed)); // (published only while TLG_PUBLISHED_PLAN is on)
+    if (pe == nullptr || pe->epoch != exec_epoch || pe->pipeline == nullptr || !pe->pipeline->StagesAdopted()) {
+        return false;
+    }
+    for (u32 s = 0; s < MaxShaderStages; ++s) {
+        if (pe->infos[s] && pe->stage_hw[s] != static_cast<u32>(HwStage::Vertex) && pe->stage_hw[s] != static_cast<u32>(HwStage::Fragment)) {
+            return false; // (as PlanGraphicsTyped: vertex and pixel stages only)
+        }
+    }
+    out.pipeline = pe->pipeline;
+    out.any_flat_skipped = false;
+    for (u32 s = 0; s < MaxShaderStages; ++s) {
+        out.stages[s].info = nullptr;
+        if (pe->infos[s] == nullptr) {
+            continue;
+        }
+        const bool vertex = pe->stage_hw[s] == static_cast<u32>(HwStage::Vertex);
+        bool skip = false;
+        if (skip_flat_for != nullptr) {
+            const u32 coverage = StageCoverage(*pe->infos[s], vertex ? 0u : 1u, *skip_flat_for);
+            skip = coverage == 0;
+            if (note_binder) {
+                if (coverage != 0) {
+                    Core::NativeRegistry::NoteBinderReason(draw_class, vertex ? 0u : 1u, coverage);
+                }
+                Core::NativeRegistry::NoteBinder(skip ? 9 : 10);
+            }
+        }
+        out.any_flat_skipped |= skip;
+        CapturePlanPure(out.stages[s], pe->clones[s], *pe->infos[s], skip, vertex ? vertex_user_data : pixel_user_data, pe->pgm_base[s]);
+    }
+    return true;
 }
 
 void PipelineCache::CapturePlan(StagePlan& out, Shader::Info* clone, const Shader::Info& shared, bool skip_flat) {
@@ -588,6 +708,9 @@ bool PipelineCache::PlanGraphicsTyped(u64 exec_key, const FixedState& fixed, std
         }
     }
     plan.pipeline = entry.pipeline;
+    if (PublishedPlanMode() != 0) [[unlikely]] {
+        PublishExecEntry(ExecKeyOf(exec_key, fixed), entry); // note 184
+    }
     for (u32 i = 0; i < MaxShaderStages; ++i) {
         if (!infos[i]) {
             continue;

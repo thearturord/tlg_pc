@@ -46,6 +46,9 @@ class GraphicsPipeline;
 class Runtime;
 struct FixedState;
 struct DrawInputs;
+/// Note 184: the draw inputs by inputs key, published read-only (written by the front only, wherever its own inputs cache is written).
+[[nodiscard]] const DrawInputs* FindPublishedInputs(u64 key) noexcept;
+void PublishDrawInputs(u64 key, const DrawInputs& value);
 
 class Rasterizer : public Core::RasterHost {
 public:
@@ -701,6 +704,12 @@ private:
     bool BindTexturesFromEntries(const Shader::Info& stage, const TextureSet& set, u32 count, Shader::Backend::Bindings& binding);
     /// Note 173: the Map upload copy as an upload into the texture's image instead of the copy program's dispatch; true when done (the dispatch is skipped).
     bool NativeMapUpload(const DispatchPlan& plan, const Shader::Info& cs);
+    /// Note 184 shadow: the typed plan made from the published read-only entries and the record, against the front's plan.
+    void PublishedPlanShadow(const DrawPlan& plan, const FixedState& native, u64 exec_key, u64 inputs_key, const DrawInputs& cached, std::span<const u32, 16> vertex_user_data,
+                             std::span<const u32, 16> pixel_user_data, const Core::NativeDraw::ExecDraw& draw, u32 index_count, bool skip_flat);
+public:
+    static nlohmann::json PublishedPlanReport();
+private:
     /// Design review notes 95 and 96 (`TLG_VIEW_TABLE`): after a stage's images were bound by the old path, the view table's answer for each read-only binding of a non-dynamic
     /// engine texture view is compared with it, and the entry is made or remade from it (`first_info`: the stage's first image info; `bound_before`: the bound image list's size
     /// before the stage; `answers`/`answers_ok`: the old path's per-image record and whether it can be bound from the table).

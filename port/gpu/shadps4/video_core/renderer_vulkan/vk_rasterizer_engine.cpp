@@ -268,13 +268,71 @@ void Rasterizer::EngineObjectDeleted(u64 id, VAddr address, u64 bytes, u32 what)
     }
 }
 
+namespace {
+// note 184: the draw inputs by inputs key, published read-only (one writer: the front)
+std::array<std::atomic<u64>, 65536> g_inputs_key{};
+std::array<std::atomic<const DrawInputs*>, 65536> g_inputs_val{};
+std::vector<std::unique_ptr<DrawInputs>> g_inputs_storage;
+std::array<std::atomic<u64>, 8> g_pp{}; // 0 compared, 1 same, 2 PUBLISHED_PLAN_DIFFERS_MUST_BE_0, 3 inputs bytes differ (informative), 4 not published, 5 inputs published,
+                                       // 6 planned from published (real), 7 real: fell back to the front's caches
+const DrawInputs* FindInputs(u64 key) noexcept {
+    const u64 h = (key * 0x9E3779B97F4A7C15ull) >> 48;
+    for (u64 i = 0; i < 32; ++i) {
+        const u64 at = (h + i) & 65535;
+        const u64 cur = g_inputs_key[at].load(std::memory_order_acquire);
+        if (cur == 0) {
+            return nullptr;
+        }
+        if (cur == key) {
+            return g_inputs_val[at].load(std::memory_order_acquire);
+        }
+    }
+    return nullptr;
+}
+void PublishInputs(u64 key, const DrawInputs& value) {
+    const u64 h = (key * 0x9E3779B97F4A7C15ull) >> 48;
+    for (u64 i = 0; i < 32; ++i) {
+        const u64 at = (h + i) & 65535;
+        const u64 cur = g_inputs_key[at].load(std::memory_order_acquire);
+        if (cur == key) {
+            const DrawInputs* old = g_inputs_val[at].load(std::memory_order_acquire);
+            if (old != nullptr && std::memcmp(old, &value, sizeof(DrawInputs)) == 0) {
+                return;
+            }
+        } else if (cur != 0) {
+            continue;
+        }
+        g_inputs_storage.push_back(std::make_unique<DrawInputs>(value));
+        g_inputs_val[at].store(g_inputs_storage.back().get(), std::memory_order_release);
+        g_inputs_key[at].store(key, std::memory_order_release);
+        g_pp[5].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+}
+} // namespace
+
+const DrawInputs* FindPublishedInputs(u64 key) noexcept {
+    return FindInputs(key);
+}
+void PublishDrawInputs(u64 key, const DrawInputs& value) {
+    if (key != 0) {
+        PublishInputs(key, value);
+    }
+}
+
 std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64 exec_key, u64 inputs_key,
                                                    std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data,
                                                    const Core::NativeDraw::ExecDraw& draw, u32 index_count, u32 draw_class) {
-    const auto cached = exec_inputs.find(inputs_key);
-    if (cached == exec_inputs.end()) {
-        Core::NativeDraw::Live().plan_null[1].fetch_add(1, std::memory_order_relaxed);
-        return nullptr;
+    // note 184 real: the inputs and the plan come from the published read-only copies; the front's caches only when the keys are not published (yet)
+    const u32 published = PipelineCache::PublishedPlanMode();
+    const DrawInputs* inputs_src = published == 2 ? FindInputs(inputs_key) : nullptr;
+    if (inputs_src == nullptr) {
+        const auto cached = exec_inputs.find(inputs_key);
+        if (cached == exec_inputs.end()) {
+            Core::NativeDraw::Live().plan_null[1].fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
+        }
+        inputs_src = &cached->second;
     }
     std::unique_ptr<DrawPlan> plan = plan_pool.TakeDraw();
     plan->executed = true;
@@ -293,7 +351,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
         plan->fixed = &plan->fixed_copy;
     }
     plan->fixed_source = &native; // note 154 (the record's cached state: never freed)
-    plan->inputs = cached->second;
+    plan->inputs = *inputs_src;
     // E1b: the draw's arguments are the typed values the record builder set (the argument registers of the record are not decoded any more); a field the record did
     // not set keeps what the cached inputs hold, as before.
     Core::NativeDrawInputs::ApplyDrawArgs(plan->inputs, draw.args);
@@ -307,12 +365,29 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
     if ((binder_mode == 1 || binder_mode == 2) && !draw.bindings_complete) {
         Core::NativeRegistry::NoteBinderReason(draw_class, 2, draw.bindings_overflow ? 10 : 1); // the whole draw keeps the flat user data: its binding list is not complete
     }
-    if (!pipeline_cache.PlanGraphicsTyped(exec_key, *plan->fixed, vertex_user_data, pixel_user_data, *plan, skip_flat ? &draw : nullptr, draw_class)) {
+    bool planned = false;
+    if (published == 2) {
+        planned = pipeline_cache.PlanFromPublished(exec_key, *plan->fixed, vertex_user_data, pixel_user_data, *plan, skip_flat ? &draw : nullptr, draw_class, true);
+        g_pp[planned ? 6 : 7].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!planned && !pipeline_cache.PlanGraphicsTyped(exec_key, *plan->fixed, vertex_user_data, pixel_user_data, *plan, skip_flat ? &draw : nullptr, draw_class)) {
         Core::NativeDraw::Live().plan_null[2].fetch_add(1, std::memory_order_relaxed);
         RecyclePlan(std::move(plan));
         return nullptr;
     }
     Core::NativeDraw::Live().stage_key_typed_hits.fetch_add(1, std::memory_order_relaxed);
+    if (published == 1) [[unlikely]] {
+        PublishedPlanShadow(*plan, native, exec_key, inputs_key, *inputs_src, vertex_user_data, pixel_user_data, draw, index_count, skip_flat); // note 184
+    }
+    if (Core::NativeDraw::HookPlanMode() != 0) [[unlikely]] {
+        // note 183 shadow: the pipeline the hook found for this record's keys against the front's plan; then this plan is published for later records
+        if (draw.hook_plan_state == 1) {
+            Core::NativeDraw::NoteHookPlan(draw.hook_pipeline == reinterpret_cast<u64>(plan->pipeline) ? 2 : 3);
+        } else if (draw.hook_plan_state == 2) {
+            Core::NativeDraw::NoteHookPlan(4);
+        }
+        Core::NativeDraw::PublishHookPlan(exec_key, reinterpret_cast<u64>(&native), reinterpret_cast<u64>(plan->pipeline));
+    }
     if (Core::NativeDraw::SkipUserDataMode() != 0) [[unlikely]] {
         // note 179: a stage the record covers: its shader object is published to the hook; a stage the hook skipped (or would skip) that is not covered here is a guard
         for (u32 st = 0; st < 2; ++st) {
@@ -355,6 +430,45 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanExecDraw(const FixedState& native, u64
     }
     Core::NativeDraw::Live().fixed_native.fetch_add(1, std::memory_order_relaxed);
     return plan;
+}
+
+
+nlohmann::json Rasterizer::PublishedPlanReport() {
+    return {{"mode", PipelineCache::PublishedPlanMode()}, {"compared", g_pp[0].load()}, {"same", g_pp[1].load()}, {"PUBLISHED_PLAN_DIFFERS_MUST_BE_0", g_pp[2].load()},
+            {"inputs_bytes_differ_informative", g_pp[3].load()}, {"not_published_yet", g_pp[4].load()}, {"inputs_published", g_pp[5].load()},
+            {"planned_from_published_real", g_pp[6].load()}, {"real_fell_back_to_front_caches", g_pp[7].load()}};
+}
+
+void Rasterizer::PublishedPlanShadow(const DrawPlan& plan, const FixedState& native, u64 exec_key, u64 inputs_key, const DrawInputs& cached, std::span<const u32, 16> vertex_user_data,
+                                     std::span<const u32, 16> pixel_user_data, const Core::NativeDraw::ExecDraw& draw, u32 index_count, bool skip_flat) {
+    PublishInputs(inputs_key, cached);
+    static thread_local std::unique_ptr<DrawPlan> alt = std::make_unique<DrawPlan>();
+    const DrawInputs* inputs = FindInputs(inputs_key);
+    if (inputs == nullptr || !pipeline_cache.PlanFromPublished(exec_key, native, vertex_user_data, pixel_user_data, *alt, skip_flat ? &draw : nullptr, 0, false)) {
+        g_pp[4].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_pp[0].fetch_add(1, std::memory_order_relaxed);
+    bool same = alt->pipeline == plan.pipeline && alt->any_flat_skipped == plan.any_flat_skipped;
+    for (u32 s = 0; s < MaxShaderStages && same; ++s) {
+        const auto& a = alt->stages[s];
+        const auto& b = plan.stages[s];
+        if ((a.info == nullptr) != (b.info == nullptr)) {
+            same = false;
+        } else if (a.info != nullptr) {
+            same = a.info == b.info && a.pgm_base == b.pgm_base && a.flat_skipped == b.flat_skipped && a.flat == b.flat && a.user_data_count == b.user_data_count &&
+                   std::equal(a.user_data.begin(), a.user_data.begin() + a.user_data_count, b.user_data.begin());
+        }
+    }
+    g_pp[same ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
+    DrawInputs alt_inputs = *inputs;
+    Core::NativeDrawInputs::ApplyDrawArgs(alt_inputs, draw.args);
+    if (index_count != ~0u) {
+        alt_inputs.num_indices = index_count;
+    }
+    if (std::memcmp(&alt_inputs, &plan.inputs, sizeof(DrawInputs)) != 0) {
+        g_pp[3].fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 std::unique_ptr<DrawPlan> Rasterizer::PlanExecOperation(const Core::NativeDraw::ExecDraw& draw) {
@@ -1151,3 +1265,7 @@ void Rasterizer::OcclusionClose(VAddr address) {
 }
 
 } // namespace Vulkan
+
+nlohmann::json TlgPublishedPlanReport() { // note 184: for the hook ring report
+    return Vulkan::Rasterizer::PublishedPlanReport();
+}

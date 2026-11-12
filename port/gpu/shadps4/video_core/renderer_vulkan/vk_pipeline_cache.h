@@ -260,7 +260,13 @@ private:
 public:
     /// Note 182: the counters of the plan-local capture (`TLG_PURE_PLAN`).
     static nlohmann::json PurePlanReport();
+    /// Note 184 (plan R3.4d-2/4, `TLG_PUBLISHED_PLAN`: 0 off, 1 shadow, 2 real): a typed plan made only from read-only published entries (published where the cache entry is
+    /// written) and the record: what another thread can plan without the front's caches. False: no published entry for the keys (the caller plans the old way).
+    [[nodiscard]] static u32 PublishedPlanMode() noexcept;
+    bool PlanFromPublished(u64 exec_key, const FixedState& fixed, std::span<const u32, 16> vertex_user_data, std::span<const u32, 16> pixel_user_data, DrawPlan& out,
+                           const Core::NativeDraw::ExecDraw* skip_flat_for, u32 draw_class, bool note_binder) const;
 private:
+    void PublishExecEntry(u64 key, const ExecEntry& entry); ///< note 184 (the front thread only)
     static void CapturePlanPure(StagePlan& out, Shader::Info* clone, const Shader::Info& shared, bool skip_flat, std::span<const u32, 16> user_data, u64 pgm_base);
     std::array<u32, MaxShaderStages> stage_hw{};
     std::array<VAddr, MaxShaderStages> stage_base{};

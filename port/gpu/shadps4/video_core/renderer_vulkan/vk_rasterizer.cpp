@@ -584,6 +584,9 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(DrawIndirectParams params, const 
     }
     if (inputs_key != 0 && plan->executed) {
         exec_inputs.insert_or_assign(inputs_key, plan->inputs);
+        if (PipelineCache::PublishedPlanMode() != 0) [[unlikely]] {
+            PublishDrawInputs(inputs_key, plan->inputs); // note 184: every write is published
+        }
     }
     pipeline_cache.PlanGraphics(*plan->fixed, params, *plan, exec_key);
     return plan;
