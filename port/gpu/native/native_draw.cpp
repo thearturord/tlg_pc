@@ -5358,7 +5358,12 @@ void HookPlanDraw(u64 seq, u64 ctx, u32 draw_class) {
         return;
     }
     u64 epoch = 0;
-    void* plan = planner(d, ud.vs, ud.ps, draw_class, &epoch);
+    void* plan = nullptr;
+    // (the SRT walker reads guest memory through the user data, on the game's thread: a fault leaves the draw to the front, as the record builder's own reads do)
+    Guarded([&] {
+        plan = planner(d, ud.vs, ud.ps, draw_class, &epoch);
+        return u64{0};
+    });
     if (plan == nullptr) {
         NoteHookPlanImpl(7);
         return;
