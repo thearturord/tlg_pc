@@ -801,7 +801,7 @@ static u32 ObtainCachesMode() {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_OBTAIN_CACHES");
         if (e == nullptr || e[0] == 0) {
-            return 2u;
+            return 0u; // note 169: deleted by default since 2026-11-12 (owner play p7play); LEGACY(obtain_caches): =2 the caches back, =1 shadow
         }
         return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();

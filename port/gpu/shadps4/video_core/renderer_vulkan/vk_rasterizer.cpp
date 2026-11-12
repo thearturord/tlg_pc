@@ -6971,7 +6971,10 @@ namespace {
 u32 TwiceTailMode() {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_TWICE_TAIL");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u;
+        if (e == nullptr || e[0] == 0) {
+            return 2u; // note 170: default 2 since 2026-11-12 (owner play p7play); LEGACY(twice_tail): =0 such stages refused to the old binder, =1 shadow
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }

@@ -769,7 +769,10 @@ std::atomic<u64> c_open_guard[3]{};
 u32 OpenMapGuardMode() noexcept {
     static const u32 mode = [] {
         const char* e = std::getenv("TLG_OPEN_MAP_GUARD");
-        return e != nullptr && (e[0] == '1' || e[0] == '2') ? static_cast<u32>(e[0] - '0') : 0u; // note 168: 0 off until the owner's play, 1 shadow, 2 real
+        if (e == nullptr || e[0] == 0) {
+            return 2u; // note 168: default 2 since 2026-11-12 (owner play p7play); LEGACY(open_map_guard): =0 answers over an open Map given, =1 shadow
+        }
+        return e[0] == '1' || e[0] == '2' ? static_cast<u32>(e[0] - '0') : 0u;
     }();
     return mode;
 }
